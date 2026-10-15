@@ -560,8 +560,9 @@ codex:
   #
   # A Phase-4a-gated PR (MERGEPATH_PHASE_4A_GATED=true) is requested
   # whatever this key says. An unreadable policy fails toward requesting:
-  # a missing or unparseable file, no yq, a duplicated key or a non-boolean
-  # value (a quoted 'false' is a string) posts the trigger with a warning.
+  # a missing or unparseable file, no yq, an empty or null codex: block, a
+  # duplicated key or codex: block in any YAML style, or a non-boolean value
+  # (a quoted 'false' is a string) posts the trigger with a warning.
   #
   # ORTHOGONAL to `enabled` above: `request_by_default` governs only WHEN
   # the trigger is posted, never WHETHER Codex participates. When

@@ -630,14 +630,15 @@ CODEX_ENABLED=${CODEX_ENABLED:-true}
 # true|false and REQUEST_BY_DEFAULT_SOURCE to explicit|unset|failsafe.
 #
 #   explicit  the key holds a YAML boolean; its value is used.
-#   unset     the policy parses, and the key (or the whole codex: block) is
+#   unset     the policy parses, and the key (or the whole codex: key) is
 #             absent: false, the owner-decided default since #2240.
 #   failsafe  the policy cannot be trusted to answer, so the trigger IS
 #             requested, with a warning naming the cause: the file is
 #             missing, no YAML parser is available, the file does not parse
 #             or holds more than one document, the root or codex: is not a
-#             mapping, the key or codex: block is duplicated, or the value
-#             is not a boolean (a quoted 'false' is a string, not a boolean).
+#             mapping, codex: is present but empty or null, the key or the
+#             codex: block is duplicated in any YAML style, or the value is
+#             not a boolean (a quoted 'false' is a string, not a boolean).
 #
 # The two outcomes are not symmetric: requesting wrongly costs one Codex
 # round, while skipping wrongly silently drops a review. So a skip needs a
@@ -648,8 +649,8 @@ CODEX_ENABLED=${CODEX_ENABLED:-true}
 # Presence is tested with has(), never with `//`: yq's alternative operator
 # treats an explicit `false` like null, so `.request_by_default // "x"`
 # reports an explicit false as missing. go-yaml resolves a duplicated key
-# last-wins without complaint, so duplicates are counted separately, in
-# either key spelling: a quoted `"codex":` is the same key to the parser.
+# last-wins without complaint, so duplicates are counted separately, through
+# the parser's own key list so that every spelling is seen.
 # MERGEPATH_YQ_BIN is a test seam for the parser-unavailable path.
 REQUEST_BY_DEFAULT=""
 REQUEST_BY_DEFAULT_SOURCE=""
@@ -659,7 +660,7 @@ request_by_default_failsafe() {  # <cause>
   echo "[codex-review-request] WARN: cannot read codex.request_by_default: $1 — requesting Codex anyway (an unreadable policy never opts out of review, #2240)" >&2
 }
 resolve_request_by_default() {
-  local yq_bin=${MERGEPATH_YQ_BIN:-yq} docs root_type codex_type dups present tag value
+  local yq_bin=${MERGEPATH_YQ_BIN:-yq} docs root_type codex_count codex_type key_count present tag value
   if [ ! -f "$CONFIG" ]; then
     request_by_default_failsafe "policy file not found ($CONFIG)"
     return 0
@@ -686,25 +687,46 @@ resolve_request_by_default() {
     request_by_default_failsafe "$CONFIG is not a YAML mapping"
     return 0
   fi
-  codex_type=$("$yq_bin" '.codex | type' "$CONFIG" 2>/dev/null) || codex_type="?"
-  dups=$(awk '
-    /^["\047]?codex["\047]?[[:space:]]*:/ { blocks++; in_block=1; next }
-    in_block && /^[^[:space:]#]/ { in_block=0 }
-    in_block && /^[[:space:]]+["\047]?request_by_default["\047]?[[:space:]]*:/ { keys++ }
-    END { print ((blocks > 1 || keys > 1) ? "yes" : "no") }
-  ' "$CONFIG")
-  if [ "$dups" = "yes" ]; then
-    request_by_default_failsafe "$CONFIG has more than one codex: block or codex.request_by_default key"
-    return 0
-  fi
-  case "$codex_type" in
-    ""|"!!null")
+  # Duplicates are counted by the parser, not by scanning lines: yq's `keys`
+  # keeps every duplicated key in any style (block, flow, quoted), while the
+  # value read resolves them last-wins. A line scan missed the flow and
+  # quoted spellings (#2245).
+  codex_count=$("$yq_bin" '[keys[] | select(. == "codex")] | length' "$CONFIG" 2>/dev/null) || codex_count="?"
+  case "$codex_count" in
+    0)
+      # The codex: key is absent altogether: unset, the #2240 default.
       REQUEST_BY_DEFAULT="false"
       REQUEST_BY_DEFAULT_SOURCE="unset"
       return 0 ;;
+    1) ;;
+    *[!0-9]*|"")
+      request_by_default_failsafe "the parser could not count codex: keys in $CONFIG"
+      return 0 ;;
+    *)
+      request_by_default_failsafe "$CONFIG has $codex_count codex: blocks"
+      return 0 ;;
+  esac
+  codex_type=$("$yq_bin" '.codex | type' "$CONFIG" 2>/dev/null) || codex_type="?"
+  case "$codex_type" in
     "!!map") ;;
+    "!!null")
+      # Present but empty or null (`codex:`, `codex: null`, `codex: ~`): a
+      # block that says nothing is a malformed policy, not an absent one
+      # (#2245). Only a missing codex: key means unset.
+      request_by_default_failsafe "codex: in $CONFIG is present but empty or null"
+      return 0 ;;
     *)
       request_by_default_failsafe "codex: in $CONFIG is not a mapping"
+      return 0 ;;
+  esac
+  key_count=$("$yq_bin" '[.codex | keys[] | select(. == "request_by_default")] | length' "$CONFIG" 2>/dev/null) || key_count="?"
+  case "$key_count" in
+    0|1) ;;
+    *[!0-9]*|"")
+      request_by_default_failsafe "the parser could not count codex.request_by_default keys in $CONFIG"
+      return 0 ;;
+    *)
+      request_by_default_failsafe "$CONFIG has $key_count codex.request_by_default keys"
       return 0 ;;
   esac
   present=$("$yq_bin" '.codex | has("request_by_default")' "$CONFIG" 2>/dev/null) || present="?"

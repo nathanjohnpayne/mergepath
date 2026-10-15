@@ -312,12 +312,15 @@ test_request_by_default_unreadable_requests() {
   assert_unreadable_requests "unparseable" "is not valid YAML" \
     "  enabled: true"$'\n'"  request_by_default: false" "broken: [1, 2"
   # Duplicated key: go-yaml resolves last-wins without complaint.
-  assert_unreadable_requests "duplicate" "more than one codex: block or codex.request_by_default key" \
+  assert_unreadable_requests "duplicate" "has 2 codex.request_by_default keys" \
     "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  request_by_default: false"
+  # A duplicated key spelled with quotes inside a block mapping (#2245).
+  assert_unreadable_requests "quoted-duplicate-key" "has 2 codex.request_by_default keys" \
+    "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  \"request_by_default\": false"
   # A duplicate codex: block spelled with a quoted key: the parser treats
   # "codex": as the same key and keeps the last block's false, so the count
   # must see both spellings (Codex task on #2243).
-  assert_unreadable_requests "quoted-duplicate-block" "more than one codex: block or codex.request_by_default key" \
+  assert_unreadable_requests "quoted-duplicate-block" "has 2 codex: blocks" \
     "  enabled: true"$'\n'"  request_by_default: true" '"codex":'$'\n''  request_by_default: false'
   # No YAML parser to verify the file with.
   local dir rc count
@@ -331,6 +334,64 @@ test_request_by_default_unreadable_requests() {
   else
     pass "request_by_default with no YAML parser ⇒ requested with a warning naming the cause (#2240)"
   fi
+}
+
+# --- whole-policy shapes the codex:-block fixture cannot express (#2245) ----
+# Each writes the ENTIRE policy, so codex_field's line reader finds none of
+# the fast timing keys and the run would use the default 1800s poll. As in
+# the missing-policy case below, the gh stub refuses the first read past the
+# entry decision: exit 3 after "fetching HEAD commit metadata" proves a
+# request, where a skip exits 5 before any read. Args: <case> <cause> <policy>
+assert_policy_requests_at_fetch() {
+  local name=$1 cause=$2 policy=$3 dir rc
+  dir=$(make_case "rbd-$name" "  enabled: true")
+  printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
+    fail "rbd $name: exit $rc, expected 3 at the PR fetch past a request decision; stderr=$(cat "$dir/err.log")"
+  elif ! grep -F 'WARN: cannot read codex.request_by_default' "$dir/err.log" | grep -Fq "$cause"; then
+    fail "rbd $name: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default $name ⇒ requested with a warning naming the cause (#2245)"
+  fi
+}
+
+# Args: <case> <policy>. The policy parses and states no request_by_default,
+# so the run must skip with exit 5 and no warning.
+assert_policy_skips_unset() {
+  local name=$1 policy=$2 dir rc
+  dir=$(make_case "rbd-$name" "  enabled: true")
+  printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  if [ "$rc" != "5" ]; then
+    fail "rbd $name: exit $rc, expected 5 (unset ⇒ false); stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
+    fail "rbd $name: a parseable policy with the key absent must not warn; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'codex.request_by_default is not set' "$dir/err.log"; then
+    fail "rbd $name: the skip must report the key as not set; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default $name ⇒ unset, skip with exit 5"
+  fi
+}
+
+test_request_by_default_policy_shapes() {
+  # Duplicated key inside a flow mapping: go-yaml keeps the last value.
+  assert_policy_requests_at_fetch "flow-duplicate-key" "has 2 codex.request_by_default keys" \
+    'codex: {enabled: true, request_by_default: true, request_by_default: false}'
+  # Duplicated codex key in a flow-style root mapping.
+  assert_policy_requests_at_fetch "flow-duplicate-block" "has 2 codex: blocks" \
+    '{codex: {request_by_default: true}, codex: {request_by_default: false}}'
+  # A present but empty codex: block, an explicit null and a tilde null.
+  assert_policy_requests_at_fetch "empty-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex:"
+  assert_policy_requests_at_fetch "null-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex: null"
+  assert_policy_requests_at_fetch "tilde-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex: ~"
+  # Controls: an absent codex: key still means unset, and so does a
+  # well-formed empty mapping, which states no value rather than a broken one.
+  assert_policy_skips_unset "absent-codex" "author_identity: nathanjohnpayne"
+  assert_policy_skips_unset "empty-mapping-codex" "author_identity: nathanjohnpayne"$'\n'"codex: {}"
 }
 
 # --- missing policy file ⇒ request, with a warning --------------------------
@@ -503,6 +564,7 @@ test_defaults_request_on_gated_pr
 test_request_by_default_unset_skips_under_threshold
 test_request_by_default_true_triggers_under_threshold
 test_request_by_default_unreadable_requests
+test_request_by_default_policy_shapes
 test_request_by_default_missing_policy_requests
 test_gated_requests_in_every_case
 test_request_by_default_false_skips_under_threshold
