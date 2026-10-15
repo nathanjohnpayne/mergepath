@@ -366,7 +366,8 @@ print(json.dumps(result))
         for relative in ('scripts/gh-as-author.sh', 'scripts/identity-check.sh',
                          'scripts/workflow/owner-admin-override.py', 'scripts/lib/gh-token-resolver.sh',
                          'scripts/lib/gh-command-classifier.sh', 'scripts/lib/gh-rest-transport.sh',
-                         'scripts/lib/credential-class.sh',
+                         'scripts/lib/credential-class.sh', 'scripts/lib/gh-comment-trigger-guard.sh',
+                         'scripts/workflow/gh-comment-trigger-guard.py',
                          'scripts/lib/pr-body-contract.sh', 'scripts/lib/pr-body-contract.mjs',
                          'scripts/lib/reviewers-helpers.sh', 'scripts/lib/feedback-policy-helpers.sh'):
             target = wrapper_root / relative

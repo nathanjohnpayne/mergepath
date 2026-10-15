@@ -55,6 +55,13 @@ gh_require_direct_gh_payload "gh-as-reviewer" "$@" || exit 1
 # (--hostname, a host-qualified --repo, an Authorization header on gh api)
 # are refused before any token is looked up (#1542).
 gh_payload_refuse_credential_overrides gh-as-reviewer "$@" || exit 1
+# shellcheck source=lib/gh-comment-trigger-guard.sh
+. "$ROOT/scripts/lib/gh-comment-trigger-guard.sh"
+# shellcheck disable=SC2034 # consumed by the sourced comment guard
+GH_COMMENT_GUARD_ROLE=reviewer
+trap 'gh_comment_guard_cleanup' EXIT
+gh_comment_guard_prepare "$@" || exit 1
+set -- "${GH_COMMENT_GUARD_ARGS[@]}"
 
 set +e
 gh_resolve_token_for_identity "$REVIEWER" "OP_PREFLIGHT_REVIEWER_PAT" "gh-as-reviewer"
@@ -72,8 +79,9 @@ TOKEN="$GH_RESOLVED_TOKEN"
 # the wrapped command runs through gh, as before. See
 # scripts/lib/gh-rest-transport.sh.
 TRANSPORT="$(gh_transport_select)" || exit 1
+gh_comment_guard_check_transport "$TRANSPORT" || exit 1
 if [ "$TRANSPORT" = "rest" ]; then
-  trap 'gh_rest_cleanup' EXIT
+  trap 'gh_comment_guard_cleanup; gh_rest_cleanup' EXIT
   set +e
   gh_rest_run gh-as-reviewer "$REVIEWER" "$TOKEN" "$@"
   WRAPPED_RC=$?
