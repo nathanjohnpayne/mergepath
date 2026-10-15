@@ -2498,11 +2498,14 @@ EOF
     # to hand a rate-limited head to Codex, whatever the head's age.
     n=$(grep -c '^true|--trigger-only --allow-moving-head 999 owner/repo$' "$WORKDIR/timeout-$name.events" || true)
     [ "$n" = "$calls" ] || fail "940 $name: expected $calls gated Codex trigger(s), got $n"
-    if [ "$pause" = true ] || [ "$terminal" != none ] || [ "$trust" = false ]; then
-      ! grep -q '^status-read$' "$WORKDIR/timeout-$name.events" || fail "940 $name: later status read ran despite earlier precedence or opt-out"
+    if [ "$pause" = true ] || [ "$trust" = false ]; then
+      ! grep -q '^status-read$' "$WORKDIR/timeout-$name.events" || fail "940 $name: status read ran despite pause or opt-out"
     else
-      [ "$(tail -n +1 "$WORKDIR/timeout-$name.events" | grep -E '^status-question$|^terminal-check$|^status-read$' | tr '\n' ',')" = 'status-question,terminal-check,status-read,' ] \
-        || fail "940 $name: did not use fresh status after question/terminal check"
+      local expected_order='status-read,status-question,terminal-check,status-read,'
+      [ "$rc" != 5 ] || expected_order='status-read,terminal-check,'
+      [ "$terminal" = none ] || expected_order='status-read,terminal-check,'
+      [ "$(grep -E '^status-question$|^terminal-check$|^status-read$' "$WORKDIR/timeout-$name.events" | tr '\n' ',')" = "$expected_order" ] \
+        || fail "940 $name: did not refresh terminal evidence before the status question"
     fi
     if [ "$helper_rc" != 0 ] || [ "$calls" = 0 ]; then
       [ "$(jq -r '.codex_failover_requested' "$out")" = false ] || fail "940 $name: recorded a failover that did not succeed"

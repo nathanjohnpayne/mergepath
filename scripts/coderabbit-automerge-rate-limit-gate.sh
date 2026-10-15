@@ -149,8 +149,12 @@ await_codex_head_clearance() {
         return 0
         ;;
       1) ;;
+      2)
+        echo "rate-limit-gate: human_attention_required — Codex cannot report on this head; stop the substitution wait immediately" >&2
+        return 1
+        ;;
       *)
-        # codex-review-check.sh's contract is 0 clear / 1 gate-fail / 3 infra.
+        # Strict checker: 0 clear / 1 pending / 2 cannot-report / 3 infra.
         # Anything else is a config or infrastructure fault, which retrying
         # will not repair — and an unproven answer must never read as proof.
         echo "rate-limit-gate: codex-review-check.sh returned rc=${crc} (config/infrastructure error) on probe ${attempt} — clearance unproven; block (fail-closed)" >&2

@@ -71,7 +71,7 @@
 #
 # Environment:
 #   GH_TOKEN   Required unless a fresh op-preflight cache is available.
-#              Must resolve to the reviewer identity for retry-trigger
+#              Must resolve to the reviewer identity for pause/status-probe
 #              writes. In the template flow this helper auto-sources
 #              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
 #   CODERABBIT_WAIT_PROBE
@@ -79,9 +79,9 @@
 #              caller's argument list. Reads still need a token.
 #
 # Behavior:
-#   1. Reads coderabbit.max_wait_seconds (default 1245; measured full-fleet max + one poll interval, #623) and
-#      coderabbit.max_rate_limit_retries (default 2) from
-#      .github/review-policy.yml.
+#   1. Reads coderabbit.max_wait_seconds (default 1245; measured full-fleet
+#      max + one poll interval, #623) from .github/review-policy.yml. The
+#      max_rate_limit_retries field is deprecated compatibility input.
 #   2. Fetches PR HEAD SHA + committer date.
 #   0. Before polling, check the static skips that mean auto-review will
 #      never fire on this PR: base branch matched by none of the
@@ -96,17 +96,10 @@
 #                        auto-generated marker (the #485 auto-pause NOTE)
 #        - in_progress — body matches /review in progress|currently reviewing/i
 #        - review      — anything else authored by coderabbitai[bot]
-#   4. On rate_limit: parse "X minutes and Y seconds" (or "X seconds") into a
-#      window, sleep the portion of it that REMAINS after subtracting the time
-#      already elapsed since the notice was posted (#727 — the window runs from
-#      the notice's post time, not from when this helper first sees it), + 30s
-#      buffer, then post `@coderabbitai, try again.`, increment the retry
-#      counter, and continue polling. An already-expired window sleeps 0.
-#      A notice whose PUBLISHED window is still open reaches this arm even
-#      after it has aged past the wall-clock freshness floor (#891/#912): the
-#      floor exists to stop a STALE notice blocking a current head, and a
-#      notice's staleness is not evidence that the limit it announces lifted.
-#      CodeRabbit's observed windows (59 min) outrun the default 1800s floor.
+#   4. On a provider-owned rate_limit refusal, request Codex immediately and
+#      exit 5. Never sleep out the window or post a CodeRabbit retry. Published
+#      windows still determine whether an aged notice remains authoritative;
+#      they do not schedule a wait. Strict review and pause precedence apply.
 #   4b. On paused: post `@coderabbitai resume` (a one-shot `review`
 #      re-pauses after the next push, so resume is the correct verb),
 #      increment a resume-retry counter, and continue polling. If
@@ -122,12 +115,14 @@
 #      budget to its cap), exit 6 (SKIPPED) with status=paused /
 #      skip_reason=paused — a still-paused PR must not fall through to the
 #      advisory timeout that agent-review.yml merges past. Otherwise
-#      optionally post `@coderabbitai, how is the review going?`, wait a
+#      refresh the trusted status; a confirmed refusal takes immediate
+#      substitution after strict review grading. Otherwise optionally post
+#      `@coderabbitai, how is the review going?`, wait a
 #      short bounded status-probe window for CodeRabbit's reply, then exit 4
 #      (TIMEOUT) with the reply excerpt surfaced in JSON. The probe is
 #      narration only, never a review / clearance signal.
-#   7. If rate_limit_retries > max_rate_limit_retries: exit 5 (STALLED),
-#      emit JSON with status=rate_limit_stalled.
+#   7. Exit 5 reports proceed_on_codex_clearance for a usable request, or
+#      human_attention_required when the substitute cannot be requested.
 #
 # Output JSON shape (stdout):
 #   {
@@ -2744,13 +2739,11 @@ iso_within_seconds_after() {
 # created_at/updated_at) and now. The published "try again in N" window is
 # measured from the notice's post time, NOT from when this helper first
 # observes it — auto-merge-on-approval routinely starts this wait minutes
-# after the notice landed (the reviewer approval that ARMS the job can post
-# long after CodeRabbit rate-limited), so the sleep should cover only the
-# window that REMAINS, not a fresh full copy of it. Emits max(0, now -
-# fresh_at) on stdout. Fails SAFE to 0 (⇒ the caller sleeps the full window,
-# the pre-#727 behavior) on empty/unparseable input, so a bad timestamp can
-# never SHORTEN a genuine rate-limit wait — only a parseable, already-elapsed
-# window trims the sleep.
+# after the notice landed. This arithmetic now scopes whether an aged notice
+# still governs refusal classification; it never schedules a sleep (#2139).
+# Emits max(0, now - fresh_at) on stdout. Fails SAFE to 0 on empty/unparseable
+# input, conservatively retaining the published window rather than treating
+# an unreadable timestamp as evidence of expiry.
 rate_limit_window_elapsed_seconds() {
   local fresh_at=$1 now_epoch=$2 elapsed
   if [ -z "$fresh_at" ] || [ "$fresh_at" = "null" ]; then
@@ -3645,7 +3638,11 @@ request_codex_rate_limit_failover() {
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
-  if [ "$#" -gt 0 ]; then rec=$1; else rec=$(check_status_context_record) || return 0; fi
+  if [ "${1:-}" = --before-probe ] || [ "$#" = 0 ]; then
+    rec=$(check_status_context_record) || return 0
+  else
+    rec=$1
+  fi
   state=$(crw_status_record_state "$rec")
   [ "$state" = success ] || return 0
   desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 0
@@ -3663,6 +3660,11 @@ emit_rate_limit_stall_at_timeout_if_present() {
       1) ;;
       *) die 3 "could not order the selected CodeRabbit progress against its status refusal" ;;
     esac
+  fi
+  # Only a confirmed terminal refusal needs an extra strict review scan.
+  # Ordinary timeouts keep their existing single post-probe scan.
+  if [ "${1:-}" = --before-probe ]; then
+    emit_terminal_review_after_probe_if_present
   fi
   # An explicit record is checked only after the normal strict poll has
   # graded current provider evidence, immediately before it would sleep.
@@ -3686,6 +3688,9 @@ emit_timeout() {
     SKIP_REASON="paused"
     emit_json_and_exit "paused" 6 "null" 0
   fi
+  # Recheck trusted refusal before the narrative-probe wait; the helper grades
+  # strict review evidence before handing off a confirmed final-interval refusal.
+  emit_rate_limit_stall_at_timeout_if_present --before-probe
   run_status_probe_once
   emit_terminal_review_after_probe_if_present
   emit_rate_limit_stall_at_timeout_if_present

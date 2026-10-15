@@ -365,6 +365,15 @@ case "$endpoint" in
         else . end' ;;
   repos/owner/repo/issues/999/comments)
     case "$CLEARANCE_SCENARIO" in clean-review|blocking-review|substitute-only) printf '[]'; exit 0 ;; esac
+    case "$CLEARANCE_SCENARIO" in
+      usage_limit) body='You have reached your Codex usage limits for code reviews.' ;;
+      not_connected) body='To use Codex here, create a Codex account and connect to GitHub.' ;;
+      *) body='' ;;
+    esac
+    if [ -n "$body" ]; then
+      jq -nc --arg body "$body" '[{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-06-01T00:01:00Z",body:$body}]'
+      exit 0
+    fi
     jq -nc --arg sha "${REVIEWED_HEAD:-$head}" '[{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-06-01T00:01:00Z",body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: " + $sha)}]' ;;
   repos/owner/repo/pulls/999/comments|repos/owner/repo/issues/999/timeline) printf '[]' ;;
   graphql) printf '{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviewThreads":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
@@ -409,6 +418,33 @@ chmod +x "$fixture/bin/gh"
       [ ! -e "$APPROVAL_FIXTURE/approved" ] || fail "substitution $scenario: invalid evidence reached approval"
     fi
     [ "$FAIL" -ne "$before" ] || pass "substitution $scenario: actual clearance checker controls reviewer approval"
+  done
+  # A refusal delivered after trigger-only returned must stop a live wait.
+  cat > "$fixture/bin/sleep" <<'STUB'
+#!/bin/sh
+touch "$APPROVAL_FIXTURE/slept"
+exit 99
+STUB
+  chmod +x "$fixture/bin/sleep"
+  cat > "$fixture/bin/date" <<'STUB'
+#!/bin/sh
+if [ "$1" = +%s ]; then printf '1780272000\n'; else exec /bin/date "$@"; fi
+STUB
+  chmod +x "$fixture/bin/date"
+  for scenario in usage_limit not_connected; do
+    before=$FAIL;APPROVAL_FIXTURE="$fixture/late-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO="$scenario" AUDIT_SCENARIO=before \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=1800 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = 1 ] || fail "late $scenario: wanted blocked exit 1, got $rc"
+    grep -q human_attention_required "$APPROVAL_FIXTURE/err" || fail "late $scenario: missing immediate attention disposition"
+    [ ! -f "$APPROVAL_FIXTURE/slept" ] || fail "late $scenario: slept after a provider refusal"
+    [ "$FAIL" -ne "$before" ] || pass "late $scenario: real checker stops automatic substitution without sleeping"
   done
   # The merge probe runs after approval; the agent probe above runs before it.
   for scenario in none before same-second after no-audit wrong-sha wrong-head withdrawn malformed-time malformed-later-opinion author; do

@@ -99,6 +99,8 @@
 #       consumers; the hub is 0). See mergepath#1059.
 #   1   At least one gate condition fails. A one-line reason is
 #       printed to stderr.
+#   2   Diagnostic or strict substitution probe: Codex cannot report because
+#       a fresh account/connection block exists without an exact-head response.
 #   3   API / infrastructure error. Error message on stderr.
 #
 # Design notes:
@@ -2486,6 +2488,19 @@ REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 COMMENTS_JSON='[]'
 if [ "$CODEX_ENABLED" = "true" ] && [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
   COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+fi
+
+# A refusal may arrive after trigger-only returned. Route it before the
+# approval gate, so the substitution caller does not poll an unavailable
+# provider while also waiting for an approval. Existing exact-head responses
+# retain their ordinary grading; this branch never grants clearance.
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && [ -n "$CODEX_BLOCKED_REASON" ] \
+   && [ -z "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
+  BLOCKED_HEAD_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") \
+    || die 3 "cannot inspect exact-head review evidence for the substitution refusal"
+  if [ "$BLOCKED_HEAD_REVIEW" = null ]; then
+    die 2 "human_attention_required: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME; it cannot report on $HEAD_SHA"
+  fi
 fi
 
 # Build a JSON array of reviewer logins for the filter.
