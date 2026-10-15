@@ -648,7 +648,8 @@ CODEX_ENABLED=${CODEX_ENABLED:-true}
 # Presence is tested with has(), never with `//`: yq's alternative operator
 # treats an explicit `false` like null, so `.request_by_default // "x"`
 # reports an explicit false as missing. go-yaml resolves a duplicated key
-# last-wins without complaint, so duplicates are counted separately.
+# last-wins without complaint, so duplicates are counted separately, in
+# either key spelling: a quoted `"codex":` is the same key to the parser.
 # MERGEPATH_YQ_BIN is a test seam for the parser-unavailable path.
 REQUEST_BY_DEFAULT=""
 REQUEST_BY_DEFAULT_SOURCE=""
@@ -687,7 +688,7 @@ resolve_request_by_default() {
   fi
   codex_type=$("$yq_bin" '.codex | type' "$CONFIG" 2>/dev/null) || codex_type="?"
   dups=$(awk '
-    /^codex[[:space:]]*:/ { blocks++; in_block=1; next }
+    /^["\047]?codex["\047]?[[:space:]]*:/ { blocks++; in_block=1; next }
     in_block && /^[^[:space:]#]/ { in_block=0 }
     in_block && /^[[:space:]]+["\047]?request_by_default["\047]?[[:space:]]*:/ { keys++ }
     END { print ((blocks > 1 || keys > 1) ? "yes" : "no") }

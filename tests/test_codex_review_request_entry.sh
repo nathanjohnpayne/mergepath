@@ -314,6 +314,11 @@ test_request_by_default_unreadable_requests() {
   # Duplicated key: go-yaml resolves last-wins without complaint.
   assert_unreadable_requests "duplicate" "more than one codex: block or codex.request_by_default key" \
     "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  request_by_default: false"
+  # A duplicate codex: block spelled with a quoted key: the parser treats
+  # "codex": as the same key and keeps the last block's false, so the count
+  # must see both spellings (Codex task on #2243).
+  assert_unreadable_requests "quoted-duplicate-block" "more than one codex: block or codex.request_by_default key" \
+    "  enabled: true"$'\n'"  request_by_default: true" '"codex":'$'\n''  request_by_default: false'
   # No YAML parser to verify the file with.
   local dir rc count
   dir=$(make_case "rbd-no-parser" "  enabled: true"$'\n'"  request_by_default: false")
