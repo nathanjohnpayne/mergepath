@@ -1657,9 +1657,29 @@ class Lexer:
             if lv["word"]:
                 w = "".join(lv["word"])
                 eligible = lv.get("xtrace_keyword_prefix", True)
+                words = lv["seg"].words
+                # A coproc name can precede only an existing compound opener,
+                # never another wrapper or an ordinary command's arguments.
+                compound_openers = ("if", "while", "until", "for", "select", "case", "{")
+                after_coproc_name = (
+                    len(words) >= 2 and words[-2] == "coproc"
+                    and _IDENT_RE.fullmatch(words[-1]) is not None
+                    and words[-1] not in RESERVED_WORDS
+                    and words[-1] not in compound_openers + ("time",)
+                )
+                if after_coproc_name:
+                    eligible = eligible and w in compound_openers
                 self.xtrace_context_events.append((i, lv["seg"], w, eligible))
+                time_option = (
+                    words[-1:] == ["time"] and w in ("-p", "--")
+                    or words[-2:] == ["time", "-p"] and w == "--"
+                )
+                coproc_name = (
+                    words[-1:] == ["coproc"] and _IDENT_RE.fullmatch(w) is not None
+                    and w not in RESERVED_WORDS and w not in compound_openers + ("time",)
+                )
                 lv["xtrace_keyword_prefix"] = eligible and (
-                    w in RESERVED_WORDS or w == "time"
+                    w in RESERVED_WORDS or w == "time" or time_option or coproc_name
                 )
                 lv["seg"].words.append(w)
                 lv["word"] = []
@@ -11855,6 +11875,15 @@ CORPUS = [
         'set -x\nselect item in one; do\n set +x\n break\ndone <<< 1\n: "$GH_TOKEN"\n',
     ),
     ('conditional-xtrace-and-newline-after-heredoc', MUST_FLAG, 'set -x\nfalse <<EOF &&\nx\nEOF\nset +x\n: "$GH_TOKEN"\n'),
+    # #1458 review: measured multiline prefixes; not the already-flagged one-line example.
+    ('conditional-xtrace-prefix-time_-p-multiline', MUST_FLAG, 'set -x\ntime -p if false; then\n set +x\nfi\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-time_---multiline', MUST_FLAG, 'set -x\ntime -- if false; then\n set +x\nfi\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-time_-p_---multiline', MUST_FLAG, 'set -x\ntime -p -- if false; then\n set +x\nfi\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-time_-p-standalone-disable', MUST_NOT_FLAG, 'set -x\ntime -p true\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-time_---standalone-disable', MUST_NOT_FLAG, 'set -x\ntime -- true\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-time_-p_---standalone-disable', MUST_NOT_FLAG, 'set -x\ntime -p -- true\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-coproc_WORK-conditional', MUST_FLAG, 'set -x\ncoproc WORK if false; then\n set +x\nfi\nwait\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-prefix-coproc_WORK-quiet-control', MUST_NOT_FLAG, 'set -x\ncoproc WORK { :; }\nwait\nset +x\n: "$GH_TOKEN"\n'),
 ]
 
 CORPUS.extend([
@@ -15468,6 +15497,43 @@ def _heredoc_conservatism_cases():
     return failures
 
 
+def _xtrace_prefix_cases():
+    """Harmless parser DATA pins finite raw prefixes without shell execution."""
+    failures = []
+    for prefix, expected in [
+        ("time", True), ("time -p", True), ("time --", True),
+        ("time -p --", True), ("coproc", True), ("coproc WORK", True),
+        ("time -p -p", False), ("time -- -p", False),
+        ("time -p -- -p", False), ("time '--'", False),
+        ("time '-p'", False), ('time "-p"', False),
+        ("'time' -p", False), (r"t\ime -p", False),
+        (r"time \-p", False), ("printf time -p", False),
+        ("coproc WORK true", False), ("coproc WORK time -p", False),
+        ("coproc WORK other argument", False), ("printf coproc WORK", False),
+        ("'coproc' WORK", False), (r"co\proc WORK", False),
+        ("coproc 'WORK'", False), (r"coproc W\ORK", False),
+        ("coproc WORK OTHER", False),
+    ]:
+        body = prefix + " if false; then\n :\nfi\n"
+        lx = Lexer(body)
+        events = [eligible for _pos, _seg, word, eligible in lx.xtrace_context_events
+                  if word == "if"]
+        if events != [expected]:
+            failures.append("xtrace raw prefix eligibility: " + prefix)
+        if expected:
+            guarded = _conditional_xtrace_segments(lx, [])
+            inner = [seg for ll in lx.logical for seg in ll.segments
+                     if seg.words == [":"]]
+            if len(inner) != 1 or inner[0] not in guarded:
+                failures.append("xtrace raw prefix lost conditional scope: " + prefix)
+    # Braces keep their existing distinct Lexer seam after a literal name.
+    lx = Lexer("coproc WORK { :; }\n")
+    if not any(word == "{" and eligible
+               for _pos, _seg, word, eligible in lx.xtrace_context_events):
+        failures.append("xtrace named coproc lost existing brace eligibility")
+    return failures
+
+
 def _heredoc_list_continuation_cases():
     """Parse harmless DATA; never execute a shell or infer command truth."""
     failures = []
@@ -15814,6 +15880,7 @@ def self_test():
     failures.extend(_quoted_default_head_cases())
     failures.extend(_heredoc_conservatism_cases())
     failures.extend(_heredoc_list_continuation_cases())
+    failures.extend(_xtrace_prefix_cases())
     failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
