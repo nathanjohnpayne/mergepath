@@ -161,8 +161,12 @@ EOF
   cat >"$dir/bin/codex-request-stub.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'phase4a=%s args=[%s]\n' "${MERGEPATH_PHASE_4A_GATED:-unset}" "$*" >>"${CODEX_STUB_LOG:?}"
-echo '{"trigger_only":true,"trigger_posted":true,"trigger_requested":true}'
+printf 'phase4a=%s auto=%s args=[%s]\n' "${MERGEPATH_PHASE_4A_GATED:-unset}" "${MERGEPATH_CODEX_AUTO_TRIGGER:-unset}" "$*" >>"${CODEX_STUB_LOG:?}"
+posted=true
+if [ "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" = true ]; then posted=false
+elif [ "${CODEX_STUB_EXIT:-0}" = 0 ]; then touch "$CODEX_STUB_LOG.posted"; fi
+jq -nc --argjson posted "$posted" --arg blocked "${CODEX_STUB_BLOCKED:-}" \
+  '{trigger_only:true,trigger_posted:$posted,trigger_requested:true,blocked_reason:(if $blocked=="" then null else $blocked end)}'
 exit "${CODEX_STUB_EXIT:-0}"
 EOF
   chmod +x "$dir/bin/codex-request-stub.sh"
@@ -390,6 +394,27 @@ chmod +x "$fixture/bin/gh"
   done
 }
 
+test_failover_exact_head_request_and_known_blocks() {
+  local dir rc reason before=$FAIL
+  dir=$(make_case "automatic-content-free" 300 0 true)
+  rc=$(MERGEPATH_CODEX_AUTO_TRIGGER=true run_case "$dir" 0)
+  [ "$rc" = 5 ] && [ -f "$dir/state/codex-stub.log.posted" ] \
+    && grep -q 'auto=false' "$dir/state/codex-stub.log" \
+    || fail "exact-head substitution was suppressed as content-free"
+  [ "$FAIL" -ne "$before" ] || pass "automatic failover requests this head despite inherited carry-forward suppression"
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "known-$reason" 300 0 true)
+    rc=$(CODEX_STUB_BLOCKED="$reason" run_case "$dir" 0)
+    [ "$rc" = 5 ] && [ "$(jqf "$dir" '.codex_failover_requested')" = false ] \
+      && [ "$(jqf "$dir" '.disposition')" = human_attention_required ] \
+      && [ ! -s "$dir/state/sleeps.log" ] \
+      || fail "known $reason block did not immediately require human attention"
+    [ "$FAIL" -ne "$before" ] || pass "known $reason yields human attention despite a posted request"
+  done
+}
+
+test_failover_exact_head_request_and_known_blocks
 test_failover_fires
 test_failover_opt_out
 test_failover_codex_disabled

@@ -3622,7 +3622,16 @@ request_codex_rate_limit_failover() {
     # a head CodeRabbit refused to Codex so the PR is not stranded, and it
     # fires on the provider's refusal, not on a push the agent is amending.
     # The requester still warns, and its dedup/idempotency is untouched.
-    if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only --allow-moving-head "$PR_NUMBER" "$REPO" >&2; then
+    local request_json
+    # This substitution requires Codex on this exact head, so automatic
+    # content-free carry-forward suppression cannot satisfy the request.
+    if request_json=$(MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_AUTO_TRIGGER=false \
+        "$CODEX_REQUEST_CMD" --trigger-only --allow-moving-head "$PR_NUMBER" "$REPO"); then
+      printf '%s\n' "$request_json" >&2
+      if ! printf '%s' "$request_json" | jq -e '.trigger_requested == true and (.blocked_reason // null) == null' >/dev/null 2>&1; then
+        log "codex failover: unusable request or known provider block — human attention required"
+        return 0
+      fi
       CODEX_FAILOVER_REQUESTED=true
       log "codex failover: @codex review requested (or already present) on HEAD"
     else
@@ -3631,8 +3640,8 @@ request_codex_rate_limit_failover() {
   fi
 }
 
-# A refusal with no published notice has no retry window to schedule. Preserve
-# the existing wait, then diagnose only a still-current, positively read refusal.
+# A refusal with no published notice has no retry window to schedule.
+# Diagnose it after the normal strict pass, before that pass would sleep.
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
@@ -3642,6 +3651,19 @@ emit_rate_limit_stall_at_timeout_if_present() {
   desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 0
   desc=$(crw_normalize_status_description "$desc") || return 0
   [ "$desc" = "review rate limited" ] || return 0
+  # A selected equal/newer progress publication supersedes the sampled
+  # refusal, matching the probe's temporal precedence.
+  if [ "${CLASS:-}" = in_progress ] && [ -n "${COMMENT_FRESH_AT:-}" ]; then
+    local order_rc=0
+    jq -e --arg progress "$COMMENT_FRESH_AT" \
+      '($progress | fromdateiso8601) >= ((.updated_at // .created_at) | fromdateiso8601)' \
+      <<<"$rec" >/dev/null 2>&1 || order_rc=$?
+    case "$order_rc" in
+      0) return 0 ;;
+      1) ;;
+      *) die 3 "could not order the selected CodeRabbit progress against its status refusal" ;;
+    esac
+  fi
   # An explicit record is checked only after the normal strict poll has
   # graded current provider evidence, immediately before it would sleep.
   evidence=$(printf '%s' "$rec" | jq -c '{id:null, created_at, endpoint:"status_context", body_excerpt:.description}') || return 0

@@ -2452,6 +2452,7 @@ test_notice_less_timeout_contract() {
   cat >"$WORKDIR/timeout-codex.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s|%s\n' "${MERGEPATH_PHASE_4A_GATED:-}" "$*" >>"$TIMEOUT_EVENTS"
+echo '{"trigger_requested":true,"blocked_reason":null}'
 exit "${TIMEOUT_CODEX_RC:-0}"
 EOF
   chmod +x "$WORKDIR/timeout-codex.sh"
@@ -2972,6 +2973,30 @@ test_final_risk_marker_fallback() {
 }
 
 test_final_risk_marker_fallback
+
+test_immediate_status_refusal_respects_selected_progress() {
+  local mode status_at dir rc expected before
+  for mode in older equal newer; do
+    before=$FAIL
+    case "$mode" in
+      older) status_at=2026-06-04T00:00:10Z; expected=4 ;;
+      equal) status_at=2026-06-04T00:00:20Z; expected=4 ;;
+      newer) status_at=2026-06-04T00:00:30Z; expected=5 ;;
+    esac
+    dir=$(make_case "status-refusal-progress-$mode" "$FULL_REVIEW_TRIGGER_BODY" \
+      "$status_at" "Review rate limited" "2026-06-04T00:00:20Z" 999999999)
+    sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "status/progress $mode: expected $expected, got $rc; $(tail -4 "$dir/err.log")"
+    if [ "$expected" = 4 ]; then
+      [ ! -s "$dir/state/codex-stub.log" ] || fail "status/progress $mode: older refusal requested an unnecessary substitute"
+    else
+      [ "$(jqf "$dir" '.codex_failover_requested')" = true ] || fail "status/progress newer: current refusal did not request Codex"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "immediate refusal respects $mode status against selected progress"
+  done
+}
+test_immediate_status_refusal_respects_selected_progress
 
 test_quoted_refusal_marker_is_not_current_refusal
 test_current_refusal_with_blocking_head_review_is_findings

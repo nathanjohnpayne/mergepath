@@ -356,6 +356,7 @@ test_unusable_window_failover() {
 set -euo pipefail
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
 printf '%s|%s\n' "${MERGEPATH_PHASE_4A_GATED:-}" "$*" >>"$state_dir/codex-requests.log"
+echo '{"trigger_requested":true,"blocked_reason":null}'
 exit "$(cat "$state_dir/codex-request-rc")"
 EOF
   chmod +x "$dir/scripts/codex-review-request.sh"
