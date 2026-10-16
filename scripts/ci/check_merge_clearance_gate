@@ -1122,8 +1122,14 @@ STEP_IF_ALLOWED = {
     # pending verdict on a run that opened its own Checks-API hold. Any other
     # condition either skips it (fail closed: the native run stays red) or
     # runs it where there is no hold of this run's own to rely on.
+    # #2286: and for a run that did not evaluate (the budget guard skipped
+    # it, or the script failed on the exhausted installation budget), whose
+    # phase 2 closed its own hold with the publisher's back-off red.
     ("merge-clearance-gate", "Confirm the Checks-API lineage blocks while pending (#2247)"):
-        "${{ steps.gate.outputs.pending == 'true' && steps.open.outputs.id != '' }}",
+        "${{ (steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true') && steps.open.outputs.id != '' }}",
+    # #2286: the gate step is skipped only when the budget guard said so.
+    ("merge-clearance-gate", "Run scripts/merge-clearance-gate.sh"):
+        "${{ steps.budget.outputs.skip != 'true' }}",
 }
 for key in PRODUCERS:
     job = jobs.get(key)
@@ -1294,6 +1300,59 @@ else:
             bad("FAIL: [#2247 pending arm] the lineage-confirmation step must run",
                 "      scripts/gate-api-lineage-blocking.sh, the helper that states and",
                 "      checks each condition the pending arm relies on.")
+
+# Property 6 (#2286)—a run that did not evaluate (budget guard skip, or the
+# script failed on the exhausted installation budget) is bound to the guard's
+# own outputs, closes its hold red with the publisher's back-off title, and
+# reaches a non-failing native conclusion only through the lineage
+# confirmation. A constant, a renamed output or a success on that path would
+# let a run that evaluated nothing look green.
+budget_step = step_named(event_job or {}, "Installation budget guard (#2286)")
+if budget_step in (None, "ambiguous"):
+    bad("FAIL: [#2286 budget guard] the merge-clearance-gate job needs exactly one",
+        "      'Installation budget guard (#2286)' step.")
+else:
+    benv = budget_step.get("env") or {}
+    brun = strip_comments(budget_step.get("run") or "")
+    if budget_step.get("id") != "budget" or "if" in budget_step:
+        bad("FAIL: [#2286 budget guard] the budget step must carry id: budget and no",
+            "      step-level if:, so every evaluating run reads the budget first.")
+    for knob in ("BUDGET_PER_EVAL_REQUESTS", "BUDGET_RESERVE_REQUESTS",
+                 "BUDGET_PER_EVAL_GRAPHQL_POINTS", "BUDGET_GRAPHQL_RESERVE_POINTS"):
+        if not re.fullmatch(r"[0-9]+", str(benv.get(knob, ""))):
+            bad("FAIL: [#2286 budget guard] %s must be a quoted integer; a missing or" % knob,
+                "      malformed knob silently turns the guard off.")
+    if benv.get("OPEN_ID") != "${{ steps.open.outputs.id }}":
+        bad("FAIL: [#2286 budget guard] OPEN_ID must be exactly ${{ steps.open.outputs.id }}:",
+            "      only a run holding its own Checks-API hold may skip evaluation.")
+    if "ib_affordable 1" not in brun or 'echo "skip=true"' not in brun \
+            or "ib_backoff_title" not in brun:
+        bad("FAIL: [#2286 budget guard] the budget step must decide with ib_affordable 1",
+            "      and emit skip=true with the publisher's back-off title (ib_backoff_title).")
+if isinstance(close_step, dict):
+    cenv = close_step.get("env") or {}
+    crun = strip_comments(close_step.get("run") or "")
+    if cenv.get("BUDGET_SKIP") != "${{ steps.budget.outputs.skip }}" \
+            or cenv.get("RATE_LIMITED") != "${{ steps.gate.outputs.rate_limited }}":
+        bad("FAIL: [#2286 budget guard] phase 2 must bind BUDGET_SKIP and RATE_LIMITED to the",
+            "      budget step's and gate step's own outputs.")
+    budget_arm = re.search(r'^if \[ "\$\{BUDGET_SKIP:-\}" = true \] \|\| \[ "\$\{RATE_LIMITED:-\}" = true \]; then\n(.*?)\n^else$', crun, re.S | re.M)
+    if not budget_arm or 'conclusion="failure"' not in budget_arm.group(1) \
+            or "success" in budget_arm.group(1):
+        bad("FAIL: [#2286 budget guard] phase 2 must close a run that did not evaluate",
+            "      with conclusion failure, and never success.")
+if isinstance(report_step, dict):
+    renv = report_step.get("env") or {}
+    rrun = strip_comments(report_step.get("run") or "")
+    if renv.get("BUDGET_SKIP") != "${{ steps.budget.outputs.skip }}" \
+            or renv.get("RATE_LIMITED") != "${{ steps.gate.outputs.rate_limited }}":
+        bad("FAIL: [#2286 budget guard] 'Report gate verdict' must bind BUDGET_SKIP and",
+            "      RATE_LIMITED to the budget step's and gate step's own outputs.")
+    arm = re.search(r'^if \[ "\$\{BUDGET_SKIP:-\}" = true \] \|\| \[ "\$\{RATE_LIMITED:-\}" = true \]; then\n(.*?)\n^fi$', rrun, re.S | re.M)
+    if not arm or not re.search(r'if \[ "\$\{API_BLOCKING:-\}" = true \]; then\n[^\n]*\n\s*exit 0', arm.group(1)) \
+            or not arm.group(1).rstrip().endswith("exit 1"):
+        bad("FAIL: [#2286 budget guard] the report step's budget arm must exit 0 only when",
+            "      API_BLOCKING is true and exit 1 otherwise.")
 
 if failures:
     print("\n".join(failures))

@@ -295,12 +295,68 @@ jobs:
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
+      - name: Installation budget guard (#2286)
+        # Reads GET /rate_limit (free) through the publisher's own reader,
+        # scripts/workflow/installation-budget.sh. When the installation
+        # budget cannot cover one evaluation plus the reserve, this run does
+        # NOT evaluate: skip=true skips the gate step, phase 2 closes this
+        # run's own Checks-API hold with the publisher's back-off red (never
+        # a green; its title records the reset, so the publisher's due()
+        # leaves the PR alone until then and its first pass after the reset
+        # re-evaluates it with no manual rerun), and the report step makes
+        # the job-native run non-failing only when the lineage step confirms
+        # that red blocks the head (the #2247 rule). Only a run that opened
+        # its own hold can skip: a fork or Dependabot run (restricted token,
+        # no hold) evaluates as before. An unreadable budget, or a default
+        # branch without the library, evaluates as before too.
+        id: budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OPEN_ID: ${{ steps.open.outputs.id }}
+          CHECK_NAME: "Merge clearance gate"
+          # One evaluation costs 3 to 19 REST requests and up to one GraphQL
+          # point in scripts/merge-clearance-gate.sh (measured on #2249,
+          # #2265, #2292, #2226, #2232 and #2225), plus phase 2's two reads
+          # and PATCH and the lineage read. The reserve is the publisher's own
+          # floor for one event-head evaluation (60 per PR plus its 100
+          # reserve) plus room for the skip-path writes of the other gate
+          # workflows the same review event starts, so an event workflow
+          # stops spending before the publisher has to.
+          BUDGET_PER_EVAL_REQUESTS: "30"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
+        run: |
+          set -uo pipefail
+          if [ -z "$OPEN_ID" ]; then
+            echo "No Checks-API hold of this run's own (fork or Dependabot token); evaluating without the budget guard (#2286)."
+            exit 0
+          fi
+          if [ ! -r scripts/workflow/installation-budget.sh ]; then
+            echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
+            exit 0
+          fi
+          # shellcheck source=scripts/workflow/installation-budget.sh
+          . scripts/workflow/installation-budget.sh
+          ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+            "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+          if ib_affordable 1; then
+            exit 0
+          fi
+          reset=$(ib_short_bucket_reset)
+          echo "::notice::Budget guard (#2286): $rl_remaining REST request(s) and ${gql_remaining:-?} GraphQL point(s) remain, short of one evaluation ($BUDGET_PER_EVAL_REQUESTS requests) plus the $BUDGET_RESERVE_REQUESTS-request reserve; not evaluating. The publisher re-evaluates this head after ${reset:-the window resets}."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "title=$(ib_backoff_title "$CHECK_NAME" 2 "$reset")" >> "$GITHUB_OUTPUT"
+
       - name: Run scripts/merge-clearance-gate.sh
         id: gate
+        if: ${{ steps.budget.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
+          CHECK_NAME: "Merge clearance gate"
         run: |
           set -uo pipefail
           # The script is the source of truth for what blocks merge.
@@ -357,6 +413,20 @@ jobs:
             pending=true
           fi
           echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          # #2286: the script stops at its first failed read, so an rc 2 on
+          # the exhausted installation budget is the end of this run's
+          # evaluation. Phase 2 closes the hold with the publisher's back-off
+          # red (the reset read from a refused probe's X-RateLimit-* headers,
+          # see installation-budget.sh), and the native run follows the
+          # lineage confirmation like a budget skip.
+          if [ "$rc" -eq 2 ] && [ -r scripts/workflow/installation-budget.sh ]; then
+            # shellcheck source=scripts/workflow/installation-budget.sh
+            . scripts/workflow/installation-budget.sh
+            if ib_rate_limited "$output"; then
+              echo "rate_limited=true" >> "$GITHUB_OUTPUT"
+              echo "budget_title=$(ib_backoff_title "$CHECK_NAME" 2 "$(ib_exhausted_reset "$output")")" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Close the required check_run (#841 phase 2)
         # !cancelled(), NOT always(): on cancellation we deliberately leave the
@@ -370,45 +440,67 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RC: ${{ steps.gate.outputs.rc }}
           VERDICT: ${{ steps.gate.outputs.verdict }}
+          # #2286: a run that did not evaluate closes its hold with the
+          # publisher's back-off red, whichever way it stopped.
+          BUDGET_SKIP: ${{ steps.budget.outputs.skip }}
+          BUDGET_SKIP_TITLE: ${{ steps.budget.outputs.title }}
+          RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
+          RATE_LIMITED_TITLE: ${{ steps.gate.outputs.budget_title }}
         run: |
           set -uo pipefail
-          # ONE request (gh pr view), not `gh pr list --limit 500` (5+
-          # paginated calls, and a PR past position 500 reads as unknown).
-          current=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-                      --json headRefOid --jq .headRefOid 2>/dev/null || true)
-          trusted_revision=$(git rev-parse HEAD 2>/dev/null || true)
-          current_trusted=$(gh api "repos/$REPO/commits/HEAD" --jq .sha 2>/dev/null || true)
-          if [ -z "$trusted_revision" ] || [ "$current_trusted" != "$trusted_revision" ]; then
+          if [ "${BUDGET_SKIP:-}" = true ] || [ "${RATE_LIMITED:-}" = true ]; then
+            # Not evaluated (#2286): a failure, never a success, and no
+            # further read. The title carries the publisher's back-off mark
+            # and the reset, so due() re-evaluates the PR after the reset.
+            # The one PATCH below closes it.
             conclusion="failure"
-            title="Merge clearance gate — trusted revision changed or unreadable"
-            summary="$title"
-          elif [ "$current" != "$HEAD_SHA" ]; then
-            # Head moved, or could not be read. Do NOT publish nothing: a
-            # silent skip leaves whatever verdict is standing on $HEAD_SHA, and
-            # a force-push back to $HEAD_SHA would then merge on it. Close the
-            # run we opened as a FAILURE, pinned to the head we bound to. That
-            # SHA is no longer the PR head so the red blocks nothing current,
-            # and it retires any stale green sitting there.
-            conclusion="failure"
-            title="Merge clearance gate — head moved during evaluation (${HEAD_SHA:0:7} -> ${current:0:7}); awaiting re-evaluation on the new head"
-            summary="$title"
+            if [ "${BUDGET_SKIP:-}" = true ]; then
+              title="${BUDGET_SKIP_TITLE:-}"
+              summary="Not evaluated: the installation API budget could not cover this evaluation plus the reserve kept for the publisher (#2286). The publisher re-evaluates this head after the reset in the title."
+            else
+              title="${RATE_LIMITED_TITLE:-}"
+              summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
+            fi
+            [ -n "$title" ] || title="Merge clearance gate — installation API budget exhausted (rc=2)"
           else
-            case "$RC" in
-              0)
-                if [ "$VERDICT" = "pass" ]; then
-                  conclusion="success"
-                  title="Merge clearance gate (event-driven re-evaluation)"
-                else
-                  conclusion="failure"
-                  title="Merge clearance gate — infra/config error (rc=0 with no PASS verdict line)"
-                fi
-                ;;
-              1) conclusion="failure"
-                 title="Merge clearance gate (event-driven re-evaluation)" ;;
-              *) conclusion="failure"
-                 title="Merge clearance gate — infra/config error (rc=$RC)" ;;
-            esac
-            summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
+            # ONE request (gh pr view), not `gh pr list --limit 500` (5+
+            # paginated calls, and a PR past position 500 reads as unknown).
+            current=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+                        --json headRefOid --jq .headRefOid 2>/dev/null || true)
+            trusted_revision=$(git rev-parse HEAD 2>/dev/null || true)
+            current_trusted=$(gh api "repos/$REPO/commits/HEAD" --jq .sha 2>/dev/null || true)
+            if [ -z "$trusted_revision" ] || [ "$current_trusted" != "$trusted_revision" ]; then
+              conclusion="failure"
+              title="Merge clearance gate — trusted revision changed or unreadable"
+              summary="$title"
+            elif [ "$current" != "$HEAD_SHA" ]; then
+              # Head moved, or could not be read. Do NOT publish nothing: a
+              # silent skip leaves whatever verdict is standing on $HEAD_SHA, and
+              # a force-push back to $HEAD_SHA would then merge on it. Close the
+              # run we opened as a FAILURE, pinned to the head we bound to. That
+              # SHA is no longer the PR head so the red blocks nothing current,
+              # and it retires any stale green sitting there.
+              conclusion="failure"
+              title="Merge clearance gate — head moved during evaluation (${HEAD_SHA:0:7} -> ${current:0:7}); awaiting re-evaluation on the new head"
+              summary="$title"
+            else
+              case "$RC" in
+                0)
+                  if [ "$VERDICT" = "pass" ]; then
+                    conclusion="success"
+                    title="Merge clearance gate (event-driven re-evaluation)"
+                  else
+                    conclusion="failure"
+                    title="Merge clearance gate — infra/config error (rc=0 with no PASS verdict line)"
+                  fi
+                  ;;
+                1) conclusion="failure"
+                   title="Merge clearance gate (event-driven re-evaluation)" ;;
+                *) conclusion="failure"
+                   title="Merge clearance gate — infra/config error (rc=$RC)" ;;
+              esac
+              summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
+            fi
           fi
           # A PATCH that never lands leaves the run in_progress = the required
           # context PENDING = merge blocked. Fail-closed in BOTH verdict
@@ -438,8 +530,14 @@ jobs:
         # before. Never fails the job itself: the next step decides. No
         # status function in the condition, so the implicit success() also
         # skips it after any earlier failed step or a cancellation.
+        #
+        # #2286: it also runs for a run that did not evaluate (the budget
+        # guard skipped it, or the script failed on the exhausted
+        # installation budget), whose phase 2 closed this run's own hold
+        # with the publisher's back-off red. The same confirmation decides
+        # whether that run's job-native conclusion may be non-failing.
         id: lineage
-        if: ${{ steps.gate.outputs.pending == 'true' && steps.open.outputs.id != '' }}
+        if: ${{ (steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true') && steps.open.outputs.id != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -483,8 +581,27 @@ jobs:
           VERDICT: ${{ steps.gate.outputs.verdict }}
           PENDING: ${{ steps.gate.outputs.pending }}
           API_BLOCKING: ${{ steps.lineage.outputs.api_blocking }}
+          BUDGET_SKIP: ${{ steps.budget.outputs.skip }}
+          RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
         run: |
           set -euo pipefail
+          # #2286: a run that did not evaluate (budget guard skip, or the
+          # script failed on the exhausted installation budget). Its phase 2
+          # closed this run's hold with the publisher's back-off red; the
+          # job-native run is non-failing ONLY when the lineage step
+          # confirmed that red (or a newer non-green) blocks the head outside
+          # this run's suite, exactly the #2247 condition. Otherwise it fails
+          # as before. Never a success computed from no evaluation: the
+          # Checks-API run carries the block until the publisher's first
+          # pass after the reset re-evaluates the head.
+          if [ "${BUDGET_SKIP:-}" = true ] || [ "${RATE_LIMITED:-}" = true ]; then
+            if [ "${API_BLOCKING:-}" = true ]; then
+              echo "::notice::Merge clearance was NOT evaluated on this head: the installation API budget is short or exhausted (#2286). This job-native run concludes non-failing by design; the Checks-API run of the same name carries the block until the publisher re-evaluates the head after the budget resets."
+              exit 0
+            fi
+            echo "::error::Merge clearance was not evaluated (installation API budget, #2286), and the Checks-API lineage could not be confirmed to block, so the job-native run fails."
+            exit 1
+          fi
           if [ "$RC" -eq 0 ] && [ "$VERDICT" != "pass" ]; then
             echo "::error::merge-clearance-gate.sh exited 0 without a PASS verdict line (query mode reached?)"
             exit 1

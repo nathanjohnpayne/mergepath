@@ -195,6 +195,22 @@ jobs:
           # goes non-green, the sweep declines to publish), which is where the
           # asymmetry belongs.
           REQUIRE_REVIEW_SUMMARY: "true"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          CHECK_NAME: "CodeRabbit unresolved blocking findings"
+          # Budget guard knobs (#2286), read by
+          # scripts/workflow/installation-budget.sh. One evaluation costs
+          # about 4 REST requests (measured on #2249, #2265, #2292, #2232 and
+          # #2225; the review-thread GraphQL reads run only when CodeRabbit
+          # has inline findings on the head). The skip path below writes one
+          # check run and reads the head's runs once. The reserve is the
+          # publisher's own floor for one event-head evaluation (60 per PR
+          # plus its 100 reserve) plus room for the skip-path writes of the
+          # other gate workflows the same event starts.
+          BUDGET_PER_EVAL_REQUESTS: "10"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           set -euo pipefail
           # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
@@ -215,10 +231,68 @@ jobs:
           #   1 = unresolved blocking-tier findings present (gate blocks)
           #   2 = config / usage error (CI failure, not a gate block)
           #   3 = a current-HEAD review run is awaiting its PR-level summary
+          #
+          # Budget guard (#2286). This job publishes no Checks-API run of its
+          # own, so a run that does not evaluate (the guard skipped it, or the
+          # evaluation died on the exhausted installation budget) first POSTs
+          # the publisher's back-off red under the required name on the head:
+          # never a green, and its title records the reset, so the
+          # publisher's due() leaves the PR alone until then and its first
+          # pass after the reset (an event pass on any PR, or the */30
+          # chained full pass) re-evaluates it with no manual rerun. The
+          # job-native run then concludes non-failing ONLY when
+          # scripts/gate-api-lineage-blocking.sh confirms that the
+          # Checks-API lineage blocks the head on its own, outside this
+          # run's suite (the #2247 rule); otherwise it fails as before. A
+          # native red here would sit in this run's own suite until someone
+          # reran it. An unreadable budget, or a default branch without the
+          # library, evaluates as before.
+          budget_stop() {  # <rc> <reason> <skipped|rate-limited> [gate output]
+            local reset title
+            if [ "$3" = skipped ]; then
+              reset=$(ib_short_bucket_reset)
+            else
+              reset=$(ib_exhausted_reset "${4:-}")
+            fi
+            title=$(ib_backoff_title "$CHECK_NAME" "$1" "$reset")
+            gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
+              -f status=completed -f conclusion=failure \
+              -f "output[title]=$title" \
+              -f "output[summary]=Not evaluated: $2 (#2286). The publisher re-evaluates this head after ${reset:-the window resets}." \
+              >/dev/null || echo "::warning::Could not post the back-off red on $HEAD_SHA."
+            if [ -x scripts/gate-api-lineage-blocking.sh ] \
+               && scripts/gate-api-lineage-blocking.sh "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"; then
+              echo "::notice::$CHECK_NAME was not evaluated on $HEAD_SHA ($2). This job-native run concludes non-failing by design (#2286); the Checks-API run of the same name carries the block until the publisher re-evaluates the head."
+              exit 0
+            fi
+            echo "::error::$CHECK_NAME was not evaluated on $HEAD_SHA ($2), and the Checks-API lineage could not be confirmed to block, so the job-native run fails (#2286)."
+            exit 1
+          }
+          budget_lib=false
+          if [ -r scripts/workflow/installation-budget.sh ]; then
+            # shellcheck source=scripts/workflow/installation-budget.sh
+            . scripts/workflow/installation-budget.sh
+            budget_lib=true
+            ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+              "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+            if ! ib_affordable 1; then
+              budget_stop 2 "the installation API budget ($rl_remaining REST request(s), ${gql_remaining:-?} GraphQL point(s)) is short of one evaluation plus the $BUDGET_RESERVE_REQUESTS-request reserve" skipped
+            fi
+          else
+            echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
+          fi
+          gate_out=$(mktemp)
           set +e
-          scripts/coderabbit-severity-gate.sh "$PR_NUMBER" "$REPO"
-          rc=$?
+          scripts/coderabbit-severity-gate.sh "$PR_NUMBER" "$REPO" 2>&1 | tee "$gate_out"
+          rc=${PIPESTATUS[0]}
           set -e
+          if [ "$rc" -eq 2 ] && [ "$budget_lib" = true ] \
+             && ib_rate_limited "$(cat "$gate_out")"; then
+            # The gate stops at its first failed read; nothing more is
+            # evaluated in this run (#2286).
+            budget_stop 2 "the gate failed on the exhausted installation API budget" rate-limited "$(cat "$gate_out")"
+          fi
           if [ "$rc" -eq 2 ]; then
             echo "::error::coderabbit-severity-gate.sh exited 2 (config/usage error)"
             exit 1
@@ -345,6 +419,19 @@ jobs:
           # PUBLISH: the hold withholds a success, it never manufactures a red
           # this arm cannot retire.
           REQUIRE_REVIEW_SUMMARY: "true"
+          EVENT_NAME: ${{ github.event_name }}
+          # Budget guard knobs for the issue_comment path (#2286), read by
+          # scripts/workflow/installation-budget.sh. One evaluation of the
+          # commented PR costs about 18 REST requests and 2 GraphQL points:
+          # two head reads, the generation open, two four-surface
+          # fingerprints (one GraphQL page each), the gate's 4, and
+          # rcg_close's binding read, three revalidation reads and PATCH.
+          # The reserve matches the event job's. The scheduled sweep is not
+          # guarded here: it is the delivery-independent backstop (#2224).
+          BUDGET_PER_EVAL_REQUESTS: "25"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           set -euo pipefail
           . scripts/workflow/required-check-generation.sh
@@ -356,6 +443,46 @@ jobs:
             echo "::notice::coderabbit-severity-gate.sh is not on the default branch yet (bootstrap); sweep is a no-op until the gate merges."
             exit 0
           fi
+          # Budget guard, issue_comment path only (#2286). A PR comment
+          # re-evaluates the one commented PR. When the installation budget
+          # cannot cover that plus the reserve, the PR's head gets the
+          # publisher's back-off red instead (two requests: the head read and
+          # the POST): never a green, and its title records the reset, so
+          # the publisher's due() leaves the PR alone until then and its
+          # first pass after the reset re-evaluates it with no manual rerun.
+          # This job's own native check is not a required context and is
+          # attached to the default branch, so the run ends green. An
+          # unreadable budget, or a default branch without the library,
+          # evaluates as before.
+          budget_lib=false
+          if [ "${EVENT_NAME:-}" = issue_comment ] && [ -r scripts/workflow/installation-budget.sh ]; then
+            # shellcheck source=scripts/workflow/installation-budget.sh
+            . scripts/workflow/installation-budget.sh
+            budget_lib=true
+            ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+              "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+            if ! ib_affordable 1; then
+              reset=$(ib_short_bucket_reset)
+              title=$(ib_backoff_title "$CHECK_NAME" 2 "$reset")
+              echo "::notice::Budget guard (#2286): $rl_remaining REST request(s) and ${gql_remaining:-?} GraphQL point(s) remain, short of one evaluation plus the $BUDGET_RESERVE_REQUESTS-request reserve; posting the back-off red instead of evaluating."
+              while IFS= read -r PR; do
+                [ -n "$PR" ] || continue
+                if ! head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha) \
+                    || ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::warning::Could not read PR #$PR's head; its previous verdict stands until the publisher's next pass."
+                  continue
+                fi
+                gh api -X POST "repos/$REPO/check-runs" \
+                  -f name="$CHECK_NAME" -f head_sha="$head_sha" \
+                  -f status=completed -f conclusion=failure \
+                  -f "output[title]=$title" \
+                  -f "output[summary]=Not evaluated: the installation API budget is short (#2286). The publisher re-evaluates this head after ${reset:-the window resets}." \
+                  >/dev/null || echo "::warning::Could not post the back-off red on PR #$PR."
+              done <<<"$PRS"
+              exit 0
+            fi
+          fi
+          budget_stopped=0
           had_infra_error=0
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
@@ -509,6 +636,17 @@ jobs:
             set -e
             echo "$output"
 
+            # issue_comment path (#2286): the gate died on the exhausted
+            # installation budget. Stop here, with no further call: this
+            # PR's open generation stays in progress (blocking, and due for
+            # the publisher's first pass that can afford it).
+            if [ "$budget_lib" = true ] && [ "$rc" -eq 2 ] && ib_rate_limited "$output"; then
+              echo "::warning::PR #$PR: the gate failed on the exhausted installation API budget; leaving generation $generation_id in progress for the publisher to re-evaluate (#2286)."
+              budget_stopped=1
+              echo "::endgroup::"
+              break
+            fi
+
             set +e
             post_fp=$(cr_surface_fp "$PR")
             post_fp_rc=$?
@@ -600,6 +738,9 @@ jobs:
             fi
             echo "::endgroup::"
           done <<<"$PRS"
+          if [ "$budget_stopped" -eq 1 ]; then
+            echo "::notice::Stopped at an installation API rate-limit failure (#2286); the publisher re-evaluates the commented PR once the budget allows."
+          fi
           if [ "$had_infra_error" -ne 0 ]; then
             echo "::error::Sweep finished with one or more infra errors"
             exit 1

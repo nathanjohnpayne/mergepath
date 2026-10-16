@@ -1094,6 +1094,19 @@ The heal re-nomination is what makes a failed heal retried without a manual edit
 
 What changes is the outage dynamics. With 8 open PRs the floor still takes most of the budget, so a busy hour can still run it out; the guard is what keeps that hour from turning into a self-sustaining outage, and the threshold fix removes about 420 requests per hour of event-pass re-evaluation under traffic.
 
+**After #2286.** In the 24 hours after #2220, 808 gate runs still failed on `rate limit exceeded for installation`, 88% of them in the event-driven workflows, which spent the budget on every review event without reading it. Each of them now reads the budget through the publisher's reader (`scripts/workflow/installation-budget.sh`) and does not evaluate when it cannot cover one evaluation plus a 200-request reserve, which is the publisher's own floor for one event-head evaluation plus room for the other workflows' skip-path writes. The per-evaluation costs, measured with a counting `gh` shim on 2026-10-15:
+
+| Workflow (path) | REST requests per evaluation | GraphQL points | Skip path costs |
+|---|---|---|---|
+| Codex Feedback Archive Relay (same-repository source) | 1, or 2 when the run lists no PR | 0 | 0 |
+| Codex P1 Gate event job (lease, snapshot driver, close) | about 20 per clean attempt; up to about 60 with the driver's three drift retries | 0 to 1 | lease PATCH and one lineage read |
+| CodeRabbit Severity Gate event job | about 4 | 0 (review-thread reads only with inline findings) | one check-run POST and one lineage read |
+| CodeRabbit Severity Gate `issue_comment` path | about 18 | 2 | the head read and one check-run POST |
+| Merge Clearance Gate event job | 3 to 19 in the script, plus phase 2's two reads and PATCH | 0 to 1 | the phase-2 PATCH and one lineage read |
+| Auto-clear blocking labels event job (installation token only; `codex-review-check.sh` runs on the CI PAT: 20 REST and 3 GraphQL) | 1 to about 8 (the head/base reads, plus the protective-retraction reads counted from `approval-merge-continuation.sh` on a pass or a `workflow_run` continuation) | 0 to about 5 | 0 |
+
+A skipped run never publishes a green. On a required context the event head gets the publisher's back-off red, which its due() backs off until the reset and re-evaluates on the first pass after it, and the job-native run is non-failing only when the Checks-API lineage is confirmed to block (`specs/required_check_publisher.md` § Event-driven gate workflows).
+
 ### `resolveReviewThread`
 
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
