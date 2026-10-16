@@ -719,10 +719,10 @@ else
 
   aggregator_run=$(yq -r '.jobs.lint.steps[] | select(.name == "publish aggregate lint result") | .run' "$REPO_LINT")
   if yq -e '.jobs.lint.name == "lint" and .jobs.lint.if == "always()" and (.jobs.lint.needs | contains(["scope", "lint_fast", "deep_safety"]))' "$REPO_LINT" >/dev/null \
-     && printf '%s' "$aggregator_run" | grep -Fq 'FAST_RESULT' \
-     && printf '%s' "$aggregator_run" | grep -Fq 'DEEP_RESULT' \
-     && printf '%s' "$aggregator_run" | grep -Fq 'SCOPE_RESULT' \
-     && printf '%s' "$aggregator_run" | grep -Fq 'exit 1'; then
+     && printf '%s' "$aggregator_run" | grep -F 'FAST_RESULT' >/dev/null \
+     && printf '%s' "$aggregator_run" | grep -F 'DEEP_RESULT' >/dev/null \
+     && printf '%s' "$aggregator_run" | grep -F 'SCOPE_RESULT' >/dev/null \
+     && printf '%s' "$aggregator_run" | grep -F 'exit 1' >/dev/null; then
     pass "a stable lint aggregator preserves the required status context"
   else
     fail "repo-lint must retain one always-running lint aggregator over every lane"
@@ -841,8 +841,8 @@ else
   shard_members=$(yq -r '.jobs.lint_fast.strategy.matrix.shard[]?' "$REPO_LINT")
   shard_count=$(printf '%s\n' "$shard_members" | sed '/^$/d' | wc -l | tr -d ' ')
   if [ "$shard_count" -ge 2 ] && [ "$shard_count" -le 4 ] \
-     && printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Eqx '[0-9]+' \
-     && ! printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Evq '^[0-9]+$' \
+     && printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Ex '[0-9]+' >/dev/null \
+     && ! printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Ev '^[0-9]+$' >/dev/null \
      && yq -e '.jobs.lint_fast.strategy."fail-fast" == false and .jobs.lint_fast.if == null and .jobs.lint_fast.name == "lint-fast" and (.jobs.lint_fast."timeout-minutes" | tag == "!!int")' "$REPO_LINT" >/dev/null; then
     pass "lint-fast is a 2-4 shard matrix that reports every leg, is never skipped, and is time-bounded"
   else
@@ -872,13 +872,13 @@ else
       unpinned_steps="$unpinned_steps $step_name"
       continue
     fi
-    if ! printf '%s' "$step_if" | grep -Eq '^matrix\.shard (==|!=) [0-9]+$'; then
+    if ! printf '%s' "$step_if" | grep -E '^matrix\.shard (==|!=) [0-9]+$' >/dev/null; then
       pins_ok=0
       bad_pins="$bad_pins ${step_name}(${step_if})"
       continue
     fi
     pin_value="${step_if##* }"
-    if ! printf '%s\n' "$shard_members" | grep -Fxq "$pin_value"; then
+    if ! printf '%s\n' "$shard_members" | grep -Fx "$pin_value" >/dev/null; then
       pins_ok=0
       bad_pins="$bad_pins ${step_name}(shard $pin_value is not in the matrix)"
       continue
@@ -1151,8 +1151,8 @@ elif replay_loop=$(awk '/^while IFS= read -r name; do$/ {f=1} f {print} f && /^d
      && [ "$(tail -n 1 <<<"$replay_loop")" = 'done <<< "$REPLAY_ORDER"' ] \
      && grep -Fq 'repo_lint_shard_owns "$ordinal"' <<<"$replay_loop" \
      && grep -Fq 'ordinal=$((ordinal + 1))' <<<"$replay_loop" \
-     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_codex_scripts' \
-     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_gh_as_author'; then
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -F 'check_codex_scripts' >/dev/null \
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -F 'check_gh_as_author' >/dev/null; then
   pass "the consumer replay loop shards REPLAY_ORDER (heavy wrappers first) through the shared shard selector"
 else
   fail "tests/test_repo_lint_consumer_safety.sh must order heavy wrappers first, number them, and consult repo_lint_shard_owns inside the replay loop"
@@ -1174,7 +1174,7 @@ if [ -f "$CONSUMER_HARNESS" ] && [ -f "$SELECTION_HELPER" ]; then
 fi
 
 if sed -n '/Stale-ratchet sweep/,/Same ratchet/p' "$RESIDUE_HARNESS" \
-     | grep -Fq 'repo_lint_check_is_selected "$n"'; then
+     | grep -F 'repo_lint_check_is_selected "$n"' >/dev/null; then
   pass "partial residue selection audits only the selected wrappers' exception records"
 else
   fail "partial residue selection must not report unselected legacy exceptions as stale"
