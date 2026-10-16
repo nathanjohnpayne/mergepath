@@ -1,0 +1,137 @@
+name: Token-output oracle (macOS)
+
+# Hub-only, unprivileged native Mac evidence for #1036. Deliberately absent
+# from .mergepath-sync.yml and separate from the required repo-lint workflow.
+# Hosted runners avoid nesting Seatbelt inside an operator-file sandbox.
+on:
+  pull_request:
+    paths:
+      - scripts/ci/token_output_gate.py
+      - scripts/ci/check_no_token_in_output
+      - .github/workflows/token-output-oracle-macos.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: token-output-oracle-macos-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  macos-oracle:
+    if: github.repository == 'nathanjohnpayne/mergepath'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify exact event head
+        env:
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EVENT_HEAD"
+
+      - name: Provision oracle Bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          set -euo pipefail
+          brew install bash
+          bash_bin="$(brew --prefix bash)/bin"
+          test -x "$bash_bin/bash"
+          printf '%s\n' "$bash_bin" >> "$GITHUB_PATH"
+          command -v python3
+
+      - name: Run exact-source native oracle with closed stdin
+        env:
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          RECEIPT_DIR: ${{ runner.temp }}/token-output-oracle-macos
+        run: |
+          python3 -I -S - <<'PYTHON'
+          from pathlib import Path
+          import hashlib, json, os, platform, re, shutil, subprocess, sys, time
+          out = Path(os.environ["RECEIPT_DIR"])
+          out.mkdir(parents=True, exist_ok=True)
+          source = Path("scripts/ci/token_output_gate.py").resolve()
+          workflow = Path(".github/workflows/token-output-oracle-macos.yml").resolve()
+          digest = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          receipt = {"expected_head": os.environ["EVENT_HEAD"],
+                     "runner": platform.platform(), "machine": platform.machine(),
+                     "python": sys.version, "python_path": sys.executable,
+                     "python_sha256": digest(sys.executable), "status": "setup"}
+          stdout = stderr = b""
+          rc = 1
+          try:
+              head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if not re.fullmatch(r"[0-9a-f]{40}", receipt["expected_head"]) or head != receipt["expected_head"]:
+                  raise RuntimeError("checkout is not the exact event head")
+              receipt.update(head=head, source_sha256=digest(source),
+                             source_mode=oct(source.stat().st_mode & 0o777),
+                             workflow_sha256=digest(workflow))
+              (out / "source.py").write_bytes(source.read_bytes())
+              (out / "workflow.yml").write_bytes(workflow.read_bytes())
+              bash = shutil.which("bash")
+              if not bash:
+                  raise RuntimeError("Bash unavailable")
+              version = subprocess.check_output([bash, "--version"], text=True).splitlines()[0]
+              match = re.search(r"version (\d+)\.(\d+)", version)
+              receipt.update(bash_path=bash, bash_version=version, bash_sha256=digest(bash))
+              if not match or tuple(map(int, match.groups())) < (5, 1):
+                  raise RuntimeError("oracle requires Bash5.1 or newer")
+              home = out / "private-home"
+              temporary = out / "private-tmp"
+              home.mkdir(); temporary.mkdir()
+              # No Actions/operator credential variables enter candidate Python.
+              env = {"PATH": os.environ["PATH"], "HOME": str(home),
+                     "TMPDIR": str(temporary), "LC_ALL": "C"}
+              argv = [sys.executable, "-I", "-S", str(source), "--self-test"]
+              receipt.update(argv=argv, stdin="DEVNULL", timeout_seconds=900)
+              started = time.monotonic()
+              try:
+                  proc = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL,
+                                        capture_output=True, timeout=900)
+                  stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+                  receipt.update(status="completed", returncode=rc)
+              except subprocess.TimeoutExpired as exc:
+                  stdout, stderr = exc.stdout or b"", exc.stderr or b""
+                  receipt.update(status="timeout", returncode=None)
+              receipt["seconds"] = time.monotonic() - started
+              receipt["source_after_sha256"] = digest(source)
+              receipt["workflow_after_sha256"] = digest(workflow)
+              if (receipt["source_after_sha256"] != receipt["source_sha256"]
+                      or receipt["workflow_after_sha256"] != receipt["workflow_sha256"]):
+                  raise RuntimeError("source/workflow changed during the oracle")
+          except Exception as exc:
+              receipt.update(status="infrastructure-error", error=str(exc))
+              rc = 1
+          finally:
+              (out / "stdout.txt").write_bytes(stdout)
+              (out / "stderr.txt").write_bytes(stderr)
+              receipt["stdout_sha256"] = hashlib.sha256(stdout).hexdigest()
+              receipt["stderr_sha256"] = hashlib.sha256(stderr).hexdigest()
+              (out / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          print(json.dumps(receipt, indent=2))
+          print(stdout.decode("utf-8", "replace"))
+          print(stderr.decode("utf-8", "replace"), file=sys.stderr)
+          raise SystemExit(0 if receipt["status"] == "completed" and rc == 0 else 1)
+          PYTHON
+
+      - name: Retain exact-head oracle evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: token-output-oracle-macos-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/token-output-oracle-macos/receipt.json
+            ${{ runner.temp }}/token-output-oracle-macos/stdout.txt
+            ${{ runner.temp }}/token-output-oracle-macos/stderr.txt
+            ${{ runner.temp }}/token-output-oracle-macos/source.py
+            ${{ runner.temp }}/token-output-oracle-macos/workflow.yml
+          if-no-files-found: error
+          retention-days: 14

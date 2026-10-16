@@ -59,47 +59,47 @@ EXECUTABLE.  This file carries both halves:
     refused with an environment error instead of producing a number that
     reads like ground truth and is not.  See the block above `run_oracle`.
 
-    It is NOT independent of WHICH VALUE it samples either, and that one is
-    still open.  Ground truth is established from a SINGLE sentinel, and that
-    sentinel is LETTER-LEADING, so every verdict below was measured at ONE
-    point in the value space rather than across credentials.  At least one
-    construct's verdict is an artefact of that point: `echo $((GH_TOKEN))`
-    reads CLEAN because a LETTER-LEADING operand is a NAME to bash, which
-    finds it unset and evaluates it to `0`.  Hand the same line a
-    DIGIT-LEADING NON-NUMERIC value and bash writes `9Zq7Xf2Lp: value too
-    great for base (error token is "9Zq7Xf2Lp")` to STDERR -- the value,
-    reproduced TWICE -- and `run_oracle` greps stderr.  Measured on this head:
-    the oracle reports leaks=False under the shipped sentinel and leaks=True
-    under a digit-leading one, while the SCANNER reads clean under both.  So
-    the construct is an agreeing pair today and would be an UNDECLARED MISS
-    the moment the sampled shape changed -- and it is not in `CORPUS` at all.
-    (An ALL-DIGIT value reads clean again, because bash evaluates it as a
-    number: one shape surfaces this, the other two do not, which is why the
-    sweep is a sweep.)  So a construct that measures clean here may leak on a
-    value shaped differently, and this corpus would not know.
-    It is NOT independent of HOW MUCH of the value reaches the stream, and
-    that one has a stated floor.  The oracle greps for WINDOWS as well as the
-    whole string, because `${VAR:0:8}` is a partial leak -- and a window has a
-    length, below which a real leak measures CLEAN.  At the original eight,
-    `echo "${GH_TOKEN:0:7}"` put seven credential characters on stdout and
-    read clean, which would have filed the scanner's CORRECT finding under
-    conservatism: a real leak recorded in the register of things the gate is
-    too strict about (#1032 round 3).  The floor is now four, both sides of it
-    are asserted in `_sentinel_window_cases`, and it PRINTS on the summary
-    line.  Below the floor the residue is a limit of the MEASUREMENT and is
-    named as one -- never smuggled into `KNOWN_BROADER`, which is a register
-    of what the SCANNER gets wrong.
+    It is NOT independent of WHICH VALUES it samples. The ordinary corpus
+    samples three explicit fake shapes (#1036): the legacy mixed-case
+    letter-leading value, a digit-leading non-numeric value, and the bounded
+    all-digit decimal 73919. Arithmetic can diagnose a non-numeric value,
+    emit a representable numeral, or remain quiet as a statement. No single
+    point proves a claim over arbitrary credentials. The summary prints each
+    shape, its recognition bound, and distinct constructs versus sample cells.
 
-    The sampled shape is derived from `SENTINEL` and PRINTS on the
-    `--self-test` summary line beside the interpreter and the floor; that
-    print is the record, the same way the registries are.  This is the `ORACLE_BASH_MIN`
-    problem one axis over -- an unstated dependency of the measurement, on the
-    VALUE instead of on the environment -- and unlike that one it is declared
-    rather than closed: sweeping the corpus across letter-leading,
-    digit-leading and all-digit sentinels is #1036.
+    Recognition preserves the legacy four-character case-sensitive fragment
+    proof: every raw window contains an uppercase letter and a digit. The
+    digit-leading non-numeric sample has the same raw-window property. Whole
+    lower/upper alphabetic values are additionally recognized; partial
+    case-transformed fragments and arbitrary encodings are outside that bound.
+    All-caps is not lowercase-invariant. The all-digit sample is recognized
+    only as its complete five-character value, with no uppercase collision
+    proof. Unrelated numeric output can coincide: focused noise/resource
+    characterization and captured matched streams bound this finite sample,
+    never a universal collision-free claim. Below each printed floor a real
+    leak can measure clean; that is an oracle limit, not scanner conservatism.
 
-    The suite then asserts the static scanner AGREES with the oracle on every
-    construct.  A construct the oracle says leaks and the scanner calls clean
+    Every parallel fixture binds immutable sample source AND recognition
+    data in its own (construct, shape) directory. Legacy default constants
+    remain available to the separate auxiliary axes, and no sampling globals
+    change while executor jobs run. The two exact numeric-target kill cells
+    require OS signal isolation and a source-bound out-of-band Bash startup
+    receipt: macOS denies signals; Linux gives each builtin-only cell a fresh
+    user/PID namespace whose Bash is PID1. Missing isolation or startup proof
+    is unavailable, never clean or an unsafe fallback. These are explicit
+    oracle-environment constraints, not general arbitrary-shell isolation.
+    The self-signal trap fixture keeps its ordinary launch path. The #2199
+    fd-state assertions still run after the executor closes. Shape-qualified
+    disagreement declarations keep
+    the original letter-leading stale checks rather than waiving them for
+    an agreeing different sample.
+
+    Historical noncanonical corpus rule labels remain observations, separately
+    reported from canonical rule assertions. A source/sample/exact-stream-pinned
+    four-digit numeric residue is reported as measurement-limited, not BROADER.
+
+    The suite then asserts the static scanner AGREES with the oracle on each
+    assessable sample cell.  A construct the oracle says leaks and the scanner calls clean
     is a FALSE NEGATIVE; a construct the oracle says is clean and the scanner
     flags is scanner conservatism.  Both must be DECLARED in `KNOWN_MISSES` or
     `KNOWN_BROADER` with a written reason, or the suite fails and prints the
@@ -303,7 +303,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Existing pipe-separated alternation misses remain inherited (#2234); no
     extglob grammar or fragment reconstruction is added.
     Four inherited assignment-tilde misses are version-qualified: Linux
-    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
+    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 and 5.3.15 builds had
+    no recognized sample for these cases. The owner
     preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
     Irreducible eval operands retain independent
     scanning of known literal fragments. Trap actions and callback operands
@@ -668,20 +669,15 @@ gate at their original sites.  All three reached the token under another name
 or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
-And the recall claim is bounded by the CORPUS and by the SENTINEL, not by an
-argument.  What the harness demonstrates is that on ~440 constructs --
-generated across line spellings, file selection, pipeline consumers and
-legal-but-unusual precision shapes, each measured against ONE letter-leading
-sentinel value and only down to a four-character fragment -- the scanner and
-bash agree except for the declared entries.  The run prints the exact count,
-the interpreter, the sentinel shape AND the detection floor that produced it,
-and both registries; that print is the number of record, not this sentence.  A
-construct nobody wrote into the corpus is not covered by the statement at all,
-neither is a value shape nobody sampled (#1036), and neither is a leak too
-short for the floor.  Adding
-a construct is a three-line edit to `CORPUS`, and the oracle decides it --
-under an interpreter that can evaluate it, which is what `ORACLE_BASH_MIN`
-is for.
+And the recall claim is bounded by CORPUS and the named fake samples, not by
+an argument. The run prints N distinct constructs, three shapes, attempted
+and completed sample cells, interpreter, per-shape recognition floors and
+per-shape differential counts. Those measured counts are the record; a
+construct or value shape nobody sampled is not covered. Legacy raw fragments
+have a four-character floor, the numeric sample needs its whole five digits,
+and transformed alphabetic values need their whole value. Shorter residues
+are measurement limits. Auxiliary source-selection and fd-state checks retain
+their separately stated default sample.
 
 Related and equally out of reach (#1021): `scripts/op-preflight.sh` writing
 export lines carrying live PAT values to ITS OWN stdout is a CALLER-side
@@ -774,6 +770,7 @@ Exit codes: 0 pass, 1 findings or a failing case, 2 usage/environment error.
 from __future__ import annotations
 
 import concurrent.futures
+from collections import namedtuple
 import errno
 import os
 import re
@@ -5728,18 +5725,8 @@ def scan_tree(root):
 # Lowering the floor can only make the oracle see MORE, so it can surface a
 # scanner false negative and can never invent a false positive.
 #
-# It is ONE value, and its SHAPE is load-bearing.  This one is LETTER-LEADING,
-# so `echo $((GH_TOKEN))` resolves the operand as a name, finds it unset and
-# evaluates to 0 -- measuring CLEAN.  A DIGIT-LEADING NON-NUMERIC value on the
-# same line puts the sentinel on STDERR twice, through bash's own `value too
-# great for base` diagnostic, and the oracle greps stderr.  (An all-digit
-# value evaluates as a number and reads clean again -- the shapes are not
-# interchangeable, which is the point of sweeping them.)  Every verdict this
-# records is therefore quantified over this shape and no other; sweeping the
-# corpus across letter-leading, digit-leading and all-digit values is #1036.
-# `sentinel_shape()` below DERIVES the shape from this constant instead of
-# restating it, and `--self-test` prints it, so the limit stated in the header
-# cannot drift away from the value the fixtures actually carry.
+# Keep this original value/floor/window proof for compatibility and the
+# auxiliary axes. CORPUS sampling below binds an immutable sample per cell.
 SENTINEL = "Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr"
 SENTINEL_WINDOW = 4
 _SENTINEL_WINDOWS = tuple(
@@ -5748,41 +5735,53 @@ _SENTINEL_WINDOWS = tuple(
 )
 
 
-def sentinel_shape():
-    """Name the ONE value shape the oracle samples, derived from `SENTINEL`.
+OracleSample = namedtuple("OracleSample", "name value minimum_fragment")
+DEFAULT_ORACLE_SAMPLE = OracleSample("letter-leading", SENTINEL, SENTINEL_WINDOW)
+ORACLE_SAMPLES = (
+    DEFAULT_ORACLE_SAMPLE,
+    OracleSample("digit-leading-non-numeric", "9" + SENTINEL, SENTINEL_WINDOW),
+    OracleSample("all-digit", "73919", 5),
+)
 
-    Written as a derivation rather than a constant so that changing `SENTINEL`
-    changes what `--self-test` reports, instead of leaving the header's stated
-    limit describing a value the fixtures no longer carry.  The three names
-    are the three shapes #1036 asks the corpus to sweep.
-    """
-    if not SENTINEL:
+
+def sentinel_shape(sample=None):
+    """Derive the reported shape from the immutable value actually sampled."""
+    value = (sample or DEFAULT_ORACLE_SAMPLE).value
+    if not value:
         return "empty"
-    if SENTINEL.isdigit():
+    if value.isdigit():
         return "all-digit"
-    if SENTINEL[0].isdigit():
-        return "digit-leading non-numeric"
-    if SENTINEL[0].isalpha():
+    if value[0].isdigit():
+        return "digit-leading-non-numeric"
+    if value[0].isalpha():
         return "letter-leading"
     return "other-leading"
 
 
-def sentinel_reached(*streams):
-    """Ground truth: did any recognisable piece of the sentinel reach a stream?
+def _oracle_sample_windows(sample):
+    return tuple(
+        sample.value[i:i + sample.minimum_fragment]
+        for i in range(len(sample.value) - sample.minimum_fragment + 1)
+    )
 
-    RECOGNISABLE has a floor, and the floor is `SENTINEL_WINDOW` consecutive
-    characters.  Below it this returns False on a value that really did reach
-    a stream -- that is a limit of the MEASUREMENT, not conservatism in the
-    scanner, and `_sentinel_window_cases` pins both sides of the boundary so
-    the bound is asserted rather than merely written down.
+
+def sentinel_reached(*streams, sample=None):
+    """Recognize this sample's raw fragments or whole upper/lower value.
+
+    Alphabetic raw windows retain their case-sensitive four-character floor.
+    Numeric recognition requires all five digits. Case-transformed alphabetic
+    values require the whole value; shorter transformed fragments and other
+    encodings are explicitly outside this measurement bound.
     """
-    for s in streams:
-        if not s:
-            continue
-        for w in _SENTINEL_WINDOWS:
-            if w in s:
-                return True
+    sample = sample or DEFAULT_ORACLE_SAMPLE
+    windows = _oracle_sample_windows(sample)
+    whole_variants = (sample.value.lower(), sample.value.upper())
+    for stream in streams:
+        if stream and (any(window in stream for window in windows)
+                       or any(value in stream for value in whole_variants)):
+            return True
     return False
+
 
 PROLOGUE = (
     "#!/usr/bin/env bash\n"
@@ -5791,6 +5790,19 @@ PROLOGUE = (
     "GH_TOKEN='" + SENTINEL + "'\n"
     "OP_PREFLIGHT_REVIEWER_PAT='" + SENTINEL + "'\n"
 )
+
+
+def oracle_prologue(sample=None):
+    """The fake fixture source and its recognizer share one immutable sample."""
+    sample = sample or DEFAULT_ORACLE_SAMPLE
+    return (
+        "#!/usr/bin/env bash\n"
+        "# Disposable oracle fixture. The value below is an obviously fake\n"
+        "# constant, never real credential material (#996 Not in scope).\n"
+        "GH_TOKEN='" + sample.value + "'\n"
+        "OP_PREFLIGHT_REVIEWER_PAT='" + sample.value + "'\n"
+    )
+
 
 MUST_FLAG = "flag"
 MUST_NOT_FLAG = "clean"
@@ -13940,11 +13952,11 @@ KNOWN_BROADER = {
 #
 # So: resolve the interpreter once, RECORD its version on the summary line,
 # and refuse to run below a floor rather than produce an authoritative-looking
-# number.  4.4 is where every construct named above became available (`@A`,
-# `@Q`, `@P` in 4.4; `^^` in 4.0; `declare -n` in 4.3; `|&` in 4.0).  The
-# printed version is the record; the floor only stops the run that could not
-# have measured what it claims to have measured.
-ORACLE_BASH_MIN = (4, 4)
+# number. The original constructs need4.4 (`@A`, `@Q`, `@P` in4.4; `^^`
+# in4.0; `declare -n` in4.3; `|&` in4.0). The #1036 `@L`/`@U` probes need
+#5.1 (GNU Bash5.1 NEWS, item dd). This is an ORACLE floor; --scan is unchanged.
+# The printed version records what actually measured the corpus.
+ORACLE_BASH_MIN = (5, 1)
 _ORACLE_BASH = None
 _BASH_VERSION_RE = re.compile(r"version (\d+)\.(\d+)")
 
@@ -13982,11 +13994,143 @@ def oracle_bash():
     return _ORACLE_BASH
 
 
-def run_oracle(body, workdir, name, shebang=None, run_via=None):
-    """Ground truth: run the fixture with EOF stdin and grep both streams."""
+# Only these exact builtin-only numeric-target programs have the finite signal
+# capsule proof. Their source and samples are immutable executor inputs. This
+# is not a general arbitrary-shell sandbox or a stubbed kill implementation.
+ORACLE_SIGNAL_CELLS = {'numeric-kill': {'body_sha256': 'bf7b540e5ffb6e22a64c428c29d6996e783efe0cdc7847c2ee4f2983c15c3918', 'source_sha256': '62bffc1dd0aa3a20c664984c88fbed20c1a9cee083a2b431a5e58f2776bc4733'}, 'numeric-kill-with-signal': {'body_sha256': '1d794e6291aa15b93deb52a5b2db90f24259a5937ea52106077dcccffd753552', 'source_sha256': '4eb502caa98d977965b19118b765b13f11880e898c6d34340dac878c967735a9'}}
+
+
+def _oracle_signal_binding(body, sample, fixture_id=None):
+    """Return (protected ID | None, unavailable reason | None), without launch."""
+    import hashlib
+    sample = sample or DEFAULT_ORACLE_SAMPLE
+    digest = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    body_hash = digest(body)
+    matching = next((cid for cid, expected in ORACLE_SIGNAL_CELLS.items()
+                     if expected["body_sha256"] == body_hash), None)
+    if fixture_id in ORACLE_SIGNAL_CELLS and fixture_id != matching:
+        return None, "protected oracle fixture body changed: " + fixture_id
+    # Matching by body protects callers without a corpus ID too. Only these
+    # two exact approved samples may use the ordinary launch; spelling a value
+    # with a sign/whitespace or another label cannot evade protected dispatch.
+    if matching is None:
+        return None, None
+    plain_samples = (
+        OracleSample("letter-leading", "Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr", 4),
+        OracleSample("digit-leading-non-numeric", "9Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr", 4),
+    )
+    if sample in plain_samples:
+        return None, None
+    if sample != OracleSample("all-digit", "73919", 5):
+        return None, "protected oracle sample is outside the admitted binding"
+    expected = ORACLE_SIGNAL_CELLS[matching]
+    if digest(oracle_prologue(sample) + body) != expected["source_sha256"]:
+        return None, "protected oracle fixture source changed: " + matching
+    return matching, None
+
+
+def _oracle_signal_inventory_cases():
+    """Check finite ID/body/sample bindings before starting executor jobs."""
+    failures = []
+    for cid in ORACLE_SIGNAL_CELLS:
+        bodies = [body for name, _rule, body in CORPUS if name == cid]
+        if len(bodies) != 1:
+            failures.append("signal oracle: missing/duplicate protected ID " + cid)
+            continue
+        for sample in ORACLE_SAMPLES:
+            bound, error = _oracle_signal_binding(bodies[0], sample, cid)
+            expected = cid if sample.name == "all-digit" else None
+            if error or bound != expected:
+                failures.append("signal oracle: stale binding " + cid)
+    return failures
+
+
+
+def _oracle_signal_binding_cases():
+    """Harmless source/sample dispatch controls; never launch a process."""
+    failures = []
+    bodies = {cid: body for cid, _rule, body in CORPUS}
+    numeric = OracleSample("all-digit", "73919", 5)
+    for cid in ORACLE_SIGNAL_CELLS:
+        body = bodies.get(cid, "")
+        if _oracle_signal_binding(body, numeric) != (cid, None):
+            failures.append("signal oracle: anonymous exact body bypassed capsule " + cid)
+        if _oracle_signal_binding(body, DEFAULT_ORACLE_SAMPLE, cid) != (None, None):
+            failures.append("signal oracle: legacy nonnumeric dispatch changed " + cid)
+        for changed in (body + "# changed\n", ""):
+            if _oracle_signal_binding(changed, numeric, cid)[1] is None:
+                failures.append("signal oracle: stale protected body admitted " + cid)
+        for sample in (OracleSample("all-digit", "73918", 5),
+                       OracleSample("all-digit", "73919", 4),
+                       OracleSample("letter-leading", "73919", 5),
+                       OracleSample("letter-leading", "-1", 2),
+                       OracleSample("letter-leading", "+73919", 5),
+                       OracleSample("letter-leading", " 73919", 5),
+                       OracleSample("custom", DEFAULT_ORACLE_SAMPLE.value, 4),
+                       OracleSample("letter-leading", "changed", 4)):
+            if _oracle_signal_binding(body, sample, cid)[1] is None:
+                failures.append("signal oracle: changed numeric sample admitted " + cid)
+    if _oracle_signal_binding(bodies.get("trap-on-signal", ""), numeric) != (None, None):
+        failures.append("signal oracle: legitimate self-signal trap was isolated")
+    return failures
+
+def _oracle_signal_capsule(path, env, cid):
+    """Prepare a real-Bash capsule and its out-of-band startup receipt.
+
+    All state is private to this cell. No subprocess or global mutation here.
+    Linux needs the caller's toolchain to permit the exact unshare operation;
+    inability to enter it must remain unavailable, never a plain-Bash retry.
+    """
+    bash = oracle_bash()[0]
+    if not bash:
+        raise OSError("protected oracle has no resolved Bash")
+    if sys.platform == "darwin":
+        tool = "/usr/bin/sandbox-exec"
+        if not os.path.isfile(tool) or not os.access(tool, os.X_OK):
+            raise OSError("protected oracle needs macOS sandbox-exec signal denial")
+    elif sys.platform.startswith("linux"):
+        tool = shutil.which("unshare")
+        if not tool:
+            raise OSError("protected oracle needs fresh user/PID namespace support")
+    else:
+        raise OSError("protected oracle signal isolation unavailable on " + sys.platform)
+    capsule = tempfile.mkdtemp(prefix=".signal-capsule.", dir=os.path.dirname(path))
+    receipt = os.path.join(capsule, "started")
+    bootstrap = os.path.join(capsule, "startup.sh")
+    expected = (os.urandom(24).hex() + ":" + cid + ":"
+                + ORACLE_SIGNAL_CELLS[cid]["source_sha256"] + "\n")
+    startup = ""
+    if sys.platform.startswith("linux"):
+        # The exact two bodies only assign values/use builtins and create no
+        # children. Fresh PID1 cannot target outer or in-namespace PID73919.
+        startup += 'if [ "$$" -ne 1 ]; then exit 125; fi\n'
+    startup += ("printf %s " + shlex.quote(expected) + " > "
+                + shlex.quote(receipt) + " || exit 125\nunset BASH_ENV\n")
+    with open(bootstrap, "w", encoding="utf-8") as fh:
+        fh.write(startup)
+    if sys.platform == "darwin":
+        profile = os.path.join(capsule, "deny-signal.sb")
+        with open(profile, "w", encoding="utf-8") as fh:
+            fh.write("(version 1)\n(allow default)\n(deny signal)\n")
+        argv = [tool, "-f", profile, bash, path]
+    else:
+        argv = [tool, "--user", "--map-root-user", "--pid", "--fork", bash, path]
+    # Actual noninteractive Bash runs this only after entering the capsule.
+    # Remove it before the unchanged fixture; no measured stream handshake.
+    capsule_env = dict(env, BASH_ENV=bootstrap)
+    return argv, capsule_env, receipt, expected
+
+
+def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None, fixture_id=None):
+    """Run real Bash with EOF stdin; numeric signal cells require their capsule."""
+    protected, binding_error = _oracle_signal_binding(body, sample, fixture_id)
+    if binding_error:
+        return None, "", "oracle unavailable: " + binding_error
+    if protected and (shebang is not None or run_via is not None):
+        return None, "", "oracle unavailable: protected fixture cannot override its launcher"
     path = os.path.join(workdir, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = (shebang if shebang is not None else PROLOGUE) + body
+    text = (shebang if shebang is not None else oracle_prologue(sample)) + body
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.chmod(path, 0o755)
@@ -14009,6 +14153,12 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None):
     # says -- which is what it WAS doing before #1032, under a comment here
     # claiming the opposite.
     argv = (run_via if run_via is not None else [oracle_bash()[0] or "bash"]) + [path]
+    receipt = expected_receipt = None
+    if protected:
+        try:
+            argv, env, receipt, expected_receipt = _oracle_signal_capsule(path, env, protected)
+        except OSError as exc:
+            return None, "", "oracle unavailable: signal capsule setup failed: %s" % exc
     try:
         proc = subprocess.run(
             argv,
@@ -14022,7 +14172,15 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None):
         return None, "", "oracle could not run: %s" % exc
     out = proc.stdout.decode("utf-8", "replace")
     err = proc.stderr.decode("utf-8", "replace")
-    return sentinel_reached(out, err), out, err
+    if protected:
+        try:
+            with open(receipt, encoding="utf-8") as fh:
+                started = fh.read()
+        except OSError:
+            started = None
+        if started != expected_receipt:
+            return None, out, "oracle unavailable: signal capsule startup not verified: " + err
+    return sentinel_reached(out, err, sample=sample), out, err
 
 
 def _oracle_stdin_cases(tmp):
@@ -15379,6 +15537,11 @@ EVAL_ASSIGNMENT_TILDE_MISSES = frozenset(('eval-assignment-tilde-inherited-tilde
 EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
     "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)"
 )
+EVAL_ASSIGNMENT_TILDE_QUIET_ORACLES = frozenset((
+    EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE,
+    "GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)",
+    "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin25.6.0)",
+))
 CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
 KNOWN_MISSES.update({cid: (
     "Inherited assignment-tilde eval miss: Linux Bash 5.2.15 leaked in the "
@@ -16008,14 +16171,1271 @@ def _ansi_c_quote_cases():
     return failures
 
 
-def self_test():
+# Exact shape scopes are populated only from inspected measurements. Existing
+# declarations default to the legacy sample; a new shape disagreement is not
+# covered merely because the case has a legacy declaration. Shape-only cases
+# must name their scope explicitly and still disagree on every named cell.
+# Measured scopes are explicit per ID; agreement in a sibling shape does not
+# waive a declaration. Existing reasons and ordinary scanner rules stay intact.
+KNOWN_MISS_SHAPES = {
+    'ansi-c-plain-alias-invoked-inherited': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'array-double-quoted-apostrophe-after-nested-substitution': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'deferred-enable-depth-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'dumper-bare-set': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'dumper-declare-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'dumper-env-after-export': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'dumper-set-after-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-assignment-tilde-inherited-tilde-append': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-assignment-tilde-inherited-tilde-colon': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-assignment-tilde-inherited-tilde-equal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-assignment-tilde-inherited-tilde-escaped-continuation': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-adjacent-comment-unmatched-quotes': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-double-quoted-backtick-quote-context': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-brace-modified-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-backtick-comment-nested-parameter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-external-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-interpreter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-loop-variable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-pipe-into-emitting-filter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-pipe-into-stdin-echoing-helper': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-printf-v': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-rename': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'indirect-through-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-exit-captured': ('digit-leading-non-numeric', 'letter-leading'),
+    'numeric-let-clean': ('digit-leading-non-numeric',),
+    'numeric-operand-boundary-cd': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-operand-boundary-external': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-operand-boundary-type': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-honoured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-array-child-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-backtick-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-backtick-same-line-siblings': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-continued-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-function-subshell-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-heredoc-child-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-same-line-nested': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-same-line-siblings': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-subshell-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pragma-line-substitution-claimed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-helper-positional-index-inherited': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-manual-indirect-invalid-name': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-manual-indirect-valid-name': ('digit-leading-non-numeric',),
+    'printf-v-round-six-array-separate-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-positional-separate-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-value-arithmetic-capture-baseline': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'read-ansi-index-no-apostrophe-inherited': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'read-helper-positional-index-inherited': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'shape-legacy-bare': ('all-digit', 'digit-leading-non-numeric'),
+    'shape-modern-bare': ('all-digit', 'digit-leading-non-numeric'),
+    'shape-statement-bare': ('digit-leading-non-numeric',),
+    'wrapper-operand-nice': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'wrapper-operand-timeout': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+}
+
+KNOWN_BROADER_SHAPES = {
+    'alias-defined-and-used-on-one-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'capture-stderr-only-redirection': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'capture-stderr-onto-stdout': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'cmdword-brace-expansion-to-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'cmdword-glob-pipeline-consumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-brace-argument-in-brace': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-bundle-executed-if-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-and-newline': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-brace': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-case': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-for': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-if': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-or-newline': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-until': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-executed-while': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'conditional-xtrace-select-executed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'deferred-enable-exit-trap-timing-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'deferred-enable-mapfile-empty-input-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'deferred-enable-readarray-empty-input-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'deferred-enable-uncalled-definition': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'emitter-to-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'error-word-variable-is-set': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-extglob-extglob-not': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-extglob-opener-not-space': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-extglob-safe-matched-plus': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-extglob-safe-unmatched-at': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-irreducible-operand-keeps-literal-conservatism': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'eval-joined-source-output-redirection': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'gen-bracket-numeric-eq-left': ('all-digit',),
+    'gen-bracket-numeric-eq-right': ('all-digit',),
+    'gen-bracket-numeric-ge-left': ('all-digit',),
+    'gen-bracket-numeric-ge-right': ('all-digit',),
+    'gen-bracket-numeric-gt-left': ('all-digit',),
+    'gen-bracket-numeric-gt-right': ('all-digit',),
+    'gen-bracket-numeric-le-left': ('all-digit',),
+    'gen-bracket-numeric-le-right': ('all-digit',),
+    'gen-bracket-numeric-lt-left': ('all-digit',),
+    'gen-bracket-numeric-lt-right': ('all-digit',),
+    'gen-bracket-numeric-ne-left': ('all-digit',),
+    'gen-bracket-numeric-ne-right': ('all-digit',),
+    'gen-mapfile-numeric-option-O': ('all-digit',),
+    'gen-mapfile-numeric-option-after-delimiter': ('all-digit',),
+    'gen-mapfile-numeric-option-attached': ('all-digit',),
+    'gen-mapfile-numeric-option-c': ('all-digit',),
+    'gen-mapfile-numeric-option-n': ('all-digit',),
+    'gen-mapfile-numeric-option-s': ('all-digit',),
+    'gen-mapfile-numeric-option-wrapped': ('all-digit',),
+    'gen-readarray-numeric-option-O': ('all-digit',),
+    'gen-readarray-numeric-option-after-delimiter': ('all-digit',),
+    'gen-readarray-numeric-option-attached': ('all-digit',),
+    'gen-readarray-numeric-option-c': ('all-digit',),
+    'gen-readarray-numeric-option-n': ('all-digit',),
+    'gen-readarray-numeric-option-s': ('all-digit',),
+    'gen-readarray-numeric-option-wrapped': ('all-digit',),
+    'gen-test-numeric-eq-left': ('all-digit',),
+    'gen-test-numeric-eq-right': ('all-digit',),
+    'gen-test-numeric-ge-left': ('all-digit',),
+    'gen-test-numeric-ge-right': ('all-digit',),
+    'gen-test-numeric-gt-left': ('all-digit',),
+    'gen-test-numeric-gt-right': ('all-digit',),
+    'gen-test-numeric-le-left': ('all-digit',),
+    'gen-test-numeric-le-right': ('all-digit',),
+    'gen-test-numeric-lt-left': ('all-digit',),
+    'gen-test-numeric-lt-right': ('all-digit',),
+    'gen-test-numeric-ne-left': ('all-digit',),
+    'gen-test-numeric-ne-right': ('all-digit',),
+    'helper-hd-bounded-alias-argument': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-before-definition': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-before-enable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-disable-after-enable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-escaped-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-literal-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-same-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-alias-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-for-array-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-for-comment': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-for-escaped-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-for-literal-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-bounded-for-tail-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-argument-index-mismatch': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-arithmetic-expansion': ('all-digit',),
+    'helper-hd-central-backtick': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-brace-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-brace-reply': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-dollar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-unknown-stdin-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-central-unused-helper-argument': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-after-call-function-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-command-bypasses-both-functions': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-command-bypasses-command-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-escaped-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-late-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-no-enable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-plain-dispatch-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-quoted-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-safe-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-builtin-safe-function-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-after-call-function-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-escaped-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-late-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-no-enable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-plain-dispatch-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-quoted-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-safe-alias-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-dispatch-owner-command-safe-function-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-default-inert-body': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-absolute-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-after-call-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-builtin-dispatch': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-command-dispatch': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-escaped-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-late-alias': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-late-enable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-no-enable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-plain-builtin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-safe-alias': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-owner-quiet-safe-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-quiet-quoted-double-builtin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-quiet-quoted-double-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-quiet-quoted-single-builtin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-quiet-quoted-single-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-read-captured-setup': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-read-continued-read-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-read-same-read-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-read-uninvoked-setup': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-bundle-qu': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-conflicting-default-off': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-enable-then-bundle-disable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-enable-then-disable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-invalid-default-off': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-o-mode-default-off': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-post-body-enable': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-print-only': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-query-only': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-owner-shopt-unset-only': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-executed-and-disable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-after-call-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-builtin-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-disable-only-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-hash-only-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-path-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-lookup-reenabled-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-plain-disable-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-same-line-executed-disable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-builtin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-disabled-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-echo': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-expanded-pair': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-echo-removal-startup-no-enable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-eval-no-output-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-dot-fd3': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-multiple-capture-duplicate': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-multiple-command-duplicate': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-printf-before-filename': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-printf-fd0': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-printf-path-fd0': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-FD3-before-filename': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-doublequoted-zero-input': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd0-argument-not-program': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd0-literal-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd0-quoted-zero-input': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd0-trailing-DATA': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd10': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd3': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-fd3-attached': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-named-fd': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-plain-zero-input': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-prefilename-duplicate-argument': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-prefilename-escaped-parenthesis': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-prefilename-literal-input': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-prefilename-literal-parenthesis': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-fd0-source-quoted-zero-input': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-escaped-next': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-no-trailing-blank': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-quoted-next': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-safe-next': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-alias-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-cardinality-prefix-first-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-cardinality-quoted-star-second-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-cardinality-uninvoked-at-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-indexed-associative-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-indexed-declare-array-plus': ('all-digit',),
+    'helper-hd-later-four-indexed-declare-global-plus': ('all-digit',),
+    'helper-hd-later-four-indexed-declare-plus': ('all-digit',),
+    'helper-hd-later-four-indexed-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-indexed-rhs-data-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-indexed-typeset-plus': ('all-digit',),
+    'helper-hd-later-four-neighbor-alias-colon-next-stderr-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-neighbor-alias-echo-next-stdout-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-neighbor-alias-false-next-stderr-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-attributes-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-constant-guard': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-double-escaped-literal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-empty-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-escaped-literal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-length-scalar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-null-routing': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-scalar-no-at': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-singlequoted-literal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-owner-at-stdout-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-producer-tee-fd3-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-four-producer-tee-nonconsumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-alias-chain-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-alias-invalid-slash': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-alias-invalid-space': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-alias-punctuation-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-bracket-n-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-bracket-v': ('all-digit',),
+    'helper-hd-later-three-chain-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-chain-forward-use': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-chain-safe-positional-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-chain-same-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-printf-indexed-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-read': ('all-digit',),
+    'helper-hd-later-three-read-array-other-name-ignored': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-read-delimiter-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-read-delimiter-then-name': ('all-digit',),
+    'helper-hd-later-three-read-double-dash': ('all-digit',),
+    'helper-hd-later-three-read-initial-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-read-invalid-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-test-bracket': ('all-digit',),
+    'helper-hd-later-three-test-negation': ('all-digit',),
+    'helper-hd-later-three-test-string-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-test-v': ('all-digit',),
+    'helper-hd-later-three-test-v-RHS-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-unset': ('all-digit',),
+    'helper-hd-later-three-unset-double-dash': ('all-digit',),
+    'helper-hd-later-three-unset-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-later-three-unset-v': ('all-digit',),
+    'helper-hd-owner-structural-constant-relay-HS-fd3-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-constant-sed-final-true-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-constant-sed-final-wc-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-constant-sed-nonmatch-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-constant-sed-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-Hh-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-attached-e-pattern': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-attached-f-pattern': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-count-e-pattern-copy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-count-pattern-copy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-count-stdin-copy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-diagnostic-copy-after-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-diagnostic-null-overwrite': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-e-pattern-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-f-pattern': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-label-no-H': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-label-suppressed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-long-pattern': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-long-pattern-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-pattern-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-single-file-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-stdin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-suppressed-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-grep-unknown-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-output-away': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-wc-count-stdin-copy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-wc-safe-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-count-wc-stdin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-existing-error-word-parent-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-final-null-self-dup': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-final-null-self-path': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-final-stderr-null-copy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-fragment-safe-receiver-*': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-fragment-safe-receiver-@': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-grep-count-pattern-operand': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-amp-append-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-amp-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-amp-null-overwrite': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-amp-unknown-overwrite': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-helper-scalar-star-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-mixed-second': ('all-digit',),
+    'helper-hd-owner-structural-numeric-null-to-captured-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-ordered-null-overwrite': ('all-digit',),
+    'helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-return-to-stderr-before-copy': ('all-digit',),
+    'helper-hd-owner-structural-numeric-scalar-star-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-second': ('all-digit',),
+    'helper-hd-owner-structural-numeric-second-test': ('all-digit',),
+    'helper-hd-owner-structural-numeric-second-timeout': ('all-digit',),
+    'helper-hd-owner-structural-numeric-shadowed-return-builtin': ('all-digit',),
+    'helper-hd-owner-structural-numeric-shadowed-return-command': ('all-digit',),
+    'helper-hd-owner-structural-numeric-shadowed-return-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-numeric-uninvoked-numeric-shadow': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-captured-stdout-program': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-cat-FD3-HS-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-cat-named-FD-HS-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-file-bearing-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-file-bearing-middle-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-head-extra-input-override': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-head-output-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-input-override': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-invalid-tee-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-nonconsumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-printf-assignment-head': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-relay-HS-override': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-runtime-cat-operand': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-runtime-tee-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-terminal-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-unknown-consumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-wrapped-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-plain-wrapped-tee': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-read-p-nontty': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-colon': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-grep-count': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-output-closed': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-output-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-output-stderr': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-true': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-wc-bundle': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-required-wc-lines': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-sequence-connected-final': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-sequence-output-away': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-sequence-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-sequence-split-uninvoked-helper': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-cat-file-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-colon-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-constant-transformer-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-constant-transformer-wc': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-grep-count-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-head-output-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-printf-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-sed-nonmatch-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-tee-invalid-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-true-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-unknown-fd3-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-unknown-override-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-singleton-wc-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-star-mixed-second-safe-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-stored-definition-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-bracket': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-exit': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-exit-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-helper-safe-arg': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-helper-token': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-if-false-unreached': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-inert-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-inner-captured-error': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-inner-captured-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-mapfile-count': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-nonconsumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-read-count': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-read-nonnumeric-option-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-read-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-read-stderr-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-read-timeout': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-receiver-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-return': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-return-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-return-stderr-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-safe-receiver': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-shift': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-test-left': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-test-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-test-right': ('all-digit',),
+    'helper-hd-owner-structural-unsolicited-numeric-test-stderr-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-test-string-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-uninvoked-helper': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-numeric-unreached-after-return': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-braced-quoted-scalar-second': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-captured-scalar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-escaped-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-fixed-first-safe-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-high-ninth-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-length-scalar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-quoted-prefix-scalar-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-quoted-scalar-second': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-scalar-one-second-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-singlequoted-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-stderr-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-stdout-captured-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-owner-structural-unsolicited-star-uninvoked-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-plain-cat-extra-hop-builtin-cat-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-plain-cat-extra-hop-cat-file-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-plain-cat-extra-hop-cat-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-plain-cat-extra-hop-nonconsumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-printf-captured-deferred-stdout-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-printf-captured-direct-stdout-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-printf-no-output-deferred-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-indirect-named-set-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-indirect-positional-set-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-comment-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-deferred-child-one': ('all-digit',),
+    'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary': ('all-digit',),
+    'helper-hd-round10-sub-arithmetic-deferred-one-hop': ('all-digit',),
+    'helper-hd-round10-sub-arithmetic-escaped-opener': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-escaped-operand': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-literal-singlequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-safe-positional': ('all-digit', 'letter-leading'),
+    'helper-hd-round10-sub-arithmetic-valid-escaped-opener': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-array-escaped-opener': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-array-literal-singlequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-legacy-comment-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-legacy-escaped-opener': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-legacy-inert-suffix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-legacy-literal-singlequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-nonarithmetic-quoted-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-primitive-inert-suffix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round10-sub-substring-unset-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-adjacent-declare-index': ('all-digit', 'letter-leading'),
+    'helper-hd-round11-adjacent-let': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-adjacent-local-index': ('all-digit', 'letter-leading'),
+    'helper-hd-round11-assignment-argument': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-comment': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-declare': ('all-digit', 'letter-leading'),
+    'helper-hd-round11-assignment-escaped-dollar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-nested': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-tail-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-value-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-assignment-whole-quoted': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-command-comment': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-command-escaped-dollar': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-command-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-command-outer-doublequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-command-safe-positional': ('all-digit', 'letter-leading'),
+    'helper-hd-round11-command-tail-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-arithmetic-after-redir': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-array-DATA-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-builtin-arith': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-builtin-index': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-command-arith': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-command-index': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-function-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-if-adjacent-tail': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-if-escaped-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-if-quoted-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-prefix-time-quoted-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-builtin-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-command-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-env-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-escaped-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-later-argument': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-path-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-quoted-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-quoted-time': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-quoted-time-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-time-printf-quoted-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round11-time-unknown-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-arithmetic-continued-opener': ('all-digit',),
+    'helper-hd-round4-arithmetic-diagnostic': ('all-digit',),
+    'helper-hd-round4-arithmetic-diagnostic-direct': ('all-digit',),
+    'helper-hd-round4-arithmetic-diagnostic-echo': ('all-digit',),
+    'helper-hd-round4-arithmetic-safe-conservative': ('all-digit', 'letter-leading'),
+    'helper-hd-round4-escaped-error-word-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-inner-command-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-nested-command-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-qualified-command-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-cat-command-redirection-target-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-cat-command-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-cat-command-upper-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-cat-default': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-command-cat-data-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-command-qualified-target-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-command-unshadowed-target-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-shadow-tee-default': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-unshadowed-command-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round4-unshadowed-command-upper-report-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-array-direct-diagnostic': ('all-digit',),
+    'helper-hd-round5-array-index-diagnostic': ('all-digit',),
+    'helper-hd-round5-array-indirect-index-diagnostic': ('all-digit',),
+    'helper-hd-round5-array-length-index-diagnostic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-array-safe-positional-conservative': ('all-digit', 'letter-leading'),
+    'helper-hd-round5-case-captured-stdout-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-case-no-output-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-complex-tail-inert-positional-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-initialized-array-length-diagnostic': ('all-digit',),
+    'helper-hd-round5-initialized-named-substring-diagnostic': ('all-digit',),
+    'helper-hd-round5-named-substring-diagnostic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round5-substring-echo-diagnostic': ('all-digit',),
+    'helper-hd-round5-substring-heredoc-apostrophe-literal': ('all-digit',),
+    'helper-hd-round5-substring-length-diagnostic': ('all-digit',),
+    'helper-hd-round5-substring-offset-diagnostic': ('all-digit',),
+    'helper-hd-round5-substring-safe-positional-conservative': ('all-digit', 'letter-leading'),
+    'helper-hd-round5-zero-substring-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-after-array-close': ('all-digit',),
+    'helper-hd-round6-legacy-array-initialized': ('all-digit',),
+    'helper-hd-round6-legacy-array-unset': ('all-digit',),
+    'helper-hd-round6-legacy-body-apostrophes': ('all-digit',),
+    'helper-hd-round6-legacy-body-doublequotes': ('all-digit',),
+    'helper-hd-round6-legacy-continued-opener': ('all-digit',),
+    'helper-hd-round6-legacy-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-direct-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-double-escaped-opener': ('all-digit',),
+    'helper-hd-round6-legacy-echo-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-nested-legacy': ('all-digit', 'letter-leading'),
+    'helper-hd-round6-legacy-nested-legacy-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-nested-modern-diagnostic': ('all-digit',),
+    'helper-hd-round6-legacy-operand-doublequote': ('all-digit',),
+    'helper-hd-round6-legacy-operand-escaped': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round6-legacy-safe-positional': ('all-digit', 'letter-leading'),
+    'helper-hd-round7-backtick-escaped-comment-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-backtick-singlequote-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-command-substitution-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-command-substitution-singlequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-error-set-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-error-substitution-literal-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-modern-doublequote': ('all-digit',),
+    'helper-hd-round7-modern-escaped-operand': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round7-parameter-substring-unset-singlequote': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-known-echo-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-opaque-eval-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-opaque-source-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-opaque-trap-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-unresolved-echo-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-unresolved-printf-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-unresolved-quiet-shadow': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-unresolved-read-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round8-unresolved-true-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-attributes-cat-A': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-attributes-fallback-a': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-attributes-ordinary-a': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-nested-cat-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-nested-cat-escaped-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-nested-cat-quoted-delimiter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-nested-printf-inert': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-nested-read-stores': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-round9-positional-error-set-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-alias-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-alias-stdout-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-alias-stdout-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-alias-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-arith-null-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-arith-null-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-assign-printf-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-assign-printf-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-colon-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-command-other-null': ('all-digit',),
+    'helper-hd-routing-command-overwritten-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-declare-index-stderr-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-direct-stdout-fd2-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-dup-to-fd2-null-before': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-emit-uninvoked-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-expansion-self-null': ('all-digit',),
+    'helper-hd-routing-func-stdout-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-func-stdout-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-function-cyclic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-function-index-mismatch': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-function-index1-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-function-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-function-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-helper-arith-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-helper-index-diagnostic': ('all-digit',),
+    'helper-hd-routing-helper-index-null-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-helper-quoted-guard-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-helper-stderr-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-index-null-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-index-null-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-later-emitter-definition-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-nested-capture-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-nested-capture-source': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-nonconsumer-trace-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-null-quoted-path-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-override-before-call-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-printf-index-stderr-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-program-xtrace-future': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-quoted-redirection-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-command-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-empty-arg': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-expansion-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-index-mismatch': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-literal-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-multiple-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-safe-escaped-close': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-safe-quoted-close': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-stdout-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-receiver-token-second': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-saved-fd-overwrite-leak': ('all-digit',),
+    'helper-hd-routing-stdout-dot': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-trace-disable-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-trace-sibling-quiet': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-typeset-index-stderr-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-uninvoked-helper-arithmetic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-routing-uninvoked-helper-two-statements': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-.-quiet-fd3': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-declare--a': ('all-digit',),
+    'helper-hd-siblings-declare--g': ('all-digit',),
+    'helper-hd-siblings-declare--ga': ('all-digit',),
+    'helper-hd-siblings-declare-existing-DATA': ('all-digit', 'letter-leading'),
+    'helper-hd-siblings-declare-mixed-index-quoting': ('all-digit',),
+    'helper-hd-siblings-declare-plain': ('all-digit',),
+    'helper-hd-siblings-declare-with-array-declaration': ('all-digit',),
+    'helper-hd-siblings-local-existing-covered': ('all-digit',),
+    'helper-hd-siblings-nonconsumer-cat': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-nonconsumer-printf': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-printf-repeated-indexed-last': ('all-digit',),
+    'helper-hd-siblings-printf-repeated-safe-last': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-printf-v-attached': ('all-digit',),
+    'helper-hd-siblings-printf-v-no-array-declaration': ('all-digit',),
+    'helper-hd-siblings-printf-v-separate': ('all-digit',),
+    'helper-hd-siblings-quiet-cat-fd3-producer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-declare-associative-explicit': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-declare-f': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-declare-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-declare-value-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-devfd0-program-noop-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-devfd0-program-stdout-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-export': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-getopts': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-let': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-nonconsumer-fd0': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-other-filename': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-prefix-path-concatenation': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-printf-assigned': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-program-noop-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-program-stdout-captured': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-process-suffix-path-concatenation': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-read-a': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-readonly': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-disabled': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-escaped': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-forward-use': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-no-trailing-blank': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-safe-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-same-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-trailing-uninvoked': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-typeset-f': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-typeset-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-quiet-wait-n-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-source-quiet-fd3': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-trailing-quoted-nextword': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-siblings-typeset--a': ('all-digit',),
+    'helper-hd-siblings-typeset--g': ('all-digit',),
+    'helper-hd-siblings-typeset--ga': ('all-digit',),
+    'helper-hd-siblings-typeset-mixed-index-quoting': ('all-digit',),
+    'helper-hd-siblings-typeset-plain': ('all-digit',),
+    'helper-hd-siblings-typeset-with-array-declaration': ('all-digit',),
+    'helper-hd-substitution-quoted-data-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-bound-invalid-runtime-option': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-inputoverride': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-invalidoption': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-nonconsumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-nontee-consumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-nullrelay': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-tee-relay-pipeline-unsupported-builtin-relay': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-after-enable-qu': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-after-enable-uq': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-os': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-p': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-q': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-qsu': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-qsx': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-qu': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-qus': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-uq': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-alias-xqs': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-brace-literal-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-brace-reply-literal-positional': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-herestring-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-herestring-printf': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-herestring-read': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-herestring-source-literal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-hd-three-herestring-source-nonstdin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-heredoc-backtick-2-backslashes': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-heredoc-backtick-3-backslashes': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-heredoc-backtick-quoted-positional-data-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-heredoc-modern-substitution-escaped-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-heredoc-positional-substitution-quoted-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-herestring-to-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-piped-into-consumer': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-redefinitions-chain-before-call-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-redefinitions-direct-before-call-safe': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-redefinitions-direct-false-later-emitter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-redefinitions-direct-later-emitter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-body-file-capture': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-body-file-pipeline': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-caller-joins-stderr-capture': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-caller-shields-stderr-pipeline': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-later-stderr-body': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'helper-routing-stdout-stderr-redirection-capture': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'mapfile-callback-options-unknown-array-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'mapfile-callback-options-unknown-delimiter-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-break': ('all-digit',),
+    'numeric-continue': ('all-digit',),
+    'numeric-exit': ('all-digit',),
+    'numeric-exit-stderr-discarded': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-exit-stderr-piped': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'numeric-history': ('all-digit',),
+    'numeric-return': ('all-digit',),
+    'numeric-shift': ('all-digit',),
+    'numeric-ulimit': ('all-digit',),
+    'pipe-into-brace-group': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pipe-into-subshell': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'pipe-through-tee-into-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-option-a-lowercase-special': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-option-a-readline-target': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-option-a-string-conversion-only': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-alias-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-ansi-numeric-format': ('all-digit',),
+    'printf-v-ansi-text-format': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-array-target-literal': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-attached-delimited-numeric': ('all-digit',),
+    'printf-v-attached-dynamic-format': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-attached-numeric': ('all-digit',),
+    'printf-v-attached-numeric-i': ('all-digit',),
+    'printf-v-attached-repeat-numeric': ('all-digit',),
+    'printf-v-builtin-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-command-noop-wrapper': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-command-path-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-command-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-command-query': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-continued-noop-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-array-default-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-default-colon-data': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-escaped-legacy': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-histfile-point': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-ordinary-array': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-ordinary-legacy-arithmetic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-ordinary-substring': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-eligibility-ordinary-token-substring': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-glob-numeric-format': ('all-digit',),
+    'printf-v-integer-scalar-target': ('all-digit', 'letter-leading'),
+    'printf-v-literal-assignment-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-locale-lang': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-locale-lc_custom': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-locale-lc_monetary': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-editor-point': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-fcedit-point': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-inputrc-point': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-mail': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-mailpath': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-pwd-noninteractive-point': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-managed-pwd-prompt': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-manual-legacy-ordinary-after-index': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-nameref-scalar-target': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-ordinary-assignment-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-prompt-prompt_command': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-prompt-ps0': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-prompt-ps1': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-prompt-ps2': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-prompt-ps3': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-restored-builtin': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-array-default-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-array-set': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-callback-attached': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-callback-dynamic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-callback-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-count-length-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-heredoc-literal-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-heredoc-plain': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-heredoc-quoted-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-herestring-escaped-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-herestring-plain': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-herestring-quoted-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-offset-literal-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-positional-set': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-time-p-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-time-reserved-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-round-six-time-reserved-negated-control': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-shadowed-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-split-keyword-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-value-arithmetic-clean-point': ('all-digit', 'letter-leading'),
+    'printf-v-value-escaped-arithmetic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-value-ordinary-arithmetic': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'printf-v-value-ordinary-default': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'procsub-input-into-filter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-callback-unknown-prefix-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-callback-unknown-prefix-known-final': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-mapfile-unknown-final-after-known-pair': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-mapfile-unknown-final-callback': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-readarray-unknown-final-after-known-pair': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'r4-readarray-unknown-final-callback': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'read-numeric-option-attached': ('all-digit',),
+    'read-numeric-option-bundled': ('all-digit',),
+    'read-numeric-option-nchars': ('all-digit',),
+    'read-numeric-option-timeout': ('all-digit',),
+    'read-prompt-after-delimiter': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'read-prompt-attached': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'read-prompt-separate': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'readarray-callback-options-unknown-array-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'readarray-callback-options-unknown-delimiter-prefix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'redir-glued-ampersand-to-file': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'shadowed-emitter-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'shape-legacy-dollar': ('letter-leading',),
+    'shape-modern-dollar': ('letter-leading',),
+    'shape-statement-dollar': ('all-digit', 'letter-leading'),
+    'subshell-inside-capture-stderr-only': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-bundle-shopt-disable-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-disable-in-called-commented-header-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-disable-in-called-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-disable-in-called-next-line-function': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-inherited-indexed-literal-conservative': ('all-digit', 'letter-leading'),
+    'xtrace-inherited-integration-shopt-unknown-flags-safe-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-inherited-integration-shopt-unknown-name-safe-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-inherited-integration-unknown-set-safe-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review-shopt-unresolved-conflict': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review2-set-bundled-plus-no-disable-credit': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review2-set-unresolved-named-e-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review2-set-unresolved-named-pipefail-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review2-set-unresolved-next-name-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review2-set-unresolved-next-name-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-malformed-prefix-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-malformed-prefix-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-disable-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-disable-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-e-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-e-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-named-disable-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-named-disable-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-ordinary-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-quoted-ordinary-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unquoted-e-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unquoted-e-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unquoted-ordinary-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unquoted-ordinary-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unresolved-plus-o-safe-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review3-unresolved-plus-o-safe-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-minus-o-invalid-name-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-minus-o-invalid-name-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-plus-zox-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-plus-zox-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-set-eoz-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-set-eoz-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-set-zox-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-set-zox-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-query-unknown-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-query-unknown-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-empty-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-empty-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-safe-flags-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-safe-flags-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-safe-name-conservative': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'xtrace-review4-shopt-unknown-safe-name-conservative-deferred': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+}
+
+ORACLE_SHAPE_PROBES = (
+    ("shape-modern-bare", 'echo $((GH_TOKEN))\n'),
+    ("shape-modern-dollar", 'echo $(( $GH_TOKEN ))\n'),
+    ("shape-legacy-bare", 'echo $[GH_TOKEN]\n'),
+    ("shape-legacy-dollar", 'echo $[ $GH_TOKEN ]\n'),
+    ("shape-statement-bare", '(( GH_TOKEN ))\n'),
+    ("shape-statement-dollar", '(( $GH_TOKEN ))\n'),
+    ("shape-lower", 'echo "${GH_TOKEN,,}"\n'),
+    ("shape-upper", 'echo "${GH_TOKEN^^}"\n'),
+    ("shape-at-L", 'echo "${GH_TOKEN@L}"\n'),
+    ("shape-at-U", 'echo "${GH_TOKEN@U}"\n'),
+)
+
+
+# The ten already-measured arithmetic/case probes now join the ordinary matrix.
+ORACLE_SHAPE_RULES = {
+    'shape-at-L': 'flag',
+    'shape-at-U': 'flag',
+    'shape-legacy-bare': 'clean',
+    'shape-legacy-dollar': 'flag',
+    'shape-lower': 'flag',
+    'shape-modern-bare': 'clean',
+    'shape-modern-dollar': 'flag',
+    'shape-statement-bare': 'clean',
+    'shape-statement-dollar': 'flag',
+    'shape-upper': 'flag',
+}
+CORPUS += [(cid, ORACLE_SHAPE_RULES[cid], body) for cid, body in ORACLE_SHAPE_PROBES]
+
+KNOWN_MISSES.update({
+    'numeric-let-clean': 'Digit-leading nonnumeric sample appears in full on stderr while scanner stays clean; measured shape-specific inherited miss, no resolution claim.',
+    'printf-v-manual-indirect-valid-name': 'Digit-leading nonnumeric sample appears in full on stderr while scanner stays clean; measured shape-specific inherited miss, no resolution claim.',
+    'shape-legacy-bare': 'Measured #1036 shape-specific arithmetic sample: the named nonnumeric/numeric sample reaches a stream while the unchanged scanner stays clean; no arithmetic or command-resolution model is added.',
+    'shape-modern-bare': 'Measured #1036 shape-specific arithmetic sample: the named nonnumeric/numeric sample reaches a stream while the unchanged scanner stays clean; no arithmetic or command-resolution model is added.',
+    'shape-statement-bare': 'Measured #1036 shape-specific arithmetic sample: the named nonnumeric/numeric sample reaches a stream while the unchanged scanner stays clean; no arithmetic or command-resolution model is added.',
+})
+
+KNOWN_BROADER.update({
+    'gen-bracket-numeric-eq-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-eq-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-ge-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-ge-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-gt-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-gt-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-le-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-le-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-lt-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-lt-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-ne-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-bracket-numeric-ne-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-O': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-after-delimiter': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-attached': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-c': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-n': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-s': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-mapfile-numeric-option-wrapped': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-O': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-after-delimiter': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-attached': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-c': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-n': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-s': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-readarray-numeric-option-wrapped': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-eq-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-eq-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-ge-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-ge-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-gt-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-gt-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-le-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-le-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-lt-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-lt-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-ne-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'gen-test-numeric-ne-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-central-arithmetic-expansion': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-four-indexed-declare-array-plus': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-four-indexed-declare-global-plus': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-four-indexed-declare-plus': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-four-indexed-typeset-plus': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-bracket-v': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-read': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-read-delimiter-then-name': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-read-double-dash': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-test-bracket': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-test-negation': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-test-v': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-unset': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-unset-double-dash': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-later-three-unset-v': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-mixed-second': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-ordered-null-overwrite': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-return-to-stderr-before-copy': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-second': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-second-test': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-second-timeout': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-shadowed-return-builtin': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-numeric-shadowed-return-command': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-bracket': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-exit': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-helper-token': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-inner-captured-error': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-mapfile-count': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-read-count': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-read-timeout': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-return': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-shift': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-test-left': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-owner-structural-unsolicited-numeric-test-right': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round10-sub-arithmetic-deferred-child-one': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round10-sub-arithmetic-deferred-one-hop': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round4-arithmetic-continued-opener': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round4-arithmetic-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round4-arithmetic-diagnostic-direct': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round4-arithmetic-diagnostic-echo': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-array-direct-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-array-index-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-array-indirect-index-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-initialized-array-length-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-initialized-named-substring-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-substring-echo-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-substring-heredoc-apostrophe-literal': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-substring-length-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-substring-offset-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round5-zero-substring-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-after-array-close': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-array-initialized': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-array-unset': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-body-apostrophes': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-body-doublequotes': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-continued-opener': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-direct-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-double-escaped-opener': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-echo-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-nested-legacy-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-nested-modern-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round6-legacy-operand-doublequote': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-round7-modern-doublequote': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-routing-command-other-null': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-routing-expansion-self-null': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-routing-helper-index-diagnostic': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-routing-saved-fd-overwrite-leak': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare--a': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare--g': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare--ga': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare-mixed-index-quoting': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare-plain': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-declare-with-array-declaration': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-local-existing-covered': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-printf-repeated-indexed-last': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-printf-v-attached': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-printf-v-no-array-declaration': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-printf-v-separate': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset--a': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset--g': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset--ga': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset-mixed-index-quoting': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset-plain': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'helper-hd-siblings-typeset-with-array-declaration': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-break': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-continue': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-exit': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-history': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-return': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-shift': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'numeric-ulimit': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-ansi-numeric-format': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-attached-delimited-numeric': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-attached-numeric': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-attached-numeric-i': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-attached-repeat-numeric': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'printf-v-glob-numeric-format': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'read-numeric-option-attached': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'read-numeric-option-bundled': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'read-numeric-option-nchars': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'read-numeric-option-timeout': 'For the all-digit 73919 sample, complete measured streams contain no recognized full value and no literal sample fragment of four or more characters; scanner retains its conservative FLAG. This is a sampled, shape-specific differential, not universal quietness or arithmetic-resolution proof.',
+    'shape-legacy-dollar': 'Measured #1036 shape-specific arithmetic sample: the unchanged scanner flags the explicit reference while the named sample has no recognized stream emission; other shapes differ. No arithmetic evaluation model is claimed.',
+    'shape-modern-dollar': 'Measured #1036 shape-specific arithmetic sample: the unchanged scanner flags the explicit reference while the named sample has no recognized stream emission; other shapes differ. No arithmetic evaluation model is claimed.',
+    'shape-statement-dollar': 'Measured #1036 shape-specific arithmetic sample: the unchanged scanner flags the explicit reference while the named sample has no recognized stream emission; other shapes differ. No arithmetic evaluation model is claimed.',
+})
+
+# These historical literal tokens never asserted a scanner rule. Keep their
+# spelling, report them as observations, and reject new opaque labels.
+ORACLE_OPAQUE_RULES = {
+    'helper-hd-later-three-alias-chain': 'MUST_FLAG',
+    'helper-hd-later-three-alias-leak%': 'MUST_FLAG',
+    'helper-hd-later-three-alias-leak+': 'MUST_FLAG',
+    'helper-hd-later-three-alias-leak,': 'MUST_FLAG',
+    'helper-hd-later-three-alias-leak@': 'MUST_FLAG',
+    'helper-hd-later-three-bracket-v': 'MUST_FLAG',
+    'helper-hd-later-three-chain-cycle': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-chain-long': 'MUST_FLAG',
+    'helper-hd-later-three-chain-punctuation': 'MUST_FLAG',
+    'helper-hd-later-three-chain-quoted-hd': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-chain-reverse': 'MUST_FLAG',
+    'helper-hd-later-three-punctuation-quoted-hd': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-read': 'MUST_FLAG',
+    'helper-hd-later-three-read-delimiter-then-name': 'MUST_FLAG',
+    'helper-hd-later-three-read-double-dash': 'MUST_FLAG',
+    'helper-hd-later-three-read-literal-name': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-read-quoted-hd': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-test-bracket': 'MUST_FLAG',
+    'helper-hd-later-three-test-literal-name': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-test-negation': 'MUST_FLAG',
+    'helper-hd-later-three-test-v': 'MUST_FLAG',
+    'helper-hd-later-three-test-v-quoted-hd': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-unset': 'MUST_FLAG',
+    'helper-hd-later-three-unset-double-dash': 'MUST_FLAG',
+    'helper-hd-later-three-unset-literal-name': 'MUST_NOT_FLAG',
+    'helper-hd-later-three-unset-v': 'MUST_FLAG',
+}
+
+# A real four-digit prefix is below the numeric whole-value floor. This is
+# source/sample/stream-pinned measurement loss, never scanner conservatism.
+ORACLE_MEASUREMENT_LIMITS = {
+    ('expansion-substring-at-floor', 'all-digit'): {
+        'body_sha256': '17b909b80af9e00133bb06b0266a00f7735cbe7dbcf402f2c0a9991349be8419',
+        'source_sha256': '7a60067cb31e56e94a9bd5f68a9f2bd8aed47d587c12e9438a5157f97ac4d6ba',
+        'value': '73919', 'floor': 5,
+        'stdout': '7391\n', 'stderr': '',
+        'recognized': False, 'flagged': True,
+    },
+}
+
+
+def _oracle_declared_shapes(registry, scopes, cid):
+    if cid not in registry:
+        return ()
+    return scopes.get(cid, (DEFAULT_ORACLE_SAMPLE.name,))
+
+
+def _oracle_measurement_limit(cid, body, sample, leaked, out, err, flagged):
+    """None outside the finite inventory; a boolean pins every admitted limit."""
+    expected = ORACLE_MEASUREMENT_LIMITS.get((cid, sample.name))
+    if expected is None:
+        return None
+    import hashlib
+    digest = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (digest(body) == expected["body_sha256"]
+            and digest(oracle_prologue(sample) + body) == expected["source_sha256"]
+            and sample.value == expected["value"]
+            and sample.minimum_fragment == expected["floor"]
+            and out == expected["stdout"] and err == expected["stderr"]
+            and leaked is expected["recognized"] and flagged is expected["flagged"])
+
+
+def _oracle_sample_cases():
+    """Data-only source/recognizer checks; no shell process or global writes."""
     failures = []
+    labels = {sample.name for sample in ORACLE_SAMPLES}
+    if len(ORACLE_SAMPLES) != 3 or len(labels) != 3:
+        failures.append("oracle samples: need three unique immutable shapes")
+    if oracle_prologue() != PROLOGUE:
+        failures.append("oracle samples: legacy prologue changed")
+    if _oracle_sample_windows(DEFAULT_ORACLE_SAMPLE) != _SENTINEL_WINDOWS:
+        failures.append("oracle samples: legacy raw windows changed")
+    for sample in ORACLE_SAMPLES:
+        if sentinel_shape(sample) != sample.name:
+            failures.append("oracle samples: label/value mismatch " + sample.name)
+        if sample.minimum_fragment < 1 or sample.minimum_fragment > len(sample.value):
+            failures.append("oracle samples: unusable floor " + sample.name)
+            continue
+        if oracle_prologue(sample).count("='" + sample.value + "'") != 2:
+            failures.append("oracle samples: prologue binding " + sample.name)
+        for window in _oracle_sample_windows(sample):
+            if not sentinel_reached("", "noise " + window, sample=sample):
+                failures.append("oracle samples: raw fragment lost " + sample.name)
+        below = sample.value[:sample.minimum_fragment - 1]
+        if sentinel_reached("noise " + below, sample=sample):
+            failures.append("oracle samples: below-floor match " + sample.name)
+        for transformed in (sample.value.lower(), sample.value.upper()):
+            if not sentinel_reached(transformed, sample=sample):
+                failures.append("oracle samples: whole case transform lost " + sample.name)
+        if sentinel_reached(None, "", "plain safe 0123456789", sample=sample):
+            failures.append("oracle samples: unrelated noise matched " + sample.name)
+        if sample.value.isdigit():
+            if sample.minimum_fragment != len(sample.value):
+                failures.append("oracle samples: numeric floor is not whole value")
+        elif any(not (any(c.isupper() for c in w) and any(c.isdigit() for c in w))
+                 for w in _oracle_sample_windows(sample)):
+            failures.append("oracle samples: raw uppercase/digit proof lost " + sample.name)
+    # The new leading four-character fragment is deliberately outside the
+    # old windows: this pins per-cell matcher binding, despite shared suffixes.
+    digit = ORACLE_SAMPLES[1]
+    if (sentinel_reached(digit.value[:4])
+            or not sentinel_reached(digit.value[:4], sample=digit)):
+        failures.append("oracle samples: digit-leading matcher binding lost")
+    if sentinel_reached(DEFAULT_ORACLE_SAMPLE.value[:4].lower()):
+        failures.append("oracle samples: partial transformed value exceeded whole-only bound")
+    numeric = ORACLE_SAMPLES[2]
+    for noise in ("73918 73920", "line 73: status 919", "/tmp/oracle.case123/fixture.sh"):
+        if sentinel_reached(noise, sample=numeric):
+            failures.append("oracle samples: numeric noise control matched")
+    # Pure scope lookup controls: legacy defaults and shape-only declarations
+    # do not mutate the real registries or waive another sample's stale check.
+    synthetic = {"legacy": "reason", "numeric": "reason"}
+    synthetic_scopes = {"numeric": ("all-digit",)}
+    if (_oracle_declared_shapes(synthetic, synthetic_scopes, "legacy") != ("letter-leading",)
+            or _oracle_declared_shapes(synthetic, synthetic_scopes, "numeric") != ("all-digit",)
+            or _oracle_declared_shapes(synthetic, synthetic_scopes, "absent")):
+        failures.append("oracle samples: declaration scope lookup changed")
+    for registry, scopes in ((KNOWN_MISSES, KNOWN_MISS_SHAPES),
+                             (KNOWN_BROADER, KNOWN_BROADER_SHAPES)):
+        for cid, names in scopes.items():
+            if cid not in registry or not names or len(set(names)) != len(names) or set(names) - labels:
+                failures.append("oracle samples: invalid declaration scope " + cid)
+    effective_opaque = {cid: rule for cid, rule, _body in CORPUS
+                        if rule not in (MUST_FLAG, MUST_NOT_FLAG)}
+    if effective_opaque != ORACLE_OPAQUE_RULES:
+        failures.append("oracle samples: historical opaque rule inventory changed")
+    if set(ORACLE_SHAPE_RULES) != {cid for cid, _body in ORACLE_SHAPE_PROBES}:
+        failures.append("oracle samples: probe/rule inventory mismatch")
+    bodies = {cid: body for cid, _rule, body in CORPUS}
+    for (cid, shape), expected in ORACLE_MEASUREMENT_LIMITS.items():
+        sample = next((sample for sample in ORACLE_SAMPLES if sample.name == shape), None)
+        if (cid not in bodies or sample is None or cid in KNOWN_BROADER
+                or _oracle_measurement_limit(cid, bodies.get(cid, ""), sample,
+                    False, "7391\n", "", True) is not True):
+            failures.append("oracle samples: invalid measurement-limit inventory " + cid)
+            continue
+        for out, err, leaked, flagged in (("73919\n", "", True, True),
+                                          ("", "", False, True),
+                                          ("7391\n", "", False, False)):
+            if _oracle_measurement_limit(cid, bodies[cid], sample, leaked, out, err, flagged):
+                failures.append("oracle samples: stale measurement-limit accepted " + cid)
+        if (sentinel_reached("7391", sample=sample)
+                or not sentinel_reached("73919", sample=sample)):
+            failures.append("oracle samples: measurement-limit recognition boundary changed")
+    return failures
+
+
+def self_test():
+    import hashlib
+    import json
+
+    failures = []
+    # Evidence is additive to the existing outcomes; no cell is run twice.
+    tilde_evidence_seen = set()
+    try:
+        with open(__file__, "rb") as source_file:
+            tilde_source_sha256 = hashlib.sha256(source_file.read()).hexdigest()
+    except OSError as exc:
+        tilde_source_sha256 = None
+        failures.append("eval tilde evidence unavailable: source digest: %s" % exc)
     passed = 0
     tp = fn = fp = tn = 0
+    rule_cells_passed = opaque_rule_cells = completed = measurement_limited = 0
+    seen_limits = set()
+    shape_counts = {sample.name: dict(tp=0, fn=0, fp=0, tn=0, limited=0) for sample in ORACLE_SAMPLES}
     bash_path, bash_text, _bash_ver = oracle_bash()
     quiet_eval_tilde_samples = set()
 
+    # A direct self_test() call must reject stale protected source or an old
+    # interpreter before any cell can be submitted, not merely fail afterward.
+    startup_failures = _oracle_signal_inventory_cases() + _oracle_interpreter_cases()
+    if startup_failures:
+        for failure in startup_failures:
+            print(failure, file=sys.stderr)
+        return 1
+
     failures.extend(_corpus_id_cases())
+    failures.extend(_oracle_sample_cases())
+    failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
     failures.extend(_ansi_c_quote_cases())
@@ -16028,98 +17448,167 @@ def self_test():
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
-        def _one(entry):
+        def _one(cell):
+            entry, sample = cell
             cid, _disposition, body = entry
-            fixture_dir = os.path.join(tmp, cid)
+            fixture_dir = os.path.join(tmp, cid, sample.name)
             os.makedirs(fixture_dir, exist_ok=True)
-            return run_oracle(body, fixture_dir, "fixture.sh")
+            return run_oracle(body, fixture_dir, "fixture.sh", sample=sample, fixture_id=cid)
 
+        cells = [(entry, sample) for entry in CORPUS for sample in ORACLE_SAMPLES]
         workers = min(16, max(4, (os.cpu_count() or 4) * 2))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            oracle_results = list(pool.map(_one, CORPUS))
+            oracle_results = list(pool.map(_one, cells))
 
-        for (cid, disposition, body), (leaked, out, err) in zip(
-            CORPUS, oracle_results
+        for ((cid, disposition, body), sample), (leaked, out, err) in zip(
+            cells, oracle_results
         ):
-            findings, pragma_errors = scan_text(PROLOGUE + body, cid + "/fixture.sh")
+            cell_name = "%s [%s]" % (cid, sample.name)
+            findings, pragma_errors = scan_text(oracle_prologue(sample) + body, cid + "/fixture.sh")
             flagged = bool(findings) or bool(pragma_errors)
 
-            if disposition == MUST_FLAG and not flagged:
+            if cid in EVAL_ASSIGNMENT_TILDE_MISSES:
+                tilde_evidence_seen.add((cid, sample.name))
+                fixture_text = oracle_prologue(sample) + body
+                fixture_sha256 = hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+                actual_fixture_sha256 = None
+                try:
+                    with open(os.path.join(tmp, cid, sample.name, "fixture.sh"), "rb") as fixture_file:
+                        actual_fixture_sha256 = hashlib.sha256(fixture_file.read()).hexdigest()
+                except OSError as exc:
+                    failures.append("eval tilde evidence unavailable: %s: %s" % (cell_name, exc))
+                evidence_status = "complete"
+                if tilde_source_sha256 is None or actual_fixture_sha256 != fixture_sha256:
+                    evidence_status = "unavailable"
+                    failures.append("eval tilde evidence unavailable: source/fixture binding: " + cell_name)
+                stdout_bytes, stderr_bytes = out.encode("utf-8"), err.encode("utf-8")
+                stream_excess = max(len(stdout_bytes), len(stderr_bytes)) > 16384
+                if stream_excess:
+                    evidence_status = "stream-excess"
+                    failures.append("eval tilde evidence unavailable: stream exceeds 16384 bytes: " + cell_name)
+                print("check_no_token_in_output: eval-tilde-evidence " + json.dumps({
+                    "cid": cid, "sample": sample._asdict(), "body": body,
+                    "sample_sha256": hashlib.sha256(json.dumps(sample._asdict(), sort_keys=True).encode("utf-8")).hexdigest(),
+                    "stream_representation": "existing run_oracle UTF-8 decoded text (replace)",
+                    "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "fixture": cid + "/" + sample.name + "/fixture.sh",
+                    "fixture_sha256": fixture_sha256,
+                    "actual_fixture_sha256": actual_fixture_sha256,
+                    "source_sha256": tilde_source_sha256, "bash_version": bash_text,
+                    "oracle_status": "unavailable" if leaked is None else "completed",
+                    "process_returncode": None,
+                    "process_returncode_note": "not exposed by the existing run_oracle API",
+                    "evidence_status": evidence_status,
+                    "leaked": leaked, "flagged": flagged,
+                    "stdout": None if stream_excess else out,
+                    "stderr": None if stream_excess else err,
+                    "streams_omitted": stream_excess, "stream_byte_limit": 16384,
+                    "stdout_bytes": len(stdout_bytes), "stderr_bytes": len(stderr_bytes),
+                    "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+                    "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+                }, sort_keys=True))
+
+            if disposition not in (MUST_FLAG, MUST_NOT_FLAG):
+                opaque_rule_cells += 1
+                if ORACLE_OPAQUE_RULES.get(cid) != disposition:
+                    failures.append("%s: unknown opaque rule token %r" % (cell_name, disposition))
+            elif disposition == MUST_FLAG and not flagged:
                 failures.append(
                     "%s: the rule says FLAG and the scanner reported clean\n"
                     "    source: %s\n    oracle leaked: %s"
-                    % (cid, body.strip().replace("\n", "\\n"), leaked)
+                    % (cell_name, body.strip().replace("\n", "\\n"), leaked)
                 )
             elif disposition == MUST_NOT_FLAG and flagged:
                 failures.append(
                     "%s: the rule says CLEAN and the scanner flagged %s\n"
                     "    source: %s"
-                    % (
-                        cid,
-                        "; ".join(str(f) for f in findings) or pragma_errors,
-                        body.strip().replace("\n", "\\n"),
-                    )
+                    % (cell_name, "; ".join(str(f) for f in findings) or pragma_errors,
+                       body.strip().replace("\n", "\\n"))
                 )
             else:
-                passed += 1
+                rule_cells_passed += 1
+                if sample == DEFAULT_ORACLE_SAMPLE:
+                    passed += 1
 
             if leaked is None:
-                failures.append("%s: %s" % (cid, err))
+                failures.append("%s: %s" % (cell_name, err))
                 continue
 
-            # -- the differential ------------------------------------------
+            completed += 1
+            limit_matches = _oracle_measurement_limit(cid, body, sample, leaked, out, err, flagged)
+            if limit_matches is not None:
+                seen_limits.add((cid, sample.name))
+                if not limit_matches:
+                    failures.append("STALE measurement-limit entry %r: source/sample/streams/verdict changed" % cell_name)
+                else:
+                    measurement_limited += 1
+                    shape_counts[sample.name]["limited"] += 1
+                continue
+
+            declared_miss = sample.name in _oracle_declared_shapes(KNOWN_MISSES, KNOWN_MISS_SHAPES, cid)
+            declared_broader = sample.name in _oracle_declared_shapes(KNOWN_BROADER, KNOWN_BROADER_SHAPES, cid)
+            counts = shape_counts[sample.name]
             if leaked and flagged:
                 tp += 1
+                counts["tp"] += 1
             elif leaked and not flagged:
                 fn += 1
-                if cid not in KNOWN_MISSES:
+                counts["fn"] += 1
+                if not declared_miss:
                     failures.append(
                         "FALSE NEGATIVE (undeclared): %s\n"
                         "    source: %s\n"
-                        "    bash put the sentinel on a stream; the scanner "
-                        "reported clean\n"
+                        "    bash put this sample on a stream; the scanner reported clean\n"
                         "    stdout: %r\n    stderr: %r"
-                        % (cid, body.strip().replace("\n", "\\n"), out[:200], err[:200])
+                        % (cell_name, body.strip().replace("\n", "\\n"), out[:200], err[:200])
                     )
             elif (not leaked) and flagged:
                 fp += 1
-                if cid not in KNOWN_BROADER:
+                counts["fp"] += 1
+                if not declared_broader:
                     failures.append(
                         "FALSE POSITIVE (undeclared): %s\n"
                         "    source: %s\n"
-                        "    bash put nothing on either stream; the scanner "
-                        "flagged %s"
-                        % (
-                            cid,
-                            body.strip().replace("\n", "\\n"),
-                            "; ".join(str(f) for f in findings) or pragma_errors,
-                        )
+                        "    no sample recognized on either stream; scanner flagged %s\n"
+                        "    stdout: %r\n    stderr: %r"
+                        % (cell_name, body.strip().replace("\n", "\\n"),
+                           "; ".join(str(f) for f in findings) or pragma_errors,
+                           out[:200], err[:200])
                     )
             else:
                 tn += 1
+                counts["tn"] += 1
 
-            # Only the four inherited tilde cases on the exact observed quiet
-            # build qualify; every other declaration retains normal stale checks.
+            # The same four bodies were measured quiet for all three samples
+            # on these exact builds; this does not generalize to all Bash 5.3.
             if (cid in EVAL_ASSIGNMENT_TILDE_MISSES
-                    and bash_text == EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE
+                    and bash_text in EVAL_ASSIGNMENT_TILDE_QUIET_ORACLES
                     and not leaked and not flagged):
-                quiet_eval_tilde_samples.add(cid)
+                quiet_eval_tilde_samples.add((cid, sample.name))
             minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
             unsupported_miss = (minimum_bash is not None and _bash_ver is not None
-                                and _bash_ver < minimum_bash) or cid in quiet_eval_tilde_samples
-            if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
+                                and _bash_ver < minimum_bash) or (
+                                    (cid, sample.name) in quiet_eval_tilde_samples)
+            if declared_miss and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
-                    "the oracle (leaked=%s flagged=%s) -- delete it"
-                    % (cid, leaked, flagged)
+                    "the oracle (leaked=%s flagged=%s) -- delete that shape scope"
+                    % (cell_name, leaked, flagged)
                 )
-            if cid in KNOWN_BROADER and not ((not leaked) and flagged):
+            if declared_broader and not ((not leaked) and flagged):
                 failures.append(
                     "STALE KNOWN_BROADER entry %r: it no longer disagrees with "
-                    "the oracle (leaked=%s flagged=%s) -- delete it"
-                    % (cid, leaked, flagged)
+                    "the oracle (leaked=%s flagged=%s) -- delete that shape scope"
+                    % (cell_name, leaked, flagged)
                 )
 
+        expected_tilde_evidence = {(cid, sample.name)
+                                   for cid in EVAL_ASSIGNMENT_TILDE_MISSES
+                                   for sample in ORACLE_SAMPLES}
+        if tilde_evidence_seen != expected_tilde_evidence:
+            failures.append("eval tilde evidence unavailable: missing/extra diagnostic cells")
+        if seen_limits != set(ORACLE_MEASUREMENT_LIMITS):
+            failures.append("oracle samples: a declared measurement-limit cell was not observed")
         failures.extend(_oracle_stdin_cases(tmp))
         failures.extend(_shebang_cases())
         failures.extend(_pragma_cases())
@@ -16145,29 +17634,40 @@ def self_test():
         "check_no_token_in_output: oracle interpreter: %s -- %s"
         % (bash_path or "<none>", bash_text)
     )
-    # WHICH VALUE answered is the other half of the same disclosure (#1036).
-    # Ground truth below was taken at ONE point in the value space, and at
-    # least one construct's verdict is an artefact of that point -- see the
-    # sentinel note above SENTINEL.  Printed beside the interpreter so the
-    # summary records the SAMPLING as well as the environment.
-    # WHICH FRAGMENTS it can see is the third part of the same disclosure: a
-    # run shorter than this floor reaches a stream without the oracle seeing
-    # it, so a scanner finding about one is not conservatism (#1032 round 3).
+    # Distinct constructs and sample executions are different units. The
+    # shape table derives the printed floor from the actual immutable data.
     print(
-        "check_no_token_in_output: oracle sentinel: 1 shape sampled -- %s, "
-        "%d chars, minimum detectable fragment %d chars "
-        "(#1036 sweeps the rest)"
-        % (sentinel_shape(), len(SENTINEL), SENTINEL_WINDOW)
+        "check_no_token_in_output: oracle samples: %d shapes over %d distinct constructs; "
+        "%d/%d sample cells completed"
+        % (len(ORACLE_SAMPLES), len(CORPUS), completed, len(cells))
     )
+    for sample in ORACLE_SAMPLES:
+        counts = shape_counts[sample.name]
+        print(
+            "check_no_token_in_output: sample %s: %d chars, raw fragment floor %d chars; "
+            "whole-value case transforms only; %d agree, %d declared-or-undeclared misses, "
+            "%d declared-or-undeclared conservative, %d measurement-limited"
+            % (sample.name, len(sample.value), sample.minimum_fragment,
+               counts["tp"] + counts["tn"], counts["fn"], counts["fp"], counts["limited"])
+        )
     print(
-        "check_no_token_in_output: oracle differential over %d constructs "
-        "under %s -- %d agree, %d declared misses, %d declared conservative"
-        % (total, bash_text, tp + tn, fn, fp)
+        "check_no_token_in_output: oracle differential assessed %d/%d completed sample cells "
+        "under %s -- %d agree, %d misses, %d conservative; %d measurement-limited"
+        % (total, completed, bash_text, tp + tn, fn, fp, measurement_limited)
     )
+    canonical_constructs = sum(rule in (MUST_FLAG, MUST_NOT_FLAG) for _cid, rule, _body in CORPUS)
     print(
-        "check_no_token_in_output: rule cases %d/%d"
-        % (passed, len(CORPUS))
+        "check_no_token_in_output: canonical rule constructs %d/%d (legacy sample); "
+        "canonical rule sample cells %d/%d; opaque historical cells %d observed/unasserted"
+        % (passed, canonical_constructs, rule_cells_passed,
+           canonical_constructs * len(ORACLE_SAMPLES), opaque_rule_cells)
     )
+    for (cid, shape), expected in sorted(ORACLE_MEASUREMENT_LIMITS.items()):
+        print(
+            "check_no_token_in_output:   measurement limit: %s [%s] -- "
+            "real residue %r below the %d-character floor; not BROADER"
+            % (cid, shape, expected["stdout"], expected["floor"])
+        )
     # The header's "does NOT catch" list is re-derived from THIS, not the
     # other way round: every entry below is a live corpus case whose
     # disagreement with bash was measured on this run.  An absence from it is
@@ -16177,16 +17677,16 @@ def self_test():
         unsupported_miss = (minimum_bash is not None and _bash_ver is not None
                             and _bash_ver < minimum_bash)
         label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
-        if cid in quiet_eval_tilde_samples:
-            label = "quiet observed Bash 5.3.20 sample; inherited Linux Bash 5.2 miss"
+        if any(case_id == cid for case_id, _shape in quiet_eval_tilde_samples):
+            label = "no recognized sample on observed %s; inherited Linux Bash 5.2 miss" % bash_text
         print(
             "check_no_token_in_output:   %s: %s -- %s"
-            % (label, cid, KNOWN_MISSES[cid])
+            % (label, cid + " [" + ", ".join(_oracle_declared_shapes(KNOWN_MISSES, KNOWN_MISS_SHAPES, cid)) + "]", KNOWN_MISSES[cid])
         )
     for cid in sorted(KNOWN_BROADER):
         print(
             "check_no_token_in_output:   measured conservatism: %s -- %s"
-            % (cid, KNOWN_BROADER[cid])
+            % (cid + " [" + ", ".join(_oracle_declared_shapes(KNOWN_BROADER, KNOWN_BROADER_SHAPES, cid)) + "]", KNOWN_BROADER[cid])
         )
     if failures:
         for f in failures:
@@ -17356,7 +18856,7 @@ def main(argv):
                 "check_no_token_in_output: the oracle needs bash >= %d.%d and "
                 "PATH resolves to %s (%s).\n"
                 "An older bash REJECTS constructs it cannot parse -- "
-                "${VAR@A}, ${VAR@Q}, ${VAR@P}, ${VAR^^}, `declare -n`, `|&` "
+                "${VAR@A}, ${VAR@Q}, ${VAR@P}, ${VAR@L}, ${VAR@U}, ${VAR^^}, `declare -n`, `|&` "
                 "-- and the oracle records the rejection as CLEAN, so the "
                 "differential under-reports leaks that are real in CI.  It is "
                 "refused rather than run, because a number measured that way "
