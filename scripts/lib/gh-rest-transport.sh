@@ -87,18 +87,23 @@
 # classifier (scripts/workflow/owner-admin-override.py) recognizes is refused
 # the same way: options before the group, the REST merge endpoint, and a
 # GraphQL merge mutation through `gh api`. Any other option before the command
-# group is refused too. Park a merge with scripts/post-local-agent-handback.sh. `gh api` payloads pass through under
-# the verified token: they are REST already. Any other gh command passes
-# through unchanged; a GraphQL read fails at the proxy with its own message.
+# group is refused too. Park a merge with scripts/post-local-agent-handback.sh. Any other `gh api` payload passes
+# through under the verified token: it is REST already. Any other command of
+# gh's own groups passes through unchanged; a GraphQL read fails at the proxy
+# with its own message.
 #
 # gh_payload_refuse_credential_overrides is transport-independent: it refuses
 # the caller-supplied arguments that could send the verified token elsewhere
-# or replace it (--hostname, a host-qualified --repo or inherited GH_REPO,
-# an `api` endpoint on another host, an Authorization header on `gh api`),
-# the two #1542 inputs that only argv and environment inspection can bound.
+# or replace it (a command outside gh's own groups, --hostname, a repository
+# value that is not a plain OWNER/REPO, a host-qualified repository or URL on
+# another host, an `api` endpoint on another host, an Authorization header on
+# `gh api`), the #1542 inputs that only argv and environment inspection can
+# bound.
 #
-# Needs gh 2.41 or later (--slurp) and jq. Bash 3.2 portable; no top-level
-# side effects beyond defining functions and constants.
+# Needs gh 2.48 or later, for `gh api --paginate --slurp` (cli/cli#8620), and
+# jq. gh_rest_require_slurp checks it before a write whose attribution reads
+# the issue events (#2233). Bash 3.2 portable; no top-level side effects beyond
+# defining functions and constants.
 #
 # shellcheck disable=SC2016  # $name inside single quotes is a jq variable, bound by --arg/--argjson
 
@@ -123,6 +128,7 @@ GH_REST_DONE=" "
 GH_REST_REMOVED_LABELS=""
 GH_REST_DEFAULT_HEAD=""
 GH_REST_DEFAULT_HEAD_REPO=""
+GH_REST_SLURP_OK=""
 
 # --- transport selection ------------------------------------------------------
 
@@ -600,9 +606,30 @@ gh_rest_read_pr() {
   printf '%s\n' "$pr"
 }
 
+# gh_rest_require_slurp [suffix]: 0 iff this gh has `gh api --slurp` (gh 2.48
+# or later), which the issue-event reads need. Checked once per process, and
+# called before the first write of every verb whose attribution reads events,
+# so an older gh is refused with its cause rather than with "could not read
+# the events" after a write already landed (#2233). The help text is captured
+# rather than piped to grep -q, whose early exit can fail the pipeline.
+gh_rest_require_slurp() {
+  local help
+  if [ -z "$GH_REST_SLURP_OK" ]; then
+    help="$(gh_rest_exec_gh api --help 2>/dev/null)" || help=""
+    case "$help" in
+      *--slurp*) GH_REST_SLURP_OK=1 ;;
+      *) GH_REST_SLURP_OK=0 ;;
+    esac
+  fi
+  [ "$GH_REST_SLURP_OK" = 1 ] && return 0
+  gh_rest_err "this gh has no 'gh api --slurp', which the REST transport needs to read the issue events that attribute this write; install gh 2.48 or later.${1:+ $1}"
+  return 1
+}
+
 # gh_rest_events <repo> <N> -> the issue's events as one flat JSON array.
 gh_rest_events() {
   local pages
+  gh_rest_require_slurp || return 1
   pages="$(gh_rest_api PAGINATE "repos/$1/issues/$2/events?per_page=100")" || return 1
   printf '%s' "$pages" | jq -ce '[.[][]] | map(select(.id | type == "number"))' 2>/dev/null
 }
@@ -997,6 +1024,11 @@ gh_rest_pr_create() {
   fi
   gh_rest_check_branch "$base" "--base" || return 1
 
+  # Labels, reviewers and assignees are attributed from issue events, so an
+  # older gh is refused before the pull request is created, not after.
+  if [ -n "$labels$reviewers$assignees" ]; then
+    gh_rest_require_slurp "Nothing was written." || return 1
+  fi
   local input response number url actual rc=0
   input="$(gh_rest_json_file --arg title "$title" --rawfile body "$GH_REST_BODY_FILE" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
     --arg head_repo "$head_repo" \
@@ -1310,6 +1342,7 @@ gh_rest_pr_edit() {
     return 0
   fi
 
+  gh_rest_require_slurp "Nothing was written." || return 1
   local before
   before="$(gh_rest_events "$repo" "$number")" || {
     gh_rest_err "could not read the events of PR #$number before the edit; refusing a write that could not be attributed. Nothing was written."
@@ -1395,10 +1428,22 @@ gh_rest_pr_close() {
   state="$(printf '%s' "$pre" | jq -r '.state // ""')"
   head_ref="$(printf '%s' "$pre" | jq -r '.head.ref // ""')"
   head_repo="$(printf '%s' "$pre" | jq -r '.head.repo.full_name // ""')"
+  # As gh does: a merged pull request cannot be closed (non-zero), and one
+  # that is already closed succeeds without the comment or the branch delete
+  # (#2207). Nothing is written in either case.
   if [ "$state" != "open" ]; then
-    gh_rest_err "pull request #$number ($url) is already $state; nothing was written."
-    return 1
+    if [ "$(printf '%s' "$pre" | jq -r '(.merged == true) or (.merged_at != null)')" = "true" ]; then
+      gh_rest_err "pull request #$number ($url) can't be closed because it was already merged; nothing was written."
+      return 1
+    fi
+    if [ "$comment_set" -eq 1 ] || [ "$delete_branch" -eq 1 ]; then
+      gh_rest_err "pull request #$number ($url) is already closed; nothing was written (no comment was posted and no branch was deleted, as gh does)."
+    else
+      gh_rest_err "pull request #$number ($url) is already closed; nothing was written."
+    fi
+    return 0
   fi
+  gh_rest_require_slurp "Nothing was written." || return 1
   # The pre-close events are read before anything is written, so a failed
   # read leaves the PR untouched rather than commented and still open.
   local before input rc=0 comment_url=""
