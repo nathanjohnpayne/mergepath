@@ -198,6 +198,11 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
           CHECK_NAME: "CodeRabbit unresolved blocking findings"
+          # Fork and Dependabot pull_request* runs hold a read-only token:
+          # they cannot post the back-off red, so they are never skipped
+          # (#2286, Codex P1 on #2298).
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
           # Budget guard knobs (#2286), read by
           # scripts/workflow/installation-budget.sh. One evaluation costs
           # about 4 REST requests (measured on #2249, #2265, #2292, #2232 and
@@ -269,8 +274,19 @@ jobs:
             echo "::error::$CHECK_NAME was not evaluated on $HEAD_SHA ($2), and the Checks-API lineage could not be confirmed to block, so the job-native run fails (#2286)."
             exit 1
           }
+          #
+          # A fork or Dependabot run holds a read-only token, so it could not
+          # post that red, the lineage proof would fail, and its native run
+          # would fail for nothing but the budget. It evaluates as before
+          # instead, always (#2286, Codex P1 on #2298). `[ = ]`, not a case
+          # glob: "dependabot[bot]" in a case arm is a character class.
           budget_lib=false
-          if [ -r scripts/workflow/installation-budget.sh ]; then
+          read_only=false
+          if [ "${IS_FORK:-}" = true ] || [ "${PR_ACTOR:-}" = "dependabot[bot]" ]; then
+            read_only=true
+            echo "Read-only token (fork or Dependabot): evaluating without the budget guard (#2286)."
+          fi
+          if [ "$read_only" = false ] && [ -r scripts/workflow/installation-budget.sh ]; then
             # shellcheck source=scripts/workflow/installation-budget.sh
             . scripts/workflow/installation-budget.sh
             budget_lib=true
@@ -279,7 +295,7 @@ jobs:
             if ! ib_affordable 1; then
               budget_stop 2 "the installation API budget ($rl_remaining REST request(s), ${gql_remaining:-?} GraphQL point(s)) is short of one evaluation plus the $BUDGET_RESERVE_REQUESTS-request reserve" skipped
             fi
-          else
+          elif [ "$read_only" = false ]; then
             echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
           fi
           gate_out=$(mktemp)

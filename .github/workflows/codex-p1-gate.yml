@@ -713,10 +713,22 @@ jobs:
               # The driver stops at the first gate or read error (no retry on
               # anything but feedback drift) and closes the lease red, or
               # leaves it pending when even that write is refused. When the
-              # error was the exhausted installation budget, the native run
-              # follows the Checks-API lineage as above (#2286).
+              # error was the exhausted installation budget, the lease is
+              # re-closed with the publisher's back-off red (one best-effort
+              # PATCH; its reset read from a refused probe's headers), so the
+              # publisher backs the PR off until the reset like every other
+              # budget red, and the native run follows the Checks-API lineage
+              # as above (#2286).
               if [ "$driver_rc" -eq 2 ] \
                  && grep -qiE 'rate limit (already )?exceeded for installation' "$driver_out"; then
+                if declare -F ib_backoff_title >/dev/null; then
+                  title=$(ib_backoff_title "$CHECK_NAME" 2 "$(ib_exhausted_reset "$(cat "$driver_out")")")
+                  summary=$(cat "$driver_out")
+                  gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+                    -f status="completed" -f conclusion="failure" \
+                    -f "output[title]=$title" -f "output[summary]=${summary:0:60000}" >/dev/null \
+                    || echo "::warning::Could not stamp the back-off title on lease $CHECK_ID; the driver's red stands."
+                fi
                 budget_native_exit
               fi
               exit "$driver_rc"

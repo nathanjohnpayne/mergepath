@@ -111,6 +111,9 @@ stub() {
   cat >"$W/scripts/$1" <<SH
 #!/usr/bin/env bash
 printf '%s %s\n' "$1" "\${1:-}" >>"\$GATE_LOG"
+# EXHAUST_AFTER=1: the bucket runs dry during this evaluation, which itself
+# completes normally (the next PR's budget read then finds it empty).
+[ "\${EXHAUST_AFTER:-}" != 1 ] || : >"\$EXHAUSTED"
 case "\${$2:-pass}" in
   ratelimit) : >"\$EXHAUSTED"; echo "gh: API rate limit exceeded for installation. (HTTP 403)" >&2; exit 2 ;;
   block) echo "$4"; exit 1 ;;
@@ -203,7 +206,13 @@ if method == "GET" and endpoint == "rate_limit" and not include:
     if rem == "fail":
         sys.stderr.write("HTTP 502\n"); sys.exit(1)
     core, gql = int(rem), int(os.environ.get("RL_GQL_REMAINING", "1000"))
-    if exhausted and os.environ.get("RL_AFTER_FAIL") != "healthy":
+    # RL_HEALTHY_READS=N: the first N reads answer healthy whatever the flag
+    # says (the bucket empties between two reads of one run).
+    reads_path = os.path.join(state, "rl-reads")
+    reads = int(open(reads_path).read()) if os.path.exists(reads_path) else 0
+    open(reads_path, "w").write(str(reads + 1))
+    healthy_reads = int(os.environ.get("RL_HEALTHY_READS", "0"))
+    if exhausted and os.environ.get("RL_AFTER_FAIL") != "healthy" and reads >= healthy_reads:
         core = 0
     out({"resources": {"core": {"remaining": core, "reset": int(os.environ.get("RL_RESET", "1792115400"))},
                        "graphql": {"remaining": gql, "reset": int(os.environ.get("RL_GQL_RESET", "1792116000"))}}}, jq)
@@ -435,6 +444,8 @@ check "rate limit mid-run: the gate runs once and no fingerprint or gate call fo
   '[ "$(grep -c "^codex-p1-gate.sh" "$T/state/gates")" = 1 ] && [ "$(sed -n "/^codex-p1-gate.sh/,\$p" "$T/state/gates" | grep -c "^fingerprint")" = 0 ]'
 check "rate limit mid-run: the lease is closed red, never green, and the native run follows the lineage" \
   '[ "$(newest "Codex P1 unresolved threads" | cut -d"|" -f1-2)" = "completed|failure" ] && [ "$(greens)" = 0 ] && [ "$rc" = 0 ]'
+check "rate limit mid-run: the lease carries the back-off title, so the publisher backs it off until the reset" \
+  'newest "Codex P1 unresolved threads" | grep -q "^completed|failure|Codex P1 unresolved threads — installation API budget exhausted (rc=2); re-evaluated after "'
 fresh; p1 "$PLENTY" NATIVE_RUN_ID=9001 P1_MODE=ratelimit && rc=0 || rc=$?
 check "rate limit mid-run with every call refused: the lease stays in progress (blocking), no green, native fails" \
   '[ "$(newest "Codex P1 unresolved threads" | cut -d"|" -f1)" = in_progress ] && [ "$(greens)" = 0 ] && [ "$rc" = 1 ]'
@@ -449,6 +460,14 @@ fresh; cr "$SHORT" NATIVE_RUN_ID=9002 NATIVE_SUITE=2 && rc=0 || rc=$?
 check "below the threshold, shared suite: the native run fails" '[ "$rc" = 1 ] && [ "$(greens)" = 0 ]'
 fresh; cr "$SHORT" && rc=0 || rc=$?
 check "below the threshold, native run not listed: the native run fails" '[ "$rc" = 1 ]'
+for ro in IS_FORK=true "PR_ACTOR=dependabot[bot]"; do
+  fresh; cr "$SHORT" NATIVE_RUN_ID=9002 "$ro" && rc=0 || rc=$?
+  check "below the threshold, read-only run ($ro): evaluates as before and posts nothing (Codex P1 on #2298)" \
+    '[ "$rc" = 0 ] && [ "$(gates)" = "coderabbit-severity-gate.sh 41" ] && [ "$(newest "CodeRabbit unresolved blocking findings")" = none ]'
+done
+fresh; cr "$PLENTY" NATIVE_RUN_ID=9002 IS_FORK=true CR_MODE=ratelimit && rc=0 || rc=$?
+check "rate limit mid-run, read-only run: fails as before, no write attempted" \
+  '[ "$rc" = 1 ] && ! grep -qE "^POST" "$T/state/calls"'
 fresh; cr "$PLENTY" NATIVE_RUN_ID=9002 && rc=0 || rc=$?
 check "above the threshold: the gate evaluates and writes nothing to the Checks API" \
   '[ "$rc" = 0 ] && [ "$(gates)" = "coderabbit-severity-gate.sh 41" ] && [ "$(newest "CodeRabbit unresolved blocking findings")" = none ]'
@@ -553,13 +572,19 @@ ac_clear() {
     QUEUE_POLICY_TOKEN= QUEUE_SOURCE_TOKEN= DEFAULT_BRANCH=main EVENT_NAME=workflow_run EVENT_ACTION=completed "$@"
 }
 fresh; : >"$T/state/exhausted"; ac_clear && rc=0 || rc=$?
+check "budget already short inside the step: no PR is evaluated or written, and nothing is an infra error" \
+  '[ "$rc" = 0 ] && ! grep -q "^PRVIEW" "$T/state/calls" && [ -z "$(gates)" ] && [ "$(output budget_stopped)" = true ] && grep -q "^HAD_INFRA_ERROR=0" "$T/state/env"'
+fresh; : >"$T/state/exhausted"; ac_clear RL_HEALTHY_READS=1 && rc=0 || rc=$?
 check "rate limit mid-run: PR 41 fails on the exhausted installation token and PR 42 is never read" \
-  '[ "$(grep -c "^PRVIEW 41" "$T/state/calls")" -ge 1 ] && ! grep -q "^PRVIEW 42" "$T/state/calls" && [ -z "$(gates)" ]'
-check "rate limit mid-run: a budget stop is not an infra alarm (no failure check-run is surfaced)" \
-  '[ "$rc" = 0 ] && grep -q "^HAD_INFRA_ERROR=0" "$T/state/env" && [ "$(output budget_stopped)" = true ]'
+  '[ "$(grep -c "^PRVIEW 41" "$T/state/calls")" -ge 1 ] && ! grep -q "^PRVIEW 42" "$T/state/calls" && [ -z "$(gates)" ] && [ "$(output budget_stopped)" = true ]'
+check "rate limit mid-run: the failed PR keeps its infra error; the budget never reclassifies it (Codex P2 on #2298)" \
+  '[ "$rc" = 1 ] && grep -q "^HAD_INFRA_ERROR=1" "$T/state/env" && grep -q "^HAD_INFRA_ERROR_PRS=41$" "$T/state/env"'
+fresh; ac_clear CRC_MODE=block EXHAUST_AFTER=1 && rc=0 || rc=$?
+check "budget runs dry during a clean evaluation: the next PR is not evaluated, no failure recorded (Codex P2 on #2298)" \
+  '[ "$rc" = 0 ] && [ "$(gates)" = "codex-review-check.sh 41" ] && ! grep -q "^PRVIEW 42" "$T/state/calls" && [ "$(output budget_stopped)" = true ] && grep -q "^HAD_INFRA_ERROR=0" "$T/state/env"'
 fresh; : >"$T/state/exhausted"; ac_clear RL_AFTER_FAIL=healthy && rc=0 || rc=$?
 check "a failure with the budget still healthy stays an infra error and the next PR is evaluated" \
-  '[ "$rc" = 1 ] && grep -q "^PRVIEW 42" "$T/state/calls" && grep -q "^HAD_INFRA_ERROR=1" "$T/state/env"'
+  '[ "$rc" = 1 ] && grep -q "^PRVIEW 42" "$T/state/calls" && grep -q "^HAD_INFRA_ERROR=1" "$T/state/env" && [ -z "$(output budget_stopped)" ]'
 fresh; : >"$T/state/exhausted"; ac_clear RL_REMAINING=fail && rc=0 || rc=$?
 check "a failure with the budget unreadable stays an infra error and the next PR is evaluated" \
   '[ "$rc" = 1 ] && grep -q "^PRVIEW 42" "$T/state/calls" && grep -q "^HAD_INFRA_ERROR=1" "$T/state/env" && [ -z "$(output budget_stopped)" ]'

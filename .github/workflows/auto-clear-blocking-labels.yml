@@ -396,15 +396,17 @@ jobs:
           # infra-failure check-runs" step supersedes a stale failed
           # auto-clear-blocking-labels check-run on each one's head.
           heal_prs=""
-          # Budget stop (#2286). A PR whose evaluation failed is a budget
-          # stop, not an infrastructure alarm, when the installation budget
-          # is short right after it (GET /rate_limit, free, read with this
-          # workflow's own token): no further PR is evaluated, and the
-          # stopped PRs post no auto-clear-blocking-labels failure (which
-          # would make them UNSTABLE until healed, #2193). Their label stays,
-          # fail closed, and the */5 sweep re-evaluates them. Without the
-          # library, or with an unreadable budget, every failure stays an
-          # infrastructure error as before.
+          # Budget stop (#2286). Before EVERY PR the installation budget is
+          # read again (GET /rate_limit, free, with this workflow's own
+          # token), so a run that resolved several PRs stops as soon as the
+          # budget cannot cover the next one, whether or not an earlier PR
+          # failed (Codex P2 on #2298). A stopped PR is left untouched: its
+          # label stays, fail closed, nothing is posted on it, and the */5
+          # sweep re-evaluates it. A PR that was evaluated and failed keeps
+          # its infrastructure error and its diagnostic check-run whatever
+          # the budget reads afterwards: the budget never reclassifies a
+          # failure (Codex P2 on #2298). Without the library, or with an
+          # unreadable budget, every PR is evaluated as before.
           budget_lib=false
           if [ -r scripts/workflow/installation-budget.sh ]; then
             # shellcheck source=scripts/workflow/installation-budget.sh
@@ -412,18 +414,14 @@ jobs:
             budget_lib=true
           fi
           budget_stopped=""
-          budget_failing_before=""
-          budget_stop_check() {  # <next PR or empty>: exit 0 = stop now
+          budget_stop_check() {  # <PR>: exit 0 = stop before evaluating it
             [ "$budget_lib" = true ] || return 1
-            [ "$failing_prs" != "$budget_failing_before" ] || return 1
             GH_TOKEN="$WORKFLOW_TOKEN" ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
               "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS" >/dev/null
             if [ "$budget_known" -eq 1 ] && ! ib_affordable 1; then
-              budget_stopped="${failing_prs#"$budget_failing_before"}${1:+ $1 and any later}"
-              failing_prs="$budget_failing_before"
+              budget_stopped=" #$1 and any later PR"
               return 0
             fi
-            budget_failing_before="$failing_prs"
             return 1
           }
           while IFS= read -r PR; do
@@ -855,13 +853,9 @@ jobs:
             esac
             echo "::endgroup::"
           done <<<"$PR_NUMBERS"
-          if [ -z "$budget_stopped" ]; then
-            budget_stop_check "" || true
-          fi
           if [ -n "$budget_stopped" ]; then
-            echo "::warning::Stopped at an exhausted installation API budget (#2286). Not cleared:$budget_stopped. Each keeps needs-external-review; the */5 sweep re-evaluates."
+            echo "::warning::Stopped before an exhausted installation API budget (#2286). Not evaluated:$budget_stopped. Each keeps needs-external-review untouched; the */5 sweep re-evaluates."
             echo "budget_stopped=true" >> "$GITHUB_OUTPUT"
-            [ -n "${failing_prs// /}" ] || had_infra_error=0
           fi
           # Surface the infra-error sentinel + per-PR list to the next
           # step (#324 round 2 codex P2) so the check-run can be posted
