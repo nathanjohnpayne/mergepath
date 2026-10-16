@@ -48,9 +48,10 @@
 # strip a trailing inline comment, surrounding quotes (single OR double), and
 # trailing whitespace in sed. Every key under feedback_policy: is unique
 # (mode, priorities, p0..p3, nitpick), so an exact-name match is unambiguous.
-feedback_policy_field() {
+feedback_policy_field() (
   local field=$1 cfg="${2:-${CONFIG:-.github/review-policy.yml}}"
   [ -f "$cfg" ] || return 0
+  set -o pipefail
   awk -v field="$field" '
     /^feedback_policy:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
@@ -60,7 +61,7 @@ feedback_policy_field() {
       exit
     }
   ' "$cfg" | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]+$//"
-}
+)
 
 
 # policy_yaml_to_json <path> -- parse a review-policy YAML file to JSON on
@@ -185,7 +186,7 @@ resolve_required_tiers() {
 # priorities; by-priority treats an unset tier as discretionary. Validate the
 # entire applicable policy before printing, so errors return 2 with no output.
 resolve_tiers_by_disposition() {
-  local disposition="${1:-}" cfg="${2:-${CONFIG:-.github/review-policy.yml}}"
+  local disposition="${1:-}" cfg="${2:-${CONFIG:-.github/review-policy.yml}}" block_rc=0
   case "$disposition" in
     required|discretionary|ignore) ;;
     *)
@@ -193,7 +194,18 @@ resolve_tiers_by_disposition() {
       return 2
       ;;
   esac
-  if [ ! -f "$cfg" ] || ! grep -qE '^feedback_policy:' "$cfg"; then
+  if [ ! -f "$cfg" ]; then
+    block_rc=1
+  elif grep -qE '^feedback_policy:' "$cfg"; then
+    block_rc=0
+  else
+    block_rc=$?
+  fi
+  if [ "$block_rc" -gt 1 ]; then
+    echo "ERROR: could not read feedback policy: $cfg" >&2
+    return 2
+  fi
+  if [ "$block_rc" -eq 1 ]; then
     case "$disposition" in
       required) printf '%s\n' p0 p1 ;;
       discretionary) printf '%s\n' p2 p3 nitpick ;;

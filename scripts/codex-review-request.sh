@@ -2943,7 +2943,12 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
   # a request does not make an unavailable provider usable (#2139).
   trigger_only_blocked_reason=""
   if ! has_cleared_signal "$INITIAL_SCAN"; then
-    trigger_only_blocked_reason=$(printf '%s' "$INITIAL_SCAN" | jq -r '.blocked.reason // ""')
+    trigger_only_blocked_reason=$(printf '%s' "$INITIAL_SCAN" | jq -r \
+      --arg after "$REACTION_THRESHOLD" --arg floor "$REACTION_FLOOR_ISO" --argjson now "$EPOCH_NOW" '
+      # A future author-controlled committer date cannot hide a recent block.
+      (if ($after | fromdateiso8601) > $now then $floor else $after end) as $block_after
+      | if .blocked != null and (.blocked.created_at // "") >= $block_after
+      then .blocked.reason else "" end')
   fi
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
