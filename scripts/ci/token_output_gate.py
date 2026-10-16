@@ -82,8 +82,15 @@ EXECUTABLE.  This file carries both halves:
     Every parallel fixture binds immutable sample source AND recognition
     data in its own (construct, shape) directory. Legacy default constants
     remain available to the separate auxiliary axes, and no sampling globals
-    change while executor jobs run. The #2199 fd-state assertions still run
-    after the executor closes. Shape-qualified disagreement declarations keep
+    change while executor jobs run. The two exact numeric-target kill cells
+    require OS signal isolation and a source-bound out-of-band Bash startup
+    receipt: macOS denies signals; Linux gives each builtin-only cell a fresh
+    user/PID namespace whose Bash is PID1. Missing isolation or startup proof
+    is unavailable, never clean or an unsafe fallback. These are explicit
+    oracle-environment constraints, not general arbitrary-shell isolation.
+    The self-signal trap fixture keeps its ordinary launch path. The #2199
+    fd-state assertions still run after the executor closes. Shape-qualified
+    disagreement declarations keep
     the original letter-leading stale checks rather than waiving them for
     an agreeing different sample.
 
@@ -13944,11 +13951,11 @@ KNOWN_BROADER = {
 #
 # So: resolve the interpreter once, RECORD its version on the summary line,
 # and refuse to run below a floor rather than produce an authoritative-looking
-# number.  4.4 is where every construct named above became available (`@A`,
-# `@Q`, `@P` in 4.4; `^^` in 4.0; `declare -n` in 4.3; `|&` in 4.0).  The
-# printed version is the record; the floor only stops the run that could not
-# have measured what it claims to have measured.
-ORACLE_BASH_MIN = (4, 4)
+# number. The original constructs need4.4 (`@A`, `@Q`, `@P` in4.4; `^^`
+# in4.0; `declare -n` in4.3; `|&` in4.0). The #1036 `@L`/`@U` probes need
+#5.1 (GNU Bash5.1 NEWS, item dd). This is an ORACLE floor; --scan is unchanged.
+# The printed version records what actually measured the corpus.
+ORACLE_BASH_MIN = (5, 1)
 _ORACLE_BASH = None
 _BASH_VERSION_RE = re.compile(r"version (\d+)\.(\d+)")
 
@@ -13986,8 +13993,140 @@ def oracle_bash():
     return _ORACLE_BASH
 
 
-def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None):
-    """Ground truth: run the fixture with EOF stdin and grep both streams."""
+# Only these exact builtin-only numeric-target programs have the finite signal
+# capsule proof. Their source and samples are immutable executor inputs. This
+# is not a general arbitrary-shell sandbox or a stubbed kill implementation.
+ORACLE_SIGNAL_CELLS = {'numeric-kill': {'body_sha256': 'bf7b540e5ffb6e22a64c428c29d6996e783efe0cdc7847c2ee4f2983c15c3918', 'source_sha256': '62bffc1dd0aa3a20c664984c88fbed20c1a9cee083a2b431a5e58f2776bc4733'}, 'numeric-kill-with-signal': {'body_sha256': '1d794e6291aa15b93deb52a5b2db90f24259a5937ea52106077dcccffd753552', 'source_sha256': '4eb502caa98d977965b19118b765b13f11880e898c6d34340dac878c967735a9'}}
+
+
+def _oracle_signal_binding(body, sample, fixture_id=None):
+    """Return (protected ID | None, unavailable reason | None), without launch."""
+    import hashlib
+    sample = sample or DEFAULT_ORACLE_SAMPLE
+    digest = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    body_hash = digest(body)
+    matching = next((cid for cid, expected in ORACLE_SIGNAL_CELLS.items()
+                     if expected["body_sha256"] == body_hash), None)
+    if fixture_id in ORACLE_SIGNAL_CELLS and fixture_id != matching:
+        return None, "protected oracle fixture body changed: " + fixture_id
+    # Matching by body protects callers without a corpus ID too. Only these
+    # two exact approved samples may use the ordinary launch; spelling a value
+    # with a sign/whitespace or another label cannot evade protected dispatch.
+    if matching is None:
+        return None, None
+    plain_samples = (
+        OracleSample("letter-leading", "Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr", 4),
+        OracleSample("digit-leading-non-numeric", "9Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr", 4),
+    )
+    if sample in plain_samples:
+        return None, None
+    if sample != OracleSample("all-digit", "73919", 5):
+        return None, "protected oracle sample is outside the admitted binding"
+    expected = ORACLE_SIGNAL_CELLS[matching]
+    if digest(oracle_prologue(sample) + body) != expected["source_sha256"]:
+        return None, "protected oracle fixture source changed: " + matching
+    return matching, None
+
+
+def _oracle_signal_inventory_cases():
+    """Check finite ID/body/sample bindings before starting executor jobs."""
+    failures = []
+    for cid in ORACLE_SIGNAL_CELLS:
+        bodies = [body for name, _rule, body in CORPUS if name == cid]
+        if len(bodies) != 1:
+            failures.append("signal oracle: missing/duplicate protected ID " + cid)
+            continue
+        for sample in ORACLE_SAMPLES:
+            bound, error = _oracle_signal_binding(bodies[0], sample, cid)
+            expected = cid if sample.name == "all-digit" else None
+            if error or bound != expected:
+                failures.append("signal oracle: stale binding " + cid)
+    return failures
+
+
+
+def _oracle_signal_binding_cases():
+    """Harmless source/sample dispatch controls; never launch a process."""
+    failures = []
+    bodies = {cid: body for cid, _rule, body in CORPUS}
+    numeric = OracleSample("all-digit", "73919", 5)
+    for cid in ORACLE_SIGNAL_CELLS:
+        body = bodies.get(cid, "")
+        if _oracle_signal_binding(body, numeric) != (cid, None):
+            failures.append("signal oracle: anonymous exact body bypassed capsule " + cid)
+        if _oracle_signal_binding(body, DEFAULT_ORACLE_SAMPLE, cid) != (None, None):
+            failures.append("signal oracle: legacy nonnumeric dispatch changed " + cid)
+        for changed in (body + "# changed\n", ""):
+            if _oracle_signal_binding(changed, numeric, cid)[1] is None:
+                failures.append("signal oracle: stale protected body admitted " + cid)
+        for sample in (OracleSample("all-digit", "73918", 5),
+                       OracleSample("all-digit", "73919", 4),
+                       OracleSample("letter-leading", "73919", 5),
+                       OracleSample("letter-leading", "-1", 2),
+                       OracleSample("letter-leading", "+73919", 5),
+                       OracleSample("letter-leading", " 73919", 5),
+                       OracleSample("custom", DEFAULT_ORACLE_SAMPLE.value, 4),
+                       OracleSample("letter-leading", "changed", 4)):
+            if _oracle_signal_binding(body, sample, cid)[1] is None:
+                failures.append("signal oracle: changed numeric sample admitted " + cid)
+    if _oracle_signal_binding(bodies.get("trap-on-signal", ""), numeric) != (None, None):
+        failures.append("signal oracle: legitimate self-signal trap was isolated")
+    return failures
+
+def _oracle_signal_capsule(path, env, cid):
+    """Prepare a real-Bash capsule and its out-of-band startup receipt.
+
+    All state is private to this cell. No subprocess or global mutation here.
+    Linux needs the caller's toolchain to permit the exact unshare operation;
+    inability to enter it must remain unavailable, never a plain-Bash retry.
+    """
+    bash = oracle_bash()[0]
+    if not bash:
+        raise OSError("protected oracle has no resolved Bash")
+    if sys.platform == "darwin":
+        tool = "/usr/bin/sandbox-exec"
+        if not os.path.isfile(tool) or not os.access(tool, os.X_OK):
+            raise OSError("protected oracle needs macOS sandbox-exec signal denial")
+    elif sys.platform.startswith("linux"):
+        tool = shutil.which("unshare")
+        if not tool:
+            raise OSError("protected oracle needs fresh user/PID namespace support")
+    else:
+        raise OSError("protected oracle signal isolation unavailable on " + sys.platform)
+    capsule = tempfile.mkdtemp(prefix=".signal-capsule.", dir=os.path.dirname(path))
+    receipt = os.path.join(capsule, "started")
+    bootstrap = os.path.join(capsule, "startup.sh")
+    expected = (os.urandom(24).hex() + ":" + cid + ":"
+                + ORACLE_SIGNAL_CELLS[cid]["source_sha256"] + "\n")
+    startup = ""
+    if sys.platform.startswith("linux"):
+        # The exact two bodies only assign values/use builtins and create no
+        # children. Fresh PID1 cannot target outer or in-namespace PID73919.
+        startup += 'if [ "$$" -ne 1 ]; then exit 125; fi\n'
+    startup += ("printf %s " + shlex.quote(expected) + " > "
+                + shlex.quote(receipt) + " || exit 125\nunset BASH_ENV\n")
+    with open(bootstrap, "w", encoding="utf-8") as fh:
+        fh.write(startup)
+    if sys.platform == "darwin":
+        profile = os.path.join(capsule, "deny-signal.sb")
+        with open(profile, "w", encoding="utf-8") as fh:
+            fh.write("(version 1)\n(allow default)\n(deny signal)\n")
+        argv = [tool, "-f", profile, bash, path]
+    else:
+        argv = [tool, "--user", "--map-root-user", "--pid", "--fork", bash, path]
+    # Actual noninteractive Bash runs this only after entering the capsule.
+    # Remove it before the unchanged fixture; no measured stream handshake.
+    capsule_env = dict(env, BASH_ENV=bootstrap)
+    return argv, capsule_env, receipt, expected
+
+
+def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None, fixture_id=None):
+    """Run real Bash with EOF stdin; numeric signal cells require their capsule."""
+    protected, binding_error = _oracle_signal_binding(body, sample, fixture_id)
+    if binding_error:
+        return None, "", "oracle unavailable: " + binding_error
+    if protected and (shebang is not None or run_via is not None):
+        return None, "", "oracle unavailable: protected fixture cannot override its launcher"
     path = os.path.join(workdir, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     text = (shebang if shebang is not None else oracle_prologue(sample)) + body
@@ -14013,6 +14152,12 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None):
     # says -- which is what it WAS doing before #1032, under a comment here
     # claiming the opposite.
     argv = (run_via if run_via is not None else [oracle_bash()[0] or "bash"]) + [path]
+    receipt = expected_receipt = None
+    if protected:
+        try:
+            argv, env, receipt, expected_receipt = _oracle_signal_capsule(path, env, protected)
+        except OSError as exc:
+            return None, "", "oracle unavailable: signal capsule setup failed: %s" % exc
     try:
         proc = subprocess.run(
             argv,
@@ -14026,6 +14171,14 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None):
         return None, "", "oracle could not run: %s" % exc
     out = proc.stdout.decode("utf-8", "replace")
     err = proc.stderr.decode("utf-8", "replace")
+    if protected:
+        try:
+            with open(receipt, encoding="utf-8") as fh:
+                started = fh.read()
+        except OSError:
+            started = None
+        if started != expected_receipt:
+            return None, out, "oracle unavailable: signal capsule startup not verified: " + err
     return sentinel_reached(out, err, sample=sample), out, err
 
 
@@ -17255,8 +17408,17 @@ def self_test():
     bash_path, bash_text, _bash_ver = oracle_bash()
     quiet_eval_tilde_samples = set()
 
+    # A direct self_test() call must reject stale protected source or an old
+    # interpreter before any cell can be submitted, not merely fail afterward.
+    startup_failures = _oracle_signal_inventory_cases() + _oracle_interpreter_cases()
+    if startup_failures:
+        for failure in startup_failures:
+            print(failure, file=sys.stderr)
+        return 1
+
     failures.extend(_corpus_id_cases())
     failures.extend(_oracle_sample_cases())
+    failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
     failures.extend(_ansi_c_quote_cases())
@@ -17274,7 +17436,7 @@ def self_test():
             cid, _disposition, body = entry
             fixture_dir = os.path.join(tmp, cid, sample.name)
             os.makedirs(fixture_dir, exist_ok=True)
-            return run_oracle(body, fixture_dir, "fixture.sh", sample=sample)
+            return run_oracle(body, fixture_dir, "fixture.sh", sample=sample, fixture_id=cid)
 
         cells = [(entry, sample) for entry in CORPUS for sample in ORACLE_SAMPLES]
         workers = min(16, max(4, (os.cpu_count() or 4) * 2))
@@ -18631,7 +18793,7 @@ def main(argv):
                 "check_no_token_in_output: the oracle needs bash >= %d.%d and "
                 "PATH resolves to %s (%s).\n"
                 "An older bash REJECTS constructs it cannot parse -- "
-                "${VAR@A}, ${VAR@Q}, ${VAR@P}, ${VAR^^}, `declare -n`, `|&` "
+                "${VAR@A}, ${VAR@Q}, ${VAR@P}, ${VAR@L}, ${VAR@U}, ${VAR^^}, `declare -n`, `|&` "
                 "-- and the oracle records the rejection as CLEAN, so the "
                 "differential under-reports leaks that are real in CI.  It is "
                 "refused rather than run, because a number measured that way "
