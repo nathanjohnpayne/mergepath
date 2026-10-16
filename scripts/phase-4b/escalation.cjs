@@ -15,6 +15,7 @@ const SENSITIVE_PATHS = [
   /^scripts\/coderabbit-wait\.sh$/,
   /^scripts\/gate-api-lineage-blocking\.sh$/,
   /^scripts\/review-feedback-surface-fingerprint\.sh$/,
+  /^scripts\/(?:codex|coderabbit)-record-feedback\.sh$/,
   /^scripts\/post-phase-4b-handoff\.sh$/,
   /^scripts\/wave-audit\.sh$/,
   /^\.github\/(?:workflows|actions)\//,

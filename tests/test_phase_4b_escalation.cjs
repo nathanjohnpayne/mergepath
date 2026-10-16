@@ -79,6 +79,18 @@ test('the manual handoff renderer is an exact sensitive path', () => {
   }
 });
 
+test('the finding-disposition recorders are exact sensitive paths', () => {
+  for (const provider of ['codex', 'coderabbit']) {
+    const file = `scripts/${provider}-record-feedback.sh`;
+    assert.deepEqual(classify('+ordinary change', [file]), {
+      decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+    }, file);
+    for (const ordinary of [`${file}.example`, `${file}/child`, `nested/${file}`, `scripts/${provider}-Record-feedback.sh`, `scripts/${provider}-record-feedback-extra.sh`]) {
+      assert.deepEqual(classify('+ordinary change', [ordinary]), { decision: 'model-review', tripwires: [] }, ordinary);
+    }
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
