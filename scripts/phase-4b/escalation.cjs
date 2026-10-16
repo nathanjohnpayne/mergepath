@@ -12,6 +12,8 @@ const SENSITIVE_PATHS = [
   /^\.codex\/hooks\.json$/,
   /^\.claude\/settings\.json$/,
   /^\.github\/review-policy\.yml$/,
+  /^\.mergepath-sync\.yml$/,
+  /^scripts\/sync-to-downstream\.sh$/,
   /^scripts\/coderabbit-wait\.sh$/,
   /^scripts\/gate-api-lineage-blocking\.sh$/,
   /^scripts\/review-feedback-surface-fingerprint\.sh$/,

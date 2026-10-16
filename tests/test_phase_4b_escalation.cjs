@@ -91,6 +91,20 @@ test('the finding-disposition recorders are exact sensitive paths', () => {
   }
 });
 
+test('propagation credential and review-exemption entrypoints are exact sensitive paths', () => {
+  for (const file of ['.mergepath-sync.yml', 'scripts/sync-to-downstream.sh']) {
+    assert.deepEqual(classify('+ordinary change', [file]), {
+      decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+    }, file);
+    for (const ordinary of [`${file}.example`, `${file}/child`, `nested/${file}`]) {
+      assert.deepEqual(classify('+ordinary change', [ordinary]), { decision: 'model-review', tripwires: [] }, ordinary);
+    }
+  }
+  for (const file of ['.Mergepath-sync.yml', 'scripts/Sync-to-downstream.sh', 'scripts/sync-to-downstream-extra.sh']) {
+    assert.deepEqual(classify('+ordinary change', [file]), { decision: 'model-review', tripwires: [] }, file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

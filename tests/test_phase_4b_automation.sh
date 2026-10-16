@@ -917,7 +917,7 @@ cp "$DIFF" "$WORK/tripwire-original.diff"
 mk_fake fake-codex-tripwire-preview \
   "printf ran > \"$WORK/integrity-adapter-ran\"
    printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
-for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderabbit-wait gate-lineage wave-caller feedback-fingerprint manual-handoff codex-recorder coderabbit-recorder; do
+for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderabbit-wait gate-lineage wave-caller feedback-fingerprint manual-handoff codex-recorder coderabbit-recorder sync-manifest sync-credentials; do
   cp "$WORK/tripwire-original.diff" "$DIFF"
   rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
   case "$tripwire_case" in
@@ -933,6 +933,8 @@ for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderab
     manual-handoff) printf 'scripts/post-phase-4b-handoff.sh\0' > "$WORK/tripwire-paths" ;;
     codex-recorder) printf 'scripts/codex-record-feedback.sh\0' > "$WORK/tripwire-paths" ;;
     coderabbit-recorder) printf 'scripts/coderabbit-record-feedback.sh\0' > "$WORK/tripwire-paths" ;;
+    sync-manifest) printf '.mergepath-sync.yml\0' > "$WORK/tripwire-paths" ;;
+    sync-credentials) printf 'scripts/sync-to-downstream.sh\0' > "$WORK/tripwire-paths" ;;
   esac
   set +e
   out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
@@ -1038,7 +1040,7 @@ for adapter_state in absent non-executable; do
   done
 done
 # Near-name/case controls keep the ordinary production model dispatch path.
-for ordinary_path in .codex/Hooks.json .claude/settings.local.json scripts/post-phase-4b-handoff.sh.example scripts/codex-record-feedback.sh.example scripts/coderabbit-Record-feedback.sh; do
+for ordinary_path in .codex/Hooks.json .claude/settings.local.json scripts/post-phase-4b-handoff.sh.example scripts/codex-record-feedback.sh.example scripts/coderabbit-Record-feedback.sh .mergepath-sync.yml.example scripts/Sync-to-downstream.sh; do
   cp "$WORK/tripwire-original.diff" "$DIFF"
   printf '%s\0' "$ordinary_path" > "$WORK/tripwire-paths"
   rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
