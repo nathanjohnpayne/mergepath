@@ -1893,7 +1893,7 @@ mcg22_case F 's{(      - name: Resolve PR number)}{      - name: Forbidden PATCH
 # G — no verdict sentinel, so a query-mode rc 0 could look cleared.
 mcg22_case G 's{\*"Merge clearance: PASS"\*\)}{*"nope"*)}' fail "verdict sentinel"
 # H — lineage confirmation runs without the explicit pending predicate.
-mcg22_case H 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: always()}' fail '[#850 producer eligibility]'
+mcg22_case H 's{(id: lineage\n)        if: [^\n]*}{$1        if: always()}' fail '[#850 producer eligibility]'
 # J — a write grant cannot hide behind an inline read-permission comment.
 mcg22_case J 's{^(      checks:) read$}{$1 write # checks: read}m' fail '[#1547 read-only native]'
 # K — rebind the lineage proof to the merge commit in the direct spelling.
@@ -2011,7 +2011,7 @@ mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(   
 #     P2, round 4: a quoted "true" constructed the string and proved nothing).
 mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  true:\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
 # o — the pending proof is made unreachable (#1547 replacement).
-mcg22_case o 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: \$\{\{ steps.gate.outputs.pending == \x27true\x27 && false \}\}}' fail '[#850 producer eligibility]'
+mcg22_case o 's{(id: lineage\n)        if: [^\n]*}{$1        if: \$\{\{ false \}\}}' fail '[#850 producer eligibility]'
 # p — the sweep's publish step on a NON-literal condition false on schedule.
 mcg22_case p 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2github.event_name == \x27push\x27}sm' \
   fail "[#850 producer eligibility] step"
@@ -2025,7 +2025,7 @@ mcg22_case l 's{(      - name: Run scripts/merge-clearance-gate.sh.*?)(         
 # q — an echoed promise replaces the causal helper invocation (#1547 replacement).
 mcg22_case q 's{if "\$helper" "\$REPO" "\$HEAD_SHA" "\$CHECK_NAME" "\$RUN_ID" "\$RUN_ATTEMPT"; then}{if echo no-proof; then}' fail '[#2247 pending arm]'
 # r — the lineage step wears an unrelated sweep condition (#1547 replacement).
-mcg22_case r 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: steps.find.outputs.prs != \x27\x27}' fail '[#850 producer eligibility]'
+mcg22_case r 's{(id: lineage\n)        if: [^\n]*}{$1        if: steps.find.outputs.prs != \x27\x27}' fail '[#850 producer eligibility]'
 # s — a duplicate lineage step shadows the proof (#1547 replacement).
 mcg22_case s 's{(      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n)}{$1        run: echo decoy\n$1}' fail '[#2247 pending arm]'
 # t — a needs: dependency on a producer job: GitHub skips the producer when
@@ -4701,7 +4701,7 @@ rcp_case nominate-if-not-cancelled \
   's|if: \$\{\{ !cancelled\(\) && needs\.publish\.outputs\.autoclear_prs|if: \${{ needs.publish.outputs.autoclear_prs|' \
   fail 'condition is'
 rcp_case nominate-needs \
-  's{^    needs: publish$}{    needs: open}m' \
+  's{(  nominate-auto-clear:\n.*?)    needs: publish}{$1    needs: open}s' \
   fail 'not the publish job'
 rcp_case nominate-type-renamed \
   's{event_type=auto-clear-evaluate}{event_type=auto-clear-eval}' \
@@ -4980,7 +4980,7 @@ t30_lin absent; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-absent"
 printf '%s' "$LOUT" | grep -q '::warning::' || bad="$bad absent-warn"
 rm -f "$T30/wd/scripts/gate-api-lineage-blocking.sh"
 # Report step: the full conjunction, and nothing less.
-rv2() { RC="$1" VERDICT="$2" PENDING="$3" API_BLOCKING="$4" t30_run "$RV2_BODY" >/dev/null 2>&1; }
+rv2() { RC="$1" VERDICT="$2" PENDING="$3" API_BLOCKING="$4" RUN_ATTEMPT="${5:-1}" t30_run "$RV2_BODY" >/dev/null 2>&1; }
 rv2 1 blocked true true    || bad="$bad rv-pending"
 rv2 1 blocked true ''      && bad="$bad rv-pending-unconfirmed"
 rv2 1 blocked false true   && bad="$bad rv-not-pending"
@@ -4990,6 +4990,8 @@ rv2 2 absent true true     && bad="$bad rv-infra"
 rv2 0 absent true true     && bad="$bad rv-rc0-no-pass"
 rv2 3 absent true true     && bad="$bad rv-unknown-rc"
 rv2 0 pass '' ''           || bad="$bad rv-pass"
+rv2 1 blocked true true 2  && bad="$bad recovery-pending-cannot-pass"
+rv2 0 pass '' '' 2        || bad="$bad recovery-real-pass"
 RVOUT=$(RC=1 VERDICT=blocked PENDING=true API_BLOCKING=true t30_run "$RV2_BODY")
 printf '%s' "$RVOUT" | grep -q '::notice::Merge clearance is PENDING' || bad="$bad rv-notice"
 # The candidate report performs no Checks-API write. Trusted writer mapping
@@ -5084,10 +5086,36 @@ mcg22_case lineage-run-id \
 mcg22_case lineage-helper-dropped \
   's{helper=scripts/gate-api-lineage-blocking\.sh}{helper=scripts/true.sh}' \
   fail '[#2247 pending arm]'
-mcg22_case lineage-if-unguarded 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: always()}' fail '[#850 producer eligibility]'
+mcg22_case lineage-if-unguarded \
+  's{if: \$\{\{ steps.gate.outputs.pending == .true. \|\| steps.budget.outputs.skip == .true. \|\| steps.gate.outputs.rate_limited == .true. \}\}}{if: always()}' fail '[#850 producer eligibility]'
 mcg22_case lineage-step-removed \
   's{      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n.*?(      - name: Report gate verdict)}{$1}s' \
   fail '[#2247 pending arm]'
+unset MCG_TAG
+fi
+
+# Test 30g (#2286): the fence pins on the budget guard reject each shape that
+# would let a run that evaluated nothing look green, or turn the guard off.
+if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ] && declare -f mcg22_case >/dev/null 2>&1; then
+MCG_TAG='#2286'
+mcg22_case budget-skip-bypasses-lineage \
+  's{(if \[ "\$\{BUDGET_SKIP:-\}" = true \] \|\| \[ "\$\{RATE_LIMITED:-\}" = true \]; then\n.*?if \[ )"\$\{API_BLOCKING:-\}" = true}{$1"true" = true}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-report-unconditional \
+  's{(if \[ "\$\{API_BLOCKING:-\}" = true \]; then\n.*?exit 0\n\s*fi\n.*?)exit 1}{$1exit 0}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-skip-const \
+  's{(Report gate verdict.*?)BUDGET_SKIP: \$\{\{ steps\.budget\.outputs\.skip \}\}}{$1BUDGET_SKIP: "true"}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-knob-malformed \
+  's{(Installation budget guard \(#2286\).*?BUDGET_RESERVE_REQUESTS: )"200"}{$1"two hundred"}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-candidate-hold-reintroduced \
+  's{(id: budget\n        env:\n)}{$1          OPEN_ID: "1"\n}' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-gate-if-dropped \
+  's{(      - name: Run scripts/merge-clearance-gate\.sh\n        id: gate\n)        if: [^\n]*\n}{$1        if: \$\{\{ always() \}\}\n}' \
+  fail '[#850 producer eligibility]'
 unset MCG_TAG
 fi
 

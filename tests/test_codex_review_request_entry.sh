@@ -64,13 +64,16 @@ make_case() {
   cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
-  # #2257: the Phase 4 gate derivation loads the shared matcher and the
+  # #2257: the Phase 4 gate derivation reads the parser, the matcher and the
   # fingerprint helper's EXCLUDE_RE AT THE BASE, which the gh stub serves from
-  # state/. Neither is staged in this checkout, so a passing case proves the
-  # base copies were used.
+  # state/.
   cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/state/base-matcher.sh"
   cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/state/base-parser.sh"
   cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"
+  # #2272: the parser and matcher that RUN are the requester's own copies,
+  # and only when byte-identical to the base copies the stub serves.
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"
+  cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/scripts/workflow/parse_policy_list.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   {
@@ -797,22 +800,31 @@ test_derive_failsafe() {
   # The labeler's policy list parser, loaded from the base.
   dir=$(derive_case parser-unread 'external_review_paths:'$'\n''  - ".github/**"')
   rc=$(CODEX_TEST_BASE_PARSER=fail run_case "$dir" false)
-  assert_failsafe_request "an unreadable base policy list parser" "$dir" "$rc" "cannot read the policy list parser"
+  assert_failsafe_request "an unreadable base policy list parser" "$dir" "$rc" "the policy list parser: cannot read scripts/workflow/parse_policy_list.sh at base-sha"
+  # A parser that exits nonzero: identical at the base and in the requester
+  # (#2272: only an identical own copy runs), so it runs and fails.
   dir=$(derive_case parser-fails 'external_review_paths:'$'\n''  - ".github/**"')
-  rc=$(CODEX_TEST_BASE_PARSER=broken run_case "$dir" false)
+  printf '#!/usr/bin/env bash\nexit 3\n' | tee "$dir/state/base-parser.sh" >"$dir/scripts/workflow/parse_policy_list.sh"
+  rc=$(run_case "$dir" false)
   assert_failsafe_request "a base policy list parser that exits nonzero" "$dir" "$rc" "the policy list parser failed on external_review_paths (rc=3)"
   dir=$(derive_case matcher-unread 'external_review_paths:'$'\n''  - ".github/**"')
   rc=$(CODEX_TEST_BASE_MATCHER=fail run_case "$dir" false)
-  assert_failsafe_request "an unreadable base protected-path matcher" "$dir" "$rc" "cannot read the protected-path matcher"
+  assert_failsafe_request "an unreadable base protected-path matcher" "$dir" "$rc" "the protected-path matcher: cannot read scripts/workflow/match_protected_paths.sh at base-sha"
   dir=$(derive_case matcher-fails 'external_review_paths:'$'\n''  - ".github/**"')
-  rc=$(CODEX_TEST_BASE_MATCHER=broken run_case "$dir" false)
+  printf '#!/usr/bin/env bash\nexit 2\n' | tee "$dir/state/base-matcher.sh" >"$dir/scripts/workflow/match_protected_paths.sh"
+  rc=$(run_case "$dir" false)
   assert_failsafe_request "a failing base protected-path matcher" "$dir" "$rc" "the protected-path matcher failed (rc=2)"
-  # A narrower matcher in this checkout is never consulted: the base copy
-  # still matches the protected path.
+  # A narrower matcher in this checkout never decides a skip: it differs from
+  # the base copy, so the PR is requested without running either (#2272).
   dir=$(derive_case matcher-local-narrow 'external_review_paths:'$'\n''  - "src/**"')
   printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' >"$dir/scripts/workflow/match_protected_paths.sh"
   rc=$(run_case "$dir" false)
-  assert_derived_request "a narrower checkout matcher (the base copy decides)" "$dir" "$rc" "protected paths changed: src/app.ts"
+  assert_failsafe_request "a narrower checkout matcher" "$dir" "$rc" "the protected-path matcher: scripts/workflow/match_protected_paths.sh at base-sha is not byte-identical to this requester's own copy"
+  # The requester's own copy is missing: nothing runs, the PR is requested.
+  dir=$(derive_case parser-own-missing 'external_review_paths:'$'\n''  - "src/**"')
+  rm -f "$dir/scripts/workflow/parse_policy_list.sh"
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "no own copy of the parser" "$dir" "$rc" "the policy list parser: this requester has no copy of scripts/workflow/parse_policy_list.sh"
   # The default branch: its head is pinned before the policy read.
   dir=$(derive_case default-unread)
   rc=$(CODEX_TEST_DEFAULT_MODE=fail run_case "$dir" false)
@@ -956,6 +968,88 @@ CASES
   [ "$FAIL" -ne "$before" ] || pass "#2257 derive: external_review_paths is read exactly as the labeler reads it, on every spelling"
 }
 
+# #2272: the parser and matcher are code, and the PR base can be any branch
+# the PR targets. Two properties, each with planted helpers that dump their
+# whole environment to a file and then do their normal work:
+#  1. a base copy that differs from the requester's own is NEVER executed,
+#     and the PR is requested through the fail-safe;
+#  2. an identical copy runs (it is the requester's own) with no inherited
+#     credentials: the dump holds no credential value and no variable beyond
+#     PATH and LC_ALL plus those bash sets itself.
+# Every credential variable this script can hold is set for the runs.
+plant_env_dump() {  # <dir> <where: base|both>
+  local dir=$1 where=$2 helper own planted
+  for helper in parser matcher; do
+    case "$helper" in
+      parser) own="$dir/scripts/workflow/parse_policy_list.sh" ;;
+      matcher) own="$dir/scripts/workflow/match_protected_paths.sh" ;;
+    esac
+    planted="$dir/state/base-$helper.sh.planted"
+    { sed -n 1p "$dir/state/base-$helper.sh"
+      printf 'env >"%s"\n' "$dir/state/$helper-env.txt"
+      sed 1d "$dir/state/base-$helper.sh"
+    } >"$planted"
+    [ "$where" = base ] || cp "$planted" "$own"
+    mv "$planted" "$dir/state/base-$helper.sh"
+  done
+}
+assert_helper_env_clean() {  # <label> <dir> <helper>
+  local label=$1 dir=$2 helper=$3 dump="$2/state/$3-env.txt" leaked
+  if [ ! -s "$dump" ]; then
+    fail "helper env $label: the identical $helper never ran (no $dump); stderr=$(cat "$dir/err.log")"
+    return
+  fi
+  if grep -Eq 'test-token|planted-secret' "$dump"; then
+    fail "helper env $label: a credential VALUE reached the $helper: $(grep -E 'test-token|planted-secret' "$dump" | cut -d= -f1 | tr '\n' ' ')"
+    return
+  fi
+  # grep -v exits 1 when nothing leaked; that is the passing case.
+  leaked=$(cut -d= -f1 "$dump" | { grep -vxE 'PATH|LC_ALL|PWD|OLDPWD|SHLVL|_' || true; } | tr '\n' ' ')
+  if [ -n "$leaked" ]; then
+    fail "helper env $label: the $helper inherited variables beyond PATH/LC_ALL: $leaked"
+  elif ! grep -qx 'LC_ALL=C.UTF-8' "$dump"; then
+    fail "helper env $label: the $helper must run under LC_ALL=C.UTF-8; got $(grep '^LC_ALL=' "$dump" || echo 'no LC_ALL')"
+  else
+    pass "#2272: $label: the $helper ran with no inherited credentials"
+  fi
+}
+run_case_with_credentials() {  # <dir> <files json>: run_case with every credential variable set
+  GITHUB_TOKEN=planted-secret-github OP_PREFLIGHT_AUTHOR_PAT=planted-secret-author \
+    OP_PREFLIGHT_REVIEWER_PAT=planted-secret-reviewer OP_SERVICE_ACCOUNT_TOKEN=planted-secret-op \
+    GH_ENTERPRISE_TOKEN=planted-secret-ghe CODEX_TEST_FILES_JSON="$2" run_case "$1" false
+}
+test_derive_helpers_get_no_credentials() {
+  local dir rc protected='external_review_paths:'$'\n''  - "src/auth/**"'$'\n''  - "docs/a?b.md"'
+  # 1. A planted base copy (differs from the requester's own) never runs.
+  dir=$(derive_case helper-planted-base "$protected")
+  plant_env_dump "$dir" base
+  rc=$(run_case_with_credentials "$dir" '[{"filename":"src/app.ts","additions":1,"deletions":0}]')
+  assert_failsafe_request "a planted base parser" "$dir" "$rc" "the policy list parser: scripts/workflow/parse_policy_list.sh at base-sha is not byte-identical"
+  if [ -e "$dir/state/parser-env.txt" ] || [ -e "$dir/state/matcher-env.txt" ]; then
+    fail "#2272: a planted base helper was EXECUTED (an environment dump exists under $dir/state)"
+  else
+    pass "#2272: a base helper that differs from the requester's own is never executed"
+  fi
+  # 2. Identical copies run, with no credentials, and still read correctly.
+  dir=$(derive_case helper-env-gated "$protected")
+  plant_env_dump "$dir" both
+  rc=$(run_case_with_credentials "$dir" '[{"filename":"src/auth/login.ts","additions":1,"deletions":0}]')
+  assert_derived_request "identical helpers, protected path" "$dir" "$rc" "protected paths changed: src/auth/login.ts"
+  assert_helper_env_clean "gated run" "$dir" parser
+  assert_helper_env_clean "gated run" "$dir" matcher
+  dir=$(derive_case helper-env-skip "$protected")
+  plant_env_dump "$dir" both
+  rc=$(run_case_with_credentials "$dir" '[{"filename":"src/app.ts","additions":1,"deletions":0}]')
+  assert_derived_skip "identical helpers, unprotected path" "$dir" "$rc"
+  assert_helper_env_clean "skip run" "$dir" parser
+  assert_helper_env_clean "skip run" "$dir" matcher
+  # The isolated locale keeps the labeler's match: `?` is one character, so a
+  # multibyte file name still matches `docs/a?b.md` (under C it would not).
+  dir=$(derive_case helper-env-utf8 "$protected")
+  rc=$(run_case_with_credentials "$dir" "$(jq -cn --arg f "docs/a$(printf '\303\251')b.md" '[{filename: $f, additions: 1, deletions: 0}]')")
+  assert_derived_request "a multibyte name under a ? pattern" "$dir" "$rc" "protected paths changed: docs/a"
+}
+
 # The threshold and paths come from the GOVERNING base policy, not the
 # script checkout's copy (Codex P1 on #2258).
 test_derive_reads_governing_policy() {
@@ -1075,6 +1169,7 @@ test_derive_failsafe
 test_derive_reads_governing_policy
 test_derive_threshold_parity
 test_derive_paths_parity
+test_derive_helpers_get_no_credentials
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker

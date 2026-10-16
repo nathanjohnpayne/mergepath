@@ -297,9 +297,33 @@ if gate.is_a?(Hash)
       close_env.fetch("FINGERPRINT_AVAILABLE", "").to_s.include?("steps.gate.outputs.fingerprint_available") &&
       close_run.include?('scripts/workflow/codex-p1-snapshot-retry.py') &&
       close_run.include?('"$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode"') &&
-      close_run.include?('exit "$?"') && close_run.include?('"$GATE_READY" = true') &&
+      close_run.include?('driver_rc=${PIPESTATUS[0]}') && close_run.include?('exit "$driver_rc"') &&
+      close_run.include?('"$GATE_READY" = true') &&
       close_run.include?('"$ARCHIVE_RESULT" != failure') && close_run.include?('"$ARCHIVE_RESULT" != cancelled'),
     "codex-p1-gate does not bind native completion and its original lease to bounded snapshot recovery"
+  )
+  # #2286: the budget guard. A skipped or rate-limited run may conclude its
+  # job-native run non-failing only through budget_native_exit, which
+  # requires scripts/gate-api-lineage-blocking.sh to confirm the Checks-API
+  # lineage blocks; the skip closes the lease with the publisher's back-off
+  # red (ib_backoff_title) and never with success. The knobs are integers.
+  budget_lineage = close_run.index('scripts/gate-api-lineage-blocking.sh "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"')
+  budget_check = close_run.index('if ! ib_affordable 1; then')
+  budget_close = close_run.index('title=$(ib_backoff_title "$CHECK_NAME" 2 "$reset")')
+  driver_call = close_run.index('scripts/workflow/codex-p1-snapshot-retry.py \\')
+  require_shape.call(
+    [budget_lineage, budget_check, budget_close, driver_call].all? &&
+      budget_check < budget_close && budget_close < driver_call &&
+      close_run.scan('exit 0').length == 1 &&
+      (native_body = close_run[/budget_native_exit\(\) \{\n(.*?)\n\s*\}\n/m, 1]) &&
+      native_body.index("gate-api-lineage-blocking.sh") &&
+      native_body.index("gate-api-lineage-blocking.sh") < native_body.index("exit 0") &&
+      native_body.index("exit 0") < native_body.index("exit 1") &&
+      !native_body.include?("success") &&
+      close_env.fetch("RUN_ID", "").to_s.include?("github.run_id") &&
+      %w[BUDGET_PER_EVAL_REQUESTS BUDGET_RESERVE_REQUESTS BUDGET_PER_EVAL_GRAPHQL_POINTS
+         BUDGET_GRAPHQL_RESERVE_POINTS].all? { |k| close_env.fetch(k, "").to_s.match?(/\A[0-9]+\z/) },
+    "codex-p1-gate's budget guard (#2286) can conclude a run that did not evaluate without confirming the Checks-API lineage blocks"
   )
 
 end

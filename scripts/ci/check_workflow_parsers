@@ -1634,7 +1634,7 @@ else
 fi
 
 echo "Trusted event binding and candidate authority boundaries (#1547)"
-if node tests/test_trusted_pr_event.cjs && python3 -B tests/test_trusted_workflow_boundaries.py; then
+if node tests/test_trusted_pr_event.cjs && python3 -B tests/test_trusted_workflow_boundaries.py && python3 -B tests/test_native_clearance_recovery.py; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))

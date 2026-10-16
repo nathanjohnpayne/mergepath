@@ -594,16 +594,109 @@ jobs:
           GATE_READY: ${{ steps.gate.outputs.ready }}
           LEGACY_BOOTSTRAP: ${{ steps.gate.outputs.legacy_bootstrap }}
           FINGERPRINT_AVAILABLE: ${{ steps.gate.outputs.fingerprint_available }}
+          RUN_ID: ${{ github.run_id }}
+          CHECK_NAME: "Codex P1 unresolved threads"
+          # Budget guard knobs (#2286), read by
+          # scripts/workflow/installation-budget.sh. One clean evaluation
+          # costs about 20 REST requests (two head reads, three surface
+          # fingerprints of three reads each, codex-p1-gate.sh's 6 to 9, the
+          # lease PATCH) and up to one GraphQL point, measured on #2249,
+          # #2265, #2292 and #2232; the driver retries up to three times on
+          # feedback drift, so a run can cost about 60. The reserve is the
+          # publisher's own floor for one event-head evaluation (60 per PR
+          # plus its 100 reserve) plus room for the skip-path writes of the
+          # other gate workflows the same event starts, so an event workflow
+          # stops spending before the publisher has to.
+          BUDGET_PER_EVAL_REQUESTS: "60"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "3"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           set -uo pipefail
+          # The job-native conclusion of a run that did not evaluate (#2286):
+          # the budget guard skipped it, or the evaluation died on the
+          # exhausted installation budget. Failing the native run here would
+          # leave a red in this run's own check suite that only a manual
+          # rerun retires (#2232 needed 53). So, as the clearance gate's
+          # pending arm does (#2247), it concludes non-failing ONLY when
+          # scripts/gate-api-lineage-blocking.sh confirms that the
+          # Checks-API lineage of this context blocks the head on its own,
+          # outside this run's suite; that lineage carries the block until
+          # the publisher re-evaluates the head. A missing helper, a failed
+          # read or any unmet condition fails the native run as before, and
+          # so does an issue_comment run, whose native check is attached to
+          # the default branch and never listed on the PR head.
+          budget_native_exit() {
+            if [ -x scripts/gate-api-lineage-blocking.sh ] \
+               && scripts/gate-api-lineage-blocking.sh "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"; then
+              echo "::notice::$CHECK_NAME was not evaluated on $HEAD_SHA because the installation API budget is short or exhausted (#2286). This job-native run concludes non-failing by design; the Checks-API run of the same name carries the block until the publisher re-evaluates the head after the budget resets."
+              exit 0
+            fi
+            echo "::error::$CHECK_NAME was not evaluated on $HEAD_SHA (installation API budget, #2286), and the Checks-API lineage could not be confirmed to block, so the job-native run fails."
+            exit 1
+          }
           if [ "$ARCHIVE_RESULT" != failure ] && [ "$ARCHIVE_RESULT" != cancelled ] \
             && [ "$GATE_READY" = true ]; then
             mode=fingerprint
             [ "$FINGERPRINT_AVAILABLE" = true ] || mode=bootstrap
+            # Budget guard (#2286). GET /rate_limit is free; when the
+            # installation budget cannot cover one evaluation plus the
+            # reserve, the lease this run opened is closed with the
+            # publisher's back-off red instead of evaluating: never a green,
+            # and its title records the reset, so the publisher's due() leaves
+            # the PR alone until then and its first pass after the reset (an
+            # event pass on any PR, or the */30 chained full pass)
+            # re-evaluates it with no manual rerun. An unreadable budget
+            # evaluates as before (see installation-budget.sh). The library is
+            # absent on a default branch that predates it; evaluate then too.
+            if [ -r scripts/workflow/installation-budget.sh ]; then
+              # shellcheck source=scripts/workflow/installation-budget.sh
+              . scripts/workflow/installation-budget.sh
+              ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+                "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+              if ! ib_affordable 1; then
+                reset=$(ib_short_bucket_reset)
+                title=$(ib_backoff_title "$CHECK_NAME" 2 "$reset")
+                summary="Not evaluated: $rl_remaining REST request(s) and ${gql_remaining:-?} GraphQL point(s) of the installation API budget remain, short of one evaluation ($BUDGET_PER_EVAL_REQUESTS requests) plus the $BUDGET_RESERVE_REQUESTS-request reserve (#2286). The publisher re-evaluates this head after ${reset:-the window resets}."
+                echo "::notice::Budget guard (#2286): $summary"
+                for attempt in 1 2; do
+                  gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+                    -f status="completed" -f conclusion="failure" \
+                    -f "output[title]=$title" -f "output[summary]=$summary" >/dev/null && break
+                  [ "$attempt" -eq 2 ] || sleep 5
+                done
+                budget_native_exit
+              fi
+            else
+              echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
+            fi
             if [ -x scripts/workflow/codex-p1-snapshot-retry.py ]; then
+              driver_out=$(mktemp)
               scripts/workflow/codex-p1-snapshot-retry.py \
-                "$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode"
-              exit "$?"
+                "$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode" 2>&1 | tee "$driver_out"
+              driver_rc=${PIPESTATUS[0]}
+              # The driver stops at the first gate or read error (no retry on
+              # anything but feedback drift) and closes the lease red, or
+              # leaves it pending when even that write is refused. When the
+              # error was the exhausted installation budget, the lease is
+              # re-closed with the publisher's back-off red (one best-effort
+              # PATCH; its reset read from a refused probe's headers), so the
+              # publisher backs the PR off until the reset like every other
+              # budget red, and the native run follows the Checks-API lineage
+              # as above (#2286).
+              if [ "$driver_rc" -eq 2 ] \
+                 && grep -qiE 'rate limit (already )?exceeded for installation' "$driver_out"; then
+                if declare -F ib_backoff_title >/dev/null; then
+                  title=$(ib_backoff_title "$CHECK_NAME" 2 "$(ib_exhausted_reset "$(cat "$driver_out")")")
+                  summary=$(cat "$driver_out")
+                  gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+                    -f status="completed" -f conclusion="failure" \
+                    -f "output[title]=$title" -f "output[summary]=${summary:0:60000}" >/dev/null \
+                    || echo "::warning::Could not stamp the back-off title on lease $CHECK_ID; the driver's red stands."
+                fi
+                budget_native_exit
+              fi
+              exit "$driver_rc"
             elif [ "$LEGACY_BOOTSTRAP" = true ]; then
               # First-delivery compatibility only: retain the old single-shot
               # fail-closed gate until trusted main installs the bounded driver.

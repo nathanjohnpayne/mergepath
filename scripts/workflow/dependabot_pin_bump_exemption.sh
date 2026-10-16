@@ -263,7 +263,7 @@ fi
 #
 #   dependabot.pin_bump_exemption.enabled  absent => true; true/false (bare
 #                                          or quoted) honored; anything else
-#                                          is unreadable.
+#                                          (including explicit null) is unreadable.
 #   external_review_threshold              absent => 300; a non-negative
 #                                          integer; anything else unreadable.
 POLICY_JSON='{}'
@@ -274,9 +274,11 @@ if [ -n "$CONFIG" ]; then
   fi
 fi
 ENABLED=$(jq -r '
-  (try (.dependabot.pin_bump_exemption.enabled) catch "<malformed>")
-  | if . == null then "true"
-    elif . == true or . == "true" then "true"
+  (try (.dependabot.pin_bump_exemption
+    | if . == null then true
+      elif has("enabled") then .enabled
+      else true end) catch "<malformed>")
+  | if . == true or . == "true" then "true"
     elif . == false or . == "false" then "false"
     else "<invalid:" + tostring + ">" end' <<<"$POLICY_JSON")
 case "$ENABLED" in

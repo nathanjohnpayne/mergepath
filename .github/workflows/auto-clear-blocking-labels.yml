@@ -199,8 +199,55 @@ jobs:
           # checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
+      - name: Installation budget guard (#2286)
+        # Reads GET /rate_limit (free) for this workflow's GITHUB_TOKEN
+        # through the publisher's own reader,
+        # scripts/workflow/installation-budget.sh. When the installation
+        # budget cannot cover one evaluation plus the reserve, nothing below
+        # runs: no PR is resolved or evaluated, no label is removed (the
+        # label stays, which keeps Label Gate red: fail closed), and no
+        # auto-clear-blocking-labels check-run is posted (an infra-failure
+        # run there would make the PR UNSTABLE until healed, #2193). The
+        # job ends green with a notice. The PR is re-evaluated by the */5
+        # scheduled sweep below, which is not budget-guarded, and by the
+        # publisher's auto-clear nomination after its next green clearance
+        # verdict. An unreadable budget, or a default branch without the
+        # library, evaluates as before.
+        id: budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Installation-token cost of one evaluation (codex-review-check.sh
+          # itself runs on the CI PAT: 20 REST and 3 GraphQL measured on
+          # #2249): the live head/base read, the pre-DELETE fence read, the
+          # protective-retraction reads of approval-merge-continuation.sh
+          # (about 4, counted from the script), the workflow_run fallback's
+          # open-PR list (one GraphQL query) and, on a workflow_run event,
+          # the continuation step's retraction reads again. The reserve
+          # matches the other event workflows (#2286).
+          BUDGET_PER_EVAL_REQUESTS: "15"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
+        run: |
+          set -uo pipefail
+          if [ ! -r scripts/workflow/installation-budget.sh ]; then
+            echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
+            exit 0
+          fi
+          # shellcheck source=scripts/workflow/installation-budget.sh
+          . scripts/workflow/installation-budget.sh
+          ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+            "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+          if ib_affordable 1; then
+            exit 0
+          fi
+          echo "::notice::Budget guard (#2286): $rl_remaining REST request(s) and ${gql_remaining:-?} GraphQL point(s) remain until ${RATE_LIMIT_RESET_ISO:-the window resets}, short of one evaluation ($BUDGET_PER_EVAL_REQUESTS requests) plus the $BUDGET_RESERVE_REQUESTS-request reserve. Not evaluating: needs-external-review stays where it is, nothing is written, and the */5 sweep re-evaluates."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+
       - name: Resolve PR number from event
         id: pr
+        if: steps.budget.outputs.skip != 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_JSON: ${{ toJSON(github.event) }}
@@ -231,6 +278,19 @@ jobs:
                 exit 0
               fi
               prs=$(jq -r '.workflow_run.pull_requests[].number' <<<"$EVENT_JSON")
+              # The trusted review pipeline's default-branch run has no PR
+              # association. Its title carries nomination only; the existing
+              # helpers rederive the live tuple, clearance and writer fences.
+              if [ -z "$prs" ]; then
+                source=$(jq -r '.workflow_run | select(.path == ".github/workflows/agent-review.yml" and .event == "workflow_run") | .display_title // empty' <<<"$EVENT_JSON")
+                if [[ "$source" =~ ^policy-v1\ pr=0\ source=([1-9][0-9]*)$ ]]; then
+                  source_id=${BASH_REMATCH[1]}
+                  review_title=$(gh api "repos/$REPO/actions/runs/$source_id" --jq 'select(.path == ".github/workflows/agent-review-events.yml" and .event == "pull_request_review" and .status == "completed") | .display_title // empty') || exit 1
+                  if [[ "$review_title" =~ ^review-v1\ pr=([1-9][0-9]*)\ review=[1-9][0-9]*\ head=[a-f0-9]{40}\ base=[a-f0-9]{40}$ ]]; then
+                    prs=${BASH_REMATCH[1]}
+                  fi
+                fi
+              fi
               # #730: `workflow_run.pull_requests` is frequently EMPTY even for a
               # run whose head IS a PR head (a documented GitHub quirk for
               # same-repo PR runs, and always empty for push / issue_comment /
@@ -320,11 +380,20 @@ jobs:
           # #2193: selects which label-absent PRs are heal candidates below.
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
+          # Budget stop knobs (#2286): the same values as the budget guard
+          # step above.
+          BUDGET_PER_EVAL_REQUESTS: "15"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           bash scripts/workflow/auto-clear-event.sh
 
       - name: Continue approved PRs after completed checks
-        if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
+        # Not after a budget stop (#2286): the continuation spends the same
+        # installation token, and the */5 sweep's continuation backstop
+        # re-enters every open approved PR.
+        if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != '' && steps.clear.outputs.budget_stopped != 'true'
         env:
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
@@ -839,7 +908,7 @@ jobs:
 
   clear-event-labels:
     needs: [evaluate-and-clear]
-    if: needs.evaluate-and-clear.result == 'success' && needs.evaluate-and-clear.outputs.protected_pairs != '' && needs.evaluate-and-clear.outputs.protected_pairs != '[]'
+    if: ${{ !cancelled() && contains(fromJSON('["success","failure"]'), needs.evaluate-and-clear.result) && needs.evaluate-and-clear.outputs.protected_pairs != '' && needs.evaluate-and-clear.outputs.protected_pairs != '[]' }}
     environment: review-automation
     runs-on: ubuntu-latest
     permissions:
@@ -883,7 +952,7 @@ jobs:
 
   clear-sweep-labels:
     needs: [scheduled-sweep]
-    if: needs.scheduled-sweep.result == 'success' && needs.scheduled-sweep.outputs.protected_pairs != '' && needs.scheduled-sweep.outputs.protected_pairs != '[]'
+    if: ${{ !cancelled() && contains(fromJSON('["success","failure"]'), needs.scheduled-sweep.result) && needs.scheduled-sweep.outputs.protected_pairs != '' && needs.scheduled-sweep.outputs.protected_pairs != '[]' }}
     environment: review-automation
     runs-on: ubuntu-latest
     permissions:

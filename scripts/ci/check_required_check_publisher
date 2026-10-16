@@ -146,6 +146,9 @@ DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
 DUE_TEST="tests/test_required_check_publisher_due.sh"
 GENERATION_TEST="tests/test_required_check_generations.py"
+# #2286: the event-driven gate workflows read the installation budget through
+# the publisher's own reader (scripts/workflow/installation-budget.sh).
+EVENT_BUDGET_TEST="tests/test_event_budget_guard.sh"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -1247,7 +1250,8 @@ NOMINATE_ENV = {
     "AUTOCLEAR_PRS": "${{ needs.publish.outputs.autoclear_prs }}",
 }
 PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}",
-                   "evidence_escalations": "${{ steps.publish.outputs.evidence_escalations }}"}
+                   "evidence_escalations": "${{ steps.publish.outputs.evidence_escalations }}",
+                   "native_recoveries": "${{ steps.publish.outputs.native_recoveries }}"}
 nominate = jobs.get(NOMINATE_JOB)
 if not isinstance(nominate, dict):
     bad("FAIL: [rcp auto-clear nomination] the publisher has no %r job mapping;" % NOMINATE_JOB,
@@ -1372,6 +1376,15 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   fi
   if ! bash "$DUE_TEST"; then
     echo "check_required_check_publisher: FAIL (due-only targeting behavior suite)"
+    exit 1
+  fi
+  if [ ! -f "$EVENT_BUDGET_TEST" ]; then
+    echo "FAIL: $EVENT_BUDGET_TEST is missing; the event-driven workflows' budget guard (#2286) is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$EVENT_BUDGET_TEST"; then
+    echo "check_required_check_publisher: FAIL (event-driven budget guard suite)"
     exit 1
   fi
 fi

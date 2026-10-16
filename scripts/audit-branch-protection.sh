@@ -930,7 +930,7 @@ $ctxs"
 canonical_checks_all_present() {  # <contexts, one per line>
   local have="$1" check
   for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
-    printf '%s\n' "$have" | grep -Fxq "$check" || return 1
+    grep -Fxq "$check" <<<"$have" || return 1
   done
   return 0
 }
@@ -1230,7 +1230,7 @@ if [ "$SCAN_RULESETS" -eq 1 ]; then
     RS_CANONICAL_RELEVANT=0
     if [ -n "$THIS_CHECKS" ]; then
       for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
-        if printf '%s\n' "$THIS_CHECKS" | grep -Fxq "$check"; then
+        if grep -Fxq "$check" <<<"$THIS_CHECKS"; then
           RS_CANONICAL_RELEVANT=1
           break
         fi
@@ -1401,7 +1401,7 @@ echo ""
 # later is exactly the latency #774 exists to remove.
 MISSING=()
 for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
-  if ! echo "$REQUIRED_CHECKS" | grep -Fxq "$check"; then
+  if ! grep -Fxq "$check" <<<"$REQUIRED_CHECKS"; then
     MISSING+=("$check")
   fi
 done

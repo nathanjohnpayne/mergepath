@@ -25,6 +25,7 @@ spec_test_map:
   stalled_pr_resume: tests/test_stalled_pr_resume.sh
   credential_isolation: tests/test_credential_isolation.py
   trusted_workflow_credentials:
+    - tests/test_native_clearance_recovery.py
     - tests/test_trusted_workflow_boundaries.py
     - tests/test_trusted_pr_event.cjs
     - tests/test_dependabot_auto_merge.sh
@@ -56,6 +57,9 @@ spec_test_map:
     - tests/test_cockpit_prs_ui.cjs
   sync_audit_json: tests/test_sync_audit_json.sh
   phase_4b_immutable_input: tests/test_phase_4b_immutable_input.sh
+  phase_4b_escalation:
+    - tests/test_phase_4b_escalation.cjs
+    - tests/test_phase_4b_automation.sh
   phase_4b_heartbeat:
     - tests/test_phase_4b_heartbeat.sh
     - tests/test_phase_4b_accounting.sh

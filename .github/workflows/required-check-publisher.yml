@@ -324,6 +324,7 @@ jobs:
     outputs:
       autoclear_prs: ${{ steps.publish.outputs.autoclear_prs }}
       evidence_escalations: ${{ steps.publish.outputs.evidence_escalations }}
+      native_recoveries: ${{ steps.publish.outputs.native_recoveries }}
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -494,80 +495,29 @@ jobs:
           # previous verdict on its own head and is never given a new green.
           # An unreadable /rate_limit, or a malformed knob, proceeds exactly
           # as before: fail toward evaluating, with a warning.
-          budget_known=0
-          gql_known=0
-          rl_remaining=""
-          rl_reset=""
-          gql_remaining=""
-          gql_reset=""
-          RATE_LIMIT_RESET_ISO=""
-          per_pr="${BUDGET_PER_PR_REQUESTS:-60}"
-          reserve="${BUDGET_RESERVE_REQUESTS:-100}"
-          gql_per_pr="${BUDGET_PER_PR_GRAPHQL_POINTS:-10}"
-          gql_reserve="${BUDGET_GRAPHQL_RESERVE_POINTS:-50}"
+          # The reader and the affordability arithmetic live in
+          # scripts/workflow/installation-budget.sh (#2286), shared with the
+          # event-driven gate workflows so every budget decision reads
+          # /rate_limit the same way. It sets per_pr, reserve, gql_per_pr,
+          # gql_reserve, budget_known, gql_known, rl_remaining, rl_reset,
+          # gql_remaining, gql_reset and RATE_LIMIT_RESET_ISO.
+          . scripts/workflow/installation-budget.sh
           # Requests this pass has already spent on its own selection reads
           # (one per due() proof read), charged against the snapshot below
           # so the proof reads cannot eat the reserve unseen (Codex P2 on
           # #2225).
           spent=0
-          if rl_line=$(gh api rate_limit \
-              --jq '[.resources.core.remaining, .resources.core.reset, (.resources.graphql.remaining // "-"), (.resources.graphql.reset // "-")] | map(tostring) | join("\t")'); then
-            IFS=$'\t' read -r rl_remaining rl_reset gql_remaining gql_reset <<<"$rl_line" || true
-          fi
-          case "$rl_remaining:$rl_reset:$per_pr:$reserve" in
-            *[!0-9:]*|:*|*::*|*:)
-              echo "::warning::Could not read the installation budget from GET /rate_limit (or a budget knob is malformed); evaluating as before (#2220)."
-              ;;
-            *)
-              budget_known=1
-              # The GraphQL bucket is budgeted only when it was readable and
-              # its knobs are well-formed; otherwise the core check stands
-              # alone (fail toward evaluating).
-              case "$gql_remaining:$gql_reset:$gql_per_pr:$gql_reserve" in
-                *[!0-9:]*|:*|*::*|*:) echo "::warning::GraphQL budget unreadable; budgeting the REST core bucket only (#2220)." ;;
-                *) gql_known=1 ;;
-              esac
-              RATE_LIMIT_RESET_ISO=$(jq -nr --argjson r "$rl_reset" '$r | todateiso8601' 2>/dev/null || true)
-              echo "Installation budget: $rl_remaining REST request(s) and ${gql_remaining} GraphQL point(s) remaining; the REST window resets at ${RATE_LIMIT_RESET_ISO:-epoch $rl_reset}."
-              ;;
-          esac
-          # affordable <count>: exit 0 when BOTH buckets cover <count> PR
+          ib_read "${BUDGET_PER_PR_REQUESTS:-60}" "${BUDGET_RESERVE_REQUESTS:-100}" \
+            "${BUDGET_PER_PR_GRAPHQL_POINTS:-10}" "${BUDGET_GRAPHQL_RESERVE_POINTS:-50}"
+          # ib_affordable <count>: exit 0 when BOTH buckets cover <count> PR
           # evaluations plus their reserves (net of this pass's own
-          # selection reads), or when the budget is unknown.
-          affordable() {
-            [ "$budget_known" -eq 1 ] || return 0
-            [ $(( rl_remaining - spent )) -ge $(( per_pr * $1 + reserve )) ] || return 1
-            [ "$gql_known" -eq 1 ] || return 0
-            [ "$gql_remaining" -ge $(( gql_per_pr * $1 + gql_reserve )) ]
-          }
-          # capacity: how many PR evaluations the budget covers beyond the
-          # reserves (a large number when the budget is unknown).
-          capacity() {
-            local k g
-            if [ "$budget_known" -ne 1 ]; then echo 1000000; return 0; fi
-            k=$(( (rl_remaining - spent - reserve) / per_pr ))
-            if [ "$gql_known" -eq 1 ]; then
-              g=$(( (gql_remaining - gql_reserve) / gql_per_pr ))
-              [ "$g" -ge "$k" ] || k="$g"
-            fi
-            [ "$k" -ge 0 ] || k=0
-            echo "$k"
-          }
-          # The reset to stamp on a budget red: the later reset of the
+          # selection reads), or when the budget is unknown. ib_capacity:
+          # how many PR evaluations the budget covers beyond the reserves (a
+          # large number when the budget is unknown). ib_short_bucket_reset:
+          # the reset to stamp on a budget red, the later reset of the
           # bucket(s) that cannot cover one evaluation, so the back-off ends
           # when the bucket that actually ran out refills (Codex P1 on
-          # #2225). Falls back to the REST core reset.
-          short_bucket_reset() {
-            local r="$rl_reset" core_short=0 gql_short=0
-            [ $(( rl_remaining - spent )) -ge $(( per_pr + reserve )) ] || core_short=1
-            if [ "$gql_known" -eq 1 ] && [ "$gql_remaining" -lt $(( gql_per_pr + gql_reserve )) ]; then
-              gql_short=1
-            fi
-            if [ "$gql_short" -eq 1 ] && { [ "$core_short" -eq 0 ] || [ "$gql_reset" -gt "$r" ]; }; then
-              r="$gql_reset"
-            fi
-            jq -nr --argjson r "$r" '$r | todateiso8601' 2>/dev/null || true
-          }
+          # #2225).
           n_targets=$(awk 'NF { n++ } END { print n + 0 }' <<<"$targets")
           # Heads this pass claimed with holds. Under a short budget they are
           # the only heads evaluated, and after a rate-limit stop their
@@ -577,7 +527,7 @@ jobs:
           CLAIMED_HEADS=""
           # Set by gate() on the first installation rate-limit failure.
           RATE_LIMITED=0
-          RATE_LIMIT_MARK="installation API budget exhausted"
+          RATE_LIMIT_MARK="$IB_RATE_LIMIT_MARK"
           # A dispatch-narrowed pass opens pendings on the named head FIRST
           # (cross-agent round 8): without them the previous green stays
           # usable for the whole re-evaluation it was asked to refresh.
@@ -615,7 +565,7 @@ jobs:
           budget_low=0
           if [ -n "$dispatch_matched" ]; then
             dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
-            if ! affordable 1; then
+            if ! ib_affordable 1; then
               budget_low=1
             elif [ -n "$dispatch_head" ]; then
               open_holds "$dispatch_head" "$(awk -F'\t' 'NR==1{print $1}' <<<"$dispatch_matched")"
@@ -638,7 +588,7 @@ jobs:
           # fail, the holds stay pending: fail closed, never a green.
           if [ -n "$RUN_HEAD" ] && [ -n "$targets" ] \
               && [ "$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")" = "$RUN_HEAD" ]; then
-            if affordable 1; then
+            if ib_affordable 1; then
               open_holds "$RUN_HEAD" "$(awk -F'\t' -v h="$RUN_HEAD" '$2==h{print $1; exit}' <<<"$targets")"
             elif [ "${PARENT_NAME:-}" = "repo-lint" ]; then
               # A lint-parent pass opened no holds and the gates do not
@@ -649,7 +599,7 @@ jobs:
             else
               CLAIMED_HEADS="$CLAIMED_HEADS $RUN_HEAD"
               RATE_LIMITED=1
-              RATE_LIMIT_RESET_ISO=$(short_bucket_reset)
+              RATE_LIMIT_RESET_ISO=$(ib_short_bucket_reset)
               echo "::warning::Budget guard (#2220): $rl_remaining REST request(s) and ${gql_remaining} GraphQL point(s) remain, short of one evaluation plus the reserves; closing the event head's holds with the budget red instead of evaluating it (re-evaluated after ${RATE_LIMIT_RESET_ISO:-the window resets})."
             fi
           fi
@@ -834,17 +784,19 @@ jobs:
               # REST says "rate limit exceeded for installation"; GraphQL says
               # "rate limit already exceeded for installation".
               if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ] \
-                  && grep -qiE 'rate limit (already )?exceeded for installation' <<<"$output"; then
+                  && ib_rate_limited "$output"; then
                 RATE_LIMITED=1
                 rate_limit_red=1
                 echo "::error::$script hit the installation API rate limit on PR #$pr; stopping this pass (#2220)."
-                # Stamp the reset of the bucket that actually ran out (REST
-                # core or GraphQL; the later one when both did), read again
-                # now — GET /rate_limit answers even when both are empty.
-                # An unreadable answer keeps the pass-start reset.
+                # Stamp the reset of the bucket that actually ran out, read
+                # now from the X-RateLimit-* headers of a probe the same
+                # bucket refuses (#2286: GET /rate_limit can read healthy
+                # while calls are refused), falling back to the exhausted
+                # bucket GET /rate_limit names. An unreadable answer keeps
+                # the pass-start reset.
                 local exhausted_reset
-                if exhausted_reset=$(gh api rate_limit --jq '[.resources.core, .resources.graphql] | map(select(. != null)) as $b | ($b | map(select(.remaining == 0))) as $out | (if ($out | length) > 0 then $out else $b end) | map(.reset) | max | todateiso8601' 2>/dev/null) \
-                    && [ -n "$exhausted_reset" ]; then
+                exhausted_reset=$(ib_exhausted_reset "$output")
+                if [ -n "$exhausted_reset" ]; then
                   RATE_LIMIT_RESET_ISO="$exhausted_reset"
                 fi
               fi
@@ -925,6 +877,15 @@ jobs:
               # (a moved head was turned red above). The nomination step
               # after the loop decides whether auto-clear should run on it.
               MCG_GREEN_PRS="${MCG_GREEN_PRS:-} $pr"
+              # This is nomination, never native clearance. The recovery job
+              # binds this owned generation and rederives every live predicate.
+              if recovery_base=$(gh api "repos/$REPO/pulls/$pr" --jq .base.sha); then
+                NATIVE_RECOVERIES=$(jq -c --argjson pr "$pr" --arg head "$head" \
+                  --arg base "$recovery_base" --arg revision "$(git rev-parse HEAD)" \
+                  --argjson generation "$generation_id" \
+                  '. + [{pr:$pr,head:$head,base:$base,revision:$revision,generation:$generation}]' \
+                  <<<"${NATIVE_RECOVERIES:-[]}")
+              fi
             fi
           }
 
@@ -958,7 +919,7 @@ jobs:
             if [ "$due_only" -eq 1 ] && [ "$head_sha" != "$RUN_HEAD" ]; then
               # The event head plus this PR is already more than the budget
               # covers: skip without spending a due() read on it (#2220).
-              if ! affordable 2; then
+              if ! ib_affordable 2; then
                 budget_skipped="$budget_skipped #$PR"
                 continue
               fi
@@ -980,7 +941,7 @@ jobs:
 
           n_selected=$(awk 'NF { n++ } END { print n + 0 }' <<<"$selected")
           if [ -n "$budget_skipped" ] \
-              || { [ "$n_selected" -gt 0 ] && ! affordable "$n_selected"; }; then
+              || { [ "$n_selected" -gt 0 ] && ! ib_affordable "$n_selected"; }; then
             budget_low=1
           fi
           if [ "$budget_low" -eq 1 ]; then
@@ -1007,7 +968,7 @@ jobs:
                 *) others="$others$PR"$'\t'"$head_sha"$'\n' ;;
               esac
             done <<<"$selected"
-            slots=$(( $(capacity) - n_claimed_kept ))
+            slots=$(( $(ib_capacity) - n_claimed_kept ))
             [ "$slots" -ge 0 ] || slots=0
             n_others=$(awk 'NF { n++ } END { print n + 0 }' <<<"$others")
             batch=""
@@ -1093,6 +1054,7 @@ jobs:
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "autoclear_prs=$(echo $autoclear_prs)" >> "$GITHUB_OUTPUT"
           echo "evidence_escalations=$(echo $EVIDENCE_ESCALATIONS)" >> "$GITHUB_OUTPUT"
+          echo "native_recoveries=${NATIVE_RECOVERIES:-[]}" >> "$GITHUB_OUTPUT"
 
           if [ -n "$stopped" ]; then
             echo "::warning::Stopped at an installation API rate-limit failure (#2220). Not evaluated:$stopped. Each keeps its previous verdict on its own head; a pass after ${RATE_LIMIT_RESET_ISO:-the budget resets} evaluates them."
@@ -1104,6 +1066,31 @@ jobs:
             echo "::error::Publisher finished with one or more infra errors"
             exit 1
           fi
+
+  recover-native-clearance:
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.outputs.native_recoveries != '' && needs.publish.outputs.native_recoveries != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      checks: read
+      pull-requests: read
+      issues: read
+      security-events: read
+    steps:
+      - name: Checkout trusted recovery code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Rerun actual native gates after genuine clearance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NOMINATIONS: ${{ needs.publish.outputs.native_recoveries }}
+        run: python3 scripts/workflow/recover-native-clearance.py "$REPO" "$NOMINATIONS"
 
   # Phase 3 (#2239, #2205). Sends one `auto-clear-evaluate` repository_dispatch
   # per PR the publish pass nominated (see "Auto-clear nominations" in its

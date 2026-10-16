@@ -36,8 +36,39 @@ cleared_prs=""
 # infra-failure check-runs" step supersedes a stale failed
 # auto-clear-blocking-labels check-run on each one's head.
 heal_prs=""
+# Budget stop (#2286). Before EVERY PR the installation budget is
+# read again (GET /rate_limit, free, with this workflow's own
+# token), so a run that resolved several PRs stops as soon as the
+# budget cannot cover the next one, whether or not an earlier PR
+# failed (Codex P2 on #2298). A stopped PR is left untouched: its
+# label stays, fail closed, nothing is posted on it, and the */5
+# sweep re-evaluates it. A PR that was evaluated and failed keeps
+# its infrastructure error and its diagnostic check-run whatever
+# the budget reads afterwards: the budget never reclassifies a
+# failure (Codex P2 on #2298). Without the library, or with an
+# unreadable budget, every PR is evaluated as before.
+budget_lib=false
+if [ -r scripts/workflow/installation-budget.sh ]; then
+  # shellcheck source=scripts/workflow/installation-budget.sh
+  . scripts/workflow/installation-budget.sh
+  budget_lib=true
+fi
+budget_stopped=""
+budget_stop_check() {  # <PR>: exit 0 = stop before evaluating it
+  [ "$budget_lib" = true ] || return 1
+  GH_TOKEN="$WORKFLOW_TOKEN" ib_read "${BUDGET_PER_EVAL_REQUESTS:-15}" "${BUDGET_RESERVE_REQUESTS:-200}" \
+    "${BUDGET_PER_EVAL_GRAPHQL_POINTS:-5}" "${BUDGET_GRAPHQL_RESERVE_POINTS:-75}" >/dev/null
+  if [ "$budget_known" -eq 1 ] && ! ib_affordable 1; then
+    budget_stopped=" #$1 and any later PR"
+    return 0
+  fi
+  return 1
+}
 while IFS= read -r PR; do
   [ -z "$PR" ] && continue
+  if budget_stop_check "$PR"; then
+    break
+  fi
   echo "::group::Evaluating PR #$PR"
 
   # Skip if label not present (no-op, common case on
@@ -516,4 +547,8 @@ done
 # shellcheck disable=SC2086  # intentional word-splitting to trim
 echo "heal_prs=$(echo $heal_out)" >> "$GITHUB_OUTPUT"
 echo "protected_pairs=$protected_pairs" >> "$GITHUB_OUTPUT"
+if [ -n "$budget_stopped" ]; then
+  echo "::notice::Installation budget stopped before$budget_stopped; the scheduled sweep retries without changing its labels."
+  echo "budget_stopped=true" >> "$GITHUB_OUTPUT"
+fi
 exit "$had_infra_error"

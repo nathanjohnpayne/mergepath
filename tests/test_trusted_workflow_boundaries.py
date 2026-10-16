@@ -73,6 +73,52 @@ class CausalHold(unittest.TestCase):
 
 
 class CredentialDestinations(unittest.TestCase):
+    def test_recovery_authority_is_only_trusted_actions_rerun(self):
+        document = workflow('required-check-publisher.yml')
+        job = document['jobs']['recover-native-clearance']
+        self.assertEqual(job['permissions']['actions'], 'write')
+        self.assertEqual(job['permissions']['checks'], 'read')
+        self.assertNotIn('environment', job)
+        self.assertNotIn('workflow_dispatch', document.get('on', document.get(True, {})))
+        self.assertNotIn('secrets.', json.dumps(job))
+        checkout = next(s for s in job['steps'] if 'checkout@' in s.get('uses', ''))
+        self.assertEqual(checkout['with']['ref'], '${{ github.event.repository.default_branch }}')
+        self.assertFalse(checkout['with']['persist-credentials'])
+
+    def test_completed_partial_batch_can_deliver_only_recorded_protected_pairs(self):
+        jobs = workflow('auto-clear-blocking-labels.yml')['jobs']
+        for parent, child in [('evaluate-and-clear', 'clear-event-labels'),
+                              ('scheduled-sweep', 'clear-sweep-labels')]:
+            condition = jobs[child]['if']
+            self.assertIn('!cancelled()', condition)
+            self.assertIn('contains(fromJSON(\'["success","failure"]\'), needs.' + parent + '.result)', condition)
+            self.assertIn('needs.' + parent + '.outputs.protected_pairs', condition)
+
+    def test_review_chain_nomination_survives_empty_associations(self):
+        resolver = next(s for s in workflow('auto-clear-blocking-labels.yml')['jobs']['evaluate-and-clear']['steps']
+                        if s.get('id') == 'pr')['run']
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            stub = path / 'gh'
+            stub.write_text('#!/bin/sh\ncase "$*" in\n  *actions/runs/42*) echo "$SOURCE_TITLE";;\n  *"pr list"*) echo "[]";;\n  *) exit 90;;\nesac\n')
+            stub.chmod(0o755)
+            for title, expected in [(f'review-v1 pr=7 review=9 head={HEAD} base={"b" * 40}', '7'),
+                                    ('invalid source', '')]:
+                output = path / 'output'
+                output.write_text('')
+                event = dict(workflow_run=dict(conclusion='success', pull_requests=[], head_sha='d' * 40,
+                             path='.github/workflows/agent-review.yml', event='workflow_run',
+                             display_title='policy-v1 pr=0 source=42'))
+                result = subprocess.run(['bash', '-c', resolver], timeout=10, capture_output=True, text=True,
+                    env=dict(PATH=directory + os.pathsep + os.environ['PATH'], REPO='o/r',
+                             EVENT_NAME='workflow_run', EVENT_JSON=json.dumps(event),
+                             GITHUB_OUTPUT=str(output), SOURCE_TITLE=title))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if expected:
+                    self.assertIn('\n7\n', output.read_text())
+                else:
+                    self.assertEqual(output.read_text(), 'numbers=\n')
+
     def test_maintenance_destinations(self):
         for name, job, environment in [
             ('daily-feedback-rollup', 'rollup', 'reviewer-maintenance'),

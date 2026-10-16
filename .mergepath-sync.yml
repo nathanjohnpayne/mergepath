@@ -612,6 +612,12 @@ paths:
       # on the consumer, whose rate-limit failover would then exit 8 without
       # posting. A caller must travel with the callee whose contract it uses.
       - "scripts/coderabbit-wait.sh"
+      # #2272: the Phase 4 gate derivation reads the labeler's parser and
+      # matcher at the PR base as DATA and runs only these own copies, after a
+      # byte compare. Absent or skewed, the derivation fails safe (requests),
+      # so the edge keeps a sync from turning every PR into a Codex request.
+      - "scripts/workflow/parse_policy_list.sh"
+      - "scripts/workflow/match_protected_paths.sh"
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
@@ -1453,6 +1459,26 @@ paths:
     consumers: all
     requires:
       - ".github/workflows/required-check-publisher.yml"
+      - "scripts/workflow/installation-budget.sh"   # #2286, staged into the extracted publish step
+  # Runs the budget guard of every event-driven gate workflow (#2286) from the
+  # shipped workflow files, against the real budget reader, snapshot driver,
+  # lineage helper and the publisher's own due(). Hard-run by
+  # check_required_check_publisher.
+  - path: tests/test_event_budget_guard.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/installation-budget.sh"
+      - "scripts/workflow/codex-p1-snapshot-retry.py"
+      - "scripts/workflow/required-check-generation.sh"
+      - "scripts/gate-api-lineage-blocking.sh"
+      - "scripts/lib/gh-retry-helpers.sh"
+      - ".github/workflows/codex-feedback-archive-relay.yml"
+      - ".github/workflows/codex-p1-gate.yml"
+      - ".github/workflows/coderabbit-severity-gate.yml"
+      - ".github/workflows/merge-clearance-gate.yml"
+      - ".github/workflows/auto-clear-blocking-labels.yml"
+      - ".github/workflows/required-check-publisher.yml"
   - path: tests/test_required_check_publisher_summary_hold.sh
     type: canonical
     consumers: all
@@ -1690,6 +1716,11 @@ paths:
   # Pairs with scripts/phase-4b-review.sh + the scripts/phase-4b/ kit
   # and is hard-required by scripts/ci/check_phase_4b_automation.
   # Fake CLIs and fake gh wrappers only; no live GitHub network.
+  - path: tests/test_phase_4b_escalation.cjs
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b/"
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
@@ -2107,6 +2138,11 @@ paths:
       - ".github/workflows/daily-feedback-rollup.yml"
       - ".github/workflows/pr-audit.yml"
       - ".github/workflows/thread-resolution-lane.yml"
+  - path: tests/test_native_clearance_recovery.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/recover-native-clearance.py"
   - path: tests/test_dependabot_auto_merge.sh
     type: canonical
     consumers: all
@@ -2225,6 +2261,7 @@ paths:
       - "scripts/workflow/auto-clear-sweep.sh"
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/blocking-labels.sh"
+      - "scripts/workflow/installation-budget.sh"   # #2286, budget guard (absent: evaluates without it)
       - "scripts/workflow/approval-merge-continuation.sh"
       - "scripts/workflow/report-approval-continuation-failures.sh"
       # Both jobs' final step supersedes a stale failed
@@ -2402,6 +2439,8 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
       - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
       - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding for the scheduled inventory
+      - "scripts/workflow/installation-budget.sh"   # #2286, event-job budget guard (absent: evaluates without it)
+      - "scripts/gate-api-lineage-blocking.sh"   # #2286, native conclusion of a run that did not evaluate
   - path: .github/workflows/codex-feedback-archive-relay.yml
     type: canonical
     consumers: all
@@ -2416,6 +2455,7 @@ paths:
       - "scripts/review-feedback-surface-fingerprint.sh"
       - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding before every writer
       - "scripts/lib/gh-api-array.sh"   # #1413, helper's paginated source-origin candidate resolution
+      - "scripts/workflow/installation-budget.sh"   # #2286, budget guard (absent: binds without it)
   - path: .github/workflows/coderabbit-severity-gate.yml
     type: canonical
     consumers: all
@@ -2430,6 +2470,8 @@ paths:
       - "scripts/workflow/required-check-generation.sh"
       - "scripts/coderabbit-severity-gate.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/installation-budget.sh"   # #2286, budget guard (absent: evaluates without it)
+      - "scripts/gate-api-lineage-blocking.sh"   # #2286, native conclusion of a run that did not evaluate
   - path: .github/workflows/merge-clearance-gate.yml
     type: canonical
     consumers: all
@@ -2443,6 +2485,7 @@ paths:
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/gate-api-lineage-blocking.sh"   # #2247 pending arm of the native conclusion
+      - "scripts/workflow/installation-budget.sh"   # #2286, budget guard (absent: evaluates without it)
   - path: .github/workflows/required-check-publisher.yml
     type: canonical
     consumers: all
@@ -2452,7 +2495,9 @@ paths:
     # scripts directly — same coupling class as the gate-workflow
     # entries above; missing scripts fail-closed on missing-file.
     requires:
+      - "scripts/workflow/recover-native-clearance.py"
       - "scripts/workflow/required-check-generation.sh"
+      - "scripts/workflow/installation-budget.sh"   # #2286, the budget reader, sourced hard (#2220 guard)
       - "scripts/workflow/coderabbit-evidence-recovery.py"
       # The parent workflow is the trigger source: workflow_run fires only
       # on its exact top-level name, so a consumer missing (or renaming)
@@ -2587,6 +2632,7 @@ paths:
       - "tests/test_trusted_workflow_boundaries.py"
       - ".github/workflows/trusted-pr-policy.yml"
       - "tests/test_required_check_generations.py"
+      - "tests/test_event_budget_guard.sh"   # #2286, hard-run by check_required_check_publisher
       - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "tests/test_gh_comment_trigger_guard.py"
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
@@ -2649,6 +2695,7 @@ paths:
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
       - "tests/test_phase_4b_automation.sh"  # check_phase_4b_automation (#579)
       - "tests/test_phase_4b_heartbeat.sh"  # check_phase_4b_automation (#1589)
+      - "tests/test_phase_4b_escalation.cjs" # deterministic dispatch tripwires (#1757)
       - "tests/test_phase_4b_accounting.sh"  # check_phase_4b_accounting (#602)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)

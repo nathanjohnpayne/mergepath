@@ -225,12 +225,53 @@ jobs:
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
+      - name: Installation budget guard (#2286)
+        # Read-only budget guard. A skipped evaluation leaves the native run
+        # failing unless the trusted publisher already opened its exact
+        # run/attempt/head hold. Only a later real native PASS recovers it.
+        id: budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CHECK_NAME: "Merge clearance gate"
+          # One evaluation costs 3 to 19 REST requests and up to one GraphQL
+          # point in scripts/merge-clearance-gate.sh (measured on #2249,
+          # #2265, #2292, #2226, #2232 and #2225), plus phase 2's two reads
+          # and PATCH and the lineage read. The reserve is the publisher's own
+          # floor for one event-head evaluation (60 per PR plus its 100
+          # reserve) plus room for the skip-path writes of the other gate
+          # workflows the same review event starts, so an event workflow
+          # stops spending before the publisher has to.
+          BUDGET_PER_EVAL_REQUESTS: "30"
+          BUDGET_RESERVE_REQUESTS: "200"
+          BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
+          BUDGET_GRAPHQL_RESERVE_POINTS: "75"
+        run: |
+          set -uo pipefail
+          if [ ! -r scripts/workflow/installation-budget.sh ]; then
+            echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; evaluating without the budget guard (#2286)."
+            exit 0
+          fi
+          # shellcheck source=scripts/workflow/installation-budget.sh
+          . scripts/workflow/installation-budget.sh
+          ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
+            "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
+          if ib_affordable 1; then
+            exit 0
+          fi
+          reset=$(ib_short_bucket_reset)
+          echo "::notice::Budget guard (#2286): $rl_remaining REST request(s) and ${gql_remaining:-?} GraphQL point(s) remain, short of one evaluation ($BUDGET_PER_EVAL_REQUESTS requests) plus the $BUDGET_RESERVE_REQUESTS-request reserve; not evaluating. The publisher re-evaluates this head after ${reset:-the window resets}."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "title=$(ib_backoff_title "$CHECK_NAME" 2 "$reset")" >> "$GITHUB_OUTPUT"
+
       - name: Run scripts/merge-clearance-gate.sh
         id: gate
+        if: ${{ steps.budget.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
+          CHECK_NAME: "Merge clearance gate"
         run: |
           set -uo pipefail
           # The script is the source of truth for what blocks merge.
@@ -287,6 +328,20 @@ jobs:
             pending=true
           fi
           echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          # #2286: the script stops at its first failed read, so an rc 2 on
+          # the exhausted installation budget is the end of this run's
+          # evaluation. Phase 2 closes the hold with the publisher's back-off
+          # red (the reset read from a refused probe's X-RateLimit-* headers,
+          # see installation-budget.sh), and the native run follows the
+          # lineage confirmation like a budget skip.
+          if [ "$rc" -eq 2 ] && [ -r scripts/workflow/installation-budget.sh ]; then
+            # shellcheck source=scripts/workflow/installation-budget.sh
+            . scripts/workflow/installation-budget.sh
+            if ib_rate_limited "$output"; then
+              echo "rate_limited=true" >> "$GITHUB_OUTPUT"
+              echo "budget_title=$(ib_backoff_title "$CHECK_NAME" 2 "$(ib_exhausted_reset "$output")")" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Confirm the Checks-API lineage blocks while pending (#2247)
         # Runs only for the script's explicit pending verdict. The existing
@@ -301,8 +356,14 @@ jobs:
         # before. Never fails the job itself: the next step decides. No
         # status function in the condition, so the implicit success() also
         # skips it after any earlier failed step or a cancellation.
+        #
+        # #2286: it also runs for a run that did not evaluate (the budget
+        # guard skipped it, or the script failed on the exhausted
+        # installation budget), whose independently trusted publisher must
+        # already have opened the exact causal hold. The same confirmation decides
+        # whether that run's job-native conclusion may be non-failing.
         id: lineage
-        if: ${{ steps.gate.outputs.pending == 'true' }}
+        if: ${{ steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -343,12 +404,40 @@ jobs:
         # fail-closed applicability fallback, an infra exit, a missing
         # verdict line) still fails here.
         env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           RC: ${{ steps.gate.outputs.rc }}
           VERDICT: ${{ steps.gate.outputs.verdict }}
           PENDING: ${{ steps.gate.outputs.pending }}
           API_BLOCKING: ${{ steps.lineage.outputs.api_blocking }}
+          BUDGET_SKIP: ${{ steps.budget.outputs.skip }}
+          RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
         run: |
           set -euo pipefail
+          # #1547 option B: a recovery attempt succeeds only from an actual
+          # PASS evaluation. A new causal pending hold or budget skip cannot
+          # turn the requested native recovery into an unevaluated success.
+          # Preserve the inherited pending behavior on first attempts.
+          if [ "${RUN_ATTEMPT:-1}" != 1 ] && { [ "$RC" != 0 ] || [ "$VERDICT" != pass ]; }; then
+            echo "::error::Native recovery did not evaluate PASS; its required native check remains failing."
+            exit 1
+          fi
+          # #2286: a run that did not evaluate (budget guard skip, or the
+          # script failed on the exhausted installation budget). The trusted
+          # publisher must have opened this attempt's exact hold; the
+          # job-native run is non-failing ONLY when the lineage step
+          # confirmed that red (or a newer non-green) blocks the head outside
+          # this run's suite, exactly the #2247 condition. Otherwise it fails
+          # as before. Never a success computed from no evaluation: the
+          # Checks-API run carries the block until the publisher's first
+          # pass after the reset re-evaluates the head.
+          if [ "${BUDGET_SKIP:-}" = true ] || [ "${RATE_LIMITED:-}" = true ]; then
+            if [ "${API_BLOCKING:-}" = true ]; then
+              echo "::notice::Merge clearance was NOT evaluated on this head: the installation API budget is short or exhausted (#2286). This job-native run concludes non-failing by design; the Checks-API run of the same name carries the block until the publisher re-evaluates the head after the budget resets."
+              exit 0
+            fi
+            echo "::error::Merge clearance was not evaluated (installation API budget, #2286), and the Checks-API lineage could not be confirmed to block, so the job-native run fails."
+            exit 1
+          fi
           if [ "$RC" -eq 0 ] && [ "$VERDICT" != "pass" ]; then
             echo "::error::merge-clearance-gate.sh exited 0 without a PASS verdict line (query mode reached?)"
             exit 1
