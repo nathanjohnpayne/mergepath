@@ -35,8 +35,8 @@
 #                       measure neither review completion nor a stable event.
 #                       Rounds where a rate-limit notice intervened between the
 #                       commit and the review segment out (rate_limited=true):
-#                       those are the coderabbit-wait.sh retry path, not the
-#                       max_wait_seconds budget.
+#                       those use immediate Codex substitution, outside the
+#                       max_wait_seconds budget; historical rounds may include retries.
 #   p4b_adapter_latency .loop.elapsed_seconds for rounds that produced a
 #                       verdict (fail-closed aborts — quota/connection — are
 #                       reported separately; they are not review latencies).
@@ -318,8 +318,8 @@ analyze() {
            weekday:($e | gmtime | strftime("%a"))};
     # A round is rate_limited if CodeRabbit posted a rate-limit notice in this
     # PR between the reviewed commit and the review. Those rounds are handled
-    # by the coderabbit-wait.sh retry path, not by max_wait_seconds, so they
-    # segment out of the normal-latency basis (rate_limited=true) rather than
+    # by immediate Codex substitution, outside max_wait_seconds (historical
+    # rounds may include retries), so they segment out (rate_limited=true) rather than
     # inflating it, mirroring the rate_limited segmentation in
     # audit-codex-latency.sh.
     def rl($repo; $pr; $from_iso; $to_iso):

@@ -1560,8 +1560,7 @@ log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
 # FINDING-PINNED as well as head-pinned. Head-pinning alone binds the ack to a
 # COMMIT, not to the finding set that was on screen when it was written, and
 # the summary surface can change WITHOUT the head changing: a same-head
-# re-review (`@coderabbitai review`, `@coderabbitai resume`, or the rate-limit
-# `try again` retry that scripts/coderabbit-wait.sh posts itself) rewrites the
+# re-review (`@coderabbitai review` or `@coderabbitai resume`) rewrites the
 # summary — in place, or as a later comment this script then selects — with a
 # finding the acking collaborator never saw. A head-only ack would clear that
 # new finding retroactively, and a required gate would pass with an
