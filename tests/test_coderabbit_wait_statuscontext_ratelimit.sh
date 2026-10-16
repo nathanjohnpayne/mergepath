@@ -742,7 +742,9 @@ test_refusal_run_is_revalidated_before_clearance() {
 
   dir=$(make_case "headref-unread-revalidation" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_FAIL_REVIEWS_AFTER=1 run_case "$dir")
-  [ "$rc" = "5" ] || fail "3b0 unread: unread revalidation must withhold clearance, got $rc; err=$(tail -6 "$dir/err.log")"
+  # The published-refusal route now performs a fresh strict reviews read
+  # before substitution. Its unreadable follow-up is infrastructure failure.
+  [ "$rc" = "3" ] || fail "3b0 unread: unread strict refresh must fail closed, got $rc; err=$(tail -6 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b0 unread: unread revalidation cleared"
   grep -q 'could not be re-read before clearance' "$dir/err.log" || fail "3b0 unread: expected re-read failure log"
   [ "$FAIL" -ne "$before" ] || pass "3b0: #956 revalidates a stable clean run and withholds clearance when its id or body changes or becomes unread"
@@ -2541,7 +2543,8 @@ EOF
 test_notice_less_timeout_contract
 
 test_status_only_refusal_grades_head_run() {
-  local scenario dir rc before expected calls reviews body at sha fail_read
+  local source scenario dir rc before expected calls reviews body at sha fail_read notice description
+  for source in status notice notice-untrusted; do
   for scenario in clean marker old bodyless wrong-head unreadable malformed-time same-second; do
     before=$FAIL;expected=5;calls=1;fail_read=''
     body='Review completed. No actionable comments.'
@@ -2556,15 +2559,23 @@ test_status_only_refusal_grades_head_run() {
       malformed-time) at=invalid;expected=3;calls=0 ;;
       same-second) at=$STATUS_TIME ;;
     esac
-    dir=$(make_case "status-only-run-$scenario" '' "$STATUS_TIME" 'Review rate limited')
+    notice='';description='Review rate limited'
+    if [ "$source" != status ]; then
+      notice=$LEGACY_RATE_LIMIT_BODY;description='Review in progress'
+    fi
+    dir=$(make_case "refusal-run-$source-$scenario" "$notice" "$STATUS_TIME" "$description" "$STATUS_TIME")
+    if [ "$source" = notice-untrusted ]; then
+      sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    fi
     reviews=$(jq -nc --arg body "$body" --arg at "$at" --arg sha "$sha" \
       '[{id:8801,user:{login:"coderabbitai[bot]"},commit_id:$sha,submitted_at:$at,body:$body}]')
     rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" CODERABBIT_TEST_FAIL_REVIEWS="$fail_read" run_case "$dir")
-    [ "$rc" = "$expected" ] || fail "2139 status-only $scenario: expected $expected, got $rc; $(tail -5 "$dir/err.log")"
-    [ "$(stub_calls "$dir")" = "$calls" ] || fail "2139 status-only $scenario: unexpected Codex substitution"
+    [ "$rc" = "$expected" ] || fail "2139 $source $scenario: expected $expected, got $rc; $(tail -5 "$dir/err.log")"
+    [ "$(stub_calls "$dir")" = "$calls" ] || fail "2139 $source $scenario: unexpected Codex substitution"
     [ ! -f "$dir/state/fake-time" ] || [ "$(cat "$dir/state/fake-time")" = 2000000000 ] \
-      || fail "2139 status-only $scenario: unexpectedly slept"
-    [ "$FAIL" -ne "$before" ] || pass "2139 status-only $scenario: exact-head review grading precedes substitution"
+      || fail "2139 $source $scenario: unexpectedly slept"
+    [ "$FAIL" -ne "$before" ] || pass "2139 $source $scenario: exact-head review grading precedes substitution"
+  done
   done
 }
 

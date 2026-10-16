@@ -3633,11 +3633,81 @@ request_codex_rate_limit_failover() {
   fi
 }
 
+# Grade the existing exact-head review evidence before either refusal route.
+# Return 0 to keep polling after changed/replacement evidence; 1 permits
+# substitution. A completed verdict exits through the shared scanner.
+emit_head_review_before_refusal() {
+  local rec=$1 state=$2 review_evidence=${3:-}
+  local reviews run run_id run_body marker_rc clean_rc run_order_rc comments trigger_rc
+  # The poll may have seen no summary comment yet. Grade a body-bearing head
+  # run before substituting; the existing verdict path handles inline and
+  # summary markers and revalidates the selected run before clearance.
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") \
+    || die 3 "could not read current-head reviews before rate-limit-refusal substitution"
+  run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") \
+    || die 3 "could not select the current-head review before rate-limit-refusal substitution"
+  if [ -n "$run" ]; then
+    run_id=$(jq -er '.id' <<<"$run") || die 3 "unreadable rate-limit-refusal review id"
+    run_body=$(jq -er --argjson id "$run_id" \
+      'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)' \
+      <<<"$reviews") || die 3 "unreadable rate-limit-refusal review body"
+    STATUS_CONTEXT_HEAD_RUN_FINDING=false
+    STATUS_CONTEXT_CLEARANCE_REFUSAL=rate_limit
+    STATUS_CONTEXT_CLEARANCE_RUN_ID=""
+    STATUS_CONTEXT_CLEARANCE_RUN_BODY=""
+    marker_rc=0
+    summary_blocking_marker_present "$run_body" || marker_rc=$?
+    case "$marker_rc" in
+      0) STATUS_CONTEXT_HEAD_RUN_FINDING=true ;;
+      1) ;;
+      *) die 3 "could not grade the rate-limit-refusal review body" ;;
+    esac
+    clean_rc=0
+    crw_head_pinned_clean_review_run "$HEAD_SHA" "$run_id" >/dev/null || clean_rc=$?
+    case "$clean_rc" in
+      0)
+        run_order_rc=0
+        jq -e --arg at "$(jq -r '.updated_at // .created_at' <<<"$rec")" \
+          '(.submitted_at | fromdateiso8601) > ($at | fromdateiso8601)' \
+          <<<"$run" >/dev/null 2>&1 || run_order_rc=$?
+        case "$run_order_rc" in
+          0)
+            comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
+              || die 3 "could not read replacement-trigger evidence before rate-limit-refusal clearance"
+            trigger_rc=0
+            crw_newer_review_trigger_accepted "$comments" "$(jq -r '.submitted_at' <<<"$run")" || trigger_rc=$?
+            case "$trigger_rc" in
+              0)
+                # An accepted replacement request prevents crediting this
+                # older run. It does not erase a published refusal notice.
+                [ -z "$review_evidence" ] || return 1
+                return 0
+                ;;
+              1) ;;
+              *) die 3 "could not grade replacement-trigger evidence before rate-limit-refusal clearance" ;;
+            esac
+            STATUS_CONTEXT_CLEARANCE_REFUSAL=""
+            STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
+            STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
+            ;;
+          1) ;;
+          *) die 3 "could not order the current-head review against the rate-limit-refusal refusal" ;;
+        esac
+        ;;
+      1) ;;
+      4) return 0 ;;
+      *) die 3 "could not validate the current-head review before rate-limit-refusal substitution" ;;
+    esac
+    emit_status_context_verdict "$state" "$(jq -r '.created_at' <<<"$rec")" "$review_evidence"
+    [ -n "$STATUS_CONTEXT_CLEARANCE_REFUSAL" ] || return 0
+  fi
+  return 1
+}
+
 # A refusal with no published notice has no retry window to schedule.
 # Diagnose it after the normal strict pass, before that pass would sleep.
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
-  local reviews run run_id run_body marker_rc clean_rc run_order_rc comments trigger_rc
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
   if [ "${1:-}" = --before-probe ] || [ "$#" = 0 ]; then
     rec=$(check_status_context_record) || return 0
@@ -3667,62 +3737,8 @@ emit_rate_limit_stall_at_timeout_if_present() {
   if [ "${1:-}" = --before-probe ]; then
     emit_terminal_review_after_probe_if_present
   fi
-  # The poll may have seen no summary comment yet. Grade a body-bearing head
-  # run before substituting; the existing verdict path handles inline and
-  # summary markers and revalidates the selected run before clearance.
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") \
-    || die 3 "could not read current-head reviews before status-only substitution"
-  run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") \
-    || die 3 "could not select the current-head review before status-only substitution"
-  if [ -n "$run" ]; then
-    run_id=$(jq -er '.id' <<<"$run") || die 3 "unreadable status-only review id"
-    run_body=$(jq -er --argjson id "$run_id" \
-      'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)' \
-      <<<"$reviews") || die 3 "unreadable status-only review body"
-    STATUS_CONTEXT_HEAD_RUN_FINDING=false
-    STATUS_CONTEXT_CLEARANCE_REFUSAL=rate_limit
-    STATUS_CONTEXT_CLEARANCE_RUN_ID=""
-    STATUS_CONTEXT_CLEARANCE_RUN_BODY=""
-    marker_rc=0
-    summary_blocking_marker_present "$run_body" || marker_rc=$?
-    case "$marker_rc" in
-      0) STATUS_CONTEXT_HEAD_RUN_FINDING=true ;;
-      1) ;;
-      *) die 3 "could not grade the status-only review body" ;;
-    esac
-    clean_rc=0
-    crw_head_pinned_clean_review_run "$HEAD_SHA" "$run_id" >/dev/null || clean_rc=$?
-    case "$clean_rc" in
-      0)
-        run_order_rc=0
-        jq -e --arg at "$(jq -r '.updated_at // .created_at' <<<"$rec")" \
-          '(.submitted_at | fromdateiso8601) > ($at | fromdateiso8601)' \
-          <<<"$run" >/dev/null 2>&1 || run_order_rc=$?
-        case "$run_order_rc" in
-          0)
-            comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
-              || die 3 "could not read replacement-trigger evidence before status-only clearance"
-            trigger_rc=0
-            crw_newer_review_trigger_accepted "$comments" "$(jq -r '.submitted_at' <<<"$run")" || trigger_rc=$?
-            case "$trigger_rc" in
-              0) return 0 ;;
-              1) ;;
-              *) die 3 "could not grade replacement-trigger evidence before status-only clearance" ;;
-            esac
-            STATUS_CONTEXT_CLEARANCE_REFUSAL=""
-            STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
-            STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
-            ;;
-          1) ;;
-          *) die 3 "could not order the current-head review against the status-only refusal" ;;
-        esac
-        ;;
-      1) ;;
-      4) return 0 ;;
-      *) die 3 "could not validate the current-head review before status-only substitution" ;;
-    esac
-    emit_status_context_verdict "$state" "$(jq -r '.created_at' <<<"$rec")"
-    [ -n "$STATUS_CONTEXT_CLEARANCE_REFUSAL" ] || return 0
+  if emit_head_review_before_refusal "$rec" "$state"; then
+    return 0
   fi
   evidence=$(printf '%s' "$rec" | jq -c '{id:null, created_at, endpoint:"status_context", body_excerpt:.description}') || return 0
   log "trusted per-SHA CodeRabbit rate-limit refusal — proceeding immediately on Codex clearance (exit 5)"
@@ -4015,7 +4031,7 @@ sleep_or_timeout() {
 }
 
 emit_status_context_verdict() {
-  local state=$1
+  local state=$1 verdict_label="StatusContext $1"
   local revalidated_reviews revalidated_run revalidated_run_id revalidated_run_body
   # CodeRabbit's StatusContext SUCCESS state means "review completed"
   # — NOT "no findings remain." With CodeRabbit's default
@@ -4074,12 +4090,18 @@ emit_status_context_verdict() {
       potential_issue_count: $p,
       body_excerpt: ("CodeRabbit StatusContext = " + $state + " on " + $sha + " (potential_issue_count=" + ($p | tostring) + ")")
     }')
+  if [ -n "${3:-}" ]; then
+    synthetic=$(jq -c --arg sha "$HEAD_SHA" --argjson p "$potential_issues" \
+      '. + {head_sha:$sha,potential_issue_count:$p}' <<<"$3") \
+      || die 3 "could not retain the published-refusal evidence for the head-review verdict"
+    verdict_label="CodeRabbit head review after a published refusal"
+  fi
   if [ "$potential_issues" -gt 0 ]; then
-    log "StatusContext $state but $potential_issues blocking (p0/p1) inline finding(s) on HEAD — emitting findings (exit 2)"
+    log "$verdict_label but $potential_issues blocking (p0/p1) inline finding(s) on HEAD — emitting findings (exit 2)"
     emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
   fi
   if [ "${STATUS_CONTEXT_HEAD_RUN_FINDING:-false}" = true ]; then
-    log "StatusContext $state but the body-bearing current-HEAD review carries a blocking marker — emitting findings (exit 2) (#956)"
+    log "$verdict_label but the body-bearing current-HEAD review carries a blocking marker — emitting findings (exit 2) (#956)"
     emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
   fi
   # #877: the inline scan above is only ONE of the two surfaces a blocking
@@ -4131,7 +4153,7 @@ emit_status_context_verdict() {
   summary_body_has_potential_issue_marker "$HEAD_IDENTITY_ANCHOR" || summary_marker_rc=$?
   case "$summary_marker_rc" in
     0)
-      log "StatusContext $state and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"
+      log "$verdict_label and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"
       emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
       ;;
     1) : ;;   # no summary-only marker — fall through to clearance
@@ -4140,7 +4162,7 @@ emit_status_context_verdict() {
       ;;
   esac
   if [ -n "${STATUS_CONTEXT_CLEARANCE_REFUSAL:-}" ]; then
-    log "StatusContext $state found no blocking findings, but clearance remains suppressed by CodeRabbit's current $STATUS_CONTEXT_CLEARANCE_REFUSAL refusal until a body-bearing review run is pinned to HEAD $HEAD_SHA (#956)"
+    log "$verdict_label found no blocking findings, but clearance remains suppressed by CodeRabbit's current $STATUS_CONTEXT_CLEARANCE_REFUSAL refusal until a body-bearing review run is pinned to HEAD $HEAD_SHA (#956)"
     return 0
   fi
   # The #956 refusal override is a selected review RUN, rather than a general
@@ -4174,7 +4196,7 @@ emit_status_context_verdict() {
       return 0
     fi
   fi
-  log "StatusContext $state and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
+  log "$verdict_label and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
 
@@ -5833,8 +5855,14 @@ while :; do
 
   case "$CLASS" in
     rate_limit)
-      request_codex_rate_limit_failover
       RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+      RATE_LIMIT_ANCHOR=$(jq -c --arg at "$COMMENT_FRESH_AT" '. + {updated_at:$at}' <<<"$LATEST") \
+        || die 3 "could not bind the published rate-limit refusal to its freshness anchor"
+      if emit_head_review_before_refusal "$RATE_LIMIT_ANCHOR" published_refusal "$RATE_LIMIT_REVIEW"; then
+        sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+        continue
+      fi
+      request_codex_rate_limit_failover
       log "CodeRabbit rate-limited — not sleeping or retrying its window; Codex carries this head only after clearance (#2139)"
       emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       ;;
