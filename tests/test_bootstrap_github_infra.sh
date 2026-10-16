@@ -32,7 +32,7 @@ fi
 if ! command -v yq >/dev/null 2>&1; then
   echo "SKIP: yq not installed" >&2; exit 0
 fi
-if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+if ! yq --version 2>&1 | grep "mikefarah/yq" >/dev/null; then
   echo "SKIP: non-mikefarah yq" >&2; exit 0
 fi
 
@@ -263,7 +263,7 @@ grep -q "^gh repo create .* --push" "$SHIM_LOG" \
   || pass "gh repo create no longer bundles --push"
 
 # --- assertion 1b: the bootstrap commit is pushed as its own step ---
-echo "$out" | grep -q "push bootstrap commit to nathanjohnpayne/test-repo" \
+echo "$out" | grep "push bootstrap commit to nathanjohnpayne/test-repo" >/dev/null \
   && pass "the bootstrap commit is pushed by a separate step" \
   || fail "no separate push step logged; out: $out"
 # And it really pushed: the shim's stand-in remote has the commit.
@@ -348,7 +348,7 @@ done
 # dropped a bad colour or an empty field — the same silent-skip failure
 # the guard exists to prevent.
 for badspec in "future-label|abcdef" "no-separators-at-all" "bad-colour|zzzzzz|nope" "|abcdef|empty name" "empty-desc|abcdef|"; do
-  printf '%s' "$malformed_out" | grep -qF "$badspec" \
+  printf '%s' "$malformed_out" | grep -F "$badspec" >/dev/null \
     && pass "malformed spec '$badspec' is named in a warning rather than silently dropped" \
     || fail "no warning named malformed spec '$badspec'; out: $malformed_out"
 done
@@ -399,7 +399,7 @@ lblfail_out=$(PATH="$SHIM_PATH" SHIM_LOG="$LBLFAIL_LOG" GH_SHIM_FAIL_LABEL="flak
   echo "SEED_RC=$?"
 ' 2>&1)
 set -e
-printf '%s' "$lblfail_out" | grep -q "SEED_RC=0" \
+printf '%s' "$lblfail_out" | grep "SEED_RC=0" >/dev/null \
   && pass "a single label failure stays non-fatal (the stage continues)" \
   || fail "label failure became fatal; out: $lblfail_out"
 grep -q "^gh label create good-label " "$LBLFAIL_LOG" \
@@ -531,7 +531,7 @@ if [ -s "$SHIM_LOG" ]; then
 else
   pass "dry-run did not invoke gh (bootstrap::run honors --dry-run)"
 fi
-echo "$dry_out" | grep -q "DRY-RUN" \
+echo "$dry_out" | grep "DRY-RUN" >/dev/null \
   && pass "dry-run output includes [DRY-RUN] tags" \
   || fail "dry-run missing [DRY-RUN] markers"
 
@@ -645,7 +645,7 @@ set -e
 grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/cachedpat-repo\$" "$SHIM_LOG" \
   && pass "REVIEWER_ASSIGNMENT_TOKEN set from cached \$OP_PREFLIGHT_REVIEWER_PAT" \
   || fail "secret not set from cached PAT; log: $(grep secret "$SHIM_LOG" || true)"
-echo "$out" | grep -q "reusing session-cached" \
+echo "$out" | grep "reusing session-cached" >/dev/null \
   && pass "provisioning logs the cached-PAT path" \
   || fail "missing cached-PAT log line; out: $out"
 
@@ -675,10 +675,10 @@ set -e
 grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
   && fail "secret set from a cached PAT whose agent is not a selected reviewer" \
   || pass "mismatched cached PAT is NOT installed as the secret"
-echo "$out" | grep -q "NOT reusing session-cached" \
+echo "$out" | grep "NOT reusing session-cached" >/dev/null \
   && pass "mismatch fall-through is logged" \
   || fail "missing mismatch log line; out: $out"
-echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+echo "$out" | grep "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" >/dev/null \
   && pass "mismatch falls through to the loud-miss path" \
   || fail "expected loud miss after mismatch fall-through; out: $out"
 
@@ -689,19 +689,19 @@ echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
 # install a wrong-identity secret with nothing downstream to catch it.
 # The hint must name a SELECTED reviewer's preflight instead.
 # ---------------------------------------------------------------------------
-echo "$out" | grep -qF "do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT" \
+echo "$out" | grep -F "do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT" >/dev/null \
   && pass "remediation warns off the rejected cached PAT" \
   || fail "remediation did not warn off the rejected cached PAT; out: $out"
-echo "$out" | grep -qF "it belongs to agent 'codex', which is not one of the selected reviewers (claude,cursor)" \
+echo "$out" | grep -F "it belongs to agent 'codex', which is not one of the selected reviewers (claude,cursor)" >/dev/null \
   && pass "remediation names the rejected PAT's owning agent and the selection" \
   || fail "remediation missing the rejected-agent explanation; out: $out"
-echo "$out" | grep -qF 'eval "$(scripts/op-preflight.sh --agent claude --mode review)"' \
+echo "$out" | grep -F 'eval "$(scripts/op-preflight.sh --agent claude --mode review)"' >/dev/null \
   && pass "remediation points at preflight for a SELECTED reviewer (claude)" \
   || fail "remediation missing the selected-reviewer preflight line; out: $out"
-echo "$out" | grep -qF "fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh" \
+echo "$out" | grep -F "fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh" >/dev/null \
   && fail "remediation still pipes the rejected \$OP_PREFLIGHT_REVIEWER_PAT straight into gh secret set; out: $out" \
   || pass "remediation no longer pipes the rejected PAT directly into gh secret set"
-echo "$out" | grep -qF "verifies the account performing the write, NOT the token on its stdin" \
+echo "$out" | grep -F "verifies the account performing the write, NOT the token on its stdin" >/dev/null \
   && pass "remediation states why the wrapper cannot catch a wrong-identity payload" \
   || fail "remediation missing the wrapper-does-not-verify-stdin note; out: $out"
 
@@ -725,7 +725,7 @@ grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
   || pass "cached PAT with unset \$OP_PREFLIGHT_AGENT is NOT installed (fail closed)"
 # The remediation must explain the unverifiable-identity case on its own
 # terms rather than blaming a reviewer mismatch it cannot prove (#761).
-echo "$out" | grep -qF "\$OP_PREFLIGHT_AGENT is unset, so its owning identity could not be verified" \
+echo "$out" | grep -F "\$OP_PREFLIGHT_AGENT is unset, so its owning identity could not be verified" >/dev/null \
   && pass "remediation explains the unverifiable cached-PAT identity" \
   || fail "remediation missing the unset-agent explanation; out: $out"
 
@@ -751,7 +751,7 @@ set -e
 grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
   && fail "secret set invoked despite no PAT available" \
   || pass "no secret-set call on the miss path"
-echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+echo "$out" | grep "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" >/dev/null \
   && pass "PAT miss emits ERROR-level lines (loud, #734)" \
   || fail "missing loud ERROR on PAT miss; out: $out"
 [ -s "$TARGET7/.bootstrap-state.warnings" ] \
@@ -762,10 +762,10 @@ echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
 # line must NOT appear — it is emitted only on positive evidence that a
 # cached PAT existed and was refused (#761). The actionable preflight
 # remediation still has to be there.
-echo "$out" | grep -qF "do NOT install the PAT currently in" \
+echo "$out" | grep -F "do NOT install the PAT currently in" >/dev/null \
   && fail "remediation warned off a cached PAT that was never present; out: $out" \
   || pass "no-cached-PAT miss omits the rejected-PAT warning"
-echo "$out" | grep -qF 'eval "$(scripts/op-preflight.sh --agent claude --mode review)"' \
+echo "$out" | grep -F 'eval "$(scripts/op-preflight.sh --agent claude --mode review)"' >/dev/null \
   && pass "no-cached-PAT miss still emits the selected-reviewer preflight remediation" \
   || fail "remediation missing on the no-cached-PAT miss; out: $out"
 
@@ -900,7 +900,7 @@ retry_out=$(PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" bash -c '
 ' 2>&1)
 retry_ec=$?
 set -e
-echo "$retry_out" | grep -q "RC=0" \
+echo "$retry_out" | grep "RC=0" >/dev/null \
   && [ "$retry_ec" -eq 0 ] \
   && pass "successful retry sets REVIEWER_ASSIGNMENT_TOKEN after a recorded failure" \
   || fail "token retry helper failed; rc=$retry_ec; out: $retry_out"
@@ -912,7 +912,7 @@ grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/retry-r
 # original message is deliberately preserved inside that line, so
 # grepping for the failure text alone would match the resolved record.)
 grep '^@reviewer-assignment-token	' "$TARGET9B/.bootstrap-state.warnings" \
-  | grep -qv '	RESOLVED: ' \
+  | grep -v '	RESOLVED: ' >/dev/null \
   && fail "successful retry left the outstanding REVIEWER_ASSIGNMENT_TOKEN failure: $(cat "$TARGET9B/.bootstrap-state.warnings")" \
   || pass "successful retry retires the outstanding REVIEWER_ASSIGNMENT_TOKEN failure line"
 grep -q "^@reviewer-assignment-token" "$TARGET9B/.bootstrap-state.warnings" \
@@ -971,13 +971,13 @@ set -e
 [ "$summary_ec" -eq 0 ] \
   && pass "summary renders after the token warning is resolved" \
   || fail "summary render failed after token warning resolution; rc=$summary_ec; out: $summary_out"
-echo "$summary_out" | grep -q "RECORDED FAILURES" \
+echo "$summary_out" | grep "RECORDED FAILURES" >/dev/null \
   && fail "summary printed stale recorded failures after successful token retry: $summary_out" \
   || pass "summary omits the resolved token warning from RECORDED FAILURES"
-echo "$summary_out" | grep -qF "ok RESOLVED (recorded earlier in this bootstrap" \
+echo "$summary_out" | grep -F "ok RESOLVED (recorded earlier in this bootstrap" >/dev/null \
   && pass "summary reports the resolved warning in its own RESOLVED block (#761)" \
   || fail "summary dropped the resolved warning entirely; out: $summary_out"
-echo "$summary_out" | grep -qF "ok - REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/retry-repo (no PAT available, prompts skipped)" \
+echo "$summary_out" | grep -F "ok - REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/retry-repo (no PAT available, prompts skipped)" >/dev/null \
   && pass "RESOLVED block strips the wire-format marker and shows the original failure" \
   || fail "resolved line rendered wrong; out: $summary_out"
 
@@ -1098,13 +1098,13 @@ declined_out=$(PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" bash -c '
 ' 2>&1)
 declined_ec=$?
 set -e
-echo "$declined_out" | grep -q "RC=0" \
+echo "$declined_out" | grep "RC=0" >/dev/null \
   && [ "$declined_ec" -eq 0 ] \
   || fail "declined-PAT path did not return 0; rc=$declined_ec; out: $declined_out"
 grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
   && fail "secret set invoked after the human declined to paste a PAT" \
   || pass "declined-PAT path invokes no gh secret set"
-echo "$declined_out" | grep -qF 'eval "$(scripts/op-preflight.sh --agent cursor --mode review)"' \
+echo "$declined_out" | grep -F 'eval "$(scripts/op-preflight.sh --agent cursor --mode review)"' >/dev/null \
   && pass "declined-PAT path emits the remediation for the first SELECTED reviewer (cursor)" \
   || fail "declined-PAT path missing the selected-reviewer remediation; out: $declined_out"
 grep -q "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned" "$TARGET9D/.bootstrap-state.warnings" \
@@ -1121,10 +1121,10 @@ grep -q "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned" "$TARGET9D/.bootstrap-st
 # makes skipping the preflight impossible (#761).
 # ---------------------------------------------------------------------------
 echo "$declined_out" \
-  | grep -qF 'eval "$(scripts/op-preflight.sh --agent cursor --mode review)" && printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/declined-repo' \
+  | grep -F 'eval "$(scripts/op-preflight.sh --agent cursor --mode review)" && printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/declined-repo' >/dev/null \
   && pass "remediation chains the re-preflight and the secret write into one command" \
   || fail "remediation emitted the preflight and the gh write as separable lines; out: $declined_out"
-echo "$declined_out" | grep -F 'gh secret set REVIEWER_ASSIGNMENT_TOKEN' | grep -qv 'op-preflight.sh' \
+echo "$declined_out" | grep -F 'gh secret set REVIEWER_ASSIGNMENT_TOKEN' | grep -v 'op-preflight.sh' >/dev/null \
   && fail "a gh secret set line is transcribable without the preflight; out: $declined_out" \
   || pass "no gh secret set line appears without its preflight prefix"
 
@@ -1147,10 +1147,10 @@ emit_remediation() {
   ' 2>&1
 }
 hint_out=$(emit_remediation "copilot,claude")
-echo "$hint_out" | grep -qF -- "--agent claude --mode review" \
+echo "$hint_out" | grep -F -- "--agent claude --mode review" >/dev/null \
   && pass "remediation skips an unsupported reviewer name and picks the first preflight-valid one" \
   || fail "remediation named an agent op-preflight rejects; out: $hint_out"
-echo "$hint_out" | grep -qF -- "--agent copilot" \
+echo "$hint_out" | grep -F -- "--agent copilot" >/dev/null \
   && fail "remediation emitted 'copilot', which op-preflight exits 1 on; out: $hint_out" \
   || pass "remediation never emits an --agent op-preflight would reject"
 # --- assertion 15g-2: the unsupported-reviewer remediation is runnable ---
@@ -1165,7 +1165,7 @@ echo "$hint_out" | grep -qF -- "--agent copilot" \
 for selection in "copilot" ""; do
   label=${selection:-<empty>}
   hint_out=$(emit_remediation "$selection")
-  echo "$hint_out" | grep -qF -- "<selected-reviewer>" \
+  echo "$hint_out" | grep -F -- "<selected-reviewer>" >/dev/null \
     && fail "unsupported-reviewer remediation ($label) still emits the <selected-reviewer> placeholder; out: $hint_out" \
     || pass "unsupported-reviewer remediation ($label) emits no <selected-reviewer> placeholder"
   # Stronger than a single-placeholder grep: the emitted command lines
@@ -1178,23 +1178,23 @@ for selection in "copilot" ""; do
   [ -n "$cmdlines" ] \
     && pass "unsupported-reviewer remediation ($label) emits a command line" \
     || fail "unsupported-reviewer remediation ($label) emitted no command line; out: $hint_out"
-  printf '%s\n' "$cmdlines" | grep -q '[<>]' \
+  printf '%s\n' "$cmdlines" | grep '[<>]' >/dev/null \
     && fail "unsupported-reviewer remediation ($label) command carries a shell-redirect placeholder: $cmdlines" \
     || pass "unsupported-reviewer remediation ($label) command is free of angle-bracket placeholders"
-  echo "$hint_out" | grep -qF "none of the selected reviewers ($selection) is an agent scripts/op-preflight.sh can resolve a PAT for (it accepts: claude cursor codex)" \
+  echo "$hint_out" | grep -F "none of the selected reviewers ($selection) is an agent scripts/op-preflight.sh can resolve a PAT for (it accepts: claude cursor codex)" >/dev/null \
     && pass "unsupported-reviewer remediation ($label) names the unusable selection and the accepted set" \
     || fail "unsupported-reviewer remediation ($label) did not explain why preflight cannot help; out: $hint_out"
-  echo "$hint_out" | grep -qF "scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/hint-repo" \
+  echo "$hint_out" | grep -F "scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/hint-repo" >/dev/null \
     && pass "unsupported-reviewer remediation ($label) emits the direct token-verified secret-set command" \
     || fail "unsupported-reviewer remediation ($label) emitted no runnable secret-set command; out: $hint_out"
   # The chained preflight form must NOT appear: with no valid agent it
   # could only name a placeholder or a non-selected agent's cache.
-  echo "$hint_out" | grep -qF "op-preflight.sh --agent" \
+  echo "$hint_out" | grep -F "op-preflight.sh --agent" >/dev/null \
     && fail "unsupported-reviewer remediation ($label) still emits an op-preflight invocation; out: $hint_out" \
     || pass "unsupported-reviewer remediation ($label) drops the unusable op-preflight route"
   # ...and it must not tell the operator to pipe the session cache in,
   # which is what the && chain exists to prevent on the valid-agent path.
-  echo "$hint_out" | grep -qF 'printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh' \
+  echo "$hint_out" | grep -F 'printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh' >/dev/null \
     && fail "unsupported-reviewer remediation ($label) pipes \$OP_PREFLIGHT_REVIEWER_PAT with no preflight; out: $hint_out" \
     || pass "unsupported-reviewer remediation ($label) never pipes the session cache"
 done
@@ -1262,7 +1262,7 @@ carry_out=$(PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" SHIM_EXIT_SECRET=1 bash -c '
 ' 2>&1)
 carry_ec=$?
 set -e
-echo "$carry_out" | grep -q "RC1=1 RC2=1" \
+echo "$carry_out" | grep "RC1=1 RC2=1" >/dev/null \
   && [ "$carry_ec" -eq 0 ] \
   && pass "both carry-forward attempts failed as designed (strict mode, rc=1 each)" \
   || fail "carry-forward harness did not fail as expected; rc=$carry_ec; out: $carry_out"
@@ -1369,7 +1369,7 @@ set +e
 refuse_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9I")
 refuse_ec=$?
 set -e
-echo "$refuse_out" | grep -q "RC=3" && [ "$refuse_ec" -eq 0 ] \
+echo "$refuse_out" | grep "RC=3" >/dev/null && [ "$refuse_ec" -eq 0 ] \
   && pass "wrapper pre-gh failure propagates its rc (3) out of provisioning" \
   || fail "wrapper-refusal harness misbehaved; rc=$refuse_ec; out: $refuse_out"
 grep -q "secret set" "$SHIM_LOG" \
@@ -1382,7 +1382,7 @@ grep -qF "the author write path failed before the gh secret-set call ran, rc=3" 
      "$TARGET9I/.bootstrap-state.warnings" \
   && pass "wrapper failure records an author-authentication cause instead" \
   || fail "sidecar does not name the author write path: $(cat "$TARGET9I/.bootstrap-state.warnings" 2>/dev/null)"
-echo "$refuse_out" | grep -q "this is an AUTHOR-authentication failure" \
+echo "$refuse_out" | grep "this is an AUTHOR-authentication failure" >/dev/null \
   && pass "the operator-facing ERROR lines point at author auth, not the reviewer PAT" \
   || fail "no author-auth ERROR line emitted; out: $refuse_out"
 
@@ -1412,7 +1412,7 @@ set +e
 fwd_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9I2")
 fwd_ec=$?
 set -e
-echo "$fwd_out" | grep -q "RC=1" && [ "$fwd_ec" -eq 0 ] \
+echo "$fwd_out" | grep "RC=1" >/dev/null && [ "$fwd_ec" -eq 0 ] \
   && pass "a forwarded secret-set propagates gh's own rc (1)" \
   || fail "wrapper-forward harness misbehaved; rc=$fwd_ec; out: $fwd_out"
 grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/wrapperfail-repo\$" "$SHIM_LOG" \
@@ -1443,7 +1443,7 @@ set +e
 logged_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9J" "$LOG9J")
 logged_ec=$?
 set -e
-echo "$logged_out" | grep -q "RC=3" && [ "$logged_ec" -eq 0 ] \
+echo "$logged_out" | grep "RC=3" >/dev/null && [ "$logged_ec" -eq 0 ] \
   && pass "logged wrapper-refusal harness reproduces the pre-gh failure (rc=3)" \
   || fail "logged harness misbehaved; rc=$logged_ec; out: $logged_out"
 # The wrapper's own words, indented under a header by
@@ -1457,7 +1457,7 @@ grep -qE '^    gh-as-author: could not read a token for nathanjohnpayne' "$LOG9J
   && pass "the wrapper's own diagnostic is persisted to the run log" \
   || fail "wrapper diagnostic missing from the run log: $(cat "$LOG9J" 2>/dev/null)"
 # Persisting must not come at the cost of the live view.
-echo "$logged_out" | grep -qF "gh-as-author: could not read a token for nathanjohnpayne" \
+echo "$logged_out" | grep -F "gh-as-author: could not read a token for nathanjohnpayne" >/dev/null \
   && pass "the wrapper's diagnostic is still shown on the terminal" \
   || fail "capturing the diagnostic swallowed it; out: $logged_out"
 grep -qF "the wrapper's own error is in the run log" "$TARGET9J/.bootstrap-state.warnings" \
@@ -1484,12 +1484,12 @@ set +e
 fwdlog_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9J2" "$LOG9J2")
 fwdlog_ec=$?
 set -e
-echo "$fwdlog_out" | grep -q "RC=1" && [ "$fwdlog_ec" -eq 0 ] \
+echo "$fwdlog_out" | grep "RC=1" >/dev/null && [ "$fwdlog_ec" -eq 0 ] \
   && pass "logged wrapper-forward harness reproduces the gh failure (rc=1)" \
   || fail "logged forward harness misbehaved; rc=$fwdlog_ec; out: $fwdlog_out"
 # There IS a capture to decline here — the shim gh prints a diagnostic
 # before it exits — so the assertion below cannot pass on an empty file.
-echo "$fwdlog_out" | grep -qF "gh: HTTP 403: Resource not accessible by personal access token" \
+echo "$fwdlog_out" | grep -F "gh: HTTP 403: Resource not accessible by personal access token" >/dev/null \
   && pass "the gh-reached branch captured a non-empty diagnostic and showed it" \
   || fail "no gh diagnostic captured, so the no-persist check would be vacuous; out: $fwdlog_out"
 grep -qF "captured output follows" "$LOG9J2" 2>/dev/null \
@@ -1522,10 +1522,10 @@ set -e
 [ "$ec" -eq 0 ] \
   && pass "dry-run PAT miss exits 0 even under BOOTSTRAP_STRICT_SECRETS=1" \
   || fail "dry-run PAT miss failed under strict-secrets: rc=$ec, out: $out"
-echo "$out" | grep -q "\[DRY-RUN\] REVIEWER_ASSIGNMENT_TOKEN" \
+echo "$out" | grep "\[DRY-RUN\] REVIEWER_ASSIGNMENT_TOKEN" >/dev/null \
   && pass "dry-run PAT miss prints [DRY-RUN] plan lines" \
   || fail "missing [DRY-RUN] REVIEWER_ASSIGNMENT_TOKEN plan lines; out: $out"
-echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+echo "$out" | grep "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" >/dev/null \
   && fail "dry-run PAT miss emitted the live-run loud-miss ERROR lines" \
   || pass "dry-run PAT miss emits no loud-miss ERROR lines"
 [ -f "$TARGET10/.bootstrap-state.warnings" ] \
@@ -1595,13 +1595,13 @@ out=$(run_wizard_nopat resumewarn-repo \
         --firebase none --codex-app n --project new --dry-run --resume 2>&1)
 ec=$?
 set -e
-echo "$out" | grep -q "is not empty" \
+echo "$out" | grep "is not empty" >/dev/null \
   && fail "resume preflight rejected a dir containing only bookkeeping + warnings sidecar; out: $out" \
   || pass "resume preflight accepts the .bootstrap-state.warnings sidecar"
 [ "$ec" -eq 0 ] \
   && pass "resume run with a warnings sidecar completes (rc=$ec)" \
   || fail "resume run with a warnings sidecar failed: rc=$ec, out: $out"
-echo "$out" | grep -q "resume: skip template-mirror" \
+echo "$out" | grep "resume: skip template-mirror" >/dev/null \
   && pass "resume actually skipped the recorded template-mirror stage" \
   || fail "resume did not skip template-mirror; out: $out"
 
@@ -1687,10 +1687,10 @@ resume_out=$(run_wizard_toolcheck strictresume-repo \
                --resume template-mirror 2>&1)
 resume_ec=$?
 set -e
-echo "$resume_out" | grep -q "is not empty" \
+echo "$resume_out" | grep "is not empty" >/dev/null \
   && fail "resume preflight rejected the target dir the earlier stages populated; out: $resume_out" \
   || pass "resume preflight accepts a target dir populated by earlier stages"
-echo "$resume_out" | grep -q "remote already exists" \
+echo "$resume_out" | grep "remote already exists" >/dev/null \
   && fail "resume preflight rejected the remote this bootstrap created; out: $resume_out" \
   || pass "resume preflight accepts the remote recorded by the checkpoint"
 [ "$resume_ec" -eq 0 ] \
@@ -1699,7 +1699,7 @@ echo "$resume_out" | grep -q "remote already exists" \
 grep -q "^gh repo create " "$SHIM_LOG" \
   && fail "resume re-invoked gh repo create on an existing remote; log: $(cat "$SHIM_LOG")" \
   || pass "resume skips gh repo create (checkpointed step is idempotent)"
-echo "$resume_out" | grep -q "skipping gh repo create" \
+echo "$resume_out" | grep "skipping gh repo create" >/dev/null \
   && pass "resume logs why the create was skipped" \
   || fail "resume did not log the checkpoint skip; out: $resume_out"
 grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/strictresume-repo\$" "$SHIM_LOG" \
@@ -1733,7 +1733,7 @@ set -e
 [ "$hijack_ec" -eq 2 ] \
   && pass "a resume naming a different repo in the same target dir fails preflight (rc=2)" \
   || fail "resume onto an unrelated repo should exit 2; rc=$hijack_ec; out: $hijack_out"
-echo "$hijack_out" | grep -q "remote already exists: nathanjohnpayne/hijack-repo" \
+echo "$hijack_out" | grep "remote already exists: nathanjohnpayne/hijack-repo" >/dev/null \
   && pass "preflight refuses the unrelated remote despite a checkpoint for another repo" \
   || fail "existing-remote guard did not fire for the unnamed repo; out: $hijack_out"
 grep -q -- "--repo nathanjohnpayne/hijack-repo" "$SHIM_LOG" \
@@ -1780,7 +1780,7 @@ set -e
 [ "$nocp_ec" -eq 2 ] \
   && pass "resume without the checkpoint fails preflight (rc=2)" \
   || fail "resume without the checkpoint should exit 2; rc=$nocp_ec; out: $nocp_out"
-echo "$nocp_out" | grep -q "remote already exists" \
+echo "$nocp_out" | grep "remote already exists" >/dev/null \
   && pass "resume without the checkpoint still refuses the existing remote" \
   || fail "existing-remote guard did not fire without the checkpoint; out: $nocp_out"
 [ -s "$SHIM_LOG" ] \
@@ -1844,7 +1844,7 @@ set -e
 grep -q "^gh repo create nathanjohnpayne/pushfail-repo " "$SHIM_LOG" \
   && pass "push-failure run did create the remote" \
   || fail "run never reached gh repo create; log: $(cat "$SHIM_LOG")"
-echo "$pf_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+echo "$pf_out" | grep "push bootstrap commit to nathanjohnpayne/pushfail-repo" >/dev/null \
   && pass "push-failure run attempted the push as its own step" \
   || fail "no push step attempted; out: $pf_out"
 [ -f "$TARGET14/.bootstrap-state.checkpoints" ] \
@@ -1866,7 +1866,7 @@ pf2_out=$(run_wizard_toolcheck pushfail-repo \
             --resume template-mirror 2>&1)
 pf2_ec=$?
 set -e
-echo "$pf2_out" | grep -q "remote already exists" \
+echo "$pf2_out" | grep "remote already exists" >/dev/null \
   && fail "preflight refused the remote created before the push failed; out: $pf2_out" \
   || pass "preflight accepts the remote whose push failed (checkpoint present)"
 [ "$pf2_ec" -eq 0 ] \
@@ -1875,7 +1875,7 @@ echo "$pf2_out" | grep -q "remote already exists" \
 grep -q "^gh repo create " "$SHIM_LOG" \
   && fail "resume re-invoked gh repo create on the existing remote; log: $(cat "$SHIM_LOG")" \
   || pass "resume skips the create"
-echo "$pf2_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+echo "$pf2_out" | grep "push bootstrap commit to nathanjohnpayne/pushfail-repo" >/dev/null \
   && pass "resume retries the push it skipped the create for" \
   || fail "resume did not retry the push; out: $pf2_out"
 git -C "$WORKDIR/remotes/pushfail-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
@@ -1961,7 +1961,7 @@ ap_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18F" \
            "nathanjohnpayne/authpush-repo" "$WRAPPER_LOG18F")
 ap_ec=$?
 set -e
-echo "$ap_out" | grep -q "RC=0" && [ "$ap_ec" -eq 0 ] \
+echo "$ap_out" | grep "RC=0" >/dev/null && [ "$ap_ec" -eq 0 ] \
   && pass "author-credential harness completes step 1 end to end (rc=0)" \
   || fail "author-credential harness misbehaved; rc=$ap_ec; out: $ap_out"
 # Sanity: the create half was always wrapped, so a wrapper log that
@@ -1994,7 +1994,7 @@ case "$push_line" in
 esac
 # The credential travels over the helper protocol, so it must not appear
 # in the remote URL or anywhere else git wrote to disk (reflog included).
-git -C "$T18F" remote get-url origin | grep -qF "fake-author-token" \
+git -C "$T18F" remote get-url origin | grep -F "fake-author-token" >/dev/null \
   && fail "the token leaked into the remote URL: $(git -C "$T18F" remote get-url origin)" \
   || pass "the remote URL carries no token"
 grep -rqF "fake-author-token-for-the-push" "$T18F/.git" 2>/dev/null \
@@ -2038,7 +2038,7 @@ if command -v gh >/dev/null 2>&1; then
   [ "$probe_pw" = "$PROBE_TOKEN" ] \
     && pass "the shipped credential wiring resolves git's password from the wrapper's GH_TOKEN" \
     || fail "credential wiring did not yield the wrapper's token (password line redacted); other output: $probe_rest"
-  printf '%s\n' "$probe_rest" | grep -qF "username=x-access-token" \
+  printf '%s\n' "$probe_rest" | grep -F "username=x-access-token" >/dev/null \
     && pass "gh answers the credential request as the token-bearing user" \
     || fail "unexpected credential username; output: $probe_rest"
 else
@@ -2073,7 +2073,7 @@ cf_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18H" \
            "nathanjohnpayne/checkpointfail-repo" "$WRAPPER_LOG18H")
 cf_ec=$?
 set -e
-echo "$cf_out" | grep -q "RC=0" \
+echo "$cf_out" | grep "RC=0" >/dev/null \
   && fail "an unrecorded create was treated as success; out: $cf_out" \
   || pass "a checkpoint write that does not land fails the stage"
 [ "$cf_ec" -eq 0 ] \
@@ -2092,13 +2092,13 @@ git -C "$WORKDIR/remotes/checkpointfail-repo.git" rev-parse --verify -q refs/hea
   || pass "nothing reached the remote after the failed checkpoint"
 # The operator has to be able to repair it by hand — the remote exists
 # and the create cannot be repeated.
-echo "$cf_out" | grep -qF "resume checkpoint could not be written" \
+echo "$cf_out" | grep -F "resume checkpoint could not be written" >/dev/null \
   && pass "the failure names the checkpoint write as the cause" \
   || fail "no checkpoint-write diagnostic; out: $cf_out"
-echo "$cf_out" | grep -qF "github-infra:remote-created:nathanjohnpayne/checkpointfail-repo" \
+echo "$cf_out" | grep -F "github-infra:remote-created:nathanjohnpayne/checkpointfail-repo" >/dev/null \
   && pass "the failure prints the exact line to add by hand" \
   || fail "no manual-repair line emitted; out: $cf_out"
-echo "$cf_out" | grep -qF -- "--resume template-mirror" \
+echo "$cf_out" | grep -F -- "--resume template-mirror" >/dev/null \
   && pass "the failure points at the documented resume path" \
   || fail "no resume remediation; out: $cf_out"
 
@@ -2159,13 +2159,13 @@ set +e
 tmpfail_out=$(run_secret_set_with_tmpdir "$FAKE_ROOT_TMPFAIL" "$TARGET15" \
                 "$WORKDIR/no-such-tmpdir")
 set -e
-echo "$tmpfail_out" | grep -q "RC=1" \
+echo "$tmpfail_out" | grep "RC=1" >/dev/null \
   && pass "an unallocatable temp dir fails provisioning (rc=1)" \
   || fail "expected rc=1 from the temp-dir guard; out: $tmpfail_out"
 grep -q "secret set" "$SHIM_LOG" \
   && fail "the secret write ran without its trace/capture files; log: $(cat "$SHIM_LOG")" \
   || pass "no secret-set call is attempted when the temp dir cannot be allocated"
-echo "$tmpfail_out" | grep -q "could not allocate a temporary directory" \
+echo "$tmpfail_out" | grep "could not allocate a temporary directory" >/dev/null \
   && pass "the ERROR lines name the temp dir as the cause" \
   || fail "no temp-dir diagnostic; out: $tmpfail_out"
 grep -qF "could not allocate a temporary directory" "$TARGET15/.bootstrap-state.warnings" \
@@ -2277,13 +2277,13 @@ rw_push="$(cat "$WORKDIR/rw-git.log")"
 # the same call is refused before any push (owner's allowlist on #1541).
 rw_other="$(run_real_wrapper_case ghp_bootstrap-author '
   rc=0; bootstrap::run_author_git "push bootstrap commit" nathanjohnpayne/some-other-repo -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
-if printf '%s' "$rw_other" | grep -q '^RC=5$' && [ ! -s "$WORKDIR/rw-git.log" ]; then
+if printf '%s' "$rw_other" | grep '^RC=5$' >/dev/null && [ ! -s "$WORKDIR/rw-git.log" ]; then
   pass "real bootstrap::run_author_git: an origin that is not the expected repository is refused before the push"
 else
   fail "real bootstrap push to an unexpected repository: $rw_other"
 fi
-if printf '%s' "$rw_out" | grep -q '^RC=0$' \
-   && printf '%s' "$rw_push" | grep -q "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!'/[^']*/gh' auth git-credential .* -C $RW_REPO push -u origin HEAD\$"; then
+if printf '%s' "$rw_out" | grep '^RC=0$' >/dev/null \
+   && printf '%s' "$rw_push" | grep "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!'/[^']*/gh' auth git-credential .* -C $RW_REPO push -u origin HEAD\$" >/dev/null; then
   pass "real bootstrap::run_author_git through the real wrapper: pushes under the verified author token with gh's helper pinned"
 else
   fail "real bootstrap push: out=$rw_out push=$rw_push"
@@ -2292,7 +2292,7 @@ fi
 rm -f "$WORKDIR/rw-marker"
 rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
   rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_MARKER" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
-if printf '%s' "$rw_out" | grep -q '^RC=0$' && [ -f "$WORKDIR/rw-marker" ] \
+if printf '%s' "$rw_out" | grep '^RC=0$' >/dev/null && [ -f "$WORKDIR/rw-marker" ] \
    && grep -qx 'stdin=the-pat token=ghp_bootstrap-author' "$WORKDIR/rw-gh.log" \
    && ! grep -q 'marker=/' "$WORKDIR/rw-gh.log"; then
   pass "real bootstrap::author_gh_traced through the real wrapper: marker written, gh ran with stdin and the verified token, marker never inherited"
@@ -2303,7 +2303,7 @@ fi
 rm -f "$WORKDIR/rw-marker"
 rw_out="$(run_real_wrapper_case "" '
   rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_MARKER" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
-if ! printf '%s' "$rw_out" | grep -q '^RC=0$' && [ ! -e "$WORKDIR/rw-marker" ] && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
+if ! printf '%s' "$rw_out" | grep '^RC=0$' >/dev/null && [ ! -e "$WORKDIR/rw-marker" ] && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
   pass "real traced call with no author token: refused before gh, marker absent"
 else
   fail "real traced call without a token: out=$rw_out marker=$([ -e "$WORKDIR/rw-marker" ] && echo present || echo absent)"
@@ -2311,7 +2311,7 @@ fi
 
 rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
   rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_REPO/no-such-dir/marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
-if printf '%s' "$rw_out" | grep -q '^RC=70$' && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
+if printf '%s' "$rw_out" | grep '^RC=70$' >/dev/null && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
   pass "real traced call with an unwritable marker: exit 70, the secret write never ran"
 else
   fail "real traced call with unwritable marker: out=$rw_out"
