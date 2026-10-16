@@ -168,7 +168,7 @@ assert_rc_contains() {
   set -e
   if [ "$rc" -ne "$expected_rc" ]; then
     fail "$label: rc=$rc expected $expected_rc; output: $out"
-  elif [ -n "$needle" ] && ! echo "$out" | grep -qi "$needle"; then
+  elif [ -n "$needle" ] && ! echo "$out" | grep -i "$needle" >/dev/null; then
     fail "$label: missing '$needle'; output: $out"
   else
     pass "$label"
@@ -630,7 +630,7 @@ out=$(unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_REVIEWER_PAT; STUB_REQUIRE_TOKEN=
   run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'could not fetch PR metadata'; then
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep 'could not fetch PR metadata' >/dev/null; then
   pass "self-approve read with no token at all still blocks"
 else
   fail "self-approve read no token: rc=$rc out=$out"
@@ -1033,7 +1033,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=nathanpayne-codex run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "author wrapper exported non-author identity blocked"
 else
   fail "author wrapper exported non-author identity blocked: rc=$rc; output: $out"
@@ -1066,7 +1066,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "empty inline author override fails closed in custom-author repo"
 else
   fail "empty inline author override fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1080,7 +1080,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "env -u identity unset fails closed in custom-author repo"
 else
   fail "env -u identity unset fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1089,7 +1089,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset=GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "env --unset= identity fails closed in custom-author repo"
 else
   fail "env --unset= identity fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1107,7 +1107,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "env --unset NAME (space form) fails closed in custom-author repo"
 else
   fail "env --unset NAME (space form) fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1129,7 +1129,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -uGH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "#451: env -uNAME (compact) author unset fails closed in custom-author repo"
 else
   fail "#451: env -uNAME (compact) author unset fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1152,7 +1152,7 @@ set +e
 out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "unset builtin identity removal fails closed in custom-author repo"
 else
   fail "unset builtin identity removal fails closed in custom-author repo: rc=$rc; output: $out"
@@ -1212,7 +1212,7 @@ set +e
 out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
   pass "author wrapper unset identity under custom expected author fails closed"
 else
   fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
