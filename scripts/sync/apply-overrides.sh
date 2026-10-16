@@ -266,6 +266,9 @@ override_requires_check() {
       return index("," scope ",", ",all,") || index("," scope ",", "," consumer ",")
     }
     function covered(path, delivery,    i, prefix) {
+      # An applicable exact template names a rendered artifact, not its raw
+      # source. Keep plain/kit union only for non-templated requirements.
+      if (!delivery && template_key[key(path)]) return rendered[key(path)]
       if (delivery ? delivered[key(path)] : logical[key(path)]) return 1
       # Literal component prefixes implement ${carrier%/}/ without regex or
       # path normalization, including already-terminated kit spellings.
@@ -297,7 +300,10 @@ override_requires_check() {
     END {
       if (invalid) exit 2
       for (i = 1; i <= n; i++) {
-        if (!applies(scopes[i]) || skipped[key(targets[i])]) continue
+        if (!applies(scopes[i])) continue
+        if (types[i] == "templated") template_key[key(paths[i])] = 1
+        if (skipped[key(targets[i])]) continue
+        if (types[i] == "templated") rendered[key(paths[i])] = 1
         logical[key(paths[i])] = 1
         if (types[i] == "kit") {
           prefix = paths[i]

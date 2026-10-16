@@ -1845,7 +1845,7 @@ requires_closure_gate() {
   local covering_path covering_type covering_consumers covering_source covering_dest kit_prefix
   local coverage_found applicable_coverage unoverridden_coverage
   local plain_unoverridden_coverage templated_coverages requirement_satisfied
-  local plain_requirement_satisfied
+  local plain_requirement_satisfied applicable_template unskipped_template
   local coverage_reason req_entry_violations plain_violations
   local req_object_type
 
@@ -1880,6 +1880,8 @@ requires_closure_gate() {
     unoverridden_coverage=0
     plain_unoverridden_coverage=0
     templated_coverages=""
+    applicable_template=0
+    unskipped_template=0
     while IFS=$'\t' read -r covering_path covering_type covering_consumers covering_source covering_dest; do
       [ -z "$covering_path" ] && continue
       if [ "$covering_path" = "$req_entry" ]; then
@@ -1903,18 +1905,26 @@ requires_closure_gate() {
       fi
       applicable_coverage=1
       if [ "$covering_type" = "templated" ] && [ "$covering_path" = "$req_entry" ]; then
+        applicable_template=1
         # Templated materialization and audit both apply overrides to the
         # destination because that is the path the consumer owns.
         if override_should_skip_path "$consumer_overrides" "$covering_dest"; then
           continue
         fi
         unoverridden_coverage=1
+        unskipped_template=1
         templated_coverages+="${templated_coverages:+$'\n'}${covering_source}"$'\t'"${covering_dest}"
       elif ! override_should_skip_path "$consumer_overrides" "$covering_path"; then
         unoverridden_coverage=1
         plain_unoverridden_coverage=1
       fi
     done <<< "$manifest_entry_rows"
+    # Match the metadata carrier class independently of manifest row order:
+    # raw template source cannot mask a skipped or stale rendered artifact.
+    if [ "$applicable_template" -eq 1 ]; then
+      plain_unoverridden_coverage=0
+      unoverridden_coverage=$unskipped_template
+    fi
 
     if [ "$applicable_coverage" -eq 0 ]; then
       coverage_reason="not covered by the manifest"
@@ -1929,8 +1939,8 @@ requires_closure_gate() {
       continue
     fi
 
-    # Coverage is a union. A correct templated destination OR a correct
-    # plain/exact/kit artifact satisfies the requirement for this consumer.
+    # Applicable exact templates require a correct rendered destination.
+    # Other logical requirements retain the plain/exact/kit coverage union.
     requirement_satisfied=0
     req_entry_violations=""
     while IFS=$'\t' read -r covering_source covering_dest; do
@@ -3020,6 +3030,16 @@ sync_all_one_consumer() {
     if consumer_root=$(resolve_consumer_worktree "$consumer_name" 2>/dev/null); then
       if [ -f "$consumer_root/$OVERRIDES_PATH" ]; then
         local_overrides="$consumer_root/$OVERRIDES_PATH"
+      fi
+      # Local override metadata is known, so preview the same selected
+      # closure decision without cloning or pretending to prove artifact bytes.
+      local preview_targets="$canonical_targets"$'\n'"$kit_targets"$'\n'"$templated_targets"
+      if ! override_requires_load "$manifest" "$local_overrides" \
+         || ! override_requires_check "$consumer_name" "$preview_targets"; then
+        printf "  ✗ %s — requires-closure gate (#1041): %s\n" \
+          "$consumer_name" "$OVERRIDE_REQUIRES_DETAIL"
+        SYNC_FAILED=$((SYNC_FAILED + 1))
+        return 0
       fi
     fi
 

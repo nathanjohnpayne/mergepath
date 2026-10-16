@@ -464,4 +464,18 @@ grep -q 'kit/one (required by callers/a)' "$WORK/err" || fail 'kit-delivered cal
 printf '  - {path: callers/, reason: whole caller kit override}\n' >>"$SIB/drift/.sync-overrides.yml"
 run 0 --audit --json --use-local-tree --no-clone --repos drift --paths callers/
 assert_json 'length == 1 and .[0].status == "in-sync"'
+# Review2: an active source kit is not the rendered logical requirement.
+rm "$SIB/drift/.sync-overrides.yml"
+# Use a real source directory distinct from the rendered destination.
+mkdir -p "$MP/templates"
+cp "$MP/template.txt" "$MP/templates/tool.in"
+yq -i '.paths += [{"path": "templates/tool.in", "source": "templates/tool.in", "dest": "runtime/tool", "type": "templated", "consumers": "all"}, {"path": "templates/", "type": "kit", "consumers": "all"}] | .paths[0].requires = ["templates/tool.in"]' "$MP/.mergepath-sync.yml"
+cat >"$SIB/drift/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: runtime/tool, reason: consumer owns rendered dependency}
+YAML
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths canonical.txt
+[ ! -s "$WORK/out" ] || fail 'source-kit template contradiction leaked partial audit records'
+grep -q 'templates/tool.in (required by canonical.txt)' "$WORK/err" || fail 'audit source kit masked skipped render'
 echo 'PASS: sync audit JSON states, provenance, pagination, failures, filters, live baseline, and text parity'

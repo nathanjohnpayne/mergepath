@@ -2706,6 +2706,115 @@ done
 mv "$review_manifest_backup" "$REQ_MP/.mergepath-sync.yml"
 echo 'PASS: selected kit descendants retain metadata and current-artifact proof'
 
+# Review2: applicable template dependency identity survives a source kit.
+# A selected caller kit retains its declared edge; byte-current raw source
+# cannot mask skipped, missing, stale or mode-wrong rendered destinations.
+identity_backup="$req_workdir/template-identity-manifest.backup"
+cp "$REQ_MP/.mergepath-sync.yml" "$identity_backup"
+mkdir -p "$REQ_MP/render-callers"
+printf 'needs rendered runtime\n' >"$REQ_MP/render-callers/a"
+cp -p "$REQ_MP/examples/runtime-helper.in" "$REQ_MP/examples/physical-runtime.in"
+yq -i '(.paths[] | select(.path == "examples/runtime-helper.in")).source = "examples/physical-runtime.in" | .paths += [{"path": "examples/", "type": "kit", "consumers": "all"}, {"path": "render-callers/a", "type": "canonical", "consumers": "all", "requires": ["examples/runtime-helper.in"]}, {"path": "render-callers/", "type": "kit", "consumers": "all"}]' "$REQ_MP/.mergepath-sync.yml"
+git -C "$REQ_MP" add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'rendered dependency identity fixture'
+# Local dry-run uses only shared selected metadata, never clones, probes PRs
+# or pretends to prove rendered bytes. Closed stubs record forbidden egress.
+identity_preview="$req_workdir/identity-preview"
+mkdir -p "$identity_preview/bin" "$identity_preview/siblings/alpha" "$identity_preview/cache"
+git init -q "$identity_preview/siblings/alpha"
+cat >"$identity_preview/bin/git" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in clone|fetch|pull|push|ls-remote)
+    printf 'git %s\n' "$*" >>"$IDENTITY_PREVIEW_EGRESS"; exit 93 ;;
+  esac
+done
+exec "$IDENTITY_PREVIEW_REAL_GIT" "$@"
+SH
+cat >"$identity_preview/bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"$IDENTITY_PREVIEW_EGRESS"
+exit 94
+SH
+chmod +x "$identity_preview/bin/git" "$identity_preview/bin/gh"
+identity_dryrun() {
+  local expected=$1 paths=$2 siblings=${3:-$identity_preview/siblings} actual=0
+  output=$(env PATH="$identity_preview/bin:$PATH" \
+    IDENTITY_PREVIEW_REAL_GIT="$REQ_REAL_GIT" IDENTITY_PREVIEW_EGRESS="$identity_preview/egress" \
+    MERGEPATH_ROOT_OVERRIDE="$REQ_MP" MERGEPATH_SIBLINGS_DIR="$siblings" \
+    MERGEPATH_SYNC_CACHE="$identity_preview/cache" \
+    "$SCRIPT" --sync-all --dry-run --repos alpha --paths "$paths" 2>&1) || actual=$?
+  [ "$actual" = "$expected" ] || fail "local closure dry-run expected $expected got $actual: $output"
+  [ ! -s "$identity_preview/egress" ] || fail 'closure dry-run cloned/fetched/pushed or called GitHub'
+}
+# This plain dependency already fails the old metadata checker; its dry-run
+# regression therefore isolates the missing call rather than template typing.
+printf 'version: 1\nskip_paths: [{path: scripts/ci/, reason: custom required kit}]\n' >"$identity_preview/siblings/alpha/.sync-overrides.yml"
+identity_dryrun 1 .github/workflows/repo_lint.yml
+grep -q 'requires-closure gate' <<<"$output" || fail 'local dry-run omitted plain closure contradiction'
+! grep -q 'would open PR' <<<"$output" || fail 'local plain contradiction planned a PR'
+printf 'version: 1\nskip_paths: [{path: scripts/runtime/helper.sh, reason: custom rendered dependency}]\n' >"$identity_preview/siblings/alpha/.sync-overrides.yml"
+identity_dryrun 1 render-callers/
+grep -q 'requires-closure gate' <<<"$output" || fail 'local dry-run omitted closure contradiction'
+! grep -q 'would open PR' <<<"$output" || fail 'local contradictory dry-run planned a PR'
+# Unrelated selected slice and a known empty local skip set keep their plan.
+identity_dryrun 0 .github/workflows/slashless_kit.yml
+grep -q 'would open PR' <<<"$output" || fail 'unrelated dry-run slice was rejected'
+rm "$identity_preview/siblings/alpha/.sync-overrides.yml"
+identity_dryrun 0 render-callers/
+grep -q 'would open PR' <<<"$output" || fail 'absent local override changed normal dry-run'
+printf 'version: 1\nskip_paths: []\n' >"$identity_preview/siblings/alpha/.sync-overrides.yml"
+identity_dryrun 0 render-callers/
+grep -q 'would open PR' <<<"$output" || fail 'empty local skip set changed normal dry-run'
+# All selected delivery carriers skipped stays a no-target success.
+cat >"$identity_preview/siblings/alpha/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: scripts/runtime/helper.sh, reason: custom rendered dependency}
+  - {path: render-callers/a, reason: custom caller}
+  - {path: render-callers/, reason: custom caller kit}
+YAML
+identity_dryrun 0 render-callers/
+grep -q 'all effective sync targets skipped' <<<"$output" || fail 'all-skipped dry-run lost its zero-target outcome'
+! grep -q 'would open PR' <<<"$output" || fail 'all-skipped dry-run planned a PR'
+# Remote unknown override state remains a preview without new I/O.
+identity_dryrun 0 render-callers/ "$identity_preview/no-sibling"
+grep -q 'would open PR' <<<"$output" || fail 'remote unknown-state preview changed'
+for identity_state in skipped missing stale mode current; do
+  identity_remote="$req_workdir/template-source-$identity_state.git"
+  identity_seed="$req_workdir/template-source-$identity_state-seed"
+  req_setup_remote "$identity_remote" "$identity_seed"
+  mkdir -p "$identity_seed/examples"
+  cp -p "$REQ_MP/examples/runtime-helper.in" "$identity_seed/examples/runtime-helper.in"
+  if [ "$identity_state" = skipped ]; then
+    printf 'version: 1\nskip_paths: [{path: scripts/runtime/helper.sh, reason: custom rendered dependency}]\n' >"$identity_seed/.sync-overrides.yml"
+  fi
+  case "$identity_state" in
+    stale|mode|current)
+      mkdir -p "$identity_seed/scripts/runtime"
+      printf 'runtime blue\n' >"$identity_seed/scripts/runtime/helper.sh"
+      chmod +x "$identity_seed/scripts/runtime/helper.sh"
+      if [ "$identity_state" = stale ]; then printf 'stale render\n' >"$identity_seed/scripts/runtime/helper.sh"; fi
+      if [ "$identity_state" = mode ]; then chmod -x "$identity_seed/scripts/runtime/helper.sh"; fi ;;
+  esac
+  req_push_seed "$identity_remote" "$identity_seed"
+  set +e
+  output=$(req_run_sync_all "req-identity-$identity_state" "$identity_remote" render-callers/)
+  identity_rc=$?
+  set -e
+  if [ "$identity_state" = current ]; then
+    [ "$identity_rc" -eq 0 ] || fail "current render rejected with source kit: $output"
+    ! grep -q 'requires-closure gate' <<<"$output" || fail "current render failed artifact proof: $output"
+    [ -f "$REQ_CAPTURE/pr-title-req-identity-current.txt" ] || fail 'current render did not allow caller PR'
+  else
+    grep -q 'requires-closure gate' <<<"$output" || fail "source kit masked $identity_state render: $output"
+    [ ! -f "$REQ_CAPTURE/pr-title-req-identity-$identity_state.txt" ] || fail "source kit allowed PR with $identity_state render"
+  fi
+done
+
+mv "$identity_backup" "$REQ_MP/.mergepath-sync.yml"
+echo 'PASS: rendered dependency identity and local metadata-only dry-run closure'
+
 # Exercise the actual PR-create block with the unchanged verified author
 # wrapper and a closed fake gh; no auth cache/keyring/network can be reached.
 telemetry_bin="$metadata_workdir/telemetry-bin"

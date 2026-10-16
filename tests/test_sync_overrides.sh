@@ -903,6 +903,45 @@ review_check 1 alpha
 [[ "$OVERRIDE_REQUIRES_DETAIL" == *'node300 (required by node299)'* ]] \
   && pass 'indexed graph retains late contradiction' || fail 'bounded graph truncated or reordered'
 
+# Review2: an exact applicable template denotes its rendered dependency.
+# A raw containing source kit cannot satisfy a skipped rendered destination.
+identity_manifest="$WORKDIR/template-identity.yml"
+identity_skip="$WORKDIR/template-identity-skip.yml"
+cat >"$identity_manifest" <<'YAML'
+consumers: [{name: alpha}, {name: beta}]
+paths:
+  - {path: caller, type: canonical, consumers: all, requires: [templates/logical.in]}
+  - {path: templates/logical.in, source: templates/physical.in, dest: runtime/tool, type: templated, consumers: all}
+  - {path: templates/, type: kit, consumers: all}
+YAML
+printf 'skip_paths: [{path: runtime/tool, reason: custom rendered dependency}]\n' >"$identity_skip"
+override_requires_load "$identity_manifest" "$identity_skip" || fail 'template identity fixture rejected'
+review_check 1 alpha
+[[ "$OVERRIDE_REQUIRES_DETAIL" == *'templates/logical.in (required by caller)'* ]] \
+  || fail 'skipped rendered dependency diagnostic lost its logical key'
+override_requires_load "$identity_manifest" '' || fail 'unskipped template identity rejected'
+review_check 0 alpha caller
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'caller\ttemplates/logical.in' ] || fail 'unskipped template edge lost'
+# Mapping applicability belongs to this consumer; another consumer's template
+# must not shadow ordinary raw kit coverage here.
+yq -i '.paths[1].consumers = ["beta"]' "$identity_manifest"
+override_requires_load "$identity_manifest" "$identity_skip" || fail 'scoped template identity rejected'
+review_check 0 alpha
+review_check 1 beta
+# An omitted destination still denotes a render at its logical path.
+yq -i '.paths[1].consumers = "all" | del(.paths[1].dest)' "$identity_manifest"
+printf 'skip_paths: [{path: templates/logical.in, reason: custom path-preserving render}]\n' >"$identity_skip"
+override_requires_load "$identity_manifest" "$identity_skip" || fail 'path-preserving template identity rejected'
+review_check 1 alpha
+# Ordinary exact/kit alternative coverage remains a union.
+yq -i '.paths[1].type = "canonical"' "$identity_manifest"
+override_requires_load "$identity_manifest" "$identity_skip" || fail 'plain dependency union fixture rejected'
+review_check 0 alpha
+# Classification precedes skip filtering and does not depend on row order.
+yq -i '.paths[1].type = "templated" | .paths = [.paths[2], .paths[1], .paths[0]]' "$identity_manifest"
+override_requires_load "$identity_manifest" "$identity_skip" || fail 'reordered template identity rejected'
+review_check 1 alpha
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
