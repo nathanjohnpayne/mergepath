@@ -68,7 +68,8 @@
       "scripts/workflow/heal-auto-clear-infra-check.sh",
       "scripts/workflow/report-approval-continuation-failures.sh",
       "tests/test_approval_merge_continuation.sh",
-      "tests/test_merge_clearance_gate.sh"
+      "tests/test_merge_clearance_gate.sh",
+      "scripts/workflow/installation-budget.sh"
     ],
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh"
@@ -137,7 +138,8 @@
       "tests/test_coderabbit_record_feedback.sh"
     ],
     "check_coderabbit_severity_gate": [
-      "tests/test_coderabbit_severity_gate.sh"
+      "tests/test_coderabbit_severity_gate.sh",
+      "scripts/workflow/installation-budget.sh"
     ],
     "check_coderabbit_wait": [
       "scripts/lib/ci-check-modes.sh",
@@ -156,7 +158,8 @@
       "scripts/workflow/feedback-archive-relay-source.sh",
       "scripts/render-feedback-archive.sh",
       "scripts/review-feedback-surface-fingerprint.sh",
-      "scripts/lib/feedback-archive-identities.sh"
+      "scripts/lib/feedback-archive-identities.sh",
+      "scripts/workflow/installation-budget.sh"
     ],
     "check_codex_scripts": [
       "scripts/lib/codex-request-evidence.sh",
@@ -253,7 +256,8 @@
       "scripts/merge-clearance-gate.sh",
       "scripts/gate-api-lineage-blocking.sh",
       "tests/test_merge_clearance_gate.sh",
-      "tests/test_465_fail_closed.sh"
+      "tests/test_465_fail_closed.sh",
+      "scripts/workflow/installation-budget.sh"
     ],
     "check_merge_group_required_checks": [
       "tests/test_merge_group_required_checks.sh"
@@ -339,7 +343,16 @@
       "scripts/workflow/required-check-generation.sh",
       "scripts/workflow/coderabbit-evidence-recovery.py",
       "tests/test_consumer_residue_safety.sh",
-      "tests/test_merge_clearance_gate.sh"
+      "tests/test_merge_clearance_gate.sh",
+      "scripts/workflow/installation-budget.sh",
+      "tests/test_event_budget_guard.sh",
+      ".github/workflows/codex-feedback-archive-relay.yml",
+      ".github/workflows/codex-p1-gate.yml",
+      ".github/workflows/coderabbit-severity-gate.yml",
+      ".github/workflows/merge-clearance-gate.yml",
+      "scripts/gate-api-lineage-blocking.sh",
+      "scripts/workflow/codex-p1-snapshot-retry.py",
+      "scripts/lib/gh-retry-helpers.sh"
     ],
     "check_resolve_pr_threads": [
       "tests/test_resolve_pr_threads_rationale_tag.sh",
