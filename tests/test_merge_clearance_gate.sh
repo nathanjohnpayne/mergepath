@@ -5211,11 +5211,36 @@ mcg22_case lineage-helper-dropped \
   's{helper=scripts/gate-api-lineage-blocking\.sh}{helper=scripts/true.sh}' \
   fail '[#2247 pending arm]'
 mcg22_case lineage-if-unguarded \
-  's{if: \$\{\{ steps\.gate\.outputs\.pending == .true. && steps\.open\.outputs\.id != .. \}\}}{if: \$\{\{ always() && steps.open.outputs.id != \x27\x27 \}\}}' \
+  's{if: \$\{\{ \(steps\.gate\.outputs\.pending == .true. \|\| steps\.budget\.outputs\.skip == .true. \|\| steps\.gate\.outputs\.rate_limited == .true.\) && steps\.open\.outputs\.id != .. \}\}}{if: \$\{\{ always() && steps.open.outputs.id != \x27\x27 \}\}}' \
   fail '[#850 producer eligibility]'
 mcg22_case lineage-step-removed \
   's{      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n.*?(      - name: Report gate verdict)}{$1}s' \
   fail '[#2247 pending arm]'
+unset MCG_TAG
+fi
+
+# Test 30g (#2286): the fence pins on the budget guard reject each shape that
+# would let a run that evaluated nothing look green, or turn the guard off.
+if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ] && declare -f mcg22_case >/dev/null 2>&1; then
+MCG_TAG='#2286'
+mcg22_case budget-skip-closes-green \
+  's{(if \[ "\$\{BUDGET_SKIP:-\}" = true \] \|\| \[ "\$\{RATE_LIMITED:-\}" = true \]; then\n.*?)conclusion="failure"}{$1conclusion="success"}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-report-unconditional \
+  's{(if \[ "\$\{API_BLOCKING:-\}" = true \]; then\n.*?exit 0\n\s*fi\n.*?)exit 1}{$1exit 0}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-skip-const \
+  's{(Report gate verdict.*?)BUDGET_SKIP: \$\{\{ steps\.budget\.outputs\.skip \}\}}{$1BUDGET_SKIP: "true"}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-knob-malformed \
+  's{(Installation budget guard \(#2286\).*?BUDGET_RESERVE_REQUESTS: )"200"}{$1"two hundred"}s' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-open-id-unbound \
+  's{OPEN_ID: \$\{\{ steps\.open\.outputs\.id \}\}}{OPEN_ID: "1"}' \
+  fail '[#2286 budget guard]'
+mcg22_case budget-gate-if-dropped \
+  's{(      - name: Run scripts/merge-clearance-gate\.sh\n        id: gate\n)        if: [^\n]*\n}{$1        if: \$\{\{ always() \}\}\n}' \
+  fail '[#850 producer eligibility]'
 unset MCG_TAG
 fi
 

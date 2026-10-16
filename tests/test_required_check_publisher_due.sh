@@ -93,7 +93,7 @@ RUBY
 . "$TMP/step-env.sh"
 
 mkdir -p "$TMP/bin" "$TMP/work/scripts/workflow"
-cp "$ROOT/scripts/workflow/required-check-generation.sh" "$TMP/work/scripts/workflow/"
+cp "$ROOT/scripts/workflow/required-check-generation.sh" "$ROOT/scripts/workflow/installation-budget.sh" "$TMP/work/scripts/workflow/"
 printf '#!/bin/sh\necho bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TMP/bin/git"
 chmod +x "$TMP/bin/git"
 for g in merge-clearance-gate.sh codex-p1-gate.sh coderabbit-severity-gate.sh; do
