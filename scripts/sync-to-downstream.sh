@@ -1840,8 +1840,8 @@ requires_closure_gate() {
     return 1
   fi
   local req_violations=""
-  local manifest_entry_rows manifest_requires_rows
-  local req_target edge_target req_entry req_files req_file
+  local manifest_entry_rows
+  local req_target req_entry req_files req_file
   local covering_path covering_type covering_consumers covering_source covering_dest kit_prefix
   local coverage_found applicable_coverage unoverridden_coverage
   local plain_unoverridden_coverage templated_coverages requirement_satisfied
@@ -1866,139 +1866,126 @@ requires_closure_gate() {
     err "$consumer_name: requires-closure gate could not read manifest coverage"
     return 1
   fi
-  if ! manifest_requires_rows=$(yq -r '
-    .paths[]
-    | .path as $target
-    | (.requires // [])[]
-    | [$target, .]
-    | @tsv
-  ' "$requires_manifest" 2>/dev/null); then
-    err "$consumer_name: requires-closure gate could not read manifest requirements"
-    return 1
-  fi
+  # Use the shared effective slice, including declared descendants delivered
+  # by selected kits. Metadata coverage still needs the artifact proof below.
+  while IFS=$'\t' read -r req_target req_entry; do
+    [ -n "$req_entry" ] || continue
 
-  while IFS= read -r req_target; do
-    [ -z "$req_target" ] && continue
-    while IFS=$'\t' read -r edge_target req_entry; do
-      [ "$edge_target" = "$req_target" ] || continue
-      [ -z "$req_entry" ] && continue
-
-      # Resolve the UNION of every manifest entry that covers this required
-      # path: exact entries plus every containing kit. The metadata gate above
-      # rejects all-carriers-skipped contradictions; any surviving carrier
-      # still needs the existing current-artifact proof below.
-      coverage_found=0
-      applicable_coverage=0
-      unoverridden_coverage=0
-      plain_unoverridden_coverage=0
-      templated_coverages=""
-      while IFS=$'\t' read -r covering_path covering_type covering_consumers covering_source covering_dest; do
-        [ -z "$covering_path" ] && continue
-        if [ "$covering_path" = "$req_entry" ]; then
+    # Resolve the UNION of every manifest entry that covers this required
+    # path: exact entries plus every containing kit. The metadata gate above
+    # rejects all-carriers-skipped contradictions; any surviving carrier
+    # still needs the existing current-artifact proof below.
+    coverage_found=0
+    applicable_coverage=0
+    unoverridden_coverage=0
+    plain_unoverridden_coverage=0
+    templated_coverages=""
+    while IFS=$'\t' read -r covering_path covering_type covering_consumers covering_source covering_dest; do
+      [ -z "$covering_path" ] && continue
+      if [ "$covering_path" = "$req_entry" ]; then
+        coverage_found=1
+      elif [ "$covering_type" = "kit" ]; then
+        kit_prefix="${covering_path%/}/"
+        if [[ "$req_entry" == "$kit_prefix"* ]]; then
           coverage_found=1
-        elif [ "$covering_type" = "kit" ]; then
-          kit_prefix="${covering_path%/}/"
-          if [[ "$req_entry" == "$kit_prefix"* ]]; then
-            coverage_found=1
-          else
-            continue
-          fi
         else
           continue
         fi
+      else
+        continue
+      fi
 
-        if [ "$covering_consumers" != "all" ]; then
-          case ",$covering_consumers," in
-            *",$consumer_name,"*) : ;;
-            *) continue ;;
-          esac
+      if [ "$covering_consumers" != "all" ]; then
+        case ",$covering_consumers," in
+          *",$consumer_name,"*) : ;;
+          *) continue ;;
+        esac
+      fi
+      applicable_coverage=1
+      if [ "$covering_type" = "templated" ] && [ "$covering_path" = "$req_entry" ]; then
+        # Templated materialization and audit both apply overrides to the
+        # destination because that is the path the consumer owns.
+        if override_should_skip_path "$consumer_overrides" "$covering_dest"; then
+          continue
         fi
-        applicable_coverage=1
-        if [ "$covering_type" = "templated" ] && [ "$covering_path" = "$req_entry" ]; then
-          # Templated materialization and audit both apply overrides to the
-          # destination because that is the path the consumer owns.
-          if override_should_skip_path "$consumer_overrides" "$covering_dest"; then
-            continue
+        unoverridden_coverage=1
+        templated_coverages+="${templated_coverages:+$'\n'}${covering_source}"$'\t'"${covering_dest}"
+      elif ! override_should_skip_path "$consumer_overrides" "$covering_path"; then
+        unoverridden_coverage=1
+        plain_unoverridden_coverage=1
+      fi
+    done <<< "$manifest_entry_rows"
+
+    if [ "$applicable_coverage" -eq 0 ]; then
+      coverage_reason="not covered by the manifest"
+      if [ "$coverage_found" -eq 1 ]; then
+        coverage_reason="manifest coverage excludes $consumer_name"
+      fi
+      req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; $coverage_reason)"
+      continue
+    fi
+    if [ "$unoverridden_coverage" -eq 0 ]; then
+      req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; every applicable carrier is override-skipped)"
+      continue
+    fi
+
+    # Coverage is a union. A correct templated destination OR a correct
+    # plain/exact/kit artifact satisfies the requirement for this consumer.
+    requirement_satisfied=0
+    req_entry_violations=""
+    while IFS=$'\t' read -r covering_source covering_dest; do
+      [ -z "$covering_source" ] && continue
+      if requires_templated_artifact_matches "$consumer_name" "$sha" "$workspace" \
+           "$covering_source" "$covering_dest" "$requires_manifest"; then
+        requirement_satisfied=1
+        break
+      fi
+      req_entry_violations+="${req_entry_violations:+$'\n'}$REQUIRES_TEMPLATE_DETAIL (required by $req_target)"
+    done <<< "$templated_coverages"
+    if [ "$requirement_satisfied" -eq 1 ]; then
+      continue
+    fi
+
+    if [ "$plain_unoverridden_coverage" -eq 1 ]; then
+      plain_requirement_satisfied=0
+      plain_violations=""
+      # `type: kit` accepts paths with or without a trailing slash. Infer
+      # recursion from the source tree object, not spelling, so an exact
+      # slashless kit is compared file-by-file instead of comparing its tree
+      # metadata to the consumer's first child blob.
+      req_object_type=$(git -C "$MERGEPATH_ROOT" cat-file -t \
+        "$sha:${req_entry%/}" 2>/dev/null || true)
+      if [ "$req_object_type" = "tree" ]; then
+        if ! req_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only \
+            "$sha" -- "${req_entry%/}" 2>/dev/null); then
+          plain_violations="$req_entry (could not enumerate source tree at $sha)"
+        elif [ -z "$req_files" ]; then
+          plain_violations="$req_entry (source tree at $sha unexpectedly enumerated no files)"
+        fi
+      else
+        req_files="$req_entry"
+      fi
+      if [ -z "$plain_violations" ]; then
+        while IFS= read -r req_file; do
+          [ -z "$req_file" ] && continue
+          if ! requires_plain_artifact_matches "$sha" "$workspace" "$req_file"; then
+            plain_violations+="${plain_violations:+$'\n'}$REQUIRES_PLAIN_DETAIL (required by $req_target)"
           fi
-          unoverridden_coverage=1
-          templated_coverages+="${templated_coverages:+$'\n'}${covering_source}"$'\t'"${covering_dest}"
-        elif ! override_should_skip_path "$consumer_overrides" "$covering_path"; then
-          unoverridden_coverage=1
-          plain_unoverridden_coverage=1
-        fi
-      done <<< "$manifest_entry_rows"
-
-      if [ "$applicable_coverage" -eq 0 ]; then
-        coverage_reason="not covered by the manifest"
-        if [ "$coverage_found" -eq 1 ]; then
-          coverage_reason="manifest coverage excludes $consumer_name"
-        fi
-        req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; $coverage_reason)"
-        continue
-      fi
-      if [ "$unoverridden_coverage" -eq 0 ]; then
-        req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; every applicable carrier is override-skipped)"
-        continue
-      fi
-
-      # Coverage is a union. A correct templated destination OR a correct
-      # plain/exact/kit artifact satisfies the requirement for this consumer.
-      requirement_satisfied=0
-      req_entry_violations=""
-      while IFS=$'\t' read -r covering_source covering_dest; do
-        [ -z "$covering_source" ] && continue
-        if requires_templated_artifact_matches "$consumer_name" "$sha" "$workspace" \
-             "$covering_source" "$covering_dest" "$requires_manifest"; then
-          requirement_satisfied=1
-          break
-        fi
-        req_entry_violations+="${req_entry_violations:+$'\n'}$REQUIRES_TEMPLATE_DETAIL (required by $req_target)"
-      done <<< "$templated_coverages"
-      if [ "$requirement_satisfied" -eq 1 ]; then
-        continue
-      fi
-
-      if [ "$plain_unoverridden_coverage" -eq 1 ]; then
-        plain_requirement_satisfied=0
-        plain_violations=""
-        # `type: kit` accepts paths with or without a trailing slash. Infer
-        # recursion from the source tree object, not spelling, so an exact
-        # slashless kit is compared file-by-file instead of comparing its tree
-        # metadata to the consumer's first child blob.
-        req_object_type=$(git -C "$MERGEPATH_ROOT" cat-file -t \
-          "$sha:${req_entry%/}" 2>/dev/null || true)
-        if [ "$req_object_type" = "tree" ]; then
-          if ! req_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only \
-              "$sha" -- "${req_entry%/}" 2>/dev/null); then
-            plain_violations="$req_entry (could not enumerate source tree at $sha)"
-          elif [ -z "$req_files" ]; then
-            plain_violations="$req_entry (source tree at $sha unexpectedly enumerated no files)"
-          fi
-        else
-          req_files="$req_entry"
-        fi
+        done <<< "$req_files"
         if [ -z "$plain_violations" ]; then
-          while IFS= read -r req_file; do
-            [ -z "$req_file" ] && continue
-            if ! requires_plain_artifact_matches "$sha" "$workspace" "$req_file"; then
-              plain_violations+="${plain_violations:+$'\n'}$REQUIRES_PLAIN_DETAIL (required by $req_target)"
-            fi
-          done <<< "$req_files"
-          if [ -z "$plain_violations" ]; then
-            plain_requirement_satisfied=1
-          fi
+          plain_requirement_satisfied=1
         fi
-        if [ "$plain_requirement_satisfied" -eq 1 ]; then
-          continue
-        fi
-        req_entry_violations+="${req_entry_violations:+$'\n'}$plain_violations"
       fi
-      if [ -z "$req_entry_violations" ]; then
-        req_entry_violations="$req_entry (required by $req_target; no comparable artifact resolved from manifest coverage)"
+      if [ "$plain_requirement_satisfied" -eq 1 ]; then
+        continue
       fi
-      req_violations+="${req_violations:+$'\n'}$req_entry_violations"
-    done <<< "$manifest_requires_rows"
-  done <<< "$targets"
+      req_entry_violations+="${req_entry_violations:+$'\n'}$plain_violations"
+    fi
+    if [ -z "$req_entry_violations" ]; then
+      req_entry_violations="$req_entry (required by $req_target; no comparable artifact resolved from manifest coverage)"
+    fi
+    req_violations+="${req_violations:+$'\n'}$req_entry_violations"
+  done <<< "$OVERRIDE_REQUIRES_ACTIVE_EDGES"
 
   if [ -z "$req_violations" ]; then
     return 0

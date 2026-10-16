@@ -443,4 +443,25 @@ assert_json 'length == 1 and .[0].status == "in-sync"'
 rm "$SIB/drift/.sync-overrides.yml"
 run 1 --audit --json --use-local-tree --no-clone --repos drift --paths canonical.txt
 assert_json 'length == 1 and .[0].status == "drift"'
+# A skipped exact caller remains delivered by its active containing kit.
+# Contradiction is still fatal before any partial fleet records are published.
+mkdir -p "$MP/callers" "$SIB/clean/callers" "$SIB/drift/callers"
+printf 'caller\n' >"$MP/callers/a"
+cp "$MP/callers/a" "$SIB/clean/callers/a"
+cp "$MP/callers/a" "$SIB/drift/callers/a"
+yq -i '.paths += [{"path": "callers/a", "type": "canonical", "consumers": "all", "requires": ["kit/one"]}, {"path": "callers/", "type": "kit", "consumers": "all"}]' "$MP/.mergepath-sync.yml"
+# Isolate this declared edge from the preceding canonical.txt fixture.
+yq -i 'del(.paths[0].requires)' "$MP/.mergepath-sync.yml"
+cat >"$SIB/drift/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: callers/a, reason: exact caller override}
+  - {path: kit/, reason: required kit override}
+YAML
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths callers/
+[ ! -s "$WORK/out" ] || fail 'kit-delivered caller contradiction leaked partial audit records'
+grep -q 'kit/one (required by callers/a)' "$WORK/err" || fail 'kit-delivered caller edge missing from audit'
+printf '  - {path: callers/, reason: whole caller kit override}\n' >>"$SIB/drift/.sync-overrides.yml"
+run 0 --audit --json --use-local-tree --no-clone --repos drift --paths callers/
+assert_json 'length == 1 and .[0].status == "in-sync"'
 echo 'PASS: sync audit JSON states, provenance, pagination, failures, filters, live baseline, and text parity'

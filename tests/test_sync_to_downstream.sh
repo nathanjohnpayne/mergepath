@@ -2673,6 +2673,39 @@ for status_at in 2 3; do
 done
 echo "PASS: actual engine fails closed on unavailable pre-copy and pre-push hub status"
 
+# Shared selected-edge proof (#1041 review1): a selected kit delivers an
+# exact requirer even when its own entry is absent from the selected targets.
+# Keep the existing artifact gate authoritative after metadata succeeds.
+review_manifest_backup="$req_workdir/review-manifest.backup"
+cp "$REQ_MP/.mergepath-sync.yml" "$review_manifest_backup"
+mkdir -p "$REQ_MP/delivery"
+printf 'requires check a\n' >"$REQ_MP/delivery/a.txt"
+yq -i '.paths += [{"path": "delivery/a.txt", "type": "canonical", "consumers": "all", "requires": ["scripts/ci/check_a"]}, {"path": "delivery/", "type": "kit", "consumers": "all"}]' "$REQ_MP/.mergepath-sync.yml"
+git -C "$REQ_MP" add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'selected kit descendant requires fixture'
+for review_kind in skipped stale; do
+  review_remote="$req_workdir/review-$review_kind.git"
+  review_seed="$req_workdir/review-$review_kind-seed"
+  req_setup_remote "$review_remote" "$review_seed"
+  if [ "$review_kind" = skipped ]; then
+    cat >"$review_seed/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: delivery/a.txt, reason: exact requiring override}
+  - {path: scripts/ci/, reason: required kit override}
+YAML
+  fi
+  req_push_seed "$review_remote" "$review_seed"
+  set +e
+  output=$(req_run_sync_all "req-review-$review_kind" "$review_remote" delivery/)
+  set -e
+  grep -q 'requires-closure gate' <<<"$output" || fail "selected kit lost $review_kind descendant obligation: $output"
+  grep -q 'scripts/ci/check_a' <<<"$output" || fail "selected kit $review_kind proof omitted dependency: $output"
+  [ ! -f "$REQ_CAPTURE/pr-title-req-review-$review_kind.txt" ] || fail "selected kit opened PR with $review_kind dependency"
+done
+mv "$review_manifest_backup" "$REQ_MP/.mergepath-sync.yml"
+echo 'PASS: selected kit descendants retain metadata and current-artifact proof'
+
 # Exercise the actual PR-create block with the unchanged verified author
 # wrapper and a closed fake gh; no auth cache/keyring/network can be reached.
 telemetry_bin="$metadata_workdir/telemetry-bin"

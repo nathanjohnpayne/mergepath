@@ -704,7 +704,7 @@ for nul_field in '.paths[0].path' '.paths[5].dest' '.paths[0].requires' '.consum
   nul_read=$nul_field
   case "$nul_field" in
     '.paths[0].requires'|'.paths[0].consumers')
-      nul_value="[$nul_value]"; nul_read="$nul_field[0]" ;;
+      nul_value="[$nul_value]"; nul_read="${nul_field}[0]" ;;
   esac
   OVERRIDE_NUL_SCALAR="$WORKDIR/nul-scalar.yml" yq -i "$nul_field = $nul_value" "$WORKDIR/nul-closure.yml"
   if ! yq -e "$nul_read | test(\"\\x00\")" "$WORKDIR/nul-closure.yml" >/dev/null; then
@@ -751,6 +751,157 @@ rc=0; override_requires_load "$closure_manifest" "$WORKDIR/bad-closure-overrides
 [ "$rc" = 2 ] && pass 'strict closure rejects malformed skip set' || fail 'malformed skips became empty graph'
 # Old permissive API retains parse-error/no-override behavior independently.
 if override_should_skip_path "$WORKDIR/bad-closure-overrides.yml" kit; then fail 'old malformed matcher changed'; else pass 'old matcher default preserved'; fi
+
+# Review1: destination omission, selected delivery and indexed metadata proof.
+review_manifest="$WORKDIR/review-closure.yml"
+review_skip="$WORKDIR/review-skip.yml"
+review_check() {
+  local expected=$1; shift
+  local actual=0
+  override_requires_check "$@" >"$WORKDIR/review-stdout" || actual=$?
+  if [ "$actual" = "$expected" ] && [ ! -s "$WORKDIR/review-stdout" ]; then
+    pass "indexed closure exit $expected: $*"
+  else
+    fail "indexed closure expected $expected got $actual: $OVERRIDE_REQUIRES_DETAIL"
+  fi
+  if [ "$actual" != 0 ] && [ -n "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ]; then
+    fail 'failed metadata proof exposed partial effective edges'
+  fi
+}
+# (1–3) Omission defaults to path; present invalid values do not default.
+cat >"$review_manifest" <<'YAML'
+consumers: [{name: alpha}]
+paths:
+  - {path: template.in, type: templated, consumers: all}
+YAML
+if override_requires_load "$review_manifest" ''; then
+  [ "$OVERRIDE_REQUIRES_ENTRIES" = $'template.in\ttemplated\tall\ttemplate.in' ] \
+    && pass 'omitted templated dest resolves to path' || fail 'omitted dest serialized incorrectly'
+  review_check 0 alpha
+else fail 'omitted templated dest rejected'; fi
+cat >>"$review_manifest" <<'YAML'
+  - {path: caller, type: canonical, consumers: all, requires: [template.in]}
+YAML
+printf 'skip_paths: [{path: template.in, reason: custom}]\n' >"$review_skip"
+override_requires_load "$review_manifest" "$review_skip" || fail 'omitted-dest carrier fixture rejected'
+review_check 1 alpha
+for invalid_dest in null true 7 '{}' '""' '"bad\tcell"' '"bad\ncell"' '"bad\0cell"'; do
+  printf 'consumers: [{name: alpha}]\npaths:\n  - {path: template.in, type: templated, consumers: all, dest: %s}\n' "$invalid_dest" >"$WORKDIR/review-invalid-dest.yml"
+  rc=0; override_requires_load "$WORKDIR/review-invalid-dest.yml" '' || rc=$?
+  [ "$rc" = 2 ] && [ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] \
+    && pass "present invalid dest cannot default: $invalid_dest" || fail "invalid dest accepted: $invalid_dest"
+done
+# (4) Ignored canonical/kit malformed and genuine-NUL destinations above stay
+# applicable only through path; these earlier assertions are not weakened.
+# (5–8) Exact and kit carriers form a union for the delivered requirer too.
+cat >"$review_manifest" <<'YAML'
+consumers: [{name: alpha}, {name: beta}]
+paths:
+  - {path: scripts/a.sh, type: canonical, consumers: [alpha], requires: [dep]}
+  - {path: scripts/, type: kit, consumers: [alpha]}
+  - {path: dep, type: canonical, consumers: all}
+  - {path: unrelated, type: canonical, consumers: all}
+YAML
+cat >"$review_skip" <<'YAML'
+skip_paths:
+  - {path: scripts/a.sh, reason: custom exact}
+  - {path: dep, reason: custom dependency}
+YAML
+override_requires_load "$review_manifest" "$review_skip" || fail 'delivery union fixture rejected'
+review_check 1 alpha
+review_check 1 alpha scripts/
+[[ "$OVERRIDE_REQUIRES_DETAIL" == *'dep (required by scripts/a.sh)'* ]] \
+  || fail 'selected kit lost descendant diagnostic'
+printf '  - {path: scripts/, reason: custom whole kit}\n' >>"$review_skip"
+override_requires_load "$review_manifest" "$review_skip" || fail 'all requiring carriers fixture rejected'
+review_check 0 alpha
+[ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] || fail 'fully skipped requirer retained edges'
+# A surviving required carrier supplies logical metadata coverage. Its actual
+# consumer bytes are still checked independently by the sync gate suite.
+yq -i '.paths += [{"path": "deps/tool", "type": "canonical", "consumers": "all"}, {"path": "deps", "type": "kit", "consumers": "all"}] | .paths[0].requires = ["deps/tool"]' "$review_manifest"
+printf 'skip_paths: [{path: deps/tool, reason: exact}, {path: scripts/a.sh, reason: exact}]\n' >"$review_skip"
+override_requires_load "$review_manifest" "$review_skip" || fail 'required carrier union rejected'
+review_check 0 alpha scripts/
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'scripts/a.sh\tdeps/tool' ] \
+  && pass 'selected kit publishes declared descendant edge' || fail 'shared selected edge missing'
+# (9–10) Empty/unrelated selection, scope and component boundaries are literal.
+review_check 0 alpha unrelated
+[ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] || fail 'unrelated selection activated descendant'
+review_check 0 alpha ''
+review_check 0 beta scripts/
+review_check 0 alpha $'scripts/\tunexpected'
+review_check 0 alpha scripts-extra/
+# A neighboring kit cannot deliver the requiring file either.
+yq -i '.paths[1].path = "scripts-extra/"' "$review_manifest"
+override_requires_load "$review_manifest" "$review_skip" || fail 'neighbor carrier fixture rejected'
+review_check 0 alpha
+[ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] || fail 'neighbor kit supplied requiring delivery'
+# (11) A selected kit carrying template SOURCE is not its skipped DEST.
+cat >"$review_manifest" <<'YAML'
+consumers: [{name: alpha}]
+paths:
+  - {path: templates/tool.in, dest: runtime/tool, type: templated, consumers: all, requires: [dep]}
+  - {path: templates/, type: kit, consumers: all}
+  - {path: dep, type: canonical, consumers: all}
+YAML
+printf 'skip_paths: [{path: runtime/tool, reason: custom}, {path: dep, reason: custom}]\n' >"$review_skip"
+override_requires_load "$review_manifest" "$review_skip" || fail 'rendered target fixture rejected'
+review_check 0 alpha templates/
+[ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] || fail 'template source kit reactivated rendered destination'
+# (12) Literal backslashes, spaces and regexp punctuation survive stdin.
+cat >"$review_manifest" <<'YAML'
+consumers: [{name: alpha}]
+paths:
+  - {path: 'caller \.[x]', type: canonical, consumers: all, requires: ['kit \.[x]/tool']}
+  - {path: 'kit \.[x]/', type: kit, consumers: all}
+YAML
+override_requires_load "$review_manifest" '' || fail 'literal metadata fixture rejected'
+review_check 0 alpha 'caller \.[x]'
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'caller \\.[x]\tkit \\.[x]/tool' ] \
+  && pass 'literal metadata retained in effective edges' || fail 'literal metadata changed in processor'
+# TSV forbids tab/newline/NUL, but not awk SUBSEP. This accepted path must not
+# collide with another path/edge-index composite. Edge order remains literal.
+cat >"$review_manifest" <<'YAML'
+consumers: [{name: alpha}]
+paths:
+  - {path: "a\x1c1", type: canonical, consumers: all, requires: [ok]}
+  - {path: a, type: canonical, consumers: all, requires: [missing-first, missing-second]}
+  - {path: ok, type: canonical, consumers: all}
+YAML
+override_requires_load "$review_manifest" '' || fail 'SUBSEP literal fixture rejected'
+review_check 0 alpha $'a\0341'
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'a\0341\tok' ] || fail 'length-framed key collision changed edge'
+review_check 1 alpha
+[[ "$OVERRIDE_REQUIRES_DETAIL" == *'missing-first (required by a)'* ]] \
+  && pass 'first manifest edge diagnostic remains stable' || fail 'edge diagnostic reordered'
+# (13) Processor absence/failure/empty success cannot clear stale proof.
+# Function shadowing is local to a subshell and does not change the host PATH.
+for processor_mode in absent failed empty; do
+  if (
+    initial_fail=$FAIL
+    override_requires_load "$review_manifest" '' || exit 91
+    OVERRIDE_REQUIRES_ACTIVE_EDGES=stale
+    case "$processor_mode" in
+      absent) command() { if [ "$*" = '-v awk' ]; then return 1; fi; builtin command "$@"; } ;;
+      failed) awk() { return 1; } ;;
+      empty) awk() { return 0; } ;;
+    esac
+    review_check 2 alpha
+    [ "$FAIL" -eq "$initial_fail" ]
+  ); then pass "processor $processor_mode fails closed without stale edges";
+  else fail "processor $processor_mode accepted unavailable proof"; fi
+done
+# (14) A bounded graph with a final contradiction cannot truncate to success.
+{
+  printf 'consumers: [{name: alpha}]\npaths:\n'
+  for ((review_i=0; review_i<300; review_i++)); do
+    printf '  - {path: node%s, type: canonical, consumers: all, requires: [node%s]}\n' "$review_i" "$((review_i+1))"
+  done
+} >"$review_manifest"
+override_requires_load "$review_manifest" '' || fail 'bounded graph fixture rejected'
+review_check 1 alpha
+[[ "$OVERRIDE_REQUIRES_DETAIL" == *'node300 (required by node299)'* ]] \
+  && pass 'indexed graph retains late contradiction' || fail 'bounded graph truncated or reordered'
 
 # ---------------------------------------------------------------------------
 # Summary

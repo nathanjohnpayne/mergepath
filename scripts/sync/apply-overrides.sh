@@ -154,6 +154,9 @@ override_requires_load() {
   OVERRIDE_REQUIRES_DETAIL="could not read requires metadata"
   OVERRIDE_REQUIRES_CONSUMERS="" OVERRIDE_REQUIRES_ENTRIES=""
   OVERRIDE_REQUIRES_EDGES="" OVERRIDE_REQUIRES_SKIPS=""
+  # Buffered cross-file output read by requires_closure_gate.
+  # shellcheck disable=SC2034
+  OVERRIDE_REQUIRES_ACTIVE_EDGES=""
   command -v yq >/dev/null 2>&1 || return 2
   # Validate containers before traversing members, then scalar types before
   # string operations. TSV has no escaping ambiguity: reject control bytes
@@ -170,7 +173,7 @@ override_requires_load() {
     (.paths[].type | select(. != "canonical" and . != "kit" and . != "templated")),
     (.paths[].consumers | select(tag != "!!seq" and . != "all")),
     (.paths[] | select(has("requires")) | .requires | select(tag != "!!seq")),
-    (.paths[] | select(.type == "templated") | .dest | select(tag != "!!str"))
+    (.paths[] | select(.type == "templated" and has("dest")) | .dest | select(tag != "!!str"))
   ] | length == 0' "$manifest" >/dev/null 2>&1 || return 2
   yq -e '[
     (.paths[].consumers | select(tag == "!!seq") | .[] | select(tag != "!!str")),
@@ -178,7 +181,7 @@ override_requires_load() {
   ] | length == 0' "$manifest" >/dev/null 2>&1 || return 2
   yq -e '[
     ((.consumers[].name, .paths[].path,
-      (.paths[] | select(.type == "templated") | .dest),
+      (.paths[] | select(.type == "templated") | (.dest // .path)),
       (.paths[] | (.requires // [])[])) | select(test("^[^\x00\t\r\n]+$") == false)),
     ((.consumers[].name, (.paths[].consumers | select(tag == "!!seq") | .[]))
       | select(test("^[^,\x00\t\r\n]+$") == false))
@@ -192,8 +195,8 @@ override_requires_load() {
     (($entry.dest | select($entry.type == "templated")) // $entry.path)' "$manifest" 2>/dev/null) || return 2
   OVERRIDE_REQUIRES_EDGES=$(yq -r '.paths[] | .path as $p | (.requires // [])[] | $p + "\t" + .' "$manifest" 2>/dev/null) || return 2
   # Unknown consumer scopes cannot stand in for declared applicability.
-  local path type scopes dest scope known name
-  while IFS=$'\t' read -r path type scopes dest; do
+  local path _type scopes _dest scope known name
+  while IFS=$'\t' read -r path _type scopes _dest; do
     [ -n "$path" ] || continue
     [ "$scopes" != all ] || continue
     local -a scope_names=()
@@ -221,51 +224,121 @@ override_requires_load() {
   return 0
 }
 
+# On success ACTIVE_EDGES is the ordered, selected direct-edge list used by
+# the artifact gate too. Never publish a partial list on contradiction/error.
 override_requires_check() {
   local consumer=$1 selected=${2-} filtered=0
   [ "$#" -lt 2 ] || filtered=1
+  # Buffered cross-file output read by requires_closure_gate.
+  # shellcheck disable=SC2034
+  OVERRIDE_REQUIRES_ACTIVE_EDGES=""
   OVERRIDE_REQUIRES_DETAIL="unknown consumer: $consumer"
   local name known=0
   while IFS= read -r name; do
     if [ "$name" = "$consumer" ]; then known=1; break; fi
   done <<< "$OVERRIDE_REQUIRES_CONSUMERS"
   [ "$known" -eq 1 ] || return 2
-  local path type scopes dest target skip edge required
-  local carrier carrier_type carrier_scopes carrier_dest covered
-  while IFS=$'\t' read -r path type scopes dest; do
-    [ -n "$path" ] || continue
-    case ",$scopes," in *,all,*|*",$consumer,"*) ;; *) continue ;; esac
-    if [ "$filtered" -eq 1 ]; then
-      known=0
-      while IFS= read -r target; do
-        if [ "$target" = "$path" ]; then known=1; break; fi
-      done <<< "$selected"
-      [ "$known" -eq 1 ] || continue
-    fi
-    target=$path
-    [ "$type" != templated ] || target=$dest
-    case $'\n'"$OVERRIDE_REQUIRES_SKIPS"$'\n' in *$'\n'"$target"$'\n'*) continue ;; esac
-    while IFS=$'\t' read -r edge required; do
-      [ "$edge" = "$path" ] || continue
-      covered=0
-      while IFS=$'\t' read -r carrier carrier_type carrier_scopes carrier_dest; do
-        [ -n "$carrier" ] || continue
-        if [ "$carrier" != "$required" ]; then
-          [ "$carrier_type" = kit ] && [[ "$required" == "${carrier%/}/"* ]] || continue
-        fi
-        case ",$carrier_scopes," in *,all,*|*",$consumer,"*) ;; *) continue ;; esac
-        skip=$carrier
-        [ "$carrier_type" != templated ] || skip=$carrier_dest
-        case $'\n'"$OVERRIDE_REQUIRES_SKIPS"$'\n' in *$'\n'"$skip"$'\n'*) continue ;; esac
-        covered=1
-        break
-      done <<< "$OVERRIDE_REQUIRES_ENTRIES"
-      if [ "$covered" -eq 0 ]; then
-        OVERRIDE_REQUIRES_DETAIL="$consumer: $required (required by $path) has no applicable unskipped manifest carrier; remove the required-path skip or also skip the requiring entry"
-        return 1
-      fi
+  OVERRIDE_REQUIRES_DETAIL="could not process requires metadata"
+  command -v awk >/dev/null 2>&1 || return 2
+  local row result rc
+  # Typed stdin preserves literal backslashes (awk -v would reinterpret them).
+  # Validated metadata has no tabs/newlines; selected targets are opaque whole
+  # records, so an arbitrary tab-containing selector cannot select its prefix.
+  if result=$({
+    printf 'C\t%s\nF\t%s\n' "$consumer" "$filtered"
+    while IFS= read -r row; do
+      if [ -n "$row" ]; then printf 'P\t%s\n' "$row"; fi
+    done <<< "$OVERRIDE_REQUIRES_ENTRIES"
+    while IFS= read -r row; do
+      if [ -n "$row" ]; then printf 'E\t%s\n' "$row"; fi
     done <<< "$OVERRIDE_REQUIRES_EDGES"
-  done <<< "$OVERRIDE_REQUIRES_ENTRIES"
-  OVERRIDE_REQUIRES_DETAIL=""
-  return 0
+    while IFS= read -r row; do
+      if [ -n "$row" ]; then printf 'S\t%s\n' "$row"; fi
+    done <<< "$OVERRIDE_REQUIRES_SKIPS"
+    while IFS= read -r row; do
+      if [ -n "$row" ]; then printf 'T\t%s\n' "$row"; fi
+    done <<< "$selected"
+  } | LC_ALL=C awk '
+    # Length framing, not SUBSEP: validated literal paths can contain SUBSEP.
+    function key(a) { return length(a) ":" a }
+    function pair(a, b) { return key(a) key(b) }
+    function applies(scope) {
+      return index("," scope ",", ",all,") || index("," scope ",", "," consumer ",")
+    }
+    function covered(path, delivery,    i, prefix) {
+      if (delivery ? delivered[key(path)] : logical[key(path)]) return 1
+      # Literal component prefixes implement ${carrier%/}/ without regex or
+      # path normalization, including already-terminated kit spellings.
+      for (i = 1; i <= length(path); i++) {
+        if (substr(path, i, 1) != "/") continue
+        prefix = substr(path, 1, i)
+        if (delivery ? selected_kits[key(prefix)] : kits[key(prefix)]) return 1
+      }
+      return 0
+    }
+    {
+      kind = substr($0, 1, 1)
+      value = substr($0, 3)
+      if (substr($0, 2, 1) != "\t") { invalid = 1; next }
+      if (kind == "C") consumer = value
+      else if (kind == "F") filtered = value + 0
+      else if (kind == "P") {
+        if (split(value, cell, "\t") != 4) { invalid = 1; next }
+        n++; paths[n] = cell[1]; types[n] = cell[2]
+        scopes[n] = cell[3]; targets[n] = cell[4]
+      } else if (kind == "E") {
+        if (split(value, cell, "\t") != 2) { invalid = 1; next }
+        count[key(cell[1])]++
+        edges[pair(cell[1], count[key(cell[1])])] = cell[2]
+      } else if (kind == "S") skipped[key(value)] = 1
+      else if (kind == "T") selected[key(value)] = 1
+      else invalid = 1
+    }
+    END {
+      if (invalid) exit 2
+      for (i = 1; i <= n; i++) {
+        if (!applies(scopes[i]) || skipped[key(targets[i])]) continue
+        logical[key(paths[i])] = 1
+        if (types[i] == "kit") {
+          prefix = paths[i]
+          if (substr(prefix, length(prefix), 1) != "/") prefix = prefix "/"
+          kits[key(prefix)] = 1
+        }
+        if (!filtered || selected[key(paths[i])]) {
+          delivered[key(targets[i])] = 1
+          if (types[i] == "kit") selected_kits[key(prefix)] = 1
+        }
+      }
+      for (i = 1; i <= n; i++) {
+        if (!applies(scopes[i]) || !covered(targets[i], 1)) continue
+        for (j = 1; j <= count[key(paths[i])]; j++) {
+          required = edges[pair(paths[i], j)]
+          if (!covered(required, 0)) {
+            print "D\t" consumer ": " required " (required by " paths[i] ") has no applicable unskipped manifest carrier; remove the required-path skip or also skip the requiring entry"
+            exit 1
+          }
+          output[++out_count] = paths[i] "\t" required
+        }
+      }
+      print "OK"
+      for (i = 1; i <= out_count; i++) print output[i]
+    }
+  '); then
+    # Successful buffered cross-file output; the artifact gate reads it.
+    # shellcheck disable=SC2034
+    case "$result" in
+      OK) OVERRIDE_REQUIRES_ACTIVE_EDGES="" ;;
+      OK$'\n'*) OVERRIDE_REQUIRES_ACTIVE_EDGES=${result#*$'\n'} ;;
+      *) return 2 ;;
+    esac
+    OVERRIDE_REQUIRES_DETAIL=""
+    return 0
+  else
+    rc=$?
+    if [ "$rc" -eq 1 ] && [[ "$result" == D$'\t'* ]]; then
+      OVERRIDE_REQUIRES_DETAIL=${result#*$'\t'}
+      return 1
+    fi
+    return 2
+  fi
 }
