@@ -235,6 +235,17 @@ disposition_result 0 $'p2\np3\nnitpick\n' $'disposition: no-block/discretionary'
   resolve_tiers_by_disposition $'discretionary' "$CFG_NO_BLOCK"
 disposition_result 0 $'' $'disposition: no-block/ignore' \
   resolve_tiers_by_disposition $'ignore' "$CFG_NO_BLOCK"
+
+# A transport/read error is not evidence that the block is absent. Inject
+# grep's documented error status without relying on host file permissions.
+disposition_read_error() (
+  grep() { return 2; }
+  resolve_tiers_by_disposition "$@"
+)
+for disposition in required discretionary ignore; do
+  disposition_result 2 '' "disposition: unreadable policy/$disposition" \
+    disposition_read_error "$disposition" "$CFG_BYPRI"
+done
 disposition_result 0 $'' $'disposition: empty-block/required' \
   resolve_tiers_by_disposition $'required' "$DISP_CFG_5"
 disposition_result 0 $'p0\np1\np2\np3\nnitpick\n' $'disposition: empty-block/discretionary' \
