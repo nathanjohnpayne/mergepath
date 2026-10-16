@@ -96,6 +96,12 @@ if [ "${1:-}" = auth ] && [ "${2:-}" = token ]; then
   esac
   exit 0
 fi
+# `gh api --help`: STUB_NO_SLURP models a gh older than 2.48.
+if [ "${1:-}" = api ] && [ "${2:-}" = --help ]; then
+  echo "  --paginate   Make additional HTTP requests to fetch all pages of results"
+  [ -n "${STUB_NO_SLURP:-}" ] || echo "  --slurp      Use with \"--paginate\" to return an array of all pages"
+  exit 0
+fi
 if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
   [ -n "$login" ] || exit 4
   echo "$login"
@@ -149,8 +155,8 @@ case "$method $endpoint" in
       --arg body "${STUB_PR_BODY:-old body}" --arg base "${STUB_PR_BASE:-main}" \
       --arg labels "${STUB_PR_LABELS:-}" --arg reviewers "${STUB_PR_REVIEWERS:-}" --arg assignees "${STUB_PR_ASSIGNEES:-}" \
       --arg state "${STUB_PR_STATE:-open}" --arg href "${STUB_PR_HEAD_REF:-feature}" --arg hrepo "${STUB_PR_HEAD_REPO:-$REPO}" \
-      --arg author "${STUB_PR_AUTHOR:-$write_login}" '
-      {number: ($num | tonumber), html_url: $url, state: $state, title: $title, body: $body,
+      --arg author "${STUB_PR_AUTHOR:-$write_login}" --arg merged "${STUB_PR_MERGED:-false}" '
+      {number: ($num | tonumber), html_url: $url, state: $state, merged: ($merged == "true"), title: $title, body: $body,
        user: {login: $author}, base: {ref: $base}, head: {ref: $href, repo: {full_name: $hrepo}},
        labels: ($labels | split(",") | map(select(length > 0)) | map({name: .})),
        requested_reviewers: ($reviewers | split(",") | map(select(length > 0)) | map({login: .})),
@@ -930,12 +936,22 @@ else
 fi
 new_case
 set +e
-err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r --comment bye --delete-branch 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already closed' && log_lacks 'PATCH'; then
-  pass "pr close on a closed PR: refused, nothing written"
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'already closed; nothing was written (no comment was posted and no branch was deleted' \
+   && log_lacks 'PATCH' && log_lacks 'issues/42/comments' && log_lacks 'git/refs' && log_lacks 'events?per_page'; then
+  pass "pr close on an already-closed PR: succeeds as gh does, writing nothing (no comment, no branch delete) (#2207)"
 else
-  fail "pr close already closed: rc=$rc err=$err"
+  fail "pr close already closed: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed STUB_PR_MERGED=true as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already merged; nothing was written' && log_lacks 'PATCH'; then
+  pass "pr close on a merged PR: still refused (1), nothing written (#2207)"
+else
+  fail "pr close merged: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
 new_case
@@ -970,6 +986,55 @@ if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 
   pass "pr close readback: a closed event by another login exits 5"
 else
   fail "pr close actor mutation: rc=$rc err=$err"
+fi
+
+# --- gh without `gh api --slurp` (#2233) -----------------------------------
+# The event reads need gh 2.48 or later. A write whose attribution reads
+# events is refused before anything is written, naming the requirement; a
+# write that reads no events still runs.
+slurp_refused() { # <label> <args...>
+  local label="$1" rc=0 err
+  shift
+  new_case
+  set +e
+  err="$(MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_author -- "$@" 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'install gh 2.48 or later. Nothing was written.' \
+     && log_lacks $'POST\t' && log_lacks $'PATCH\t' && log_lacks $'DELETE\t' && log_lacks 'events?per_page'; then
+    pass "no --slurp: $label is refused before any write"
+  else
+    fail "no --slurp, $label: rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+}
+slurp_refused "an edit" gh pr edit 42 --repo o/r --add-label x
+slurp_refused "a close" gh pr close 42 --repo o/r --comment bye
+slurp_refused "a create with a label" gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls' && log_lacks $'api\t--help'; then
+  pass "no --slurp: a create with no follow-ups reads no events, so it runs without the probe"
+else
+  fail "no --slurp, plain create: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_reviewer -- gh pr comment 1 --repo o/r --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "no --slurp: a comment, attributed from its POST response, still runs"
+else
+  fail "no --slurp, comment: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --add-label x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(grep -c $'api\t--help' "$LOGF")" -eq 1 ]; then
+  pass "with --slurp: the probe runs once per command, however many event reads follow"
+else
+  fail "probe count: rc=$rc count=$(grep -c $'api\t--help' "$LOGF")"; cat "$LOGF" >&2
 fi
 
 # --- partial failures and case ---------------------------------------------

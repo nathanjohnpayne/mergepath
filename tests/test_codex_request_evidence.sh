@@ -62,6 +62,37 @@ EYES='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"eyes","create
 RUNNING='{"id":456,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `abcdef0` | Manual |"}'
 REVIEW='[{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED"}]'
 PASS=0
+# #1635: each empty input must fail without partial anchor output.
+threshold_committed=2026-09-14T00:00:00Z
+threshold_now=1789345200
+for threshold_empty in committed seconds epoch; do
+  threshold_date="$threshold_committed"; threshold_seconds=1800; threshold_epoch="$threshold_now"
+  case "$threshold_empty" in
+    committed) threshold_date='' ;;
+    seconds) threshold_seconds='' ;;
+    epoch) threshold_epoch='' ;;
+  esac
+  threshold_rc=0
+  crqe_request_threshold "$threshold_date" '[]' "$threshold_seconds" "$threshold_epoch" \
+    >"$DIR/threshold.out" 2>"$DIR/threshold.err" || threshold_rc=$?
+  if [ "$threshold_rc" = 1 ] && [ ! -s "$DIR/threshold.out" ]; then
+    PASS=$((PASS + 1)); echo "PASS: empty threshold $threshold_empty fails with no output"
+  else
+    echo "FAIL: empty threshold $threshold_empty returned rc=$threshold_rc or output" >&2
+    exit 1
+  fi
+done
+# Fixed valid inputs retain the complete byte-level anchor record.
+threshold_out=$(crqe_request_threshold "$threshold_committed" '[]' 1800 "$threshold_now") \
+  || { echo 'FAIL: valid threshold input was rejected' >&2; exit 1; }
+threshold_expected='{"head_pushed_at":"2026-09-14T00:00:00Z","anchor_source":"HEAD committer date","reaction_floor":"2026-09-13T23:50:00Z","reaction_threshold":"2026-09-14T00:00:00Z","reaction_threshold_source":"HEAD pushed-at anchor (HEAD committer date)"}'
+if [ "$threshold_out" = "$threshold_expected" ]; then
+  PASS=$((PASS + 1)); echo 'PASS: valid threshold anchor output is unchanged'
+else
+  echo "FAIL: valid threshold anchor output: $threshold_out" >&2
+  exit 1
+fi
+
 while IFS='|' read -r name comments ack reviews mode opted expected pattern reads; do
   case "$comments" in
     trigger) comments="[$TRIGGER]" ;;

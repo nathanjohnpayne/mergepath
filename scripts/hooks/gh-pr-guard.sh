@@ -1448,7 +1448,7 @@ guard_review_pr_json_rest() { # <selector> <repo>
     rm -f "$err"
     return 1
   fi
-  # --slurp needs gh 2.41 or later, as the merge path's review read does.
+  # --slurp needs gh 2.48 or later (cli/cli#8620), as the merge path's review read does.
   if ! pages=$(guard_review_gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>"$err") \
      || ! printf '%s' "$pages" | jq -e 'type == "array" and all(.[]; type == "array")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read the files of $repo#$sel over REST for the self-approve check." >&2

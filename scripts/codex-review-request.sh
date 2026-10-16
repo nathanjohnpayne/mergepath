@@ -1887,7 +1887,7 @@ run_feedback_accounting_gate() {
           "$(printf '%s' "$__cra_policy_json" | jq -r '.available_reviewers[]? // empty' 2>/dev/null || true)" \
           | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -v '^$' || true)
         if [ -n "$__cra_relax" ] && [ -n "$__cra_gating" ] \
-           && printf '%s\n' "$__cra_relax" | grep -qxF "$__cra_gating"; then
+           && printf '%s\n' "$__cra_relax" | grep -xF "$__cra_gating" >/dev/null; then
           log "review feedback accounting: the governing base policy gives a skippable provider the same login as Codex, the author identity, or a registered reviewer; no provider is skippable (#1100)"
           __cra_relax=""
         fi

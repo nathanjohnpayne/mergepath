@@ -74,8 +74,9 @@ function collect(root) {
 
 // The existing contract removes HTML comments before checking marker syntax.
 // Here the mdast html-node positions identify only real comments: a comment
-// spelling inside fenced or inline code never appears as html and cannot alter
-// the marker text.
+// spelling inside fenced, indented or inline code never appears as html and
+// cannot alter marker text. A flow comment's first zero to three spaces can
+// be retained in both its node value and raw source-position span.
 function visibleLinesAfterComments(body, lines, entries) {
   const characters = body.split('');
   const discardLines = new Set();
@@ -85,10 +86,10 @@ function visibleLinesAfterComments(body, lines, entries) {
   const bomOffset = body.charCodeAt(0) === 0xFEFF ? 1 : 0;
   for (const { node } of entries) {
     const position = node.type === 'html' ? node.position : null;
-    if (!position || !node.value?.startsWith('<!--')) continue;
+    if (!position || !/^ {0,3}<!--/.test(node.value ?? '')) continue;
     const startOffset = position.start.offset + bomOffset;
     const endOffset = position.end.offset + bomOffset;
-    if (body.slice(startOffset, startOffset + 4) !== '<!--') continue;
+    if (!/^ {0,3}<!--/.test(body.slice(startOffset, Math.min(startOffset + 7, endOffset)))) continue;
     for (let offset = startOffset; offset < endOffset; offset += 1) {
       if (characters[offset] !== '\n' && characters[offset] !== '\r') characters[offset] = '';
     }
