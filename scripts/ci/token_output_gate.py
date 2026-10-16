@@ -303,7 +303,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Existing pipe-separated alternation misses remain inherited (#2234); no
     extglob grammar or fragment reconstruction is added.
     Four inherited assignment-tilde misses are version-qualified: Linux
-    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
+    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 and 5.3.15 builds had
+    no recognized sample for these cases. The owner
     preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
     Irreducible eval operands retain independent
     scanning of known literal fragments. Trap actions and callback operands
@@ -15536,6 +15537,10 @@ EVAL_ASSIGNMENT_TILDE_MISSES = frozenset(('eval-assignment-tilde-inherited-tilde
 EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
     "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)"
 )
+EVAL_ASSIGNMENT_TILDE_QUIET_ORACLES = frozenset((
+    EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE,
+    "GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)",
+))
 CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
 KNOWN_MISSES.update({cid: (
     "Inherited assignment-tilde eval miss: Linux Bash 5.2.15 leaked in the "
@@ -17399,7 +17404,18 @@ def _oracle_sample_cases():
 
 
 def self_test():
+    import hashlib
+    import json
+
     failures = []
+    # Evidence is additive to the existing outcomes; no cell is run twice.
+    tilde_evidence_seen = set()
+    try:
+        with open(__file__, "rb") as source_file:
+            tilde_source_sha256 = hashlib.sha256(source_file.read()).hexdigest()
+    except OSError as exc:
+        tilde_source_sha256 = None
+        failures.append("eval tilde evidence unavailable: source digest: %s" % exc)
     passed = 0
     tp = fn = fp = tn = 0
     rule_cells_passed = opaque_rule_cells = completed = measurement_limited = 0
@@ -17449,6 +17465,47 @@ def self_test():
             cell_name = "%s [%s]" % (cid, sample.name)
             findings, pragma_errors = scan_text(oracle_prologue(sample) + body, cid + "/fixture.sh")
             flagged = bool(findings) or bool(pragma_errors)
+
+            if cid in EVAL_ASSIGNMENT_TILDE_MISSES:
+                tilde_evidence_seen.add((cid, sample.name))
+                fixture_text = oracle_prologue(sample) + body
+                fixture_sha256 = hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+                actual_fixture_sha256 = None
+                try:
+                    with open(os.path.join(tmp, cid, sample.name, "fixture.sh"), "rb") as fixture_file:
+                        actual_fixture_sha256 = hashlib.sha256(fixture_file.read()).hexdigest()
+                except OSError as exc:
+                    failures.append("eval tilde evidence unavailable: %s: %s" % (cell_name, exc))
+                evidence_status = "complete"
+                if tilde_source_sha256 is None or actual_fixture_sha256 != fixture_sha256:
+                    evidence_status = "unavailable"
+                    failures.append("eval tilde evidence unavailable: source/fixture binding: " + cell_name)
+                stdout_bytes, stderr_bytes = out.encode("utf-8"), err.encode("utf-8")
+                stream_excess = max(len(stdout_bytes), len(stderr_bytes)) > 16384
+                if stream_excess:
+                    evidence_status = "stream-excess"
+                    failures.append("eval tilde evidence unavailable: stream exceeds 16384 bytes: " + cell_name)
+                print("check_no_token_in_output: eval-tilde-evidence " + json.dumps({
+                    "cid": cid, "sample": sample._asdict(), "body": body,
+                    "sample_sha256": hashlib.sha256(json.dumps(sample._asdict(), sort_keys=True).encode("utf-8")).hexdigest(),
+                    "stream_representation": "existing run_oracle UTF-8 decoded text (replace)",
+                    "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "fixture": cid + "/" + sample.name + "/fixture.sh",
+                    "fixture_sha256": fixture_sha256,
+                    "actual_fixture_sha256": actual_fixture_sha256,
+                    "source_sha256": tilde_source_sha256, "bash_version": bash_text,
+                    "oracle_status": "unavailable" if leaked is None else "completed",
+                    "process_returncode": None,
+                    "process_returncode_note": "not exposed by the existing run_oracle API",
+                    "evidence_status": evidence_status,
+                    "leaked": leaked, "flagged": flagged,
+                    "stdout": None if stream_excess else out,
+                    "stderr": None if stream_excess else err,
+                    "streams_omitted": stream_excess, "stream_byte_limit": 16384,
+                    "stdout_bytes": len(stdout_bytes), "stderr_bytes": len(stderr_bytes),
+                    "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+                    "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+                }, sort_keys=True))
 
             if disposition not in (MUST_FLAG, MUST_NOT_FLAG):
                 opaque_rule_cells += 1
@@ -17522,9 +17579,9 @@ def self_test():
                 counts["tn"] += 1
 
             # The same four bodies were measured quiet for all three samples
-            # on this exact build; this does not generalize to all Bash 5.3.
+            # on these exact builds; this does not generalize to all Bash 5.3.
             if (cid in EVAL_ASSIGNMENT_TILDE_MISSES
-                    and bash_text == EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE
+                    and bash_text in EVAL_ASSIGNMENT_TILDE_QUIET_ORACLES
                     and not leaked and not flagged):
                 quiet_eval_tilde_samples.add((cid, sample.name))
             minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
@@ -17544,6 +17601,11 @@ def self_test():
                     % (cell_name, leaked, flagged)
                 )
 
+        expected_tilde_evidence = {(cid, sample.name)
+                                   for cid in EVAL_ASSIGNMENT_TILDE_MISSES
+                                   for sample in ORACLE_SAMPLES}
+        if tilde_evidence_seen != expected_tilde_evidence:
+            failures.append("eval tilde evidence unavailable: missing/extra diagnostic cells")
         if seen_limits != set(ORACLE_MEASUREMENT_LIMITS):
             failures.append("oracle samples: a declared measurement-limit cell was not observed")
         failures.extend(_oracle_stdin_cases(tmp))
@@ -17615,7 +17677,7 @@ def self_test():
                             and _bash_ver < minimum_bash)
         label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
         if any(case_id == cid for case_id, _shape in quiet_eval_tilde_samples):
-            label = "quiet observed Bash 5.3.20 sample; inherited Linux Bash 5.2 miss"
+            label = "no recognized sample on observed %s; inherited Linux Bash 5.2 miss" % bash_text
         print(
             "check_no_token_in_output:   %s: %s -- %s"
             % (label, cid + " [" + ", ".join(_oracle_declared_shapes(KNOWN_MISSES, KNOWN_MISS_SHAPES, cid)) + "]", KNOWN_MISSES[cid])
