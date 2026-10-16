@@ -21,6 +21,8 @@
 #   source scripts/lib/feedback-policy-helpers.sh
 #   feedback_policy_field <key> [cfg]      # scalar under feedback_policy:
 #   resolve_required_tiers [cfg]           # one blocking tier per line
+#   resolve_tiers_by_disposition <required|discretionary|ignore> [cfg]
+#                                         # one disposition tier per line
 #   codex_tier_of "<comment-body>"         # p0..p3 or empty
 #   codex_tiers_of "<comment-body>"        # every p0..p3 marker, in order
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
@@ -174,6 +176,63 @@ resolve_required_tiers() {
       return 2
       ;;
   esac
+}
+
+# Emit the DISPOSITION tier set, one tier per line (#1672).
+# Unlike resolve_required_tiers (the legacy gate blocking set), an absent
+# block uses agent defaults: p0/p1 required, p2/p3/nitpick discretionary.
+# Present blocks share its modes and scalar validation: address-all ignores
+# priorities; by-priority treats an unset tier as discretionary. Validate the
+# entire applicable policy before printing, so errors return 2 with no output.
+resolve_tiers_by_disposition() {
+  local disposition="${1:-}" cfg="${2:-${CONFIG:-.github/review-policy.yml}}"
+  case "$disposition" in
+    required|discretionary|ignore) ;;
+    *)
+      echo "ERROR: disposition must be required|discretionary|ignore; got '$disposition'" >&2
+      return 2
+      ;;
+  esac
+  if [ ! -f "$cfg" ] || ! grep -qE '^feedback_policy:' "$cfg"; then
+    case "$disposition" in
+      required) printf '%s\n' p0 p1 ;;
+      discretionary) printf '%s\n' p2 p3 nitpick ;;
+    esac
+    return 0
+  fi
+
+  local mode tier val selected=""
+  mode=$(feedback_policy_field mode "$cfg") || return 2
+  mode=${mode:-by-priority}
+  case "$mode" in
+    address-all)
+      if [ "$disposition" = required ]; then
+        printf '%s\n' p0 p1 p2 p3 nitpick
+      fi
+      ;;
+    by-priority)
+      for tier in p0 p1 p2 p3 nitpick; do
+        val=$(feedback_policy_field "$tier" "$cfg") || return 2
+        val=${val:-discretionary}
+        case "$val" in
+          required|discretionary|ignore) ;;
+          *)
+            echo "ERROR: feedback_policy.priorities.$tier must be required|discretionary|ignore; got '$val'" >&2
+            return 2
+            ;;
+        esac
+        if [ "$val" = "$disposition" ]; then
+          selected="${selected}${tier}"$'\n'
+        fi
+      done
+      printf '%s' "$selected"
+      ;;
+    *)
+      echo "ERROR: feedback_policy.mode must be by-priority|address-all; got '$mode'" >&2
+      return 2
+      ;;
+  esac
+  return 0
 }
 
 # Map a Codex finding body to a tier, or empty if it carries no Codex priority

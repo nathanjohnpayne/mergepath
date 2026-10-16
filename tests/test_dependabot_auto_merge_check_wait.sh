@@ -713,9 +713,28 @@ pin_case "a governing policy that opts out is honored" 1 not-exempt "opted out" 
 printf 'dependabot:\n  pin_bump_exemption:\n    enabled: "true"\n' >"$PIN_DIR/policy-quoted.yml"
 pin_case "a quoted enabled: \"true\" still enables the lane" 0 exempt "1 pin(s)" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-quoted.yml" >/dev/null
+printf 'dependabot:\n  pin_bump_exemption:\n    enabled: true\n' >"$PIN_DIR/policy-on.yml"
+pin_case "a bare enabled: true still enables the lane" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-on.yml" >/dev/null
+printf 'dependabot:\n  pin_bump_exemption:\n    enabled: "false"\n' >"$PIN_DIR/policy-quoted-off.yml"
+pin_case "a quoted enabled: \"false\" still opts out" 1 not-exempt "opted out" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-quoted-off.yml" >/dev/null
 printf 'dependabot:\n  reviewer_gate:\n    enabled: true\n' >"$PIN_DIR/policy-absent.yml"
 pin_case "an absent pin_bump_exemption block defaults to enabled" 0 exempt "1 pin(s)" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-absent.yml" >/dev/null
+printf 'dependabot:\n  pin_bump_exemption: {}\n' >"$PIN_DIR/policy-absent-enabled.yml"
+pin_case "an absent enabled key in an existing block defaults to enabled" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-absent-enabled.yml" >/dev/null
+# Explicit null is not an absent key (#2180): every YAML spelling must fail
+# closed before the provenance or diff proof can establish an exemption.
+for null_value in '' null '~'; do
+  printf 'dependabot:\n  pin_bump_exemption:\n    enabled: %s\n' "$null_value" >"$PIN_DIR/policy-null.yml"
+  pin_case "a present null enabled value '$null_value' fails closed" 3 unreadable "must be true or false" \
+    "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-null.yml" >/dev/null
+done
+printf '"dependabot": {"pin_bump_exemption": {"enabled": null}}\n' >"$PIN_DIR/policy-flow-null.yml"
+pin_case "a quoted-key flow-style null fails closed" 3 unreadable "must be true or false" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-flow-null.yml" >/dev/null
 printf 'dependabot:\n  pin_bump_exemption:\n    enabled: maybe\n' >"$PIN_DIR/policy-bad.yml"
 pin_case "a malformed enabled: value fails closed as unreadable" 3 unreadable "must be true or false" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-bad.yml" >/dev/null

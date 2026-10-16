@@ -153,23 +153,138 @@ assert_triggers "cmd + internal + root manifests/build files (go.mod, Gemfile, p
 assert_triggers "Sources + Plugins + Package.swift (Swift manifest) does not trigger cross-cutting-refactor (#2175)" \
   "swift-package-manifest.json" "" "0"
 
-# A changed file with no patch was previously counted as inspected even though
-# the content-based detectors saw nothing. That let an incomplete one-file diff
-# return a confident no-match and suppress review. The classifier must report
-# the payload as unassessed via its documented exit-2 path.
-set +e
-patchless_err=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
-  bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/patchless.json" 2>&1 >/dev/null)
-patchless_rc=$?
-set -e
-if [ "$patchless_rc" = "2" ] && echo "$patchless_err" | grep -q "patch unavailable for"; then
-  pass=$((pass + 1))
-  echo "  PASS: a patchless changed-file entry is unassessed (exit 2)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: patchless changed-file entry should exit 2 as unassessed (rc=$patchless_rc)" >&2
-  echo "$patchless_err" | sed 's/^/      /' >&2
-fi
+# #2295: valid unavailable content requires more review; malformed metadata
+# still stops. Exercise the fixture and actual API-reading branches with the
+# same payload, including the case where a later page lacks its patch.
+PATCH_PROBE="$SCRATCH_TRIGGERS/patch-probe"
+mkdir -p "$PATCH_PROBE/bin" "$PATCH_PROBE/empty-cache"
+cat > "$PATCH_PROBE/bin/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *"/pulls/99999/files "*|*"/pulls/99999/files")
+    [ "${CLASSIFIER_PROBE_FAILURE:-}" != files ] || exit 1
+    if [ "${CLASSIFIER_PROBE_PAGES:-}" = split ]; then
+      case " $* " in
+        *" --paginate "*) jq -c '.files[0:1], .files[1:]' "$CLASSIFIER_PROBE_INPUT" ;;
+        *) jq '.files[0:1]' "$CLASSIFIER_PROBE_INPUT" ;;
+      esac
+    else
+      jq '.files' "$CLASSIFIER_PROBE_INPUT"
+    fi
+    ;;
+  *"/pulls/99999 "*|*"/pulls/99999")
+    [ "${CLASSIFIER_PROBE_FAILURE:-}" != body ] || exit 1
+    jq -r '.body // ""' "$CLASSIFIER_PROBE_INPUT"
+    ;;
+  *) exit 1 ;;
+esac
+GH_STUB
+chmod +x "$PATCH_PROBE/bin/gh"
+
+for probe in absent null empty later-page newline-name number boolean array object bad-entry missing-name empty-name numeric-name; do
+  expected_rc=1
+  expected_paths='["src/plain.ts"]'
+  pages=single
+  case "$probe" in
+    absent) filter='.' ;;
+    null) filter='.files[0].patch = null' ;;
+    empty) filter='.files[0].patch = ""' ;;
+    later-page)
+      filter='.files = [{filename:"README.md",patch:"+docs"}] + .files'
+      pages='split' ;;
+    newline-name) filter='.files[0].filename = "\n"'; expected_paths='["\n"]' ;;
+    number) filter='.files[0].patch = 7'; expected_rc=2 ;;
+    boolean) filter='.files[0].patch = false'; expected_rc=2 ;;
+    array) filter='.files[0].patch = []'; expected_rc=2 ;;
+    object) filter='.files[0].patch = {}'; expected_rc=2 ;;
+    bad-entry) filter='.files = ["not a file object"]'; expected_rc=2 ;;
+    missing-name) filter='del(.files[0].filename)'; expected_rc=2 ;;
+    empty-name) filter='.files[0].filename = ""'; expected_rc=2 ;;
+    numeric-name) filter='.files[0].filename = 7'; expected_rc=2 ;;
+  esac
+  jq "$filter" "$FIXTURES_DIR/patchless.json" > "$PATCH_PROBE/input.json"
+  set +e
+  fixture_out=$(OP_PREFLIGHT_CACHE_DIR="$PATCH_PROBE/empty-cache" \
+    MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
+    bash "$ROOT/$CLASSIFIER" 99999 --fixture "$PATCH_PROBE/input.json" 2>"$PATCH_PROBE/fixture.err")
+  fixture_rc=$?
+  live_out=$(PATH="$PATCH_PROBE/bin:$PATH" GH_TOKEN=fixture-token \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-token OP_PREFLIGHT_CACHE_DIR="$PATCH_PROBE/empty-cache" \
+    CLASSIFIER_PROBE_INPUT="$PATCH_PROBE/input.json" CLASSIFIER_PROBE_PAGES="$pages" \
+    MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
+    bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>"$PATCH_PROBE/live.err")
+  live_rc=$?
+  set -e
+  truthful=0
+  if [ "$expected_rc" = 1 ]; then
+    if echo "$fixture_out" | jq -e --arg paths "$expected_paths" '.match == true and .triggers == [] and
+      .recommendation == "invoke-4b" and .files_inspected == 0 and
+      (.rationale | contains("patch unavailable for: " + $paths))' >/dev/null 2>&1; then
+      truthful=1
+    fi
+  elif [ -z "$fixture_out" ] && grep -q 'malformed changed-file metadata' "$PATCH_PROBE/fixture.err" \
+    && grep -q 'malformed changed-file metadata' "$PATCH_PROBE/live.err"; then
+    truthful=1
+  fi
+  if [ "$fixture_rc" = "$expected_rc" ] && [ "$live_rc" = "$expected_rc" ] \
+    && [ "$fixture_out" = "$live_out" ] && [ "$truthful" = 1 ]; then
+    pass=$((pass + 1))
+    echo "  PASS: $probe patch metadata has truthful fixture/live routing (exit $expected_rc)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: $probe patch metadata (fixture=$fixture_rc, live=$live_rc, expected=$expected_rc, truthful=$truthful)" >&2
+  fi
+done
+
+# Missing content must not hide a failed API or PR-body read.
+for failed_read in files body; do
+  set +e
+  out=$(PATH="$PATCH_PROBE/bin:$PATH" GH_TOKEN=fixture-token \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-token OP_PREFLIGHT_CACHE_DIR="$PATCH_PROBE/empty-cache" \
+    CLASSIFIER_PROBE_INPUT="$ROOT/$FIXTURES_DIR/patchless.json" CLASSIFIER_PROBE_FAILURE="$failed_read" \
+    MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
+    bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>"$PATCH_PROBE/read.err")
+  rc=$?
+  set -e
+  if [ "$rc" = 2 ] && [ -z "$out" ] && grep -q 'failed to fetch PR' "$PATCH_PROBE/read.err"; then
+    pass=$((pass + 1))
+    echo "  PASS: patch unavailable plus $failed_read read failure still stops (exit 2)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: patch unavailable plus $failed_read read failure (rc=$rc)" >&2
+  fi
+done
+
+# Unavailable content does not override either explicit policy short-circuit;
+# detect-only still bypasses both and selects the conservative content route.
+for mode in fallback-only always; do
+  echo "phase_4b_default: $mode" > "$PATCH_PROBE/policy.yml"
+  for detect in no yes; do
+    extra=()
+    expected_rc=1
+    expected_rec=invoke-4b
+    if [ "$detect" = yes ]; then
+      extra=(--detect-only)
+    elif [ "$mode" = fallback-only ]; then
+      expected_rc=0
+      expected_rec=fallback-only
+    fi
+    set +e
+    out=$(OP_PREFLIGHT_CACHE_DIR="$PATCH_PROBE/empty-cache" \
+      MERGEPATH_REVIEW_POLICY_PATH="$PATCH_PROBE/policy.yml" \
+      bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/patchless.json" ${extra[@]+"${extra[@]}"} 2>/dev/null)
+    rc=$?
+    set -e
+    if [ "$rc" = "$expected_rc" ] && echo "$out" | jq -e --arg rec "$expected_rec" \
+      '.recommendation == $rec and .files_inspected == 0' >/dev/null 2>&1; then
+      pass=$((pass + 1))
+      echo "  PASS: unavailable content preserves $mode policy with detect-only=$detect"
+    else
+      fail=$((fail + 1))
+      echo "  FAIL: unavailable content under $mode policy with detect-only=$detect (rc=$rc)" >&2
+    fi
+  done
+done
 
 echo
 echo "phase-4b-classifier.sh policy short-circuit tests"

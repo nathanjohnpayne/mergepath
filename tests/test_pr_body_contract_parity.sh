@@ -1519,6 +1519,66 @@ else
   bad "#1281: agent-review.yml no longer degrades to the default reviewer on parser failure"
 fi
 
+# --- #1612 private comment-stripping consistency ---------------------------
+# CLI membership already excludes these hidden lines, so CLI parity alone
+# cannot prove stripping. Exercise the actual private helper without adding
+# an export or running the module's stdin-reading CLI initialization.
+if node --input-type=module - "$ROOT" <<'JS'
+import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import vm from 'node:vm';
+const root = process.argv[2];
+// Positions/value shapes were characterized with the pinned mdast parser:
+// 0..3 spaces remain in the HTML value/span; four spaces are a code node.
+const fixtures = Array.from({ length: 5 }, (_, indent) => {
+  const first = `${' '.repeat(indent)}<!-- hidden -->`;
+  return {
+    name: `indent${indent}`, body: `${first}\nafter\n`,
+    node: { type: indent < 4 ? 'html' : 'code',
+      value: indent < 4 ? first : '<!-- hidden -->',
+      position: { start: { line: 1, column: 1, offset: 0 },
+        end: { line: 1, column: first.length + 1, offset: first.length } } },
+    expected: [indent < 4 ? null : first, 'after', ''],
+  };
+});
+fixtures.push(
+  { name: 'inline-code', body: '`<!-- hidden -->`\nafter\n',
+    node: { type: 'inlineCode', value: '<!-- hidden -->',
+      position: { start: { line: 1, column: 1, offset: 0 },
+        end: { line: 1, column: 18, offset: 17 } } },
+    expected: ['`<!-- hidden -->`', 'after', ''] },
+  { name: 'fenced-code', body: '```\n<!-- hidden -->\n```\nafter\n',
+    node: { type: 'code', value: '<!-- hidden -->',
+      position: { start: { line: 1, column: 1, offset: 0 },
+        end: { line: 3, column: 4, offset: 23 } } },
+    expected: ['```', '<!-- hidden -->', '```', 'after', ''] },
+);
+const targets = ['scripts/lib/pr-body-contract.mjs'];
+const source = 'scripts/lib/pr-body-contract.source.mjs';
+if (existsSync(join(root, source))) targets.push(source);
+else assert.equal(existsSync(join(root, 'scripts/sync-to-downstream.sh')), false,
+  'hub readable parser source must exist');
+for (const target of targets) {
+  const text = readFileSync(join(root, target), 'utf8');
+  const start = text.indexOf('function visibleLinesAfterComments(');
+  const next = target === source ? '\nexport function parsePrBodyContract(' : '\nfunction parsePrBodyContract(';
+  const end = text.indexOf(next, start);
+  assert.ok(start >= 0 && end > start, `${target}: private helper boundary missing`);
+  const strip = vm.runInNewContext(text.slice(start, end) + '\nvisibleLinesAfterComments', {}, { timeout: 2000 });
+  for (const fixture of fixtures) {
+    const lines = fixture.body.split(/\r\n|\r|\n/);
+    const actual = strip(fixture.body, lines, [{ node: fixture.node }]);
+    assert.equal(JSON.stringify(actual), JSON.stringify(fixture.expected), `${target}: ${fixture.name}`);
+  }
+}
+JS
+then
+  ok "#1612: real indented flow comments are stripped; code-looking comments remain literal"
+else
+  bad "#1612: private comment stripping or literal-code preservation changed"
+fi
+
 # --- 19. generated-runtime lint regression is hub-only (#1307) --------------
 # Consumers receive the runtime, never the generator inputs or its test-only
 # dependencies. The hub marker therefore gates the real rebuild --check; a

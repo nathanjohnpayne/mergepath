@@ -96,6 +96,32 @@ if [ "${1:-}" = --rate-limit-only ]; then
   SUBSTITUTE=true
   CX_ENABLED=true CX_RC=0
   expect_case 'Codex reported, bare rate limit' 0 '.decision == "open" and .codex == "reported"'
+  # #1635: missing scalar reader changes diagnostics, never authority.
+  CX_RC=0
+  missing_reader_out=""
+  missing_reader_rc=0
+  missing_reader_out="$(unset -f gh_api_scalar; barrier_case)" || missing_reader_rc=$?
+  COUNT=$((COUNT + 1))
+  if [ "$missing_reader_rc" = 4 ] && jq -e \
+      '.decision == "error" and .codex == "escalate" and .codex_evidence == "scalar-reader-unavailable" and .request_budget.reason == "scalar-reader-unavailable"' \
+      <<<"$missing_reader_out" >/dev/null; then
+    printf 'PASS: reported Codex with missing scalar reader fails closed truthfully\n'
+  else
+    printf 'FAIL: missing scalar reader (rc=%s) %s\n' "$missing_reader_rc" "$missing_reader_out"
+    FAIL=$((FAIL + 1))
+  fi
+  # A present reader that fails keeps the existing head-read-failed result.
+  missing_reader_rc=0
+  missing_reader_out="$(gh_api_scalar() { return 1; }; barrier_case)" || missing_reader_rc=$?
+  COUNT=$((COUNT + 1))
+  if [ "$missing_reader_rc" = 4 ] && jq -e \
+      '.decision == "error" and .codex_evidence == "head-read-failed"' \
+      <<<"$missing_reader_out" >/dev/null; then
+    printf 'PASS: reported Codex unreadable head retains its diagnostic\n'
+  else
+    printf 'FAIL: unreadable head diagnostic (rc=%s) %s\n' "$missing_reader_rc" "$missing_reader_out"
+    FAIL=$((FAIL + 1))
+  fi
   CX_RC=2 BUDGET_STATE=available
   expect_case 'account-blocked Codex with available budget' 0 '.decision == "open" and .codex == "waived"'
   CX_RC=1
