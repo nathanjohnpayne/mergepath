@@ -181,7 +181,11 @@ for arg in "$@"; do
   fetch) exit 0 ;;
   rev-parse) value="${!#}"; printf '%s\n' "${value%\^\{commit\}}"; exit 0 ;;
   merge-base) prev=''; for value in "$@"; do previous="$prev"; prev="$value"; done; printf '%s\n' "$previous"; exit 0 ;;
-  diff) cat "$HB_WORK/diff"; exit 0 ;;
+  diff)
+    for option in "$@"; do
+      if [ "$option" = --name-only ]; then printf 'x.sh\0'; exit 0; fi
+    done
+    cat "$HB_WORK/diff"; exit 0 ;;
  esac
 done
 exit 99

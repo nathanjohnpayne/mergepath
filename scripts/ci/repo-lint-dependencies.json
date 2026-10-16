@@ -299,6 +299,7 @@
       "scripts/lib/gh-api-array.sh",
       "tests/test_phase_4b_automation.sh",
       "tests/test_phase_4b_heartbeat.sh",
+      "tests/test_phase_4b_escalation.cjs",
       "tests/test_coderabbit_wait_status_probe.sh",
       "tests/test_phase_4b_immutable_input.sh"
     ],
