@@ -114,15 +114,18 @@ case "${SETUP_MODE:-noop}" in
 esac
 exit 0
 SETUP
-# A PATH with only the tools the hook and its fixtures run, so whether
-# `timeout` exists is decided here, not by the host: HBIN has a pass-through
-# `timeout` that records its bound, HBIN_NT has none.
+# A PATH with only the tools the hook and its fixtures run, so timeout command
+# selection is decided here, not by the host: HBIN has `timeout`, HBIN_GT has
+# only `gtimeout`, and HBIN_NT has neither.
 HBIN="$WORKDIR/hook-bin"
+HBIN_GT="$WORKDIR/hook-bin-gtimeout"
 HBIN_NT="$WORKDIR/hook-bin-notimeout"
-mkdir -p "$HBIN" "$HBIN_NT"
+mkdir -p "$HBIN" "$HBIN_GT" "$HBIN_NT"
 for tool in bash env cat sed paste tail head dirname jq; do
   real="$(command -v "$tool" 2>/dev/null || true)"
-  case "$real" in /*) ln -sf "$real" "$HBIN/$tool"; ln -sf "$real" "$HBIN_NT/$tool" ;; esac
+  case "$real" in
+    /*) ln -sf "$real" "$HBIN/$tool"; ln -sf "$real" "$HBIN_GT/$tool"; ln -sf "$real" "$HBIN_NT/$tool" ;;
+  esac
 done
 cat >"$HBIN/timeout" <<T
 #!/usr/bin/env bash
@@ -131,14 +134,22 @@ shift
 exec "\$@"
 T
 chmod +x "$HBIN/timeout"
+cat >"$HBIN_GT/gtimeout" <<T
+#!/usr/bin/env bash
+echo "gtimeout \$1" >>"$WORKDIR/timeout.log"
+shift
+exec "\$@"
+T
+chmod +x "$HBIN_GT/gtimeout"
 : >"$WORKDIR/probe.log"
 : >"$WORKDIR/timeout.log"
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.53.6 (scripts/cloud-setup.sh).' \
    && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
    && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log" \
-   && [ "$(cat "$WORKDIR/timeout.log")" = "timeout 60" ]; then
-  pass "hook, cloud session: runs setup under a 60-second timeout before the probe and reports what it installed"
+   && [ "$(head -1 "$WORKDIR/timeout.log")" = "timeout 60" ] \
+   && [ "$(tail -1 "$WORKDIR/timeout.log")" = "timeout 90" ]; then
+  pass "hook, cloud session: bounds setup and probe before reporting what setup installed"
 else
   fail "hook setup install: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log") timeout=$(cat "$WORKDIR/timeout.log")"
 fi
@@ -151,24 +162,146 @@ for case_spec in "30:30:no" "500:60:yes" "0:60:yes" "abc:60:yes" "060:60:yes"; d
   out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" MERGEPATH_CLOUD_SETUP_TIMEOUT="$requested" PATH="$HBIN" bash "$HOOK")"; rc=$?
   noticed=no
   printf '%s' "$out" | grep -q 'MERGEPATH_CLOUD_SETUP_TIMEOUT must be a whole number of seconds from 1 to 60' && noticed=yes
-  if [ "$rc" -eq 0 ] && [ "$(cat "$WORKDIR/timeout.log")" = "timeout $expected" ] && [ "$noticed" = "$notice" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
+  if [ "$rc" -eq 0 ] && [ "$(head -1 "$WORKDIR/timeout.log")" = "timeout $expected" ] \
+     && [ "$(wc -l <"$WORKDIR/timeout.log" | tr -d ' ')" = "2" ] \
+     && [ "$noticed" = "$notice" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
     pass "hook, MERGEPATH_CLOUD_SETUP_TIMEOUT=$requested: setup bound $expected, notice $notice, the probe still runs"
   else
     fail "hook setup bound $requested: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log")"
   fi
 done
-# Without `timeout` nothing bounds setup, which could outlast the hook's own
-# 120-second limit and lose the summary: setup is skipped with a notice and
-# the probe still runs.
+# With neither timeout executable setup is skipped and the probe keeps its
+# existing unbounded fallback behavior.
 : >"$WORKDIR/probe.log"
+: >"$WORKDIR/timeout.log"
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN_NT" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand.' \
    && ! printf '%s' "$out" | grep -q 'installed yq' \
    && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
-   && ! grep -q 'setup ran' "$WORKDIR/probe.log" && grep -q '^probe ' "$WORKDIR/probe.log"; then
+   && ! grep -q 'setup ran' "$WORKDIR/probe.log" && grep -q '^probe ' "$WORKDIR/probe.log" \
+   && [ ! -s "$WORKDIR/timeout.log" ]; then
   pass "hook, no timeout available: skips setup with a one-line notice, the probe still runs, the hook still exits 0"
 else
   fail "hook no timeout: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log")"
+fi
+# gtimeout-only hosts receive the same setup and probe bounds.
+: >"$WORKDIR/probe.log"
+: >"$WORKDIR/timeout.log"
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN_GT" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(head -1 "$WORKDIR/timeout.log")" = "gtimeout 60" ] \
+   && [ "$(tail -1 "$WORKDIR/timeout.log")" = "gtimeout 90" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
+  pass "hook, gtimeout-only host: bounds setup and probe"
+else
+  fail "hook gtimeout-only: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log")"
+fi
+# The timeout requested for the probe is limited by the elapsed setup budget.
+# Virtual elapsed time is injected only into this copied hook at its single
+# asserted pre-probe timing seam; production has no clock-injection setting.
+HFIX_VIRTUAL="$WORKDIR/hook-repo-virtual-clock"
+cp -R "$HFIX" "$HFIX_VIRTUAL"
+HOOK_VIRTUAL="$HFIX_VIRTUAL/scripts/hooks/cloud-session-start.sh"
+if [ "$(grep -Fxc 'probe_elapsed=$((SECONDS - hook_started))' "$HOOK_VIRTUAL")" = "1" ]; then
+  sed 's/probe_elapsed=$((SECONDS - hook_started))/SECONDS=$((hook_started + ${TEST_VIRTUAL_ELAPSED:-0})); probe_elapsed=$((SECONDS - hook_started))/' \
+    "$HOOK_VIRTUAL" >"$HOOK_VIRTUAL.tmp"
+  mv "$HOOK_VIRTUAL.tmp" "$HOOK_VIRTUAL"
+  : >"$WORKDIR/timeout.log"
+  out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" TEST_VIRTUAL_ELAPSED=60 PATH="$HBIN" bash "$HOOK_VIRTUAL")"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(head -1 "$WORKDIR/timeout.log")" = "timeout 60" ] \
+     && awk -v line="$(tail -1 "$WORKDIR/timeout.log")" 'BEGIN { split(line, a, " "); exit !(a[1] == "timeout" && a[2] > 0 && a[2] <= 55) }'; then
+    pass "hook, virtual full setup budget: probe receives at most 55 seconds and retains five seconds for the summary"
+  else
+    fail "hook virtual elapsed budget: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log")"
+  fi
+  : >"$WORKDIR/probe.log"
+  : >"$WORKDIR/timeout.log"
+  out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" TEST_VIRTUAL_ELAPSED=120 PATH="$HBIN" bash "$HOOK_VIRTUAL")"; rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capabilities unknown' \
+     && [ "$(cat "$WORKDIR/timeout.log")" = "timeout 60" ] && ! grep -q '^probe ' "$WORKDIR/probe.log"; then
+    pass "hook, exhausted budget: skips the probe and prints the existing unknown summary"
+  else
+    fail "hook exhausted budget: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log") probe=$(cat "$WORKDIR/probe.log")"
+  fi
+
+  for case_spec in "1:1:no" "030:30:no" "119:deadline:no" "0:90:yes" "120:90:yes" "999999999999999999999:90:yes" "0000000000000000001:90:yes" "abc:90:yes"; do
+    requested="${case_spec%%:*}"; rest="${case_spec#*:}"; expected="${rest%%:*}"; notice="${rest#*:}"
+    : >"$WORKDIR/timeout.log"
+    out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" TEST_VIRTUAL_ELAPSED=0 MERGEPATH_CLOUD_PROBE_TIMEOUT="$requested" PATH="$HBIN" bash "$HOOK_VIRTUAL")"; rc=$?
+    noticed=no
+    printf '%s' "$out" | grep -q 'MERGEPATH_CLOUD_PROBE_TIMEOUT must be a positive whole number below 120' && noticed=yes
+    if [ "$expected" = deadline ]; then
+      bound_ok=no
+      if awk -v line="$(tail -1 "$WORKDIR/timeout.log")" 'BEGIN { split(line, a, " "); exit !(a[1] == "timeout" && a[2] > 0 && a[2] <= 115) }'; then
+        bound_ok=yes
+      fi
+    else
+      [ "$(tail -1 "$WORKDIR/timeout.log")" = "timeout $expected" ] && bound_ok=yes || bound_ok=no
+    fi
+    if [ "$rc" -eq 0 ] && [ "$bound_ok" = yes ] && [ "$noticed" = "$notice" ]; then
+      pass "hook, MERGEPATH_CLOUD_PROBE_TIMEOUT=$requested: effective bound $expected, notice $notice"
+    else
+      fail "hook probe override $requested: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log")"
+    fi
+  done
+else
+  fail "hook test fixture: expected exactly one pre-probe elapsed-time seam for virtual-clock evidence"
+fi
+# Exercise a real deadline with an isolated sleeper and a test-only Perl alarm
+# shim, so the regression does not depend on GNU coreutils being installed.
+if ! command -v perl >/dev/null 2>&1; then
+  fail "test prerequisite: perl is required to prove the sleeping-probe alarm path"
+else
+HFIX_SLEEP="$WORKDIR/hook-repo-sleeper"
+mkdir -p "$HFIX_SLEEP/scripts/hooks"
+cp "$HOOK" "$HFIX_SLEEP/scripts/hooks/cloud-session-start.sh"
+cat >"$HFIX_SLEEP/scripts/agent-capability-probe.sh" <<'SLEEPER'
+#!/usr/bin/env bash
+printf 'started\n' >>"$PROBE_SLEEP_LOG"
+exec sleep "${PROBE_SLEEP:-5}"
+SLEEPER
+chmod +x "$HFIX_SLEEP/scripts/agent-capability-probe.sh"
+HBIN_REAL="$WORKDIR/hook-bin-real-timeout"
+mkdir -p "$HBIN_REAL"
+for tool in bash env sleep perl dirname jq sed paste tail head; do
+  real="$(command -v "$tool" 2>/dev/null || true)"
+  case "$real" in /*) ln -sf "$real" "$HBIN_REAL/$tool" ;; esac
+done
+cat >"$HBIN_REAL/timeout" <<'REALTIMEOUT'
+#!/usr/bin/env bash
+seconds="$1"; shift
+exec perl -e '
+  my $seconds = shift;
+  my $pid = fork();
+  die "fork failed" unless defined $pid;
+  if (!$pid) { exec @ARGV or die "exec failed: $!"; }
+$SIG{ALRM} = sub {
+  my $sent = kill "TERM", $pid;
+  if ($sent) {
+    waitpid($pid, 0);
+    if (open my $fh, ">>", $ENV{TEST_TIMEOUT_MARKER}) {
+      print $fh "124\n";
+      close $fh;
+    }
+    exit 124;
+  }
+  waitpid($pid, 0);
+  exit 127;
+};
+  alarm $seconds;
+  waitpid($pid, 0);
+  alarm 0;
+  exit(($? >> 8) & 255);
+' "$seconds" "$@"
+REALTIMEOUT
+chmod +x "$HBIN_REAL/timeout"
+started="$(date +%s)"
+out="$(CLAUDE_CODE_REMOTE=true MERGEPATH_CLOUD_PROBE_TIMEOUT=1 PROBE_SLEEP_LOG="$WORKDIR/probe-start.log" TEST_TIMEOUT_MARKER="$WORKDIR/alarm.log" PATH="$HBIN_REAL" bash "$HFIX_SLEEP/scripts/hooks/cloud-session-start.sh")"; rc=$?
+elapsed=$(( $(date +%s) - started ))
+if [ "$rc" -eq 0 ] && [ "$elapsed" -le 3 ] && [ -s "$WORKDIR/probe-start.log" ] \
+   && [ "$(cat "$WORKDIR/alarm.log")" = "124" ] && printf '%s' "$out" | grep -q 'capabilities unknown'; then
+  pass "hook, sleeping probe: invoked sleeper, recorded alarm/124, and printed the unknown summary within the shortened bound"
+else
+  fail "hook sleeping probe: rc=$rc elapsed=${elapsed}s start=$(cat "$WORKDIR/probe-start.log" 2>/dev/null) alarm=$(cat "$WORKDIR/alarm.log" 2>/dev/null) out=$out"
+fi
 fi
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' \
