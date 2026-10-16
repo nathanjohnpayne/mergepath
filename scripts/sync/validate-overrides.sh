@@ -9,7 +9,7 @@
 # system exists to prevent.
 #
 # Usage:
-#   scripts/sync/validate-overrides.sh [overrides-file] [manifest-file]
+#   scripts/sync/validate-overrides.sh [overrides-file] [manifest-file] [consumer-name]
 #
 # Arguments:
 #   overrides-file  Optional. Path to the .sync-overrides.yml. Defaults
@@ -20,6 +20,10 @@
 #                   in tests) or, if unset, the parent of the directory
 #                   containing this script (i.e., scripts/sync/.. → repo
 #                   root for an in-mergepath-checkout invocation).
+#
+# consumer-name   Optional explicit manifest consumer. Without it, skipped
+#                 paths must have the same closure verdict for every declared
+#                 consumer; otherwise exit 2 requests the selector.
 #
 # Validation rules:
 #   1. Overrides file (if it exists) parses as YAML.
@@ -61,6 +65,7 @@ set -euo pipefail
 SUPPORTED_OVERRIDE_VERSION=1
 
 OVERRIDES_FILE="${1:-.sync-overrides.yml}"
+CONSUMER_NAME="${3:-}"
 
 if [ -n "${2:-}" ]; then
   MANIFEST_FILE="$2"
@@ -334,6 +339,41 @@ fi
 if [ "$VIOLATIONS" -gt 0 ]; then
   err "$VIOLATIONS validation error(s) in $OVERRIDES_FILE"
   exit 1
+fi
+
+# Only nonempty skip sets need an identity-sensitive closure proof. Existing
+# absent/empty/no-skip behavior and all schema/substitution checks stay intact.
+if [ "$SKIP_COUNT" -gt 0 ]; then
+  # Load alongside this executable, not an inferred consumer checkout path.
+  # shellcheck source=scripts/sync/apply-overrides.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/apply-overrides.sh"
+  if ! override_requires_load "$MANIFEST_FILE" "$OVERRIDES_FILE"; then
+    fail "requires-closure metadata: $OVERRIDE_REQUIRES_DETAIL"
+  fi
+  if [ -n "$CONSUMER_NAME" ]; then
+    closure_rc=0
+    override_requires_check "$CONSUMER_NAME" || closure_rc=$?
+    case "$closure_rc" in
+      0) ;;
+      1) fail "requires-closure: $OVERRIDE_REQUIRES_DETAIL" ;;
+      *) usage "$OVERRIDE_REQUIRES_DETAIL" ;;
+    esac
+  else
+    closure_verdict="" closure_detail=""
+    while IFS= read -r consumer; do
+      [ -n "$consumer" ] || continue
+      closure_rc=0
+      override_requires_check "$consumer" || closure_rc=$?
+      [ "$closure_rc" -lt 2 ] || usage "$OVERRIDE_REQUIRES_DETAIL"
+      if [ -n "$closure_verdict" ] && [ "$closure_verdict" != "$closure_rc" ]; then
+        usage "requires-closure depends on consumer identity; pass consumer-name as the third argument"
+      fi
+      closure_verdict=$closure_rc
+      [ -z "$OVERRIDE_REQUIRES_DETAIL" ] || closure_detail=$OVERRIDE_REQUIRES_DETAIL
+    done <<< "$OVERRIDE_REQUIRES_CONSUMERS"
+    [ -n "$closure_verdict" ] || usage "requires-closure needs a declared consumer"
+    [ "$closure_verdict" != 1 ] || fail "requires-closure: $closure_detail"
+  fi
 fi
 
 echo "validate-overrides: OK — $OVERRIDES_FILE matches schema"
