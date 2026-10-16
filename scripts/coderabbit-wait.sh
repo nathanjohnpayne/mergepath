@@ -3637,6 +3637,7 @@ request_codex_rate_limit_failover() {
 # Diagnose it after the normal strict pass, before that pass would sleep.
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
+  local reviews run run_id run_body marker_rc clean_rc run_order_rc comments trigger_rc
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
   if [ "${1:-}" = --before-probe ] || [ "$#" = 0 ]; then
     rec=$(check_status_context_record) || return 0
@@ -3666,8 +3667,63 @@ emit_rate_limit_stall_at_timeout_if_present() {
   if [ "${1:-}" = --before-probe ]; then
     emit_terminal_review_after_probe_if_present
   fi
-  # An explicit record is checked only after the normal strict poll has
-  # graded current provider evidence, immediately before it would sleep.
+  # The poll may have seen no summary comment yet. Grade a body-bearing head
+  # run before substituting; the existing verdict path handles inline and
+  # summary markers and revalidates the selected run before clearance.
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") \
+    || die 3 "could not read current-head reviews before status-only substitution"
+  run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") \
+    || die 3 "could not select the current-head review before status-only substitution"
+  if [ -n "$run" ]; then
+    run_id=$(jq -er '.id' <<<"$run") || die 3 "unreadable status-only review id"
+    run_body=$(jq -er --argjson id "$run_id" \
+      'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)' \
+      <<<"$reviews") || die 3 "unreadable status-only review body"
+    STATUS_CONTEXT_HEAD_RUN_FINDING=false
+    STATUS_CONTEXT_CLEARANCE_REFUSAL=rate_limit
+    STATUS_CONTEXT_CLEARANCE_RUN_ID=""
+    STATUS_CONTEXT_CLEARANCE_RUN_BODY=""
+    marker_rc=0
+    summary_blocking_marker_present "$run_body" || marker_rc=$?
+    case "$marker_rc" in
+      0) STATUS_CONTEXT_HEAD_RUN_FINDING=true ;;
+      1) ;;
+      *) die 3 "could not grade the status-only review body" ;;
+    esac
+    clean_rc=0
+    crw_head_pinned_clean_review_run "$HEAD_SHA" "$run_id" >/dev/null || clean_rc=$?
+    case "$clean_rc" in
+      0)
+        run_order_rc=0
+        jq -e --arg at "$(jq -r '.updated_at // .created_at' <<<"$rec")" \
+          '(.submitted_at | fromdateiso8601) > ($at | fromdateiso8601)' \
+          <<<"$run" >/dev/null 2>&1 || run_order_rc=$?
+        case "$run_order_rc" in
+          0)
+            comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
+              || die 3 "could not read replacement-trigger evidence before status-only clearance"
+            trigger_rc=0
+            crw_newer_review_trigger_accepted "$comments" "$(jq -r '.submitted_at' <<<"$run")" || trigger_rc=$?
+            case "$trigger_rc" in
+              0) return 0 ;;
+              1) ;;
+              *) die 3 "could not grade replacement-trigger evidence before status-only clearance" ;;
+            esac
+            STATUS_CONTEXT_CLEARANCE_REFUSAL=""
+            STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
+            STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
+            ;;
+          1) ;;
+          *) die 3 "could not order the current-head review against the status-only refusal" ;;
+        esac
+        ;;
+      1) ;;
+      4) return 0 ;;
+      *) die 3 "could not validate the current-head review before status-only substitution" ;;
+    esac
+    emit_status_context_verdict "$state" "$(jq -r '.created_at' <<<"$rec")"
+    [ -n "$STATUS_CONTEXT_CLEARANCE_REFUSAL" ] || return 0
+  fi
   evidence=$(printf '%s' "$rec" | jq -c '{id:null, created_at, endpoint:"status_context", body_excerpt:.description}') || return 0
   log "trusted per-SHA CodeRabbit rate-limit refusal — proceeding immediately on Codex clearance (exit 5)"
   request_codex_rate_limit_failover

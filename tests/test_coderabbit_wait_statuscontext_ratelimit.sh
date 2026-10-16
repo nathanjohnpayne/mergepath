@@ -2463,8 +2463,10 @@ source "$1"
 TRUST_STATUS_CONTEXT=$2; CODEX_FAILOVER_ON_RATE_LIMIT=$3
 PAUSE_OBSERVED=$4; terminal=$5; prior=$6; fixture_state=$7; fixture_desc=$8
 CODEX_FAILOVER_FIRED=false; CODEX_FAILOVER_REQUESTED=false
-PR_NUMBER=999; REPO=owner/repo
+PR_NUMBER=999; REPO=owner/repo; HEAD_SHA=head-sha; BOT_LOGIN='coderabbitai[bot]'
 log() { :; }
+fetch_api_array() { printf '[]\n'; }
+crw_select_head_pinned_review_run() { :; }
 check_status_context_record() {
   echo status-read >>"$TIMEOUT_EVENTS"
   jq -nc --arg state "$fixture_state" --arg desc "$fixture_desc" '{state:$state,description:$desc,created_at:"2026-06-04T00:00:01Z"}'
@@ -2537,6 +2539,36 @@ EOF
 }
 
 test_notice_less_timeout_contract
+
+test_status_only_refusal_grades_head_run() {
+  local scenario dir rc before expected calls reviews body at sha fail_read
+  for scenario in clean marker old bodyless wrong-head unreadable malformed-time same-second; do
+    before=$FAIL;expected=5;calls=1;fail_read=''
+    body='Review completed. No actionable comments.'
+    at='2026-06-04T00:00:02Z';sha=head-sha
+    case "$scenario" in
+      clean) expected=0;calls=0 ;;
+      marker) body="$(printf '%*s' 300 '') _🟠 Major_ | A blocking finding in the review body.";expected=2;calls=0 ;;
+      old) at='2026-06-04T00:00:00Z' ;;
+      bodyless) body='' ;;
+      wrong-head) sha=previous-head ;;
+      unreadable) fail_read=1;expected=3;calls=0 ;;
+      malformed-time) at=invalid;expected=3;calls=0 ;;
+      same-second) at=$STATUS_TIME ;;
+    esac
+    dir=$(make_case "status-only-run-$scenario" '' "$STATUS_TIME" 'Review rate limited')
+    reviews=$(jq -nc --arg body "$body" --arg at "$at" --arg sha "$sha" \
+      '[{id:8801,user:{login:"coderabbitai[bot]"},commit_id:$sha,submitted_at:$at,body:$body}]')
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" CODERABBIT_TEST_FAIL_REVIEWS="$fail_read" run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "2139 status-only $scenario: expected $expected, got $rc; $(tail -5 "$dir/err.log")"
+    [ "$(stub_calls "$dir")" = "$calls" ] || fail "2139 status-only $scenario: unexpected Codex substitution"
+    [ ! -f "$dir/state/fake-time" ] || [ "$(cat "$dir/state/fake-time")" = 2000000000 ] \
+      || fail "2139 status-only $scenario: unexpectedly slept"
+    [ "$FAIL" -ne "$before" ] || pass "2139 status-only $scenario: exact-head review grading precedes substitution"
+  done
+}
+
+test_status_only_refusal_grades_head_run
 
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
