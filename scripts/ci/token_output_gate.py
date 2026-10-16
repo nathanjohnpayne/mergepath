@@ -15540,6 +15540,7 @@ EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
 EVAL_ASSIGNMENT_TILDE_QUIET_ORACLES = frozenset((
     EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE,
     "GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)",
+    "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin25.6.0)",
 ))
 CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
 KNOWN_MISSES.update({cid: (
