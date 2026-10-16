@@ -40,6 +40,8 @@
 #   --wave-scope-file structured canonical range; trusted wave code regenerates
 #                    the curated bytes after live canary byte verification.
 #   --offline-diff   preview supplied bytes with --dry-run; never posts.
+#   --retain-evidence require tripwires for a bound --dry-run whose verdict
+#                     the caller will retain (historical prefix receipts).
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
 #   --force-enabled  run this one invocation even when
@@ -98,9 +100,10 @@
 #      Before dispatch, account for findings and rerun (#1000). After a posted
 #      approval, review_posted:true identifies an acknowledgment to repair
 #      without repeating the review. No handoff block is emitted.
-#   8  HUMAN_TIEBREAKER_REQUIRED — the governing Codex request cap is
-#      exhausted with no automated response path left. No adapter is run and
-#      no Phase 4b handoff is rendered; a human must decide the PR's state.
+#   8  HUMAN_TIEBREAKER_REQUIRED — a deterministic tripwire matched, or a
+#      governing Codex-cap human stop holds. Tripwires stop before adapter
+#      dispatch. No review authority or Phase 4b handoff is produced; a human
+#      must select the review/disposition path.
 #   10 BARRIER_EVIDENCE_ERROR — request-budget evidence was unreadable or the
 #      head moved. No adapter is run and no Phase 4b handoff is rendered.
 
@@ -231,7 +234,7 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; RETAIN_EVIDENCE=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
@@ -240,7 +243,7 @@ case "${P4B_FORCE_ENABLED:-}" in
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--force-enabled]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled]" >&2
   exit 3
 }
 
@@ -256,6 +259,7 @@ while [ $# -gt 0 ]; do
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
     --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
+    --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
     -h|--help)       usage ;;
@@ -265,6 +269,11 @@ while [ $# -gt 0 ]; do
       shift ;;
   esac
 done
+
+if [ "$RETAIN_EVIDENCE" = true ]; then
+  [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
+    || p4b_die 3 "--retain-evidence requires a bound, non-offline --dry-run"
+fi
 
 if [ "$OFFLINE_DIFF" = true ]; then
   [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "offline input cannot request wave scope"
@@ -783,7 +792,11 @@ hold_for_external_review() {
 
 stop_for_human_tiebreaker() {
   local payload="$1"
-  p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  if printf '%s' "$payload" | jq -e '.tripwire' >/dev/null 2>&1; then
+    p4b_warn "Deterministic Phase 4b tripwire requires human-mediated review; no adapter or approval dispatched"
+  else
+    p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -1185,14 +1198,16 @@ if [ "$DRY_RUN" = true ]; then
   export P4B_ACCT_STATE_DIR
 fi
 
+ADAPTER_MISSING=false
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
+  ADAPTER_MISSING=true
   # No adapter is an infrastructure fallback, never authority to bypass the
   # governing Codex cap. This mode makes no provider-triggering writes and
-  # leaves below-cap fallback behavior unchanged. Offline dry runs stay offline.
+  # still requires authority-bearing input classification before fallback.
+  # Pure previews keep their existing offline/unavailable behavior.
   if [ "$DRY_RUN" != true ]; then
     run_same_head_barrier "pre-fallback" cap-only
   fi
-  fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
 
 # First barrier evaluation (#814), before the adapter run — the expensive part
@@ -1211,7 +1226,9 @@ fi
 # with fake CLIs)"), which exists precisely to validate adapter dispatch and
 # verdict parsing with no network and no credentials. That workflow is also
 # how tests/test_phase_4b_automation.sh exercises the package.
-if [ "$DRY_RUN" = true ]; then
+if [ "$ADAPTER_MISSING" = true ]; then
+  : # The cap-only barrier above owns this path; no provider-triggering probe.
+elif [ "$DRY_RUN" = true ]; then
   p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
 else
   run_same_head_barrier "pre-adapter"
@@ -1223,7 +1240,7 @@ fi
 # its bounded wait) instead of spending an adapter run that the post-adapter
 # fence would only discard. It runs before the accounting gate below, so that
 # gate stays the last read before dispatch.
-if [ "$DRY_RUN" != true ]; then
+if [ "$DRY_RUN" != true ] && [ "$ADAPTER_MISSING" != true ]; then
   revalidate_request_ceiling_authority pre-dispatch
 fi
 
@@ -1231,41 +1248,44 @@ fi
 # unread or undispositioned. Unlike the provider-ordering barrier, this also
 # applies to dry-runs: invoking the reasoning adapter is the scarce action the
 # gate protects. The command override keeps the orchestrator hermetic in tests.
-require_feedback_accounted
+# An unavailable pure preview needs no captured input. Posting and retained
+# evidence must cross the same input fence even when no adapter can run.
+if [ "$ADAPTER_MISSING" != true ] || [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; then
+  require_feedback_accounted
 
-# Resolve exact objects in an isolated store, never through a mutable PR diff
-# endpoint. A supplied diff is only a compatibility assertion of these bytes.
-INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
-  || p4b_die 3 "could not create protected review input"
-if [ "$OFFLINE_DIFF" = true ]; then
-  [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
-    || p4b_die 3 "offline diff must be a regular file"
-  cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
-  chmod 400 "$INPUT_DIR/review.diff"
-  DIFF_FILE="$INPUT_DIR/review.diff"
-  OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
-else
-if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
-     "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
-  p4b_die 3 "could not capture immutable PR base/head objects"
-fi
-if [ -n "$WAVE_SCOPE_FILE" ]; then
-  if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
-      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
-      "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
-    p4b_die 3 "could not regenerate trusted canonical wave input"
+  # Resolve exact objects in an isolated store, never through a mutable PR diff
+  # endpoint. A supplied diff is only a compatibility assertion of these bytes.
+  INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
+    || p4b_die 3 "could not create protected review input"
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+      || p4b_die 3 "offline diff must be a regular file"
+    cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
+    chmod 400 "$INPUT_DIR/review.diff"
+    DIFF_FILE="$INPUT_DIR/review.diff"
+    OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
+  else
+    if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
+         "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
+      p4b_die 3 "could not capture immutable PR base/head objects"
+    fi
+    if [ -n "$WAVE_SCOPE_FILE" ]; then
+      if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
+          "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+          "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
+        p4b_die 3 "could not regenerate trusted canonical wave input"
+      fi
+    fi
+    INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
+      || p4b_die 3 "could not fingerprint review input metadata"
+    if [ -n "$DIFF_FILE" ]; then
+      SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
+        || p4b_die 3 "supplied diff is unreadable or unprotected"
+      [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
+        || p4b_die 3 "supplied diff differs from captured immutable objects"
+    fi
+    DIFF_FILE="$INPUT_DIR/review.diff"
   fi
-fi
-INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
-  || p4b_die 3 "could not fingerprint review input metadata"
-if [ -n "$DIFF_FILE" ]; then
-  SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
-    || p4b_die 3 "supplied diff is unreadable or unprotected"
-  [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
-    || p4b_die 3 "supplied diff differs from captured immutable objects"
-fi
-DIFF_FILE="$INPUT_DIR/review.diff"
-
 fi
 
 revalidate_immutable_input() {
@@ -1276,6 +1296,23 @@ revalidate_immutable_input() {
   [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
     && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
 }
+
+# #1757: the complete immutable PR input, before trimming or model dispatch,
+# owns deterministic egregious-case escalation. Existing barrier stops above
+# remain authoritative. Pure previews retain their exemption; historical
+# callers retaining reusable review evidence request the same tripwire fence.
+if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; }; then
+  escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
+    || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
+  if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
+    stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
+      '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
+  fi
+fi
+
+if [ "$ADAPTER_MISSING" = true ]; then
+  fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
+fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )

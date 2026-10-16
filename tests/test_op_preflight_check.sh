@@ -291,7 +291,7 @@ test_check_stale_cache() {
     fail "test_check_stale_cache: expected non-zero exit, got 0"
     return
   fi
-  if ! echo "$err" | grep -q "cache missing or stale"; then
+  if ! grep -q "cache missing or stale" "$WORKDIR/case3.err"; then
     fail "test_check_stale_cache: stderr missing remediation; got $err"
     return
   fi
