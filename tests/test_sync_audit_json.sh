@@ -418,4 +418,64 @@ assert_json '.[0].baseline_info.refreshed == false'
 git -C "$CACHE/clean" remote set-url origin "$WORK/absent-origin"
 run 3 --audit --json --repos clean
 assert_json '.[0].baseline == null and .[0].error.reason == "consumer default-branch refresh failed"'
+# Effective skip closure (#1041) is a fatal configuration error, including
+# after another selected consumer completed. No partial NDJSON may escape.
+yq -i '.paths[0].requires = ["kit/one"]' "$MP/.mergepath-sync.yml"
+cat > "$SIB/drift/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: kit/, reason: custom kit}
+YAML
+: > "$AUDIT_CALLS"
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths canonical.txt
+[ ! -s "$WORK/out" ] || fail 'requires contradiction published a partial fleet'
+grep -q 'kit/one (required by canonical.txt)' "$WORK/err" || fail 'requires contradiction did not name both paths'
+[ "$(wc -l < "$AUDIT_CALLS" | tr -d ' ')" = 1 ] || fail 'first valid consumer did not complete before contradiction'
+run 2 --audit --use-local-tree --no-clone --repos drift --paths canonical.txt
+grep -q 'requires-closure gate' "$WORK/err" || fail 'text audit ignored contradiction'
+# A skipped requiring entry has no obligation; independent overrides and
+# current JSON status/exit behavior stay valid.
+printf '  - {path: canonical.txt, reason: custom caller}\n' >> "$SIB/drift/.sync-overrides.yml"
+run 0 --audit --json --use-local-tree --no-clone --repos drift --paths kit/
+assert_json 'length == 1 and .[0].status == "in-sync"'
+# Configuration proof is metadata-only: ordinary stale/missing bytes retain
+# the existing drift result when the required carrier remains unskipped.
+rm "$SIB/drift/.sync-overrides.yml"
+run 1 --audit --json --use-local-tree --no-clone --repos drift --paths canonical.txt
+assert_json 'length == 1 and .[0].status == "drift"'
+# A skipped exact caller remains delivered by its active containing kit.
+# Contradiction is still fatal before any partial fleet records are published.
+mkdir -p "$MP/callers" "$SIB/clean/callers" "$SIB/drift/callers"
+printf 'caller\n' >"$MP/callers/a"
+cp "$MP/callers/a" "$SIB/clean/callers/a"
+cp "$MP/callers/a" "$SIB/drift/callers/a"
+yq -i '.paths += [{"path": "callers/a", "type": "canonical", "consumers": "all", "requires": ["kit/one"]}, {"path": "callers/", "type": "kit", "consumers": "all"}]' "$MP/.mergepath-sync.yml"
+# Isolate this declared edge from the preceding canonical.txt fixture.
+yq -i 'del(.paths[0].requires)' "$MP/.mergepath-sync.yml"
+cat >"$SIB/drift/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: callers/a, reason: exact caller override}
+  - {path: kit/, reason: required kit override}
+YAML
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths callers/
+[ ! -s "$WORK/out" ] || fail 'kit-delivered caller contradiction leaked partial audit records'
+grep -q 'kit/one (required by callers/a)' "$WORK/err" || fail 'kit-delivered caller edge missing from audit'
+printf '  - {path: callers/, reason: whole caller kit override}\n' >>"$SIB/drift/.sync-overrides.yml"
+run 0 --audit --json --use-local-tree --no-clone --repos drift --paths callers/
+assert_json 'length == 1 and .[0].status == "in-sync"'
+# Review2: an active source kit is not the rendered logical requirement.
+rm "$SIB/drift/.sync-overrides.yml"
+# Use a real source directory distinct from the rendered destination.
+mkdir -p "$MP/templates"
+cp "$MP/template.txt" "$MP/templates/tool.in"
+yq -i '.paths += [{"path": "templates/tool.in", "source": "templates/tool.in", "dest": "runtime/tool", "type": "templated", "consumers": "all"}, {"path": "templates/", "type": "kit", "consumers": "all"}] | .paths[0].requires = ["templates/tool.in"]' "$MP/.mergepath-sync.yml"
+cat >"$SIB/drift/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - {path: runtime/tool, reason: consumer owns rendered dependency}
+YAML
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths canonical.txt
+[ ! -s "$WORK/out" ] || fail 'source-kit template contradiction leaked partial audit records'
+grep -q 'templates/tool.in (required by canonical.txt)' "$WORK/err" || fail 'audit source kit masked skipped render'
 echo 'PASS: sync audit JSON states, provenance, pagination, failures, filters, live baseline, and text parity'
