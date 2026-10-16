@@ -100,7 +100,7 @@
 #   1   At least one gate condition fails. A one-line reason is
 #       printed to stderr.
 #   2   Diagnostic or strict substitution probe: Codex cannot report because
-#       a fresh account/connection block exists without an exact-head response.
+#       a fresh account/connection block prevents current-request clearance.
 #   3   API / infrastructure error. Error message on stderr.
 #
 # Design notes:
@@ -3021,22 +3021,16 @@ if [ "$CLEARED" != "true" ]; then
   # (quota exhausted / App not connected → a human must act) instead of
   # inferring review latency and waiting or re-triggering.
   BLOCKED_SUFFIX=""
-  if [ -n "$CODEX_BLOCKED_REASON" ]; then
+  if [ -n "$CODEX_BLOCKED_REASON" ] \
+     && { [ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || [ -z "$LATEST_SIGNAL_TIME" ] \
+          || ! [[ "$LATEST_SIGNAL_TIME" > "$CODEX_BLOCKED_TIME" ]]; }; then
     BLOCKED_SUFFIX=" — NOTE: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME; this is an account/connection block a human must resolve (upgrade / add credits / connect the App), not review latency — route to Phase 4b (#722)"
-    # In DIAGNOSTIC mode only, distinguish "Codex CANNOT report" from "Codex
-    # has not reported YET" with exit 2 (#842). The #814 barrier is the only
-    # caller of that mode, and it must not hold a Phase 4b run behind a Codex
-    # that is account-blocked: Phase 4b is the documented fallback for exactly
-    # that state, and the message directly above already says to route there.
-    # Holding instead made the barrier wait out its whole budget and then page
-    # a human, so the automated leg could never serve its fallback role
-    # (Codex P1 on #842).
-    #
-    # Diagnostic-only on purpose. The merge gate must keep failing closed on a
-    # block — an account-blocked Codex has cleared nothing — so exit 2 is
-    # unreachable for every real gate caller, whose exit codes stay 0/1/3.
-    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
-      echo "[codex-review-check] diagnostic: Codex is account-blocked ('$CODEX_BLOCKED_REASON') — reporting CANNOT-REPORT (exit 2), not merely absent" >&2
+    # Preserve the diagnostic cannot-report result. Strict substitution also
+    # needs it after the existing request-freshness check supersedes an older
+    # head response. A newer response outranks an older resolved block above.
+    # Ordinary merge-gate callers retain their 0/1/3 contract.
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$REQUIRE_CODEX_ON_HEAD" = 1 ]; then
+      echo "[codex-review-check] human_attention_required: Codex is account-blocked ('$CODEX_BLOCKED_REASON') — reporting CANNOT-REPORT (exit 2), not merely absent" >&2
       exit 2
     fi
   fi

@@ -345,6 +345,12 @@ case "$endpoint" in
       substitute-only) jq -nc --arg head "$head" '[{id:9,user:{login:"nathanpayne-claude"},submitted_at:"2026-06-01T00:01:00Z",commit_id:$head,state:"APPROVED",body:"External review approval"}]' ;;
       *) printf '[]' ;;
     esac)
+    case "${RE_REQUEST_CASE:-}" in
+      review_*) response_time='2026-06-01T00:01:00Z'
+        case "$RE_REQUEST_CASE" in *_recovered) response_time='2026-06-01T00:04:00Z' ;; esac
+        reviews=$(jq -nc --arg head "$head" --arg t "$response_time" '[{id:9,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$t,commit_id:$head,state:"COMMENTED",body:"Completed clean review"}]') ;;
+      verdict_*) reviews='[]' ;;
+    esac
     if [ "${AUDIT_SCENARIO:-none}" = none ]; then printf '%s\n' "$reviews"; exit 0; fi
     jq -nc --argjson reviews "$reviews" --arg head "$head" --arg mode "$AUDIT_SCENARIO" '
       {id:7,user:{login:"nathanpayne-codex"},submitted_at:"2026-06-01T00:02:00Z",
@@ -352,6 +358,7 @@ case "$endpoint" in
       | ($approval
           | if $mode == "before" then .submitted_at="2026-06-01T00:00:30Z"
             elif $mode == "same-second" then .submitted_at="2026-06-01T00:01:00Z"
+            elif $mode == "after-recovery" then .submitted_at="2026-06-01T00:05:00Z"
             elif $mode == "no-audit" then .body="Reviewed"
             elif $mode == "wrong-sha" then .body="CodeRabbit rate-limited; cleared by Codex on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
             elif $mode == "wrong-head" then .commit_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -364,6 +371,23 @@ case "$endpoint" in
              |.submitted_at=(if $mode == "withdrawn" then "2026-06-01T00:03:00Z" else null end)]
         else . end' ;;
   repos/owner/repo/issues/999/comments)
+    if [ -n "${RE_REQUEST_CASE:-}" ]; then
+      kind=${RE_REQUEST_CASE%%_*};fault=${RE_REQUEST_CASE#*_}
+      block_time='2026-06-01T00:03:00Z';response_time='2026-06-01T00:01:00Z';request_time='2026-06-01T00:02:00Z'
+      body='You have reached your Codex usage limits for code reviews.'
+      case "$fault" in
+        not_connected) body='To use Codex here, create a Codex account and connect to GitHub.' ;;
+        old-block) block_time='2026-06-01T00:00:30Z' ;;
+        recovered) response_time='2026-06-01T00:04:00Z' ;;
+        tie) block_time=$response_time;request_time=$response_time ;;
+      esac
+      jq -nc --arg kind "$kind" --arg head "$head" --arg response "$response_time" \
+        --arg request "$request_time" --arg block "$block_time" --arg body "$body" '
+        [{id:10,user:{login:"nathanjohnpayne"},created_at:$request,body:"@codex review"},
+         {id:11,user:{login:"chatgpt-codex-connector[bot]"},created_at:$block,body:$body}]
+        + (if $kind=="verdict" then [{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:$response,body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: "+$head)}] else [] end)'
+      exit 0
+    fi
     case "$CLEARANCE_SCENARIO" in clean-review|blocking-review|substitute-only) printf '[]'; exit 0 ;; esac
     case "$CLEARANCE_SCENARIO" in
       usage_limit) body='You have reached your Codex usage limits for code reviews.' ;;
@@ -445,6 +469,36 @@ STUB
     grep -q human_attention_required "$APPROVAL_FIXTURE/err" || fail "late $scenario: missing immediate attention disposition"
     [ ! -f "$APPROVAL_FIXTURE/slept" ] || fail "late $scenario: slept after a provider refusal"
     [ "$FAIL" -ne "$before" ] || pass "late $scenario: real checker stops automatic substitution without sleeping"
+  done
+  # Existing response/request ordering decides whether a retained response
+  # still carries this request. A resolved older block is ordinary pending.
+  for scenario in review_usage_limit verdict_usage_limit review_not_connected verdict_not_connected review_old-block verdict_old-block review_recovered verdict_recovered review_tie; do
+    before=$FAIL;expected=1;audit=after;attention=true
+    case "$scenario" in *_old-block) attention=false ;; *_recovered) expected=0;audit=after-recovery;attention=false ;; esac
+    APPROVAL_FIXTURE="$fixture/re-request-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict RE_REQUEST_CASE="$scenario" AUDIT_SCENARIO="$audit" \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=1800 \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS=0 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = "$expected" ] || fail "re-request $scenario: wanted $expected, got $rc; $(tail -4 "$APPROVAL_FIXTURE/err")"
+    actual_attention=false;grep -q human_attention_required "$APPROVAL_FIXTURE/err" && actual_attention=true
+    [ "$actual_attention" = "$attention" ] || fail "re-request $scenario: wanted attention=$attention, got $actual_attention"
+    [ ! -f "$APPROVAL_FIXTURE/slept" ] || fail "re-request $scenario: unexpectedly slept"
+    if [ "$attention" = true ]; then
+      ordinary=0
+      GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict RE_REQUEST_CASE="$scenario" AUDIT_SCENARIO="$audit" \
+        PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+        CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+        bash "$fixture/scripts/codex-review-check.sh" 999 owner/repo \
+        >"$APPROVAL_FIXTURE/ordinary.out" 2>"$APPROVAL_FIXTURE/ordinary.err" || ordinary=$?
+      [ "$ordinary" = 1 ] || fail "re-request $scenario: ordinary merge-gate contract changed to $ordinary"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "re-request $scenario: selected response/request ordering controls immediate refusal"
   done
   # The merge probe runs after approval; the agent probe above runs before it.
   for scenario in none before same-second after no-audit wrong-sha wrong-head withdrawn malformed-time malformed-later-opinion author; do
