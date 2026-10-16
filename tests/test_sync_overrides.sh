@@ -942,6 +942,84 @@ yq -i '.paths[1].type = "templated" | .paths = [.paths[2], .paths[1], .paths[0]]
 override_requires_load "$identity_manifest" "$identity_skip" || fail 'reordered template identity rejected'
 review_check 1 alpha
 
+# Review3: closure must use the materializer's actual first serialized reason
+# line, not a second interpretation of YAML strings or duplicate skip paths.
+reason_manifest="$WORKDIR/reason-parity-manifest.yml"
+reason_skip="$WORKDIR/reason-parity-skip.yml"
+reason_parity_case() {  # label, reader rc, check rc, first YAML reason, [second]
+  local label=$1 expected_reader=$2 expected_check=$3 first=$4
+  local target=${REASON_PARITY_TARGET:-a.sh} rc=0 expected_skips
+  {
+    printf 'consumers: [{name: alpha}]\npaths:\n'
+    printf "  - {path: '%s', type: canonical, consumers: all, requires: [b.sh]}\n" "$target"
+    printf '  - {path: b.sh, type: canonical, consumers: all}\n'
+  } >"$reason_manifest"
+  {
+    printf "skip_paths:\n  - path: '%s'\n    reason: %s\n" "$target" "$first"
+    if [ "$#" -eq 5 ]; then
+      printf "  - path: '%s'\n    reason: %s\n" "$target" "$5"
+    fi
+    printf '  - {path: b.sh, reason: ordinary dependency skip}\n'
+  } >"$reason_skip"
+  override_should_skip_path "$reason_skip" "$target" || rc=$?
+  [ "$rc" = "$expected_reader" ] \
+    && pass "reason parity $label: authoritative reader result" \
+    || fail "reason parity $label: reader expected $expected_reader got $rc"
+  OVERRIDE_SKIP_REASON=reason-parity-preserved
+  if ! override_requires_load "$reason_manifest" "$reason_skip"; then
+    fail "reason parity $label: validated metadata rejected"
+    return
+  fi
+  expected_skips=b.sh
+  if [ "$expected_reader" = 0 ]; then expected_skips="$target"$'\n'b.sh; fi
+  [ "$OVERRIDE_REQUIRES_SKIPS" = "$expected_skips" ] \
+    && [ "$OVERRIDE_SKIP_REASON" = reason-parity-preserved ] \
+    && pass "reason parity $label: exact distinct skips and reader output isolation" \
+    || fail "reason parity $label: skip list/output isolation changed"
+  rc=0
+  override_requires_check alpha || rc=$?
+  [ "$rc" = "$expected_check" ] && [ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] \
+    && pass "reason parity $label: active obligation matches delivered artifacts" \
+    || fail "reason parity $label: closure expected $expected_check got $rc or leaked partial edges"
+  if [ "$expected_check" = 1 ]; then
+    [[ "$OVERRIDE_REQUIRES_DETAIL" == *"b.sh (required by $target)"* ]] \
+      || fail "reason parity $label: requiring/dependency diagnostic changed"
+  fi
+}
+reason_parity_case literal-null 1 1 '"null"'
+reason_parity_case empty-string 1 1 '""'
+reason_parity_case null-trailing-newline 1 1 '"null\n"'
+reason_parity_case null-first-line 1 1 '"null\nlater rationale"'
+reason_parity_case leading-newline 1 1 '"\nlater rationale"'
+reason_parity_case newline-only 1 1 '"\n"'
+reason_parity_case ordinary-multiline 0 0 '"ordinary\nnull"'
+reason_parity_case ordinary-trailing-newline 0 0 '"ordinary\n"'
+# This checks the permissive application reader, not the validator's stricter
+# whitespace-only reason schema. Neither API/schema is changed by closure.
+reason_parity_case whitespace-reader-compatibility 0 0 '"   "'
+reason_parity_case duplicate-null-first 1 1 '"null"' '"ordinary"'
+reason_parity_case duplicate-empty-first 1 1 '""' '"ordinary"'
+reason_parity_case duplicate-valid-first 0 0 '"ordinary"' '"null"'
+REASON_PARITY_TARGET='odd "quote"\path.sh' \
+  reason_parity_case literal-path 1 1 '"null"' '"ordinary"'
+# No-skip metadata keeps the same active direct edge and does not disturb the
+# permissive reader's cross-call output variable.
+for reason_empty in absent empty; do
+  reason_file="$WORKDIR/reason-$reason_empty.yml"
+  if [ "$reason_empty" = empty ]; then printf 'skip_paths: []\n' >"$reason_file"; fi
+  OVERRIDE_SKIP_REASON=reason-parity-preserved
+  rc=0
+  override_requires_load "$reason_manifest" "$reason_file" || rc=$?
+  [ "$rc" = 0 ] && [ -z "$OVERRIDE_REQUIRES_SKIPS" ] \
+    && [ "$OVERRIDE_SKIP_REASON" = reason-parity-preserved ] \
+    || fail "reason parity $reason_empty: no-skip load changed"
+  rc=0
+  override_requires_check alpha || rc=$?
+  [ "$rc" = 0 ] && [ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'odd "quote"\path.sh\tb.sh' ] \
+    && pass "reason parity $reason_empty: no-skip edge preserved" \
+    || fail "reason parity $reason_empty: expected active direct edge"
+done
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

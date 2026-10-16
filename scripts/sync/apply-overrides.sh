@@ -216,9 +216,22 @@ override_requires_load() {
     yq -e '[(.skip_paths // [])[] | select(tag != "!!map")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | (.path, .reason) | select(tag != "!!str")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | .path | select(test("^[^\x00\t\r\n]+$") == false)] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
-    # Same finite skip predicate as override_should_skip_path: a literal
-    # target and a nonempty reason. Schema validation remains the validator's job.
-    OVERRIDE_REQUIRES_SKIPS=$(yq -r '(.skip_paths // [])[] | select(.reason != "") | .path' "$overrides" 2>/dev/null) || return 2
+    # Delegate first-row/first-serialized-line semantics to the unchanged
+    # materializer reader, including empty/null reasons and duplicate paths.
+    # Query distinct validated targets only; the child shell contains the
+    # reader's OVERRIDE_SKIP_REASON output, and publication stays buffered.
+    local skip_targets effective_skips skip_path
+    skip_targets=$(yq -r '(.skip_paths // [])[] | .path' "$overrides" 2>/dev/null) || return 2
+    skip_targets=$(printf '%s\n' "$skip_targets" | LC_ALL=C awk '!seen[$0]++') || return 2
+    effective_skips=$(
+      while IFS= read -r skip_path; do
+        [ -n "$skip_path" ] || continue
+        if override_should_skip_path "$overrides" "$skip_path"; then
+          printf '%s\n' "$skip_path" || exit 2
+        fi
+      done <<< "$skip_targets"
+    ) || return 2
+    OVERRIDE_REQUIRES_SKIPS="$effective_skips"
   fi
   OVERRIDE_REQUIRES_DETAIL=""
   return 0
