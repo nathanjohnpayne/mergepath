@@ -742,7 +742,9 @@ test_refusal_run_is_revalidated_before_clearance() {
 
   dir=$(make_case "headref-unread-revalidation" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_FAIL_REVIEWS_AFTER=1 run_case "$dir")
-  [ "$rc" = "5" ] || fail "3b0 unread: unread revalidation must withhold clearance, got $rc; err=$(tail -6 "$dir/err.log")"
+  # The published-refusal route now performs a fresh strict reviews read
+  # before substitution. Its unreadable follow-up is infrastructure failure.
+  [ "$rc" = "3" ] || fail "3b0 unread: unread strict refresh must fail closed, got $rc; err=$(tail -6 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b0 unread: unread revalidation cleared"
   grep -q 'could not be re-read before clearance' "$dir/err.log" || fail "3b0 unread: expected re-read failure log"
   [ "$FAIL" -ne "$before" ] || pass "3b0: #956 revalidates a stable clean run and withholds clearance when its id or body changes or becomes unread"
@@ -1250,14 +1252,14 @@ test_ratelimited_description_without_notice_never_clears() {
   rc=$(run_case "$dir")
   [ "$rc" != "0" ] || fail "6: FALSE-CLEARED (exit 0) on a 'Review rate limited' success with no notice comment; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "6: status=cleared on a head CodeRabbit declined to review"
-  [ "$rc" = "5" ] || fail "6: expected exit 5 (notice-less rate-limit stall at timeout), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "5" ] || fail "6: expected exit 5 (immediate notice-less rate-limit substitution), got $rc; err=$(tail -4 "$dir/err.log")"
   grep -q 'does not name a completed review' "$dir/err.log" || fail "6: expected the description-guard log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$(jqf "$dir" '.codex_failover_requested')" = true ] || fail "6: notice-less refusal did not engage failover"
   [ "$(stub_calls "$dir")" = 1 ] || fail "6: expected one failover request"
-  [ "$(cat "$dir/state/fake-time")" = 2000000300 ] || fail "6: refusal changed the existing 300s wait"
+  [ "$(cat "$dir/state/fake-time")" = 2000000000 ] || fail "6: notice-less refusal waited instead of substituting Codex immediately"
   [ "$(jqf "$dir" '.review.created_at')" = "$STATUS_TIME" ] || fail "6: source status timestamp was lost"
   [ "$(jqf "$dir" '.rate_limit_retries')" = 0 ] || fail "6: invented a retry without a published window"
-  [ "$FAIL" -ne "$before" ] || pass "6: #940 — notice-less refusal stalls and requests Codex once at the existing timeout"
+  [ "$FAIL" -ne "$before" ] || pass "6: #2139 — notice-less refusal requests Codex immediately without sleeping"
 }
 
 # --- Test 7: description guard — an UNRECOGNIZED non-empty description ------
@@ -2452,6 +2454,7 @@ test_notice_less_timeout_contract() {
   cat >"$WORKDIR/timeout-codex.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s|%s\n' "${MERGEPATH_PHASE_4A_GATED:-}" "$*" >>"$TIMEOUT_EVENTS"
+echo '{"trigger_requested":true,"blocked_reason":null}'
 exit "${TIMEOUT_CODEX_RC:-0}"
 EOF
   chmod +x "$WORKDIR/timeout-codex.sh"
@@ -2462,8 +2465,10 @@ source "$1"
 TRUST_STATUS_CONTEXT=$2; CODEX_FAILOVER_ON_RATE_LIMIT=$3
 PAUSE_OBSERVED=$4; terminal=$5; prior=$6; fixture_state=$7; fixture_desc=$8
 CODEX_FAILOVER_FIRED=false; CODEX_FAILOVER_REQUESTED=false
-PR_NUMBER=999; REPO=owner/repo
+PR_NUMBER=999; REPO=owner/repo; HEAD_SHA=head-sha; BOT_LOGIN='coderabbitai[bot]'
 log() { :; }
+fetch_api_array() { printf '[]\n'; }
+crw_select_head_pinned_review_run() { :; }
 check_status_context_record() {
   echo status-read >>"$TIMEOUT_EVENTS"
   jq -nc --arg state "$fixture_state" --arg desc "$fixture_desc" '{state:$state,description:$desc,created_at:"2026-06-04T00:00:01Z"}'
@@ -2497,11 +2502,14 @@ EOF
     # to hand a rate-limited head to Codex, whatever the head's age.
     n=$(grep -c '^true|--trigger-only --allow-moving-head 999 owner/repo$' "$WORKDIR/timeout-$name.events" || true)
     [ "$n" = "$calls" ] || fail "940 $name: expected $calls gated Codex trigger(s), got $n"
-    if [ "$pause" = true ] || [ "$terminal" != none ] || [ "$trust" = false ]; then
-      ! grep -q '^status-read$' "$WORKDIR/timeout-$name.events" || fail "940 $name: later status read ran despite earlier precedence or opt-out"
+    if [ "$pause" = true ] || [ "$trust" = false ]; then
+      ! grep -q '^status-read$' "$WORKDIR/timeout-$name.events" || fail "940 $name: status read ran despite pause or opt-out"
     else
-      [ "$(tail -n +1 "$WORKDIR/timeout-$name.events" | grep -E '^status-question$|^terminal-check$|^status-read$' | tr '\n' ',')" = 'status-question,terminal-check,status-read,' ] \
-        || fail "940 $name: did not use fresh status after question/terminal check"
+      local expected_order='status-read,status-question,terminal-check,status-read,'
+      [ "$rc" != 5 ] || expected_order='status-read,terminal-check,'
+      [ "$terminal" = none ] || expected_order='status-read,terminal-check,'
+      [ "$(grep -E '^status-question$|^terminal-check$|^status-read$' "$WORKDIR/timeout-$name.events" | tr '\n' ',')" = "$expected_order" ] \
+        || fail "940 $name: did not refresh terminal evidence before the status question"
     fi
     if [ "$helper_rc" != 0 ] || [ "$calls" = 0 ]; then
       [ "$(jq -r '.codex_failover_requested' "$out")" = false ] || fail "940 $name: recorded a failover that did not succeed"
@@ -2533,6 +2541,45 @@ EOF
 }
 
 test_notice_less_timeout_contract
+
+test_status_only_refusal_grades_head_run() {
+  local source scenario dir rc before expected calls reviews body at sha fail_read notice description
+  for source in status notice notice-untrusted; do
+  for scenario in clean marker old bodyless wrong-head unreadable malformed-time same-second; do
+    before=$FAIL;expected=5;calls=1;fail_read=''
+    body='Review completed. No actionable comments.'
+    at='2026-06-04T00:00:02Z';sha=head-sha
+    case "$scenario" in
+      clean) expected=0;calls=0 ;;
+      marker) body="$(printf '%*s' 300 '') _🟠 Major_ | A blocking finding in the review body.";expected=2;calls=0 ;;
+      old) at='2026-06-04T00:00:00Z' ;;
+      bodyless) body='' ;;
+      wrong-head) sha=previous-head ;;
+      unreadable) fail_read=1;expected=3;calls=0 ;;
+      malformed-time) at=invalid;expected=3;calls=0 ;;
+      same-second) at=$STATUS_TIME ;;
+    esac
+    notice='';description='Review rate limited'
+    if [ "$source" != status ]; then
+      notice=$LEGACY_RATE_LIMIT_BODY;description='Review in progress'
+    fi
+    dir=$(make_case "refusal-run-$source-$scenario" "$notice" "$STATUS_TIME" "$description" "$STATUS_TIME")
+    if [ "$source" = notice-untrusted ]; then
+      sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    fi
+    reviews=$(jq -nc --arg body "$body" --arg at "$at" --arg sha "$sha" \
+      '[{id:8801,user:{login:"coderabbitai[bot]"},commit_id:$sha,submitted_at:$at,body:$body}]')
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" CODERABBIT_TEST_FAIL_REVIEWS="$fail_read" run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "2139 $source $scenario: expected $expected, got $rc; $(tail -5 "$dir/err.log")"
+    [ "$(stub_calls "$dir")" = "$calls" ] || fail "2139 $source $scenario: unexpected Codex substitution"
+    [ ! -f "$dir/state/fake-time" ] || [ "$(cat "$dir/state/fake-time")" = 2000000000 ] \
+      || fail "2139 $source $scenario: unexpectedly slept"
+    [ "$FAIL" -ne "$before" ] || pass "2139 $source $scenario: exact-head review grading precedes substitution"
+  done
+  done
+}
+
+test_status_only_refusal_grades_head_run
 
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
@@ -2972,6 +3019,30 @@ test_final_risk_marker_fallback() {
 }
 
 test_final_risk_marker_fallback
+
+test_immediate_status_refusal_respects_selected_progress() {
+  local mode status_at dir rc expected before
+  for mode in older equal newer; do
+    before=$FAIL
+    case "$mode" in
+      older) status_at=2026-06-04T00:00:10Z; expected=4 ;;
+      equal) status_at=2026-06-04T00:00:20Z; expected=4 ;;
+      newer) status_at=2026-06-04T00:00:30Z; expected=5 ;;
+    esac
+    dir=$(make_case "status-refusal-progress-$mode" "$FULL_REVIEW_TRIGGER_BODY" \
+      "$status_at" "Review rate limited" "2026-06-04T00:00:20Z" 999999999)
+    sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "status/progress $mode: expected $expected, got $rc; $(tail -4 "$dir/err.log")"
+    if [ "$expected" = 4 ]; then
+      [ ! -s "$dir/state/codex-stub.log" ] || fail "status/progress $mode: older refusal requested an unnecessary substitute"
+    else
+      [ "$(jqf "$dir" '.codex_failover_requested')" = true ] || fail "status/progress newer: current refusal did not request Codex"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "immediate refusal respects $mode status against selected progress"
+  done
+}
+test_immediate_status_refusal_respects_selected_progress
 
 test_quoted_refusal_marker_is_not_current_refusal
 test_current_refusal_with_blocking_head_review_is_findings

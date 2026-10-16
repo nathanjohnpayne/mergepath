@@ -331,8 +331,8 @@ coderabbit:
   # only when CodeRabbit is slow-but-reviewing — exactly the case worth waiting
   # for. Genuinely-stuck rounds (paused / rate-limited / non-base-branch /
   # draft) short-circuit earlier via their own fast-paths, and timeout
-  # stays advisory (the caller proceeds). Rate-limited rounds are handled
-  # by max_rate_limit_retries below, not this budget.
+  # stays advisory (the caller proceeds). Rate-limit refusals immediately
+  # hand off to Codex without spending this grace budget (#2139).
   #
   # NOTE: consumers bootstrapped with an explicit max_wait_seconds override
   # (e.g. the pre-retune 300) keep it — review-policy.yml is per-consumer
@@ -372,29 +372,17 @@ coderabbit:
   # `max_wait_seconds` grace window has already elapsed.
   status_probe_wait_seconds: 60
 
-  # Maximum number of times `scripts/coderabbit-wait.sh` will parse a
-  # "Rate limit exceeded" comment, sleep the published window + 30s
-  # buffer, and post `@coderabbitai, try again.` to re-trigger.
-  # CodeRabbit does not auto-retry after its rate-limit window elapses;
-  # the wait helper does. Set to 0 to disable retries entirely (the
-  # caller will see exit code 5 / rate_limit_stalled on the first
-  # rate-limit comment). See nathanjohnpayne/mergepath#138.
+  # Deprecated compatibility field (#2139). The waiter never sleeps out a
+  # rate-limit window or posts a retry; this value no longer changes behavior.
   max_rate_limit_retries: 2
 
-  # #489: when CodeRabbit reports rate-limited, automatically request
-  # `@codex review` (once, HEAD-pinned) so the PR advances via Codex — the
-  # real blocking gate — instead of idling on the advisory bot's hourly
-  # allowance. `scripts/coderabbit-wait.sh` fires
-  # `scripts/codex-review-request.sh --trigger-only` on the first rate-limit
-  # notice; it is time-boxed and self-reverting (a single trigger per run, no
-  # permanent Codex pin) and composes with `codex.request_by_default` (#486)
-  # without forking it. In the auto-merge workflow, a `rate_limit_stalled`
-  # (exit 5) downgrades only when the JSON carries
-  # `codex_failover_requested: true` AND merge-clearance's rate-limit
-  # protection query proves either an active external gate or already-
-  # satisfied current-head Codex/Phase-4b clearance (#713). Set to false to
-  # opt out (e.g. a repo with `codex.enabled: false`, where there is nothing
-  # to fail over to).
+  # On a published or trusted per-head rate-limit refusal, request Codex
+  # immediately through the canonical trigger-only requester (#489/#2139).
+  # The request is not clearance. Under-threshold approval requires the full
+  # exact-head checker and a later approval carrying the provider/full-SHA
+  # audit; automation enforces that ordering. A later Codex account/connection
+  # refusal stops the substitution wait with human_attention_required.
+  # Normal Phase 4 gates still apply. False opts out and requires attention.
   codex_failover_on_rate_limit: true
 
   # Maximum number of times `scripts/coderabbit-wait.sh` will post

@@ -1362,6 +1362,8 @@ paths:
   - path: tests/test_coderabbit_wait_codex_failover.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/codex-review-check.sh"  # #2139 actual exact-head approval precondition
   - path: tests/test_coderabbit_automerge_rate_limit_gate.sh
     type: canonical
     consumers: all

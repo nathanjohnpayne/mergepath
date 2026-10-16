@@ -96,8 +96,9 @@ CLEARANCE_POLL_SECONDS="${CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS:-30}
 # The probe is codex-review-check.sh under exactly the environment the #727
 # post-clearance probe and the workflow's final re-verify already use:
 #   SKIP_CI=1                     — CI greenness is a separate gate here.
-#   REQUIRE_APPROVAL_ON_HEAD=1    — a stale earlier-head APPROVED cannot ride
-#                                   a later push into clearance (#435).
+#   REQUIRE_APPROVAL_ON_HEAD=1    — combined with the strict Codex flag,
+#                                   requires a later current-head approval
+#                                   carrying the provider/full-SHA audit.
 #   ALLOW_PHASE_4B_SUBSTITUTE=false — LOAD-BEARING (#727, Codex P2 on #729):
 #                                   without it gate (c) accepts the very
 #                                   reviewer APPROVED that armed auto-merge as
@@ -139,17 +140,21 @@ await_codex_head_clearance() {
     CODEX_REVIEW_CHECK_SKIP_CI=1 \
       CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
       CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
-      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
+      bash "$CODEX_CHECK_BIN" --require-codex-on-head "$PR_NUMBER" "$REPO" >&2
     crc=$?
     set -e
     case "$crc" in
       0)
-        echo "rate-limit-gate: current-head Codex/Phase-4b clearance confirmed on probe ${attempt} — the failover really did review this head (#825)" >&2
+        echo "rate-limit-gate: current-head Codex clearance confirmed on probe ${attempt} — the failover really did review this head (#825)" >&2
         return 0
         ;;
       1) ;;
+      2)
+        echo "rate-limit-gate: human_attention_required — Codex cannot report on this head; stop the substitution wait immediately" >&2
+        return 1
+        ;;
       *)
-        # codex-review-check.sh's contract is 0 clear / 1 gate-fail / 3 infra.
+        # Strict checker: 0 clear / 1 pending / 2 cannot-report / 3 infra.
         # Anything else is a config or infrastructure fault, which retrying
         # will not repair — and an unproven answer must never read as proof.
         echo "rate-limit-gate: codex-review-check.sh returned rc=${crc} (config/infrastructure error) on probe ${attempt} — clearance unproven; block (fail-closed)" >&2

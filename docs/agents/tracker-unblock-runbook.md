@@ -68,7 +68,7 @@ Follow REVIEW_POLICY.md's workflow. The scripts it relies on are listed below. A
 | Author writes (create, edit, comment, merge) | `scripts/gh-as-author.sh -- gh …` |
 | Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh …` |
 | Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh <PR#> --repo <owner/repo>` |
-| Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh <PR#> <owner/repo>` (sleep only the remaining `retry_after` window) |
+| Handle a CodeRabbit refusal | `scripts/coderabbit-wait.sh <PR#> <owner/repo>` (request Codex immediately; await exact-head clearance under REVIEW_POLICY.md) |
 | Request Codex | `MERGEPATH_PHASE_4A_GATED=true scripts/codex-review-request.sh <PR#> <owner/repo>` on a Phase 4 PR (recommended; without the flag, when `codex.request_by_default` is false or unset, the default since #2240, the requester derives the Phase 4 gate from the PR and skips with exit `5` only a PR it reads as under the threshold, #2257) (never hand-roll the `@codex review` trigger) |
 | Read the Codex verdict | `scripts/codex-review-check.sh <PR#> <owner/repo>` |
 | Record per-finding verdicts | `scripts/codex-record-feedback.sh <PR#> <owner/repo> --verdict …`, `scripts/coderabbit-record-feedback.sh <PR#> --repo <owner/repo> …` |
@@ -79,7 +79,7 @@ Follow REVIEW_POLICY.md's workflow. The scripts it relies on are listed below. A
 Rules that come up repeatedly:
 
 - Disposition each finding in real time: reply, then fix, record and resolve. Do not batch them at the end of a round.
-- Do not infer a completed CodeRabbit review from a mutable summary's assessment marker. Do not retry a refusing provider before its `retry_after` window has elapsed.
+- Do not infer a completed CodeRabbit review from a mutable summary's assessment marker. On a CodeRabbit rate-limit refusal, follow REVIEW_POLICY.md's immediate Codex substitution; do not sleep out its window or post a retry.
 - On a Phase 4b `HELD` result (exit `6`), read the emitted reason first. A hold that clears on its own, such as external review not yet reaching the head, is a bounded wait: sleep the JSON's `retry_after` and rerun. A hold caused by persistent PR state, such as a draft or a non-base target, will not clear by waiting; fix the state instead. Treat a human-tiebreaker outcome as a required decision.
 - Never reset review counters, and never restart an exhausted loop without an explicit owner decision.
 
@@ -90,7 +90,7 @@ A spent Codex request ceiling (`CAP_EXHAUSTED`, `kind: request-ceiling`) is cost
 Park a PR and move to other work, recording why in the ledger and on the PR, when any of these happen:
 
 - an escalation signal from REVIEW_POLICY.md fires (repeat-after-rebuttal, the Phase 4b barrier's `runaway` stop, or a blocking-review ceiling), or Phase 4b returns a human-tiebreaker outcome;
-- `scripts/coderabbit-wait.sh` exits `5` (rate-limit stalled) with `codex_failover_requested: false` in its JSON. Alert the human and do not proceed toward merge. When the failover did engage (`codex_failover_requested: true`), exit `5` is a non-blocking note and the PR continues through Phase 4a;
+- `scripts/coderabbit-wait.sh` exits `5` (rate-limit stalled) with `codex_failover_requested: false` in its JSON. Alert the human and do not proceed toward merge. When the failover did engage (`codex_failover_requested: true`), await exact-head Codex clearance before under-threshold approval under REVIEW_POLICY.md; Phase 4 PRs continue their normal review loop;
 - the PR needs a decision that § 4 classifies as an owner decision;
 - a required-tier finding would enlarge the PR's contract rather than find a defect in it, and `feedback_policy` does not permit deferring it (see [high-priority-scope-discipline.md](high-priority-scope-discipline.md)). A finding whose tier permits deferral is recorded as a follow-up or accepted residual and the PR continues through the normal accounting and merge gates.
 

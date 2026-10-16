@@ -102,6 +102,7 @@ set -euo pipefail
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
 clock_file="$state_dir/fake-time"
 [ -f "$clock_file" ] || printf '2000000000\n' >"$clock_file"
+printf '%s\n' "$*" >>"$state_dir/sleeps.log"
 duration=${1:-0}
 case "$duration" in *.*) duration=${duration%%.*} ;; esac
 current=$(cat "$clock_file")
@@ -128,6 +129,7 @@ if [ "${1:-}" = "--method" ]; then method=${2:-}; shift 2; fi
 if [ "${1:-}" = "--paginate" ]; then shift; fi
 endpoint=${1:-}; shift || true
 if [ "$method" = "POST" ]; then
+  printf '%s\n' "$endpoint" >>"$state_dir/posts.log"
   case "$endpoint" in
     repos/owner/repo/issues/999/comments)
       printf '{"id":9001,"created_at":"%s","body":"ack"}\n' "$head_time" ;;
@@ -159,8 +161,12 @@ EOF
   cat >"$dir/bin/codex-request-stub.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'phase4a=%s args=[%s]\n' "${MERGEPATH_PHASE_4A_GATED:-unset}" "$*" >>"${CODEX_STUB_LOG:?}"
-echo '{"trigger_only":true,"trigger_posted":true,"trigger_requested":true}'
+printf 'phase4a=%s auto=%s args=[%s]\n' "${MERGEPATH_PHASE_4A_GATED:-unset}" "${MERGEPATH_CODEX_AUTO_TRIGGER:-unset}" "$*" >>"${CODEX_STUB_LOG:?}"
+posted=true
+if [ "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" = true ]; then posted=false
+elif [ "${CODEX_STUB_EXIT:-0}" = 0 ]; then touch "$CODEX_STUB_LOG.posted"; fi
+jq -nc --argjson posted "$posted" --arg blocked "${CODEX_STUB_BLOCKED:-}" \
+  '{trigger_only:true,trigger_posted:$posted,trigger_requested:true,blocked_reason:(if $blocked=="" then null else $blocked end)}'
 exit "${CODEX_STUB_EXIT:-0}"
 EOF
   chmod +x "$dir/bin/codex-request-stub.sh"
@@ -210,6 +216,9 @@ test_failover_fires() {
   # to hand a rate-limited head to Codex, so it passes the flag explicitly.
   grep -q -- '--allow-moving-head' "$dir/state/codex-stub.log" || fail "A: Codex helper not called with --allow-moving-head (#2166); log=$(cat "$dir/state/codex-stub.log")"
   grep -q '999' "$dir/state/codex-stub.log" || fail "A: PR number not forwarded; log=$(cat "$dir/state/codex-stub.log")"
+  [ "$(jqf "$dir" '.disposition')" = proceed_on_codex_clearance ] || fail "A: missing proceed-on-Codex disposition"
+  [ ! -s "$dir/state/sleeps.log" ] || fail "A: rate limit slept instead of handing off immediately"
+  [ ! -s "$dir/state/posts.log" ] || fail "A: posted a CodeRabbit retry"
   [ "$FAIL" -ne "$before" ] || pass "A: rate-limit fires Codex failover once (--trigger-only, phase4a, PR#) → exit 5, requested:true"
 }
 
@@ -221,6 +230,7 @@ test_failover_opt_out() {
   [ "$rc" = "5" ] || fail "B: expected exit 5, got $rc; err=$(cat "$dir/err.log")"
   [ "$(jqf "$dir" '.codex_failover_requested')" = "false" ] || fail "B: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected false"
   [ "$(stub_calls "$dir")" = "0" ] || fail "B: Codex helper invoked $(stub_calls "$dir") time(s) with knob off, expected 0"
+  [ "$(jqf "$dir" '.disposition')" = human_attention_required ] || fail "B: unavailable Codex did not request human attention"
   [ "$FAIL" -ne "$before" ] || pass "B: codex_failover_on_rate_limit:false suppresses the failover"
 }
 
@@ -244,7 +254,7 @@ test_failover_idempotent_across_retries() {
   # until the max_wait budget elapses (exit 4). The failover must fire once.
   dir=$(make_case "idempotent" 300 2 true)
   rc=$(run_case "$dir" 0)
-  [ "$rc" = "4" ] || fail "D: expected exit 4 (timeout on persistent NOTE), got $rc; err=$(tail -3 "$dir/err.log")"
+  [ "$rc" = "5" ] || fail "D: expected immediate exit 5 on persistent NOTE, got $rc; err=$(tail -3 "$dir/err.log")"
   [ "$(stub_calls "$dir")" = "1" ] || fail "D: Codex helper invoked $(stub_calls "$dir") time(s) across the run, expected exactly 1 (latch)"
   [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "D: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
   [ "$FAIL" -ne "$before" ] || pass "D: failover fires exactly once across a multi-poll run (idempotent FIRED latch)"
@@ -274,17 +284,268 @@ test_newformat_window_parsed() {
   local dir rc before=$FAIL
   dir=$(make_case "newfmt-window" 1800 1 true "$NEW_RATE_LIMIT_BODY")
   rc=$(run_case "$dir" 0)
-  [ "$rc" = "4" ] || fail "F: expected exit 4 (timeout after one retry), got $rc; err=$(tail -3 "$dir/err.log")"
-  grep -q 'window=780s' "$dir/err.log" || fail "F: expected parsed window=780s (13 min); log=$(grep -i window "$dir/err.log" || echo none)"
-  [ "$FAIL" -ne "$before" ] || pass "F: 'Next review available in: 13 minutes' parsed to a 780s window"
+  [ "$rc" = "5" ] || fail "F: expected immediate exit 5 without waiting a retry window, got $rc; err=$(tail -3 "$dir/err.log")"
+  [ ! -s "$dir/state/sleeps.log" ] || fail "F: a 13-minute window caused a sleep"
+  [ ! -s "$dir/state/posts.log" ] || fail "F: a CodeRabbit retry was posted"
+  [ "$(jqf "$dir" '.disposition')" = proceed_on_codex_clearance ] || fail "F: current head was not handed to Codex"
+  [ "$FAIL" -ne "$before" ] || pass "F: published 13-minute window never delays Codex substitution"
 }
 
+
+# #2139: drive the actual full clearance checker, then the fixture approval
+# step. CI is scoped out here; its production enforcement is covered separately.
+test_exact_head_substitution_approval() {
+  local fixture="$WORKDIR/substitution-approval" scenario rc expected reviewed before ordinary
+  mkdir -p "$fixture"
+mkdir -p "$fixture/bin"
+mkdir -p "$fixture/scripts/workflow"
+cp "$ROOT/scripts/codex-review-check.sh" "$fixture/scripts/codex-review-check.sh"
+ln -s "$ROOT/scripts/lib" "$fixture/scripts/lib"
+ln -s "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$fixture/scripts/workflow/resolve-codex-verdict-anchors.py"
+# A valid older-content carry-forward cannot satisfy exact-head substitution.
+cat > "$fixture/scripts/workflow/external_review_carryforward.sh" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"carried":true,"source_time":"2026-06-01T00:01:00Z","source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","fingerprint":"same-content"}'
+STUB
+chmod +x "$fixture/scripts/workflow/external_review_carryforward.sh"
+cat > "$fixture/policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+external_review_threshold: 300
+available_reviewers:
+  - nathanpayne-codex
+  - nathanpayne-claude
+codex:
+  enabled: true
+  bot_login: "chatgpt-codex-connector[bot]"
+  allow_phase_4b_substitute: true
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+YAML
+cat > "$fixture/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$APPROVAL_FIXTURE/calls"
+if [ "$1 $2" = 'pr review' ]; then touch "$APPROVAL_FIXTURE/approved"; exit 0; fi
+shift
+endpoint=""
+for arg in "$@"; do case "$arg" in repos/*|graphql) endpoint="$arg"; break ;; esac; done
+head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+case "$endpoint" in
+  repos/owner/repo/pulls/999) jq -nc --arg head "$head" '{user:{login:"nathanjohnpayne"},body:"Authoring-Agent: codex",head:{sha:$head,ref:"fix"},base:{ref:"main"},labels:[],additions:10,deletions:1}' ;;
+  repos/owner/repo/commits/*) printf '2026-06-01T00:00:00Z' ;;
+  repos/owner/repo/pulls/999/reviews)
+    reviews=$(case "$CLEARANCE_SCENARIO" in
+      clean-review|blocking-review) body='Completed clean review'; [ "$CLEARANCE_SCENARIO" != blocking-review ] || body='**P1** Real blocking finding'
+        jq -nc --arg head "$head" --arg body "$body" '[{id:9,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:"2026-06-01T00:01:00Z",commit_id:$head,state:"COMMENTED",body:$body}]' ;;
+      substitute-only) jq -nc --arg head "$head" '[{id:9,user:{login:"nathanpayne-claude"},submitted_at:"2026-06-01T00:01:00Z",commit_id:$head,state:"APPROVED",body:"External review approval"}]' ;;
+      *) printf '[]' ;;
+    esac)
+    case "${RE_REQUEST_CASE:-}" in
+      review_*) response_time='2026-06-01T00:01:00Z'
+        case "$RE_REQUEST_CASE" in *_recovered) response_time='2026-06-01T00:04:00Z' ;; esac
+        reviews=$(jq -nc --arg head "$head" --arg t "$response_time" '[{id:9,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$t,commit_id:$head,state:"COMMENTED",body:"Completed clean review"}]') ;;
+      verdict_*) reviews='[]' ;;
+    esac
+    if [ "${AUDIT_SCENARIO:-none}" = none ]; then printf '%s\n' "$reviews"; exit 0; fi
+    jq -nc --argjson reviews "$reviews" --arg head "$head" --arg mode "$AUDIT_SCENARIO" '
+      {id:7,user:{login:"nathanpayne-codex"},submitted_at:"2026-06-01T00:02:00Z",
+       commit_id:$head,state:"APPROVED",body:("CodeRabbit rate-limited; cleared by Codex on `"+$head+"`.")} as $approval
+      | ($approval
+          | if $mode == "before" then .submitted_at="2026-06-01T00:00:30Z"
+            elif $mode == "same-second" then .submitted_at="2026-06-01T00:01:00Z"
+            elif $mode == "after-recovery" then .submitted_at="2026-06-01T00:05:00Z"
+            elif $mode == "no-audit" then .body="Reviewed"
+            elif $mode == "wrong-sha" then .body="CodeRabbit rate-limited; cleared by Codex on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+            elif $mode == "wrong-head" then .commit_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            elif $mode == "malformed-time" then .submitted_at="unreadable"
+            elif $mode == "author" then .user.login="nathanjohnpayne"
+            else . end) as $selected
+      | $reviews+[$selected]
+      | if $mode == "withdrawn" or $mode == "malformed-later-opinion" then
+          .+[$approval|.id=8|.state="CHANGES_REQUESTED"
+             |.submitted_at=(if $mode == "withdrawn" then "2026-06-01T00:03:00Z" else null end)]
+        else . end' ;;
+  repos/owner/repo/issues/999/comments)
+    if [ -n "${RE_REQUEST_CASE:-}" ]; then
+      kind=${RE_REQUEST_CASE%%_*};fault=${RE_REQUEST_CASE#*_}
+      block_time='2026-06-01T00:03:00Z';response_time='2026-06-01T00:01:00Z';request_time='2026-06-01T00:02:00Z'
+      body='You have reached your Codex usage limits for code reviews.'
+      case "$fault" in
+        not_connected) body='To use Codex here, create a Codex account and connect to GitHub.' ;;
+        old-block) block_time='2026-06-01T00:00:30Z' ;;
+        recovered) response_time='2026-06-01T00:04:00Z' ;;
+        tie) block_time=$response_time;request_time=$response_time ;;
+      esac
+      jq -nc --arg kind "$kind" --arg head "$head" --arg response "$response_time" \
+        --arg request "$request_time" --arg block "$block_time" --arg body "$body" '
+        [{id:10,user:{login:"nathanjohnpayne"},created_at:$request,body:"@codex review"},
+         {id:11,user:{login:"chatgpt-codex-connector[bot]"},created_at:$block,body:$body}]
+        + (if $kind=="verdict" then [{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:$response,body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: "+$head)}] else [] end)'
+      exit 0
+    fi
+    case "$CLEARANCE_SCENARIO" in clean-review|blocking-review|substitute-only) printf '[]'; exit 0 ;; esac
+    case "$CLEARANCE_SCENARIO" in
+      usage_limit) body='You have reached your Codex usage limits for code reviews.' ;;
+      not_connected) body='To use Codex here, create a Codex account and connect to GitHub.' ;;
+      *) body='' ;;
+    esac
+    if [ -n "$body" ]; then
+      jq -nc --arg body "$body" '[{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-06-01T00:01:00Z",body:$body}]'
+      exit 0
+    fi
+    jq -nc --arg sha "${REVIEWED_HEAD:-$head}" '[{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-06-01T00:01:00Z",body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: " + $sha)}]' ;;
+  repos/owner/repo/pulls/999/comments|repos/owner/repo/issues/999/timeline) printf '[]' ;;
+  graphql) printf '{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED","reviewThreads":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
+  *) echo "unexpected fixture endpoint: $endpoint" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$fixture/bin/gh"
+  for scenario in clean-verdict clean-review stale-verdict blocking-review substitute-only; do
+    before=$FAIL; expected=0; reviewed=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    case "$scenario" in
+      stale-verdict) expected=1; reviewed=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+      blocking-review|substitute-only) expected=1 ;;
+    esac
+    # Each case gets a separate marker; no actual GitHub writes occur.
+    APPROVAL_FIXTURE="$fixture/$scenario"; export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE"
+    rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO="$scenario" REVIEWED_HEAD="$reviewed" \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODEX_REVIEW_CHECK_SKIP_CI=1 \
+      bash "$fixture/scripts/codex-review-check.sh" --require-codex-on-head 999 owner/repo \
+      >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    if [ "$rc" = 0 ]; then
+      PATH="$fixture/bin:$PATH" gh pr review 999 --repo owner/repo --approve \
+        --body 'CodeRabbit rate-limited; cleared by Codex on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
+    fi
+    [ "$rc" = "$expected" ] || fail "substitution $scenario: wanted $expected, got $rc; $(tail -3 "$APPROVAL_FIXTURE/err")"
+    if [ "$scenario" = stale-verdict ]; then
+      ordinary=0
+      GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO="$scenario" REVIEWED_HEAD="$reviewed" \
+        PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+        CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+        bash "$fixture/scripts/codex-review-check.sh" 999 owner/repo \
+        >"$APPROVAL_FIXTURE/control.out" 2>"$APPROVAL_FIXTURE/control.err" || ordinary=$?
+      [ "$ordinary" = 0 ] || fail "substitution stale-verdict: known-bad carry-forward control did not clear"
+    fi
+    if [ "$expected" = 0 ]; then
+      [ -f "$APPROVAL_FIXTURE/approved" ] \
+        && grep -q 'CodeRabbit rate-limited; cleared by Codex on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$APPROVAL_FIXTURE/calls" \
+        || fail "substitution $scenario: exact-head clearance did not reach an auditable approval"
+    else
+      [ ! -e "$APPROVAL_FIXTURE/approved" ] || fail "substitution $scenario: invalid evidence reached approval"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "substitution $scenario: actual clearance checker controls reviewer approval"
+  done
+  # A refusal delivered after trigger-only returned must stop a live wait.
+  cat > "$fixture/bin/sleep" <<'STUB'
+#!/bin/sh
+touch "$APPROVAL_FIXTURE/slept"
+exit 99
+STUB
+  chmod +x "$fixture/bin/sleep"
+  cat > "$fixture/bin/date" <<'STUB'
+#!/bin/sh
+if [ "$1" = +%s ]; then printf '1780272000\n'; else exec /bin/date "$@"; fi
+STUB
+  chmod +x "$fixture/bin/date"
+  for scenario in usage_limit not_connected; do
+    before=$FAIL;APPROVAL_FIXTURE="$fixture/late-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO="$scenario" AUDIT_SCENARIO=before \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=1800 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = 1 ] || fail "late $scenario: wanted blocked exit 1, got $rc"
+    grep -q human_attention_required "$APPROVAL_FIXTURE/err" || fail "late $scenario: missing immediate attention disposition"
+    [ ! -f "$APPROVAL_FIXTURE/slept" ] || fail "late $scenario: slept after a provider refusal"
+    [ "$FAIL" -ne "$before" ] || pass "late $scenario: real checker stops automatic substitution without sleeping"
+  done
+  # Existing response/request ordering decides whether a retained response
+  # still carries this request. A resolved older block is ordinary pending.
+  for scenario in review_usage_limit verdict_usage_limit review_not_connected verdict_not_connected review_old-block verdict_old-block review_recovered verdict_recovered review_tie; do
+    before=$FAIL;expected=1;audit=after;attention=true
+    case "$scenario" in *_old-block) attention=false ;; *_recovered) expected=0;audit=after-recovery;attention=false ;; esac
+    APPROVAL_FIXTURE="$fixture/re-request-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict RE_REQUEST_CASE="$scenario" AUDIT_SCENARIO="$audit" \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=1800 \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS=0 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = "$expected" ] || fail "re-request $scenario: wanted $expected, got $rc; $(tail -4 "$APPROVAL_FIXTURE/err")"
+    actual_attention=false;grep -q human_attention_required "$APPROVAL_FIXTURE/err" && actual_attention=true
+    [ "$actual_attention" = "$attention" ] || fail "re-request $scenario: wanted attention=$attention, got $actual_attention"
+    [ ! -f "$APPROVAL_FIXTURE/slept" ] || fail "re-request $scenario: unexpectedly slept"
+    if [ "$attention" = true ]; then
+      ordinary=0
+      GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict RE_REQUEST_CASE="$scenario" AUDIT_SCENARIO="$audit" \
+        PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+        CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+        bash "$fixture/scripts/codex-review-check.sh" 999 owner/repo \
+        >"$APPROVAL_FIXTURE/ordinary.out" 2>"$APPROVAL_FIXTURE/ordinary.err" || ordinary=$?
+      [ "$ordinary" = 1 ] || fail "re-request $scenario: ordinary merge-gate contract changed to $ordinary"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "re-request $scenario: selected response/request ordering controls immediate refusal"
+  done
+  # The merge probe runs after approval; the agent probe above runs before it.
+  for scenario in none before same-second after no-audit wrong-sha wrong-head withdrawn malformed-time malformed-later-opinion author; do
+    before=$FAIL;expected=1;[ "$scenario" != after ] || expected=0
+    APPROVAL_FIXTURE="$fixture/audit-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict AUDIT_SCENARIO="$scenario" \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=0 \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS=0 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = "$expected" ] || fail "approval audit $scenario: wanted $expected, got $rc; $(tail -3 "$APPROVAL_FIXTURE/err")"
+    [ "$FAIL" -ne "$before" ] || pass "approval audit $scenario: real automatic gate enforces later audited approval"
+  done
+}
+
+test_failover_exact_head_request_and_known_blocks() {
+  local dir rc reason before=$FAIL
+  dir=$(make_case "automatic-content-free" 300 0 true)
+  rc=$(MERGEPATH_CODEX_AUTO_TRIGGER=true run_case "$dir" 0)
+  [ "$rc" = 5 ] && [ -f "$dir/state/codex-stub.log.posted" ] \
+    && grep -q 'auto=false' "$dir/state/codex-stub.log" \
+    || fail "exact-head substitution was suppressed as content-free"
+  [ "$FAIL" -ne "$before" ] || pass "automatic failover requests this head despite inherited carry-forward suppression"
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "known-$reason" 300 0 true)
+    rc=$(CODEX_STUB_BLOCKED="$reason" run_case "$dir" 0)
+    [ "$rc" = 5 ] && [ "$(jqf "$dir" '.codex_failover_requested')" = false ] \
+      && [ "$(jqf "$dir" '.disposition')" = human_attention_required ] \
+      && [ ! -s "$dir/state/sleeps.log" ] \
+      || fail "known $reason block did not immediately require human attention"
+    [ "$FAIL" -ne "$before" ] || pass "known $reason yields human attention despite a posted request"
+  done
+}
+
+test_failover_exact_head_request_and_known_blocks
 test_failover_fires
 test_failover_opt_out
 test_failover_codex_disabled
 test_failover_idempotent_across_retries
 test_newformat_fires
 test_newformat_window_parsed
+test_exact_head_substitution_approval
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"
