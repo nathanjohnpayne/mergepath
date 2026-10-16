@@ -36,7 +36,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # ---------------------------------------------------------------------------
 # Test 1: --help renders without crashing.
 # ---------------------------------------------------------------------------
-if "$SCRIPT" --help 2>&1 | grep -q "Usage:"; then
+if "$SCRIPT" --help 2>&1 | grep "Usage:" >/dev/null; then
   pass "--help renders"
 else
   fail "--help did not include Usage:"
@@ -45,7 +45,7 @@ fi
 # ---------------------------------------------------------------------------
 # Test 2: --version emits the version string.
 # ---------------------------------------------------------------------------
-if "$SCRIPT" --version 2>&1 | grep -q "bootstrap-new-repo.sh"; then
+if "$SCRIPT" --version 2>&1 | grep "bootstrap-new-repo.sh" >/dev/null; then
   pass "--version renders"
 else
   fail "--version did not include script name"
@@ -126,7 +126,7 @@ out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
       --codex-app n --project new 2>&1)
 ec=$?
 set -e
-[ "$ec" -eq 2 ] && echo "$out" | grep -q "not empty" \
+[ "$ec" -eq 2 ] && echo "$out" | grep "not empty" >/dev/null \
   && pass "dirty target dir → exit 2 with diagnostic" \
   || fail "dirty target dir should exit 2 with 'not empty' diagnostic; got rc=$ec, out: $out"
 
@@ -157,16 +157,16 @@ if [ "$ec" -ne 0 ]; then
 else
   pass "dry-run with all flags completes (exit 0)"
 fi
-echo "$out" | grep -q "Starting stage: template-mirror" \
+echo "$out" | grep "Starting stage: template-mirror" >/dev/null \
   && pass "stage B stub ran" \
   || fail "stage B stub didn't run; got: $out"
-echo "$out" | grep -q "Starting stage: github-infra" \
+echo "$out" | grep "Starting stage: github-infra" >/dev/null \
   && pass "stage C stub ran" \
   || fail "stage C stub didn't run"
-echo "$out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+echo "$out" | grep "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" >/dev/null \
   && pass "stage D skipped via BOOTSTRAP_SKIP_STAGES" \
   || fail "stage D skip not logged; got: $out"
-echo "$out" | grep -q "skip board-and-summary (BOOTSTRAP_SKIP_STAGES)" \
+echo "$out" | grep "skip board-and-summary (BOOTSTRAP_SKIP_STAGES)" >/dev/null \
   && pass "stage E skipped via BOOTSTRAP_SKIP_STAGES" \
   || fail "stage E skip not logged"
 
@@ -195,17 +195,17 @@ resume_ec=$?
 set -e
 [ "$resume_ec" -eq 0 ] && pass "resume run exits 0" \
                        || fail "resume should exit 0; got $resume_ec"
-echo "$resume_out" | grep -q "skip template-mirror (already completed)" \
+echo "$resume_out" | grep "skip template-mirror (already completed)" >/dev/null \
   && pass "resume skipped template-mirror" \
   || fail "resume did not skip template-mirror; got: $resume_out"
-echo "$resume_out" | grep -q "skip github-infra (already completed)" \
+echo "$resume_out" | grep "skip github-infra (already completed)" >/dev/null \
   && pass "resume skipped github-infra" \
   || fail "resume did not skip github-infra"
-echo "$resume_out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+echo "$resume_out" | grep "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" >/dev/null \
   && pass "resume skipped firebase-and-codereview via BOOTSTRAP_SKIP_STAGES" \
   || fail "resume did not skip firebase-and-codereview"
 # Stage E is now real (#207 merged); banner is the standard "Starting stage:" form.
-echo "$resume_out" | grep -q "Starting stage: board-and-summary" \
+echo "$resume_out" | grep "Starting stage: board-and-summary" >/dev/null \
   && pass "resume ran board-and-summary" \
   || fail "resume did not run board-and-summary"
 
@@ -237,18 +237,18 @@ ex_ec=$?
 set -e
 [ "$ex_ec" -eq 0 ] && pass "--resume <stage> exits 0" \
                    || fail "--resume <stage> should exit 0; got $ex_ec"
-echo "$ex_out" | grep -q "skip github-infra (already completed)" \
+echo "$ex_out" | grep "skip github-infra (already completed)" >/dev/null \
   && pass "explicit-resume skipped github-infra" \
   || fail "explicit-resume did not skip github-infra"
-echo "$ex_out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+echo "$ex_out" | grep "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" >/dev/null \
   && pass "explicit-resume skipped firebase-and-codereview via BOOTSTRAP_SKIP_STAGES" \
   || fail "explicit-resume did not skip firebase-and-codereview"
-echo "$ex_out" | grep -q "Starting stage: template-mirror" \
+echo "$ex_out" | grep "Starting stage: template-mirror" >/dev/null \
   && fail "explicit-resume should have skipped template-mirror (came before github-infra)" \
   || pass "explicit-resume correctly skipped pre-target stages"
 # The rewind really is a rewind: board-and-summary is recorded as done
 # yet runs again, because the explicit stage overrode the last-line lookup.
-echo "$ex_out" | grep -q "Starting stage: board-and-summary" \
+echo "$ex_out" | grep "Starting stage: board-and-summary" >/dev/null \
   && pass "explicit-resume rewinds past recorded later stages" \
   || fail "explicit-resume did not re-run board-and-summary; got: $ex_out"
 
@@ -281,13 +281,13 @@ set -e
 [ "$ff_ec" -eq 1 ] \
   && pass "--resume naming an unrecorded stage exits 1" \
   || fail "fast-forward resume should exit 1; got $ff_ec; out: $ff_out"
-echo "$ff_out" | grep -q "refusing --resume github-infra" \
+echo "$ff_out" | grep "refusing --resume github-infra" >/dev/null \
   && pass "the refusal names the stage it will not skip" \
   || fail "no refusal diagnostic; out: $ff_out"
-echo "$ff_out" | grep -q "last completed stage per the state file: 'template-mirror'" \
+echo "$ff_out" | grep "last completed stage per the state file: 'template-mirror'" >/dev/null \
   && pass "the refusal points at the resume stage that IS recorded" \
   || fail "refusal does not name the last completed stage; out: $ff_out"
-echo "$ff_out" | grep -q "Starting stage: firebase-and-codereview" \
+echo "$ff_out" | grep "Starting stage: firebase-and-codereview" >/dev/null \
   && fail "the refused resume still ran later stages; out: $ff_out" \
   || pass "the refused resume ran no stage at all"
 
@@ -308,10 +308,10 @@ set -e
 [ "$ns_ec" -eq 1 ] \
   && pass "--resume with no state file at all exits 1" \
   || fail "resume with no state file should exit 1; got $ns_ec; out: $ns_out"
-echo "$ns_out" | grep -q "the state file records no completed stage" \
+echo "$ns_out" | grep "the state file records no completed stage" >/dev/null \
   && pass "the no-state refusal says so instead of naming a stage" \
   || fail "expected the no-completed-stage diagnostic; out: $ns_out"
-echo "$ns_out" | grep -q "BOOTSTRAP_SKIP_STAGES=template-mirror" \
+echo "$ns_out" | grep "BOOTSTRAP_SKIP_STAGES=template-mirror" >/dev/null \
   && pass "the refusal points at the flag that DOES skip a stage" \
   || fail "refusal does not mention BOOTSTRAP_SKIP_STAGES; out: $ns_out"
 
@@ -353,10 +353,10 @@ set -e
 [ "$rh_ec" -eq 3 ] \
   && pass "a failing stage exits 3" \
   || fail "failing stage should exit 3; got $rh_ec; out: $rh_out"
-echo "$rh_out" | grep -q -- "--resume template-mirror" \
+echo "$rh_out" | grep -- "--resume template-mirror" >/dev/null \
   && pass "the failure hint names the last completed stage, not the failed one" \
   || fail "hint does not name template-mirror; out: $rh_out"
-echo "$rh_out" | grep -q -- "--resume github-infra" \
+echo "$rh_out" | grep -- "--resume github-infra" >/dev/null \
   && fail "the failure hint still names the FAILED stage (it would skip it); out: $rh_out" \
   || pass "the failure hint never names the failed stage"
 # And the printed command is one the rewind-only guard accepts: run it.
@@ -370,10 +370,10 @@ rh2_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
           --codex-app n --project new --dry-run --resume template-mirror 2>&1)
 rh2_ec=$?
 set -e
-echo "$rh2_out" | grep -q "refusing --resume" \
+echo "$rh2_out" | grep "refusing --resume" >/dev/null \
   && fail "the wizard's own printed resume command was refused by its guard; out: $rh2_out" \
   || pass "the printed resume command passes the rewind-only guard"
-echo "$rh2_out" | grep -q "Starting stage: github-infra" \
+echo "$rh2_out" | grep "Starting stage: github-infra" >/dev/null \
   && pass "the printed resume command re-enters the stage that failed" \
   || fail "resume did not re-enter github-infra; out: $rh2_out"
 [ "$rh2_ec" -eq 3 ] \
@@ -407,7 +407,7 @@ set -e
   && pass "a failing stage with a spacey target-dir still exits 3" \
   || fail "expected exit 3; got $sq_ec; out: $sq_out"
 printf -v _expect_q_target '%q' "$space_target"
-echo "$sq_out" | grep -qF -- "--target-dir $_expect_q_target" \
+echo "$sq_out" | grep -F -- "--target-dir $_expect_q_target" >/dev/null \
   && pass "the resume hint shell-escapes a target-dir with a space/quote" \
   || fail "resume hint did not escape the target-dir; out: $sq_out"
 # The escaped command must be one bash can actually re-split back into
@@ -478,11 +478,11 @@ sb_ec=$?
 set -e
 [ "$sb_ec" -eq 0 ] && pass "--skip-board exits 0" \
                    || fail "--skip-board should exit 0; got $sb_ec"
-echo "$sb_out" | grep -q "project board skipped (--skip-board)" \
+echo "$sb_out" | grep "project board skipped (--skip-board)" >/dev/null \
   && pass "--skip-board skipped the Project v2 board sub-step" \
   || fail "--skip-board should skip project board sub-step; got: $sb_out"
 # Stage E itself still runs (banner + summary).
-echo "$sb_out" | grep -q "Starting stage: board-and-summary" \
+echo "$sb_out" | grep "Starting stage: board-and-summary" >/dev/null \
   && pass "--skip-board still runs the rest of stage E (summary)" \
   || fail "--skip-board should still run stage E for the summary; got: $sb_out"
 
@@ -509,7 +509,7 @@ sf_ec=$?
 set -e
 [ "$sf_ec" -eq 0 ] && pass "--skip-firebase exits 0" \
                    || fail "--skip-firebase should exit 0; got $sf_ec"
-echo "$sf_out" | grep -q "Firebase: scope=none" \
+echo "$sf_out" | grep "Firebase: scope=none" >/dev/null \
   && pass "--skip-firebase routes through Firebase scope=none branch" \
   || fail "--skip-firebase did not log Firebase scope=none; got: $sf_out"
 
@@ -594,7 +594,7 @@ ur_ec=$?
 set -e
 [ "$ur_ec" -ne 0 ] && pass "--resume with unknown stage → non-zero" \
                    || fail "unknown resume stage should fail; got exit 0 silently (CODEX P1)"
-echo "$ur_out" | grep -q "unknown resume stage" \
+echo "$ur_out" | grep "unknown resume stage" >/dev/null \
   && pass "unknown resume stage produces targeted diagnostic" \
   || fail "expected 'unknown resume stage' diagnostic; got: $ur_out"
 
@@ -616,7 +616,7 @@ ss_ec=$?
 set -e
 [ "$ss_ec" -ne 0 ] && pass "--resume with stale state-file stage → non-zero" \
                    || fail "stale state-file stage should fail; got 0"
-echo "$ss_out" | grep -q "state file" \
+echo "$ss_out" | grep "state file" >/dev/null \
   && pass "stale state-file diagnostic points at the file" \
   || fail "expected 'state file' diagnostic; got: $ss_out"
 
@@ -693,7 +693,7 @@ ip_ec=$?
 set -e
 [ "$ip_ec" -ne 0 ] && pass "interactive --project 12abc → non-zero" \
                   || fail "interactive prompt should reject '12abc'; got rc=$ip_ec, out: $ip_out"
-echo "$ip_out" | grep -q "invalid project value" \
+echo "$ip_out" | grep "invalid project value" >/dev/null \
   && pass "interactive --project rejection emits 'invalid project value'" \
   || fail "expected 'invalid project value' diagnostic; got: $ip_out"
 
@@ -711,7 +711,7 @@ ip_ok_ec=$?
 set -e
 [ "$ip_ok_ec" -eq 0 ] && pass "interactive --project 7 → exit 0" \
                      || fail "interactive '7' should succeed; got rc=$ip_ok_ec"
-echo "$ip_ok_out" | grep -q "project: *7" \
+echo "$ip_ok_out" | grep "project: *7" >/dev/null \
   && pass "interactive '7' captured as project=7" \
   || fail "expected 'project: 7' summary; got: $ip_ok_out"
 
@@ -746,7 +746,7 @@ if [ "$env_proj_ec" -eq 0 ]; then
 else
   fail "env BOOTSTRAP_INPUT_PROJECT=7 should succeed; got rc=$env_proj_ec, out: $env_proj_out"
 fi
-if echo "$env_proj_out" | grep -q "project: *7"; then
+if echo "$env_proj_out" | grep "project: *7" >/dev/null; then
   pass "env BOOTSTRAP_INPUT_PROJECT=7 preserved (not overwritten by prompt)"
 else
   fail "expected 'project: 7' summary; env value was overwritten. out: $env_proj_out"
