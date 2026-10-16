@@ -64,6 +64,7 @@ concurrency:
 
 jobs:
   resolve:
+    environment: reviewer-maintenance
     name: Resolve actioned bot threads
     # Backstop, not the primary control: with repository_dispatch as the
     # only trigger, github.ref_name is always the default branch. It exists

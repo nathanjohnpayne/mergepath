@@ -82,7 +82,6 @@ extract "$CR_WORKFLOW" coderabbit-severity-gate "Run scripts/coderabbit-severity
 extract "$CR_WORKFLOW" scheduled-sweep "Re-evaluate gate per PR and post check_run" "$T/steps/cr-sweep.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Installation budget guard (#2286)" "$T/steps/mcg-budget.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Run scripts/merge-clearance-gate.sh" "$T/steps/mcg-gate.sh"
-extract "$MCG_WORKFLOW" merge-clearance-gate "Close the required check_run (#841 phase 2)" "$T/steps/mcg-close.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Confirm the Checks-API lineage blocks while pending (#2247)" "$T/steps/mcg-lineage.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Report gate verdict" "$T/steps/mcg-report.sh"
 extract "$AC_WORKFLOW" evaluate-and-clear "Installation budget guard (#2286)" "$T/steps/ac-budget.sh"
@@ -102,6 +101,7 @@ cp "$ROOT/scripts/workflow/codex-p1-snapshot-retry.py" "$W/scripts/workflow/"
 cp "$ROOT/scripts/workflow/required-check-generation.sh" "$W/scripts/workflow/"
 cp "$ROOT/scripts/gate-api-lineage-blocking.sh" "$W/scripts/"
 cp "$ROOT/scripts/lib/gh-retry-helpers.sh" "$W/scripts/lib/"
+cp "$ROOT/scripts/workflow/auto-clear-event.sh" "$W/scripts/workflow/"
 chmod +x "$W/scripts/workflow/codex-p1-snapshot-retry.py" "$W/scripts/gate-api-lineage-blocking.sh"
 
 # stub <name> <rc-var> <pass line>: records "<name> <pr>" in GATE_LOG; mode
@@ -292,10 +292,10 @@ fresh() {
   rm -f "$T/state/exhausted"
 }
 # open_lease: the Checks-API hold the event job opened before its guard ran.
-open_lease() {  # <name> -> prints id
+open_lease() {  # <name> [trusted publisher summary] -> prints id
   (cd "$W" && PATH="$T/bin:$PATH" STATE="$T/state" CALLS="$T/state/calls.setup" EXHAUSTED="$T/state/none" \
     REPO=acme/widget gh api -X POST repos/acme/widget/check-runs -f name="$1" -f head_sha="$HEAD" \
-    -f status=in_progress --jq .id)
+    -f status=in_progress -f "output[summary]=${2:-}" --jq .id)
 }
 # step <script> [VAR=value ...]: run an extracted step in the work tree with
 # its own literal env, the fake gh, and the per-case overrides.
@@ -501,25 +501,24 @@ check "rate limit mid-run: the gate runs once, nothing after it, the generation 
   '[ "$rc" = 0 ] && [ "$(gates)" = "coderabbit-severity-gate.sh 41" ] && [ "$(newest "CodeRabbit unresolved blocking findings" | cut -d"|" -f1)" = in_progress ] && ! grep -q REJECTED "$T/state/calls" && [ "$(greens)" = 0 ]'
 
 echo "── Merge Clearance Gate (event job) ──"
-# mcg: run budget → gate (unless skipped) → close → lineage (when its pinned
-# condition holds) → report, threading step outputs the way Actions does.
+# #1547: the trusted publisher seeds the hold independently. The candidate
+# runs budget → gate (unless skipped) → causal lineage → native report only.
 mcg() {
   local id rc skip pending rl api=""
-  id=$(open_lease "Merge clearance gate")
+  id=$(open_lease "Merge clearance gate" "Publisher phase 1: evaluation queued for $HEAD. <!-- required-check-publisher:pending:9003:1 -->")
   : >"$T/state/output"
-  step "$T/steps/mcg-budget.sh" OPEN_ID="$id" "$@" || true
+  step "$T/steps/mcg-budget.sh" "$@" || true
   skip=$(output skip); local title; title=$(output title)
+  MCG_BACKOFF_TITLE="$title"
   : >"$T/state/output"
   if [ "$skip" != true ]; then
     step "$T/steps/mcg-gate.sh" PR_NUMBER=41 "$@" || true
   fi
   local grc gverdict gtitle
   grc=$(output rc); gverdict=$(output verdict); pending=$(output pending); rl=$(output rate_limited); gtitle=$(output budget_title)
-  step "$T/steps/mcg-close.sh" PR_NUMBER=41 CHECK_ID="$id" HEAD_SHA="$HEAD" PR_HEAD="$HEAD" RC="$grc" VERDICT="$gverdict" \
-    BUDGET_SKIP="$skip" BUDGET_SKIP_TITLE="$title" RATE_LIMITED="$rl" RATE_LIMITED_TITLE="$gtitle" "$@" || true
   : >"$T/state/output"
   if [ "$pending" = true ] || [ "$skip" = true ] || [ "$rl" = true ]; then
-    step "$T/steps/mcg-lineage.sh" HEAD_SHA="$HEAD" RUN_ID=9003 "$@" || true
+    step "$T/steps/mcg-lineage.sh" HEAD_SHA="$HEAD" RUN_ID=9003 RUN_ATTEMPT=1 "$@" || true
     api=$(output api_blocking)
   fi
   rc=0
@@ -528,32 +527,33 @@ mcg() {
   return "$rc"
 }
 fresh; mcg "$SHORT" NATIVE_RUN_ID=9003 && rc=0 || rc=$?
-check "below the threshold: no evaluation; the hold closes with the back-off red; no green" \
-  '[ -z "$(gates)" ] && [ "$(newest "Merge clearance gate")" = "completed|failure|Merge clearance gate — installation API budget exhausted (rc=2); re-evaluated after $RESET_ISO" ] && [ "$(greens)" = 0 ]'
-check "below the threshold: the native run is non-failing because the red blocks outside its suite" '[ "$rc" = 0 ]'
-check "below the threshold: phase 2 spends no read before closing the hold" '! grep -qE "^(PRVIEW|GET repos/acme/widget/commits/HEAD)" "$T/state/calls"'
-MCG_BACKOFF_TITLE=$(newest "Merge clearance gate" | cut -d'|' -f3)
+check "below the threshold: no evaluation or candidate API write; trusted hold stays pending" \
+  '[ -z "$(gates)" ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1)" = in_progress ] && [ "$(greens)" = 0 ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
+check "below the threshold: native non-failure requires the exact trusted causal hold" '[ "$rc" = 0 ]'
+check "below the threshold: no candidate close or its pre-write reads" '! grep -qE "^(PRVIEW|GET repos/acme/widget/commits/HEAD)" "$T/state/calls"'
+saved_mcg_backoff_title="$MCG_BACKOFF_TITLE"
 fresh; mcg "$SHORT" NATIVE_RUN_ID=9003 NATIVE_SUITE=2 && rc=0 || rc=$?
 check "below the threshold, shared suite: the native run fails" '[ "$rc" = 1 ] && [ "$(greens)" = 0 ]'
 fresh; mcg "$PLENTY" NATIVE_RUN_ID=9003 && rc=0 || rc=$?
-check "above the threshold: the gate evaluates and the hold closes green" \
-  '[ "$rc" = 0 ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|success" ]'
+check "above the threshold: actual native evaluation passes without candidate API publication" \
+  '[ "$rc" = 0 ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(greens)" = 0 ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
 fresh; mcg RL_REMAINING=fail NATIVE_RUN_ID=9003 && rc=0 || rc=$?
 check "unreadable budget: the gate evaluates as before" '[ "$rc" = 0 ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ]'
 fresh; mcg "$PLENTY" NATIVE_RUN_ID=9003 MCG_MODE=block && rc=0 || rc=$?
-check "above the threshold, a real block still fails the native run" '[ "$rc" = 1 ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|failure" ]'
+check "above the threshold, a real block still fails the native run" '[ "$rc" = 1 ] && [ "$(greens)" = 0 ]'
 fresh; mcg "$PLENTY" NATIVE_RUN_ID=9003 MCG_MODE=ratelimit && rc=0 || rc=$?
 check "rate limit mid-run: one gate call and no phase-2 read after it" \
   '[ "$(gates)" = "merge-clearance-gate.sh 41" ] && ! grep -qE "^(PRVIEW|GET repos/acme/widget/commits/HEAD)" "$T/state/calls" && [ "$(greens)" = 0 ]'
 fresh; mcg "$PLENTY" NATIVE_RUN_ID=9003 MCG_MODE=ratelimit RL_AFTER_FAIL=healthy EXHAUST_ONLY_TOKEN=nobody && rc=0 || rc=$?
-check "rate limit mid-run, writes still landing: the hold closes with the probe-reset back-off red and the native run is non-failing" \
-  '[ "$rc" = 0 ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|failure" ]'
+check "rate limit mid-run with readable exact causal hold: native non-failure leaves the trusted hold pending" \
+  '[ "$rc" = 0 ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1)" = in_progress ] && [ "$(greens)" = 0 ]'
 fresh
 id=$(open_lease "Merge clearance gate")
 : >"$T/state/exhausted"
 step "$T/steps/mcg-gate.sh" PR_NUMBER=41 MCG_MODE=ratelimit RL_AFTER_FAIL=healthy || true
 check "rate limit mid-run: the back-off title carries the refused probe's reset, not /rate_limit's" \
   '[ "$(output budget_title)" = "Merge clearance gate — installation API budget exhausted (rc=2); re-evaluated after $PROBE_ISO" ]'
+MCG_BACKOFF_TITLE="$saved_mcg_backoff_title"
 
 echo "── Auto-clear blocking labels ──"
 fresh; step "$T/steps/ac-budget.sh" "$SHORT" && rc=0 || rc=$?
@@ -567,7 +567,7 @@ check "the event job's later steps are gated on the guard and the stop" \
 check "the */5 sweep that re-evaluates a skipped PR carries no budget guard" \
   'ruby -ryaml -e '"'"'j = YAML.load_file(ARGV[0])["jobs"]["scheduled-sweep"]; exit(j.to_s.include?("installation-budget") ? 1 : 0)'"'"' "$AC_WORKFLOW"'
 ac_clear() {
-  step "$T/steps/ac-clear.sh" PR_NUMBERS="$(printf '41\n42')" PR_HEAD="$HEAD" GH_TOKEN=pat-token \
+  step "$T/steps/ac-clear.sh" CLEAR_PHASE=protect PR_NUMBERS="$(printf '41\n42')" PR_HEAD="$HEAD" GH_TOKEN=pat-token \
     WORKFLOW_TOKEN=installation-token EXHAUST_ONLY_TOKEN=installation-token AUTHOR_TOKEN= \
     QUEUE_POLICY_TOKEN= QUEUE_SOURCE_TOKEN= DEFAULT_BRANCH=main EVENT_NAME=workflow_run EVENT_ACTION=completed "$@"
 }

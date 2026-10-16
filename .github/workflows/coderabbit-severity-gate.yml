@@ -105,6 +105,11 @@ permissions:
 
 jobs:
   coderabbit-severity-gate:
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
     name: CodeRabbit unresolved blocking findings
     runs-on: ubuntu-latest
     # Event-driven path. The scheduled sweep below runs the same gate but

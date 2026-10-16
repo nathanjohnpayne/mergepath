@@ -228,21 +228,11 @@ EXPECTED_JOB_PERMISSIONS = {
     },
 }
 
-# The three gate workflows and the display-name contract each producer job
-# must retain (A5). Merge clearance and CodeRabbit are static. Codex selects
-# the required context for same-repository heads and a non-required handoff
-# name for fork and Dependabot heads, whose required context belongs
-# exclusively to the trusted archive relay (#1000). Deleting or drifting one of these jobs can
-# either remove a required producer or let an untrusted fork run occupy the
-# required context.
-#
-# Keyed by BASENAME and resolved against WORKFLOW_DIR so the assertion can
-# be aimed at a fixture directory, the same way the publisher and its
-# parent are aimed at fixture files.
-CODEX_FORK_AWARE_JOB_NAME = (
-    "${{ needs.archive-edited-feedback.outputs.requires_relay == 'true' && "
-    "'Codex P1 read-only archive handoff' || 'Codex P1 unresolved threads' }}"
-)
+# Merge clearance and CodeRabbit retain native required names. The adopted
+# #1547 extraction gives every Codex candidate a read-only handoff identity;
+# only the existing trusted archive relay carries its required context.
+# Resolve against WORKFLOW_DIR so fixtures still prove producer identity.
+CODEX_HANDOFF_JOB_NAME = "Codex P1 read-only archive handoff"
 
 NATIVE_PRODUCERS = {
     "merge-clearance-gate.yml": (
@@ -253,7 +243,7 @@ NATIVE_PRODUCERS = {
     "codex-p1-gate.yml": (
         "codex-p1-gate",
         "Codex P1 unresolved threads",
-        CODEX_FORK_AWARE_JOB_NAME,
+        CODEX_HANDOFF_JOB_NAME,
     ),
     "coderabbit-severity-gate.yml": (
         "coderabbit-severity-gate",
@@ -1174,9 +1164,9 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
         if not isinstance(needs_list, list) or "archive-edited-feedback" not in needs_list:
             bad("FAIL: [rcp native producer] %s job %r does not need"
                 % (path, job_key),
-                "      'archive-edited-feedback'. Its read-only-aware display name reads",
-                "      that job's requires_relay output; without the dependency the expression",
-                "      cannot reliably select the non-required handoff name.")
+                "      'archive-edited-feedback'. Its read-only handoff consumes that job's",
+                "      bound PR/head and relay outputs; without the dependency the candidate",
+                "      archive cannot be consumed under the verified source binding.")
 
 # ── A16 — the due threshold IS the gate sweep interval (#2220) ─────────
 #
@@ -1260,7 +1250,8 @@ NOMINATE_ENV = {
     "AUTOCLEAR_PRS": "${{ needs.publish.outputs.autoclear_prs }}",
 }
 PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}",
-                   "evidence_escalations": "${{ steps.publish.outputs.evidence_escalations }}"}
+                   "evidence_escalations": "${{ steps.publish.outputs.evidence_escalations }}",
+                   "native_recoveries": "${{ steps.publish.outputs.native_recoveries }}"}
 nominate = jobs.get(NOMINATE_JOB)
 if not isinstance(nominate, dict):
     bad("FAIL: [rcp auto-clear nomination] the publisher has no %r job mapping;" % NOMINATE_JOB,

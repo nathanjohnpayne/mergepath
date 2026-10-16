@@ -258,30 +258,9 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
-  # --- #845: the two-phase Checks-API publish must not regress -------------
-  #
-  # #843 made the event-driven job publish its verdict into the SAME
-  # Checks-API slot the sweep and dispatch write, because supersession is
-  # reliable only within that slot: a job-native completion can never retire a
-  # Checks-API entry. Nothing asserted that shape, so an edit could delete the
-  # scope, drop the PATCH, or move the POST back to the sweep alone and every
-  # check would stay green — #841 walks straight back in.
-  #
-  # Two properties make these assertions worth anything, and both are
-  # load-bearing rather than stylistic:
-  #
-  #   BLOCK SCOPING. Without it the sweep's own POST satisfies an assertion
-  #   about the event job, so the guard degrades into a whole-file grep that
-  #   passes on exactly the pre-#843 workflow it exists to reject.
-  #
-  #   COMMENT STRIPPING. #843 deliberately documents this design in prose at
-  #   the call sites, so an unstripped `grep -qF` matches the explanation
-  #   after the code implementing it is gone. That is the #689 lesson, already
-  #   encoded as grep_nocomment_q in tests/test_465_fail_closed.sh.
-  #
-  # Assertion H above is deliberately untouched: keeping the job NAME is what
-  # lets this check pass against #843 unchanged, and it is why the workflow
-  # and this check did not have to ship atomically.
+  # #1547: the candidate native job is read-only. Preserve scoped,
+  # comment-stripped enforcement for the trusted sweep and dispatch writers;
+  # the parsed tier pins native reads, checkout, and causal pending proof.
 
   # Print the lines of one job's block: from `  <key>:` to the next job key.
   mcg_job_block() {  # <workflow> <job-key>
@@ -299,6 +278,8 @@ if [ -f "$WORKFLOW" ]; then
   # deleted POST or PATCH behind the code it replaced. Every string these
   # assertions match is free of `#`, so removing from the first whitespace-`#`
   # cannot swallow a legitimate target.
+  # Comment stripping follows the grep_nocomment_q precedent in
+  # tests/test_465_fail_closed.sh: prose must not satisfy a live assertion.
   mcg_strip() {  # <block>
     printf '%s\n' "$1" | grep -v '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//'
   }
@@ -331,17 +312,6 @@ if [ -f "$WORKFLOW" ]; then
     ' <<<"$1"
   }
 
-  # Print one step block from a job, from its `- name: <label>` to the next
-  # step at the same indent. Per-step scope matters: an assertion over the
-  # whole job passes when phase 2 supplies a value phase 1 has lost.
-  mcg_step() {  # <block> <step-name-substring>
-    awk -v want="$2" '
-      index($0, "- name: " want) { inblk = 1; print; next }
-      inblk && /^[[:space:]]*- name:/ { exit }
-      inblk { print }
-    ' <<<"$1"
-  }
-
   mcg_evt_block="$(mcg_job_block "$WORKFLOW" merge-clearance-gate)"
   mcg_evt="$(mcg_strip "$mcg_evt_block")"
 
@@ -352,43 +322,16 @@ if [ -f "$WORKFLOW" ]; then
     echo "      whole-file grep that the pre-#843 workflow satisfies."
     FAILED=1
   else
-    if ! grep -qE '^[[:space:]]+checks:[[:space:]]*write[[:space:]]*$' \
-         <<<"$(mcg_submap "$mcg_evt" permissions)"; then
-      echo "FAIL: the merge-clearance-gate job must grant job-scoped 'checks: write' (#843)."
-      echo "      Without it the phase-1 POST 403s on every same-repo PR and the event"
-      echo "      path stops publishing into the Checks-API slot entirely."
+    # #1547 moves candidate-controlled publication to the existing trusted
+    # publisher. The native job may read its exact parent-bound hold, never
+    # mint or complete a Checks-API run itself. Parsed permission and caller
+    # bindings below carry the authority boundary; these text checks catch
+    # accidental reintroduction of the retired write path.
+    if grep -qE 'gh api.*(-X|--method)[ =]+(POST|PATCH|PUT|DELETE)|rcg_(open|close)' <<<"$mcg_evt"; then
+      echo "FAIL: [#1547 read-only native] the event job must not publish Checks-API writes."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt" '-f status="in_progress"' \
-       || ! mcg_has "$mcg_evt" 'gh api -X POST "repos/$REPO/check-runs"'; then
-      echo "FAIL: the merge-clearance-gate job must open the required check_run with"
-      echo "      status=in_progress BEFORE evaluating (#843 phase 1). That pending entry"
-      echo "      is what makes every later failure — checkout, gate crash, runner death,"
-      echo "      a failed PATCH — fail CLOSED instead of leaving a stale verdict standing."
-      FAILED=1
-    fi
-    # The PATCH must target the run phase 1 opened (Codex P2 on #849).
-    # Binding CHECK_ID to something else — github.run_id, say — satisfies an
-    # endpoint-prefix check while the PATCH 404s through its retries and the
-    # required context stays pending until a later sweep supersedes it.
-    if ! mcg_has "$mcg_evt" 'CHECK_ID: ${{ steps.open.outputs.id }}'; then
-      echo "FAIL: the phase-2 step must bind CHECK_ID to \${{ steps.open.outputs.id }},"
-      echo "      the run phase 1 opened. Any other identifier makes the PATCH miss and"
-      echo "      leaves the required context pending (#843)."
-      FAILED=1
-    fi
-    if ! mcg_has "$mcg_evt" 'gh api -X PATCH "repos/$REPO/check-runs/'; then
-      echo "FAIL: the merge-clearance-gate job must close the check_run it opened (#843"
-      echo "      phase 2). Without the PATCH the required context stays PENDING forever."
-      FAILED=1
-    fi
-    if ! mcg_has "$mcg_evt" 'CHECK_NAME: "Merge clearance gate"' \
-       || ! mcg_has "$mcg_evt" '-f name="$CHECK_NAME"'; then
-      echo "FAIL: the merge-clearance-gate job must publish under CHECK_NAME"
-      echo "      \"Merge clearance gate\" — the required-check context string."
-      FAILED=1
-    fi
-    # Three producers: event, sweep, dispatch — each verified IN ITS OWN JOB
+    # The trusted sweep and dispatch remain Checks-API producers — each verified IN ITS OWN JOB
     # SCOPE, and each required to both POST and publish under CHECK_NAME.
     #
     # Two weaker versions of this were caught in review and are worth naming,
@@ -398,19 +341,17 @@ if [ -f "$WORKFLOW" ]; then
     # publishing without naming: any unrelated check-run POST preserves the
     # count after a real producer stops emitting "Merge clearance gate"
     # (CodeRabbit Major). Only the conjunction, per scope, says what is meant —
-    # that each of the three trigger paths still writes THIS slot.
+    # that each trusted trigger path still writes THIS slot.
     #
-    # Why it matters that all three survive: the sweep and dispatch are the
-    # only refreshers for the no-event transitions (a 👍 reaction, a UI thread
-    # resolve, a GITHUB_TOKEN relabel), and the event job is the only one bound
-    # to the PR head as it moves. Lose any one and a stale verdict persists on
-    # some path.
-    for mcg_producer in merge-clearance-gate scheduled-sweep dispatch-recheck; do
+    # The sweep and dispatch refresh no-event transitions (a 👍 reaction, a UI
+    # thread resolve, a GITHUB_TOKEN relabel). The read-only native path uses
+    # the existing independent publisher's hold as its causal proof.
+    for mcg_producer in scheduled-sweep dispatch-recheck; do
       mcg_pblock_raw="$(mcg_job_block "$WORKFLOW" "$mcg_producer")"
       mcg_pblock="$(mcg_strip "$mcg_pblock_raw")"
       if [ -z "$mcg_pblock_raw" ]; then
-        echo "FAIL: $WORKFLOW is missing the '$mcg_producer' job — all three trigger"
-        echo "      paths (event, scheduled sweep, dispatch-recheck) must publish the"
+        echo "FAIL: $WORKFLOW is missing the '$mcg_producer' job — both trusted trigger"
+        echo "      paths (scheduled sweep, dispatch-recheck) must publish the"
         echo "      required check_run (#843)."
         FAILED=1
         continue
@@ -571,164 +512,29 @@ if [ -f "$WORKFLOW" ]; then
         FAILED=1
       fi
     done
-    if ! mcg_has "$mcg_evt" 'github.event.pull_request.head.sha'; then
-      echo "FAIL: the merge-clearance-gate job must bind its check_run to"
-      echo "      github.event.pull_request.head.sha (#843)."
-      FAILED=1
-    fi
-    # EVERY HEAD_SHA assignment must bind to the PR head — an allowlist, not a
-    # denylist. This assertion is on its third shape and the first two failed
-    # the same way: rejecting `head_sha="${{ github.sha }}"` missed
-    # `HEAD_SHA: ${{ github.sha }}` (Codex), and rejecting `github.sha` missed
-    # `github.event.pull_request.base.sha` (Codex again). Both slipped through
-    # because phase 2's unchanged line kept satisfying the positive search.
-    # Enumerating wrong spellings cannot terminate; requiring every binding to
-    # be the right one does.
-    # Anchored to a YAML key at line start: an unanchored 'HEAD_SHA:' also
-    # matches the shell parameter expansion ${HEAD_SHA:0:7} inside a message
-    # string, which is not a binding and made this reject the real workflow.
-    # Exact expression, not containment (Codex P2 on #849). A line reading
-    # HEAD_SHA: literal-github.event.pull_request.head.sha contains the wanted
-    # text and no github.sha, so a containment allowlist accepted it while the
-    # publisher submitted an invalid head_sha and its POST failed. Anchoring
-    # both ends is what makes an allowlist actually exclusive.
-    # Phase 1 must bind HEAD_SHA itself. Asserting over the whole job passes
-    # when only phase 2 still has one (Codex P2 on #849) — and phase 1 then
-    # expands an unset HEAD_SHA under set -u and exits BEFORE opening the
-    # in-progress run, which is precisely the fail-closed property this fence
-    # exists to protect.
-    if ! grep -qE '^[[:space:]]*HEAD_SHA:' \
-         <<<"$(mcg_step "$mcg_evt" 'Open the required check_run')"; then
-      echo "FAIL: the phase-1 step must bind HEAD_SHA itself (#843). With only"
-      echo "      phase 2 binding it, phase 1 expands an unset variable under set -u"
-      echo "      and exits before opening the in-progress run — so nothing retires"
-      echo "      the previous verdict and the publish stops failing closed."
-      FAILED=1
-    fi
     mcg_bad_headsha="$(grep -E '^[[:space:]]*HEAD_SHA:' <<<"$mcg_evt" \
       | grep -vE '^[[:space:]]*HEAD_SHA:[[:space:]]*\$\{\{[[:space:]]*github\.event\.pull_request\.head\.sha[[:space:]]*\}\}[[:space:]]*$' || true)"
     if [ -n "$mcg_bad_headsha" ]; then
-      echo "FAIL: every HEAD_SHA assignment in the merge-clearance-gate job must bind"
-      echo "      to github.event.pull_request.head.sha. Offending line(s):"
-      printf '%s\n' "$mcg_bad_headsha" | sed 's/^/        /'
-      echo "      A check_run bound to the merge commit (github.sha) or the base"
-      echo "      (base.sha) is absent from the commit branch protection evaluates."
+      echo "FAIL: every HEAD_SHA assignment in the merge-clearance-gate job must bind to github.event.pull_request.head.sha."
       FAILED=1
     fi
     if mcg_has "$mcg_evt" 'github.sha'; then
-      echo "FAIL: the merge-clearance-gate job must NOT bind to github.sha. On a"
-      echo "      pull_request event that is the refs/pull/N/merge commit, which branch"
-      echo "      protection never consults — the required context would be ABSENT on"
-      echo "      every head: a permanent block, fleet-wide, with no partial degradation."
+      echo "FAIL: the merge-clearance-gate job must NOT bind to github.sha."
       FAILED=1
     fi
     if ! mcg_has "$mcg_evt" 'Merge clearance: PASS'; then
-      echo "FAIL: the merge-clearance-gate job must require the 'Merge clearance: PASS'"
-      echo "      verdict sentinel before publishing success (#843). Without it a call"
-      echo "      site that lands in a query mode publishes an unearned green: those"
-      echo "      modes also exit 0 but print only true/false."
-      FAILED=1
-    fi
-    # The condition's SENSE, not just its presence (Codex P2 on #849).
-    # Inverting it to == '' skips phase 2 exactly when a run was opened,
-    # leaving the required context pending on every successful evaluation.
-    if ! mcg_has "$mcg_evt" "steps.open.outputs.id != ''"; then
-      echo "FAIL: the phase-2 step must run when phase 1 DID open a run"
-      echo "      (steps.open.outputs.id != ''). Inverting that condition leaves the"
-      echo "      required context pending on every evaluation that succeeded."
-      FAILED=1
-    fi
-    if ! mcg_has "$mcg_evt" '!cancelled()'; then
-      echo "FAIL: the merge-clearance-gate phase-2 step must be guarded by !cancelled()"
-      echo "      (#843) so a cancelled run leaves the required context PENDING (blocking)"
-      echo "      rather than publishing a verdict it never computed."
-      FAILED=1
-    fi
-    if mcg_has "$mcg_evt" 'if: always()'; then
-      echo "FAIL: the merge-clearance-gate job must not use if: always() for the phase-2"
-      echo "      publish — on cancellation it would publish a conclusion from an"
-      echo "      evaluation that did not finish. Use !cancelled() (#843)."
-      FAILED=1
-    fi
-    # Phase 2 must consume the GATE STEP's outputs (Codex P2 on #849).
-    # Asserting `case "$RC" in` proves a mapping exists over whatever RC holds;
-    # rebinding the step env to RC: 0 / VERDICT: pass satisfies it while the
-    # conclusion stops depending on the evaluation entirely.
-    # Scoped to the phase-2 STEP, not the job. The event job binds RC and
-    # VERDICT twice — once here and once in "Report gate verdict" — so a
-    # job-scoped assertion is satisfied by the other one while this step's
-    # binding is replaced by a constant. Same per-step lesson as HEAD_SHA.
-    mcg_p2="$(mcg_step "$mcg_evt" 'Close the required check_run')"
-    if ! mcg_has "$mcg_p2" 'RC: ${{ steps.gate.outputs.rc }}' \
-       || ! mcg_has "$mcg_p2" 'VERDICT: ${{ steps.gate.outputs.verdict }}'; then
-      echo "FAIL: the phase-2 step must take RC and VERDICT from steps.gate.outputs."
-      echo "      Any other binding decouples the published conclusion from the gate"
-      echo "      evaluation while leaving the mapping visibly intact (#843)."
-      FAILED=1
-    fi
-    if ! mcg_has "$mcg_evt" 'case "$RC" in'; then
-      echo "FAIL: the merge-clearance-gate job must map the gate exit code to a"
-      echo "      conclusion through an explicit case (#843), so rc 0-without-PASS and"
-      echo "      rc 2 cannot collapse into success."
-      FAILED=1
-    fi
-    # Conspicuousness fence: exactly one place may set a success conclusion, so
-    # adding a second green path stays a visible diff on a protected file
-    # rather than a one-token edit. This does not make tampering impossible —
-    # the workflow is PR-authored, which is #845's open restructure — it keeps
-    # it loud.
-    mcg_success_assigns="$(grep -cF 'conclusion="success"' <<<"$mcg_evt" || true)"
-    if [ "$mcg_success_assigns" -ne 1 ]; then
-      echo "FAIL: the merge-clearance-gate job assigns conclusion=\"success\""
-      echo "      $mcg_success_assigns times; expected exactly 1 (#845). More than one"
-      echo "      green path makes an added bypass indistinguishable from a refactor;"
-      echo "      zero means a passing evaluation can never close the check as success,"
-      echo "      leaving it pending or red until a later sweep supersedes it."
+      echo "FAIL: the merge-clearance-gate job must require the verdict sentinel before native success."
       FAILED=1
     fi
   fi
 
-  # --- #850: structural assertions over the PARSED document ----------------
-  #
-  # ADDITIVE. Everything above stays: the exact `-f` flags inside a `run:` body
-  # are shell, not YAML, so a parse cannot see them. What a parse can see, and
-  # text matching cannot express at all, is POSITION and REACHABILITY:
-  #
-  #   PHASE-1 POSITION. The assertions above prove the POST and
-  #   status=in_progress occur SOMEWHERE in the job block. Moving that step
-  #   below the checkout, or giving it a step-level `if:`, satisfies every one
-  #   of them — and any earlier failure then happens BEFORE the pending entry
-  #   retires the previous synthetic verdict, which is the only reason phase 1
-  #   exists.
-  #
-  #   PRODUCER ELIGIBILITY. `if: false` on scheduled-sweep leaves the
-  #   top-level `schedule:` trigger and every matched string intact, so the
-  #   producer loop above passes while the no-event transitions (a 👍 reaction,
-  #   a UI thread resolve, a GITHUB_TOKEN relabel) stop refreshing the required
-  #   context.
-  #
-  # The other two properties are #849 holes that a parse closes cheaply: the
-  # phase-2 step's own HEAD_SHA binding (a job-scoped grep is satisfied by
-  # phase 1's), and GH_TOKEN on every producer step that runs a shell (an
-  # unbound token makes a gh call fall back to no credentials and the publish
-  # 401s; #854 replaced "every step that LOOKS like it invokes gh" with the
-  # decidable universal-plus-pinned-exemptions form).
-  #
-  # Parser posture, and the two cases are NOT the same:
-  #   - PyYAML ABSENT is an environment gap → loud SKIP, exit 0. Same idiom as
-  #     scripts/ci/check_workflow_parsers (its agent-review.yml parse tier) and
-  #     scripts/ci/check_auto_clear_workflow: a YAML parser is never a hard
-  #     dependency of scripts/ci/check_*. GitHub-hosted runners ship PyYAML, so
-  #     enforcement is real in CI.
-  #   - The DOCUMENT failing to parse is a defect → hard FAIL naming the parse
-  #     error. Silently matching nothing would let a broken edit land green and
-  #     surface only when Actions rejects the workflow at schedule time.
-  # The yq tier those precedents try first is deliberately not used here: they
-  # probe validity (one expression), these are assertions over the document,
-  # and a yq spelling would be a second implementation to keep in sync.
+  # Parsed structure enforces native read-only authority, trusted checkout,
+  # exact run/head/attempt proof bindings, and eligibility/token requirements
+  # for every route. Shell reachability remains the runtime tests' concern.
+  # Missing PyYAML is a loud environment skip; malformed YAML is a failure.
   if ! python3 -c "import yaml" >/dev/null 2>&1; then
     echo "  SKIP: PyYAML unavailable — the #850 structural assertions did NOT run."
-    echo "        Install PyYAML to enforce phase-1 position + producer eligibility."
+    echo "        Install PyYAML to enforce native read authority + producer eligibility."
   elif ! python3 - "$WORKFLOW" <<'PY'
 import re
 import sys
@@ -736,7 +542,7 @@ import sys
 import yaml
 
 WORKFLOW = sys.argv[1]
-# The three jobs that publish the required context, same set as the text loop.
+# All native/trusted routes retain eligibility and per-step token checks.
 PRODUCERS = ("merge-clearance-gate", "scheduled-sweep", "dispatch-recheck")
 # Exact-match allowlists, never containment (the #849 lesson, third shape): a
 # value that CONTAINS the wanted expression — `literal-${{ ... }}` — satisfies
@@ -973,72 +779,43 @@ if "workflow_run" in trigger_keys:
         "      the event job on main's tip and doubles the publisher pass per lint",
         "      completion. Add CI-side parents to the publisher instead.")
 
-# Property 1 — phase 1 is the FIRST step, unconditional, with its own bindings.
+# Property 1 — the candidate native job is read-only. The existing trusted
+# publisher owns the causal hold; candidate checkout position no longer grants
+# publication authority. A trusted, unconditional first checkout still ensures
+# that the evaluator and lineage probe come from the default branch.
 event_job = jobs.get("merge-clearance-gate")
-if event_job is not None and not isinstance(event_job, dict):
-    # A non-mapping value (a YAML list or scalar) is truthy, so `or {}` does
-    # not normalise it and the .get below would raise — turning a malformed
-    # workflow into a traceback with NO named property, unlike every other
-    # malformed-input path here. The producer loop reports the not-a-mapping
-    # cause for this key; normalising lets the phase-1/phase-2 messages fire
-    # with accurate text instead of crashing before any of them print.
+if not isinstance(event_job, dict):
     event_job = None
 steps = (event_job or {}).get("steps") or []
-if not steps:
-    bad("FAIL: [#850 phase-1 position] the merge-clearance-gate job declares no",
-        "      steps, so nothing opens the in-progress check_run.")
-elif not isinstance(steps[0], dict):
-    bad("FAIL: [#850 phase-1 position] the FIRST entry of merge-clearance-gate's",
-        "      steps is not a mapping, so nothing opens the in-progress check_run.")
+if not steps or not isinstance(steps[0], dict):
+    bad("FAIL: [#1547 trusted checkout] the native job's FIRST step must be its trusted checkout.")
 else:
     first = steps[0]
-    label = first.get("name") or "<unnamed>"
-    body = strip_comments(first.get("run") or "")
-    # EXACT identity AND content, on the SAME step (cross-agent P1 on #852:
-    # containment admitted a decoy named `Dry-run Open the required
-    # check_run`). The canonical name is pinned whole; a rename must update
-    # this check in the same diff.
-    # SCOPE (cross-agent round 4): this tier proves placement, identity,
-    # bindings and conditions — YAML-decidable properties that catch
-    # accidental drift. It does not prove the commands EXECUTE: shell
-    # reachability inside run: (an early exit, an if-false guard) is not
-    # decidable from workflow structure, and chasing it with string
-    # assertions does not terminate (#849). Workflow edits are themselves
-    # Phase-4-reviewed; a parse-the-shell rung is filed on #854.
-    PHASE1_CMDS = ('gh api -X POST "repos/$REPO/check-runs"',
-                   '-f head_sha="$HEAD_SHA"',
-                   '-f status="in_progress"', '-f name="$CHECK_NAME"')
-    if (first.get("name") != "Open the required check_run (#841 phase 1)"
-            or any(cmd not in body for cmd in PHASE1_CMDS)):
-        bad("FAIL: [#850 phase-1 position] the FIRST step of merge-clearance-gate is",
-            "      %r, which is not the phase-1 publisher: it must carry the exact" % label,
-            "      POST command set (gh api -X POST to check-runs, status=in_progress,",
-            "      name=$CHECK_NAME) in its own run body. Every failure after this",
-            "      point fails CLOSED only if the pending entry already retired the",
-            "      previous verdict, so phase 1 must come first and must actually",
-            "      publish.")
+    checkout = first.get("with") or {}
+    if not str(first.get("uses") or "").startswith("actions/checkout@") \
+            or checkout.get("ref") != "${{ github.event.repository.default_branch }}" \
+            or checkout.get("persist-credentials") is not False:
+        bad("FAIL: [#1547 trusted checkout] the FIRST step must check out the default branch without persisted credentials.")
     if "if" in first:
-        bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
-            "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
-            "      the run it guards is the one that needed to retire a stale verdict.")
-    env = first.get("env") or {}
-    absent = [name for name in ("HEAD_SHA", "GH_TOKEN") if name not in env]
-    if absent:
-        bad("FAIL: [#850 phase-1 env] the phase-1 step %r does not bind %s in its" % (label, ", ".join(absent)),
-            "      env. Under set -u an unbound HEAD_SHA exits before the POST, and an",
-            "      unbound GH_TOKEN makes it 401 — either way nothing opens the run.")
-    # Values, not just keys (cross-agent P1 on #852). The text layer's
-    # allowlist is universal over HEAD_SHA lines and the gh-token loop below
-    # value-checks GH_TOKEN, but the structural tier mirrors both so this
-    # step's bindings are provably right without cross-layer reasoning.
-    if "HEAD_SHA" in env and env["HEAD_SHA"] not in HEAD_SHA_OK:
-        bad("FAIL: [#850 phase-1 env] the phase-1 step binds HEAD_SHA to %r;" % env["HEAD_SHA"],
-            "      it must be exactly ${{ github.event.pull_request.head.sha }} or",
-            "      the pending entry opens on a commit branch protection never",
-            "      consults.")
-    if "GH_TOKEN" in env and env["GH_TOKEN"] not in GH_TOKEN_OK:
-        bad("FAIL: [#850 phase-1 env] the phase-1 step binds GH_TOKEN to %r;" % env["GH_TOKEN"],
-            "      the only accepted value is ${{ secrets.GITHUB_TOKEN }}.")
+        bad("FAIL: [#1547 trusted checkout] the trusted checkout must be unconditional.")
+for scope, permissions in (("workflow", doc.get("permissions")),
+                           ("native job", (event_job or {}).get("permissions"))):
+    if not isinstance(permissions, dict) or any(value not in ("read", "none") for value in permissions.values()):
+        bad("FAIL: [#1547 read-only native] %s permissions must be an explicit read-only map." % scope)
+if not isinstance((event_job or {}).get("permissions"), dict) \
+        or any((event_job or {}).get("permissions", {}).get(key) != "read"
+               for key in ("contents", "pull-requests", "issues", "checks")):
+    bad("FAIL: [#1547 read-only native] the native job must explicitly grant its contents/pull-requests/issues/checks reads.")
+for step in steps:
+    if not isinstance(step, dict):
+        bad("FAIL: [#1547 read-only native] every native step must be a mapping.")
+        continue
+    body = strip_comments(str(step.get("run") or ""))
+    if re.search(r"gh api.*(?:-X|--method)[ =]+(?:POST|PATCH|PUT|DELETE)|rcg_(?:open|close)", body):
+        bad("FAIL: [#1547 read-only native] a native step reintroduces a Checks-API write.")
+    if step.get("id") == "open" or step.get("name") in (
+            "Open the required check_run (#841 phase 1)", "Close the required check_run (#841 phase 2)"):
+        bad("FAIL: [#1547 read-only native] retired candidate publication steps must remain absent.")
 
 # Property 2 — every producer is reachable on its own trigger.
 for key in PRODUCERS:
@@ -1114,22 +891,14 @@ for key in PRODUCERS:
 # while that expression is false in a job with no `find` step — every pinned
 # condition is valid only where its referenced outputs exist.
 STEP_IF_ALLOWED = {
-    ("scheduled-sweep", "Re-evaluate gate per PR and post check_run"):
-        "steps.find.outputs.prs != ''",
-    ("merge-clearance-gate", "Close the required check_run (#841 phase 2)"):
-        "${{ !cancelled() && steps.open.outputs.id != '' }}",
-    # #2247: the lineage confirmation runs only for the script's explicit
-    # pending verdict on a run that opened its own Checks-API hold. Any other
-    # condition either skips it (fail closed: the native run stays red) or
-    # runs it where there is no hold of this run's own to rely on.
-    # #2286: and for a run that did not evaluate (the budget guard skipped
-    # it, or the script failed on the exhausted installation budget), whose
-    # phase 2 closed its own hold with the publisher's back-off red.
-    ("merge-clearance-gate", "Confirm the Checks-API lineage blocks while pending (#2247)"):
-        "${{ (steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true') && steps.open.outputs.id != '' }}",
-    # #2286: the gate step is skipped only when the budget guard said so.
     ("merge-clearance-gate", "Run scripts/merge-clearance-gate.sh"):
         "${{ steps.budget.outputs.skip != 'true' }}",
+    ("scheduled-sweep", "Re-evaluate gate per PR and post check_run"):
+        "steps.find.outputs.prs != ''",
+    # #2247/#1547: only an explicit pending verdict asks the read-only
+    # helper to prove the existing publisher's exact causal parent hold.
+    ("merge-clearance-gate", "Confirm the Checks-API lineage blocks while pending (#2247)"):
+        "${{ steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true' }}",
 }
 for key in PRODUCERS:
     job = jobs.get(key)
@@ -1164,35 +933,17 @@ for key in PRODUCERS:
                 "      still runs but this step may never, so that trigger path can",
                 "      stop publishing while every string assertion stays satisfied.")
 
-# Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
-# for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
-close_step = step_named(event_job or {}, "Close the required check_run (#841 phase 2)")
-if close_step == "ambiguous":
-    bad("FAIL: [#850 phase-2 head binding] more than one step in",
-        "      merge-clearance-gate carries the exact close-step name; a decoy",
-        "      sharing the name can shadow the real publisher's bindings.")
-    close_step = None
-if close_step is None:
-    bad("FAIL: [#850 phase-2 head binding] the merge-clearance-gate job has no",
-        "      'Close the required check_run' step, so the run phase 1 opened is",
-        "      never completed and the required context stays PENDING.")
-elif 'gh api -X PATCH "repos/$REPO/check-runs/' not in strip_comments(close_step.get("run") or ""):
-    bad("FAIL: [#850 phase-2 head binding] the close step does not itself PATCH",
-        "      the opened check_run — its bindings prove nothing if the publish",
-        "      body lives elsewhere.")
-elif (close_step.get("env") or {}).get("CHECK_ID") != "${{ steps.open.outputs.id }}":
-    bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
-        "      binds CHECK_ID to %r; it must be exactly" % (close_step.get("env") or {}).get("CHECK_ID"),
-        "      ${{ steps.open.outputs.id }}. Under set -u an absent CHECK_ID exits",
-        "      before the PATCH and a wrong one PATCHes a different run — either",
-        "      way the entry phase 1 opened stays PENDING until a later sweep.")
-elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
-    bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
-        "      binds HEAD_SHA to %r; it must be exactly" % (close_step.get("env") or {}).get("HEAD_SHA"),
-        "      ${{ github.event.pull_request.head.sha }}. Phase 2 compares that value",
-        "      against the live head to decide success vs head-moved, so any other",
-        "      binding either kills the step under set -u or publishes on a commit",
-        "      branch protection never consults.")
+# Property 3 — the evaluator captures its real rc and sentinel, while the
+# lineage step below binds the exact current head/run/attempt. There is no
+# candidate close step or candidate CHECK_ID to authorise after #1547.
+gate_step = step_named(event_job or {}, "Run scripts/merge-clearance-gate.sh")
+if not isinstance(gate_step, dict):
+    bad("FAIL: [#1547 native evaluator] the native job must have one unambiguous evaluator step.")
+else:
+    body = strip_comments(str(gate_step.get("run") or ""))
+    if gate_step.get("id") != "gate" or any(text not in body for text in (
+            'scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO"', 'rc=$?', 'Merge clearance: PASS')):
+        bad("FAIL: [#1547 native evaluator] the native evaluator must capture its gate rc and verdict sentinel.")
 
 # Property 4 — every producer step that runs a shell binds the token (#849
 # hole; closed the terminating way by #854 item 1).
@@ -1273,7 +1024,9 @@ elif report_step is None:
         "      'Report gate verdict' step, so nothing sets the native conclusion.")
 else:
     renv = report_step.get("env") or {}
-    if renv.get("PENDING") != "${{ steps.gate.outputs.pending }}" \
+    if renv.get("RC") != "${{ steps.gate.outputs.rc }}" \
+            or renv.get("VERDICT") != "${{ steps.gate.outputs.verdict }}" \
+            or renv.get("PENDING") != "${{ steps.gate.outputs.pending }}" \
             or renv.get("API_BLOCKING") != "${{ steps.lineage.outputs.api_blocking }}":
         bad("FAIL: [#2247 pending arm] 'Report gate verdict' must bind PENDING to",
             "      exactly ${{ steps.gate.outputs.pending }} and API_BLOCKING to exactly",
@@ -1291,12 +1044,15 @@ else:
             bad("FAIL: [#2247 pending arm] the lineage-confirmation step must carry",
                 "      id: lineage; the report step reads steps.lineage.outputs.")
         if lenv.get("CHECK_NAME") != "Merge clearance gate" \
-                or lenv.get("RUN_ID") != "${{ github.run_id }}":
+                or lenv.get("RUN_ID") != "${{ github.run_id }}" \
+                or lenv.get("RUN_ATTEMPT") != "${{ github.run_attempt }}" \
+                or lenv.get("HEAD_SHA") != "${{ github.event.pull_request.head.sha }}":
             bad("FAIL: [#2247 pending arm] the lineage-confirmation step must bind",
                 "      CHECK_NAME to exactly 'Merge clearance gate' and RUN_ID to exactly",
                 "      ${{ github.run_id }} (got %r / %r). Confirming another context," % (lenv.get("CHECK_NAME"), lenv.get("RUN_ID")),
                 "      or another run's suite, proves nothing about this one.")
-        if "scripts/gate-api-lineage-blocking.sh" not in lrun:
+        if "scripts/gate-api-lineage-blocking.sh" not in lrun \
+                or '"$helper" "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID" "$RUN_ATTEMPT"' not in lrun:
             bad("FAIL: [#2247 pending arm] the lineage-confirmation step must run",
                 "      scripts/gate-api-lineage-blocking.sh, the helper that states and",
                 "      checks each condition the pending arm relies on.")
@@ -1322,25 +1078,12 @@ else:
         if not re.fullmatch(r"[0-9]+", str(benv.get(knob, ""))):
             bad("FAIL: [#2286 budget guard] %s must be a quoted integer; a missing or" % knob,
                 "      malformed knob silently turns the guard off.")
-    if benv.get("OPEN_ID") != "${{ steps.open.outputs.id }}":
-        bad("FAIL: [#2286 budget guard] OPEN_ID must be exactly ${{ steps.open.outputs.id }}:",
-            "      only a run holding its own Checks-API hold may skip evaluation.")
+    if "OPEN_ID" in benv or "steps.open.outputs" in brun:
+        bad("FAIL: [#2286 budget guard] the read-only guard cannot rely on a candidate-written hold.")
     if "ib_affordable 1" not in brun or 'echo "skip=true"' not in brun \
             or "ib_backoff_title" not in brun:
         bad("FAIL: [#2286 budget guard] the budget step must decide with ib_affordable 1",
             "      and emit skip=true with the publisher's back-off title (ib_backoff_title).")
-if isinstance(close_step, dict):
-    cenv = close_step.get("env") or {}
-    crun = strip_comments(close_step.get("run") or "")
-    if cenv.get("BUDGET_SKIP") != "${{ steps.budget.outputs.skip }}" \
-            or cenv.get("RATE_LIMITED") != "${{ steps.gate.outputs.rate_limited }}":
-        bad("FAIL: [#2286 budget guard] phase 2 must bind BUDGET_SKIP and RATE_LIMITED to the",
-            "      budget step's and gate step's own outputs.")
-    budget_arm = re.search(r'^if \[ "\$\{BUDGET_SKIP:-\}" = true \] \|\| \[ "\$\{RATE_LIMITED:-\}" = true \]; then\n(.*?)\n^else$', crun, re.S | re.M)
-    if not budget_arm or 'conclusion="failure"' not in budget_arm.group(1) \
-            or "success" in budget_arm.group(1):
-        bad("FAIL: [#2286 budget guard] phase 2 must close a run that did not evaluate",
-            "      with conclusion failure, and never success.")
 if isinstance(report_step, dict):
     renv = report_step.get("env") or {}
     rrun = strip_comments(report_step.get("run") or "")

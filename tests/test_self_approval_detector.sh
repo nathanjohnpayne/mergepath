@@ -1140,8 +1140,10 @@ async function main() {
       },
       dismissReview: async () => { dismissed++; },
     }}};
-    await guard(github, {eventName:mode === 'non-review' ? 'pull_request' : 'pull_request_review',repo:{owner:'owner',repo:'repo'},
-      payload:{pull_request:eventPr,review}}, {
+    // The trusted worker replaces its raw workflow_run envelope with binding outputs.
+    process.env.TRUSTED_EVENT_NAME = mode === 'non-review' ? 'pull_request' : 'pull_request_review';
+    process.env.TRUSTED_EVENT_JSON = JSON.stringify({pull_request:eventPr,review});
+    await guard(github, {eventName:'workflow_run',repo:{owner:'owner',repo:'repo'}, payload:{}}, {
       setOutput:(key,value) => { outputs[key]=value; }, setFailed:message => failed.push(message),
       notice:message => notices.push(message), info:() => {},
     }, ['first-rollout','missing-canonical'].includes(mode) ? name => {
@@ -1380,6 +1382,11 @@ async function productionStepCases() {
     console.log = () => {};
     let rejection = null;
     try {
+      process.env.TRUSTED_EVENT_NAME = context.eventName;
+      process.env.TRUSTED_EVENT_JSON = JSON.stringify(context.payload);
+      // Raw run metadata contains no PR: production must consume the bound transport.
+      context.eventName = 'workflow_run';
+      context.payload = {};
       await triage(github, context, core, fakeRequire);
     } catch (error) {
       rejection = error;

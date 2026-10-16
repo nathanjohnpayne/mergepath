@@ -2,9 +2,11 @@
 # and does not require a CI workflow step. It runs automatically when
 # installed on the repo. See .github/review-policy.yml for enablement.
 name: Agent Review Pipeline
+run-name: >-
+  policy-v1 pr=${{ github.event.pull_request.number || '0' }} source=${{ github.event.workflow_run.id || '0' }}
 
 on:
-  pull_request:
+  pull_request_target:
     # `synchronize` (every push on an open PR) is in the list so
     # `load-config` re-parses `.github/review-policy.yml` on every
     # commit, not just on `opened` / `ready_for_review`. Without it,
@@ -22,13 +24,15 @@ on:
     # `edited` re-evaluates carried approvals after mutable PR metadata or the
     # base branch changes, but it does not itself report readiness (#1094).
     types: [opened, ready_for_review, labeled, synchronize, reopened, edited, unlabeled]
-  pull_request_review:
-    types: [submitted]
+  workflow_run:
+    workflows: [Agent Review Events]
+    types: [completed]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
+  actions: read
+  pull-requests: read
+  issues: read
 
 # #1094: mutable PR events share one latest-state enforcement group, but every
 # APPROVED webhook gets a review-ID group and is never cancelled. The reviews
@@ -41,11 +45,11 @@ permissions:
 # needs-external-review force-on label joins mutable approval enforcement.
 concurrency:
   group: >-
-    agent-review-${{ github.event.pull_request.number }}-${{
+    agent-review-${{ github.event.pull_request.number || github.event.workflow_run.id }}-${{
       ((github.event_name == 'pull_request_review' &&
         github.event.review.state == 'approved' &&
         format('approval-{0}', github.event.review.id)) ||
-       ((github.event_name == 'pull_request' &&
+       ((github.event_name == 'pull_request_target' &&
          (github.event.action == 'synchronize' ||
           github.event.action == 'reopened' ||
           github.event.action == 'edited' ||
@@ -55,7 +59,7 @@ concurrency:
            contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
         'approval-enforcement') || github.run_id }}
   cancel-in-progress: >-
-    ${{ github.event_name == 'pull_request' &&
+    ${{ github.event_name == 'pull_request_target' &&
         (github.event.action == 'synchronize' ||
          github.event.action == 'reopened' ||
          github.event.action == 'edited' ||
@@ -65,10 +69,28 @@ concurrency:
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))) }}
 
 jobs:
+  binding:
+    runs-on: ubuntu-latest
+    outputs:
+      event: ${{ steps.bind.outputs.event }}
+      event_name: ${{ steps.bind.outputs.event_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - id: bind
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {bind} = require('./scripts/workflow/trusted-pr-event.cjs');
+            await bind({github, context, core});
+
   # ──────────────────────────────────────────────
   # Job 1: Read review-policy.yml configuration
   # ──────────────────────────────────────────────
   load-config:
+    needs: [binding]
     # Runs on opened, ready_for_review, synchronize, reopened, and edited so the
     # parser exercises every commit pushed to an open PR, not just
     # initial open. `reopened` is included for the #495 readiness path: a PR
@@ -91,17 +113,21 @@ jobs:
     # The merge still backstops via merge-clearance-gate. This job
     # only reads the static review-policy.yml, so it is event-shape-agnostic.
     if: >
-      (github.event_name == 'pull_request' &&
-       (github.event.action == 'opened' ||
-        github.event.action == 'ready_for_review' ||
-        github.event.action == 'synchronize' ||
-        github.event.action == 'reopened' ||
-        github.event.action == 'edited' ||
-        (github.event.action == 'labeled' &&
-         github.event.label.name == 'needs-external-review') ||
-        github.event.action == 'unlabeled')) ||
-      (github.event_name == 'pull_request_review' &&
-       github.event.review.state == 'approved')
+      needs.binding.result == 'success' &&
+      (needs.binding.outputs.event_name == 'pull_request' &&
+       (fromJSON(needs.binding.outputs.event).action == 'opened' ||
+        fromJSON(needs.binding.outputs.event).action == 'ready_for_review' ||
+        fromJSON(needs.binding.outputs.event).action == 'synchronize' ||
+        fromJSON(needs.binding.outputs.event).action == 'reopened' ||
+        fromJSON(needs.binding.outputs.event).action == 'edited' ||
+        (fromJSON(needs.binding.outputs.event).action == 'labeled' &&
+         fromJSON(needs.binding.outputs.event).label.name == 'needs-external-review') ||
+        fromJSON(needs.binding.outputs.event).action == 'unlabeled')) ||
+      (needs.binding.outputs.event_name == 'pull_request_review' &&
+       fromJSON(needs.binding.outputs.event).review.state == 'approved')
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
     runs-on: ubuntu-latest
     outputs:
       threshold: ${{ steps.config.outputs.threshold }}
@@ -122,7 +148,7 @@ jobs:
           #
           # The POLICY the helpers read is a separate decision, resolved from
           # the PR base by scripts/workflow/resolve_base_policy.sh below.
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.workflow_sha }}
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
@@ -135,11 +161,11 @@ jobs:
           # the fleet today — makes no API call at all, so an unset secret is
           # harmless there and fails closed (empty reviewer allow-list)
           # everywhere else. Mirrors the triage job's resolver invocation.
-          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_REF: ${{ fromJSON(needs.binding.outputs.event).pull_request.base.ref }}
+          BASE_SHA: ${{ fromJSON(needs.binding.outputs.event).pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ fromJSON(needs.binding.outputs.event).repository.default_branch }}
         run: |
           # Bootstrap-skew guard (the #577/#590 shape). The checkout above is
           # pinned to the DEFAULT branch so the helper code is trusted, which
@@ -211,7 +237,7 @@ jobs:
   # Job 2: Auto-label PRs that need external review
   # ──────────────────────────────────────────────
   triage:
-    needs: [load-config]
+    needs: [binding, load-config]
     # `synchronize` / `reopened` are included alongside
     # opened/ready_for_review so any push-triggered readiness retry gets
     # threshold and protected-path labels (`needs-external-review`)
@@ -230,19 +256,24 @@ jobs:
     # label already added nor undo the settle event that just removed it
     # (#620/#1094).
     if: >
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
-      ((github.event_name == 'pull_request' &&
-        (github.event.action == 'opened' ||
-         github.event.action == 'ready_for_review' ||
-         github.event.action == 'synchronize' ||
-         github.event.action == 'reopened' ||
-         github.event.action == 'edited' ||
-         (github.event.action == 'labeled' &&
-          github.event.label.name == 'needs-external-review') ||
-         (github.event.action == 'unlabeled' &&
-          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
-       (github.event_name == 'pull_request_review' &&
-        github.event.review.state == 'approved'))
+      needs.binding.result == 'success' &&
+      fromJSON(needs.binding.outputs.event).pull_request.user.login != 'dependabot[bot]' &&
+      ((needs.binding.outputs.event_name == 'pull_request' &&
+        (fromJSON(needs.binding.outputs.event).action == 'opened' ||
+         fromJSON(needs.binding.outputs.event).action == 'ready_for_review' ||
+         fromJSON(needs.binding.outputs.event).action == 'synchronize' ||
+         fromJSON(needs.binding.outputs.event).action == 'reopened' ||
+         fromJSON(needs.binding.outputs.event).action == 'edited' ||
+         (fromJSON(needs.binding.outputs.event).action == 'labeled' &&
+          fromJSON(needs.binding.outputs.event).label.name == 'needs-external-review') ||
+         (fromJSON(needs.binding.outputs.event).action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), fromJSON(needs.binding.outputs.event).label.name)))) ||
+       (needs.binding.outputs.event_name == 'pull_request_review' &&
+        fromJSON(needs.binding.outputs.event).review.state == 'approved'))
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
+    environment: review-automation
     runs-on: ubuntu-latest
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
@@ -259,19 +290,38 @@ jobs:
         with:
           # This job shells out only to trusted default-branch helpers; never
           # run helper code from the PR head under the label-writing PAT.
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
+      - name: Revalidate the source before acquiring automation authority
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {bind} = require('./scripts/workflow/trusted-pr-event.cjs');
+            await bind({github, context, core});
+      - name: Acquire a repository-scoped automation installation token
+        id: automation
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.REVIEW_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.REVIEW_AUTOMATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
       - name: Evaluate PR against review-policy.yml
         id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           THRESHOLD: ${{ needs.load-config.outputs.threshold }}
           PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
-          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ steps.automation.outputs.token }}
         with:
-          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ steps.automation.outputs.token }}
           script: |
+            context.payload = JSON.parse(process.env.TRUSTED_EVENT_JSON);
+            context.eventName = process.env.TRUSTED_EVENT_NAME;
             const childProcess = require('child_process');
             const fs = require('fs');
             const os = require('os');
@@ -876,12 +926,17 @@ jobs:
   # Job 3: Assign reviewer (internal self-peer review)
   # ──────────────────────────────────────────────
   assign:
-    needs: [load-config, triage]
+    needs: [binding, load-config, triage]
     if: >
+      needs.binding.result == 'success' &&
       always() &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
-      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+      needs.binding.outputs.event_name == 'pull_request' &&
+      fromJSON(needs.binding.outputs.event).pull_request.user.login != 'dependabot[bot]' &&
+      (fromJSON(needs.binding.outputs.event).action == 'opened' || fromJSON(needs.binding.outputs.event).action == 'ready_for_review')
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
+    environment: review-automation
     runs-on: ubuntu-latest
     steps:
       # The reviewer-assignment parse below runs the SHARED PR-body parser
@@ -901,17 +956,36 @@ jobs:
           # token in scope. Disabling checkout credential persistence removes the
           # checkout credential; it does NOT make the checked-out code
           # trusted, and the parser must be the canonical one regardless.
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
+      - name: Revalidate the source before acquiring automation authority
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {bind} = require('./scripts/workflow/trusted-pr-event.cjs');
+            await bind({github, context, core});
+      - name: Acquire a repository-scoped automation installation token
+        id: automation
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.REVIEW_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.REVIEW_AUTOMATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
       - name: Assign reviewer identity based on Authoring-Agent
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         with:
-          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ steps.automation.outputs.token }}
           script: |
+            context.payload = JSON.parse(process.env.TRUSTED_EVENT_JSON);
+            context.eventName = process.env.TRUSTED_EVENT_NAME;
             const pr = context.payload.pull_request;
             const author = pr.user.login;
             const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
@@ -1024,11 +1098,17 @@ jobs:
   # Job 4: Detect agent disagreement → escalate
   # ──────────────────────────────────────────────
   detect-disagreement:
-    if: github.event_name == 'pull_request_review'
+    needs: [binding]
+    if: needs.binding.result == 'success' && (needs.binding.outputs.event_name == 'pull_request_review')
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
+    environment: review-automation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.workflow_sha }}
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
@@ -1036,11 +1116,30 @@ jobs:
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
 
+      - name: Revalidate the source before acquiring automation authority
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {bind} = require('./scripts/workflow/trusted-pr-event.cjs');
+            await bind({github, context, core});
+      - name: Acquire a repository-scoped automation installation token
+        id: automation
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.REVIEW_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.REVIEW_AUTOMATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
       - name: Check for conflicting reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ steps.automation.outputs.token }}
           script: |
+            context.payload = JSON.parse(process.env.TRUSTED_EVENT_JSON);
+            context.eventName = process.env.TRUSTED_EVENT_NAME;
             const fs = require('fs');
             const path = require('path');
             const yaml = require('js-yaml');
@@ -1061,6 +1160,26 @@ jobs:
             } catch (e) {
               reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
             }
+
+            // A delayed review retains its historical head for archival and
+            // self-approval enforcement. Disagreement labels classify the live
+            // PR instead; the source event is only the routing identity here.
+            const readLivePair = async () => {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+              });
+              if (pr.number !== context.payload.pull_request.number || pr.state !== 'open' ||
+                  !/^[0-9a-f]{40}$/.test(pr.head?.sha || '') ||
+                  !/^[0-9a-f]{40}$/.test(pr.base?.sha || '') ||
+                  typeof pr.base?.ref !== 'string' || !pr.base.ref ||
+                  pr.base?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+                throw new Error('Unreadable live PR head/base binding for disagreement labels');
+              }
+              return { head: pr.head.sha, base: pr.base.sha, baseRef: pr.base.ref };
+            };
+            const classifiedPair = await readLivePair();
 
             // Paginate reviews — long histories (>30) otherwise truncate and
             // mask the latest-on-HEAD signal. Mirrors the pagination
@@ -1086,9 +1205,21 @@ jobs:
             const decision = decide({
               reviews,
               reviewerAccounts,
-              headSha: context.payload.pull_request.head.sha,
+              headSha: classifiedPair.head,
               hasLabel,
             });
+
+            if (decision === 'apply') {
+              // Fence the application against a push, base update or retarget
+              // during the reads above. Failure preserves the existing state.
+              // GitHub's subsequent write is not atomic with this observation.
+              const writerPair = await readLivePair();
+              if (writerPair.head !== classifiedPair.head || writerPair.base !== classifiedPair.base ||
+                  writerPair.baseRef !== classifiedPair.baseRef) {
+                core.notice('PR head/base moved during disagreement classification; preserving labels.');
+                return;
+              }
+            }
 
             if (decision === 'apply') {
               await github.rest.issues.addLabels({
@@ -1105,26 +1236,10 @@ jobs:
                 body: '**Agent disagreement detected.** One reviewer approved and another requested changes on the current HEAD. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
               });
             } else if (decision === 'remove') {
-              // No live disagreement on the current HEAD — remove the
-              // label. Covers the #259 case: a stale CHANGES_REQUESTED
-              // on an older SHA is superseded by an APPROVED on HEAD.
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.payload.pull_request.number,
-                  name: 'needs-human-review',
-                });
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.payload.pull_request.number,
-                  body: '**Agent disagreement resolved.** No live conflict on the current HEAD (latest review per reviewer, non-DISMISSED, commit_id == HEAD). Removing `needs-human-review` label.',
-                });
-              } catch (e) {
-                // Label may already be removed — ignore 404
-                if (e.status !== 404) throw e;
-              }
+              // The classifier can observe agreement, but it cannot release a
+              // human-action hold. REVIEW_POLICY.md makes needs-human-review
+              // manual-only even after the underlying disagreement clears.
+              core.notice('No live reviewer conflict on the current HEAD; retaining needs-human-review for human release per REVIEW_POLICY.md.');
             }
             // decision === 'noop' — nothing to do.
 
@@ -1132,20 +1247,25 @@ jobs:
   # Job 5: Enforce approval independence
   # ──────────────────────────────────────────────
   block-self-approval:
-    needs: [load-config, triage]
+    needs: [binding, load-config, triage]
     if: >
+      needs.binding.result == 'success' &&
       always() &&
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
-      ((github.event_name == 'pull_request_review' &&
-        github.event.review.state == 'approved') ||
-       (github.event_name == 'pull_request' &&
-        (github.event.action == 'synchronize' ||
-         github.event.action == 'reopened' ||
-         github.event.action == 'edited' ||
-         (github.event.action == 'labeled' &&
-          github.event.label.name == 'needs-external-review') ||
-         (github.event.action == 'unlabeled' &&
-          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))))
+      fromJSON(needs.binding.outputs.event).pull_request.user.login != 'dependabot[bot]' &&
+      ((needs.binding.outputs.event_name == 'pull_request_review' &&
+        fromJSON(needs.binding.outputs.event).review.state == 'approved') ||
+       (needs.binding.outputs.event_name == 'pull_request' &&
+        (fromJSON(needs.binding.outputs.event).action == 'synchronize' ||
+         fromJSON(needs.binding.outputs.event).action == 'reopened' ||
+         fromJSON(needs.binding.outputs.event).action == 'edited' ||
+         (fromJSON(needs.binding.outputs.event).action == 'labeled' &&
+          fromJSON(needs.binding.outputs.event).label.name == 'needs-external-review') ||
+         (fromJSON(needs.binding.outputs.event).action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), fromJSON(needs.binding.outputs.event).label.name)))))
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
+    environment: review-automation
     runs-on: ubuntu-latest
     outputs:
       eligible_approval: ${{ steps.check.outputs.eligible_approval }}
@@ -1156,11 +1276,28 @@ jobs:
         with:
           # The review event can target untrusted PR code. Load the detector
           # only from the trusted default branch.
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.workflow_sha }}
           # Explicit-token github-script only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
+      - name: Revalidate the source before acquiring automation authority
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {bind} = require('./scripts/workflow/trusted-pr-event.cjs');
+            await bind({github, context, core});
+      - name: Acquire a repository-scoped automation installation token
+        id: automation
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.REVIEW_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.REVIEW_AUTOMATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
       - name: Classify and dismiss ineligible approvals
         id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1174,8 +1311,10 @@ jobs:
           TRIAGE_BASE_SHA: ${{ needs.triage.outputs.classified_base_sha }}
           TRIAGE_RESULT: ${{ needs.triage.result }}
         with:
-          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ steps.automation.outputs.token }}
           script: |
+            context.payload = JSON.parse(process.env.TRUSTED_EVENT_JSON);
+            context.eventName = process.env.TRUSTED_EVENT_NAME;
             const fs = require('fs');
             const path = require('path');
             // BEGIN APPROVAL TRIAGE BOOTSTRAP
@@ -2063,10 +2202,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
           SNAPSHOT_CURRENT: ${{ steps.check.outputs.snapshot_current }}
-          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD: ${{ fromJSON(needs.binding.outputs.event).pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ fromJSON(needs.binding.outputs.event).pull_request.base.ref }}
+          EVENT_BASE_SHA: ${{ fromJSON(needs.binding.outputs.event).pull_request.base.sha }}
+          PR_NUMBER: ${{ fromJSON(needs.binding.outputs.event).pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           # Default closed. The legacy output means only "run privileged
@@ -2149,7 +2288,7 @@ jobs:
   # independence, and mutable PR state before reporting stable unarmed
   # readiness. The separate #1058 merge-group authorization owns admission.
   auto-merge-on-approval:
-    needs: [load-config, detect-disagreement, block-self-approval, triage]
+    needs: [binding, load-config, detect-disagreement, block-self-approval, triage]
     # Job-level override (replaces rather than merges with the workflow
     # default above): candidate-controlled review jobs are strictly read-only.
     # Privileged author and queue-policy credentials live behind the trusted-
@@ -2162,28 +2301,32 @@ jobs:
       pull-requests: read
       statuses: read
     if: >
+      needs.binding.result == 'success' &&
       always() &&
-      ((github.event_name == 'pull_request_review' &&
-        github.event.review.state == 'approved') ||
-       (github.event_name == 'pull_request' &&
-        (github.event.action == 'synchronize' ||
-         github.event.action == 'reopened' ||
-         (github.event.action == 'unlabeled' &&
-          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
+      ((needs.binding.outputs.event_name == 'pull_request_review' &&
+        fromJSON(needs.binding.outputs.event).review.state == 'approved') ||
+       (needs.binding.outputs.event_name == 'pull_request' &&
+        (fromJSON(needs.binding.outputs.event).action == 'synchronize' ||
+         fromJSON(needs.binding.outputs.event).action == 'reopened' ||
+         (fromJSON(needs.binding.outputs.event).action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), fromJSON(needs.binding.outputs.event).label.name))))) &&
       needs.triage.result == 'success' &&
       needs.block-self-approval.result == 'success' &&
       needs.block-self-approval.outputs.eligible_approval == 'true' &&
       needs.block-self-approval.outputs.auto_arm_allowed == 'true' &&
-      !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
-      !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
-      !contains(github.event.pull_request.labels.*.name, 'human-hold')
+      !contains(fromJSON(needs.binding.outputs.event).pull_request.labels.*.name, 'needs-external-review') &&
+      !contains(fromJSON(needs.binding.outputs.event).pull_request.labels.*.name, 'needs-human-review') &&
+      !contains(fromJSON(needs.binding.outputs.event).pull_request.labels.*.name, 'human-hold')
+    env:
+      TRUSTED_EVENT_JSON: ${{ needs.binding.outputs.event }}
+      TRUSTED_EVENT_NAME: ${{ needs.binding.outputs.event_name }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Readiness logic still comes from the trusted default branch, never
           # the PR checkout, even though this job receives only read access.
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.workflow_sha }}
           # Explicit-token API path only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
@@ -2206,12 +2349,12 @@ jobs:
       - name: Gate require existing non-author approval
         id: require_approval
         if: >
-          github.event_name == 'pull_request' ||
-          github.event_name == 'pull_request_review'
+          needs.binding.outputs.event_name == 'pull_request' ||
+          needs.binding.outputs.event_name == 'pull_request_review'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ fromJSON(needs.binding.outputs.event).pull_request.number }}
+          PR_AUTHOR: ${{ fromJSON(needs.binding.outputs.event).pull_request.user.login }}
           REPO: ${{ github.repository }}
           # #529 / #544: restrict the approval that enters readiness to a
           # REGISTERED agent reviewer identity (available_reviewers), matching
@@ -2224,13 +2367,13 @@ jobs:
           # unregistered non-author skipped it (the merge-clearance-gate still
           # backstopped the actual merge, but the readiness gate should be
           # consistent on both paths).
-          EVENT_REVIEWER: ${{ github.event.review.user.login }}
+          EVENT_REVIEWER: ${{ fromJSON(needs.binding.outputs.event).review.user.login }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         run: |
           REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
           # Direct approval event: the approval IS the trigger, so verify the
           # event reviewer is a registered, non-author reviewer here (#544).
-          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_review" ]; then
+          if [ "${TRUSTED_EVENT_NAME:-}" = "pull_request_review" ]; then
             if [ -z "$EVENT_REVIEWER" ] || [ "$EVENT_REVIEWER" = "$PR_AUTHOR" ]; then
               echo "::notice::Approval reviewer '$EVENT_REVIEWER' is empty or the PR author; readiness denied."
               echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -2324,7 +2467,7 @@ jobs:
       - name: Re-verify blocking labels before readiness probe
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ fromJSON(needs.binding.outputs.event).pull_request.number }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -2382,7 +2525,7 @@ jobs:
         id: check_readiness
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ fromJSON(needs.binding.outputs.event).pull_request.number }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           REQUIRED_HEAD_CHECK_NAME: lint

@@ -226,6 +226,13 @@ run_case 43
 assert_eq "$RC" 0 "same-name head with GitHub fork flag binds normally"
 assert_eq "$(printf '%s' "$OUTPUT" | jq -r .requires_relay)" true "relay classification follows head.repo.fork rather than name equality"
 
+# #1547: a same-repository human candidate uses the SAME existing handoff.
+write_pr 43 "$(sha 43)" "$BASE_ID" "$BASE_REPO" fork-base-branch alice 2026-09-25T09:00:00Z false
+run_case 43
+assert_eq "$RC" 0 "same-repository human source retains the existing verifier"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .requires_relay)" true "same-repository human events require the trusted relay"
+assert_empty_writes "generalizing same-repository delivery grants no source-verifier mutation"
+
 # An artifact or title that names PR 77 cannot override the source origin: the
 # unique branch candidate is PR 41, so helper stays inert for PR 77.
 write_pr 77 "$(sha 77)" 202 fork/bob victim-branch bob 2026-09-25T09:00:00Z
