@@ -48,9 +48,10 @@
 # strip a trailing inline comment, surrounding quotes (single OR double), and
 # trailing whitespace in sed. Every key under feedback_policy: is unique
 # (mode, priorities, p0..p3, nitpick), so an exact-name match is unambiguous.
-feedback_policy_field() {
+feedback_policy_field() (
   local field=$1 cfg="${2:-${CONFIG:-.github/review-policy.yml}}"
   [ -f "$cfg" ] || return 0
+  set -o pipefail
   awk -v field="$field" '
     /^feedback_policy:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
@@ -60,7 +61,7 @@ feedback_policy_field() {
       exit
     }
   ' "$cfg" | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]+$//"
-}
+)
 
 
 # policy_yaml_to_json <path> -- parse a review-policy YAML file to JSON on
