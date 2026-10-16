@@ -119,6 +119,13 @@ for a in "$@"; do
   [ "$prev" = "--diff-file" ] && cp "$a" "$CAPTURE/diff"
   prev="$a"
 done
+if [ "${FAKE_ORCH_JSON:-}" = retained-tripwire ]; then
+  if printf '%s\n' "$@" | grep -Fxq -- --retain-evidence; then
+    printf '{"human_tiebreaker_required":true,"review_posted":false,"barrier":{"tripwire":{"tripwires":["authorization-policy-publisher-or-credentials"]}}}\n'
+    exit 8
+  fi
+  FAKE_ORCH_JSON=clean
+fi
 case "${FAKE_ORCH_JSON:-}" in
   clean)
     jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
@@ -329,8 +336,8 @@ FAKE_ORCH_EXIT=8 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha
   && fail "human-tiebreaker stop should exit 8" || { [ $? -eq 8 ] && pass "human-tiebreaker stop passes exit 8 through" || fail "wrong exit for human-tiebreaker stop"; }
 grep -q "do NOT fan out" "$WORK/err-cap" \
   && pass "human-tiebreaker messaging blocks fan-out" || fail "human-tiebreaker fail-closed message missing"
-grep -q "curated diff over budget or Codex-cap human tiebreaker" "$WORK/err-cap" \
-  && pass "exit-8 messaging preserves both meanings" || fail "exit-8 messaging incorrectly assumes only the Codex cap"
+grep -q "curated diff over budget, deterministic tripwire, or Codex-cap human tiebreaker" "$WORK/err-cap" \
+  && pass "exit-8 messaging names budget, tripwire and cap stops" || fail "exit-8 messaging incorrectly assumes only the Codex cap"
 
 FAKE_ORCH_EXIT=10 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null 2>"$WORK/err-budget" \
   && fail "request-budget evidence error should exit 10" || { [ $? -eq 10 ] && pass "request-budget evidence error passes exit 10 through" || fail "wrong exit for request-budget evidence error"; }
@@ -733,6 +740,26 @@ remote_has_prefix "$LARGE_HEAD" "$C2" && fail "historical dry-run wrote prefix r
   || pass "historical dry-run writes no prefix receipt"
 remote_has_tag "$LARGE_HEAD" && fail "historical dry-run advanced full watermark" \
   || pass "historical dry-run leaves full watermark unchanged"
+
+# Retained historical evidence must request the stricter tripwire boundary;
+# unlike a genuine top-level preview, it can publish a reusable prefix receipt.
+rc=0
+FAKE_ORCH_JSON=retained-tripwire run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C3" \
+  > "$WORK/historical-tripwire.json" 2> "$WORK/historical-tripwire.err" || rc=$?
+[ "$rc" -eq 8 ] && grep -Fxq -- --retain-evidence "$CAPTURE/args" \
+  && jq -e '.human_tiebreaker_required and .review_posted == false' "$WORK/historical-tripwire.json" >/dev/null \
+  && ! remote_has_prefix "$LARGE_HEAD" "$C3" && ! remote_has_tag "$LARGE_HEAD" \
+  && pass "historical tripwire stops without prefix receipt, watermark or fan-out" \
+  || fail "historical retained evidence bypassed the deterministic tripwire"
+rc=0
+FAKE_ORCH_JSON=retained-tripwire run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C3" --dry-run \
+  > "$WORK/historical-tripwire-preview.json" 2> "$WORK/historical-tripwire-preview.err" || rc=$?
+[ "$rc" -eq 9 ] && ! grep -Fxq -- --retain-evidence "$CAPTURE/args" \
+  && jq -e '.dry_run and .receipt_written == false' "$WORK/historical-tripwire-preview.json" >/dev/null \
+  && pass "top-level historical preview retains non-persisting model validation" \
+  || fail "historical preview acquired retained-evidence enforcement or receipt authority"
 
 # Retain the first chunk while its first tag push fails. The local exact
 # receipt must make the identical retry a publish-only operation, with no

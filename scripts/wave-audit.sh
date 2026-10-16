@@ -48,7 +48,8 @@
 #           review's acknowledgment without repeating the review. Otherwise
 #           disposition the earlier findings and rerun the same audit.
 #   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
-#           orchestrator requires a human tiebreaker. No reviewer authority
+#           orchestrator requires human review (deterministic tripwire or
+#           Codex-cap human stop). No reviewer authority
 #           or tag follows. Never fan out on either shape.
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
@@ -810,6 +811,11 @@ fi
 if [ "$DRY_RUN" = true ] || [ -n "$HISTORICAL_END" ]; then
   orch_args[${#orch_args[@]}]="--dry-run"
 fi
+# A retained prefix is reusable evidence, not a non-persisting preview. Keep
+# the orchestrator's deterministic tripwires before its historical model run.
+if [ -n "$HISTORICAL_END" ] && [ "$DRY_RUN" = false ]; then
+  orch_args[${#orch_args[@]}]="--retain-evidence"
+fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
 fi
@@ -925,7 +931,7 @@ case "$orc" in
     ;;
   8)
     emit_json 8 false null
-    log "Phase 4b stopped without review authority on ${REPO}#${PR} (orchestrator exit 8: curated diff over budget or Codex-cap human tiebreaker) — no watermark; do NOT fan out or substitute Phase 4b authority"
+    log "Phase 4b stopped without review authority on ${REPO}#${PR} (orchestrator exit 8: curated diff over budget, deterministic tripwire, or Codex-cap human tiebreaker) — no watermark; do NOT fan out or substitute Phase 4b authority"
     ;;
   10)
     emit_json 10 false null
