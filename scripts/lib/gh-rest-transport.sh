@@ -88,9 +88,10 @@
 # the same way: options before the group, the REST merge endpoint, and a
 # GraphQL merge mutation through `gh api`. Any other option before the command
 # group is refused too. Park a merge with scripts/post-local-agent-handback.sh. Any other `gh api` payload passes
-# through under the verified token: it is REST already. Any other command of
-# gh's own groups passes through unchanged; a GraphQL read fails at the proxy
-# with its own message.
+# through under the verified token: a REST endpoint runs as it is, and a
+# `gh api graphql` call stays GraphQL. Any other command of gh's own groups
+# passes through unchanged. On Claude cloud the proxy refuses any GraphQL
+# call with its own message.
 #
 # gh_payload_refuse_credential_overrides is transport-independent: it refuses
 # the caller-supplied arguments that could send the verified token elsewhere
