@@ -233,6 +233,15 @@ def merge_preflight(argv, command, tools, task):
                        MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY='false')
     subprocess.run([tools['bash'], str(task / 'scripts/merge-clearance-gate.sh'), number, repo],
                    env=environment, cwd=task, check=True, timeout=TIMEOUT)
+    # The label may disappear while the threshold gate reads metadata, then
+    # return before the final snapshot. Bind an initial explicit requirement
+    # to the full checker, which does not derive scope from mutable labels.
+    codex_policy = policy_data.get('codex') or {}
+    external_gate = codex_policy.get('external_review_gate') or {}
+    if 'needs-external-review' in initial_labels and external_gate.get('enabled', True) is not False:
+        subprocess.run([tools['bash'], str(task / 'scripts/codex-review-check.sh'), number, repo],
+                       env=dict(environment, CODEX_REVIEW_CHECK_SKIP_CI='1'),
+                       cwd=task, check=True, timeout=TIMEOUT)
     # Re-read mutable CI, reviewer and queue predicates only after clearance
     # has finished, immediately before the final tuple/hold snapshot.
     environment.update(GH_AS_AUTHOR_IDENTITY=author, GH_PR_GUARD_EXPECTED_AUTHOR=author,

@@ -98,11 +98,13 @@ if 'contents/.github/review-policy.yml' in endpoint:
 if endpoint=='repos/example/repo/pulls/123':
     emit(dict(number=123,head=dict(sha=head,ref='feature/fixture'),
          base=dict(sha=base,ref='release' if state.get('nondefault') else 'main',repo=dict(default_branch='main')),
-         body='Authoring-Agent: codex',user=dict(login='nathanjohnpayne'),labels=[dict(name=l) for l in labels],
+         body='Authoring-Agent: codex',user=dict(login='nathanjohnpayne'),labels=[dict(name=l) for l in state.get('gate_labels',labels)],
          additions=1,deletions=0,changed_files=1)); sys.exit(0)
 if endpoint.startswith('repos/example/repo/commits/'):
     print('2026-09-14T00:00:00Z'); sys.exit(0)
 if endpoint.endswith('/reviews'):
+    if state.get('no_approval'):
+        emit([[]] if '--slurp' in args else []); sys.exit(0)
     reviews=[dict(id=1,user=dict(login='nathanpayne-claude'),state='APPROVED',commit_id=head,
                   submitted_at='2026-09-14T00:05:00Z',body='<!-- mergepath-p4b-request-generation: '+json.dumps([123,124] if state.get('socket_forges_generation') and socket_override else state.get('generation',[123]))+' -->')]
     if state.get('disagreement') or state.get('late_disagreement') and clearance_files_read: reviews.append(dict(id=2,user=dict(login='nathanpayne-codex'),state='CHANGES_REQUESTED',commit_id='d'*40))
@@ -307,6 +309,19 @@ if pathlib.Path(sys.argv[0]).name in ('owner-admin-override.py', 'merge-writer.p
 
     def test_existing_external_review_requirement_retains_reviewed_merge(self):
         self.state={'generation':[123,124],'labels':['needs-external-review']}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
+
+    def test_label_removed_during_clearance_cannot_skip_external_review(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review'],'no_approval':True}
+        self.assert_blocked(self.run_writer(),'no reviewer identity')
+        self.assertFalse((self.path/'writes.jsonl').exists())
+
+    def test_label_restored_after_clearance_accepts_actual_external_approval(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review']}
         result=self.run_writer()
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
