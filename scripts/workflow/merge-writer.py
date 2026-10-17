@@ -154,8 +154,12 @@ def merge_preflight(argv, command, tools, task):
     # and the final writer use the canonical URL and explicit repository.
     if 'GH_REPO' in os.environ:
         environment['GH_REPO'] = os.environ['GH_REPO']
-    fields = 'url,headRefOid,baseRefOid,baseRefName,state'
+    fields = 'url,headRefOid,baseRefOid,baseRefName,state,labels'
     pr = read(*query, '--json', fields)
+    initial_labels = pr.pop('labels')
+    if not isinstance(initial_labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in initial_labels):
+        raise ValueError('initial blocking labels are unreadable')
+    initial_labels = {label['name'] for label in initial_labels}
     environment.pop('GH_REPO', None)
     match = URL.fullmatch(pr.get('url', ''))
     head, base = pr.get('headRefOid', ''), pr.get('baseRefOid', '')
@@ -237,12 +241,14 @@ def merge_preflight(argv, command, tools, task):
     subprocess.run([tools['bash'], str(task / 'scripts/hooks/gh-pr-guard.sh')], input=payload,
                    env=environment, cwd=task, text=True, check=True, timeout=TIMEOUT)
     environment.pop('CODEX_CLEARED', None)
-    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields + ',labels')
+    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields)
     labels = fresh.pop('labels')
     if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in labels):
         raise ValueError('final blocking labels are unreadable')
     if {'human-hold', 'needs-human-review', 'policy-violation'} & {label['name'] for label in labels}:
         raise ValueError('a human-controlled hold is present in the final snapshot')
+    if 'needs-external-review' in {label['name'] for label in labels} - initial_labels:
+        raise ValueError('external-review requirement appeared during clearance; rerun against the final requirement')
     if fresh != pr:
         raise ValueError('PR target/head/base/state changed during final clearance')
     return normalized, environment

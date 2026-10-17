@@ -62,7 +62,7 @@ if args[:2] == ['pr','view']:
         calls=(root/'calls.jsonl').read_text().count('"pr", "view"')
         value=dict(url=url,headRefOid='d'*40 if state.get('head_moves') and calls>2 else head,
                   baseRefOid=base,baseRefName='release' if state.get('nondefault') else 'main',state='OPEN')
-        if 'labels' in fields: value['labels']=[dict(name=n) for n in state.get('final_labels',labels)]
+        if 'labels' in fields: value['labels']=[dict(name=n) for n in (state.get('final_labels',labels) if clearance_files_read else labels)]
         emit(value)
     sys.exit(0)
 if not args or args[0]!='api': sys.exit(99)
@@ -299,6 +299,17 @@ if pathlib.Path(sys.argv[0]).name in ('owner-admin-override.py', 'merge-writer.p
         for label in ('human-hold','needs-human-review','policy-violation'):
             self.state={'generation':[123,124],'final_labels':[label]}
             self.assert_blocked(self.run_writer(),'hold is present in the final snapshot')
+
+    def test_late_external_review_requirement_requires_fresh_clearance(self):
+        self.state={'generation':[123,124],'labels':[],'final_labels':['needs-external-review']}
+        self.assert_blocked(self.run_writer(),'external-review requirement appeared during clearance')
+        self.assertFalse((self.path/'writes.jsonl').exists())
+
+    def test_existing_external_review_requirement_retains_reviewed_merge(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review']}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
 
     def test_lowercase_proxy_transport_is_preserved(self):
         self.state={'generation':[123,124],'require_lower_proxy':True}
