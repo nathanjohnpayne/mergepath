@@ -3895,16 +3895,20 @@ test_940_fallback_authority_and_absence() {
     n=$((n + 1))
     dir=$(make_case "940-control-$n-$scenario-$state-$trust" 15 true 1 0)
     [ "$trust" != true ] || enable_trust_status_context "$dir"
-    rc=$(CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
+    rc=$(CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
     [ "$rc" = "$expected" ] || bad="$bad $scenario/$state-rc=$rc"
+    if [ "$expected" = 5 ]; then
+      [ "$(jq -r .codex_failover_requested "$dir/out.json")" = true ] && [ "$(codex_invocations "$dir")" = 1 ] || bad="$bad missing-substitute"
+    fi
     got_reads=0
     [ ! -f "$dir/state/status-reads" ] || got_reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
     [ "$got_reads" = "$reads" ] || bad="$bad $scenario/$state-status-reads=$got_reads"
   done <<'EOF'
-probe_review_on_head|pending||true|0|2
-probe_review_on_head|success|Review rate limited|true|0|2
-probe_clean_incremental|pending||true|0|2
-probe_clean_incremental|success|Review rate limited|true|0|2
+probe_review_on_head|pending||true|0|3
+probe_review_on_head|success|Review rate limited|true|5|3
+probe_clean_incremental|pending||true|0|3
+probe_clean_incremental|success|Review rate limited|true|0|3
 badge_only_inline_finding|pending||true|2|2
 badge_only_summary_finding|pending||true|2|2
 fallback_summary|absent||true|0|3

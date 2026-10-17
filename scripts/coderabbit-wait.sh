@@ -3366,6 +3366,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
+  local clearance_status_record clearance_status_state
   local latest body class poll_class potential_issues review_json summary_marker_rc
   local summary_head_claim_rc head_run_rc head_run_id graded_review_id
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
@@ -3408,6 +3409,8 @@ emit_terminal_review_after_probe_if_present() {
   fi
   case "$class" in
     review)
+      # Grade this terminal selection rather than the last polling class.
+      local CLASS=review COMMENT_FRESH_AT=""
       # #1031 round 2: select the graded review object ONCE, here, and use the
       # same id for both the count below and the exact-SHA rung further down.
       # Letting each derive its own would let a run published between the two
@@ -3463,7 +3466,20 @@ emit_terminal_review_after_probe_if_present() {
             log "post-probe terminal-review check: a newer CodeRabbit run superseded the counted run — leaving the advisory timeout in place"
             return 0
           fi
+          # Re-sample after selecting the counted run: a refusal may have
+          # arrived since the loop or pre-probe status read.
+          if [ "${TRUST_STATUS_CONTEXT:-false}" = true ]; then
+            clearance_status_record=$(check_status_context_record) || clearance_status_record='{"state":"unreadable"}'
+            clearance_status_state=$(crw_status_record_state "$clearance_status_record") || clearance_status_state=unreadable
+            if [ "$clearance_status_state" = unreadable ]; then
+              log "post-probe terminal-review check: trusted CodeRabbit status could not be read — leaving the advisory timeout in place"
+              return 0
+            fi
+            POLLED_STATUS_RECORD=$clearance_status_record
+          fi
           if [ "$head_run_rc" = "0" ]; then
+            emit_rate_limit_stall_at_timeout_if_present "${POLLED_STATUS_RECORD:-}"
+            [ "${RATE_LIMIT_REFUSAL_PENDING:-false}" != true ] || return 0
             log "post-probe terminal-review check: CodeRabbit review run id=$head_run_id is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
             summary_head_claim_rc=0
@@ -3686,6 +3702,7 @@ emit_head_review_before_refusal() {
               1) ;;
               *) die 3 "could not grade replacement-trigger evidence before rate-limit-refusal clearance" ;;
             esac
+            log "CodeRabbit review run id=$run_id is pinned to $HEAD_SHA and strictly newer than its rate-limit refusal — the exact-SHA rung wins outright over mutable summary demotion"
             STATUS_CONTEXT_CLEARANCE_REFUSAL=""
             STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
             STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
@@ -3705,9 +3722,12 @@ emit_head_review_before_refusal() {
 }
 
 # A refusal with no published notice has no retry window to schedule.
-# Diagnose it after the normal strict pass, before that pass would sleep.
+# Diagnose it after the normal strict pass, before clearance or sleep.
+# A returned pending refusal means its review input changed: clearance callers
+# must retry rather than crediting the report they selected before that read.
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
+  RATE_LIMIT_REFUSAL_PENDING=false
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
   if [ "${1:-}" = --before-probe ] || [ "$#" = 0 ]; then
     rec=$(check_status_context_record) || return 0
@@ -3732,6 +3752,7 @@ emit_rate_limit_stall_at_timeout_if_present() {
       *) die 3 "could not order the selected CodeRabbit progress against its status refusal" ;;
     esac
   fi
+  RATE_LIMIT_REFUSAL_PENDING=true
   # Only a confirmed terminal refusal needs an extra strict review scan.
   # Ordinary timeouts keep their existing single post-probe scan.
   if [ "${1:-}" = --before-probe ]; then
@@ -4384,7 +4405,33 @@ crw_summary_blocks_fallback_clearance() {
       0) : ;; # Marker present: do not grant the completed-summary escape.
       1)
         rc=0; summary_names_head "$sbody" "$head_sha" || rc=$?
-        case "$rc" in 0) return 1 ;; 1) ;; *) return 3 ;; esac
+        case "$rc" in
+          0)
+            rec=$(check_status_context_record) || return 3
+            state=$(crw_status_record_state "$rec") || return 3
+            [ "$state" != unreadable ] || return 3
+            desc=$(jq -r '.description // ""' <<<"$rec") || return 3
+            desc=$(crw_normalize_status_description "$desc") || return 3
+            if [ "$state" = success ] && [ "$desc" = 'review rate limited' ]; then
+              # Editing an old summary is not evidence of a new review.
+              # Only a summary created after the refusal proves this order.
+              local summary_at order_rc=0
+              summary_at=$(printf '%s' "$summary" | base64 --decode | jq -er '.json | fromjson | .created_at | select(type == "string" and length > 0)') || return 3
+              jq -e --arg at "$summary_at" '($at | fromdateiso8601) > ((.updated_at // .created_at) | fromdateiso8601)' \
+                <<<"$rec" >/dev/null 2>&1 || order_rc=$?
+              case "$order_rc" in
+                0) ;;
+                1)
+                  POLLED_STATUS_RECORD=$rec
+                  log "a later or same-second trusted rate-limit refusal supersedes the completed current-head summary (#2326)"
+                  return 0 ;;
+                *) return 3 ;;
+              esac
+            fi
+            return 1 ;;
+          1) ;;
+          *) return 3 ;;
+        esac
         ;;
       *) return 3 ;;
     esac
@@ -5970,6 +6017,15 @@ while :; do
             continue
           fi
           if [ "$HEAD_RUN_RC" = "0" ]; then
+            if [ "${TRUST_STATUS_CONTEXT:-false}" = true ]; then
+              POLLED_STATUS_RECORD=$(check_status_context_record) || die 3 "could not refresh CodeRabbit status before review clearance"
+              [ "$(crw_status_record_state "$POLLED_STATUS_RECORD")" != unreadable ] || die 3 "CodeRabbit status unreadable before review clearance"
+            fi
+            emit_rate_limit_stall_at_timeout_if_present "${POLLED_STATUS_RECORD:-}"
+            if [ "${RATE_LIMIT_REFUSAL_PENDING:-false}" = true ]; then
+              sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+              continue
+            fi
             log "CodeRabbit review run id=$HEAD_RUN_ID is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
             SUMMARY_HEAD_CLAIM_RC=0
