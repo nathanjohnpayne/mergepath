@@ -3020,6 +3020,65 @@ test_final_risk_marker_fallback() {
 
 test_final_risk_marker_fallback
 
+# #2326: a refused rerun on the same SHA must not credit an older report.
+test_status_refusal_before_clean_review_clearance() {
+  local authority phase mode review_at dir reviews rc expected before body
+  for authority in run summary; do
+  for phase in polling terminal terminal_fresh; do
+  for mode in older equal newer untrusted; do
+    before=$FAIL
+    case "$mode" in
+      older|untrusted) review_at=2026-06-04T00:00:10Z ;;
+      equal) review_at=2026-06-04T00:00:20Z ;;
+      newer) review_at=2026-06-04T00:00:30Z ;;
+    esac
+    expected=5
+    case "$mode" in newer|untrusted) expected=0 ;; esac
+    body="<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+
+**Actionable comments posted: 0**
+
+Review between $BASE_SHA_40 and $HEAD_SHA_40."
+    dir=$(make_case "2326-$authority-$phase-$mode" "$body" \
+      2026-06-04T00:00:20Z 'Review rate limited' "$review_at" 999999999 \
+      '' "$HEAD_TIME" "$HEAD_SHA_40")
+    [ "$mode" != untrusted ] || sed -i.bak \
+      's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' \
+      "$dir/.github/review-policy.yml"
+    if [ "$phase" != polling ]; then
+      # Drive the real terminal-upgrade helper after production startup and
+      # its initial trusted status read, instead of entering the poll loop.
+      python3 - "$dir/scripts/coderabbit-wait.sh" "$phase" <<'TERMINAL'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); code = p.read_text(); entry = "\nwhile :; do\n"
+assert code.count(entry) == 1
+invoke = "emit_terminal_review_after_probe_if_present"
+if sys.argv[2] == "terminal_fresh":
+    invoke = 'fresh=$(check_status_context_record)\nPOLLED_STATUS_RECORD=\'{"state":"success","description":"Review completed"}\'\nemit_terminal_review_after_probe_if_present "$fresh"'
+code = code.replace(entry, "\n" + invoke + "\nemit_rate_limit_stall_at_timeout_if_present\nemit_json_and_exit timeout 4 null 0\n" + entry)
+p.write_text(code)
+TERMINAL
+    fi
+    reviews=$(jq -nc --arg sha "$HEAD_SHA_40" --arg at "$review_at" \
+      '[{id:5501,user:{login:"coderabbitai[bot]"},commit_id:$sha,submitted_at:$at,body:"**Actionable comments posted: 0**"}]')
+    [ "$authority" != summary ] || reviews='[]'
+    rc=$(CODERABBIT_TEST_REVIEWS_RAW="$reviews" run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "2326 $mode: expected $expected, got $rc; $(tail -4 "$dir/err.log")"
+    if [ "$expected" = 5 ]; then
+      [ "$(stub_calls "$dir")" = 1 ] && [ "$(jqf "$dir" '.codex_failover_requested')" = true ] \
+        || fail "2326 $mode: refusal did not request exactly one substitute"
+      [ "$(cat "$dir/state/fake-time")" = 2000000000 ] || fail "2326 $mode: refusal slept before substitution"
+    else
+      [ "$(stub_calls "$dir")" = 0 ] || fail "2326 $mode: valid clearance unnecessarily requested a substitute"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "2326 $authority $phase $mode report respects same-SHA refusal ordering"
+  done
+  done
+  done
+}
+test_status_refusal_before_clean_review_clearance
+
 test_immediate_status_refusal_respects_selected_progress() {
   local mode status_at dir rc expected before
   for mode in older equal newer; do
