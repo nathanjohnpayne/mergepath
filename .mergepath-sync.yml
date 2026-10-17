@@ -749,6 +749,7 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/workflow/resolve_base_policy.sh"
       - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/lib/codex-failure-markers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical

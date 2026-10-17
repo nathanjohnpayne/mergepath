@@ -72,6 +72,8 @@ EOF
 . "$SCRIPT_DIR/lib/pr-body-contract.sh"
 # shellcheck source=lib/codex-request-evidence.sh
 . "$SCRIPT_DIR/lib/codex-request-evidence.sh"
+# shellcheck source=lib/codex-failure-markers.sh
+. "$SCRIPT_DIR/lib/codex-failure-markers.sh"
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 
@@ -171,7 +173,7 @@ fetch_history_array() {
 # request or cap reset; an unanswered expired request permits timeout fallback.
 ensure_codex_idle() {
   local repo="$1" num="$2" head="$3" policy_json="$4"
-  local bot author timeout comments reviews inline summary trigger response committed floor since enabled
+  local bot author timeout comments reviews inline summary trigger response committed floor since enabled failure
   bot=$(jq -er '.codex.bot_login // "chatgpt-codex-connector[bot]" | select(type == "string" and length > 0)' <<<"$policy_json") || exit 3
   author=$(crqe_policy_author "$policy_json") || exit 3
   timeout=$(jq -er '.codex.review_timeout_seconds // 1800 | select(type == "number" and . > 0 and floor == .)' <<<"$policy_json") || exit 3
@@ -185,13 +187,7 @@ ensure_codex_idle() {
   response=$(crqe_select_head_review "$reviews" "$inline" "$bot" "$head" | jq -r '.submitted_at // ""') || exit 3
   response=$(crqe_verdicts "$comments" "$bot" | jq -r --arg head "$head" --arg response "$response" '
     [ $response, (.[] | select(.reviewed_shas == [$head]) | .created_at) ] | max // ""') || exit 3
-  if [[ "$(jq -r '.status // ""' <<<"$summary")" =~ ^(running|unknown)$ ]] \
-     && [[ "$(jq -r '.observed_at // ""' <<<"$summary")" > "$response" || "$(jq -r '.observed_at // ""' <<<"$summary")" == "$response" ]]; then
-    echo "post-phase-4b-handoff.sh: Codex review in flight on HEAD $head; rerun after it reports" >&2
-    exit 5
-  fi
-  # A disabled provider has no expected request response, but an observed
-  # active summary above still prevents briefing over actual ongoing work.
+  trigger=null
   if [[ "$enabled" != false ]]; then
     committed=$(gh api "repos/$repo/commits/$head" --jq .commit.committer.date) || exit 3
     [[ -n "$committed" && "$committed" != null ]] || exit 3
@@ -199,7 +195,28 @@ ensure_codex_idle() {
     since=$(date -u -r "$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$floor" +%Y-%m-%dT%H:%M:%SZ) || exit 3
     [[ "$since" > "$committed" ]] || since="$committed"
     trigger=$(crqe_select_trigger "$comments" "$author" "$since") || exit 3
+    # A provider-owned refusal answers this request without claiming a review.
+    # Older refusals and other identities cannot end a renewed request's wait.
+    if [[ "$trigger" != null ]]; then
+      failure=$(jq -r --arg bot "$bot" --argjson trigger "$trigger" \
+        --arg usage "$CODEX_USAGE_LIMIT_MARKER_RE" --arg connection "$CODEX_NOT_CONNECTED_MARKER_RE" '
+        [.[] | select(.user.login == $bot)
+         | select((.body // "") | test($usage; "i") or test($connection; "i"))
+         | select([.created_at, .id] > [$trigger.created_at, $trigger.id])]
+        | max_by([.created_at, .id]) | .created_at // ""' <<<"$comments") || exit 3
+      [[ "$failure" < "$response" ]] || response="$failure"
+    fi
     response=$(jq -r --arg response "$response" '[ $response, (if .status == "completed" then .observed_at else "" end) ] | max // ""' <<<"$summary") || exit 3
+  fi
+  # A disabled provider has no expected response, but an observed running
+  # summary still prevents briefing over actual ongoing work. A newer summary
+  # likewise retains the hold after an earlier terminal failure.
+  if [[ "$(jq -r '.status // ""' <<<"$summary")" =~ ^(running|unknown)$ ]] \
+     && [[ "$(jq -r '.observed_at // ""' <<<"$summary")" > "$response" || "$(jq -r '.observed_at // ""' <<<"$summary")" == "$response" ]]; then
+    echo "post-phase-4b-handoff.sh: Codex review in flight on HEAD $head; rerun after it reports" >&2
+    exit 5
+  fi
+  if [[ "$enabled" != false ]]; then
     if [[ "$trigger" != null && "$(jq -r .created_at <<<"$trigger")" > "$response" ]]; then
       echo "post-phase-4b-handoff.sh: Codex request in flight on HEAD $head; rerun after it reports" >&2
       exit 5
@@ -264,7 +281,7 @@ fetch_pr_metadata() {
 
   # Resolve each target's governing policy, including cross-repository batches.
   # Candidate checkout policy must not choose its own external reviewer.
-  local policy body author_count author reviewer candidate
+  local policy body author_count author reviewer candidate policy_json unresolved live_head
   policy=$("$SCRIPT_DIR/workflow/resolve_base_policy.sh" --repo "$repo" \
     --base-ref "$(printf '%s' "$json" | jq -r '.base.ref // empty')" \
     --base-sha "$base_sha" \
@@ -277,6 +294,7 @@ fetch_pr_metadata() {
   # shellcheck disable=SC2064 # Bind the escaped path before function-local scope ends.
   trap "$(printf 'rm -f -- %q' "$policy")" EXIT
   body=$(printf '%s' "$json" | jq -r '.body // ""')
+  policy_json=$(policy_yaml_to_json "$policy") || exit 3
   author_count=$(pr_body_authoring_agent_count "$body") && \
     author=$(pr_body_authoring_agent "$body") || {
       echo "post-phase-4b-handoff.sh: Authoring-Agent parser failed for ${repo}#${num}" >&2
@@ -288,6 +306,13 @@ fetch_pr_metadata() {
     exit 3
   fi
   reviewer=$(printf '%s' "${PHASE_4B_REVIEWER_IDENTITY:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ -z "$reviewer" ]]; then
+    candidate=$(jq -r '.default_external_reviewer // "" | if type == "string" then ascii_downcase else error("default_external_reviewer") end' <<<"$policy_json") || exit 3
+    if [[ -n "$candidate" && "$candidate" != "nathanpayne-$author" ]] \
+       && login_is_available_reviewer "$candidate" "$policy"; then
+      reviewer="$candidate"
+    fi
+  fi
   if [[ -z "$reviewer" ]]; then
     while IFS= read -r candidate; do
       candidate=$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')
@@ -307,8 +332,6 @@ fetch_pr_metadata() {
     exit 3
   fi
 
-  local policy_json unresolved live_head
-  policy_json=$(policy_yaml_to_json "$policy") || exit 3
   ensure_codex_idle "$repo" "$num" "$head_sha" "$policy_json"
   unresolved=$(awk -F '\t' -v repo="$repo" -v num="$num" '$1 == repo && $2 == num {print $3; exit}' <<<"$ACCOUNTING_TSV")
   [[ "$unresolved" =~ ^[0-9]+$ ]] || exit 3

@@ -448,6 +448,20 @@ OUT=$(PHASE_4B_REVIEWER_IDENTITY=nathanpayne-cursor "$SCRIPT" nathanjohnpayne/me
 printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-cursor' \
   && pass "registered cross-agent override is honored" \
   || fail "valid cross-agent override was lost"
+# The governing default wins over list order, but cannot select the author.
+cp "$FIXTURE_DIR/review-policy.yml" "$WORKDIR/default-policy.yml"
+printf '\ndefault_external_reviewer: nathanpayne-cursor\n' >> "$FIXTURE_DIR/review-policy.yml"
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
+printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-cursor' \
+  && pass "governing default reviewer wins over available-reviewer order" \
+  || fail "configured default reviewer was ignored"
+cp "$WORKDIR/default-policy.yml" "$FIXTURE_DIR/review-policy.yml"
+printf '\ndefault_external_reviewer: nathanpayne-claude\n' >> "$FIXTURE_DIR/review-policy.yml"
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
+printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-codex' \
+  && pass "same-author default falls back to a registered cross-agent reviewer" \
+  || fail "same-author default bypassed cross-agent selection"
+cp "$WORKDIR/default-policy.yml" "$FIXTURE_DIR/review-policy.yml"
 for override in nathanpayne-codex NathanPayne-Codex unregistered-reviewer; do
   rc=0
   OUT=$(PHASE_4B_REVIEWER_IDENTITY="$override" "$SCRIPT" nathanjohnpayne/mergepath#42 2>"$WORKDIR/error") || rc=$?
@@ -485,11 +499,25 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REQUEST=$(jq -nc --arg now "$NOW" '[{id:801,user:{login:"nathanjohnpayne"},created_at:$now,body:"@codex review"}]')
 RUNNING=$(jq -nc --arg now "$NOW" --arg head "$HEAD" \
   '[{id:802,user:{login:"chatgpt-codex-connector[bot]"},created_at:$now,updated_at:$now,body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `" + $head + "` | New commits |")}]')
-for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled; do
+for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal; do
   history='[]'; reviews='[]'; expected=0
   case "$scenario" in
     running|batch-running) history="$RUNNING"; expected=5 ;;
     requested) history="$REQUEST"; expected=5 ;;
+    terminal-usage|terminal-connection|stale-terminal|spoofed-terminal|renewed-request|terminal-after-running|running-after-terminal)
+      history=$(jq -nc --argjson request "$REQUEST" --arg scenario "$scenario" --argjson running "$RUNNING" --arg now "$NOW" '
+        ($now | fromdateiso8601) as $epoch
+        | (if $scenario == "stale-terminal" then $epoch - 1 else $epoch + 1 end | todateiso8601) as $failed
+        | ($epoch + 2 | todateiso8601) as $later
+        | {id:804,user:{login:(if $scenario == "spoofed-terminal" then "someone-else" else "chatgpt-codex-connector[bot]" end)},created_at:$failed,
+           body:(if $scenario == "terminal-connection" then "To use Codex here, configure an environment." else "You have reached your Codex usage limits for code reviews." end)} as $failure
+        | $request + [$failure]
+        + (if $scenario == "renewed-request" then [$request[0] | .id=805 | .created_at=$later]
+           elif $scenario == "terminal-after-running" then $running
+           elif $scenario == "running-after-terminal" then [$running[0] | .updated_at=$later]
+           else [] end)')
+      case "$scenario" in stale-terminal|spoofed-terminal|renewed-request|running-after-terminal) expected=5 ;; esac
+      ;;
     completed) history="$REQUEST"; reviews=$(jq -nc --arg now "$NOW" --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$now,commit_id:$head,state:"COMMENTED",body:"Completed review"}]') ;;
     stale-response) history="$REQUEST"; expected=5; reviews=$(jq -nc --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:"2026-01-02T00:00:00Z",commit_id:$head,state:"COMMENTED",body:"Old same-head review"}]') ;;
     newer-response) history=$(jq '.[0].updated_at="2026-01-02T00:00:00Z"' <<<"$RUNNING"); reviews=$(jq -nc --arg now "$NOW" --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$now,commit_id:$head,state:"COMMENTED",body:"Completed review"}]') ;;
