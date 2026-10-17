@@ -497,10 +497,10 @@ case "\$endpoint" in
     # clearing so the #221 fast path survives.
     if [ -n "\$status_description" ]; then
       jq -cn --arg bot "\$bot" --arg t "\$status_time" --arg d "\$status_description" \
-        '[{context:"CodeRabbit",creator:{login:\$bot},state:"success",created_at:\$t,description:\$d}]'
+        '[{id:1,context:"CodeRabbit",creator:{login:\$bot},state:"success",created_at:\$t,description:\$d}]'
     else
       jq -cn --arg bot "\$bot" --arg t "\$status_time" \
-        '[{context:"CodeRabbit",creator:{login:\$bot},state:"success",created_at:\$t}]'
+        '[{id:1,context:"CodeRabbit",creator:{login:\$bot},state:"success",created_at:\$t}]'
     fi ;;
   repos/owner/repo/issues/999/timeline) printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)

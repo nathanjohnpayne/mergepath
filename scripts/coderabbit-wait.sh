@@ -4609,8 +4609,8 @@ crw_probe_head_review_in_progress() {
   [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
   # `--by-id` reads the ID-ordered record instead: a new run's `pending`
   # posted in the same second as the prior `success` must win the tie.
-  # Opt-in, so the #919 callers keep their ordering (see
-  # crw_carry_status_record).
+  # The carry-forward reader also retains the ID for its two-sample fence;
+  # ordinary callers use the standard record (see crw_carry_status_record).
   if [ "${1:-}" = "--by-id" ]; then
     rec=$(crw_carry_status_record)
   else
