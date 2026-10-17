@@ -1623,7 +1623,38 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 }
 
 # #2120: status-only refusal controls, expected ~20s, outer timeout 45s.
+test_2360_same_second_status_ordering() {
+  local shape dir fixture rc expected
+  for shape in ${CODERABBIT_TEST_STATUS_ID_CASES:-refusal reversed completed wrong-author malformed-id}; do
+    dir=$(make_case "2360-$shape" 1 false 0 0)
+    sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
+    fixture="$dir/statuses.json"
+    jq -n --arg bot coderabbitai\[bot\] --arg shape "$shape" '
+      {id: 1, context: "CodeRabbit", state: "success",
+       created_at: "2026-06-04T00:00:09Z", updated_at: "2026-06-04T00:00:09Z",
+       creator: {login: $bot}, description: "Review completed"} as $old
+      | [$old + {id: 2, description: "Review rate limited"}, $old]
+      | if $shape == "reversed" then reverse
+        elif $shape == "completed" then map(.description = (if .id == 2 then "Review completed" else "Review rate limited" end))
+        elif $shape == "wrong-author" then .[0].creator.login = "someone-else"
+        elif $shape == "malformed-id" then .[0].id = "invalid"
+        else . end
+      | {statuses: .}' >"$fixture"
+    expected=5
+    case "$shape" in completed|wrong-author) expected=0 ;; malformed-id) expected=3 ;; esac
+    rc=$(CODERABBIT_TEST_NATIVE_REFUSAL=true CODERABBIT_TEST_STATUS_FIXTURE="$fixture" \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" run_case "$dir" probe_review_on_head)
+    if [ "$rc" = "$expected" ]; then
+      pass "#2360 same-second $shape: polling rc=$rc"
+    else
+      fail "#2360 same-second $shape: polling rc=$rc expected=$expected; $(tail -2 "$dir/err.log")"
+    fi
+  done
+}
+
 if [ "${1:-}" = --status-refusal-only ]; then
+  test_2360_same_second_status_ordering
   helpers="$WORKDIR/status-refusal-helpers.sh"
   sed -n '/^# BEGIN coderabbit_status_description_helpers$/,/^# END coderabbit_status_description_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
   sed -n '/^# BEGIN coderabbit_probe_status_refusal_helpers$/,/^# END coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
@@ -4373,6 +4404,7 @@ fi
 test_878_waiter_tier_errors
 
 test_900_review_run_selector_ignores_bodyless_replies
+test_2360_same_second_status_ordering
 test_919_pending_status_blocks_the_terminal_verdict
 test_940_fallback_status_veto
 test_878_aged_marker_cannot_escape_trusted_status_veto
