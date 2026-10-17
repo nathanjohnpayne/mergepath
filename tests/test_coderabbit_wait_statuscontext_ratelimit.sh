@@ -488,6 +488,10 @@ case "\$endpoint" in
     if [ "\${1:-}" = "--jq" ]; then printf '%s\n' "\$head_time"
     else printf '{"commit":{"committer":{"date":"%s"}}}\n' "\$head_time"; fi ;;
   repos/owner/repo/commits/$head_sha/statuses)
+    if [ -f "\$state_dir/late-refusal-enabled" ]; then
+      status_description='Review in progress'
+      [ ! -f "\$state_dir/selection-done" ] || status_description='Review rate limited'
+    fi
     # An EMPTY status_description omits the key entirely — the shape every
     # pre-#891 fixture modelled, and the one the description guard must keep
     # clearing so the #221 fast path survives.
@@ -3027,12 +3031,14 @@ test_status_refusal_before_clean_review_clearance() {
   local authority phase mode review_at updated_at dir reviews rc expected before body
   for authority in run summary; do
   for phase in polling terminal terminal_fresh; do
-  for mode in older equal newer untrusted edited progress_newer; do
+  for mode in older equal newer untrusted edited progress_newer progress_older raced; do
     [ "$mode" != edited ] || [ "$authority" = summary ] || continue
-    [ "$mode" != progress_newer ] || { [ "$authority" = run ] && [ "$phase" != polling ]; } || continue
+    case "$mode" in progress_newer|progress_older)
+      { [ "$authority" = run ] && [ "$phase" != polling ]; } || continue ;;
+    esac
     before=$FAIL
     case "$mode" in
-      older|untrusted|edited) review_at=2026-06-04T00:00:10Z ;;
+      older|untrusted|edited|raced|progress_older) review_at=2026-06-04T00:00:10Z ;;
       equal) review_at=2026-06-04T00:00:20Z ;;
       newer|progress_newer) review_at=2026-06-04T00:00:30Z ;;
     esac
@@ -3048,6 +3054,18 @@ Review between $BASE_SHA_40 and $HEAD_SHA_40."
     dir=$(make_case "2326-$authority-$phase-$mode" "$body" \
       2026-06-04T00:00:20Z 'Review rate limited' "$review_at" 999999999 \
       '' "$HEAD_TIME" "$HEAD_SHA_40" "$updated_at")
+    if [ "$mode" = raced ]; then
+      touch "$dir/state/late-refusal-enabled"
+      python3 - "$dir/scripts/coderabbit-wait.sh" <<'RACE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); code = p.read_text()
+entry = 'crw_head_pinned_clean_review_run() {'
+assert code.count(entry) == 1
+code = code.replace(entry, entry + '\n  touch "$CODERABBIT_TEST_STATE_DIR/selection-done"', 1)
+p.write_text(code)
+RACE
+    fi
     [ "$mode" != untrusted ] || sed -i.bak \
       's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' \
       "$dir/.github/review-policy.yml"
@@ -3062,7 +3080,7 @@ assert code.count(entry) == 1
 invoke = "emit_terminal_review_after_probe_if_present"
 if sys.argv[2] == "terminal_fresh":
     invoke = 'fresh=$(check_status_context_record)\nPOLLED_STATUS_RECORD=\'{"state":"success","description":"Review completed"}\'\nemit_terminal_review_after_probe_if_present "$fresh"'
-if sys.argv[3] == "progress_newer":
+if sys.argv[3] in ("progress_newer", "progress_older"):
     invoke = 'CLASS=in_progress\nCOMMENT_FRESH_AT=2026-06-04T00:00:20Z\n' + invoke
 code = code.replace(entry, "\n" + invoke + "\nemit_rate_limit_stall_at_timeout_if_present\nemit_json_and_exit timeout 4 null 0\n" + entry)
 p.write_text(code)

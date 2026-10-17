@@ -3905,10 +3905,10 @@ test_940_fallback_authority_and_absence() {
     [ ! -f "$dir/state/status-reads" ] || got_reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
     [ "$got_reads" = "$reads" ] || bad="$bad $scenario/$state-status-reads=$got_reads"
   done <<'EOF'
-probe_review_on_head|pending||true|0|2
-probe_review_on_head|success|Review rate limited|true|5|2
-probe_clean_incremental|pending||true|0|2
-probe_clean_incremental|success|Review rate limited|true|0|2
+probe_review_on_head|pending||true|0|3
+probe_review_on_head|success|Review rate limited|true|5|3
+probe_clean_incremental|pending||true|0|3
+probe_clean_incremental|success|Review rate limited|true|0|3
 badge_only_inline_finding|pending||true|2|2
 badge_only_summary_finding|pending||true|2|2
 fallback_summary|absent||true|0|3

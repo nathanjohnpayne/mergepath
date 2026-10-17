@@ -3366,7 +3366,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local clearance_status_record=${1:-} clearance_status_state
+  local clearance_status_record clearance_status_state
   local latest body class poll_class potential_issues review_json summary_marker_rc
   local summary_head_claim_rc head_run_rc head_run_id graded_review_id
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
@@ -3409,6 +3409,8 @@ emit_terminal_review_after_probe_if_present() {
   fi
   case "$class" in
     review)
+      # Grade this terminal selection rather than the last polling class.
+      local CLASS=review COMMENT_FRESH_AT=""
       # #1031 round 2: select the graded review object ONCE, here, and use the
       # same id for both the count below and the exact-SHA rung further down.
       # Letting each derive its own would let a run published between the two
@@ -3443,19 +3445,6 @@ emit_terminal_review_after_probe_if_present() {
           emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
           ;;
         1)
-          # The caller may already have refreshed status before the probe.
-          # Otherwise sample here before upgrading a timeout into clearance.
-          if [ "${TRUST_STATUS_CONTEXT:-false}" = true ]; then
-            if [ -z "$clearance_status_record" ]; then
-              clearance_status_record=$(check_status_context_record) || clearance_status_record='{"state":"unreadable"}'
-            fi
-            clearance_status_state=$(crw_status_record_state "$clearance_status_record") || clearance_status_state=unreadable
-            if [ "$clearance_status_state" = unreadable ]; then
-              log "post-probe terminal-review check: trusted CodeRabbit status could not be read — leaving the advisory timeout in place"
-              return 0
-            fi
-            POLLED_STATUS_RECORD=$clearance_status_record
-          fi
           # #968, mirroring the polling `review` arm — including its AC1
           # correction: the head claim is read off the SUMMARY, because `$body`
           # is only the newest bot comment and a later benign chat reply makes
@@ -3476,6 +3465,17 @@ emit_terminal_review_after_probe_if_present() {
           if [ "$head_run_rc" = 4 ]; then
             log "post-probe terminal-review check: a newer CodeRabbit run superseded the counted run — leaving the advisory timeout in place"
             return 0
+          fi
+          # Re-sample after selecting the counted run: a refusal may have
+          # arrived since the loop or pre-probe status read.
+          if [ "${TRUST_STATUS_CONTEXT:-false}" = true ]; then
+            clearance_status_record=$(check_status_context_record) || clearance_status_record='{"state":"unreadable"}'
+            clearance_status_state=$(crw_status_record_state "$clearance_status_record") || clearance_status_state=unreadable
+            if [ "$clearance_status_state" = unreadable ]; then
+              log "post-probe terminal-review check: trusted CodeRabbit status could not be read — leaving the advisory timeout in place"
+              return 0
+            fi
+            POLLED_STATUS_RECORD=$clearance_status_record
           fi
           if [ "$head_run_rc" = "0" ]; then
             emit_rate_limit_stall_at_timeout_if_present "${POLLED_STATUS_RECORD:-}"
@@ -3756,7 +3756,7 @@ emit_rate_limit_stall_at_timeout_if_present() {
   # Only a confirmed terminal refusal needs an extra strict review scan.
   # Ordinary timeouts keep their existing single post-probe scan.
   if [ "${1:-}" = --before-probe ]; then
-    emit_terminal_review_after_probe_if_present "$rec"
+    emit_terminal_review_after_probe_if_present
   fi
   if emit_head_review_before_refusal "$rec" "$state"; then
     return 0
@@ -4407,9 +4407,9 @@ crw_summary_blocks_fallback_clearance() {
         rc=0; summary_names_head "$sbody" "$head_sha" || rc=$?
         case "$rc" in
           0)
-            rec=${POLLED_STATUS_RECORD:-}
-            [ -n "$rec" ] || rec=$(check_status_context_record) || return 3
+            rec=$(check_status_context_record) || return 3
             state=$(crw_status_record_state "$rec") || return 3
+            [ "$state" != unreadable ] || return 3
             desc=$(jq -r '.description // ""' <<<"$rec") || return 3
             desc=$(crw_normalize_status_description "$desc") || return 3
             if [ "$state" = success ] && [ "$desc" = 'review rate limited' ]; then
@@ -6017,6 +6017,10 @@ while :; do
             continue
           fi
           if [ "$HEAD_RUN_RC" = "0" ]; then
+            if [ "${TRUST_STATUS_CONTEXT:-false}" = true ]; then
+              POLLED_STATUS_RECORD=$(check_status_context_record) || die 3 "could not refresh CodeRabbit status before review clearance"
+              [ "$(crw_status_record_state "$POLLED_STATUS_RECORD")" != unreadable ] || die 3 "CodeRabbit status unreadable before review clearance"
+            fi
             emit_rate_limit_stall_at_timeout_if_present "${POLLED_STATUS_RECORD:-}"
             if [ "${RATE_LIMIT_REFUSAL_PENDING:-false}" = true ]; then
               sleep_or_timeout "$POLL_INTERVAL_SECONDS"
