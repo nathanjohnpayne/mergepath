@@ -62,7 +62,7 @@ if args[:2] == ['pr','view']:
         calls=(root/'calls.jsonl').read_text().count('"pr", "view"')
         value=dict(url=url,headRefOid='d'*40 if state.get('head_moves') and calls>2 else head,
                   baseRefOid=base,baseRefName='release' if state.get('nondefault') else 'main',state='OPEN')
-        if 'labels' in fields: value['labels']=[dict(name=n) for n in state.get('final_labels',labels)]
+        if 'labels' in fields: value['labels']=[dict(name=n) for n in (state.get('final_labels',labels) if clearance_files_read else labels)]
         emit(value)
     sys.exit(0)
 if not args or args[0]!='api': sys.exit(99)
@@ -98,13 +98,17 @@ if 'contents/.github/review-policy.yml' in endpoint:
 if endpoint=='repos/example/repo/pulls/123':
     emit(dict(number=123,head=dict(sha=head,ref='feature/fixture'),
          base=dict(sha=base,ref='release' if state.get('nondefault') else 'main',repo=dict(default_branch='main')),
-         body='Authoring-Agent: codex',user=dict(login='nathanjohnpayne'),labels=[dict(name=l) for l in labels],
+         body=state.get('pr_body','Authoring-Agent: codex'),user=dict(login=state.get('pr_author','nathanjohnpayne')),labels=[dict(name=l) for l in state.get('gate_labels',labels)],
          additions=1,deletions=0,changed_files=1)); sys.exit(0)
 if endpoint.startswith('repos/example/repo/commits/'):
     print('2026-09-14T00:00:00Z'); sys.exit(0)
 if endpoint.endswith('/reviews'):
+    if state.get('no_approval'):
+        emit([[]] if '--slurp' in args else []); sys.exit(0)
     reviews=[dict(id=1,user=dict(login='nathanpayne-claude'),state='APPROVED',commit_id=head,
                   submitted_at='2026-09-14T00:05:00Z',body='<!-- mergepath-p4b-request-generation: '+json.dumps([123,124] if state.get('socket_forges_generation') and socket_override else state.get('generation',[123]))+' -->')]
+    if state.get('stale_approval'): reviews[0]['commit_id']='d'*40
+    if state.get('fresh_codex'): reviews.append(dict(id=3,user=dict(login='chatgpt-codex-connector[bot]'),state='COMMENTED',commit_id=head,submitted_at='2026-09-14T00:06:00Z',body='No issues found.'))
     if state.get('disagreement') or state.get('late_disagreement') and clearance_files_read: reviews.append(dict(id=2,user=dict(login='nathanpayne-codex'),state='CHANGES_REQUESTED',commit_id='d'*40))
     emit([reviews] if '--slurp' in args else reviews); sys.exit(0)
 if endpoint.endswith('/issues/123/comments'):
@@ -299,6 +303,45 @@ if pathlib.Path(sys.argv[0]).name in ('owner-admin-override.py', 'merge-writer.p
         for label in ('human-hold','needs-human-review','policy-violation'):
             self.state={'generation':[123,124],'final_labels':[label]}
             self.assert_blocked(self.run_writer(),'hold is present in the final snapshot')
+
+    def test_late_external_review_requirement_requires_fresh_clearance(self):
+        self.state={'generation':[123,124],'labels':[],'final_labels':['needs-external-review']}
+        self.assert_blocked(self.run_writer(),'external-review requirement appeared during clearance')
+        self.assertFalse((self.path/'writes.jsonl').exists())
+
+    def test_existing_external_review_requirement_retains_reviewed_merge(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review']}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
+
+    def test_label_removed_during_clearance_cannot_skip_external_review(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review'],'no_approval':True}
+        self.assert_blocked(self.run_writer(),'no reviewer identity')
+        self.assertFalse((self.path/'writes.jsonl').exists())
+
+    def test_label_restored_after_clearance_accepts_actual_external_approval(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review']}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
+
+    def test_restored_label_rejects_stale_approval_despite_fresh_codex(self):
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review'],
+                    'pr_author':'another-maintainer','stale_approval':True,'fresh_codex':True}
+        self.assert_blocked(self.run_writer(),'no reviewer identity')
+        self.assertFalse((self.path/'writes.jsonl').exists())
+
+    def test_omitted_external_gate_retains_disabled_default(self):
+        (self.path/'governing-policy.yml').write_text(POLICY.replace('  external_review_gate:\n    enabled: true\n',''))
+        self.state={'generation':[123,124],'labels':['needs-external-review'],
+                    'gate_labels':[],'final_labels':['needs-external-review'],'no_approval':True}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()),1)
 
     def test_lowercase_proxy_transport_is_preserved(self):
         self.state={'generation':[123,124],'require_lower_proxy':True}
