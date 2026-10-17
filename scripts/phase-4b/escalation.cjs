@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 
 const SENSITIVE_PATHS = [
+  /^(?:.*\/)?AGENTS\.md$/,
   /^REVIEW_POLICY\.md$/,
   /^\.codex\/hooks\.json$/,
   /^\.claude\/settings\.json$/,
@@ -15,6 +16,7 @@ const SENSITIVE_PATHS = [
   /^\.mergepath-sync\.yml$/,
   /^scripts\/sync-to-downstream\.sh$/,
   /^scripts\/coderabbit-wait\.sh$/,
+  /^scripts\/coderabbit-automerge-rate-limit-gate\.sh$/,
   /^scripts\/gate-api-lineage-blocking\.sh$/,
   /^scripts\/review-feedback-surface-fingerprint\.sh$/,
   /^scripts\/(?:codex|coderabbit)-record-feedback\.sh$/,

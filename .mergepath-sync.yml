@@ -749,6 +749,7 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/workflow/resolve_base_policy.sh"
       - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/lib/codex-failure-markers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
@@ -1704,6 +1705,9 @@ paths:
   - path: tests/test_post_phase_4b_handoff.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/post-phase-4b-handoff.sh"
+      - "scripts/lib/codex-failure-markers.sh"
   # Pairs with scripts/phase-4b-review.sh + the scripts/phase-4b/ kit
   # and is hard-required by scripts/ci/check_phase_4b_automation.
   # Fake CLIs and fake gh wrappers only; no live GitHub network.

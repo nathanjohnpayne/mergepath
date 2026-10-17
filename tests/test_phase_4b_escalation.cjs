@@ -45,6 +45,15 @@ test('the CodeRabbit provider barrier entrypoint is an exact sensitive path', ()
   }
 });
 
+test('scoped agent instructions and the substitution merge gate require human review', () => {
+  for (const file of ['AGENTS.md', 'src/AGENTS.md', 'src/nested/AGENTS.md', 'scripts/coderabbit-automerge-rate-limit-gate.sh']) {
+    assert.equal(classify('+ordinary change', [file]).decision, 'human-review', file);
+  }
+  for (const file of ['AGENTS.md.example', 'src/agents.md', 'scripts/coderabbit-automerge-rate-limit-gate.sh.example']) {
+    assert.equal(classify('+ordinary change', [file]).decision, 'model-review', file);
+  }
+});
+
 test('the native/API lineage gate entrypoint is an exact sensitive path', () => {
   assert.deepEqual(classify('+ordinary change', ['scripts/gate-api-lineage-blocking.sh']), {
     decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
