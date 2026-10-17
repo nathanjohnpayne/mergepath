@@ -2137,14 +2137,16 @@ test_summary_naming_other_head_does_not_clear() {
 }
 
 # --- Test 30: #968 AC2 — the #824 rung must not regress ---------------------
-# Same edit timeline, same 40-hex head, one difference: the commits range ends
+# With an ordinary non-completion status (no terminal refusal), the range ends
 # at the CURRENT head. `created_at` still predates the head committer date, so
-# only `fresh_at` admits it — and it must still clear. A demotion keyed on
+# only `fresh_at` admits it — and it must still clear. The #2326 edited-summary
+# controls below separately prove that a terminal refusal defeats this escape.
+# A demotion keyed on
 # "created_at is old" rather than on the named SHA fails here.
 test_summary_naming_current_head_still_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "summary-current-head" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_TIME" \
-    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "" "$HEAD_TIME" \
+    "Review in progress" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "" "$HEAD_TIME" \
     "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
   rc=$(run_case "$dir")
   [ "$rc" = "0" ] || fail "30: expected exit 0 (cleared) for a summary naming the current head, got $rc; err=$(tail -4 "$dir/err.log")"
@@ -2286,7 +2288,7 @@ test_later_chat_reply_does_not_restore_other_head_clear() {
 test_later_chat_reply_over_current_head_summary_still_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "summary-current-head-chat" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_TIME" \
-    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
+    "Review in progress" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
     "$CHAT_REPLY_AFTER_SUMMARY" "$CHAT_REPLY_TIME" "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
   rc=$(run_case "$dir")
   [ "$rc" = "0" ] || fail "34: expected exit 0 (cleared) — the summary names this head, got $rc; err=$(tail -4 "$dir/err.log")"
@@ -2387,7 +2389,7 @@ test_bodyless_ack_does_not_outrank_stale_summary() {
 test_quoted_range_in_chat_reply_does_not_veto_current_head() {
   local dir rc before=$FAIL
   dir=$(make_case "quoted-range-chat" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_TIME" \
-    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
+    "Review in progress" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
     "$CHAT_REPLY_QUOTING_OLD_RANGE" "$CHAT_REPLY_TIME" "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
   rc=$(run_case "$dir")
   grep -q 'latest CodeRabbit comment id=7702' "$dir/err.log" \
@@ -3022,33 +3024,37 @@ test_final_risk_marker_fallback
 
 # #2326: a refused rerun on the same SHA must not credit an older report.
 test_status_refusal_before_clean_review_clearance() {
-  local authority phase mode review_at dir reviews rc expected before body
+  local authority phase mode review_at updated_at dir reviews rc expected before body
   for authority in run summary; do
   for phase in polling terminal terminal_fresh; do
-  for mode in older equal newer untrusted; do
+  for mode in older equal newer untrusted edited progress_newer; do
+    [ "$mode" != edited ] || [ "$authority" = summary ] || continue
+    [ "$mode" != progress_newer ] || { [ "$authority" = run ] && [ "$phase" != polling ]; } || continue
     before=$FAIL
     case "$mode" in
-      older|untrusted) review_at=2026-06-04T00:00:10Z ;;
+      older|untrusted|edited) review_at=2026-06-04T00:00:10Z ;;
       equal) review_at=2026-06-04T00:00:20Z ;;
-      newer) review_at=2026-06-04T00:00:30Z ;;
+      newer|progress_newer) review_at=2026-06-04T00:00:30Z ;;
     esac
     expected=5
-    case "$mode" in newer|untrusted) expected=0 ;; esac
+    case "$mode" in newer|untrusted|progress_newer) expected=0 ;; esac
     body="<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
 
 **Actionable comments posted: 0**
 
 Review between $BASE_SHA_40 and $HEAD_SHA_40."
+    updated_at=$review_at
+    [ "$mode" != edited ] || updated_at=2026-06-04T00:00:30Z
     dir=$(make_case "2326-$authority-$phase-$mode" "$body" \
       2026-06-04T00:00:20Z 'Review rate limited' "$review_at" 999999999 \
-      '' "$HEAD_TIME" "$HEAD_SHA_40")
+      '' "$HEAD_TIME" "$HEAD_SHA_40" "$updated_at")
     [ "$mode" != untrusted ] || sed -i.bak \
       's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' \
       "$dir/.github/review-policy.yml"
     if [ "$phase" != polling ]; then
       # Drive the real terminal-upgrade helper after production startup and
       # its initial trusted status read, instead of entering the poll loop.
-      python3 - "$dir/scripts/coderabbit-wait.sh" "$phase" <<'TERMINAL'
+      python3 - "$dir/scripts/coderabbit-wait.sh" "$phase" "$mode" <<'TERMINAL'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]); code = p.read_text(); entry = "\nwhile :; do\n"
@@ -3056,6 +3062,8 @@ assert code.count(entry) == 1
 invoke = "emit_terminal_review_after_probe_if_present"
 if sys.argv[2] == "terminal_fresh":
     invoke = 'fresh=$(check_status_context_record)\nPOLLED_STATUS_RECORD=\'{"state":"success","description":"Review completed"}\'\nemit_terminal_review_after_probe_if_present "$fresh"'
+if sys.argv[3] == "progress_newer":
+    invoke = 'CLASS=in_progress\nCOMMENT_FRESH_AT=2026-06-04T00:00:20Z\n' + invoke
 code = code.replace(entry, "\n" + invoke + "\nemit_rate_limit_stall_at_timeout_if_present\nemit_json_and_exit timeout 4 null 0\n" + entry)
 p.write_text(code)
 TERMINAL

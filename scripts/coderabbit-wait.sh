@@ -3739,7 +3739,6 @@ emit_rate_limit_stall_at_timeout_if_present() {
   desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 0
   desc=$(crw_normalize_status_description "$desc") || return 0
   [ "$desc" = "review rate limited" ] || return 0
-  RATE_LIMIT_REFUSAL_PENDING=true
   # A selected equal/newer progress publication supersedes the sampled
   # refusal, matching the probe's temporal precedence.
   if [ "${CLASS:-}" = in_progress ] && [ -n "${COMMENT_FRESH_AT:-}" ]; then
@@ -3753,6 +3752,7 @@ emit_rate_limit_stall_at_timeout_if_present() {
       *) die 3 "could not order the selected CodeRabbit progress against its status refusal" ;;
     esac
   fi
+  RATE_LIMIT_REFUSAL_PENDING=true
   # Only a confirmed terminal refusal needs an extra strict review scan.
   # Ordinary timeouts keep their existing single post-probe scan.
   if [ "${1:-}" = --before-probe ]; then
@@ -4413,8 +4413,10 @@ crw_summary_blocks_fallback_clearance() {
             desc=$(jq -r '.description // ""' <<<"$rec") || return 3
             desc=$(crw_normalize_status_description "$desc") || return 3
             if [ "$state" = success ] && [ "$desc" = 'review rate limited' ]; then
+              # Editing an old summary is not evidence of a new review.
+              # Only a summary created after the refusal proves this order.
               local summary_at order_rc=0
-              summary_at=$(printf '%s' "$summary" | base64 --decode | jq -er '.json | fromjson | .fresh_at | select(type == "string" and length > 0)') || return 3
+              summary_at=$(printf '%s' "$summary" | base64 --decode | jq -er '.json | fromjson | .created_at | select(type == "string" and length > 0)') || return 3
               jq -e --arg at "$summary_at" '($at | fromdateiso8601) > ((.updated_at // .created_at) | fromdateiso8601)' \
                 <<<"$rec" >/dev/null 2>&1 || order_rc=$?
               case "$order_rc" in
