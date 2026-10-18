@@ -1050,11 +1050,9 @@ crw_status_description_permits_clearance() {
 #    creator filter, that's a spoof vector. The configured bot login
 #    is the only signal we trust.
 #
-# 2. Use `sort_by(.created_at) | last` to pick the latest status, not
-#    `head -n 1`. The /statuses endpoint does not guarantee chronological
-#    ordering across calls, so `head` could return a stale status if
-#    multiple have been posted on the same SHA (e.g., re-evaluation
-#    after a CodeRabbit retry).
+# 2. Order trusted statuses by numeric ID, not response order or timestamps
+#    (#2360). Whole-second timestamps can tie; a newer refusal must outrank
+#    an older completion even when the endpoint returns newest first.
 #
 # Endpoint choice: `/commits/{sha}/statuses` (plural) returns each
 # status object with full `creator` details. The singular
@@ -1142,7 +1140,8 @@ check_status_context_record() {
       | select(.context == "CodeRabbit")
       | select((.creator.login // "") == $bot)
     ]
-    | sort_by(.created_at)
+    | if any(.[]; (.id | type) != "number" or .id < 1 or (.id | floor) != .id)
+      then error("invalid trusted status ID") else sort_by(.id) end
     | last
     | if . == null then
         {state: "missing", created_at: "", updated_at: "", description: ""}
@@ -4610,8 +4609,8 @@ crw_probe_head_review_in_progress() {
   [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
   # `--by-id` reads the ID-ordered record instead: a new run's `pending`
   # posted in the same second as the prior `success` must win the tie.
-  # Opt-in, so the #919 callers keep their ordering (see
-  # crw_carry_status_record).
+  # The carry-forward reader also retains the ID for its two-sample fence;
+  # ordinary callers use the standard record (see crw_carry_status_record).
   if [ "${1:-}" = "--by-id" ]; then
     rec=$(crw_carry_status_record)
   else
@@ -4630,20 +4629,18 @@ crw_probe_head_review_in_progress() {
 # The newest CodeRabbit StatusContext on HEAD_SHA, ordered by status ID, as
 # {id, state, description, updated_at}; the `unreadable` record on any failed
 # read, `missing` when there is none. Used ONLY by the carry-forward evidence
-# (Codex P1 on #1340). check_status_context_record orders by created_at, which
-# has whole-second resolution, and the statuses endpoint is newest-first, so a
-# `pending` posted in the same second as the prior `success` sorts BEFORE it
-# and the older success wins — enough to make two samples look identical while
-# a new run is active. Status IDs increase strictly with creation, so they
-# order a tie. Kept separate so no other consumer's ordering changes.
+# (Codex P1 on #1340). Both readers now order by numeric ID (#2360), so a
+# same-second newer pending or refusal outranks an older completion. This
+# carry-forward record additionally retains the ID for its two-sample fence.
 crw_carry_status_record() {
   local statuses out
   statuses=$(fetch_api_array "repos/$REPO/commits/$HEAD_SHA/statuses" "statuses (carry-forward)") || {
     printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"; return 0; }
   out=$(printf '%s' "$statuses" | jq -c --arg bot "$BOT_LOGIN" '
-    [ .[]? | select(.context == "CodeRabbit") | select((.creator.login // "") == $bot)
-      | select((.id | type) == "number") ]
-    | sort_by(.id) | last
+    [ .[]? | select(.context == "CodeRabbit") | select((.creator.login // "") == $bot) ]
+    | if any(.[]; (.id | type) != "number" or .id < 1 or (.id | floor) != .id)
+      then error("invalid trusted status ID") else sort_by(.id) end
+    | last
     | if . == null then {id: null, state: "missing", created_at: "", updated_at: "", description: ""}
       else {id, state: (.state // "missing"), created_at: (.created_at // ""),
             updated_at: (.updated_at // .created_at // ""), description: (.description // "")}
