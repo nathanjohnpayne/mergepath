@@ -1331,6 +1331,7 @@ case "$1" in
           cat <<JSON
 [
   {
+    "id": 1,
     "context": "CodeRabbit",
     "state": "success",
     "created_at": "$status_created_at",
