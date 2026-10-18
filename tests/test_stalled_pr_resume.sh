@@ -401,6 +401,34 @@ else
   fail "author merge is advertised before the CodeRabbit selector and selected wait"
 fi
 
+# #2424: a quota refusal found after an earlier approval needs a replacement
+# approval after exact-head Codex clearance, not merely another plain gate.
+if grep -Fq -- "--approve --body 'CodeRabbit rate-limited; cleared by Codex on $(sha 105).'" "$TMP/resume-105.txt" \
+   && grep -Fq 'NEW approval AFTER that clearance' "$TMP/resume-105.txt" \
+   && grep -Fq 'Any earlier approval cannot carry the failover' "$TMP/resume-105.txt"; then
+  pass "under-threshold failover names a new audited approval with provider and full head"
+else
+  fail "under-threshold failover omits the later approval or its provider/full-head audit body"
+fi
+if awk '
+  /CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=0 scripts\/codex-review-check.sh --require-codex-on-head 105 octo\/demo/ {clearance=NR}
+  /scripts\/gh-as-reviewer.sh -- gh pr review 105 --repo octo\/demo --approve/ {approval=NR}
+  /CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 scripts\/codex-review-check.sh --require-codex-on-head 105 octo\/demo/ {strict=NR}
+  /gh pr merge 105 --repo octo\/demo/ {merger=NR}
+  END {exit !(clearance > 0 && approval > clearance && strict > approval && merger > strict)}
+' "$TMP/resume-105.txt"; then
+  pass "failover clearance, replacement approval and strict verification precede merge in order"
+else
+  fail "failover approval sequence lacks its exact-head or post-clearance verification"
+fi
+if grep -Fq 'Under-threshold exit-5 failover only' "$TMP/resume-105.txt" \
+   && grep -Fq 'Above-threshold exit-5 failover continues through Phase 4 instead' "$TMP/resume-105.txt" \
+   && grep -Fq 'do not add a same-agent approval' "$TMP/resume-105.txt"; then
+  pass "replacement self-peer approval is scoped to under-threshold failover"
+else
+  fail "failover approval work order blurs the external-review threshold"
+fi
+
 set +e
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --pr 102 >/dev/null 2>"$TMP/resume-102.err"; rc_live=$?
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --threshold-minutes 720 >/dev/null 2>"$TMP/resume-none.err"; rc_none=$?

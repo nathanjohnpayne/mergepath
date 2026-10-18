@@ -344,13 +344,13 @@ for tpl_rel in examples/eslint.config.js examples/eslint.config.cjs.js; do
   fi
   tpl_live="$(grep -vE '^[[:space:]]*//' "$TPL")"
 
-  if printf '%s\n' "$tpl_live" | grep -qE '^[[:space:]]*\.\.\.tseslint\.configs\.recommended,[[:space:]]*$'; then
+  if printf '%s\n' "$tpl_live" | grep -E '^[[:space:]]*\.\.\.tseslint\.configs\.recommended,[[:space:]]*$' >/dev/null; then
     fail "$tpl_rel spreads tseslint.configs.recommended UNSCOPED; it will apply TS rules to .cjs and every other file type"
   else
     pass "$tpl_rel does not spread the TypeScript preset unscoped"
   fi
 
-  if printf '%s\n' "$tpl_live" | grep -qF 'tseslint.configs.recommended.map'; then
+  if printf '%s\n' "$tpl_live" | grep -F 'tseslint.configs.recommended.map' >/dev/null; then
     pass "$tpl_rel maps the TypeScript preset onto explicit file globs"
   else
     fail "$tpl_rel no longer scopes tseslint.configs.recommended to TS globs"
@@ -397,7 +397,7 @@ for tpl_rel in examples/eslint.config.js examples/eslint.config.cjs.js; do
     # is the consumer probe recorded in the commit that added this.
     map_body="$(printf '%s\n' "$tpl_live" \
       | sed -n '/tseslint\.configs\.recommended\.map/,/^[[:space:]]*),\{0,1\}[[:space:]]*$/p')"
-    if printf '%s\n' "$map_body" | grep -qF 'config.files'; then
+    if printf '%s\n' "$map_body" | grep -F 'config.files' >/dev/null; then
       pass "$tpl_rel only scopes preset entries that do not already carry their own files"
     else
       fail "$tpl_rel maps files: onto EVERY preset entry unconditionally; that overwrites typescript-eslint/eslint-recommended's own TS-only scope and disables its core-rule checks (no-undef, no-dupe-keys, ...) for the extra extensions"
@@ -438,7 +438,7 @@ for tpl_rel in examples/eslint.config.js examples/eslint.config.cjs.js; do
   fi
 
   # The .cjs block only means something if the TS preset cannot override it.
-  if printf '%s\n' "$tpl_live" | grep -qF '"**/*.cjs"'; then
+  if printf '%s\n' "$tpl_live" | grep -F '"**/*.cjs"' >/dev/null; then
     pass "$tpl_rel still declares a CommonJS block for .cjs"
   else
     fail "$tpl_rel no longer declares the .cjs CommonJS block the scoping protects"
