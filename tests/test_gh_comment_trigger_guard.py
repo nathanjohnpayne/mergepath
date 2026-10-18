@@ -113,6 +113,30 @@ class TriggerGuardTests(unittest.TestCase):
         _, meta = self.check(["api", "graphql", "--input", str(self.root / "missing.json")], role="hook", state=False)
         self.assertTrue(meta["deferred"])
 
+    def test_graphql_keyword_fragment_spread_cannot_hide_comment_call(self):
+        for fragment in ("query", "mutation", "subscription"):
+            query = ('mutation { ...' + fragment + ' addComment(input:{subjectId:"P", '
+                     'body:"@codex review"}) { clientMutationId } } fragment '
+                     + fragment + ' on Mutation { __typename }')
+            for role in ("author", "reviewer"):
+                with self.subTest(fragment=fragment, role=role), self.assertRaises(guard.Refused):
+                    self.check(["api", "graphql", "-f", "query=" + query], role=role)
+
+    def test_graphql_valueless_empty_array_fields_preserve_read_calls(self):
+        query = 'query($ids:[ID!]!) { nodes(ids:$ids) { id } }'
+        for field in (["-F", "ids[]"], ["-Fids[]"], ["--field=ids[]"]):
+            args = ["api", "graphql", "-f", "query=" + query, *field]
+            normalized, meta = self.check(args)
+            self.assertEqual(["gh", *args], normalized)
+            self.assertFalse(meta["guarded"])
+
+    def test_graphql_empty_array_does_not_skip_other_mutation_fields(self):
+        query = 'mutation { addComment(input:{subjectId:"P", body:"@codex review"}) { clientMutationId } }'
+        with self.assertRaises(guard.Refused):
+            self.check(["api", "graphql", "-F", "ids[]", "-f", "query=" + query])
+        with self.assertRaises(guard.Refused):
+            self.check(["api", "graphql", "-F", "ids", "-f", 'query=query { viewer { login } }'])
+
     def test_graphql_bom_between_comment_call_tokens_is_ignored(self):
         query = 'mutation { addComment\ufeff(input: {subjectId:"P", body:"@codex review"}) { clientMutationId } }'
         for role in ("author", "reviewer"):
