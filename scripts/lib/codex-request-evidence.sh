@@ -64,6 +64,16 @@ crqe_count_triggers() { # comments-json author
   printf '%s\n' "$generation" | jq -er 'length'
 }
 
+# Latest trusted PR force-push transition, not an author-controlled commit date.
+crqe_latest_head_transition() { # timeline-json
+  printf '%s' "$1" | jq -er '
+    if type != "array" then error("timeline") else
+      [.[] | select(.event == "head_ref_force_pushed") | .created_at] as $times
+      | if all($times[]; type == "string" and (try fromdateiso8601 catch null) != null)
+        then $times | max // "" else error("head transition time") end
+    end'
+}
+
 # Compute the request freshness anchor shared by the requester and Phase 4b
 # cap sensing. Inputs are already-read evidence so each caller retains its own
 # API failure action. Prints the full anchor record as JSON.
@@ -73,9 +83,7 @@ crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds
   [ -n "$committed" ] || return 1
   case "$seconds" in ''|*[!0-9]*) return 1 ;; esac
   case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
-  forced=$(printf '%s' "$timeline" | jq -er \
-    '[.[] | select(.event == "head_ref_force_pushed") | .created_at] | max // ""') \
-    || return 1
+  forced=$(crqe_latest_head_transition "$timeline") || return 1
   pushed="$committed"
   source="HEAD committer date"
   if [ -n "$forced" ] && [[ "$forced" > "$pushed" ]]; then
