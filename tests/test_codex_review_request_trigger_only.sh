@@ -1631,9 +1631,12 @@ test_guard_runs_after_the_cap_branch() {
 # #2158: fresh write-boundary authorization shares the production budgets,
 # performs no POST, and cannot authorize a different expected head.
 test_write_boundary_authorization() {
-  local scenario dir rc expected before=$FAIL
-  for scenario in fresh cap_at_limit stale_head; do
+  local scenario dir rc expected auto gate reason before=$FAIL
+  for scenario in fresh cap_at_limit stale_head body-P2 dup_author content-free; do
     dir=$(make_case "authorize-$scenario")
+    auto=false
+    gate=$(write_gate_stub "$dir" false)
+    [ "$scenario" != content-free ] || auto=true
     expected=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     [ "$scenario" != stale_head ] || expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     rc=0
@@ -1642,6 +1645,7 @@ test_write_boundary_authorization() {
       PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$expected" \
+        MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"
     ) || rc=$?
@@ -1651,6 +1655,15 @@ test_write_boundary_authorization() {
           || fail "authorization: fresh governing budget should authorize (rc=$rc; $(cat "$dir/err.log"))" ;;
       cap_at_limit) [ "$rc" = 7 ] || fail "authorization: spent request ceiling must refuse (rc=$rc)" ;;
       stale_head) [ "$rc" = 3 ] || fail "authorization: stale expected head must refuse (rc=$rc)" ;;
+      body-P2|dup_author|content-free)
+        case "$scenario" in
+          body-P2) reason=already-cleared ;;
+          dup_author) reason=existing-trigger ;;
+          content-free) reason=content-free-auto-trigger ;;
+        esac
+        [ "$rc" = 3 ] && jq -e --arg reason "$reason" \
+          '.authorized == false and .reason == $reason' "$dir/out.json" >/dev/null \
+          || fail "authorization: $scenario must explicitly refuse (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "authorization must never post ($scenario)"
   done

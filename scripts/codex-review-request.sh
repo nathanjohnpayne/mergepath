@@ -2967,22 +2967,29 @@ RESUMED_EVER=false
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
-if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
-  post_codex_trigger
-  die 3 "trigger authorization returned without an authorization record"
-fi
-
+NO_WRITE_REASON=""
 if has_cleared_signal "$INITIAL_SCAN"; then
+  NO_WRITE_REASON="already-cleared"
   log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+  NO_WRITE_REASON="existing-trigger"
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
+  NO_WRITE_REASON="content-free-auto-trigger"
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
 elif [ "$TRIGGER_ONLY" != "true" ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
      && resume_pending_codex_request; then
   log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
 else
   post_codex_trigger
+fi
+
+# The wrapper's fresh scan must honor the same no-write decisions as the
+# outer requester. Authorization never spends a request or posts a comment.
+if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+  jq -n --arg reason "${NO_WRITE_REASON:-no-request-authorized}" \
+    '{authorized:false,reason:$reason}'
+  die 3 "trigger not authorized: ${NO_WRITE_REASON:-no-request-authorized}"
 fi
 
 # #489 trigger-only: return immediately after posting (or confirming) the
