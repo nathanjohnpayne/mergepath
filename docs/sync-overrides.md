@@ -46,6 +46,8 @@ substitutions:
 
 ### Validation rules
 
+A version-only document (`version: 1`), or a document with absent, null or empty `skip_paths`, declares no skipped paths. The requires-closure metadata reader retains every applicable dependency edge for these forms; other override schema checks still apply.
+
 `scripts/sync/validate-overrides.sh` enforces:
 
 | Rule | Behavior on violation |

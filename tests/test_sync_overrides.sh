@@ -1004,9 +1004,13 @@ REASON_PARITY_TARGET='odd "quote"\path.sh' \
   reason_parity_case literal-path 1 1 '"null"' '"ordinary"'
 # No-skip metadata keeps the same active direct edge and does not disturb the
 # permissive reader's cross-call output variable.
-for reason_empty in absent empty; do
+for reason_empty in absent empty version-only null-skips; do
   reason_file="$WORKDIR/reason-$reason_empty.yml"
-  if [ "$reason_empty" = empty ]; then printf 'skip_paths: []\n' >"$reason_file"; fi
+  case "$reason_empty" in
+    empty) printf 'skip_paths: []\n' >"$reason_file" ;;
+    version-only) printf 'version: 1\n' >"$reason_file" ;;
+    null-skips) printf 'version: 1\nskip_paths: null\n' >"$reason_file" ;;
+  esac
   OVERRIDE_SKIP_REASON=reason-parity-preserved
   rc=0
   override_requires_load "$reason_manifest" "$reason_file" || rc=$?
