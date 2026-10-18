@@ -351,7 +351,8 @@ case "$*" in
     printf '[{"filename":"src/example.sh","status":"modified","additions":400,"deletions":0}]\n' ;;
   "pr view 42 --repo o/r --json labels --jq .labels[].name")
     cat "$GH_STUB_DIR/labels.txt" ;;
-  "pr view 42 --repo o/r --json comments --jq .comments[].body")
+  "pr view 42 --repo o/r --json comments --jq .comments[].body"|\
+  "api --paginate repos/o/r/issues/42/comments --jq .[].body")
     cat "$GH_STUB_DIR/pr-comments.txt" ;;
   "api repos/o/r/pulls/42 --jq {head:.head.sha,base:.base.sha}")
     [ ! -f "$GH_STUB_DIR/fail-live-head" ] || exit 1
