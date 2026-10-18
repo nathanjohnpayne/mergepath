@@ -26,7 +26,7 @@ SPEC.loader.exec_module(OWNER)
 SHA = re.compile(r'[0-9a-f]{40}')
 URL = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)')
 CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
-              'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
+              'scripts/codex-review-ledger.sh', 'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
 # Reviewed enrollment in the trusted installed launcher, never target policy.
 # Immutable repository/owner IDs prevent a reused name or transferred repo from

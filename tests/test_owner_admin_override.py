@@ -56,6 +56,25 @@ def inventory_pages(pr, checks, size=100):
             for index, chunk in enumerate(chunks)]
 
 
+def completion_fixture(*, requests=None, replies=False, response_time='2026-01-01T00:00:02Z'):
+    request = {'id': 801, 'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review',
+               'created_at': '2026-01-01T00:00:01Z'}
+    requests = requests or [request]
+    review = {'id': 901, 'user': {'login': override.BOT}, 'body': '' if replies else 'Completed review',
+              'commit_id': 'b' * 40, 'submitted_at': response_time}
+    inputs = {'pr': 123, 'repo': 'example/repo', 'head_sha': HEAD, 'author': 'nathanjohnpayne',
+              'bot': override.BOT, 'required_tiers': ['p0', 'p1'],
+              'requests': [{'id': row['id'], 'created_at': row['created_at'], 'counted': True,
+                            'source': 'issue', 'author': 'nathanjohnpayne', 'eyes_at': None} for row in requests],
+              'reviews': [{'id': 901, 'submitted_at': response_time, 'commit_id': 'b' * 40,
+                           'body_tiers': [], 'root_findings': [], 'reply_comments': int(replies), 'reply_markers': []}],
+              'verdicts': [], 'blocks': [], 'rebuttals': [], 'summary': None}
+    result = subprocess.run(['bash', '-c', '. "$1"; crl_ledger "$(cat)"', '_',
+                             str(ROOT / 'scripts/lib/codex-review-ledger.sh')],
+                            input=json.dumps(inputs), text=True, capture_output=True, check=True, timeout=30)
+    return requests, [review], json.loads(result.stdout)
+
+
 class OverrideTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -119,7 +138,7 @@ print(json.dumps(result))
 ''')
         stub.chmod(0o755)
 
-    def run_prepare(self, record=None, args=None, pin=None, *, mode='prepare', wrapper=False):
+    def run_prepare(self, record=None, args=None, pin=None, *, mode='prepare', wrapper=False, inprocess=False):
         (self.path / 'state.json').write_text(json.dumps(self.state))
         for counter in ('inventory-round', 'pr-reads', 'calls'):
             (self.path / counter).unlink(missing_ok=True)
@@ -136,6 +155,16 @@ print(json.dumps(result))
             env.update(OP_PREFLIGHT_AUTHOR_PAT='ghp_fixture', GH_AS_AUTHOR_IDENTITY='nathanjohnpayne',
                        MERGEPATH_GH_TRANSPORT='gh',
                        GH_AS_AUTHOR_TRACE_MARKER=str(self.path / 'write-trace'))
+        if inprocess:
+            stdout, stderr, code = io.StringIO(), io.StringIO(), 0
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    override.prepare(['gh', 'pr', 'merge', '123',
+                                      *(args or ['--admin', '--match-head-commit', HEAD])], check_only=mode == 'check')
+                except (ValueError, KeyError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    code = 2
+                    print('BLOCKED: owner admin authorization:', error, file=stderr)
+            return subprocess.CompletedProcess([], code, stdout.getvalue(), stderr.getvalue())
         return subprocess.run([*command, 'gh', 'pr', 'merge', '123',
                                *(args or ['--admin', '--match-head-commit', HEAD])], env=env,
                               capture_output=True, text=True, timeout=60)
@@ -424,6 +453,94 @@ print(json.dumps(result))
         self.assertEqual(self.run_prepare().returncode, 0)
         self.state['reviews'][0]['user']['login'] = override.BOT
         self.assertEqual(self.run_prepare().returncode, 2)
+
+    def test_canonical_historical_completion_stays_terminal_in_prepare_and_check(self):
+        requests, reviews, ledger = completion_fixture()
+        self.assertEqual(ledger['requests'][0]['outcome'], 'attributed')
+        self.state.update(comments=requests, reviews=reviews)
+        with mock.patch.object(override, 'historical_request_ledger', return_value=ledger) as reader:
+            for mode in ('check', 'prepare'):
+                result = self.run_prepare(mode=mode, inprocess=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreaterEqual(reader.call_count, 4)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        self.assertFalse(json.loads(posted['body'].split('```json\n')[1].split('\n```')[0])['observed_codex_inflight'])
+
+    def test_historical_completion_rejects_changed_generation_before_publication(self):
+        requests, reviews, ledger = completion_fixture()
+        self.state.update(comments=requests, reviews=reviews, prepost_codex=True)
+        with mock.patch.object(override, 'historical_request_ledger', return_value=ledger):
+            result = self.run_prepare(inprocess=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
+
+    def test_historical_completion_rejects_changed_generation_after_publication(self):
+        requests, reviews, ledger = completion_fixture()
+        self.state.update(comments=requests, reviews=reviews, late_codex=True)
+        with mock.patch.object(override, 'historical_request_ledger', return_value=ledger):
+            result = self.run_prepare(inprocess=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue((self.path / 'posted.json').exists())
+
+    def test_canonical_historical_completion_retains_active_and_ambiguous_holds(self):
+        requests, reviews, ledger = completion_fixture()
+        def inflight(comments=requests, runs=reviews, evidence=ledger):
+            return override.codex_inflight(comments, runs, [], HEAD, 'nathanjohnpayne',
+                                            ledger=evidence, repository='example/repo')
+        self.assertTrue(inflight(evidence=None))
+        self.assertFalse(inflight())
+        for anchor in (HEAD, 'b' * 40):
+            for status in ('Running', 'Unknown'):
+                summary = {'id': 902, 'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:03Z',
+                           'body': '<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **' + status + '** | `' + anchor + '` | Manual |'}
+                self.assertTrue(inflight(comments=requests + [summary]))
+        self.assertTrue(inflight(comments=[{**requests[0], 'updated_at': '2026-01-01T00:00:02Z'}]))
+        new_request = {**requests[0], 'id': 802, 'created_at': '2026-01-01T00:00:03Z'}
+        self.assertTrue(inflight(comments=requests + [new_request]))
+        ambiguous_requests, ambiguous_reviews, ambiguous = completion_fixture(
+            requests=[requests[0], {**new_request, 'created_at': '2026-01-01T00:00:02Z'}],
+            response_time='2026-01-01T00:00:03Z')
+        self.assertTrue(inflight(ambiguous_requests, ambiguous_reviews, ambiguous))
+        _, reply_reviews, reply_ledger = completion_fixture(replies=True)
+        inline = [{'pull_request_review_id': 901, 'in_reply_to_id': 900, 'user': {'login': override.BOT}}]
+        self.assertTrue(override.codex_inflight(requests, reply_reviews, inline, HEAD, 'nathanjohnpayne', ledger=reply_ledger))
+        for key, value in [('head_sha', 'c' * 40), ('author', 'other'), ('bot', 'other'), ('repo', 'other/repo'), ('requests', [])]:
+            self.assertTrue(inflight(evidence={**ledger, key: value}), key)
+        for evidence in (None, {}, {'requests': 'unreadable'}):
+            self.assertTrue(inflight(evidence=evidence))
+        for field, value in [('anchor', 'b' * 7), ('tie', True), ('mixed_heads', True), ('anchor_conflict', True)]:
+            malformed = copy.deepcopy(ledger)
+            malformed['responses'][0][field] = value
+            self.assertTrue(inflight(evidence=malformed), field)
+        _, tied_reviews, tied_ledger = completion_fixture(response_time=requests[0]['created_at'])
+        self.assertTrue(inflight(requests, tied_reviews, tied_ledger))
+
+    def test_historical_completion_reader_failure_and_wrong_target_stay_blocking(self):
+        requests, reviews, ledger = completion_fixture()
+        for value in (None, [], {}, {**ledger, 'pr': 124}):
+            with mock.patch.object(override, 'historical_request_ledger', return_value=value):
+                self.assertTrue(override.observe_codex_inflight(requests, reviews, [], HEAD,
+                                                               'nathanjohnpayne', 'example/repo', 123))
+        for error in (OSError('unavailable'), ValueError('unreadable'), subprocess.TimeoutExpired('ledger', 300)):
+            with mock.patch.object(override, 'historical_request_ledger', side_effect=error):
+                self.assertTrue(override.observe_codex_inflight(requests, reviews, [], HEAD,
+                                                               'nathanjohnpayne', 'example/repo', 123))
+
+    def test_historical_completion_audit_keeps_merge_time_and_generation_fences(self):
+        requests, reviews, ledger = completion_fixture()
+        self.state.update(comments=requests, reviews=reviews)
+        with mock.patch.object(override, 'historical_request_ledger', return_value=ledger):
+            self.assertEqual(self.run_prepare(inprocess=True).returncode, 0)
+            posted = json.loads((self.path / 'posted.json').read_text())
+            payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
+                       'author': 'nathanjohnpayne', 'comments': requests + [posted], 'reviews': reviews, 'inline_comments': []}
+            self.assertTrue(override.audit(payload)['recorded_override'])
+            payload['comments'].append({**requests[0], 'id': 802, 'created_at': '2026-01-01T00:01:01Z'})
+            self.assertFalse(override.audit(payload)['recorded_override'])
+        _, late_reviews, late_ledger = completion_fixture(response_time='2026-01-01T00:03:00Z')
+        payload.update(comments=requests + [posted], reviews=late_reviews)
+        with mock.patch.object(override, 'historical_request_ledger', return_value=late_ledger):
+            self.assertFalse(override.audit(payload)['recorded_override'])
 
     def test_malformed_governing_bot_fails_before_recording(self):
         self.state['policy'] = {'codex': {'bot_login': ['custom-codex[bot]']}}
