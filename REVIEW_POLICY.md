@@ -350,6 +350,8 @@ Phase 2.5 is non-blocking (#2166): nothing here holds the agent before Phase 3 (
 - [ ] Substantive findings fixed or dismissed with reasoning
 - [ ] Recorded each finding's disposition (fixed / rebutted / permitted deferral) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
 
+Trusted per-head CodeRabbit status selection uses numeric status IDs, including the polling clearance refresh: a later refusal supersedes an older completion with the same whole-second timestamp. Unusable trusted ordering evidence fails closed (#2360).
+
 ### Real-Time Per-Finding Disposition (#865)
 
 Every disposition step described above — triage reply, fix, verdict recording (`codex-record-feedback.sh` / `coderabbit-record-feedback.sh`), and, when a thread exists, thread resolution (the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)) — happens **per finding, at the moment that finding is worked**, not gathered up and run once at the end of the round or deferred to the merge endgame; summary-only findings (no review thread to resolve) use the documented summary-ack path instead ([§ Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)). This is a sequencing rule layered on top of the existing steps above; it does not introduce a new mechanism or a new required check.
