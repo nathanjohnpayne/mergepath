@@ -1549,8 +1549,8 @@ out=$(
 rc=$?
 set -e
 if [ "$rc" = "5" ] &&
-   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
-   echo "$out" | grep -q "clearance remains suppressed"; then
+   echo "$out" | grep '"status": "rate_limit_stalled"' >/dev/null &&
+   echo "$out" | grep "clearance remains suppressed" >/dev/null; then
   pass=$((pass + 1))
   echo "  PASS: a StatusContext success 1s after a current-head rate-limit notice is suppressed within the published 10-minute window (630s, window-aware grace) (#596/#599)"
 else

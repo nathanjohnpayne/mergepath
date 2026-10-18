@@ -175,9 +175,9 @@ done
 : >"$WORKDIR/probe.log"
 : >"$WORKDIR/timeout.log"
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN_NT" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand.' \
-   && ! printf '%s' "$out" | grep -q 'installed yq' \
-   && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | sed -n '1p' | grep -x 'mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand.' >/dev/null \
+   && ! printf '%s' "$out" | grep 'installed yq' >/dev/null \
+   && printf '%s' "$out" | grep 'capability tier `author-writes`' >/dev/null \
    && ! grep -q 'setup ran' "$WORKDIR/probe.log" && grep -q '^probe ' "$WORKDIR/probe.log" \
    && [ ! -s "$WORKDIR/timeout.log" ]; then
   pass "hook, no timeout available: skips setup with a one-line notice, the probe still runs, the hook still exits 0"

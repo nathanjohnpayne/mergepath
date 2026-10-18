@@ -591,7 +591,7 @@ PATHS_EMPTY_PATH="scripts/foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_EMPTY_PATH" "$PATHS_EMPTY_PATH"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit path: ""'; then
+if [ "$rc" = "1" ] && echo "$out" | grep 'explicit path: ""' >/dev/null; then
   pass "Case 18d: .paths[] entry with explicit empty path rejected"
 else
   fail "Case 18d unexpected (rc=$rc): $out"
