@@ -74,6 +74,11 @@ class Evidence:
         argv = ([self.gh, 'api'] + (['--paginate', '--slurp'] if pages else [])
                 + ([ESCAPE_FLAG] if text and self.escape_flag() else [])
                 + [f'repos/{self.repo}' + ('/' + endpoint if endpoint else '')])
+        # Capability probing can consume the allowance computed above.
+        # Give the API subprocess only the time that remains after it.
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadBudgetExhausted('relay provenance read budget exhausted')
         result = subprocess.run(argv, capture_output=True, text=True, timeout=min(remaining, 20))
         if result.returncode:
             if 'HTTP 404' in result.stderr or 'HTTP 410' in result.stderr:

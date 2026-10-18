@@ -13,6 +13,66 @@ import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/workflow/verified-relay-markers.py'
+
+
+class ReadBudget(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(str(SCRIPT))
+        self.now = 0.0
+        self.probe_seconds = 0.0
+        self.calls = []
+        for patcher in (
+                mock.patch.object(self.module['time'], 'monotonic', side_effect=lambda: self.now),
+                mock.patch.object(self.module['shutil'], 'which', return_value='/fixture/gh'),
+                mock.patch.object(self.module['subprocess'], 'run', side_effect=self.fake_run)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.evidence = self.module['Evidence']('owner/repo', 7)
+
+    def fake_run(self, args, **kwargs):
+        self.calls.append((args, kwargs['timeout']))
+        if args[-1] == '--help':
+            self.now += self.probe_seconds
+            return subprocess.CompletedProcess(args, 0, self.module['ESCAPE_FLAG'], '')
+        return subprocess.CompletedProcess(args, 0, '{}', '')
+
+    def test_slow_probe_leaves_only_fresh_remaining_api_allowance(self):
+        self.now, self.probe_seconds = 55.0, 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1][1], 2.0)
+
+    def test_probe_exhaustion_prevents_api_subprocess(self):
+        self.now, self.probe_seconds = 55.0, 6.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0][-1], '--help')
+
+    def test_initial_exhaustion_prevents_even_the_probe(self):
+        self.now = 61.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(self.calls, [])
+
+    def test_json_read_needs_no_probe(self):
+        self.now = 55.0
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], 5.0)
+
+    def test_cached_read_still_needs_no_subprocess(self):
+        self.evidence.read_cache['actions/jobs/901/logs', False, True] = 'cached log'
+        self.now = 61.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), 'cached log')
+        self.assertEqual(self.calls, [])
+
+    def test_api_timeout_keeps_twenty_second_cap(self):
+        self.probe_seconds = 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(self.calls[1][1], 20)
+
+
 REPO = 'acme/widget'
 MARKER = '<!-- mergepath-feedback-archive-relay:v2 run=12345 publisher=900 status=complete -->'
 LOG = '''2026-10-09T00:00:00Z ##[group]Run set -euo pipefail
