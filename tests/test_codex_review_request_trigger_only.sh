@@ -106,7 +106,7 @@ scenario=${CODEX_TEST_SCENARIO:?}
 head_sha=${CODEX_TEST_HEAD:-head-sha}
 author='nathanjohnpayne'
 reviewer='nathanpayne-codex'
-t=${CODEX_TEST_HEAD_DATE:-2026-06-04T00:00:00Z}
+t=${CODEX_TEST_HEAD_DATE-2026-06-04T00:00:00Z}
 old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
@@ -1759,6 +1759,46 @@ test_trigger_only_future_head_preserves_recent_blocks() {
     done
   done
 }
+# #2317: metadata that the post-write diagnostic cannot parse must refuse
+# before a trigger mutation. Standard UTC, including future dates, stays valid.
+test_trigger_timestamp_validation() {
+  local variant dir timestamp rc expected before=$FAIL
+  for variant in empty invalid fractional offset invalid-date utc future; do
+    dir=$(make_case "timestamp-$variant")
+    expected=3
+    case "$variant" in
+      empty) timestamp="" ;;
+      invalid) timestamp=not-a-timestamp ;;
+      fractional) timestamp=2026-06-04T00:00:00.123Z ;;
+      offset) timestamp=2026-06-04T00:00:00+00:00 ;;
+      invalid-date) timestamp=2026-02-30T00:00:00Z ;;
+      utc) timestamp=2026-06-04T00:00:00Z; expected=0 ;;
+      future) timestamp=2099-06-04T00:00:00Z; expected=0 ;;
+    esac
+    rc=0
+    (
+      cd "$dir"
+      PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+        CODEX_TEST_SCENARIO=fresh CODEX_TEST_HEAD_DATE="$timestamp" \
+        ./scripts/codex-review-request.sh --trigger-only --allow-moving-head 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    ) || rc=$?
+    [ "$rc" = "$expected" ] || fail "#2317: $variant expected exit $expected, got $rc"
+    if [ "$expected" = 0 ]; then
+      [ "$(trig_count "$dir")" = 1 ] \
+        && jq -e --arg t "$timestamp" '.trigger_posted == true and .head_committer_date == $t' "$dir/out.json" >/dev/null \
+        || fail "#2317: $variant must preserve the post-write JSON contract"
+    else
+      [ "$(trig_count "$dir")" = 0 ] && [ ! -s "$dir/out.json" ] \
+        && grep -q 'unsupported commit timestamp' "$dir/err.log" \
+        || fail "#2317: $variant must refuse before POST with a metadata diagnostic (posts=$(trig_count "$dir"))"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2317: unsupported commit metadata refuses before writes; canonical and future UTC keep JSON"
+}
+
+test_trigger_timestamp_validation
+
 test_trigger_only_future_head_preserves_recent_blocks
 
 echo "----"

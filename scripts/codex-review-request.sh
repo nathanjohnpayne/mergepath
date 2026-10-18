@@ -1427,6 +1427,12 @@ fi
 # Use the committer date for request/provider diagnostics, not the author date.
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
+# Post-write diagnostics use jq's canonical UTC parser. Refuse unsupported
+# metadata before a trigger can be written, rather than failing afterward.
+jq -ne --arg t "$HEAD_COMMITTER_DATE" '
+  $t | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+  and (try ($t | fromdateiso8601 | todateiso8601 == $t) catch false)' >/dev/null \
+  || die 3 "unsupported commit timestamp; expected a valid YYYY-MM-DDTHH:MM:SSZ value"
 
 # Retain the shared timestamp diagnostics used by request evidence and
 # provider-state polling. Clearance below depends on commit anchors; a PR
