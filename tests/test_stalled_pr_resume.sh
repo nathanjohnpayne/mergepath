@@ -376,6 +376,31 @@ else
   fail "resume --pr 105 (rc=$rc): $(cat "$TMP/resume-105.txt")"
 fi
 
+# The real merge work order must select and wait for the advisory provider,
+# including refusal/failover routing, before advertising the author merge.
+if grep -Fq 'scripts/coderabbit-should-invoke.sh 105 --repo octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/coderabbit-wait.sh 105 octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq 'selector: 0 invoke, 1 skip; other exits stop' "$TMP/resume-105.txt" \
+   && grep -Fq '2: address findings' "$TMP/resume-105.txt" \
+   && grep -Fq 'Wait exit 4: advisory timeout' "$TMP/resume-105.txt" \
+   && grep -Fq 'codex_failover_requested:true and current-head Codex/Phase 4 clearance' "$TMP/resume-105.txt" \
+   && grep -Fq 'otherwise stop and alert the human' "$TMP/resume-105.txt" \
+   && grep -Fq 'Wait exit 6: repair the paused/non-base-branch/draft cause' "$TMP/resume-105.txt"; then
+  pass "merge work order includes the configured CodeRabbit selector, wait and routing outcomes"
+else
+  fail "merge work order omits CodeRabbit selection, waiting or a required routing outcome"
+fi
+if awk '
+  /scripts\/coderabbit-should-invoke.sh 105 --repo octo\/demo/ {selector=NR}
+  /scripts\/coderabbit-wait.sh 105 octo\/demo/ {waiter=NR}
+  /gh pr merge 105 --repo octo\/demo/ {merger=NR}
+  END {exit !(selector > 0 && waiter > selector && merger > waiter)}
+' "$TMP/resume-105.txt"; then
+  pass "selected CodeRabbit wait precedes the author merge command"
+else
+  fail "author merge is advertised before the CodeRabbit selector and selected wait"
+fi
+
 set +e
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --pr 102 >/dev/null 2>"$TMP/resume-102.err"; rc_live=$?
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --threshold-minutes 720 >/dev/null 2>"$TMP/resume-none.err"; rc_none=$?

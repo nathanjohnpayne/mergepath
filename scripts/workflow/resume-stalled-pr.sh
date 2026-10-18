@@ -203,6 +203,13 @@ case "$next_action" in
     ;;
   merge)
     echo "Pre-merge sequence (REVIEW_POLICY.md §§ Workflow and Pre-Merge Review Conversation Gate) — every gate clean, then merge as the author:"
+    echo "  scripts/coderabbit-should-invoke.sh $number --repo $REPO         # selector: 0 invoke, 1 skip; other exits stop"
+    echo "  If selected, run the current-head wait before continuing:"
+    echo "    scripts/coderabbit-wait.sh $number $REPO"
+    echo "    Wait exit 0: continue; 2: address findings, record feedback and resolve threads, then restart this sequence."
+    echo "    Wait exit 4: advisory timeout; record status_probe if present, then continue."
+    echo "    Wait exit 5: proceed only with codex_failover_requested:true and current-head Codex/Phase 4 clearance; otherwise stop and alert the human."
+    echo "    Wait exit 6: repair the paused/non-base-branch/draft cause, then rerun; any other exit stops."
     echo "  scripts/review-feedback-accounting.sh $number $REPO              # posted == accounted"
     echo "  scripts/resolve-pr-threads.sh $number --repo $REPO --list        # zero unresolved threads required"
     echo "  scripts/required-head-checks.sh --repo $REPO --verify --sha $head_sha   # configured build checks green on the head"
