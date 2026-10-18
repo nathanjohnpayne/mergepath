@@ -2880,4 +2880,63 @@ for telemetry_mode in verified wrong duplicate mixed malformed missing failed; d
 done
 echo "PASS: actual verified author wrapper emits only one exact repository URL result"
 
+# A selected script cannot outrun its declared tests (#2256). Exercise the
+# real materializer and artifact proof, including a deliberately broken copy.
+mkdir -p "$REQ_MP/scripts" "$REQ_MP/tests"
+printf 'caller-v2\n' >"$REQ_MP/scripts/paired.sh"
+printf 'test-v2\n' >"$REQ_MP/tests/test_paired.sh"
+cat >"$REQ_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers: [{name: alpha, repo: example/alpha}]
+paths:
+  - {path: scripts/paired.sh, type: canonical, consumers: all}
+  - {path: tests/test_paired.sh, type: canonical, consumers: all, requires: [scripts/paired.sh]}
+YAML
+git -C "$REQ_MP" add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m paired-test-fixture
+for paired_state in stale missing current paired; do
+  paired_remote="$req_workdir/paired-$paired_state.git"
+  paired_seed="$req_workdir/paired-$paired_state-seed"
+  req_setup_remote "$paired_remote" "$paired_seed"
+  mkdir -p "$paired_seed/scripts" "$paired_seed/tests"
+  printf 'caller-v1\n' >"$paired_seed/scripts/paired.sh"
+  case "$paired_state" in
+    stale|paired) printf 'test-v1\n' >"$paired_seed/tests/test_paired.sh" ;;
+    current) cp -p "$REQ_MP/tests/test_paired.sh" "$paired_seed/tests/test_paired.sh" ;;
+  esac
+  req_push_seed "$paired_remote" "$paired_seed"
+  paired_filter=scripts/paired.sh
+  if [ "$paired_state" = paired ]; then paired_filter='@(scripts/paired.sh|tests/test_paired.sh)'; fi
+  set +e
+  output=$(req_run_sync_all "paired-$paired_state" "$paired_remote" "$paired_filter")
+  paired_rc=$?
+  set -e
+  case "$paired_state" in
+    stale|missing)
+      grep -q 'requires-closure gate' <<<"$output" || fail "script outran $paired_state test: $output"
+      grep -q 'tests/test_paired.sh' <<<"$output" || fail 'paired refusal did not name test'
+      [ ! -f "$REQ_CAPTURE/pr-title-paired-$paired_state.txt" ] || fail 'stale/missing test allowed PR'
+      ;;
+    *)
+      [ "$paired_rc" -eq 0 ] || fail "valid paired delivery rejected: $output"
+      [ -f "$REQ_CAPTURE/pr-title-paired-$paired_state.txt" ] || fail "valid paired delivery created no PR: $output"
+      ;;
+  esac
+done
+# Disable only the reverse-edge condition in the disposable fake hub. The
+# stale case must become an observable PR, proving the negative control bites.
+python3 - "$REQ_MP/scripts/sync/apply-overrides.sh" <<'PYMUTANT'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); text=p.read_text()
+old='if (substr(paths[i], 1, 6) != "tests/" ||'
+assert text.count(old) == 1
+p.write_text(text.replace(old, 'if (1 || substr(paths[i], 1, 6) != "tests/" ||'))
+PYMUTANT
+git -C "$REQ_MP" add scripts/sync/apply-overrides.sh
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m disable-reverse-edge-known-bad
+output=$(req_run_sync_all paired-known-bad "$req_workdir/paired-stale.git" scripts/paired.sh)
+[ -f "$REQ_CAPTURE/pr-title-paired-known-bad.txt" ] || fail "known-bad control did not expose stale test: $output"
+echo 'PASS: real sync refuses stale/missing paired tests, accepts paired/current tests, and kills the reverse-edge mutant'
+
 echo "test_sync_to_downstream: PASS"
