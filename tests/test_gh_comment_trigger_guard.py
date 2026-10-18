@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("guard", ROOT / "scripts/workflow/gh-comment-trigger-guard.py")
@@ -52,6 +53,79 @@ class TriggerGuardTests(unittest.TestCase):
                      ["api", "repos/o/r/pulls/123/reviews/456/events", "--input", str(payload)]):
             with self.subTest(args=args), self.assertRaises(guard.Refused):
                 self.check(args)
+
+    def test_graphql_comment_mutation_payload_forms(self):
+        query = 'mutation Post($text: String!) { posted: addComment(input: {subjectId: "P", body: $text}) { clientMutationId } }'
+        query_file = self.root / "comment.graphql"
+        query_file.write_text(query)
+        text_file = self.root / "text.txt"
+        text_file.write_text("Explain @codex review safely.")
+        payload = self.root / "graphql.json"
+        payload.write_text(json.dumps({"query": query, "variables": {"text": text_file.read_text()}}))
+        forms = [
+            ["api", "graphql", "-f", "query=" + query, "-f", "text=" + text_file.read_text()],
+            ["api", "/graphql", "-F", "query=@" + str(query_file), "-F", "text=@" + str(text_file)],
+            ["api", "https://api.github.com/graphql", "--input", str(payload)],
+            ["api", "graphql", "-f", r'query=mutation { addComment(input: {subjectId: "P", body: "\u0040codex review"}) { clientMutationId } }'],
+            ["api", "graphql?" + urlencode({"query": query, "variables": json.dumps({"text": text_file.read_text()})}), "-X", "POST"],
+        ]
+        for role in ("author", "reviewer", "hook"):
+            for args in forms:
+                with self.subTest(role=role, args=args), self.assertRaises(guard.Refused):
+                    self.check(args, role=role)
+
+    def test_graphql_reads_and_noncomment_mutations_remain_supported(self):
+        queries = [
+            'query Read($text: String!) { search(query: $text, type: ISSUE) { issueCount } }',
+            '# mutation { addComment(input: {}) }\nquery { viewer { login } }',
+            'query { search(query: "mutation { addComment(input: {}) } @codex review", type: ISSUE) { issueCount } }',
+            'query addComment($text: String!) { search(query: $text, type: ISSUE) { issueCount } }',
+            'mutation Resolve($id: ID!) { resolveReviewThread(input: {threadId: $id}) { clientMutationId } }',
+            'mutation addComment($id: ID!) { resolveReviewThread(input: {threadId: $id}) { clientMutationId } }',
+            'mutation Delete($id: ID!) { deleteIssueComment(input: {id: $id}) { clientMutationId } }',
+        ]
+        for query in queries:
+            with self.subTest(query=query):
+                _, meta = self.check(["api", "graphql", "-f", "query=" + query, "-f", "text=@codex review"])
+                self.assertFalse(meta["trigger"])
+
+    def test_graphql_known_comment_calls_and_canonical_context(self):
+        names = (
+            "addComment", "addDiscussionComment", "addPullRequestReview",
+            "addPullRequestReviewComment", "addPullRequestReviewThread",
+            "addPullRequestReviewThreadReply", "submitPullRequestReview",
+            "updateDiscussionComment", "updateIssueComment",
+            "updatePullRequestReview", "updatePullRequestReviewComment",
+        )
+        for name in names:
+            query = 'mutation Post($body: String!) { alias: ' + name + '(input: {body: $body}) { clientMutationId } }'
+            with self.subTest(name=name), patch.dict(os.environ, {
+                "MERGEPATH_CODEX_TRIGGER_WRITE": "1",
+                "MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD": "a" * 40,
+            }), self.assertRaises(guard.Refused):
+                self.check(["api", "graphql", "-f", "query=" + query, "-f", "body=@codex review"], role="author")
+
+    def test_graphql_stdin_and_hook_deferral(self):
+        raw = json.dumps({"query": 'mutation { addComment(input: {body: "@codex review"}) { clientMutationId } }'}).encode()
+        stream = io.TextIOWrapper(io.BytesIO(raw))
+        with patch.object(guard.sys, "stdin", stream), self.assertRaises(guard.Refused):
+            self.check(["api", "graphql", "--input", "-"])
+        _, meta = self.check(["api", "graphql", "--input", str(self.root / "missing.json")], role="hook", state=False)
+        self.assertTrue(meta["deferred"])
+
+    def test_graphql_unsupported_literal_is_refused_without_unbounded_backtracking(self):
+        query = 'mutation { addComment(input: {body: """' + "\\" * 1000
+        with self.assertRaises(guard.Refused):
+            self.check(["api", "graphql", "-f", "query=" + query])
+
+    def test_graphql_read_input_is_frozen_before_execution(self):
+        payload = self.root / "graphql-read.json"
+        raw = b'{"query":"query { viewer { login } }"}\n'
+        payload.write_bytes(raw)
+        args, meta = self.check(["api", "graphql", "--input", str(payload)])
+        payload.write_text(json.dumps({"query": 'mutation { addComment(input: {body: "@codex review"}) { clientMutationId } }'}))
+        self.assertEqual(raw, Path(args[-1]).read_bytes())
+        self.assertFalse(meta["trigger"])
 
     def test_snapshot_preserves_unicode_and_trailing_newlines(self):
         body = self.root / "comment.md"
@@ -131,6 +205,10 @@ class TriggerGuardTests(unittest.TestCase):
             result = subprocess.run(["bash", str(fixture / f"scripts/gh-as-{role}.sh"), "--", "gh", "pr", "comment", "123", "--body-file", str(body)], env=env, capture_output=True, timeout=10)
             self.assertNotEqual(0, result.returncode, result.stderr)
             self.assertFalse((fixture / "writes").exists())
+            query = 'mutation Post($text: String!) { addComment(input: {subjectId: "P", body: $text}) { clientMutationId } }'
+            result = subprocess.run(["bash", str(fixture / f"scripts/gh-as-{role}.sh"), "--", "gh", "api", "graphql", "-f", "query=" + query, "-F", "text=@" + str(body)], env=env, capture_output=True, timeout=10)
+            self.assertNotEqual(0, result.returncode)
+            self.assertFalse((fixture / "writes").exists(), "GraphQL trigger prose must be refused before the fake GH write")
         env.update(MERGEPATH_CODEX_TRIGGER_WRITE="1", MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="a" * 40)
         result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"], env=env, capture_output=True, timeout=10)
         self.assertNotEqual(0, result.returncode)
