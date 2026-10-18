@@ -268,6 +268,9 @@ SH
 set -euo pipefail
 printf '%q ' "$@" >> "$FIXTURE_LOG/gh.log"
 printf '\n' >> "$FIXTURE_LOG/gh.log"
+# The real relay reader probes CLI support before a deadline-bound API read.
+# A successful legacy help response selects the existing timeout environment.
+if [ "$*" = 'api --help' ]; then echo 'Usage: gh api <endpoint>'; exit 0; fi
 [ "${1:-}" = api ] || exit 90
 
 if [ "${2:-}" = -X ] && [ "${3:-}" = POST ]; then
@@ -545,6 +548,8 @@ SH
     fail "pending relay holds only its PR" "pending relay was evaluated as clear"
   elif [ "$relay_mode" != pending ] && ! grep -Fxq 'gate 1' "$dir/gate.log"; then
     fail "relay $relay_mode inventory permits gate evaluation" "first PR was not evaluated"
+  elif [ "$relay_mode" != empty ] && ! grep -Fxq 'api --help ' "$dir/gh.log"; then
+    fail "relay $relay_mode inventory exercises CLI capability detection" "production help probe was not called"
   else
     pass "relay $relay_mode inventory yields its verdict and continues the sweep"
   fi
