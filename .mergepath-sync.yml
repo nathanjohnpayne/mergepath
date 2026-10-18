@@ -559,6 +559,9 @@ paths:
   - path: scripts/codex-review-request.sh
     type: canonical
     consumers: all
+    # #2281: requester markers are inert unless the write-boundary guard
+    # travels too. Name the complete enforcement half here: commit-path
+    # propagation checks this entry's direct requires, not nested edges.
     # Sources scripts/lib/codex-failure-markers.sh (existence-guarded) so the
     # poll loop can short-circuit on a usage-limit / not-connected marker
     # instead of running out the full review timeout (#722). That provider-
@@ -582,6 +585,11 @@ paths:
     # "newer than my trigger?" comparison in the poll loop, so degrading it
     # silently is worse than refusing to run.
     requires:
+      - "scripts/gh-as-author.sh"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/hooks/gh-pr-guard.sh"
+      - "scripts/lib/gh-comment-trigger-guard.sh"
+      - "scripts/workflow/gh-comment-trigger-guard.py"
       - "scripts/lib/codex-request-evidence.sh"   # #1276 selectors; #1550 Review Summary selector for resume
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/lib/gh-retry-helpers.sh"   # #1550, gh_failure_is_permanent for poll-read retry (existence-guarded)
