@@ -407,8 +407,9 @@ fi
 
 # --- config readers ---------------------------------------------------------
 
-# Resolve the policy from the SCRIPT's checkout, not $PWD (Codex P2 on #2175),
-# the way coderabbit-should-invoke.sh and phase-4b-classifier.sh already do.
+# Runtime knobs retain the SCRIPT's checkout, not $PWD (Codex P2 on #2175).
+# The entry decision below materializes REPO's governing base policy for its
+# enabled/request_by_default switches (#2273).
 # A cwd-relative path read no file at all when the script ran from a
 # subdirectory or by absolute path from elsewhere, and every codex: key then
 # took its default -- request_by_default then to true (since #2240 a
@@ -574,13 +575,14 @@ __CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # at the moment the next one is assigned keeps exactly one file live, and the
 # trap removes that one.
 __CRA_BASE_CFG_TMP=""
+__CRA_ENTRY_CFG_TMP=""
 __cra_retire_base_cfg() { # <new-path-or-empty>
   if [ -n "$__CRA_BASE_CFG_TMP" ] && [ "$__CRA_BASE_CFG_TMP" != "${1:-}" ]; then
     rm -f "$__CRA_BASE_CFG_TMP"
   fi
   __CRA_BASE_CFG_TMP="${1:-}"
 }
-trap '__cra_retire_base_cfg ""' EXIT
+trap '__cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # shellcheck source=lib/feedback-policy-helpers.sh
@@ -636,8 +638,7 @@ fi
 # per-repo docs call this script without the flag, and a Phase 4 PR must not
 # lose its mandatory request because of that. Only a PR the derivation reads
 # as under-threshold is skipped (exit 5, NO_TRIGGER_REQUESTED).
-CODEX_ENABLED=$(codex_field enabled)
-CODEX_ENABLED=${CODEX_ENABLED:-true}
+CODEX_ENABLED=true
 
 # Resolve codex.request_by_default (#2240). Sets REQUEST_BY_DEFAULT to
 # true|false and REQUEST_BY_DEFAULT_SOURCE to explicit|unset|failsafe.
@@ -1127,6 +1128,20 @@ derive_phase_4a_gate() {
 # or 1 (skip). Kept as a function so the decision is testable in one place
 # and reads as a single boolean expression at the call site.
 should_request_codex() {
+  # Keep the established readers, but scope their CONFIG to the policy of
+  # REPO's base. The script's checkout can belong to another repository.
+  local CONFIG="$CONFIG" entry_cfg
+  entry_cfg=$("$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
+    --repo "$REPO" --pr "$PR_NUMBER" --default-config "$CONFIG" \
+    --materialize-default 2>/dev/null) || entry_cfg=""
+  if [ -z "$entry_cfg" ] || [ ! -r "$entry_cfg" ]; then
+    request_by_default_failsafe "could not resolve the governing policy for $REPO#$PR_NUMBER"
+    return 0
+  fi
+  [ "$entry_cfg" = "$CONFIG" ] || __CRA_ENTRY_CFG_TMP="$entry_cfg"
+  CONFIG="$entry_cfg"
+  CODEX_ENABLED=$(codex_field enabled)
+  CODEX_ENABLED=${CODEX_ENABLED:-true}
   # Codex off ⇒ never trigger (orthogonality rule).
   [ "$CODEX_ENABLED" = "true" ] || return 1
   # A caller-flagged Phase-4a-gated PR is always requested: Phase 4 review is
@@ -1330,8 +1345,8 @@ fetch_scan_array() {
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------
-# Evaluate the request decision BEFORE any PR fetch / signal scan / trigger
-# write. When the decision is "skip", emit a minimal JSON object (same field
+# Evaluate the request decision after its governing-policy metadata lookup,
+# before per-head signal scanning or trigger writes. On "skip", emit a minimal JSON object (same field
 # names as the terminal output, all signals null) and exit 5
 # (NO_TRIGGER_REQUESTED) so the caller can distinguish "deliberately did not
 # request" from a timeout (4) or an API error (3).

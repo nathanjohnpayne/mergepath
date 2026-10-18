@@ -82,6 +82,7 @@ EOF
 author_identity: nathanjohnpayne
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true
   max_review_rounds: 10
 EOF
 
