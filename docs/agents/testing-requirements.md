@@ -4,6 +4,8 @@
 - Do not delete tests to make a build pass.
 - Every spec file should have a corresponding test file or a documented exception explaining why one does not exist.
 
+The bare-write scanner admission and error contract is defined in the [canonical repo-lint specification](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/repo_lint_execution.md#bare-write-scanner-admission-and-errors). Its existing native regression corpus includes inert bytecode and scanner-error controls; run it when changing that surface.
+
 ## Repo-lint execution
 
 The required `lint` context is an aggregator over a fast live-assertion lane and a change-aware deep lane of three `deep-safety (...)` jobs: the consumer-smoke and residue legs run for every deep selection, the sharded complete consumer replay runs when the consumer shape or the lane itself changes (and on every main push and scheduled run), and the self-test legs run when an affected wrapper is enrolled in them. Pull requests that change CI implementation, propagation, or tests select the wrappers the dependency graph declares for those paths, or fail closed to the complete surface when a path is undeclared; governance documents and specifications request the deep legs in smoke mode. Main pushes, the daily schedule, and manual runs always select the complete surface. Do not add path filters to the aggregator itself: every pull-request head must publish exactly one stable `lint` result, and the aggregator must keep reading every deep job's result against the scope bit that selected it.
