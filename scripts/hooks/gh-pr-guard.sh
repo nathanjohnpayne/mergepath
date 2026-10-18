@@ -1406,12 +1406,14 @@ guard_review_gh() {
 # GH_REPO) or from a URL selector (Phase 4b on #2178). A repository value
 # must be a plain OWNER/REPO: gh also reads git@HOST:OWNER/REPO, URLs and
 # HOST/OWNER/REPO there, so screening for bad shapes misses forms. Anything
-# else keeps gh's own credentials, which fail closed.
+# else keeps gh's own credentials, which fail closed. A missing repository
+# is not canonical proof: gh may infer a different host from the checkout.
 guard_canonical_repo() {
   [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
 }
 guard_review_reads_github_com() {
   case "${GH_HOST:-github.com}" in github.com) ;; *) return 1 ;; esac
+  [ -n "${REVIEW_REPO:-}${GH_REPO:-}" ] || return 1
   if [ -n "${GH_REPO:-}" ] && ! guard_canonical_repo "$GH_REPO"; then return 1; fi
   if [ -n "${REVIEW_REPO:-}" ] && ! guard_canonical_repo "$REVIEW_REPO"; then return 1; fi
   case "${REVIEW_PR_SELECTOR:-}" in
