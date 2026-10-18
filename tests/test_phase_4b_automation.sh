@@ -2724,6 +2724,29 @@ if [ "$rc" = 4 ] \
   pass "manual fallback handoff targets the selected Claude reviewer for codex-authored PRs"
 else fail "claude fallback target (rc=$rc): $out"; fi
 
+# #2338: the renderer may observe a review starting after adapter failure.
+# Preserve its hold through the caller; no manual fallback is authoritative.
+mk_fake fake-handoff-active \
+  "echo 'Codex review in flight on HEAD; rerun after it reports' >&2
+exit 5"
+for author in claude codex; do
+  set +e
+  out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-junk" CLAUDE_BIN="$BIN/fake-claude-junk" \
+    P4B_HANDOFF="$BIN/fake-handoff-active" P4B_FAKE_PR_BODY_AGENT="$author" \
+    bash "$ORCH" 126 --repo o/r --author "$author" \
+      --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+      --dry-run 2>"$WORK/handoff-active.err")"; rc=$?
+  set -e
+  if [ "$rc" = 6 ] \
+     && printf '%s' "$out" | jq -e '.barrier_pending == true and .retry_after == 30 and .review_posted == false and .fell_back_to_manual == false and .barrier.codex_evidence == "manual-handoff-review-in-flight"' >/dev/null \
+     && ! grep -Eq 'brief the human manually|falling back to the manual Phase 4b handoff' "$WORK/handoff-active.err"; then
+    pass "manual handoff active-review exit 5 remains a retry hold for $author author"
+  else
+    fail "manual handoff active-review hold for $author (rc=$rc): $out $(cat "$WORK/handoff-active.err")"
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # #1143 — --author is cross-checked against the PR body, never a bypass of it
 # ---------------------------------------------------------------------------
