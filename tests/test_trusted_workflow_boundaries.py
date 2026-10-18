@@ -155,6 +155,28 @@ class CredentialDestinations(unittest.TestCase):
                 action = next(step for step in jobs[child]['steps'] if step.get('id') == 'automation')
                 self.assertEqual(action['with']['repositories'], '${{ github.event.repository.name }}')
 
+    def test_trusted_classifier_stdin_cannot_consume_remaining_classification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / 'scripts/workflow/run-pr-policy-classifier.py'
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes((ROOT / 'scripts/workflow/run-pr-policy-classifier.py').read_bytes())
+            target = root / '.github/workflows/pr-review-policy.yml'
+            target.parent.mkdir(parents=True)
+            # A reader must see EOF, while the classifier still completes its
+            # later protected-path decision. Stdin-fed Bash loses that tail.
+            target.write_text(json.dumps({'jobs': {'external-review-labeling': {'steps': [
+                {'id': 'check', 'run': 'cat >/dev/null\necho protected-path\n'}]}}}))
+            # Parsing is not under test: a JSON subset keeps this process
+            # fixture hermetic without requiring the Actions PyYAML install.
+            launcher = ('import json,runpy,sys,types; '
+                        'sys.modules["yaml"]=types.SimpleNamespace(safe_load=json.loads); '
+                        'runpy.run_path(sys.argv[1],run_name="__main__")')
+            result = subprocess.run(['python3', '-c', launcher, str(helper)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, 'protected-path\n')
+
     def test_candidate_jobs_have_only_read_access_and_no_standing_secrets(self):
         selected = [('pr-review-policy.yml', ['self-review-check', 'label-gate', 'external-review-labeling']),
                     ('agent-review-events.yml', ['signal']),

@@ -221,6 +221,12 @@ case "$endpoint" in
       author_padded)    jq -cn --arg who "$author" --arg t "$t" '[{id:7005,user:{login:$who},created_at:$t,body:"@codex review "}]' ;;
       stale_author)     jq -cn --arg who "$author" --arg t "$old" '[{id:7006,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       reviewer_only)    jq -cn --arg who "$reviewer" --arg t "$t" '[{id:7007,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      known_usage_limit) jq -cn --arg t "$t" '[{id:8061,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      known_not_connected) jq -cn --arg t "$t" '[{id:8062,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
+      stale_usage_limit) jq -cn --arg t "$old" '[{id:8063,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      stale_not_connected) jq -cn --arg t "$old" '[{id:8064,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
+      current_usage_limit) jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:8065,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      current_not_connected) jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:8066,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
       cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
       cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
@@ -1673,6 +1679,55 @@ test_policy_resolved_from_script_checkout
 test_guard_workflow_signal_shapes
 test_guard_override_paginates_and_scopes
 test_guard_runs_after_the_cap_branch
+
+test_trigger_only_preserves_known_provider_block() {
+  local reason dir rc before
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "known-block-$reason")
+    rc=$(run_trigger_only "$dir" "known_$reason")
+    [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = "$reason" ] \
+      && [ "$(trig_count "$dir")" = 1 ] \
+      || fail "trigger-only lost known $reason diagnostic; err=$(tail -3 "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "trigger-only preserves known $reason without changing request authority or budgets"
+  done
+}
+test_trigger_only_preserves_known_provider_block
+
+test_trigger_only_ignores_stale_provider_block() {
+  local reason dir rc before
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "stale-block-$reason")
+    rc=$(run_trigger_only "$dir" "stale_$reason")
+    [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = null ] \
+      && [ "$(trig_count "$dir")" = 1 ] \
+      || fail "trigger-only retained stale $reason diagnostic; err=$(tail -3 "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "trigger-only ignores $reason before the current freshness threshold"
+  done
+}
+test_trigger_only_ignores_stale_provider_block
+
+test_trigger_only_future_head_preserves_recent_blocks() {
+  local reason age dir rc before expected
+  for reason in usage_limit not_connected; do
+    for age in current stale; do
+      before=$FAIL
+      dir=$(make_case "future-head-$age-$reason")
+      sed -i.bak 's/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: 1800/' \
+        "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
+      rc=$(run_guard "$dir" "${age}_$reason" 2099-01-01T00:00:00Z completed "" \
+        --trigger-only --allow-moving-head)
+      expected=$reason
+      [ "$age" != stale ] || expected=null
+      [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = "$expected" ] \
+        && [ "$(trig_count "$dir")" = 1 ] \
+        || fail "future head mishandled $age $reason; err=$(tail -3 "$dir/err.log")"
+      [ "$FAIL" -ne "$before" ] || pass "future head preserves freshness distinction for $age $reason"
+    done
+  done
+}
+test_trigger_only_future_head_preserves_recent_blocks
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

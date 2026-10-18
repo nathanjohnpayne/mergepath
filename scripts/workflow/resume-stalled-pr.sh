@@ -177,7 +177,7 @@ echo
 
 case "$next_action" in
   "push fix")
-    echo "Round to run (AGENTS.md § Workflow Summary steps 3, 5f, 6, 7/8):"
+    echo "Round to run (REVIEW_POLICY.md §§ Workflow and Feedback Disposition Policy):"
     echo "  1. Read every unanswered finding on the head and fix or rebut each one:"
     printf '%s' "$SELECTED" | jq -r '.unanswered_findings[] | "       - " + .actor + "  " + .url'
     echo "  2. Push the fix commits (author identity; commits sign via local git config)."
@@ -202,7 +202,7 @@ case "$next_action" in
     echo "  Phase 4b: scripts/phase-4b-review.sh $number --repo $REPO, from a trusted main checkout"
     ;;
   merge)
-    echo "Pre-merge sequence (AGENTS.md § Workflow Summary steps 6, 8 and 10) — every gate clean, then merge as the author:"
+    echo "Pre-merge sequence (REVIEW_POLICY.md §§ Workflow and Pre-Merge Review Conversation Gate) — every gate clean, then merge as the author:"
     echo "  scripts/review-feedback-accounting.sh $number $REPO              # posted == accounted"
     echo "  scripts/resolve-pr-threads.sh $number --repo $REPO --list        # zero unresolved threads required"
     echo "  scripts/required-head-checks.sh --repo $REPO --verify --sha $head_sha   # configured build checks green on the head"

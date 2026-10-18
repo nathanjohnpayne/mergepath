@@ -93,9 +93,9 @@ To **diagnose a suspected rate-limit stall without spending a review**, post on 
 
 `@coderabbitai reviews remaining?` works too. CodeRabbit replies with the remaining count and refill timing and does **not** consume a review to answer.
 
-This is the read-only counterpart to what `scripts/coderabbit-wait.sh` already automates on the *write* side: when CodeRabbit posts an actual `Rate limit exceeded` comment, the wait helper parses the published retry window, sleeps it + a 30s buffer, posts `@coderabbitai, try again.`, and retries up to `coderabbit.max_rate_limit_retries` (default 2) before exiting `5` (`rate_limit_stalled`). Use `@coderabbitai rate limit` when you want to *check* the allowance up front (e.g. before kicking off a multi-push loop, or to confirm a stall is genuinely the hourly cap) rather than react to a stall.
+Use `@coderabbitai rate limit` to check the allowance before a review or confirm that a stall is the hourly cap. On an actual published refusal or trusted current-head `Review rate limited` status, `scripts/coderabbit-wait.sh` requests Codex immediately and exits `5` (`rate_limit_stalled`) with its substitution disposition. It never sleeps out the window or posts a CodeRabbit retry; `coderabbit.max_rate_limit_retries` is deprecated compatibility input.
 
-> Automated failover when stalled (request `@codex review`, revert when the window elapses) is tracked separately in **#489** — CodeRabbit is advisory and Codex is the real blocking gate, so we should not sit idle on an advisory bot's hourly cap. This audit only wires the *manual diagnostic* command into the runbook.
+> The substitution rule is governed by [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and [mergepath#2139](https://github.com/nathanjohnpayne/mergepath/issues/2139). A request is not clearance: under-threshold approval awaits full exact-head Codex clearance and records the provider plus full SHA. An unavailable Codex substitute requires human attention or the policy-authorized fallback; expiry of the CodeRabbit window does not revert or authorize the substitution.
 
 ### Confirming author seat coverage across consumers
 

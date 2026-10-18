@@ -229,6 +229,18 @@ make_sweep_fixture() {
   make_common_fixture "$dir"
   : > "$dir/mutations.log"
   : > "$dir/fingerprint.log"
+  cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$dir/scripts/workflow/"
+  # Every PR origin now scans the relay; fix the clock independently of
+  # the host's BSD/GNU date implementation for every sweep fixture.
+  cat > "$dir/bin/date" <<'SH'
+#!/usr/bin/env bash
+case "${@: -1}" in
+  +%s) echo 1767225600 ;;
+  +%Y-%m-%dT%H:%M:%SZ) echo 2026-01-01T00:00:00Z ;;
+  *) exit 92 ;;
+esac
+SH
+  chmod +x "$dir/bin/date"
   cat > "$dir/scripts/review-feedback-surface-fingerprint.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -323,8 +335,8 @@ if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
   fi
   exit 0
 fi
-if [ "$endpoint" = --paginate ] && [ "${3:-}" = repos/owner/repo/issues/1/comments ]; then
-  if [ "${RELAY_MODE:-empty}" = empty ]; then
+if [ "$endpoint" = --paginate ] && [[ "${3:-}" =~ ^repos/owner/repo/issues/[12]/comments$ ]]; then
+  if [ "${RELAY_MODE:-empty}" = empty ] || [ "$3" != repos/owner/repo/issues/1/comments ]; then
     echo '[]'
   else
     echo '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-feedback-archive-relay:v2 run=501 publisher=900 status=complete -->"}]'
@@ -507,8 +519,9 @@ fi
 
 # Drive the production relay predicate inside the complete two-PR sweep. The
 # mixed case has one completed source run and one still awaiting its relay.
+for origin in relay-fork stable; do
 for relay_mode in empty all-terminal pending; do
-  dir="$TMP/sweep-relay-$relay_mode"
+  dir="$TMP/sweep-relay-$origin-$relay_mode"
   make_sweep_fixture "$dir"
   mkdir -p "$dir/scripts/workflow"
   cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$dir/scripts/workflow/"
@@ -529,7 +542,7 @@ case "${@: -1}" in
 esac
 SH
   chmod +x "$dir/bin/date"
-  rc=$(run_sweep "$dir" relay-fork stable "$relay_mode")
+  rc=$(run_sweep "$dir" "$origin" stable "$relay_mode")
   expected=success
   [ "$relay_mode" != pending ] || expected=failure
   if [ "$rc" -ne 0 ]; then
@@ -546,8 +559,9 @@ SH
   elif [ "$relay_mode" != pending ] && ! grep -Fxq 'gate 1' "$dir/gate.log"; then
     fail "relay $relay_mode inventory permits gate evaluation" "first PR was not evaluated"
   else
-    pass "relay $relay_mode inventory yields its verdict and continues the sweep"
+    pass "$origin relay $relay_mode inventory yields its verdict and continues the sweep"
   fi
+done
 done
 
 # #1825: a bot posts once while the gate evaluates, then the full surface

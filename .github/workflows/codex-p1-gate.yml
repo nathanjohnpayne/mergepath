@@ -855,10 +855,10 @@ jobs:
               echo "::endgroup::"
               continue
             fi
-            requires_relay="$is_fork"
-            if [ "$pr_actor" = 'dependabot[bot]' ]; then
-              requires_relay=true
-            fi
+            # All candidate origins use the same trusted archive relay.
+            # The scheduled backstop must not outrun same-repository edits
+            # or deletions whose native source still awaits persistence.
+            requires_relay=true
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
               had_infra_error=1

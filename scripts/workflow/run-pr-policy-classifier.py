@@ -14,5 +14,5 @@ steps = workflow['jobs']['external-review-labeling']['steps']
 classifiers = [step['run'] for step in steps if step.get('id') == 'check']
 if len(classifiers) != 1 or not isinstance(classifiers[0], str):
     raise SystemExit('Expected one native PR policy classifier; refusing mutation')
-raise SystemExit(subprocess.run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail'],
-                              input=classifiers[0], text=True, cwd=root).returncode)
+raise SystemExit(subprocess.run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail',
+                               '-c', classifiers[0]], stdin=subprocess.DEVNULL, cwd=root).returncode)

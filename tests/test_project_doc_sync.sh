@@ -48,9 +48,9 @@ cat >"$APP/specs/old.md" <<'EOF'
 Will be deleted to verify orphan mirror detection.
 EOF
 git init -q "$DOCS"
-(cd "$DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
+(cd "$DOCS" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m docs)
 git init -q "$APP"
-(cd "$APP" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m app)
+(cd "$APP" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m app)
 
 cat >"$MP/.mergepath-project-docs.yml" <<EOF
 version: 1
@@ -502,9 +502,9 @@ title: FM spec
 Implementation contract with front matter.
 EOF
 git init -q "$FM_DOCS"
-(cd "$FM_DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
+(cd "$FM_DOCS" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m docs)
 git init -q "$FM_APP"
-(cd "$FM_APP" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m app)
+(cd "$FM_APP" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m app)
 
 cat >"$FM_MP/.mergepath-project-docs.yml" <<EOF
 version: 1

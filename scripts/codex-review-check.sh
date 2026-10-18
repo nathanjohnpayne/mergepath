@@ -8,6 +8,9 @@
 # Usage:
 #   scripts/codex-review-check.sh <PR_NUMBER> [REPO]
 #   scripts/codex-review-check.sh --approval-readiness-only <PR_NUMBER> [REPO]
+#   scripts/codex-review-check.sh --require-codex-on-head <PR_NUMBER> [REPO]
+#     Full checks, but no older-content carry-forward or Phase 4b substitute
+#     may stand in for Codex on this exact head (#2139).
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
@@ -96,6 +99,8 @@
 #       consumers; the hub is 0). See mergepath#1059.
 #   1   At least one gate condition fails. A one-line reason is
 #       printed to stderr.
+#   2   Diagnostic or strict substitution probe: Codex cannot report because
+#       a fresh account/connection block prevents current-request clearance.
 #   3   API / infrastructure error. Error message on stderr.
 #
 # Design notes:
@@ -256,11 +261,13 @@ fi
 # one is not.
 DIAGNOSTIC_SIGNAL_ONLY=0
 APPROVAL_READINESS_ONLY=0
+REQUIRE_CODEX_ON_HEAD=0
 _crc_positional=()
 for _arg in "$@"; do
   case "$_arg" in
     --diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;
     --approval-readiness-only) APPROVAL_READINESS_ONLY=1 ;;
+    --require-codex-on-head) REQUIRE_CODEX_ON_HEAD=1 ;;
     *) _crc_positional+=("$_arg") ;;
   esac
 done
@@ -271,8 +278,13 @@ if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$APPROVAL_READINESS_ONLY" = "1" ]; 
   exit 3
 fi
 
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && { [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$APPROVAL_READINESS_ONLY" = 1 ]; }; then
+  echo "ERROR: --require-codex-on-head requires the full clearance check" >&2
+  exit 3
+fi
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 [--diagnostic-signal-only|--approval-readiness-only] <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--diagnostic-signal-only|--approval-readiness-only|--require-codex-on-head] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -517,6 +529,7 @@ SKIP_REVIEWER_APPROVAL="$DIAGNOSTIC_SIGNAL_ONLY"
 # question "did Codex speak on this head", and splitting them would let a
 # caller ask half of it.
 REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
+[ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || REQUIRE_HEAD_SIGNAL=1
 
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
@@ -539,6 +552,9 @@ REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
 # CodeRabbit wait and reopen the pre-review merge race. Unset ⇒ policy value.
 ALLOW_PHASE_4B_SUBSTITUTE=${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-$(codex_field allow_phase_4b_substitute)}
 ALLOW_PHASE_4B_SUBSTITUTE=${ALLOW_PHASE_4B_SUBSTITUTE:-true}
+# #2139 under-threshold substitution needs Codex itself on this head, with
+# ordinary finding disposition and approval checks still active.
+[ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || ALLOW_PHASE_4B_SUBSTITUTE=false
 case "$ALLOW_PHASE_4B_SUBSTITUTE" in
   true|false) ;;
   *)
@@ -2362,7 +2378,11 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
     # #814: the caller is asking whether Codex spoke on THIS head. A
     # same-content verdict on an older commit is not that answer.
-    log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ]; then
+      log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
+    else
+      log "codex verdict carry-forward: SKIPPED (--require-codex-on-head)"
+    fi
   elif [ -x "$CARRY_BIN" ]; then
     # #1092: capture the helper's stderr instead of discarding it. Sending it
     # to /dev/null is why an rc=126 ("Argument list too long") went unnoticed
@@ -2468,6 +2488,19 @@ REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 COMMENTS_JSON='[]'
 if [ "$CODEX_ENABLED" = "true" ] && [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
   COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+fi
+
+# A refusal may arrive after trigger-only returned. Route it before the
+# approval gate, so the substitution caller does not poll an unavailable
+# provider while also waiting for an approval. Existing exact-head responses
+# retain their ordinary grading; this branch never grants clearance.
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && [ -n "$CODEX_BLOCKED_REASON" ] \
+   && [ -z "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
+  BLOCKED_HEAD_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") \
+    || die 3 "cannot inspect exact-head review evidence for the substitution refusal"
+  if [ "$BLOCKED_HEAD_REVIEW" = null ]; then
+    die 2 "human_attention_required: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME; it cannot report on $HEAD_SHA"
+  fi
 fi
 
 # Build a JSON array of reviewer logins for the filter.
@@ -2988,22 +3021,16 @@ if [ "$CLEARED" != "true" ]; then
   # (quota exhausted / App not connected → a human must act) instead of
   # inferring review latency and waiting or re-triggering.
   BLOCKED_SUFFIX=""
-  if [ -n "$CODEX_BLOCKED_REASON" ]; then
+  if [ -n "$CODEX_BLOCKED_REASON" ] \
+     && { [ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || [ -z "$LATEST_SIGNAL_TIME" ] \
+          || ! [[ "$LATEST_SIGNAL_TIME" > "$CODEX_BLOCKED_TIME" ]]; }; then
     BLOCKED_SUFFIX=" — NOTE: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME; this is an account/connection block a human must resolve (upgrade / add credits / connect the App), not review latency — route to Phase 4b (#722)"
-    # In DIAGNOSTIC mode only, distinguish "Codex CANNOT report" from "Codex
-    # has not reported YET" with exit 2 (#842). The #814 barrier is the only
-    # caller of that mode, and it must not hold a Phase 4b run behind a Codex
-    # that is account-blocked: Phase 4b is the documented fallback for exactly
-    # that state, and the message directly above already says to route there.
-    # Holding instead made the barrier wait out its whole budget and then page
-    # a human, so the automated leg could never serve its fallback role
-    # (Codex P1 on #842).
-    #
-    # Diagnostic-only on purpose. The merge gate must keep failing closed on a
-    # block — an account-blocked Codex has cleared nothing — so exit 2 is
-    # unreachable for every real gate caller, whose exit codes stay 0/1/3.
-    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
-      echo "[codex-review-check] diagnostic: Codex is account-blocked ('$CODEX_BLOCKED_REASON') — reporting CANNOT-REPORT (exit 2), not merely absent" >&2
+    # Preserve the diagnostic cannot-report result. Strict substitution also
+    # needs it after the existing request-freshness check supersedes an older
+    # head response. A newer response outranks an older resolved block above.
+    # Ordinary merge-gate callers retain their 0/1/3 contract.
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$REQUIRE_CODEX_ON_HEAD" = 1 ]; then
+      echo "[codex-review-check] human_attention_required: Codex is account-blocked ('$CODEX_BLOCKED_REASON') — reporting CANNOT-REPORT (exit 2), not merely absent" >&2
       exit 2
     fi
   fi
@@ -3034,6 +3061,32 @@ if [ "$CLEARED" != "true" ]; then
 fi
 
 log "gate (c): cleared — $CLEARANCE_REASON"
+
+# The substitution auto-merge caller combines these existing strict modes.
+# Its earlier approval cannot carry a review that arrived afterward. The
+# agent's pre-approval probe omits REQUIRE_APPROVAL_ON_HEAD and then approves.
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && [ "$REQUIRE_APPROVAL_ON_HEAD" = 1 ]; then
+  AUDITED_REVIEWER=$(printf '%s' "$REVIEWS_JSON" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" --arg author "$PR_AUTHOR" \
+    --arg sha "$HEAD_SHA" --arg cleared "$LATEST_SIGNAL_TIME" '
+      def epoch: try fromdateiso8601 catch null;
+      ($cleared | epoch) as $floor
+      | [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login != $author and (.user.login as $u | $reviewers | index($u)))
+        ] as $opinions
+      | if all($opinions[]; (.submitted_at | epoch) != null) then $opinions
+        else error("unreadable reviewer approval timestamp") end
+      | group_by(.user.login) | map(max_by(.submitted_at))
+      | map(select(.state == "APPROVED" and .commit_id == $sha)
+          | select((.submitted_at | epoch) as $when | $floor != null and $when != null and $when > $floor)
+          | select((.body // "") | test("CodeRabbit rate-limited; cleared by Codex on `?" + $sha + "`?([.[:space:]]|$)"; "i")))
+      | first | if . == null then empty else .user.login end
+    ') || die 3 "cannot read the substitution approval audit"
+  [ -n "$AUDITED_REVIEWER" ] \
+    || fail_gate "Codex cleared this commit at $LATEST_SIGNAL_TIME; a later reviewer approval must record CodeRabbit rate-limited; cleared by Codex on $HEAD_SHA."
+  log "substitution approval: audited approval for the current commit by $AUDITED_REVIEWER after $LATEST_SIGNAL_TIME"
+fi
 
 # --- all gates pass ---------------------------------------------------------
 

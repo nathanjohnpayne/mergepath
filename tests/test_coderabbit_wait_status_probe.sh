@@ -1623,7 +1623,62 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 }
 
 # #2120: status-only refusal controls, expected ~20s, outer timeout 45s.
+test_2360_same_second_status_ordering() {
+  local shape dir fixture rc expected helpers record
+  helpers="$WORKDIR/2360-carry-reader.sh"
+  sed -n '/^CRW_STATUS_RECORD_UNREADABLE=/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
+  sed -n '/^crw_carry_status_record() {$/,/^# BEGIN coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
+  for shape in ${CODERABBIT_TEST_STATUS_ID_CASES:-refusal reversed completed wrong-author malformed-id missing-id fractional-id}; do
+    dir=$(make_case "2360-$shape" 1 false 0 0)
+    sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
+    fixture="$dir/statuses.json"
+    jq -n --arg bot coderabbitai\[bot\] --arg shape "$shape" '
+      {id: 1, context: "CodeRabbit", state: "success",
+       created_at: "2026-06-04T00:00:09Z", updated_at: "2026-06-04T00:00:09Z",
+       creator: {login: $bot}, description: "Review completed"} as $old
+      | [$old + {id: 2, description: "Review rate limited"}, $old]
+      | if $shape == "reversed" then reverse
+        elif $shape == "completed" then map(.description = (if .id == 2 then "Review completed" else "Review rate limited" end))
+        elif $shape == "wrong-author" then .[0].creator.login = "someone-else"
+        elif $shape == "malformed-id" then .[0].id = "invalid"
+        elif $shape == "missing-id" then del(.[0].id)
+        elif $shape == "fractional-id" then .[0].id = 1.5
+        else . end
+      | {statuses: .}' >"$fixture"
+    expected=5
+    case "$shape" in completed|wrong-author) expected=0 ;; malformed-id|missing-id|fractional-id) expected=3 ;; esac
+    rc=$(CODERABBIT_TEST_NATIVE_REFUSAL=true CODERABBIT_TEST_STATUS_FIXTURE="$fixture" \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" run_case "$dir" probe_review_on_head)
+    if [ "$rc" = "$expected" ]; then
+      pass "#2360 same-second $shape: polling rc=$rc"
+    else
+      fail "#2360 same-second $shape: polling rc=$rc expected=$expected; $(tail -2 "$dir/err.log")"
+    fi
+    case "$shape" in malformed-id|missing-id|fractional-id)
+      record=$(
+        # Exercise the production carry reader directly: the general reader
+        # can reject malformed evidence before a full probe reaches it.
+        # shellcheck disable=SC1090
+        . "$helpers"
+        BOT_LOGIN='coderabbitai[bot]'
+        REPO=owner/repo
+        HEAD_SHA=head-sha
+        fetch_api_array() { printf 'read\n' >>"$dir/carry-fetches"; jq -c '.statuses' "$fixture"; }
+        crw_carry_status_record
+      )
+      if [ -s "$dir/carry-fetches" ] && jq -e '.state == "unreadable"' <<<"$record" >/dev/null 2>&1; then
+        pass "#2360 carry-forward $shape: unusable trusted ordering is unreadable"
+      else
+        fail "#2360 carry-forward $shape: expected unreadable, got $record"
+      fi
+      ;;
+    esac
+  done
+}
+
 if [ "${1:-}" = --status-refusal-only ]; then
+  test_2360_same_second_status_ordering
   helpers="$WORKDIR/status-refusal-helpers.sh"
   sed -n '/^# BEGIN coderabbit_status_description_helpers$/,/^# END coderabbit_status_description_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
   sed -n '/^# BEGIN coderabbit_probe_status_refusal_helpers$/,/^# END coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
@@ -3787,13 +3842,17 @@ test_940_fallback_status_veto() {
         [ "$(jq -r '.status' "$dir/out.json")" = timeout ] || bad="$bad not-timeout"
         [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = false ] || bad="$bad invented-failover"
       fi
-      [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
-      grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
+      if [ "$expected" = 5 ]; then
+        [ "$(probe_count "$dir")" = 0 ] || bad="$bad refusal-posted-a-status-question"
+      else
+        [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
+        grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
+      fi
     fi
   done <<'EOF'
-fallback_summary|success|Review rate limited|5|non-completion description 'Review rate limited'
+fallback_summary|success|Review rate limited|5|trusted per-SHA CodeRabbit rate-limit refusal
 fallback_summary|pending|Review in progress|4|is pending
-fallback_summary_during_probe|success|Review rate limited|5|non-completion description 'Review rate limited'
+fallback_summary_during_probe|success|Review rate limited|5|trusted per-SHA CodeRabbit rate-limit refusal
 fallback_summary_during_probe|pending|Review in progress|4|is pending
 fallback_summary|unreadable||3|could not read CodeRabbit fallback
 fallback_summary_during_probe|unreadable||4|could not be read
@@ -3891,16 +3950,20 @@ test_940_fallback_authority_and_absence() {
     n=$((n + 1))
     dir=$(make_case "940-control-$n-$scenario-$state-$trust" 15 true 1 0)
     [ "$trust" != true ] || enable_trust_status_context "$dir"
-    rc=$(CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
+    rc=$(CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
     [ "$rc" = "$expected" ] || bad="$bad $scenario/$state-rc=$rc"
+    if [ "$expected" = 5 ]; then
+      [ "$(jq -r .codex_failover_requested "$dir/out.json")" = true ] && [ "$(codex_invocations "$dir")" = 1 ] || bad="$bad missing-substitute"
+    fi
     got_reads=0
     [ ! -f "$dir/state/status-reads" ] || got_reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
     [ "$got_reads" = "$reads" ] || bad="$bad $scenario/$state-status-reads=$got_reads"
   done <<'EOF'
-probe_review_on_head|pending||true|0|2
-probe_review_on_head|success|Review rate limited|true|0|2
-probe_clean_incremental|pending||true|0|2
-probe_clean_incremental|success|Review rate limited|true|0|2
+probe_review_on_head|pending||true|0|3
+probe_review_on_head|success|Review rate limited|true|5|3
+probe_clean_incremental|pending||true|0|3
+probe_clean_incremental|success|Review rate limited|true|0|3
 badge_only_inline_finding|pending||true|2|2
 badge_only_summary_finding|pending||true|2|2
 fallback_summary|absent||true|0|3
@@ -4365,6 +4428,7 @@ fi
 test_878_waiter_tier_errors
 
 test_900_review_run_selector_ignores_bodyless_replies
+test_2360_same_second_status_ordering
 test_919_pending_status_blocks_the_terminal_verdict
 test_940_fallback_status_veto
 test_878_aged_marker_cannot_escape_trusted_status_veto
