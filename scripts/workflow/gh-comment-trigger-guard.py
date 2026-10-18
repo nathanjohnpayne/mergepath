@@ -70,6 +70,8 @@ def inspect(argv, role, state=None):
 
     def file_body(value, json_input=False):
         nonlocal serial, deferred
+        if state is None:
+            deferred = True  # Only the runtime wrapper can freeze execution bytes.
         if state is None and (value in ("-", "/dev/stdin", "/dev/fd/0") or not Path(value).is_file()):
             deferred = True
             return None, value
