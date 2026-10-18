@@ -402,7 +402,7 @@ esac
 # skip-of-push message instead of running `git push origin main`.
 # Verify the skip-message path fired — that's the test-mode signal
 # the push step ran (just short-circuited the network call).
-echo "$out" | grep -q "BOOTSTRAP_SKIP_REMOTE_PUSH=1 — skipping git push origin main" \
+echo "$out" | grep "BOOTSTRAP_SKIP_REMOTE_PUSH=1 — skipping git push origin main" >/dev/null \
   && pass "private visibility: push step ran (BOOTSTRAP_SKIP_REMOTE_PUSH=1 short-circuits the network call)" \
   || fail "private visibility: push step did not log the skip message; out: $out"
 
@@ -564,11 +564,11 @@ set -e
 [ "$ec" -eq 0 ] \
   && pass "codex_app=n run completes (rc=0)" \
   || fail "codex_app=n failed; rc=$ec; out: $out"
-echo "$out" | grep -q "Codex App: NOT requested" \
+echo "$out" | grep "Codex App: NOT requested" >/dev/null \
   && pass "codex_app=n logs 'NOT requested' message" \
   || fail "codex_app=n missing 'NOT requested' log; got: $out"
 # None of the Codex install URLs should appear in stdout when codex_app=n.
-if echo "$out" | grep -q "github.com/apps/chatgpt-codex-connector"; then
+if echo "$out" | grep "github.com/apps/chatgpt-codex-connector" >/dev/null; then
   fail "codex_app=n leaked Codex install URL"
 else
   pass "codex_app=n suppresses Codex install URLs"
@@ -590,13 +590,13 @@ set -e
 [ "$ec" -eq 0 ] \
   && pass "codex_app=y run completes (rc=0)" \
   || fail "codex_app=y failed; rc=$ec; out: $out"
-echo "$out" | grep -q "github.com/apps/chatgpt-codex-connector" \
+echo "$out" | grep "github.com/apps/chatgpt-codex-connector" >/dev/null \
   && pass "codex_app=y prints App install URL" \
   || fail "codex_app=y missing App install URL; got: $out"
-echo "$out" | grep -q "chatgpt.com/codex/cloud/settings/code-review" \
+echo "$out" | grep "chatgpt.com/codex/cloud/settings/code-review" >/dev/null \
   && pass "codex_app=y prints code-review settings URL" \
   || fail "codex_app=y missing code-review settings URL"
-echo "$out" | grep -q "chatgpt.com/codex/cloud/settings/environments" \
+echo "$out" | grep "chatgpt.com/codex/cloud/settings/environments" >/dev/null \
   && pass "codex_app=y prints environments settings URL" \
   || fail "codex_app=y missing environments URL"
 
@@ -663,10 +663,10 @@ else
   pass "dry-run did not invoke op-firebase-setup"
 fi
 # Plan output should mention DRY-RUN tags for stage D actions.
-echo "$dry_out" | grep -q "DRY-RUN.*firebase projects:create" \
+echo "$dry_out" | grep "DRY-RUN.*firebase projects:create" >/dev/null \
   && pass "dry-run plan includes firebase projects:create action" \
   || fail "dry-run plan missing firebase projects:create; got: $dry_out"
-echo "$dry_out" | grep -q "DRY-RUN.*yq.*coderabbit.enabled" \
+echo "$dry_out" | grep "DRY-RUN.*yq.*coderabbit.enabled" >/dev/null \
   && pass "dry-run plan includes yq coderabbit flip action" \
   || fail "dry-run plan missing yq coderabbit flip; got: $dry_out"
 
