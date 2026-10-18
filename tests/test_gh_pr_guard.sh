@@ -36,6 +36,9 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "pr view")
+    if [ -n "${STUB_INFERRED_HOST:-}" ]; then
+      printf 'pr view repository inferred host: %s\n' "$STUB_INFERRED_HOST" >>"${STUB_API_LOG:-/dev/null}"
+    fi
     # STUB_REQUIRE_TOKEN: a session with no gh keyring, where gh needs GH_TOKEN.
     if [ "${STUB_REQUIRE_TOKEN:-0}" = 1 ]; then
       [ -n "${GH_TOKEN:-}" ] || { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }
@@ -671,6 +674,54 @@ fi
 # --repo, a GH_HOST elsewhere, or a URL selector on another host keeps gh's
 # own (absent) credentials, so the read fails closed without sending the PAT
 # (Phase 4b on #2178).
+for selector in 123 https://github.com/example/repo/pull/123; do
+  : >"$API_LOG"
+  inferred_host=""
+  [ "$selector" != 123 ] || inferred_host=tenant.ghe.com
+  set +e
+  out=$(unset GH_TOKEN GITHUB_TOKEN GH_REPO GH_HOST; \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat \
+    STUB_REQUIRE_TOKEN=1 STUB_INFERRED_HOST="$inferred_host" STUB_API_LOG="$API_LOG" \
+    run_hook "scripts/gh-as-reviewer.sh -- gh pr review $selector --approve --body lgtm" \
+      "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] \
+      && { [ -z "$inferred_host" ] || grep -q 'repository inferred host: tenant.ghe.com' "$API_LOG"; } \
+      && ! grep -q 'authenticated with the expected token' "$API_LOG"; then
+    pass "self-approve read without explicit canonical repository withholds reviewer PAT ($selector)"
+  else
+    fail "self-approve inferred repository PAT boundary ($selector): rc=$rc out=$out"
+  fi
+done
+: >"$API_LOG"
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN GH_HOST; \
+  GH_REPO=example/repo OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "inherited canonical GH_REPO permits reviewer PAT fallback"
+else
+  fail "inherited canonical GH_REPO PAT boundary: rc=$rc out=$out"
+fi
+: >"$API_LOG"
+set +e
+out=$(unset GITHUB_TOKEN GH_REPO GH_HOST; \
+  GH_TOKEN=fixture-ambient-pat OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-ambient-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "an ambient CLI credential remains available without reviewer PAT fallback"
+else
+  fail "ambient CLI credential changed: rc=$rc out=$out"
+fi
 for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123" \
     "--repo git@tenant.ghe.com:o/r" "--repo=git@tenant.ghe.com:o/r" "--repo=https://tenant.ghe.com/o/r" "GH_REPO=git@tenant.ghe.com:o/r"; do
   : >"$API_LOG"
