@@ -24,7 +24,7 @@ The token-verifying wrappers inspect comment and review bodies before writing, i
 
 Manual Phase 4b handoffs hold while a current-head Codex review is in flight and report accounting's undispositioned finding count. The automation caller preserves the renderer's active-review hold as a retryable exit `6` instead of instructing a manual briefing. The sensing and timeout-fallback contract is documented in `specs/review_feedback_accounting.md` (#2157, #2338).
 
-The requester reads its moving-head check override as YAML, preserving absent, exact-name and explicitly empty meanings across block and flow styles. The write-only validation boundary and native controls are documented in `specs/codex_request_evidence.md` (#2340).
+The requester reads its moving-head check override as YAML, preserving absent, exact-name and explicitly empty meanings across block and flow styles. The write-only validation boundary and native controls are documented in `specs/codex_request_evidence.md` (#2340). A matching check with unavailable suite branch attribution is reported as an unavailable advisory pickup signal; it does not invent a missing check or disable the independent age guard (#2200).
 
 Provider-block diagnostics use the latest exact author request and same-second comment ordering rather than reusing an earlier account refusal. Requester and checker share that filter and retain newer Running/unknown holds; the contract and native cases are in `specs/codex_request_evidence.md` (#2337).
 
