@@ -168,7 +168,8 @@ class WriterTests(unittest.TestCase):
         (self.path/'state.json').write_text(json.dumps(self.state))
         env={k:v for k,v in os.environ.items() if not k.startswith(('GH_','GITHUB_','OP_PREFLIGHT_','MERGEPATH_','MERGE_CLEARANCE_','CODEX_REVIEW_','GIT_','BASH_','PYTHON','NODE_','BREAK_GLASS_')) and k not in ('ENV','CODEX_CLEARED')}
         env.update(PATH=str(self.path/'bin')+os.pathsep+env['PATH'], OP_PREFLIGHT_AUTHOR_PAT='ghp_fixture-author',
-                   GH_AS_AUTHOR_TRACE_MARKER=str(self.path/'trace'), CODEX_CLEARED='1', **overrides)
+                   GH_AS_AUTHOR_TRACE_MARKER=str(self.path/'trace'), CODEX_CLEARED='1')
+        env.update(overrides)
         argv=args if args is not None else ['pr','merge','123','--squash','--match-head-commit',HEAD]
         return subprocess.run(['/bin/bash',str(self.candidate/'scripts/gh-as-author.sh'),'--','gh',*argv],
                               env=env,cwd=self.candidate,text=True,capture_output=True,timeout=40)
@@ -189,6 +190,24 @@ class WriterTests(unittest.TestCase):
                 self.state = dict(generation=[123,124], **changes)
                 self.assert_blocked(self.run_writer(), 'enrolled target')
                 self.assertNotIn('/tarball/', (self.path/'calls.jsonl').read_text())
+
+    def test_unpinned_path_utilities_cannot_enter_credentialed_checker(self):
+        import shlex
+        self.state['generation'] = [123,124]
+        poison = self.path/'untrusted-utilities'
+        poison.mkdir()
+        marker = self.path/'utility-executed'
+        for name in ('awk', 'sed', 'grep'):
+            actual = shutil.which(name)
+            self.assertIsNotNone(actual)
+            (poison/name).write_text('#!/bin/sh\ncase "$PATH" in *mergepath-merge-code-*) printf reached > '
+                                     + shlex.quote(str(marker)) + ';; esac\nexec '
+                                     + shlex.quote(actual) + ' "$@"\n')
+            (poison/name).chmod(0o755)
+        result = self.run_writer(PATH=str(self.path/'bin')+os.pathsep+str(poison)+os.pathsep+os.environ['PATH'])
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertFalse(marker.exists(), 'inherited unpinned utility executed inside credentialed checker')
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()), 1)
 
     def test_stale_green_claim_and_candidate_poison_do_not_authorize(self):
         self.assert_blocked(self.run_writer(), 'outside the request generation')

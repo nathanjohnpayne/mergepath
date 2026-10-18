@@ -41,6 +41,8 @@ TRUSTED_TARGETS = {
     'nathanjohnpayne/tadlockpsychiatry': (1226654565, 23488723),
     'nathanjohnpayne/fiveacross': (1292606950, 23488723),
 }
+
+SYSTEM_PATH = ('/usr/bin', '/bin', '/usr/sbin', '/sbin')
 TIMEOUT = 300
 
 
@@ -64,6 +66,12 @@ def trusted_tools(argv):
     for name, value in tools.items():
         if not value or not Path(value).is_absolute() or ROOT in Path(value).resolve().parents:
             raise ValueError(f'trusted operator toolchain is missing {name}')
+    # Optional YAML acceleration is part of the explicit operator tool set.
+    yq = shutil.which('yq')
+    if yq:
+        if not Path(yq).is_absolute() or ROOT in Path(yq).resolve().parents:
+            raise ValueError('trusted operator toolchain has an unsafe yq')
+        tools['yq'] = yq
     return tools
 
 
@@ -151,7 +159,8 @@ def merge_preflight(argv, command, tools, task):
     tool_dir.mkdir()
     for name, executable in tools.items():
         (tool_dir / name).symlink_to(executable)
-    environment['PATH'] = str(tool_dir) + os.pathsep + environment['PATH']
+    # Unlisted helpers use fixed OS search directories, never inherited PATH.
+    environment['PATH'] = os.pathsep.join((str(tool_dir), *SYSTEM_PATH))
 
     def read(*args):
         result = subprocess.run([gh, *args], env=environment, text=True,
