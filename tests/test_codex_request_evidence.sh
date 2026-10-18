@@ -646,7 +646,11 @@ RESOLVER
   checker_author_block=$(sed -n '/^AUTHOR_POLICY_JSON=/,/^  }$/p' "$ROOT/scripts/codex-review-check.sh")
   [ -n "$checker_author_block" ] || { echo 'FAIL checker parsed-author assignment missing'; exit 1; }
   checker_author=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY")
-  [ "$checker_author" = base-author ] && [ "$(p4b_live_request_generation owner/repo 99)" = '[8201,8203]' ]
+  [ "$checker_author" = base-author ] \
+    || { echo "FAIL flow-style checker author: $checker_author"; exit 1; }
+  flow_generation=$(p4b_live_request_generation owner/repo 99)
+  [ "$flow_generation" = '[8201,8203]' ] \
+    || { echo "FAIL flow-style request generation: $flow_generation"; exit 1; }
   echo 'PASS: valid flow YAML selects the same author in capture and production checker'
   printf '%s\n' '{codex: {enabled: true}}' >"$P4B_TEST_BASE"
   checker_author=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY")
