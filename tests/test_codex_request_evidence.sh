@@ -61,6 +61,7 @@ EYES='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"eyes","create
 # shellcheck disable=SC2016 # Literal Markdown commit cell, not shell substitution.
 RUNNING='{"id":456,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `abcdef0` | Manual |"}'
 REVIEW='[{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED"}]'
+QUOTA='{"id":124,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:01:00Z","body":"You have reached your Codex usage limits for code reviews."}'
 PASS=0
 # #1635: each empty input must fail without partial anchor output.
 threshold_committed=2026-09-14T00:00:00Z
@@ -105,6 +106,11 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
     foreign) comments="[${TRIGGER/nathanjohnpayne/nathanpayne-claude}]" ;;
     running) comments="[$RUNNING]" ;;
     completed) comments="[${RUNNING/Running/Completed}]" ;;
+    old-block) comments="[$TRIGGER,${QUOTA/2026-09-14T00:01:00Z/2026-09-14T00:00:30Z}]" ;;
+    same-second-old-block) comments="[$TRIGGER,${QUOTA/124/122}]" ;;
+    current-block) comments="[$TRIGGER,${QUOTA/2026-09-14T00:01:00Z/2026-09-14T00:01:30Z}]" ;;
+    same-second-current-block) comments="[$TRIGGER,$QUOTA]" ;;
+    running-after-block) comments="[$TRIGGER,$QUOTA,$RUNNING]" ;;
     *) comments='[]' ;;
   esac
   case "$ack" in eyes) ack="$EYES" ;; foreign) ack="${EYES/chatgpt-codex-connector\[bot\]/someone}" ;; *) ack='[]' ;; esac
@@ -191,7 +197,28 @@ gate-c|trigger|eyes|approved||1|1|linked eyes acknowledgement=true|1
 not-opted|trigger|eyes|[]||0|1|no reviewer identity|0
 readiness|trigger|eyes|[]|--approval-readiness-only|1|1|no reviewer identity|0
 diagnostic|trigger|eyes|[]|--diagnostic-signal-only|1|1|Codex has not produced|0
+renewed-provider-block|old-block|none|[]|--require-codex-on-head|0|1|no reviewer identity|0
+same-second-prior-block|same-second-old-block|none|[]|--require-codex-on-head|0|1|no reviewer identity|0
+current-provider-block|current-block|none|[]|--require-codex-on-head|0|2|human_attention_required|0
+same-second-current-block|same-second-current-block|none|[]|--require-codex-on-head|0|2|human_attention_required|0
+running-after-provider-block|running-after-block|none|[]|--diagnostic-signal-only|0|1|Codex review summary is Running|0
 CASES
+
+# #2337: both live callers use the same request-ordering predicate.
+block='{"reason":"usage_limit","created_at":"2026-09-14T00:01:00Z","comment_id":124}'
+request='{"created_at":"2026-09-14T00:01:00Z","id":123}'
+[ "$(crqe_filter_provider_block "$block" "$request")" != null ]
+[ "$(crqe_filter_provider_block "$block" "${request/123/125}")" = null ]
+[ "$(crqe_filter_provider_block "$block" "${request/00:01:00Z/00:02:00Z}")" = null ]
+[ "$(crqe_filter_provider_block "$block" "${request/00:01:00Z/00:00:00Z}")" != null ]
+for status in running unknown; do
+  summary=$(jq -nc --arg status "$status" '{status:$status,observed_at:"2026-09-14T00:02:00Z"}')
+  [ "$(crqe_filter_provider_block "$block" "$request" "$summary")" = null ]
+done
+[ "$(crqe_filter_provider_block "$block" null)" != null ]
+rc=0; result=$(crqe_filter_provider_block "$block" '{"created_at":"2026-09-14T00:01:00Z"}' 2>/dev/null) || rc=$?
+[ "$rc" != 0 ] && [ -z "$result" ] || { echo 'FAIL: unreadable same-second request ordering became absence'; exit 1; }
+PASS=$((PASS + 8)); echo 'PASS: provider refusals bind request IDs/time and preserve newer active/unknown holds'
 # The existing carry-forward remains eligible and successful, without ack reads.
 # No author request is newer than the carried verdict here; a newer one would
 # supersede it until Codex answers (#1598, covered below).
@@ -501,6 +528,7 @@ fetch_scan_array() {
   esac
 }
 export BOT_LOGIN='chatgpt-codex-connector[bot]'
+export AUTHOR_IDENTITY=nathanjohnpayne
 export HEAD_SHA='abcdef0123456789000000000000000000000000'
 export REPO=owner/repo PR_NUMBER=99 REQUIRED_TIERS_JSON='["p0","p1"]'
 export CODEX_FAILURE_MARKERS_OK=false

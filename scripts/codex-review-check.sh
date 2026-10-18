@@ -2221,7 +2221,7 @@ crc_select_codex_review_summary() {
 
 # BEGIN codex_block_marker_selector
 # Select the newest account-/connection-level BLOCK marker on this head, as
-# `{reason, created_at}` or `null` (#722).
+# `{reason, created_at, comment_id}` or `null` (#722).
 #
 # Extracted verbatim from its single call site so the selection is assertable
 # without driving the whole gate (#839): the barrier's escalate-instead-of-wait
@@ -2258,7 +2258,7 @@ crc_select_codex_block_marker() {
       | { reason: $reason, created_at: .created_at, id: .id }
     ]
     | max_by([.created_at, .id]) // null
-    | if . != null then del(.id) else . end
+    | if . != null then .comment_id = .id | del(.id) else . end
   '
 }
 # END codex_block_marker_selector
@@ -2358,9 +2358,15 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # NON-verdict bot comment. Diagnostic only — folded into the gate (c)
   # failure message, never into the clearance decision. Shares the regexes
   # with the live trigger script via scripts/lib/codex-failure-markers.sh.
+  # The shared filter then binds it to the latest exact author request and
+  # retains any newer Running/unknown observation instead of declaring a block.
   if [ "$CODEX_FAILURE_MARKERS_OK" = "true" ]; then
     CODEX_BLOCKED_JSON=$(crc_select_codex_block_marker "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" \
       "$REACTION_THRESHOLD" "$CODEX_USAGE_LIMIT_MARKER_RE" "$CODEX_NOT_CONNECTED_MARKER_RE")
+    CODEX_BLOCK_REQUEST=$(crqe_select_trigger "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" "") \
+      || die 3 "cannot select the author request for provider-block diagnostics"
+    CODEX_BLOCKED_JSON=$(crqe_filter_provider_block "$CODEX_BLOCKED_JSON" "$CODEX_BLOCK_REQUEST" "$CODEX_SUMMARY_JSON") \
+      || die 3 "cannot order the provider refusal against the current request"
     CODEX_BLOCKED_REASON=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .reason end')
     CODEX_BLOCKED_TIME=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .created_at end')
     if [ -n "$CODEX_BLOCKED_REASON" ]; then
