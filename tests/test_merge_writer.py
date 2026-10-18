@@ -76,7 +76,7 @@ if endpoint=='graphql':
         emit({'data':{'repository':{'pullRequest':dict(url=url,headRefOid=head,
             isMergeQueueEnabled=state.get('queue',False),isInMergeQueue=False)}}})
     sys.exit(0)
-if endpoint=='repos/example/repo': emit(dict(full_name='example/repo',default_branch='main')); sys.exit(0)
+if endpoint=='repos/example/repo': emit(dict(full_name='example/repo',default_branch='main',id=state.get('repository_id',123),owner=state.get('repository_owner',dict(id=456,login='nathanjohnpayne')))); sys.exit(0)
 if endpoint=='repos/example/repo/commits/main': emit({'sha':source}); sys.exit(0)
 if endpoint.startswith('repos/example/repo/tarball/'):
     if state.get('archive_fails'): sys.exit(1)
@@ -142,6 +142,13 @@ class WriterTests(unittest.TestCase):
             shutil.copytree(ROOT/folder,self.candidate/folder,ignore=shutil.ignore_patterns('__pycache__'))
         for name in ('scripts/gh-as-author.sh','scripts/identity-check.sh','scripts/merge-clearance-gate.sh','scripts/codex-review-check.sh'):
             shutil.copy2(ROOT/name,self.candidate/name)
+        # Enroll the independently controlled fake transport repository in
+        # this disposable installed launcher; production has no override knob.
+        writer = self.candidate/'scripts/workflow/merge-writer.py'
+        source = writer.read_text()
+        begin = source.index('TRUSTED_TARGETS = {')
+        end = source.index('\n}', begin) + 2
+        writer.write_text(source[:begin] + "TRUSTED_TARGETS = {'example/repo': (123, 456)}" + source[end:])
         (self.candidate/'.github').mkdir()
         # Candidate policy/checker helpers would vacuously clear; authoritative
         # evidence and code come from the independent fake default-ref archive.
@@ -174,6 +181,14 @@ class WriterTests(unittest.TestCase):
         if (self.path/'calls.jsonl').exists():
             calls=[json.loads(line) for line in (self.path/'calls.jsonl').read_text().splitlines()]
             self.assertFalse(any(call and call[0]=='api' and any(value in ('POST','PATCH','PUT','DELETE') for value in call) for call in calls))
+
+    def test_unenrolled_target_never_downloads_credentialed_checker(self):
+        for changes in ({'repository_id': 999}, {'repository_owner': {'id': 999, 'login': 'nathanjohnpayne'}},
+                        {'repository_owner': {'id': 456, 'login': 'other-author'}}, {'repository_owner': None}):
+            with self.subTest(changes=changes):
+                self.state = dict(generation=[123,124], **changes)
+                self.assert_blocked(self.run_writer(), 'enrolled target')
+                self.assertNotIn('/tarball/', (self.path/'calls.jsonl').read_text())
 
     def test_stale_green_claim_and_candidate_poison_do_not_authorize(self):
         self.assert_blocked(self.run_writer(), 'outside the request generation')

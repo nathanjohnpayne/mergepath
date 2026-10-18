@@ -28,6 +28,19 @@ URL = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
               'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
+# Reviewed enrollment in the trusted installed launcher, never target policy.
+# Immutable repository/owner IDs prevent a reused name or transferred repo from
+# selecting credentialed checker code. New targets require explicit enrollment.
+TRUSTED_TARGETS = {
+    'nathanjohnpayne/mergepath': (1190939344, 23488723),
+    'nathanjohnpayne/matchline': (1218653054, 23488723),
+    'nathanjohnpayne/nathanpaynedotcom': (1165945000, 23488723),
+    'nathanjohnpayne/overridebroadway': (1165157491, 23488723),
+    'nathanjohnpayne/friends-and-family-billing': (1165945849, 23488723),
+    'nathanjohnpayne/swipewatch': (1165945748, 23488723),
+    'nathanjohnpayne/tadlockpsychiatry': (1226654565, 23488723),
+    'nathanjohnpayne/fiveacross': (1292606950, 23488723),
+}
 TIMEOUT = 300
 
 
@@ -171,6 +184,13 @@ def merge_preflight(argv, command, tools, task):
     repository = read('api', f'repos/{repo}')
     if repository.get('full_name', '').lower() != repo.lower() or not repository.get('default_branch'):
         raise ValueError('target repository/default branch is unreadable')
+    enrolled = TRUSTED_TARGETS.get(repo.lower())
+    target_owner = repository.get('owner')
+    if (not enrolled or type(repository.get('id')) is not int or not isinstance(target_owner, dict)
+            or type(target_owner.get('id')) is not int
+            or (repository['id'], target_owner['id']) != enrolled
+            or target_owner.get('login') != os.environ.get('GH_AS_AUTHOR_RECORD_IDENTITY')):
+        raise ValueError('repository is not an enrolled target for this verified author; refusing checker download')
     from urllib.parse import quote
     commit = read('api', f'repos/{repo}/commits/{quote(repository["default_branch"], safe="")}')
     source_sha = commit.get('sha', '')
