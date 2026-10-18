@@ -119,8 +119,15 @@ case "$endpoint" in
   # labels and changed_files feed the #2257 Phase 4 gate derivation, which the
   # request_by_default: false cases reach; the default PR is under-threshold.
   repos/owner/repo/pulls/999)
+    freshness_base=base-sha
+    if [ -f "$CODEX_TEST_STATE_DIR/freshness-scan-complete" ]; then
+      case "${CODEX_TEST_FRESHNESS_TRANSITION:-}" in
+        shrink|expand|base-only) freshness_base=base-next ;;
+        unreadable-pr) echo 'simulated changed-base metadata read failure' >&2; exit 1 ;;
+      esac
+    fi
     if [ "${2:-}" = "--jq" ]; then printf '%s\n' "$head_sha"   # the #2257 head re-read
-    else jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
+    else jq -cn --arg h "$head_sha" --arg b "$freshness_base" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:$b,repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
   repos/owner/repo/pulls/999/files)      printf '%s\n' '[{"filename":"src/app.ts","additions":10,"deletions":2}]' ;;
   repos/owner/repo/branches/main)        printf '%s\n' '{"name":"main","commit":{"sha":"main-sha-1"}}' ;;  # #2257 default-branch pin
   'repos/owner/repo/contents/scripts/workflow/parse_policy_list.sh?ref=base-sha')
@@ -130,11 +137,17 @@ case "$endpoint" in
   'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
     # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
     jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
-  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha'|'repos/owner/repo/contents/.github/review-policy.yml?ref=base-next')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
       echo 'simulated governing policy read failure' >&2
       exit 1
+    fi
+    if [ -f "$CODEX_TEST_STATE_DIR/freshness-scan-complete" ]; then
+      case "${CODEX_TEST_FRESHNESS_TRANSITION:-}" in
+        unreadable-policy) echo 'simulated governing policy read failure after scan' >&2; exit 1 ;;
+        shrink|expand|cap-change) cat "$CODEX_TEST_STATE_DIR/base-review-policy-next.yml"; exit 0 ;;
+      esac
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
@@ -213,7 +226,9 @@ case "$endpoint" in
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
-      freshness_author) jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      freshness_author)
+        [ -z "${CODEX_TEST_FRESHNESS_TRANSITION:-}" ] || touch "$CODEX_TEST_STATE_DIR/freshness-scan-complete"
+        jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author_upper) jq -cn --arg who "$author" --arg t "$t" '[{id:7002,user:{login:$who},created_at:$t,body:"@CODEX REVIEW"}]' ;;
       author_prose)     jq -cn --arg who "$author" --arg t "$t" '[{id:7003,user:{login:$who},created_at:$t,body:"Status: @codex review was already requested."}]' ;;
@@ -543,6 +558,37 @@ test_governing_request_freshness() {
       || fail "#1567 $scenario: rc=$rc posts=$(trig_count "$dir") expected=$expected_posts; err=$(cat "$dir/err.log")"
     [ "$FAIL" -ne "$before" ] || pass "#1567: $scenario uses governing freshness for actual request reuse"
   done
+}
+
+# #2027: advance the governing base after the initial signal scan. A bounded
+# refusal avoids either reusing a stale window or spending from the old one.
+test_governing_freshness_revalidation() {
+  local variant dir rc initial next expected posts trigger_at before=$FAIL
+  trigger_at=$(jq -rn 'now - 3600 | floor | todate')
+  for variant in shrink expand base-only unreadable-pr unreadable-policy unchanged-wide unchanged-short malformed-cap cap-change; do
+    dir=$(make_case "freshness-fence-$variant")
+    initial=7200; next=7200; expected=3; posts=0
+    case "$variant" in
+      shrink) next=1800 ;;
+      expand) initial=1800 ;;
+      unchanged-wide|malformed-cap|cap-change) expected=0 ;;
+      unchanged-short) initial=1800; next=1800; expected=0; posts=1 ;;
+    esac
+    sed -i.bak "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $initial/" "$dir/state/base-review-policy.yml"
+    sed "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $next/" \
+      "$dir/state/base-review-policy.yml" >"$dir/state/base-review-policy-next.yml"
+    [ "$variant" != malformed-cap ] || printf '  max_review_rounds: invalid\n' >>"$dir/state/base-review-policy.yml"
+    [ "$variant" != cap-change ] || printf '  max_review_rounds: invalid\n' >>"$dir/state/base-review-policy-next.yml"
+    rc=$(CODEX_TEST_FRESHNESS_TRANSITION="$variant" CODEX_TEST_TRIGGER_AT="$trigger_at" \
+      CODEX_TEST_HEAD_DATE=1999-01-01T00:00:00Z run_trigger_only "$dir" freshness_author)
+    [ "$rc" = "$expected" ] && [ "$(trig_count "$dir")" = "$posts" ] \
+      || fail "#2027: $variant expected rc=$expected posts=$posts, got rc=$rc posts=$(trig_count "$dir") ($(cat "$dir/err.log"))"
+    if [ "$expected" = 3 ]; then
+      grep -q 'governing request freshness' "$dir/err.log" \
+        || fail "#2027: $variant must name the fresh evidence refusal"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2027: freshness/base drift refuses reuse or writes; unchanged and malformed-cap no-spend paths retain behavior"
 }
 
 test_governing_freshness_validation_preserves_no_spend_caps() {
@@ -1687,6 +1733,7 @@ test_invalid_present_governing_codex_block_refuses_new_write
 test_missing_governing_codex_block_defaults_request_cap
 test_idempotent_skip_requires_governing_freshness
 test_governing_request_freshness
+test_governing_freshness_revalidation
 test_governing_freshness_validation_preserves_no_spend_caps
 test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only

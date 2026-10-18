@@ -1411,6 +1411,32 @@ fi
 
 # --- fetch PR metadata ------------------------------------------------------
 
+request_freshness_snapshot() { # <PR metadata JSON>
+  local tuple policy freshness base_ref base_sha default_branch
+  tuple=$(printf '%s' "$1" | jq -ce '
+    [.base.ref, .base.sha, .base.repo.default_branch]
+    | select(all(.[]; type == "string" and length > 0))') || return 1
+  base_ref=$(printf '%s' "$tuple" | jq -r '.[0]')
+  base_sha=$(printf '%s' "$tuple" | jq -r '.[1]')
+  default_branch=$(printf '%s' "$tuple" | jq -r '.[2]')
+  policy=$(crqe_governing_policy_json "$REPO" "$PR_NUMBER" "$CONFIG" \
+    "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
+    "$base_ref" "$base_sha" "$default_branch") || return 1
+  freshness=$(crqe_policy_reaction_freshness "$policy") || return 1
+  jq -nSc --argjson tuple "$tuple" --argjson freshness "$freshness" \
+    '{tuple:$tuple,freshness:$freshness}'
+}
+
+revalidate_request_freshness() {
+  local metadata snapshot
+  metadata=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
+    || die 3 "cannot revalidate governing request freshness metadata; rerun the requester"
+  snapshot=$(request_freshness_snapshot "$metadata") \
+    || die 3 "cannot revalidate governing request freshness policy; rerun the requester"
+  [ "$snapshot" = "$GOVERNING_FRESHNESS_SNAPSHOT" ] \
+    || die 3 "governing request freshness base/policy changed; rerun the requester"
+}
+
 log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
 
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"
@@ -1440,9 +1466,9 @@ jq -ne --arg t "$HEAD_COMMITTER_DATE" '
 # #1567: timing is governed by the target base policy, as in Phase 4b. Read
 # freshness before any threshold/reuse decision, without validating request
 # caps on a no-spend path. Each new write still re-reads its governed budgets.
-REACTION_FRESHNESS_SECONDS=$(crqe_governing_freshness "$REPO" "$PR_NUMBER" "$CONFIG" \
-  "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh") \
+GOVERNING_FRESHNESS_SNAPSHOT=$(request_freshness_snapshot "$PR_JSON") \
   || die 3 "cannot read the governing review policy/request freshness"
+REACTION_FRESHNESS_SECONDS=$(printf '%s' "$GOVERNING_FRESHNESS_SNAPSHOT" | jq -r .freshness)
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
 EPOCH_NOW=$(date +%s)
 REACTION_ANCHOR=$(crqe_request_threshold "$HEAD_COMMITTER_DATE" "$TIMELINE_JSON" \
@@ -1744,13 +1770,15 @@ has_post_trigger_signal() {
 # coderabbit-wait.sh fires the failover more than once for the same HEAD (e.g.
 # a re-invocation). Fail-open: on a missing author identity or any read error it
 # returns non-zero so the caller still posts (better to re-request Codex than to
-# silently skip the failover).
+# silently skip the failover). Governing freshness/base uncertainty instead
+# fails closed before this lookup can authorize reuse or a new request.
 existing_codex_trigger_on_head() {
   [ -n "$AUTHOR_IDENTITY" ] || return 1
   local comments
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || return 1
   [ -n "$comments" ] || return 1
+  revalidate_request_freshness
   local trigger
   trigger=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
   [ "$trigger" != null ]
@@ -2452,6 +2480,7 @@ post_codex_trigger() {
   # idempotently-reused paths spend no request attempt and retain their
   # established behavior even if a later budget edit is malformed.
   local max_review_rounds request_comments request_count
+  revalidate_request_freshness
   governing_request_attempt_cap
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
@@ -2852,6 +2881,7 @@ resume_pending_codex_request() {
   local comments="" pending created created_epoch summary status observed now deadline
   read_with_transient_retry "resume-check issue comments read" comments \
     fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)"
+  revalidate_request_freshness
   # The latest exact author request, with no freshness anchor. Neither anchor
   # proves head attribution: the reaction-freshness floor may be shorter than
   # the reply deadline, and HEAD_PUSHED_AT falls back to the author-controlled
