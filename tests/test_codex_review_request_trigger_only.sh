@@ -189,13 +189,19 @@ case "$endpoint" in
     case "${CODEX_TEST_SUITE_BRANCH:-known}" in
       unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":null},{"id":200,"head_branch":"other"}]}\n' ;;
       unrelated-unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":null}]}\n' ;;
-      *) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
+      *) jq -cn --arg t "${CODEX_TEST_SUITE_CREATED:-}" '{total_count:2,check_suites:[
+           {id:100,head_branch:"feature",created_at:(if $t == "" then null else $t end)},
+           {id:200,head_branch:"other",created_at:"2020-01-01T00:00:00Z"}]}' ;;
     esac ;;
   repos/owner/repo/commits/*/check-runs)
     # The codex.request_requires_check OVERRIDE path (exact check-run name).
     # Runs carry check_suite.id 100 (the PR branch) unless the shape says not.
     case "${CODEX_TEST_CHECK_RUNS:-completed}" in
       unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
+      dated) jq -cn --arg c "${CODEX_TEST_RUN_CREATED:-}" --arg t "${CODEX_TEST_RUN_STARTED:-}" '
+               {total_count:1,check_runs:[{id:1,name:"lint-fast",status:(if $t == "" then "queued" else "completed" end),check_suite:{id:100},
+                 created_at:(if $c == "" then null else $c end),
+                 started_at:(if $t == "" then null else $t end)}]}' ;;
       missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
       othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed","check_suite":{"id":100}}]}\n' ;;
       # The deep `lint` job alone must not satisfy an exact `lint-fast`.
@@ -1678,6 +1684,41 @@ test_guard_runs_after_the_cap_branch() {
 }
 
 
+# #2274: queued checks need creation metadata; a missing dispatch timestamp
+# makes age unavailable rather than laundering an old committer date.
+test_guard_dates_queued_checks() {
+  refresh_head_dates
+  local variant dir rc created started suite expected before=$FAIL
+  for variant in run-created suite-created started unavailable settled invalid-run; do
+    dir=$(make_case "queued-dating-$variant")
+    printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+    created=""; started=""; suite=""; expected=8
+    case "$variant" in
+      run-created) created=$YOUNG_HEAD; suite=$OLD_HEAD ;;
+      suite-created) suite=$YOUNG_HEAD ;;
+      started) started=$YOUNG_HEAD; suite=$OLD_HEAD ;;
+      unavailable) expected=0 ;;
+      settled) created=$OLD_HEAD; suite=$OLD_HEAD; expected=0 ;;
+      invalid-run) created=unreadable; suite=$YOUNG_HEAD ;;
+    esac
+    rc=$(CODEX_TEST_RUN_CREATED="$created" CODEX_TEST_RUN_STARTED="$started" \
+      CODEX_TEST_SUITE_CREATED="$suite" CODEX_TEST_CHECK_RUNS=dated \
+      run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+    [ "$rc" = "$expected" ] || fail "#2274: $variant expected exit $expected, got $rc ($(cat "$dir/err.log"))"
+    if [ "$expected" = 8 ]; then
+      [ "$(trig_count "$dir")" = 0 ] \
+        && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+        && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+        || fail "#2274: $variant must refuse from fresh dispatch metadata before POST"
+    else
+      [ "$(trig_count "$dir")" = 1 ] || fail "#2274: $variant must retain a settled/unavailable write"
+      [ "$variant" != unavailable ] || grep -q 'head-age signal unavailable, not enforced' "$dir/err.log" \
+        || fail "#2274: missing dispatch timestamps must report unavailable age"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2274: queued check creation and suite times date pickup; absent metadata makes age unavailable"
+}
+
 # #2200: fork check suites may not identify their branch. Unknown attribution
 # is an unavailable advisory signal, never proof that a check is missing.
 test_guard_unknown_suite_branch() {
@@ -1758,6 +1799,7 @@ test_write_boundary_authorization() {
   [ "$FAIL" -ne "$before" ] || pass "write-boundary authorization enforces budget and head without a POST"
 }
 
+test_guard_dates_queued_checks
 test_guard_unknown_suite_branch
 test_write_boundary_authorization
 

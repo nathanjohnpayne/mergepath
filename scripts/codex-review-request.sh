@@ -2344,6 +2344,8 @@ refuse_moving_head_unless_allowed() {
         suites=$(printf '%s' "$suites" | jq -c -s --arg b "$HEAD_REF" '
           if length > 0 and all(.[]; type == "object" and ((.check_suites | type) == "array"))
           then {known: [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ],
+                created: [ .[].check_suites[] | select((.head_branch // "") == $b)
+                           | {id, created_at} ],
                 unknown: [ .[].check_suites[]
                            | select((.head_branch | type) != "string" or .head_branch == "") | .id ]}
           else "unreadable" end' 2>/dev/null) || suites='"unreadable"'
@@ -2375,9 +2377,18 @@ refuse_moving_head_unless_allowed() {
       # Latest run, as in the workflow path: an earlier run of the same SHA
       # must not date the current push.
       if [ "$status" != unreadable ] && [ "$status" != missing ] && [ "$status" != branch-unavailable ]; then
-        dispatched_at=$(printf '%s' "$runs" | jq -r '
-          [.[] | (.started_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
+        dispatched_at=$(printf '%s' "$runs" | jq -r --argjson suites "$suites" '
+          def timestamp: select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"));
+          [.[] | .check_suite.id as $id
+           | [.created_at, .started_at,
+              ($suites.created[]? | select(.id == $id) | .created_at)]
+           | map(timestamp) | first // empty] | max // ""' 2>/dev/null) || dispatched_at=""
+        if [ -z "$dispatched_at" ]; then
+          # Queued checks have no start time. Without any dispatch timestamp,
+          # an old commit date cannot establish when this push was picked up.
+          anchor=""
+          anchor_source="unavailable check dispatch timestamp"
+        fi
       fi
       ;;
     *) status="" ;;
