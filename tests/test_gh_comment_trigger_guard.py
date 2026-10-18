@@ -113,6 +113,26 @@ class TriggerGuardTests(unittest.TestCase):
         _, meta = self.check(["api", "graphql", "--input", str(self.root / "missing.json")], role="hook", state=False)
         self.assertTrue(meta["deferred"])
 
+    def test_graphql_bom_between_comment_call_tokens_is_ignored(self):
+        query = 'mutation { addComment\ufeff(input: {subjectId:"P", body:"@codex review"}) { clientMutationId } }'
+        for role in ("author", "reviewer"):
+            with self.subTest(role=role), self.assertRaises(guard.Refused):
+                self.check(["api", "graphql", "-f", "query=" + query], role=role)
+
+    def test_graphql_block_string_backslash_cannot_hide_comment_call(self):
+        query = ('mutation M($a: String = """\\\\""" """) { addComment(input: {subjectId:"P", '
+                 'clientMutationId:$a, body:"@codex review"}) { clientMutationId } } # """')
+        for role in ("author", "reviewer"):
+            with self.subTest(role=role), self.assertRaises(guard.Refused):
+                self.check(["api", "graphql", "-f", "query=" + query], role=role)
+
+    def test_graphql_escaped_block_string_and_bom_read_data_remain_supported(self):
+        query = 'query { node(id:"""literal \\""" addComment( @codex review \ufeff """) { id } }'
+        args = ["api", "graphql", "-f", "query=" + query]
+        normalized, meta = self.check(args)
+        self.assertEqual(["gh", *args], normalized)
+        self.assertFalse(meta["guarded"])
+
     def test_graphql_unsupported_literal_is_refused_without_unbounded_backtracking(self):
         query = 'mutation { addComment(input: {body: """' + "\\" * 1000
         with self.assertRaises(guard.Refused):
