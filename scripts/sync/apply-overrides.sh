@@ -211,8 +211,8 @@ override_requires_load() {
     done
   done <<< "$OVERRIDE_REQUIRES_ENTRIES"
   if [ -n "$overrides" ] && [ -e "$overrides" ]; then
-    yq -e '(tag == "!!null") or ((tag == "!!map") and
-      ((.skip_paths | tag) == "!!null" or (.skip_paths | tag) == "!!seq"))' "$overrides" >/dev/null 2>&1 || return 2
+    yq -e '[select(tag != "!!null") | select(tag != "!!map")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
+    yq -e '[.skip_paths | select(tag != "!!null") | select(tag != "!!seq")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | select(tag != "!!map")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | (.path, .reason) | select(tag != "!!str")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | .path | select(test("^[^\x00\t\r\n]+$") == false)] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
