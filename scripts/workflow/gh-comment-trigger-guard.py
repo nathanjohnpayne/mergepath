@@ -18,7 +18,7 @@ GRAPHQL_COMMENTS = frozenset({
     "updatePullRequestReview", "updatePullRequestReviewComment",
 })
 GRAPHQL_TOKENS = re.compile(
-    r'"""(?:\\[\s\S]|(?!""")[^\\])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*|[_A-Za-z][_0-9A-Za-z]*|[^\s,]'
+    r'"""(?:\\"""|(?!"""|\\""")[\s\S])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*|[_A-Za-z][_0-9A-Za-z]*|[^\s,]'
 )
 
 
@@ -32,7 +32,7 @@ def graphql_comment_document(query):
     unsupported_literal = False
     for match in GRAPHQL_TOKENS.finditer(query):
         token = match.group()
-        if token.startswith("#"):
+        if token.startswith("#") or token == "\ufeff":
             continue
         if token.startswith('"""'):
             literals.append(token[3:-3].replace('\\"""', '"""'))
