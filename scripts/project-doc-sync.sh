@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Generated source_ref metadata uses full Git commit IDs, with the existing
+# -dirty marker or unknown fallback when applicable.
 # scripts/project-doc-sync.sh
 #
 # Audit or materialize project documentation mirrors declared in
@@ -176,12 +178,12 @@ repo_ref() {
   local root=$1 path=${2:-}
   local ref
   if [ -n "$path" ]; then
-    ref=$(git -C "$root" log -n 1 --format=%h -- "$path" 2>/dev/null || true)
+    ref=$(git -C "$root" log -n 1 --format=%H -- "$path" 2>/dev/null || true)
   else
     ref=""
   fi
   if [ -z "$ref" ]; then
-    ref=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')
+    ref=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'unknown')
   fi
   if [ "$ref" != "unknown" ]; then
     local path_args=()
