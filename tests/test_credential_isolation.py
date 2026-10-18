@@ -24,6 +24,11 @@ class IsolationTests(unittest.TestCase):
         for name in isolation.AUTHORITY:
             self.assertIn(name, isolation.assess([{'name':name}], CLOSED, MAIN, 'main')[0])
 
+    def test_automation_private_key_shadows_are_authority_drift(self):
+        self.assertIn('REVIEW_AUTOMATION_PRIVATE_KEY', isolation.AUTHORITY)
+        self.assertTrue(isolation.assess([{'name': 'REVIEW_AUTOMATION_PRIVATE_KEY'}], CLOSED, MAIN, 'main'))
+        self.assertTrue(isolation.assess([], CLOSED, MAIN, 'main', [{'name': 'REVIEW_AUTOMATION_PRIVATE_KEY'}]))
+
     def test_merge_queue_tokens_are_authority_credentials(self):
         for name in ('MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN'):
             self.assertTrue(isolation.assess([{'name':name}], CLOSED, MAIN, 'main'))

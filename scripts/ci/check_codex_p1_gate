@@ -154,8 +154,7 @@ if archive.is_a?(Hash)
       archive_run&.include?(".changes.body.from") &&
       archive_run&.include?("EVENT_ACTION") &&
       archive_run&.include?("is_fork") &&
-      archive_run&.include?('requires_relay="$is_fork"') &&
-      archive_run&.match?(/if \[ "\$pr_actor" = 'dependabot\[bot\]' \]; then\n\s+requires_relay=true/) &&
+      archive_run&.match?(/(?:^|\n)\s*requires_relay=true(?:\n|$)/) &&
       archive_run&.include?("archive_records_file") &&
       archive_run&.include?('while IFS= read -r archive_record') &&
       archive_run&.include?("--rawfile archive_records") &&
@@ -186,9 +185,8 @@ end
 
 if gate.is_a?(Hash)
   require_shape.call(
-    gate["name"].to_s.include?("needs.archive-edited-feedback.outputs.requires_relay") &&
-      gate["name"].to_s.include?("Codex P1 read-only archive handoff") &&
-      gate["name"].to_s.include?("Codex P1 unresolved threads"),
+    gate["name"] == "Codex P1 read-only archive handoff" &&
+      [archive, gate].all? { |job| job["permissions"].is_a?(Hash) && job["permissions"].values.all? { |value| value == "read" } },
     "codex-p1-gate does not give the unprivileged read-only handoff a non-required check name"
   )
   needs = gate["needs"].is_a?(Array) ? gate["needs"] : [gate["needs"]]

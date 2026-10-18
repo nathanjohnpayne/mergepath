@@ -324,6 +324,7 @@ jobs:
     outputs:
       autoclear_prs: ${{ steps.publish.outputs.autoclear_prs }}
       evidence_escalations: ${{ steps.publish.outputs.evidence_escalations }}
+      native_recoveries: ${{ steps.publish.outputs.native_recoveries }}
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -876,6 +877,15 @@ jobs:
               # (a moved head was turned red above). The nomination step
               # after the loop decides whether auto-clear should run on it.
               MCG_GREEN_PRS="${MCG_GREEN_PRS:-} $pr"
+              # This is nomination, never native clearance. The recovery job
+              # binds this owned generation and rederives every live predicate.
+              if recovery_base=$(gh api "repos/$REPO/pulls/$pr" --jq .base.sha); then
+                NATIVE_RECOVERIES=$(jq -c --argjson pr "$pr" --arg head "$head" \
+                  --arg base "$recovery_base" --arg revision "$(git rev-parse HEAD)" \
+                  --argjson generation "$generation_id" \
+                  '. + [{pr:$pr,head:$head,base:$base,revision:$revision,generation:$generation}]' \
+                  <<<"${NATIVE_RECOVERIES:-[]}")
+              fi
             fi
           }
 
@@ -1044,6 +1054,7 @@ jobs:
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "autoclear_prs=$(echo $autoclear_prs)" >> "$GITHUB_OUTPUT"
           echo "evidence_escalations=$(echo $EVIDENCE_ESCALATIONS)" >> "$GITHUB_OUTPUT"
+          echo "native_recoveries=${NATIVE_RECOVERIES:-[]}" >> "$GITHUB_OUTPUT"
 
           if [ -n "$stopped" ]; then
             echo "::warning::Stopped at an installation API rate-limit failure (#2220). Not evaluated:$stopped. Each keeps its previous verdict on its own head; a pass after ${RATE_LIMIT_RESET_ISO:-the budget resets} evaluates them."
@@ -1055,6 +1066,31 @@ jobs:
             echo "::error::Publisher finished with one or more infra errors"
             exit 1
           fi
+
+  recover-native-clearance:
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.outputs.native_recoveries != '' && needs.publish.outputs.native_recoveries != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      checks: read
+      pull-requests: read
+      issues: read
+      security-events: read
+    steps:
+      - name: Checkout trusted recovery code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Rerun actual native gates after genuine clearance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NOMINATIONS: ${{ needs.publish.outputs.native_recoveries }}
+        run: python3 scripts/workflow/recover-native-clearance.py "$REPO" "$NOMINATIONS"
 
   # Phase 3 (#2239, #2205). Sends one `auto-clear-evaluate` repository_dispatch
   # per PR the publish pass nominated (see "Auto-clear nominations" in its

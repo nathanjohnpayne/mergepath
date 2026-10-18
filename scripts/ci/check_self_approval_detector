@@ -11,6 +11,8 @@ RENDERER="scripts/render-self-approval-bootstrap.cjs"
 TEST_SCRIPT="tests/test_self_approval_detector.sh"
 INDEPENDENCE_TEST="tests/test_approval_independence_check.sh"
 WORKFLOW=".github/workflows/agent-review.yml"
+EVENT_WORKFLOW=".github/workflows/agent-review-events.yml"
+BINDING_TEST="tests/test_trusted_pr_event.cjs"
 RULES="rules/repo_rules.md"
 COMMAND_CLASSIFIER="scripts/lib/gh-command-classifier.sh"
 
@@ -21,6 +23,9 @@ for file in \
   "$INDEPENDENCE_TEST" \
   "$COMMAND_CLASSIFIER" \
   "$WORKFLOW" \
+  "$EVENT_WORKFLOW" \
+  "$BINDING_TEST" \
+  scripts/workflow/trusted-pr-event.cjs \
   scripts/workflow/resolve_base_policy.sh \
   scripts/workflow/external_review_fingerprint.sh; do
   if [ ! -f "$file" ]; then
@@ -62,7 +67,7 @@ if ! grep -qF "'scripts/self-approval-detector.cjs'" "$WORKFLOW" ||
 fi
 
 for required_fragment in \
-  'github.event.repository.default_branch' \
+  'ref: ${{ github.workflow_sha }}' \
   'scripts/workflow/resolve_base_policy.sh' \
   'scripts/workflow/external_review_fingerprint.sh' \
   'github.paginate' \
@@ -78,7 +83,7 @@ for required_fragment in \
   'phase4IntrinsicRequired.toString(),' \
   "core.setOutput('classified_head', pr.head.sha);" \
   'JSON.stringify(governingIdentities.reviewers)' \
-  'needs: [load-config, triage]' \
+  'needs: [binding, load-config, triage]' \
   'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' \
   'REVIEWERS_JSON: ${{ needs.triage.outputs.reviewers }}' \
   'EVENT_REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}' \
@@ -214,7 +219,7 @@ if grep -qF 'approvals = [context.payload.review]' "$WORKFLOW" ||
 fi
 
 block_job=$(sed -n '/^  block-self-approval:/,/^    runs-on:/p' "$WORKFLOW")
-if ! grep -qF "github.event.pull_request.user.login != 'dependabot[bot]'" <<<"$block_job"; then
+if ! grep -qF "fromJSON(needs.binding.outputs.event).pull_request.user.login != 'dependabot[bot]'" <<<"$block_job"; then
   echo "check_self_approval_detector: Dependabot must bypass the agent-only guard because triage intentionally skips it" >&2
   exit 1
 fi
@@ -225,13 +230,13 @@ for rearm_action in synchronize reopened edited labeled unlabeled; do
   fi
 done
 has_only_force_on_labeled_predicate() {
-  local block="$1" compact labeled_count
+  local block="$1" event="${2:-github.event}" compact labeled_count
   compact=$(printf '%s\n' "$block" | awk '{$1=$1; printf "%s ", $0}')
-  labeled_count=$(printf '%s\n' "$block" | grep -cF "github.event.action == 'labeled'" || true)
+  labeled_count=$(printf '%s\n' "$block" | grep -cF "$event.action == 'labeled'" || true)
   [ "$labeled_count" -eq 1 ] &&
-    grep -qF "(github.event.action == 'labeled' && github.event.label.name == 'needs-external-review')" <<<"$compact"
+    grep -qF "($event.action == 'labeled' && $event.label.name == 'needs-external-review')" <<<"$compact"
 }
-if ! has_only_force_on_labeled_predicate "$block_job"; then
+if ! has_only_force_on_labeled_predicate "$block_job" 'fromJSON(needs.binding.outputs.event)'; then
   echo "check_self_approval_detector: only the needs-external-review force-on label may trigger approval invalidation" >&2
   exit 1
 fi
@@ -250,8 +255,8 @@ for required_fragment in \
   'GH_TOKEN: ${{ github.token }}' \
   'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' \
   '--json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid' \
-  'EVENT_HEAD: ${{ github.event.pull_request.head.sha }}' \
-  'EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
+  'EVENT_HEAD: ${{ fromJSON(needs.binding.outputs.event).pull_request.head.sha }}' \
+  'EVENT_BASE_SHA: ${{ fromJSON(needs.binding.outputs.event).pull_request.base.sha }}' \
   'Refusing to mutate or classify a durable arm from a candidate-controlled workflow.' \
   'auto_arm_allowed=false' \
   'auto_arm_allowed=true' \
@@ -297,11 +302,11 @@ for job_and_name in \
   "$triage_job|triage"; do
   job=${job_and_name%|*}
   name=${job_and_name##*|}
-  if ! grep -qF "github.event.action == 'edited'" <<<"$job"; then
+  if ! grep -qF "fromJSON(needs.binding.outputs.event).action == 'edited'" <<<"$job"; then
     echo "check_self_approval_detector: $name must reclassify PR edited events" >&2
     exit 1
   fi
-  if ! has_only_force_on_labeled_predicate "$job"; then
+  if ! has_only_force_on_labeled_predicate "$job" 'fromJSON(needs.binding.outputs.event)'; then
     echo "check_self_approval_detector: $name must classify the needs-external-review force-on label event" >&2
     exit 1
   fi
@@ -315,7 +320,7 @@ if ! grep -qF 'const mayMutateLabels = triageMayMutateLabels({' <<<"$triage_full
 fi
 
 assign_job=$(sed -n '/^  assign:/,/^    runs-on:/p' "$WORKFLOW")
-if grep -qF "github.event.action == 'labeled'" <<<"$assign_job"; then
+if grep -qF ".action == 'labeled'" <<<"$assign_job"; then
   echo "check_self_approval_detector: force-on label enforcement must not reactivate reviewer assignment on label edits" >&2
   exit 1
 fi
@@ -333,9 +338,8 @@ fi
 concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
 concurrency_group=$(sed -n '/^  group:/,/^  cancel-in-progress:/p' <<<"$concurrency_block")
 concurrency_cancel=$(sed -n '/^  cancel-in-progress:/,$p' <<<"$concurrency_block")
-if ! grep -qF 'agent-review-${{ github.event.pull_request.number }}-${{' <<<"$concurrency_group" ||
+if ! grep -qF 'agent-review-${{ github.event.pull_request.number || github.event.workflow_run.id }}-${{' <<<"$concurrency_group" ||
   ! grep -qF "'approval-enforcement'" <<<"$concurrency_group" ||
-  ! grep -qF "format('approval-{0}', github.event.review.id)" <<<"$concurrency_group" ||
   ! grep -qF 'github.run_id' <<<"$concurrency_group" ||
   grep -qF "github.event.action != 'labeled'" <<<"$concurrency_block" ||
   grep -qF "github.event.action == 'opened'" <<<"$concurrency_block" ||
@@ -363,13 +367,17 @@ for enforcement_fragment in \
     exit 1
   fi
 done
-if ! grep -qF "github.event.review.state == 'approved'" <<<"$concurrency_group"; then
-  echo "check_self_approval_detector: approved events must use their durable review-ID concurrency group" >&2
+# Review events arrive through the native signal's immutable run, not through
+# a direct privileged review trigger. workflow_run.id plus run_id isolates
+# each delivery; cancellation remains restricted to mutable PR-target events.
+if ! grep -qF "github.event_name == 'pull_request_target'" <<<"$concurrency_cancel" ||
+  grep -qF "github.event_name == 'workflow_run'" <<<"$concurrency_cancel"; then
+  echo "check_self_approval_detector: trusted review deliveries must not be cancelled as mutable PR events" >&2
   exit 1
 fi
 
-if grep -qF "github.event.action == 'edited'" <<<"$auto_merge_job" ||
-  grep -qF "github.event.action == 'labeled'" <<<"$auto_merge_job"; then
+if grep -qF ".action == 'edited'" <<<"$auto_merge_job" ||
+  grep -qF ".action == 'labeled'" <<<"$auto_merge_job"; then
   echo "check_self_approval_detector: edited and force-on labeled events must invalidate approvals without arming auto-merge" >&2
   exit 1
 fi
@@ -379,7 +387,48 @@ if ! grep -qF '#1094' "$WORKFLOW"; then
   exit 1
 fi
 
+# #1547: check the actual native/trusted roles, not a retired checkout spelling.
+# Safe YAML data only; no candidate expression or workflow script is executed.
+ruby -ryaml - "$WORKFLOW" "$EVENT_WORKFLOW" <<'RUBY'
+def require_contract(value, message)
+  raise message unless value
+end
+worker, native = ARGV.map { |file| YAML.safe_load(File.read(file), aliases: false) }
+worker_on = worker['on'] || worker[true]
+native_on = native['on'] || native[true]
+require_contract(native_on.keys == ['pull_request_review'] && native_on['pull_request_review']['types'] == ['submitted'], 'native review producer must preserve every submitted review delivery')
+require_contract(!native.key?('concurrency'), 'native review delivery must not cancel or replace earlier review events')
+require_contract(native['permissions'].values.all? { |permission| permission == 'read' }, 'native review producer must remain read-only')
+require_contract(native.fetch('jobs').values.all? { |job| job.fetch('permissions', native['permissions']).values.all? { |permission| permission == 'read' } }, 'native review jobs must not override read-only permissions')
+require_contract(!File.read(ARGV[1]).match?(/secrets\.(?!GITHUB_TOKEN\b)/), 'native review producer must carry no authority secrets')
+require_contract(native['run-name'].include?('review=${{ github.event.review.id }}') && native['run-name'].include?('head=${{ github.event.pull_request.head.sha }}') && native['run-name'].include?('base=${{ github.event.pull_request.base.sha }}'), 'review run must retain immutable review/head/base identity')
+require_contract(worker_on.keys.sort == ['pull_request_target', 'workflow_run'], 'privileged review worker must use trusted triggers only')
+require_contract(worker_on['workflow_run']['workflows'] == [native['name']] && worker_on['workflow_run']['types'] == ['completed'], 'trusted worker must consume the named completed native review producer')
+jobs = worker.fetch('jobs')
+binder = jobs.fetch('binding')
+require_contract(binder['steps'].any? { |step| step.dig('with', 'script').to_s.include?("require('./scripts/workflow/trusted-pr-event.cjs')") && step.dig('with', 'script').include?('await bind({github, context, core})') }, 'binding job must invoke the existing immutable-event verifier')
+%w[binding load-config triage assign detect-disagreement block-self-approval auto-merge-on-approval].each do |id|
+  job = jobs.fetch(id)
+  checkouts = job['steps'].select { |step| step['uses'].to_s.start_with?('actions/checkout@') }
+  require_contract(checkouts.length == 1 && checkouts.first.dig('with', 'ref') == '${{ github.workflow_sha }}' && checkouts.first.dig('with', 'persist-credentials') == false, "#{id} must check out trusted workflow source without persisted credentials")
+  next if id == 'binding'
+  require_contract(Array(job['needs']).include?('binding') && job['if'].include?("needs.binding.result == 'success'"), "#{id} must depend on successful immutable binding")
+  require_contract(job.dig('env', 'TRUSTED_EVENT_JSON') == '${{ needs.binding.outputs.event }}' && job.dig('env', 'TRUSTED_EVENT_NAME') == '${{ needs.binding.outputs.event_name }}', "#{id} must consume the bound event transport")
+end
+%w[triage assign detect-disagreement block-self-approval].each do |id|
+  job = jobs.fetch(id)
+  require_contract(job['environment'] == 'review-automation', "#{id} authority must remain in review-automation")
+  steps = job['steps']
+  acquisition = steps.index { |step| step['uses'].to_s.start_with?('actions/create-github-app-token@') }
+  require_contract(acquisition && steps[0...acquisition].any? { |step| step.dig('with', 'script').to_s.include?('await bind({github, context, core})') }, "#{id} must revalidate binding before App authority")
+  classified = steps.select { |step| step.dig('with', 'script').to_s.include?('context.payload = JSON.parse(process.env.TRUSTED_EVENT_JSON);') }
+  require_contract(!classified.empty? && classified.all? { |step| step.dig('with', 'script').include?('context.eventName = process.env.TRUSTED_EVENT_NAME;') }, "#{id} must classify the verified historical event")
+end
+puts 'check_self_approval_detector: native/trusted event binding and checkout roles PASS'
+RUBY
+
 bash "$TEST_SCRIPT"
+node "$BINDING_TEST"
 bash "$INDEPENDENCE_TEST"
 
 echo "check_self_approval_detector: PASS"

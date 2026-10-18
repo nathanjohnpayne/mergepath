@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   audit:
+    environment: reviewer-maintenance
     name: Audit Merged PRs
     # Reject manual dispatch from a non-default ref (#550 Codex P1): on
     # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen

@@ -1,0 +1,13 @@
+name: Agent Review Events
+run-name: >-
+  review-v1 pr=${{ github.event.pull_request.number }} review=${{ github.event.review.id }} head=${{ github.event.pull_request.head.sha }} base=${{ github.event.pull_request.base.sha }}
+on:
+  pull_request_review:
+    types: [submitted]
+permissions:
+  contents: read
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'The trusted Agent Review Pipeline validates this run and reads the review through GitHub APIs.'

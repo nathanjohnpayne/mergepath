@@ -16,6 +16,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
 AGENT_WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
+TRUSTED_WORKFLOW="$ROOT/.github/workflows/trusted-pr-policy.yml"
 
 for tool in yq node; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -61,6 +62,8 @@ Object.defineProperty(pull_request, 'labels', {
 const context = { repo: { owner: 'o', repo: 'r' }, payload: { pull_request } };
 const core = { setFailed: msg => failures.push(msg) };
 process.env.CLASSIFIER_RESULT = scenario.classifierResult ?? 'success';
+process.env.CLASSIFIER_NEEDS_REVIEW = scenario.needsReview ?? 'false';
+process.env.CLASSIFIER_CLASSIFICATION = scenario.classification ?? 'under-threshold';
 
 let crashed = null;
 try {
@@ -99,7 +102,7 @@ fi
 # needs-external-review lifecycle gets a fresh classification. Only the label
 # APPLY step suppresses re-adding a PAT-cleared label (#969).
 CLASSIFIER_BODY=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$WORKFLOW")
-APPLY_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Apply label and comment") | .if' "$WORKFLOW")
+APPLY_IF=$(yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Apply label and comment") | .if' "$TRUSTED_WORKFLOW")
 if [[ "$CLASSIFIER_BODY" != *'label_lifecycle_event=true'* ]] \
    && [[ "$APPLY_IF" == *"github.event.action == 'unlabeled'"* ]] \
    && [[ "$APPLY_IF" == *"github.event.label.name == 'needs-external-review'"* ]]; then
@@ -156,6 +159,16 @@ check() {
 check "a removed blocking label no longer fails the gate (re-run can retire a stale failure)" \
   '{"livePages":[[]]}' \
   '.crashed == null and .failures == []'
+
+check "an absent label cannot clear a review-required classifier before trusted mutation arrives" \
+  '{"livePages":[[]],"needsReview":"true","classification":"external-required"}' \
+  '.crashed == null and (.failures | length) == 1'
+check "a stale classifier fails closed even after label removal" \
+  '{"livePages":[[]],"classification":"stale-event"}' \
+  '.crashed == null and (.failures | length) == 1'
+check "a late trusted label still blocks an otherwise cleared classifier" \
+  '{"livePages":[["needs-external-review"]],"classification":"external-cleared"}' \
+  '.crashed == null and (.failures | length) == 1'
 
 # 2. A blocking label present NOW fails, named in the message.
 check "a live blocking label fails the gate" \
@@ -303,24 +316,24 @@ agent_lane_check "agent triage skips propagation exemption when the governing po
 # #1321: execute the real reconciliation step with a fake public API. The stub
 # accepts only paginated timeline/comment reads, so the positive case also
 # proves that ownership is decided over the complete surfaces.
-yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .run' \
-  "$WORKFLOW" >"$WORK/reconcile.sh"
+yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .run' \
+  "$TRUSTED_WORKFLOW" >"$WORK/reconcile.sh"
 if [ ! -s "$WORK/reconcile.sh" ]; then
   fail "could not extract the fail-closed label reconciliation step"
 else
   pass "fail-closed label reconciliation step is present"
 fi
 
-yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Apply label and comment") | .run' \
-  "$WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/apply.sh"
+yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Apply label and comment") | .run' \
+  "$TRUSTED_WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/apply.sh"
 if [ ! -s "$WORK/apply.sh" ]; then
   fail "could not extract the label application step"
 else
   pass "label application step is present"
 fi
 
-yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Propagation PR review lane") | .run' \
-  "$WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/propagation.sh"
+yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Propagation PR review lane") | .run' \
+  "$TRUSTED_WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/propagation.sh"
 if [ ! -s "$WORK/propagation.sh" ]; then
   fail "could not extract the propagation review lane"
 else
@@ -338,7 +351,8 @@ case "$*" in
     printf '[{"filename":"src/example.sh","status":"modified","additions":400,"deletions":0}]\n' ;;
   "pr view 42 --repo o/r --json labels --jq .labels[].name")
     cat "$GH_STUB_DIR/labels.txt" ;;
-  "pr view 42 --repo o/r --json comments --jq .comments[].body")
+  "pr view 42 --repo o/r --json comments --jq .comments[].body"|\
+  "api --paginate repos/o/r/issues/42/comments --jq .[].body")
     cat "$GH_STUB_DIR/pr-comments.txt" ;;
   "api repos/o/r/pulls/42 --jq {head:.head.sha,base:.base.sha}")
     [ ! -f "$GH_STUB_DIR/fail-live-head" ] || exit 1
@@ -638,6 +652,8 @@ fi
 # needs: the suite can therefore run from a depth-1 Actions checkout too.
 CLASSIFIER_REPO="$WORK/classifier-repo"
 mkdir -p "$CLASSIFIER_REPO/.github" "$CLASSIFIER_REPO/scripts/workflow" "$CLASSIFIER_REPO/src"
+# Match the classifier's $PWD spelling when TMPDIR has a trailing separator.
+CLASSIFIER_REPO="$(cd "$CLASSIFIER_REPO" && pwd)"
 git -C "$CLASSIFIER_REPO" init --quiet -b main
 git -C "$CLASSIFIER_REPO" config user.name "NathanPayne"
 git -C "$CLASSIFIER_REPO" config user.email "github@nathanpayne.com"
@@ -658,9 +674,53 @@ printf '%s\n' 'head' >"$CLASSIFIER_REPO/src/example.sh"
 git -C "$CLASSIFIER_REPO" add src/example.sh
 git -C "$CLASSIFIER_REPO" commit --quiet -m 'fixture head'
 EVENT_HEAD=$(git -C "$CLASSIFIER_REPO" rev-parse HEAD)
+# The production classifier fetches candidate objects as inert data.
+git -C "$CLASSIFIER_REPO" remote add origin "$CLASSIFIER_REPO"
+git -C "$CLASSIFIER_REPO" update-ref refs/pull/42/head "$EVENT_HEAD"
 
 yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
   "$WORKFLOW" >"$WORK/classifier.sh"
+
+REAL_GIT=$(command -v git)
+cat >"$WORK/bin/git" <<'GIT_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+original=("$@")
+flags=""
+while [ "${1-}" = -c ]; do flags="$flags $2"; shift 2; done
+case "$*" in
+  'config --local --get remote.origin.url')
+    [ "${FIXTURE_REMOTE_URL-}" != missing ] || exit 1
+    printf '%s\n' "${FIXTURE_REMOTE_URL:?}" ;;
+  'config --local --get-regexp '*)
+    [ "${FIXTURE_REWRITE:-0}" = 1 ] && { printf 'url.https://evil.invalid/.insteadof https://github.com/\n'; exit 0; }
+    exit 1 ;;
+  'fetch --no-tags '*)
+    [ "$3" = 'https://github.com/o/r.git' ] || exit 91
+    [ "${GIT_TERMINAL_PROMPT-}" = 0 ] && [ "${GIT_CONFIG_GLOBAL-}" = /dev/null ] && [ "${GIT_CONFIG_NOSYSTEM-}" = 1 ] || exit 92
+    for flag in core.hooksPath=/dev/null core.fsmonitor=false credential.helper= credential.useHttpPath=true http.followRedirects=false protocol.allow=never protocol.https.allow=always; do
+      [[ "$flags" == *" $flag"* ]] || exit 93
+    done
+    [ -x "${GIT_ASKPASS:-}" ] && [ "$HOME/askpass" = "$GIT_ASKPASS" ] || exit 94
+    printf '%s\n' "$GIT_ASKPASS" >>"$GH_STUB_DIR/askpass-paths"
+    [ "$("$GIT_ASKPASS" "Username for 'https://github.com/o/r.git': ")" = x-access-token ] || exit 95
+    [ "$("$GIT_ASKPASS" "Password for 'https://x-access-token@github.com/o/r.git': ")" = fake-classifier-read ] || exit 96
+    if "$GIT_ASKPASS" "Password for 'https://evil.invalid/o/r.git': " >/dev/null; then exit 97; fi
+    ! grep -Fq fake-classifier-read "$GIT_ASKPASS" || exit 98
+    [[ "$*" != *fake-classifier-read* ]] || exit 99
+    # Exercise Git's real credential prompt protocol without HTTP/network.
+    # The clean fake HOME and reset helper list prevent ambient credentials.
+    filled=$(printf 'protocol=https\nhost=github.com\npath=o/r.git\n\n' | "$REAL_GIT" -c credential.helper= -c credential.useHttpPath=true credential fill)
+    [[ "$filled" == *'username=x-access-token'* && "$filled" == *'password=fake-classifier-read'* ]] || exit 101
+    printf 'verified-private-fetch\n' >>"$GH_STUB_DIR/fetches"
+    [ "${FIXTURE_FETCH_FAIL:-0}" != 1 ] || exit 100
+    # No network: after checking the real production fetch/askpass contract,
+    # map the verified URL to this suite's inert local Git-object fixture.
+    exec "$REAL_GIT" -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags "$CLASSIFIER_REPO" "$4" ;;
+  *) exec "$REAL_GIT" "${original[@]}" ;;
+esac
+GIT_STUB
+chmod +x "$WORK/bin/git"
 
 run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [clearance-rc]
   local dir=$1 fingerprint_rc=$2 carry_rc=$3 carry_json=$4 clearance_rc=${5:-1} rc=0
@@ -671,7 +731,10 @@ run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [cle
   fi
   (
     cd "$CLASSIFIER_REPO"
-    env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
+    env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" REAL_GIT="$REAL_GIT" CLASSIFIER_REPO="$CLASSIFIER_REPO" GH_STUB_DIR="$dir" \
+      GH_TOKEN="${CLASSIFIER_TOKEN_OVERRIDE-fake-classifier-read}" \
+      FIXTURE_REMOTE_URL="${FETCH_ORIGIN_OVERRIDE-https://github.com/o/r}" \
+      FIXTURE_REWRITE="${FETCH_REWRITE_OVERRIDE:-0}" FIXTURE_FETCH_FAIL="${FETCH_FAIL_OVERRIDE:-0}" \
       GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 EVENT_ACTION="${EVENT_ACTION_OVERRIDE:-labeled}" \
       BASE_SHA="$EVENT_BASE" HEAD_SHA="$EVENT_HEAD" \
       HEAD_REF=codex/test-carry-forward PR_AUTHOR="${PR_AUTHOR_OVERRIDE:-fixture-author}" \
@@ -817,19 +880,89 @@ else
   fail "malformed live pair did not fail closed (rc=$rc output=$(cat "$C11/output" 2>/dev/null))"
 fi
 
-C12="$WORK/classifier-non-label-event"
-EVENT_ACTION_OVERRIDE=synchronize
+C12="$WORK/classifier-old-opened-rerun"
+EVENT_ACTION_OVERRIDE=opened
 export EVENT_ACTION_OVERRIDE
 rc=$(run_classifier "$C12" 0 0 '{"carried":false}' 0)
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C12/output" needs_review)" = false ] \
+   && [ "$(last_output "$C12/output" classification)" = external-cleared ] \
+   && grep -q '^require_head=1$' "$C12/clearance-call"; then
+  pass "an old opened native run recovers only through canonical exact-head clearance"
+else
+  fail "old opened run did not revalidate exact-head clearance (rc=$rc output=$(cat "$C12/output" 2>/dev/null))"
+fi
+C13="$WORK/classifier-old-opened-without-review"
+rc=$(run_classifier "$C13" 0 0 '{"carried":false}' 1)
 unset EVENT_ACTION_OVERRIDE
 if [ "$rc" -eq 0 ] \
-   && [ "$(last_output "$C12/output" needs_review)" = true ] \
-   && [ "$(last_output "$C12/output" classification)" = external-required ] \
-   && [ ! -f "$C12/clearance-call" ]; then
-  pass "non-label deliveries keep their existing classification path and skip the full clearance scan"
+   && [ "$(last_output "$C13/output" needs_review)" = true ] \
+   && [ "$(last_output "$C13/output" classification)" = external-required ] \
+   && [ -f "$C13/clearance-call" ]; then
+  pass "an old opened run without exact-head clearance retains review even before its label arrives"
 else
-  fail "canonical clearance scan broadened beyond label events (rc=$rc output=$(cat "$C12/output" 2>/dev/null))"
+  fail "old opened run cleared without exact-head review (rc=$rc output=$(cat "$C13/output" 2>/dev/null))"
 fi
+
+C14="$WORK/classifier-missing-clearance-helper"
+chmod -x "$CLASSIFIER_REPO/scripts/codex-review-check.sh"
+rc=$(run_classifier "$C14" 0 0 '{"carried":false}' 0)
+chmod +x "$CLASSIFIER_REPO/scripts/codex-review-check.sh"
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C14/output" needs_review)" = true ] \
+   && [ "$(last_output "$C14/output" classification)" = fail-closed ] \
+   && [ ! -f "$C14/clearance-call" ]; then
+  pass "a missing trusted clearance helper cannot recover an old native failure"
+else
+  fail "missing trusted clearance helper did not fail closed (rc=$rc)"
+fi
+
+# Real classifier + fake private Git origin: no credentials or network.
+for fetch_case in positive missing-token wrong-token wrong-origin missing-origin rewrite failure; do
+  CF="$WORK/private-fetch-$fetch_case"
+  CLASSIFIER_TOKEN_OVERRIDE=fake-classifier-read
+  FETCH_ORIGIN_OVERRIDE=https://github.com/o/r
+  FETCH_REWRITE_OVERRIDE=0 FETCH_FAIL_OVERRIDE=0
+  case "$fetch_case" in
+    missing-token) CLASSIFIER_TOKEN_OVERRIDE= ;;
+    wrong-token) CLASSIFIER_TOKEN_OVERRIDE=wrong-fixture-read ;;
+    wrong-origin) FETCH_ORIGIN_OVERRIDE=https://evil.invalid/o/r ;;
+    missing-origin) FETCH_ORIGIN_OVERRIDE=missing ;;
+    rewrite) FETCH_REWRITE_OVERRIDE=1 ;;
+    failure) FETCH_FAIL_OVERRIDE=1 ;;
+  esac
+  export CLASSIFIER_TOKEN_OVERRIDE FETCH_ORIGIN_OVERRIDE FETCH_REWRITE_OVERRIDE FETCH_FAIL_OVERRIDE
+  rc=$(run_classifier "$CF" 0 0 '{"carried":false}' 0)
+  unset CLASSIFIER_TOKEN_OVERRIDE FETCH_ORIGIN_OVERRIDE FETCH_REWRITE_OVERRIDE FETCH_FAIL_OVERRIDE
+  if [ "$fetch_case" = positive ]; then
+    if [ "$rc" -eq 0 ] && [ "$(wc -l <"$CF/fetches" | tr -d ' ')" -eq 2 ] \
+       && [ "$(last_output "$CF/output" classification)" = external-cleared ]; then
+      pass "private-origin reads use verified temporary askpass without token argv or stored values"
+    else fail "private-origin positive failed (rc=$rc err=$(cat "$CF/err"))"; fi
+  elif [ "$rc" -ne 0 ] && ! grep -Fq 'classification=external-cleared' "$CF/output" 2>/dev/null; then
+    pass "private-origin $fetch_case refuses clearance"
+  else fail "private-origin $fetch_case did not fail closed (rc=$rc)"; fi
+  cleanup_ok=1
+  while IFS= read -r askpass_path; do
+    [ ! -e "$askpass_path" ] && [ ! -e "$(dirname "$askpass_path")" ] || cleanup_ok=0
+  done < <(cat "$CF/askpass-paths" 2>/dev/null || true)
+  if [ "$cleanup_ok" -eq 1 ] \
+     && ! grep -Fq fake-classifier-read "$CLASSIFIER_REPO/.git/config" \
+     && ! grep -Fq fake-classifier-read "$CF/out" \
+     && ! grep -Fq fake-classifier-read "$CF/err"; then
+    pass "private-origin $fetch_case cleans its fetch-only helper and emits no token"
+  else fail "private-origin $fetch_case leaked or retained its fetch credential helper"; fi
+done
+
+# The shared reader is used under two actual caller maps, not a claimed
+# entirely read-only token in the trusted policy writer job.
+if [ "$(yq -r '.permissions.contents' "$WORKFLOW")" = read ] \
+   && [ "$(yq -r '.permissions.pull-requests' "$WORKFLOW")" = read ] \
+   && [ "$(yq -r '.permissions.contents' "$TRUSTED_WORKFLOW")" = read ] \
+   && [ "$(yq -r '.permissions.pull-requests' "$TRUSTED_WORKFLOW")" = write ] \
+   && yq -r '.jobs."classify-and-mutate".steps[] | select(.id == "check") | .run' "$TRUSTED_WORKFLOW" | grep -Fq 'scripts/workflow/run-pr-policy-classifier.py'; then
+  pass "native caller is entirely read-only; trusted workflow retains existing PR-write ownership and shares only Contents-read fetches"
+else fail "classifier caller capability maps or shared trusted entrypoint drifted"; fi
 
 C3="$WORK/classifier-fingerprint-failed"
 rc=$(run_classifier "$C3" 8 0 '{}')
@@ -865,9 +998,8 @@ fi
 pin_call=$(cat "$D1/pin-call" 2>/dev/null || true)
 if [[ "$pin_call" == *"--head $EVENT_HEAD --base $EVENT_BASE --config "*"/.github/review-policy.yml --files-json "* ]] \
    && [[ "$pin_call" != *"--config $CLASSIFIER_REPO/.github/review-policy.yml"* ]] \
-   && [[ "$pin_call" != "$CLASSIFIER_REPO/scripts/workflow/dependabot_pin_bump_exemption.sh "* ]] \
-   && [[ "$pin_call" == *"/scripts/workflow/dependabot_pin_bump_exemption.sh --repo o/r --pr 42 "* ]]; then
-  pass "the lane helper runs from the trusted base worktree, pinned to the event pair, with the base config and the fetched files payload"
+   && [[ "$pin_call" == "$CLASSIFIER_REPO/scripts/workflow/dependabot_pin_bump_exemption.sh --repo o/r --pr 42 "* ]]; then
+  pass "the lane helper runs from the trusted default checkout, pinned to the event pair, with the base config and the fetched files payload"
 else
   fail "lane helper invocation is wrong: $pin_call"
 fi
@@ -925,7 +1057,7 @@ else
   fail "non-Dependabot author reached the lane (rc=$rc output=$(cat "$D5/output" 2>/dev/null) err=$(cat "$D5/err"))"
 fi
 
-RECONCILE_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .if' "$WORKFLOW")
+RECONCILE_IF=$(yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .if' "$TRUSTED_WORKFLOW")
 if [[ "$RECONCILE_IF" == *"under-threshold"* ]] && [[ "$RECONCILE_IF" == *"carried-forward"* ]]; then
   pass "reconciliation accepts ordinary and carried-forward no-review classifications"
 else

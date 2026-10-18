@@ -1,74 +1,49 @@
 name: Dependabot Auto-merge
-# Approves and squash-merges Dependabot patch/minor updates when CI passes.
-# Major version bumps are left for manual review.
-#
-# Uses pull_request_target so the workflow has write permissions even when
-# Dependabot's restricted GITHUB_TOKEN is in effect.
-
+# Existing approval and merge duties use separate protected environments.
+# Only inert PR/full-head/base metadata crosses; the author repeats all gates.
+# Owner provisioning: store AUTHOR_MERGE_TOKEN only under
+# Settings → Environments → merge-queue-policy → Environment secrets,
+# never as a repository or organization secret. The protected environment
+# retains exactly AUTHOR_MERGE_TOKEN, MERGE_QUEUE_POLICY_TOKEN and
+# MERGE_QUEUE_SOURCE_TOKEN, pairwise distinct; the reviewer credential belongs
+# separately in reviewer-maintenance. Protect/read back before source activation;
+# provision afterward under the owner-run sequence. This workflow grants no
+# authority to create settings or enable a queue.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
-  actions: read # review accounting authenticates relay workflow, job and log evidence
-  pull-requests: write
-  contents: write
-  # Required for the immediate-squash fallback's scripts/review-feedback-
-  # accounting.sh call, which reads code-scanning/alerts to grade a
-  # github-advanced-security[bot] finding's severity (#1101). Without it,
-  # this job's GITHUB_TOKEN 403s on that read once a PR carries a real
-  # CodeQL comment. This job runs accounting under GITHUB_TOKEN specifically
-  # (not the step's default REVIEWER_ASSIGNMENT_TOKEN, an external PAT this
-  # workflow can't grant scopes to — CodeRabbit on PR #1106), so
-  # security-events: read here is what actually reaches that call.
-  security-events: read
-  # Same reasoning: accounting's issues/{pr}/comments read (PR-level
-  # findings) needs issues read under GITHUB_TOKEN. REVIEWER_ASSIGNMENT_TOKEN
-  # (a full-scope PAT) never needed this declared, so it was absent until
-  # accounting started running under GITHUB_TOKEN for the code-scanning call.
+  contents: read
+  pull-requests: read
   issues: read
 
 jobs:
-  auto-merge:
+  approve:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
-    # AUTHOR_MERGE_TOKEN is an environment secret. The trusted
-    # pull_request_target definition runs on main and no candidate-controlled
-    # workflow can request this environment from a refs/pull/* merge ref.
-    environment: merge-queue-policy
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.ref == 'refs/heads/main'
+      && github.event.repository.default_branch == 'main'
+      && github.event.pull_request.base.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main'
+    environment: reviewer-maintenance
+    permissions:
+      contents: read
+      pull-requests: write # existing provenance-failure protective disable under GITHUB_TOKEN
+      issues: read
+    outputs:
+      repo: ${{ steps.approve.outputs.repo }}
+      pr: ${{ steps.approve.outputs.pr }}
+      head: ${{ steps.approve.outputs.head }}
+      base: ${{ steps.approve.outputs.base }}
+      base_ref: ${{ steps.approve.outputs.base_ref }}
     steps:
-      # Check out the BASE ref (the target branch's tip), NOT the PR
-      # HEAD. This workflow runs under pull_request_target which has
-      # write permissions and access to secrets — checking out PR-author-
-      # controlled code (HEAD) and reading config from it would be a
-      # privilege escalation surface. We only need the BASE's
-      # .github/review-policy.yml for the available_reviewers
-      # validation in the next step. github.event.pull_request.base.sha
-      # is the merge target's tip at the moment the PR opened.
-      # codex r2 on PR #179 caught the missing checkout.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout trusted main source, never the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          # Don't persist the checkout token — we use REVIEWER_ASSIGNMENT_TOKEN
-          # for the gh calls below, not the default GITHUB_TOKEN.
+          ref: ${{ github.sha }}
           persist-credentials: false
-
-      # The job-level `if:` trusts the PR OPENER, and fetch-metadata below
-      # classifies the update from the FIRST commit's message only. Neither
-      # says anything about commits added to the branch afterwards, and anyone
-      # with push access can add them while the PR stays "authored by
-      # dependabot[bot]". So before anything is approved or merged, require
-      # EVERY commit on the PR (current head included) to be Dependabot-
-      # authored, GitHub-committed and signature-verified — the shared
-      # predicate in scripts/lib/dependabot-commit-provenance.sh, which
-      # scripts/merge-clearance-gate.sh applies to its Dependabot arm too.
-      #
-      # trusted=false (a positive "not Dependabot-only" verdict) skips the
-      # approve/merge step and exits 0: the PR is then an ordinary PR that
-      # goes through normal review. It also withdraws any auto-merge request
-      # an earlier run armed on a then-clean head, because GitHub keeps that
-      # request across pushes by write collaborators. An unreadable verdict
-      # (rc 3) or a missing helper fails the job: nothing is approved.
       - name: Verify Dependabot commit provenance
         id: provenance
         run: |
@@ -121,569 +96,65 @@ jobs:
         if: steps.provenance.outputs.trusted == 'true'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Approve and merge patch/minor + dev-dependency-group updates
-        # Single patch/minor updates, plus the `dev-dependencies` GROUP
-        # (whatever its highest bump — dev tooling major bumps are
-        # low-risk and still gated by CI-green + the reviewer-identity
-        # approval + the available_reviewers allowlist below). Grouped
-        # dev updates whose highest member is major were previously
-        # skipped here (update-type=major), fell through to a manual
-        # merge with no reviewer approval, and tripped the weekly audit
-        # (#374 Pattern A — matchline#245). Production groups + non-group
-        # major bumps still require manual review.
+      - name: Approve eligible Dependabot update
+        id: approve
         if: |
           steps.provenance.outputs.trusted == 'true' && (
             steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
             steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
             steps.metadata.outputs.dependency-group == 'dev-dependencies'
           )
-        run: |
-          set -euo pipefail
-
-          # Verify GH_TOKEN is set and resolves to a reviewer identity.
-          # The 2026-04-27 weekly PR audit caught 17 of 21 violations
-          # across 6 repos where Dependabot PRs merged without a
-          # reviewer-identity approval recorded — root cause was either
-          # an empty REVIEWER_ASSIGNMENT_TOKEN secret (the approve call
-          # silently no-op'd while the merge proceeded) or the token
-          # resolving to nathanjohnpayne, which GitHub rejects with
-          # "can't approve own pull request". Both modes left the PR
-          # merged with no approval audit trail.
-          # Closes nathanjohnpayne/mergepath#160 from the template side.
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set in this repo."
-            echo "::error::Add a reviewer-identity PAT to repo Settings → Secrets and variables → Actions → REVIEWER_ASSIGNMENT_TOKEN."
-            exit 1
-          fi
-
-          ACTING_AS=$(gh api user --jq .login 2>/dev/null || true)
-          if [ -z "$ACTING_AS" ]; then
-            echo "::error::gh api user returned empty — REVIEWER_ASSIGNMENT_TOKEN may be invalid, expired, or lacks the user scope."
-            exit 1
-          fi
-          echo "::notice::Approving $PR_URL as $ACTING_AS (PR author: $PR_AUTHOR)"
-
-          # Verify AUTHOR_MERGE_TOKEN is set and resolves to an
-          # author-identity login. Same audit-trail risk as the
-          # reviewer-token mode (#160): an empty AUTHOR_MERGE_TOKEN
-          # would silently fall back to gh's default credential
-          # resolution and record the merge under whatever identity
-          # the workflow's GITHUB_TOKEN or implicit creds resolve to.
-          # Hard-fail instead so consumer repos that haven't added
-          # the secret yet get a clear error rather than a wrong
-          # mergedBy attribution.
-          if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN is unavailable from the merge-queue-policy environment."
-            echo "::error::Add the author-identity PAT under repo Settings → Environments → merge-queue-policy → Environment secrets. Do not create a repository or organization shadow."
-            exit 1
-          fi
-          MERGE_AS=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh api user --jq .login 2>/dev/null || true)
-          if [ -z "$MERGE_AS" ]; then
-            echo "::error::gh api user with AUTHOR_MERGE_TOKEN returned empty — AUTHOR_MERGE_TOKEN may be invalid, expired, or lacks the user scope."
-            exit 1
-          fi
-          echo "::notice::Merge will be performed as $MERGE_AS."
-
-
-          # Resolve the latest check run named "$1" on commit "$2", or
-          # empty if that check is absent.
-          #
-          # The `check_name` query parameter filters SERVER-side. That is
-          # load-bearing, not a micro-optimization: the previous
-          # implementation fetched the unfiltered
-          # `check-runs?per_page=100` first page and filtered in jq, which
-          # silently truncated at 100 results because it never paginated.
-          # Repos with many bot/gate workflows blow past that easily —
-          # each re-dispatches on every PR event.
-          #
-          # Concrete failure: nathanjohnpayne/gaycruisebingo PR #524, head
-          # fa6ccdbb724ae2ba77d917371eb6ab243e0a68a0, accumulated 143
-          # check-runs (128 when first diagnosed). The `lint` run this
-          # function waits for had ALREADY succeeded, but sorted onto page
-          # 2 and so was invisible to the single-page call. The function
-          # took the "check absent" branch on every poll, spun the full
-          # 1200s deadline, then hard-failed with a false "did not
-          # complete successfully within 1200s" — blocking a perfectly
-          # mergeable Dependabot PR. With `check_name=lint` the same
-          # commit returns total_count=2. The filter keeps the usual query
-          # small, but it does NOT bound the result set: repeated
-          # re-dispatches can still leave more than 100 matching runs on a
-          # single HEAD. Request every page as well, then select the latest
-          # exact match locally.
-          #
-          # Passed via `-X GET -f` so gh URL-encodes the value. Check
-          # names legitimately contain spaces (e.g. "Label Gate", "Merge
-          # clearance gate"); interpolating one straight into the query
-          # string produces a malformed request that hangs rather than
-          # erroring.
-          #
-          # The redundant-looking jq `select(.name == $check)` is kept
-          # deliberately: it preserves exact-match semantics locally if
-          # the server-side filter ever loosens, and costs nothing on a
-          # handful of rows. `sort_by(...) | last` is unchanged — latest
-          # run of that check still wins.
-          latest_check_run() {
-            gh api --paginate -X GET "repos/${GITHUB_REPOSITORY}/commits/$2/check-runs" \
-              -f check_name="$1" -F per_page=100 \
-              | jq -sc --arg check "$1" '[.[] | .check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
-          }
-
-          # NOTE (unfixed here, deliberately): the `lint` default is a
-          # proxy signal, not the actual merge gate. It is only ever "a
-          # check we expect to be green on HEAD" — it is NOT read from
-          # branch protection's required contexts. In fiveacross, for
-          # instance, the five genuinely-required contexts are CodeRabbit
-          # unresolved blocking findings / Codex P1 unresolved threads /
-          # Label Gate / Merge clearance gate / Self-Review Required, and
-          # `lint` is not among them — so this wait watches something
-          # unrelated to what actually blocks the merge. That is mostly
-          # benign because `--auto` (the primary path) defers to real
-          # branch protection anyway, and this wait is a belt-and-braces
-          # pre-check; it matters most on the no-branch-protection
-          # fallback squash below, which is exactly where a proxy signal
-          # is weakest. The default is intentionally NOT changed here:
-          # other repos may legitimately depend on `lint`, and deriving
-          # the list from branch protection is a behavior change that
-          # belongs in its own reviewed PR, not in a pagination fix.
-          # Repos can already override via REQUIRED_HEAD_CHECK_NAME.
-          require_current_head_check_success() {
-            local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name ever_seen
-            # Optional explicit name so the plural wrapper below can loop
-            # this unchanged; with no argument the previous env behaviour is
-            # exactly preserved.
-            required_check_name=${1:-${REQUIRED_HEAD_CHECK_NAME:-lint}}
-            wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
-            poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
-            deadline=$((SECONDS + wait_seconds))
-            ever_seen=0
-            sha=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
-            while :; do
-              runs=$(latest_check_run "$required_check_name" "$sha")
-              if [ -n "$runs" ]; then
-                ever_seen=1
-                status=$(printf '%s' "$runs" | jq -r '.status')
-                conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
-                if [ "$status" = "completed" ]; then
-                  if [ "$conclusion" = "success" ]; then
-                    CURRENT_HEAD_SHA="$sha"
-                    echo "::notice::Required check run '$required_check_name' is successful on current HEAD $CURRENT_HEAD_SHA."
-                    return 0
-                  fi
-                  echo "::error::Required check run '$required_check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
-                  exit 1
-                fi
-                echo "::notice::Required check run '$required_check_name' is $status on current HEAD $sha; waiting for completion."
-              else
-                echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
-              fi
-              if [ "$SECONDS" -ge "$deadline" ]; then
-                # Deliberately still the full deadline, and still a hard
-                # refusal: a check that genuinely never ran is a real
-                # reason not to auto-merge, and shortening the wait would
-                # break repos whose CI is slow to schedule. Only the
-                # diagnostics split. The old message claimed the check
-                # "did not complete successfully" even when it had never
-                # appeared at all, which is what made the #524 truncation
-                # bug read as a CI failure and cost an hour of digging.
-                if [ "$ever_seen" -eq 0 ]; then
-                  echo "::error::Required check run '$required_check_name' never appeared on current HEAD $sha within ${wait_seconds}s; refusing auto-merge."
-                  echo "::error::The check never started, or REQUIRED_HEAD_CHECK_NAME does not match any check name in this repo. Compare against: gh api -X GET repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs --paginate --jq '.check_runs[].name' | sort -u"
-                else
-                  echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
-                fi
-                exit 1
-              fi
-              sleep "$poll_seconds"
-            done
-            echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
-            exit 1
-          }
-
-          # Wait until EVERY configured required head check is green, with
-          # the whole set pinned to ONE head SHA.
-          #
-          # Pinning matters: an earlier per-name wait could otherwise succeed
-          # against SHA1 while a later one advanced CURRENT_HEAD_SHA to SHA2,
-          # and both merge commands bind to CURRENT_HEAD_SHA -- so a check
-          # that is NOT branch-protected (the entire reason this list exists)
-          # could be pending or failing on the merged head. Re-pin and
-          # re-verify on drift instead of accepting a mixed-SHA verdict.
-          #
-          # Resolution, name splitting and per-workflow grouping all live in
-          # scripts/required-head-checks.sh so the three call sites share one
-          # implementation rather than three drifting copies.
-          require_current_head_checks_success() {
-            local wait_seconds poll_seconds deadline pinned attempts max_attempts
-            wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
-            poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
-            max_attempts=${HEAD_DRIFT_MAX_RESTARTS:-3}
-            attempts=0
-            while :; do
-              attempts=$((attempts + 1))
-              pinned=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
-              if [ -z "$pinned" ]; then
-                echo "::error::Could not resolve the PR head SHA; refusing auto-merge."
-                exit 1
-              fi
-              deadline=$((SECONDS + wait_seconds))
-              while :; do
-                # Capture the verifier's OWN status. `rc=$?` after a failed
-                # `if` reads the compound statement's status (0), not the
-                # command's -- which would take the fail-closed branch on the
-                # first not-ready poll and never wait at all.
-                rc=0
-                if [ ! -f scripts/required-head-checks.sh ]; then
-                  # First-rollout guard (#1070); see agent-review.yml for why
-                  # this falls back rather than failing closed.
-                  echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); falling back to the singular waiter."
-                  require_current_head_check_success
-                  CURRENT_HEAD_SHA="$pinned"
-                  return 0
-                fi
-                bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned" || rc=$?
-                if [ "$rc" -eq 0 ]; then
-                  break
-                fi
-                if [ "$rc" -ne 1 ]; then
-                  echo "::error::required-head-checks failed closed (rc=$rc); refusing auto-merge."
-                  exit 1
-                fi
-                if [ "$SECONDS" -ge "$deadline" ]; then
-                  echo "::error::Timed out waiting for the configured required head checks on $pinned."
-                  exit 1
-                fi
-                sleep "$poll_seconds"
-              done
-              # Every configured check is green on $pinned. Accept only if the
-              # head has not moved underneath the verdict.
-              if [ "$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)" = "$pinned" ]; then
-                CURRENT_HEAD_SHA="$pinned"
-                echo "::notice::All configured required head checks are successful on $CURRENT_HEAD_SHA."
-                return 0
-              fi
-              if [ "$attempts" -ge "$max_attempts" ]; then
-                echo "::error::PR head kept moving during check verification; refusing auto-merge."
-                exit 1
-              fi
-              echo "::notice::PR head moved during verification; re-pinning and re-verifying."
-            done
-          }
-
-          # Re-check commit provenance on the exact SHA about to be approved
-          # or merged. The provenance step above judged the event's head; the
-          # branch can move while this job waits on CI, and every approve /
-          # merge below is pinned to a SHA this function has just verified.
-          # shellcheck source=/dev/null
-          . scripts/lib/gh-api-array.sh
-          # shellcheck source=/dev/null
-          . scripts/lib/dependabot-commit-provenance.sh
-          require_dependabot_provenance() {
-            local sha=$1 rc=0
-            dependabot_commit_provenance "$GITHUB_REPOSITORY" "$PR_NUMBER" "$sha" || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              return 0
-            fi
-            if [ "$rc" -eq 1 ]; then
-              echo "::warning::PR head $sha is not Dependabot-only ($DEPENDABOT_PROVENANCE_REASON); not approving or merging. It needs ordinary review."
-              # An earlier run of this job may have armed native auto-merge
-              # on a then-clean head, and GitHub keeps that request across
-              # pushes by write collaborators. Withdraw it before stopping.
-              armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest == null then "false" else "true" end')
-              if [ "$armed" = "true" ]; then
-                gh pr merge --disable-auto "$PR_URL"
-                echo "::warning::Withdrew the auto-merge request after provenance became untrusted."
-              fi
-              exit 0
-            fi
-            echo "::error::Could not verify Dependabot commit provenance on $sha: $DEPENDABOT_PROVENANCE_REASON. Refusing auto-merge."
-            exit 1
-          }
-
-          has_human_hold() {
-            local labels
-            if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
-              echo "::error::Failed to read labels for $PR_URL while checking human-hold."
-              exit 1
-            fi
-            printf '%s\n' "$labels" | grep -Fxq human-hold
-          }
-
-          # `human-hold` is a human-remove-only hard freeze. Re-read
-          # labels at runtime so a hold added while this job is queued
-          # or waiting cannot be bypassed by the trigger-time payload.
-          if has_human_hold; then
-            echo "::notice::PR carries human-hold; skipping Dependabot auto-merge until the human removes the label."
-            exit 0
-          fi
-
-          # Self-approval guard. The real condition is "the reviewer
-          # token resolves to the PR's own author" — GitHub blocks
-          # that. The previous check hard-coded `nathanjohnpayne`,
-          # which is wrong here: a Dependabot PR's author is
-          # `dependabot[bot]`, never `nathanjohnpayne`, so the old
-          # check rejected a perfectly valid reviewer token while
-          # never actually testing the self-approval condition.
-          # Compare against the actual PR author. (CodeRabbit Major,
-          # #271.) The available_reviewers validation below is the
-          # broader gate — it independently rejects any ACTING_AS not
-          # in the reviewer-identity allowlist.
-          if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then
-            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to '$ACTING_AS', the PR's own author."
-            echo "::error::GitHub blocks self-approval, so the approve call would silently fail and the merge would proceed without an approval recorded."
-            echo "::error::Replace the secret with a distinct reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
-            exit 1
-          fi
-
-          # Validate ACTING_AS against available_reviewers in
-          # .github/review-policy.yml. Codex r1 (Phase 4b) on PR #179:
-          # without this check, any non-author write-collaborator
-          # token (e.g., a contractor's PAT, github-actions[bot]) could
-          # approve+merge and the workflow would exit 0 — but the next
-          # weekly audit would still flag the PR as "not approved by a
-          # known reviewer identity," same audit trail problem #160 set
-          # out to fix.
-          POLICY=".github/review-policy.yml"
-          if [ ! -f "$POLICY" ]; then
-            echo "::error::$POLICY not found — cannot validate $ACTING_AS against available_reviewers."
-            exit 1
-          fi
-          # Same awk extractor used by scripts/codex-review-check.sh
-          # (in-block list parser; sed strips list-marker + optional
-          # quotes). Outputs one reviewer login per line.
-          ALLOWED=$(awk '
-            /^available_reviewers:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^ *-/ {print}
-          ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
-          if [ -z "$ALLOWED" ]; then
-            echo "::error::$POLICY has no available_reviewers list. Add reviewer identities under available_reviewers: before this workflow can approve."
-            exit 1
-          fi
-          if ! printf '%s\n' "$ALLOWED" | grep -Fxq "$ACTING_AS"; then
-            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to '$ACTING_AS', which is NOT in $POLICY available_reviewers:"
-            printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
-            echo "::error::Even if this identity has write access to the repo, an approval from it would fail the next weekly audit ('approval not from a recognized reviewer identity')."
-            echo "::error::Replace the secret with a PAT for one of the listed reviewers."
-            exit 1
-          fi
-
-          # Defensive: the author identity (used for the merge) must
-          # not also be a reviewer identity. If AUTHOR_MERGE_TOKEN
-          # resolved into available_reviewers, we'd be re-using a
-          # reviewer-identity PAT — defeating the whole point of the
-          # split and producing the same mergedBy=reviewer attribution
-          # the split is meant to fix.
-          if printf '%s\n' "$ALLOWED" | grep -Fxq "$MERGE_AS"; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', which IS in $POLICY available_reviewers:"
-            printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
-            echo "::error::AUTHOR_MERGE_TOKEN must be a PAT for the documented author identity (nathanjohnpayne), not a reviewer-identity bot account."
-            exit 1
-          fi
-
-          # Codex P2 (#426): excluding reviewer identities is necessary
-          # but not sufficient. Any OTHER write-collaborator/bot token
-          # that is not a reviewer would pass the check above yet still
-          # record mergedBy as a non-author account — the same policy
-          # violation this split is meant to fix. Positively require the
-          # merge identity to equal author_identity, resolved with the
-          # same awk parser agent-review.yml uses (quote/comment-safe,
-          # nathanjohnpayne fallback). REVIEW_POLICY.md: "Only
-          # nathanjohnpayne merges to the target branch."
-          EXPECTED_AUTHOR=$(awk '
-            /^[^[:space:]]/ && $1 == "author_identity:" {
-              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-              gsub(/^"/, "", $0)
-              gsub(/^\047/, "", $0)
-              gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-              gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-              gsub(/[[:space:]]*#.*$/, "", $0)
-              sub(/[[:space:]]+$/, "", $0)
-              print
-              exit
-            }
-          ' "$POLICY")
-          EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
-          if [ "$MERGE_AS" != "$EXPECTED_AUTHOR" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', expected author_identity '$EXPECTED_AUTHOR' (REVIEW_POLICY.md: only the author merges to the target branch)."
-            echo "::error::Replace the secret with a PAT for '$EXPECTED_AUTHOR'."
-            exit 1
-          fi
-
-          # Approve. set -e ensures we abort on failure rather than
-          # continuing to the merge step with no approval on record.
-          # The review is bound to APPROVE_SHA via commit_id, the SHA whose
-          # provenance was just verified — never to whatever the head is by
-          # the time the API call lands.
-          APPROVE_SHA=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
-          require_dependabot_provenance "$APPROVE_SHA"
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
-            -f commit_id="$APPROVE_SHA" -f event=APPROVE >/dev/null
-
-          # Major dev-group bumps must NOT merge before CI (mergepath#406).
-          # A semver-MAJOR update only reaches this step via the
-          # `dependency-group == 'dev-dependencies'` arm of the job `if:`
-          # (single bumps set update-type to patch/minor). The safety case
-          # for auto-merging a dev group is explicitly "CI is green" — but
-          # `gh pr merge --auto` merges as soon as the repo's *required*
-          # status checks pass, NOT after arbitrary in-flight CI. In a
-          # consumer where auto-merge is enabled yet CI is not a required
-          # status check, the approval above already satisfies the merge
-          # requirements, so `--auto` would merge the major dev-group BEFORE
-          # CI finishes. The immediate-squash fallback below already guarded
-          # this case; the `--auto` path did not (Codex P2 on #405 → #406).
-          # Skip BOTH merge paths for a major dev-group and leave it
-          # approved-but-unmerged: the approval is on record (the weekly
-          # audit's "no reviewer approval" gate is satisfied), and a human
-          # merges after CI — or `--auto` becomes safe once required CI
-          # checks are configured. Patch/minor fall through to the path below.
-          if [ "$UPDATE_TYPE" != "version-update:semver-patch" ] && \
-             [ "$UPDATE_TYPE" != "version-update:semver-minor" ]; then
-            echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is a major dev-group bump; leaving it approved-but-unmerged to preserve the CI-green safety case (mergepath#406). Merge after CI, or enable required CI checks + auto-merge."
-            exit 0
-          fi
-
-          require_current_head_checks_success
-          require_dependabot_provenance "$CURRENT_HEAD_SHA"
-
-          # Try GitHub-side auto-merge first (fires when required
-          # checks pass). Fall back to an immediate squash ONLY when
-          # the failure cause is "auto-merge unavailable" — i.e., the
-          # repo doesn't have branch protection / auto-merge enabled
-          # in settings. Other failures (network, permissions, race,
-          # invalid token) propagate so the audit sees them.
-          #
-          # CodeRabbit on PR #179 caught that the prior bare-`||`
-          # fallback would silently retry on ANY failure mode,
-          # including transient errors that should bubble up. gh CLI
-          # returns exit 1 for all merge failures without a
-          # distinguishing exit code, so we pattern-match stderr for
-          # the documented auto-merge-unavailable GraphQL messages.
-          if has_human_hold; then
-            echo "::notice::PR carries human-hold immediately before --auto; skipping Dependabot auto-merge until the human removes the label."
-            exit 0
-          fi
-          set +e
-          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL" 2>&1 1>/dev/null)
-          AUTO_RC=$?
-          set -e
-          if [ "$AUTO_RC" -eq 0 ]; then
-            echo "$AUTO_STDERR"
-            exit 0
-          fi
-          echo "$AUTO_STDERR" >&2
-          if echo "$AUTO_STDERR" | grep -qiE 'auto[- ]?merge is not available|not in the correct state to enable auto[- ]?merge|auto[- ]?merge.*disabled|enablePullRequestAutoMerge'; then
-            echo "::notice::--auto unavailable on this repo (likely no branch protection); falling back to immediate squash."
-            if has_human_hold; then
-              echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
-              exit 0
-            fi
-            require_current_head_checks_success
-            require_dependabot_provenance "$CURRENT_HEAD_SHA"
-            if has_human_hold; then
-              echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
-              exit 0
-            fi
-            # The immediate (no --auto) squash does NOT wait for CI. That's
-            # acceptable for single patch/minor bumps (the long-standing
-            # behavior). Major dev-groups are already held approved-but-
-            # unmerged by the early guard above (mergepath#406), so they
-            # should never reach this fallback — the `if` below is a
-            # defensive backstop that re-checks update-type in case that
-            # early guard is ever removed, keeping the CI-green safety case
-            # double-guarded. For a major group, leave the PR APPROVED but
-            # unmerged — --auto will merge it once branch protection/required
-            # checks are configured, or a human merges after CI. The approval
-            # is already recorded, so the weekly audit's "no reviewer
-            # approval" gate is satisfied either way.
-            if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
-               [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
-              # Reviewer-feedback accounting immediately before the squash
-              # (#1000). The `--auto` path above hands the merge to GitHub,
-              # which releases it only after the repository's required checks
-              # pass — and the Codex P1 gate carries the accounting backstop
-              # for top-level review-body, PR-level, and prior-head findings.
-              # This fallback runs precisely when that machinery is absent:
-              # `--auto` is unavailable because the repo has no branch
-              # protection, so there are no required checks to release
-              # against and the squash below would merge past an
-              # unacknowledged bot finding. Run the gate here instead, and
-              # fail closed on any non-zero exit — an accounting miss (1) and
-              # an infrastructure error (2) are both reasons not to merge.
-              # Same posture, and the same reason, as
-              # scripts/admin-merge-codeowners-blocked.sh: that is the other
-              # merge path that cannot rely on the required-check backstop.
-              # The PR stays approved-but-unmerged, so the weekly audit's "no
-              # reviewer approval" gate is still satisfied and a human (or a
-              # rerun after the findings are dispositioned) completes it.
-              FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-scripts/review-feedback-accounting.sh}"
-              if [ ! -x "$FEEDBACK_ACCOUNTING_GATE" ]; then
-                echo "::error::$FEEDBACK_ACCOUNTING_GATE is missing or not executable in the base checkout; refusing the fallback squash because feedback accounting cannot be verified. Propagate the scripts/ kit, then rerun."
-                exit 1
-              fi
-              # Run under GITHUB_TOKEN, not this step's default GH_TOKEN
-              # (REVIEWER_ASSIGNMENT_TOKEN). Accounting is read-only and
-              # needs no reviewer attribution, and REVIEWER_ASSIGNMENT_TOKEN
-              # is an external PAT this workflow's `permissions:` block
-              # cannot grant code-scanning-alerts access to (#1101, CodeRabbit
-              # Major on PR #1106) -- GITHUB_TOKEN is the one token whose
-              # scope this workflow actually controls.
-              set +e
-              ACCOUNTING_JSON=$(GH_TOKEN="$ACCOUNTING_GH_TOKEN" "$FEEDBACK_ACCOUNTING_GATE" "$PR_NUMBER" "$GITHUB_REPOSITORY")
-              ACCOUNTING_RC=$?
-              set -e
-              if [ "$ACCOUNTING_RC" -ne 0 ]; then
-                printf '%s\n' "$ACCOUNTING_JSON" >&2
-                if [ "$ACCOUNTING_RC" -eq 1 ]; then
-                  echo "::error::reviewer feedback is unaccounted on this PR; refusing the fallback squash. Disposition every finding named above, then rerun this workflow."
-                else
-                  echo "::error::reviewer feedback accounting exited $ACCOUNTING_RC (infrastructure error); refusing the fallback squash. Failing closed."
-                fi
-                exit 1
-              fi
-              echo "::notice::reviewer feedback accounted; proceeding with the fallback squash."
-              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"
-            else
-              echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
-              exit 0
-            fi
-          else
-            echo "::error::gh pr merge --auto failed for a non-auto-merge-unavailable reason. See stderr above. Not falling back to immediate squash; surface to audit."
-            exit "$AUTO_RC"
-          fi
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          # The actual PR author — `dependabot[bot]` for these events.
-          # Used for the genuine self-approval guard below (a hard-
-          # coded `nathanjohnpayne` compare was wrong: the author of a
-          # Dependabot PR is never `nathanjohnpayne`). (CodeRabbit
-          # Major, #271.)
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          # Passed to scripts/review-feedback-accounting.sh in the
-          # immediate-squash fallback; the script takes a PR number, and
-          # PR_URL above is a URL.
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          WORKFLOW_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Dependabot metadata — used by the immediate-squash fallback to
-          # keep major dev-group bumps behind CI (#374 / Codex P2 on #405).
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
+        run: bash scripts/workflow/dependabot-approved-merge.sh approve
+
+  auto-merge:
+    needs: approve
+    runs-on: ubuntu-latest
+    if: >-
+      needs.approve.result == 'success' && needs.approve.outputs.head != ''
+      && github.ref == 'refs/heads/main'
+      && github.event.repository.default_branch == 'main'
+      && github.event.pull_request.base.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main'
+    # Exact existing three-secret environment; no reviewer/App credential.
+    environment: merge-queue-policy
+    permissions:
+      actions: read # authenticates accounting relay workflow/job/log evidence
+      contents: write
+      pull-requests: write
+      issues: read
+      security-events: read # accounting reads CodeQL findings under GITHUB_TOKEN
+    steps:
+      - name: Checkout trusted main source, never the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # Classification is re-read; no approved/cleared boolean or update
+      # classification from the reviewer job authorizes the author writer.
+      - name: Fetch Dependabot metadata again
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Merge only an independently verified approved head
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.approve.outputs.pr }}
+          PR_HEAD_SHA: ${{ needs.approve.outputs.head }}
+          PR_BASE_SHA: ${{ needs.approve.outputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
           REQUIRED_HEAD_CHECK_NAME: lint
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          # Author-identity PAT (nathanjohnpayne) used for the merge
-          # step only. Reviewer-identity --approve must stay on
-          # REVIEWER_ASSIGNMENT_TOKEN above; the merge itself should
-          # record as the author identity per REVIEW_POLICY.md
-          # ("Only nathanjohnpayne merges to the target branch").
-          # When both tokens were the reviewer's, `mergedBy` came
-          # back as the reviewer on every Dependabot merge — the
-          # audit trail was correct for the approval and wrong for
-          # the merge.
-          AUTHOR_MERGE_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
-          # GITHUB_TOKEN, scoped by this workflow's own `permissions:`
-          # block (including security-events: read and issues: read added
-          # for #1101) — used ONLY for the immediate-squash fallback's
-          # review-feedback-accounting.sh call above, never for the
-          # reviewer --approve or author-merge calls, which stay on their
-          # own PATs. REVIEWER_ASSIGNMENT_TOKEN is an external secret this
-          # workflow cannot grant Code Scanning alerts access to (CodeRabbit
-          # Major on PR #1106).
-          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/workflow/dependabot-approved-merge.sh merge

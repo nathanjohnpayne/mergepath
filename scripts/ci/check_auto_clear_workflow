@@ -15,6 +15,14 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # workflow on disk — the same contract as MERGE_CLEARANCE_WORKFLOW and
 # REQUIRED_CHECK_PUBLISHER_WORKFLOW in the sibling checks.
 WORKFLOW="${AUTO_CLEAR_WORKFLOW:-$ROOT/.github/workflows/auto-clear-blocking-labels.yml}"
+CLEAR_SOURCE=$(mktemp "${TMPDIR:-/tmp}/auto-clear-source.XXXXXX")
+trap 'rm -f "$CLEAR_SOURCE"' EXIT
+cat "$WORKFLOW" >"$CLEAR_SOURCE"
+for clear_helper in auto-clear-event.sh auto-clear-sweep.sh; do
+  if grep -Fqx "          bash scripts/workflow/$clear_helper" "$WORKFLOW"; then
+    cat "$ROOT/scripts/workflow/$clear_helper" >>"$CLEAR_SOURCE"
+  fi
+done
 CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
 CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
@@ -767,6 +775,12 @@ scheduled_clear_block=$(awk '
   in_block && /- name:/ && $0 !~ /- name: Re-evaluate gate per PR$/ {exit}
   in_block {print}
 ' "$WORKFLOW")
+if grep -Fqx '          bash scripts/workflow/auto-clear-event.sh' <<<"$clear_block"; then
+  clear_block="$clear_block"$'\n'"$(cat "$ROOT/scripts/workflow/auto-clear-event.sh")"
+fi
+if grep -Fqx '          bash scripts/workflow/auto-clear-sweep.sh' <<<"$scheduled_clear_block"; then
+  scheduled_clear_block="$scheduled_clear_block"$'\n'"$(cat "$ROOT/scripts/workflow/auto-clear-sweep.sh")"
+fi
 scheduled_continuation_block=$(awk '
   /- name: Continue approved PRs after custom-workflow completions/ {in_block=1}
   in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after custom-workflow completions/ {exit}
@@ -781,7 +795,7 @@ clear_block_protects_before_delete() {
     && grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$block" \
     && grep -Fq 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$block" \
     && grep -Fq 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$block" \
-    && grep -Fq 'GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' <<<"$block" \
+    && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$block" \
     && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$block" \
     && grep -Fq 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$block" \
     && grep -Fq 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$block" \
@@ -820,6 +834,11 @@ extract_named_run_block() {
     in_run && /^[[:space:]]*$/ { print; next }
     in_run { exit }
   ' "$WORKFLOW" >"$destination"
+  for clear_helper in auto-clear-event.sh auto-clear-sweep.sh; do
+    if grep -Fxq "bash scripts/workflow/$clear_helper" "$destination"; then
+      cp "$ROOT/scripts/workflow/$clear_helper" "$destination"
+    fi
+  done
 }
 
 extract_named_run_block \
@@ -847,6 +866,10 @@ cat >"$clear_harness_dir/bin/gh" <<'STUB'
 set -euo pipefail
 case "${1:-} ${2:-}" in
   'pr view')
+    if [[ "$*" == *'--json author,autoMergeRequest'* ]]; then
+      printf '%s\n' "$CLEAR_ARM_JSON"
+      exit 0
+    fi
     if [ "$(cat "${CLEAR_LABEL_STATE:?}")" = present ]; then
       printf 'true\n'
     else
@@ -895,6 +918,10 @@ run_clear_harness() {
   # default a stable pair.
   local script="$1" input_name="$2" protective_rc="$3"
   local label_state="${4:-present}" event_name="${5:-}" event_action="${6:-}"
+  local arm_json="${CLEAR_ARM_JSON-}"
+  if [ -z "$arm_json" ]; then
+    arm_json='{"author":{"login":"nathanjohnpayne"},"autoMergeRequest":null}'
+  fi
   printf '%s\n' "$label_state" >"$clear_harness_dir/label-state"
   printf '%s\n' "${CLEAR_PAIR_LINES:-$(printf '%s\t%s' "$clear_sha_a" "$clear_sha_b")}" >"$clear_harness_dir/pairs"
   printf '0\n' >"$clear_harness_dir/pair-reads"
@@ -905,7 +932,7 @@ run_clear_harness() {
     cd "$clear_harness_dir"
     env \
       PATH="$clear_harness_dir/bin:$PATH" \
-      GH_TOKEN=pat-token \
+      GH_TOKEN=automation-token \
       WORKFLOW_TOKEN=workflow-token \
       AUTHOR_TOKEN=author-token \
       QUEUE_POLICY_TOKEN=queue-policy-token \
@@ -914,6 +941,7 @@ run_clear_harness() {
       PR_NUMBERS="$([ "$input_name" = PR_NUMBERS ] && printf 7)" \
       PRS="$([ "$input_name" = PRS ] && printf 7)" \
       CLEAR_PROTECT_RC="$protective_rc" \
+      CLEAR_ARM_JSON="$arm_json" \
       EVENT_NAME="$event_name" \
       EVENT_ACTION="$event_action" \
       CLEAR_STUB_LOG="$clear_harness_dir/calls.log" \
@@ -922,7 +950,14 @@ run_clear_harness() {
       CLEAR_PAIR_READS="$clear_harness_dir/pair-reads" \
       GITHUB_ENV="$clear_harness_dir/github-env" \
       GITHUB_OUTPUT="$clear_harness_dir/github-output" \
-      bash "$script" >"$clear_harness_dir/run.out" 2>&1
+      bash -c '
+        CLEAR_PHASE=protect bash "$1" || exit "$?"
+        pairs=$(sed -n "s/^protected_pairs=//p" "$GITHUB_OUTPUT" | tail -n 1)
+        if [ -n "$pairs" ] && [ "$pairs" != "[]" ]; then
+          env -u AUTHOR_TOKEN -u QUEUE_POLICY_TOKEN -u QUEUE_SOURCE_TOKEN \
+            CLEAR_PHASE=mutate PROTECTED_PAIRS="$pairs" bash "$1"
+        fi
+      ' _ "$script" >"$clear_harness_dir/run.out" 2>&1
   )
 }
 
@@ -945,7 +980,7 @@ for clear_case in event scheduled; do
     "$clear_harness_dir/calls.log" | tr '\n' ' ' || true)
   if [ "$clear_success_rc" -ne 0 ] \
      || [ "$clear_success_calls" != \
-          'protect:workflow-token delete:pat-token comment:pat-token ' ]; then
+          'protect:workflow-token delete:automation-token comment:automation-token ' ]; then
     echo "  INFO: $clear_case clear success fixture rc=$clear_success_rc calls='$clear_success_calls'" >&2
     sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
     sed 's/^/        /' "$clear_harness_dir/run.out" >&2
@@ -982,10 +1017,10 @@ done
 
 if [ "$clear_execution_ok" -eq 1 ]; then
   pass=$((pass + 1))
-  echo "  PASS: both literal clear blocks classify arms before PAT deletion and skip all writes on classification failure"
+  echo "  PASS: both literal clear blocks classify arms before App deletion and skip all writes on classification failure"
 else
   fail=$((fail + 1))
-  echo "  FAIL: label-clear execution must use read-only arm classification, PAT deletion, and no writes after classification failure" >&2
+  echo "  FAIL: label-clear execution must use read-only arm classification, App deletion, and no writes after classification failure" >&2
 fi
 
 # #2193: label already absent. The event-driven block nominates the PR on a
@@ -1038,9 +1073,9 @@ for clear_case in event scheduled; do
   set -e
   if [ "$fence_rc" -ne 0 ] \
      || [ "$(grep -E '^(protect|delete|comment):' "$clear_harness_dir/calls.log" | tr '\n' ' ')" != \
-          'protect:workflow-token delete:pat-token comment:pat-token ' ] \
-     || [ "$(grep -c '^pair:workflow-token$' "$clear_harness_dir/calls.log")" -ne 2 ]; then
-    echo "  INFO: $clear_case stable-head pass rc=$fence_rc (expected one removal and two workflow-token pair reads)" >&2
+          'protect:workflow-token delete:automation-token comment:automation-token ' ] \
+     || [ "$(grep -c '^pair:workflow-token$' "$clear_harness_dir/calls.log")" -ne 4 ]; then
+    echo "  INFO: $clear_case stable-head pass rc=$fence_rc (expected one removal and four workflow-token pair reads across both phases)" >&2
     sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
     sed 's/^/        /' "$clear_harness_dir/run.out" >&2
     fence_ok=0
@@ -1073,6 +1108,43 @@ for clear_case in event scheduled; do
      || ! grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env"; then
     echo "  INFO: $clear_case unreadable pre-delete pair rc=$fence_rc (expected 1, no removal, infra sentinel)" >&2
     sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    fence_ok=0
+  fi
+done
+# #1547: adversarial transitions BETWEEN the existing credential phases.
+for clear_case in event scheduled; do
+  if [ "$clear_case" = event ]; then
+    clear_script="$clear_harness_dir/event-clear.sh"; clear_input=PR_NUMBERS
+  else
+    clear_script="$clear_harness_dir/scheduled-clear.sh"; clear_input=PRS
+  fi
+  set +e
+  CLEAR_PAIR_LINES="$(printf '%s\t%s\n%s\t%s\n%s\t%s' "$clear_sha_a" "$clear_sha_b" "$clear_sha_a" "$clear_sha_b" "$clear_sha_c" "$clear_sha_b")" \
+    run_clear_harness "$clear_script" "$clear_input" 0 present
+  transition_rc=$?
+  set -e
+  if [ "$transition_rc" -ne 0 ] || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log"; then
+    echo "  INFO: $clear_case moved inter-job tuple was not rejected" >&2
+    fence_ok=0
+  fi
+  for arm_json in '{"author":{"login":"author"},"autoMergeRequest":{}}' '{"author":{}}' 'not json'; do
+    set +e
+    CLEAR_ARM_JSON="$arm_json" run_clear_harness "$clear_script" "$clear_input" 0 present
+    transition_rc=$?
+    set -e
+    if grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+       || { [ "$arm_json" != '{"author":{"login":"author"},"autoMergeRequest":{}}' ] && [ "$transition_rc" -eq 0 ]; }; then
+      echo "  INFO: $clear_case new/malformed ordinary arm did not fail closed" >&2
+      fence_ok=0
+    fi
+  done
+  set +e
+  CLEAR_ARM_JSON='{"author":{"login":"app/dependabot"},"autoMergeRequest":{}}' \
+    run_clear_harness "$clear_script" "$clear_input" 0 present
+  transition_rc=$?
+  set -e
+  if [ "$transition_rc" -ne 0 ] || ! grep -Eq '^delete:' "$clear_harness_dir/calls.log"; then
+    echo "  INFO: $clear_case changed the existing native Dependabot arm exception" >&2
     fence_ok=0
   fi
 done
@@ -1381,10 +1453,10 @@ done
 if ! awk '
   /^      - name: Heal stale auto-clear infra-failure check-runs$/ { seen=1; next }
   seen && /^      - name: / { bad=1 }
-  seen && /^  scheduled-sweep:/ { seen=0 }
+  seen && /^  [a-z][a-z-]+:/ { seen=0 }
   END { exit bad }
 ' "$WORKFLOW" \
-   || [ "$(awk '/^      - name: Heal stale auto-clear infra-failure check-runs \(sweep\)$/ { s=1; next } s && /^      - name: / { print }' "$WORKFLOW")" != "" ] \
+   || [ "$(awk '/^      - name: Heal stale auto-clear infra-failure check-runs \(sweep\)$/ { s=1; next } s && /^  [a-z][a-z-]+:/ { s=0 } s && /^      - name: / { print }' "$WORKFLOW")" != "" ] \
    || ! grep -qE '^        id: sweep$' "$WORKFLOW"; then
   echo "  INFO: a heal step is not the last step of its job, or the sweep step lacks id: sweep" >&2
   heal_step_ok=0
@@ -1604,10 +1676,10 @@ fi
 # the label is already absent, it posts a success check-run with the
 # same name to heal any prior synthetic failure. Both event-driven and
 # scheduled-sweep surfaces need the same behavior.
-heal_title_count=$(grep -c 'Auto-clear confirmed needs-external-review absent' "$WORKFLOW" || true)
-heal_success_count=$(grep -c -- "-f conclusion='success'" "$WORKFLOW" || true)
-heal_read_count=$(grep -c 'current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels' "$WORKFLOW" || true)
-valid_label_predicate_count=$(grep -Fc -- "--jq 'any(.labels[]?; .name == \"needs-external-review\")'" "$WORKFLOW" || true)
+heal_title_count=$(grep -c 'Auto-clear confirmed needs-external-review absent' "$CLEAR_SOURCE" || true)
+heal_success_count=$(grep -c -- "-f conclusion='success'" "$CLEAR_SOURCE" || true)
+heal_read_count=$(grep -c 'current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels' "$CLEAR_SOURCE" || true)
+valid_label_predicate_count=$(grep -Fc -- "--jq 'any(.labels[]?; .name == \"needs-external-review\")'" "$CLEAR_SOURCE" || true)
 if [ "$heal_title_count" -ge 2 ] && [ "$heal_success_count" -ge 2 ] && [ "$heal_read_count" -ge 2 ] && [ "$valid_label_predicate_count" -ge 4 ]; then
   pass=$((pass + 1))
   echo "  PASS: infra-failure surfacing heals stale auto-clear check-runs when the label is already absent (#499)"
@@ -1622,8 +1694,8 @@ fi
 # CR Major on PR #202 r2.
 # CR Major on PR #202 r5: anchored to start-of-line + word boundary
 # so commented-out occurrences don't satisfy the assertion.
-if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' "$WORKFLOW" && \
-   grep -qE '^[[:space:]]*exit[[:space:]]+"?\$had_infra_error"?([[:space:]]|$)' "$WORKFLOW"; then
+if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' "$CLEAR_SOURCE" && \
+   grep -qE '^[[:space:]]*exit[[:space:]]+"?\$had_infra_error"?([[:space:]]|$)' "$CLEAR_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it (executable lines)"
 else
@@ -1644,8 +1716,8 @@ fi
 # `|| true` on both: a missing branch is the very thing this asserts, and under
 # `set -e` an empty grep would abort the whole checker instead of reporting it
 # -- taking the remaining assertions down with it. (Caught by mutation MW1.)
-eq4_lines=$(grep -n '\[ "\$protective_rc" -eq 4 \]' "$WORKFLOW" | cut -d: -f1 || true)
-ne0_lines=$(grep -n '\[ "\$protective_rc" -ne 0 \]' "$WORKFLOW" | cut -d: -f1 || true)
+eq4_lines=$(grep -n '\[ "\$protective_rc" -eq 4 \]' "$CLEAR_SOURCE" | cut -d: -f1 || true)
+ne0_lines=$(grep -n '\[ "\$protective_rc" -ne 0 \]' "$CLEAR_SOURCE" | cut -d: -f1 || true)
 # shellcheck disable=SC2206  # deliberate word-splitting of newline-separated line numbers
 eq4_arr=($eq4_lines)
 # shellcheck disable=SC2206
@@ -1661,7 +1733,7 @@ else
       protective_rc4_ok=0
       continue
     fi
-    branch_body=$(sed -n "${eq4_line},$((ne0_line - 1))p" "$WORKFLOW")
+    branch_body=$(sed -n "${eq4_line},$((ne0_line - 1))p" "$CLEAR_SOURCE")
     if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' <<<"$branch_body" \
        || grep -qE '^[[:space:]]*failing_prs=' <<<"$branch_body" \
        || ! grep -qE '^[[:space:]]*continue([[:space:]]|$)' <<<"$branch_body"; then
@@ -1678,8 +1750,8 @@ else
 fi
 
 # ── Test 3: self-fire loop guard present
-if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
-   grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then
+if grep -qE "github\.event\.action == 'unlabeled'" "$CLEAR_SOURCE" && \
+   grep -qE "github\.event\.label\.name == 'needs-external-review'" "$CLEAR_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: self-fire loop guard for unlabeled+needs-external-review present"
 else
@@ -1708,13 +1780,13 @@ fi
 # gated on (see the duplicate-comment guard below). Both spellings stay
 # refuted for the three forbidden labels, so a regression to either
 # mechanism on a human-action label still fails this check.
-if grep -qE '^[^#]*issues/\$PR/labels/needs-external-review' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*issues/\$PR/labels/needs-human-review' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*issues/\$PR/labels/policy-violation' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*issues/\$PR/labels/human-hold' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$WORKFLOW"; then
+if grep -qE '^[^#]*issues/\$PR/labels/needs-external-review' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/needs-human-review' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/policy-violation' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/human-hold' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$CLEAR_SOURCE" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$CLEAR_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
 else
@@ -1731,9 +1803,9 @@ fi
 # label-presence check, one write wins, and every one of them then reads
 # "absent". On #797 that produced 15 attribution comments for 5 real
 # removals. Both jobs must capture the status and branch on it.
-del_capture_count=$(grep -cE '^[^#]*del_status=\$\(printf' "$WORKFLOW" || true)
-del_branch_count=$(grep -cE '^[^#]*case "\$del_status" in' "$WORKFLOW" || true)
-del_delete_count=$(grep -cE '^[^#]*-X DELETE -i --silent' "$WORKFLOW" || true)
+del_capture_count=$(grep -cE '^[^#]*del_status=\$\(printf' "$CLEAR_SOURCE" || true)
+del_branch_count=$(grep -cE '^[^#]*case "\$del_status" in' "$CLEAR_SOURCE" || true)
+del_delete_count=$(grep -cE '^[^#]*-X DELETE -i --silent' "$CLEAR_SOURCE" || true)
 if [ "$del_capture_count" -ge 2 ] && [ "$del_branch_count" -ge 2 ] && [ "$del_delete_count" -ge 2 ]; then
   pass=$((pass + 1))
   echo "  PASS: both jobs gate the attribution comment on the DELETE's HTTP status, not on label absence (#827)"
@@ -1750,8 +1822,8 @@ fi
 # the sweep burns a full codex-review-check.sh evaluation per stale hit
 # and then comments on a label it never removed. Both jobs must carry the
 # HAS_LABEL precheck.
-haslabel_count=$(grep -cE '^[^#]*HAS_LABEL=\$\(with_gh_retry gh pr view' "$WORKFLOW" || true)
-if [ "$haslabel_count" -ge 2 ] && grep -qF 'stale search-index hit' "$WORKFLOW"; then
+haslabel_count=$(grep -cE '^[^#]*HAS_LABEL=\$\(with_gh_retry gh pr view' "$CLEAR_SOURCE" || true)
+if [ "$haslabel_count" -ge 2 ] && grep -qF 'stale search-index hit' "$CLEAR_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: both jobs re-verify needs-external-review authoritatively before acting (#827)"
 else
@@ -1793,7 +1865,7 @@ awk -v outdir="$block_dir" '
     print > outfile
   }
   END { if (in_run) close(outfile) }
-' "$WORKFLOW"
+' "$CLEAR_SOURCE"
 
 extracted_count=$(ls -1 "$block_dir" 2>/dev/null | wc -l | tr -d ' ')
 syntax_errors=0

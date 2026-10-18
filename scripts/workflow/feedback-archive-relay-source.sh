@@ -272,10 +272,8 @@ else
   fi
 fi
 
-REQUIRES_RELAY=$IS_FORK
-if [ "$PR_ACTOR" = 'dependabot[bot]' ]; then
-  REQUIRES_RELAY=true
-fi
+# #1547: every candidate event uses the same trusted archive relay.
+REQUIRES_RELAY=true
 
 jq -nc \
   --argjson pr "$PR_NUMBER" --argjson run "$RUN_ID" \

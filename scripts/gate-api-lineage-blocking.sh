@@ -5,6 +5,12 @@
 # Usage:
 #   scripts/gate-api-lineage-blocking.sh <REPO> <HEAD_SHA> <CHECK_NAME> <RUN_ID>
 #
+# Optional fifth argument: parent run attempt. Candidate MCG MUST pass it;
+# the current API runs must then carry the EXISTING trusted publisher hold
+# summary for this exact parent run/attempt/full head. No historical red or
+# prior parent hold can replace this causal fence (#1547). The legacy four-
+# argument read-only probe retains its current behavior for other callers.
+#
 # Read-only. Exit 0 ONLY when all of these hold, read from one paginated
 # `GET /commits/<HEAD_SHA>/check-runs?check_name=<CHECK_NAME>&filter=latest`:
 #
@@ -54,7 +60,7 @@
 
 set -euo pipefail
 
-if [ $# -ne 4 ]; then
+if [ $# -ne 4 ] && [ $# -ne 5 ]; then
   echo "Usage: $0 <REPO> <HEAD_SHA> <CHECK_NAME> <RUN_ID>" >&2
   exit 2
 fi
@@ -62,6 +68,11 @@ REPO=$1
 HEAD_SHA=$2
 CHECK_NAME=$3
 RUN_ID=$4
+PARENT_ATTEMPT=${5:-}
+if [ -n "$PARENT_ATTEMPT" ] && ! [[ "$PARENT_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Usage: parent attempt must be a positive integer" >&2
+  exit 2
+fi
 
 case "$REPO" in
   */*) ;;
@@ -90,6 +101,7 @@ if ! runs=$(gh api --paginate -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" 
     -f check_name="$CHECK_NAME" -f filter=latest -f per_page=100 \
     --jq '.check_runs[] | {id, status, conclusion,
             ext: (.external_id // ""),
+            summary: (.output.summary // ""),
             suite: (.check_suite.id // null),
             app: (.app.slug // ""),
             url: (.details_url // "")}' 2>/dev/null); then
@@ -117,6 +129,10 @@ VERDICT_JQ=$(cat <<'JQ'
       "not established: no Checks-API run of this context on the head"
     elif ([ $api[] | select(.suite == null or (.suite as $s | $own_suites | index($s))) ] | length) > 0 then
       "not established: a Checks-API run shares this run's check suite, so a job-native completion could mask it"
+    elif $attempt != "" and ([ $api[] | select(.summary !=
+        ("Publisher phase 1: evaluation queued for " + $head +
+         ". <!-- required-check-publisher:pending:" + $run + ":" + $attempt + " -->")) ] | length) > 0 then
+      "not established: no current trusted publisher hold bound to this parent run/attempt/full head"
     elif ([ $api[] | select(blocks | not) ] | length) > 0 then
       "not established: the current Checks-API run is not blocking (" + ([ $api[] | select(blocks | not) | "\(.id) \(.status)/\(.conclusion // "-")" ] | join(", ")) + ")"
     else
@@ -125,7 +141,7 @@ VERDICT_JQ=$(cat <<'JQ'
 JQ
 )
 
-verdict=$(printf '%s\n' "$runs" | jq -rs --arg run "$RUN_ID" "$VERDICT_JQ" 2>/dev/null) || {
+verdict=$(printf '%s\n' "$runs" | jq -rs --arg run "$RUN_ID" --arg attempt "$PARENT_ATTEMPT" --arg head "$HEAD_SHA" "$VERDICT_JQ" 2>/dev/null) || {
   echo "not established: could not parse the '$CHECK_NAME' check runs on $HEAD_SHA"
   exit 1
 }

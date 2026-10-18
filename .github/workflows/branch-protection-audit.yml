@@ -147,6 +147,7 @@ concurrency:
 
 jobs:
   audit:
+    environment: branch-protection-audit
     name: Audit fleet branch protection
     # Backstop, not the primary control. With repository_dispatch and
     # schedule as the only triggers, github.ref_name is ALWAYS the default

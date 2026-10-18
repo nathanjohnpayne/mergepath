@@ -19,6 +19,17 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# Follow only the fixed driver actually invoked by both role-separated jobs.
+DEPENDABOT_SOURCE=$(mktemp)
+trap 'rm -f "$DEPENDABOT_SOURCE"' EXIT
+if ! grep -Fq 'bash scripts/workflow/dependabot-approved-merge.sh approve' .github/workflows/dependabot-auto-merge.yml \
+   || ! grep -Fq 'bash scripts/workflow/dependabot-approved-merge.sh merge' .github/workflows/dependabot-auto-merge.yml; then
+  echo 'check_workflow_parsers: missing fixed Dependabot phase entrypoints' >&2
+  exit 1
+fi
+cat .github/workflows/dependabot-auto-merge.yml scripts/workflow/dependabot-approved-merge.sh >"$DEPENDABOT_SOURCE"
+
+
 FIXTURE="scripts/ci/fixtures/workflow-parsers/review-policy.sample.yml"
 PARSE="scripts/workflow/parse_policy_list.sh"
 MATCH="scripts/workflow/match_protected_paths.sh"
@@ -957,8 +968,8 @@ auto_merge_job_block=$(awk '
 ' "$agent_review_workflow")
 
 # 1. The original approval-event trigger is preserved.
-if grep -Fq "github.event_name == 'pull_request_review'" <<<"$auto_merge_job_block" \
-  && grep -Fq "github.event.review.state == 'approved'" <<<"$auto_merge_job_block"; then
+if grep -Fq "needs.binding.outputs.event_name == 'pull_request_review'" <<<"$auto_merge_job_block" \
+  && grep -Fq "fromJSON(needs.binding.outputs.event).review.state == 'approved'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: auto-merge retains the pull_request_review + approved trigger"
 else
@@ -967,8 +978,8 @@ else
 fi
 
 # 2. The synchronize/reopened re-arm trigger is present in the job if:.
-if grep -Fq "github.event.action == 'synchronize'" <<<"$auto_merge_job_block" \
-  && grep -Fq "github.event.action == 'reopened'" <<<"$auto_merge_job_block"; then
+if grep -Fq "fromJSON(needs.binding.outputs.event).action == 'synchronize'" <<<"$auto_merge_job_block" \
+  && grep -Fq "fromJSON(needs.binding.outputs.event).action == 'reopened'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: auto-merge re-arms on pull_request synchronize/reopened (#495)"
 else
@@ -981,7 +992,7 @@ fi
 # delivers an unsubscribed event to the workflow, so the reopened half (and,
 # without synchronize, the whole re-arm) silently never fires (#495).
 pr_trigger_types=$(awk '
-  /^  pull_request:/ {in_pr=1; next}
+  /^  pull_request_target:/ {in_pr=1; next}
   in_pr && /^  [a-z]/ {exit}
   in_pr && /^    types:/ {print; exit}
 ' "$agent_review_workflow")
@@ -1001,7 +1012,7 @@ fi
 # Three coupled shapes, each dead-code-prone on its own:
 #   - the trigger list must subscribe `unlabeled` (else the if: is dead);
 #   - the job if: must scope unlabeled to the BLOCKING label names via
-#     github.event.label.name (else every label removal spends a runner);
+#     fromJSON(needs.binding.outputs.event).label.name (else every label removal spends a runner);
 #   - triage must classify unlabeled without mutating labels, so the
 #     independence guard sees current Phase 4 scope without flapping the
 #     label that auto-clear just removed.
@@ -1012,14 +1023,14 @@ else
   fail=$((fail + 1))
   echo "  FAIL: on.pull_request.types must include unlabeled — the #620 settle re-arm is dead code without it" >&2
 fi
-if grep -Fq "github.event.action == 'unlabeled'" <<<"$auto_merge_job_block" \
-  && grep -Fq "github.event.label.name" <<<"$auto_merge_job_block" \
+if grep -Fq "fromJSON(needs.binding.outputs.event).action == 'unlabeled'" <<<"$auto_merge_job_block" \
+  && grep -Fq "fromJSON(needs.binding.outputs.event).label.name" <<<"$auto_merge_job_block" \
   && grep -Fq '"needs-external-review","needs-human-review","policy-violation","human-hold"' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: auto-merge unlabeled re-arm is scoped to the blocking label names (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (github.event.label.name against the four blocking names incl. policy-violation) (#620)" >&2
+  echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (fromJSON(needs.binding.outputs.event).label.name against the four blocking names incl. policy-violation) (#620)" >&2
 fi
 if ! grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
   && grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block"; then
@@ -1033,7 +1044,7 @@ fi
 # 2d. Triage classifies unlabeled but must not mutate labels: re-applying
 # needs-external-review moments after auto-clear removed it would flap.
 triage_job_block=$(awk '/^  triage:/{f=1} f && /^  [a-z-]+:$/ && !/^  triage:/{exit} f{print}' "$agent_review_workflow")
-if grep -Fq "github.event.action == 'unlabeled'" <<<"$triage_job_block" \
+if grep -Fq "fromJSON(needs.binding.outputs.event).action == 'unlabeled'" <<<"$triage_job_block" \
   && grep -Fq 'const mayMutateLabels' <<<"$triage_job_block" \
   && grep -Fq 'mayMutateLabels && needsExternal' <<<"$triage_job_block"; then
   pass=$((pass + 1))
@@ -1108,7 +1119,7 @@ if grep -Eq 'pulls/[^[:space:]]+/merge' <<<"$auto_merge_job_flat" \
   && grep -Eiq '(^|[[:space:]])(-X|--method)(=|[[:space:]])*(PUT|POST)([[:space:]]|$)' <<<"$auto_merge_job_flat"; then
   candidate_rest_merge=1
 fi
-if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
+if grep -Fq 'ref: ${{ github.workflow_sha }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
   && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
@@ -1146,10 +1157,10 @@ fi
 # CI-actor role prefers CI_ACTOR_TOKEN (nathanpayne-robot) and falls back to
 # REVIEWER_ASSIGNMENT_TOKEN where that secret is not provisioned, so this
 # asserts the fallback expression rather than one literal secret name.
-prp_workflow=".github/workflows/pr-review-policy.yml"
-if grep -Fq 'LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' "$prp_workflow" \
+prp_workflow=".github/workflows/trusted-pr-policy.yml"
+if grep -Fq 'LABEL_REMOVAL_TOKEN: ${{ steps.automation.outputs.token }}' "$prp_workflow" \
   && grep -Fq 'GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit' "$prp_workflow" \
-  && awk '/- name: Propagation PR review lane/{f=1} f && /GH_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/{found=1} f && /- name:/ && !/Propagation PR review lane/{exit} END{exit found ? 0 : 1}' "$prp_workflow"; then
+  && awk '/- name: Propagation PR review lane/{f=1} f && /GH_TOKEN: \$\{\{ github\.token \}\}/{found=1} f && /- name:/ && !/Propagation PR review lane/{exit} END{exit found ? 0 : 1}' "$prp_workflow"; then
   pass=$((pass + 1))
   echo "  PASS: propagation-lane label removal is PAT-driven (fires the settle re-arm) while the step default stays GITHUB_TOKEN (#620)"
 else
@@ -1180,13 +1191,13 @@ fi
 #    since #544, the direct pull_request_review approval path too — so an
 #    unregistered non-author approval arms auto-merge on neither path.
 if grep -Fq 'id: require_approval' <<<"$auto_merge_job_block" \
-  && grep -Eq "github\.event_name == 'pull_request'( \|\||$)" <<<"$auto_merge_job_block" \
-  && grep -Fq "github.event_name == 'pull_request_review'" <<<"$auto_merge_job_block"; then
+  && grep -Eq "needs\.binding\.outputs\.event_name == 'pull_request'( \|\||$)" <<<"$auto_merge_job_block" \
+  && grep -Fq "needs.binding.outputs.event_name == 'pull_request_review'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: require_approval gate covers the pull_request re-arm (#495) and the pull_request_review approval (#544)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: require_approval step must gate on github.event_name == 'pull_request' (#495) AND 'pull_request_review' (#544)" >&2
+  echo "  FAIL: require_approval step must gate on needs.binding.outputs.event_name == 'pull_request' (#495) AND 'pull_request_review' (#544)" >&2
 fi
 
 # 4. The gate confirms an EXISTING non-author APPROVED review: it must
@@ -1255,8 +1266,8 @@ triage_job_block=$(awk '
   in_block {print}
 ' "$agent_review_workflow")
 
-if grep -Fq "github.event.action == 'synchronize'" <<<"$load_config_job_block" \
-  && grep -Fq "github.event.action == 'reopened'" <<<"$load_config_job_block"; then
+if grep -Fq "fromJSON(needs.binding.outputs.event).action == 'synchronize'" <<<"$load_config_job_block" \
+  && grep -Fq "fromJSON(needs.binding.outputs.event).action == 'reopened'" <<<"$load_config_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: load-config re-parses policy on synchronize/reopened (re-arm sees fresh threshold/paths) (#495)"
 else
@@ -1264,8 +1275,8 @@ else
   echo "  FAIL: load-config must run on synchronize/reopened so the re-arm path sees a freshly parsed policy, not a stale snapshot (#495)" >&2
 fi
 
-if grep -Fq "github.event.action == 'synchronize'" <<<"$triage_job_block" \
-  && grep -Fq "github.event.action == 'reopened'" <<<"$triage_job_block"; then
+if grep -Fq "fromJSON(needs.binding.outputs.event).action == 'synchronize'" <<<"$triage_job_block" \
+  && grep -Fq "fromJSON(needs.binding.outputs.event).action == 'reopened'" <<<"$triage_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: triage refreshes threshold/protected-path labels on synchronize/reopened before the re-arm (#495)"
 else
@@ -1293,7 +1304,7 @@ fi
 load_config_code=$(grep -v '^[[:space:]]*#' <<<"$load_config_job_block")
 
 if grep -Fq "scripts/workflow/load_review_config.sh" <<<"$load_config_code" \
-  && grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$load_config_code" \
+  && grep -Fq 'ref: ${{ github.workflow_sha }}' <<<"$load_config_code" \
   && grep -Fq -- "--base-ref" <<<"$load_config_code" \
   && grep -Fq -- "--base-sha" <<<"$load_config_code" \
   && grep -Fq -- "--default-branch" <<<"$load_config_code"; then
@@ -1342,7 +1353,7 @@ fi
 echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 
-dependabot_workflow=".github/workflows/dependabot-auto-merge.yml"
+dependabot_workflow="$DEPENDABOT_SOURCE"
 if grep -Fq "github.event.pull_request.user.login == 'dependabot[bot]'" "$dependabot_workflow"; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge gates on pull_request.user.login"
@@ -1362,49 +1373,18 @@ fi
 echo
 echo "dependabot-auto-merge.yml reviewer-token fail-closed regression (#374 Pattern A)"
 
-if workflow_guard_block_contains_exit \
-  "$dependabot_workflow" \
-  'if [ -z "${GH_TOKEN:-}" ]; then' \
-  'GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set'; then
+if grep -Fq '[ -n "${GH_TOKEN:-}" ] || refuse' "$dependabot_workflow" \
+  && grep -Fq 'identity=$(gh api user) || refuse' "$dependabot_workflow" \
+  && grep -Fq 'select(.type == "User")' "$dependabot_workflow" \
+  && grep -Fq 'select(type == "string" and length > 0)' "$dependabot_workflow" \
+  && grep -Fq "[ \"\$ACTING_AS\" != 'dependabot[bot]' ] || refuse" "$dependabot_workflow" \
+  && grep -Fq 'login_is_available_reviewer "$ACTING_AS" "$POLICY" || refuse' "$dependabot_workflow" \
+  && grep -Fq 'login_is_non_reviewer_identity "$ACTING_AS" "$POLICY"' "$dependabot_workflow"; then
   pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN is empty"
+  echo "  PASS: approval requires a positively verified nonempty User, distinct from the author and allowlisted by governing policy"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN/GH_TOKEN is empty" >&2
-fi
-
-if grep -Fq 'ACTING_AS=$(gh api user --jq .login' "$dependabot_workflow" &&
-   workflow_guard_block_contains_exit \
-     "$dependabot_workflow" \
-     'if [ -z "$ACTING_AS" ]; then' \
-     'gh api user returned empty'; then
-  pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity" >&2
-fi
-
-if workflow_guard_block_contains_exit \
-  "$dependabot_workflow" \
-  'if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then' \
-  'GitHub blocks self-approval'; then
-  pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when the reviewer token resolves to the PR author"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN resolves to the PR author" >&2
-fi
-
-if workflow_guard_block_contains_exit \
-  "$dependabot_workflow" \
-  "if ! printf '%s\\n' \"\$ALLOWED\" | grep -Fxq \"\$ACTING_AS\"; then" \
-  'NOT in $POLICY available_reviewers'; then
-  pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN is not in available_reviewers" >&2
+  echo "  FAIL: protected reviewer identity must be positively verified, non-author, allowlisted and not a declared non-reviewer" >&2
 fi
 
 if grep -Fq "!contains(github.event.pull_request.labels.*.name, 'human-hold')" "$dependabot_workflow"; then
@@ -1431,7 +1411,7 @@ else
   echo "  FAIL: Dependabot human-hold lookup must fail closed when gh pr view cannot read labels" >&2
 fi
 
-hold_recheck_count=$(grep -Fc "if has_human_hold; then" "$dependabot_workflow" || true)
+hold_recheck_count=$(grep -Ec "^[[:space:]]*human_hold_fence$" "$dependabot_workflow" || true)
 if [ "$hold_recheck_count" -ge 3 ]; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge checks human-hold before queued work and both merge paths"
@@ -1461,9 +1441,9 @@ if [ -x "$rhc" ] && \
    grep -Fq -- '-f check_name=' "$rhc" && \
    grep -Fq 'if any(.status != "completed") then "pending"' "$rhc" && \
    grep -Fq 'required-head-checks.sh --repo' .github/workflows/agent-review.yml && \
-   grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'required-head-checks.sh --repo' "$DEPENDABOT_SOURCE" && \
    grep -Fq 'required-head-checks.sh" --repo' scripts/workflow/approval-merge-continuation.sh && \
-   grep -Fq 'PR head moved during verification' .github/workflows/dependabot-auto-merge.yml; then
+   grep -Fq 'PR head moved during verification' "$DEPENDABOT_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: all three merge gates share the required head-check resolver, which fails closed, filters per check name, treats any in-flight run in a workflow group as pending, groups by workflow identity and pins one head"
 else
@@ -1483,16 +1463,16 @@ echo "auto-merge workflows require current-head check success (#516)"
 # its local copy impossible to upstream. Assert the MECHANISM: the waiter,
 # the looper, the looper being called on both paths, the resolver, and both
 # of its fail-closed branches.
-dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_checks_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
-if grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/dependabot-auto-merge.yml && \
-   grep -Fq 'select(.name == $check)' .github/workflows/dependabot-auto-merge.yml && \
-   grep -Eq '^[[:space:]]*require_current_head_check_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
-   grep -Eq '^[[:space:]]*require_current_head_checks_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
-   grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
+dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_checks_success[[:space:]]*$' "$DEPENDABOT_SOURCE" || true)
+if grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" "$DEPENDABOT_SOURCE" && \
+   grep -Fq 'select(.name == $check)' "$DEPENDABOT_SOURCE" && \
+   grep -Eq '^[[:space:]]*require_current_head_check_success\(\)[[:space:]]*\{' "$DEPENDABOT_SOURCE" && \
+   grep -Eq '^[[:space:]]*require_current_head_checks_success\(\)[[:space:]]*\{' "$DEPENDABOT_SOURCE" && \
+   grep -Fq 'required-head-checks.sh --repo' "$DEPENDABOT_SOURCE" && \
    [ "$dependabot_check_gate_calls" -ge 2 ] && \
-   grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
-   grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \
-   grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/dependabot-auto-merge.yml; then
+   grep -Fq -- "--match-head-commit" "$DEPENDABOT_SOURCE" && \
+   grep -Fq "waiting for completion" "$DEPENDABOT_SOURCE" && \
+   grep -Fq "TEST_CHECK_WAIT_SECONDS" "$DEPENDABOT_SOURCE"; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge waits for configured current-head check success and binds merges to the checked HEAD"
 else
@@ -1585,35 +1565,25 @@ else
   echo "  FAIL: Dependabot auto-merge must use an author-owned AUTHOR_MERGE_TOKEN for the merge step" >&2
 fi
 
-if workflow_guard_block_contains_exit \
-  "$dependabot_workflow" \
-  'if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then' \
-  'AUTHOR_MERGE_TOKEN is unavailable from the merge-queue-policy environment'; then
+if grep -Fq '[ -n "${GH_TOKEN:-}" ] || refuse' "$dependabot_workflow" \
+  && grep -Fq '[ "$ACTING_AS" = "$EXPECTED_AUTHOR" ] || refuse' "$dependabot_workflow" \
+  && grep -Fq 'EXPECTED_AUTHOR=${EXPECTED_AUTHOR:-nathanjohnpayne}' "$dependabot_workflow" \
+  && grep -Fq 'login_is_available_reviewer "$ACTING_AS" "$POLICY" && refuse' "$dependabot_workflow"; then
   pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when AUTHOR_MERGE_TOKEN is empty"
+  echo "  PASS: merge phase requires a nonempty verified author User, preserves the existing default, and rejects reviewer standing"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when AUTHOR_MERGE_TOKEN is empty" >&2
+  echo "  FAIL: merge phase must positively verify the governing author identity with its existing default" >&2
 fi
 
-if workflow_guard_block_contains_exit \
-  "$dependabot_workflow" \
-  'if [ "$MERGE_AS" != "$EXPECTED_AUTHOR" ]; then' \
-  'expected author_identity'; then
+# Execute the actual split phases: the workflow binds each phase to its own
+# environment/PAT, and the driver revalidates every writer under that identity.
+if tests/test_dependabot_auto_merge.sh; then
   pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge verifies the merge identity equals author_identity"
+  echo "  PASS: both protected phases preserve credential isolation, live binding and per-writer gates"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must verify MERGE_AS equals author_identity before merging" >&2
-fi
-
-merge_token_count=$(grep -Fc 'GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge' "$dependabot_workflow" || true)
-if [ "$merge_token_count" -ge 2 ]; then
-  pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge runs both merge paths under AUTHOR_MERGE_TOKEN"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must run --auto and fallback squash under AUTHOR_MERGE_TOKEN (got $merge_token_count)" >&2
+  echo "  FAIL: role-separated Dependabot runtime controls regressed" >&2
 fi
 
 echo "Workflow js-yaml install tests"
@@ -1661,6 +1631,13 @@ elif python3 -c "import yaml" >/dev/null 2>&1; then
   fi
 else
   echo "  SKIP: no YAML parser available (install yq or PyYAML for this check)"
+fi
+
+echo "Trusted event binding and candidate authority boundaries (#1547)"
+if node tests/test_trusted_pr_event.cjs && python3 -B tests/test_trusted_workflow_boundaries.py && python3 -B tests/test_native_clearance_recovery.py; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
 fi
 
 echo
