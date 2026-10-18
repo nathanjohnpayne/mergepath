@@ -21,6 +21,28 @@ crqe_select_trigger() { # comments-json author since
   '
 }
 
+# A terminal refusal must answer the selected author request, not an earlier
+# one. Equal timestamps need comment IDs; unreadable ordering is not absence.
+# A newer active current-head summary likewise retains the pending-review hold.
+crqe_filter_provider_block() { # block-json request-json [current-head-summary-json]
+  jq -nc --argjson block "$1" --argjson request "${2:-null}" --argjson summary "${3:-null}" '
+    def comment_id: .comment_id // .id;
+    def valid_id: type == "number" and . > 0 and floor == .;
+    $block
+    | if . == null then null
+      elif ($summary.status == "running" or $summary.status == "unknown")
+           and ($summary.observed_at // "") >= .created_at then null
+      elif $request == null then .
+      elif (.created_at | type) != "string" or ($request.created_at | type) != "string"
+           or .created_at == "" or $request.created_at == "" then error("unreadable provider/request time")
+      elif .created_at < $request.created_at then null
+      elif .created_at > $request.created_at then .
+      elif ((comment_id | valid_id) and ($request.id | valid_id)) then
+        if comment_id > $request.id then . else null end
+      else error("same-second provider/request ordering needs comment IDs") end
+  '
+}
+
 # Select the immutable comment-ID generation for the configured author's exact
 # request commands across a whole PR. Comment IDs, rather than pages or
 # timestamps, are the durable accounting unit: pagination can repeat an item,

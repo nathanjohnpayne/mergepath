@@ -18,6 +18,8 @@ The token-verifying wrappers inspect comment and review bodies before writing, i
 
 Manual Phase 4b handoffs hold while a current-head Codex review is in flight and report accounting's undispositioned finding count. The sensing and timeout-fallback contract is documented in `specs/review_feedback_accounting.md` (#2157).
 
+Provider-block diagnostics use the latest exact author request and same-second comment ordering rather than reusing an earlier account refusal. Requester and checker share that filter and retain newer Running/unknown holds; the contract and native cases are in `specs/codex_request_evidence.md` (#2337).
+
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`. Targeted bot-thread resolution accepts an explicit disposition and requires its marker before resolving exactly the selected thread (#2196).
 
 CodeRabbit's exact outside-diff section headings do not contribute finding severity; nested findings keep their own badges and configured policy. The bounded shared-classifier contract and regression coverage are documented in `specs/coderabbit_review_sensing.md` and `specs/review_feedback_accounting.md` (#1407).
