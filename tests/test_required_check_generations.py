@@ -207,7 +207,7 @@ class Recovery(unittest.TestCase):
 
 
 class Escalation(unittest.TestCase):
-    def test_stale_first_nomination_does_not_prevent_later_current_escalation(self):
+    def exercise_two_nominations(self, first_override=None):
         posts = []
         heads = {7: HEAD, 8: "c" * 40}
 
@@ -225,6 +225,8 @@ class Escalation(unittest.TestCase):
                           revision="d" * 40 if number == 7 else REVISION,
                           fingerprint="f" * 64, episode=100, state="escalate",
                           kind="unreadable", recovery_token="exact recovery token")
+            if number == 7 and first_override is not None:
+                report.update(first_override)
             return [dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
                 '<!-- mergepath-generation:v1 {} -->\n' + recovery.PREFIX + json.dumps(report) + " -->"})]
 
@@ -236,8 +238,18 @@ class Escalation(unittest.TestCase):
                 mock.patch.object(recovery, "pages", side_effect=pages), \
                 mock.patch.object(recovery, "write", side_effect=write):
             recovery.escalate("owner/repo", "7 8")
+        return posts
+
+    def test_stale_first_nomination_does_not_prevent_later_current_escalation(self):
+        posts = self.exercise_two_nominations()
         self.assertEqual([path for path, _ in posts], ["repos/owner/repo/issues/8/comments"])
-        self.assertIn(heads[8], posts[0][1]["body"])
+        self.assertIn("c" * 40, posts[0][1]["body"])
+
+    def test_malformed_first_tuple_retains_fail_closed_error(self):
+        for override in ({"repo": None}, {"repo": "owner"}, {"pr": "7"}, {"pr": True},
+                         {"pr": 0}, {"head": "short"}, {"revision": None}):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "malformed escalation tuple"):
+                self.exercise_two_nominations(override)
 
     def exercise(self, existing=False, already_posted=False):
         report = dict(repo="owner/repo", pr=7, head=HEAD, revision=REVISION, fingerprint="f" * 64,
