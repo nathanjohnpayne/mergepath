@@ -145,6 +145,20 @@ class TriggerGuardTests(unittest.TestCase):
                 with self.subTest(json_input=json_input, role=role), self.assertRaises(guard.Refused):
                     self.check(["api", "graphql", *fields], role=role)
 
+    def test_readable_cli_and_rest_files_require_runtime_snapshot(self):
+        body = self.root / "safe.md"
+        body.write_text("Safe comment")
+        payload = self.root / "safe.json"
+        payload.write_text(json.dumps({"body": body.read_text()}))
+        for args in (["pr", "comment", "123", "--body-file", str(body)],
+                     ["api", "repos/o/r/issues/123/comments", "--input", str(payload)],
+                     ["api", "repos/o/r/issues/123/comments", "-F", "body=@" + str(body)]):
+            with self.subTest(args=args):
+                _, meta = self.check(args, role="hook", state=False)
+                self.assertTrue(meta["guarded"])
+                self.assertTrue(meta["deferred"])
+                self.assertFalse(meta["trigger"])
+
     def test_graphql_keyword_fragment_spread_cannot_hide_comment_call(self):
         for fragment in ("query", "mutation", "subscription"):
             query = ('mutation { ...' + fragment + ' addComment(input:{subjectId:"P", '
@@ -253,7 +267,7 @@ class TriggerGuardTests(unittest.TestCase):
         _, metadata = self.check(args, role="hook", state=False)
         self.assertTrue(metadata["cli_stdin"])
 
-    def test_real_wrappers_refuse_accidental_trigger_before_gh_write(self):
+    def wrapper_fixture(self):
         fixture = self.root / "wrapper"
         (fixture / "scripts/lib").mkdir(parents=True)
         (fixture / "scripts/workflow").mkdir()
@@ -276,7 +290,14 @@ class TriggerGuardTests(unittest.TestCase):
         body = fixture / "body.md"
         body.write_text("The guard missed `@codex review` in prose.")
         env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "OP_PREFLIGHT_AUTHOR_PAT", "OP_PREFLIGHT_REVIEWER_PAT")}
-        env.update(PATH=str(fixture / "bin") + os.pathsep + env["PATH"], OP_PREFLIGHT_CACHE_DIR=str(fixture / "empty-cache"), OP_PREFLIGHT_AUTHOR_PAT="ghp_fixture_author", OP_PREFLIGHT_REVIEWER_PAT="ghp_fixture_reviewer", WRITE_LOG=str(fixture / "writes"), AUTH_LOG=str(fixture / "auth"), MERGEPATH_AGENT="codex")
+        # This fixture asserts native gh argv. REST transport has its own suite.
+        env.update(PATH=str(fixture / "bin") + os.pathsep + env["PATH"], OP_PREFLIGHT_CACHE_DIR=str(fixture / "empty-cache"), OP_PREFLIGHT_AUTHOR_PAT="ghp_fixture_author", OP_PREFLIGHT_REVIEWER_PAT="ghp_fixture_reviewer", WRITE_LOG=str(fixture / "writes"), AUTH_LOG=str(fixture / "auth"), MERGEPATH_AGENT="codex", MERGEPATH_GH_TRANSPORT="gh")
+        return fixture, env
+
+    def test_real_wrappers_refuse_accidental_trigger_before_gh_write(self):
+        fixture, env = self.wrapper_fixture()
+        body = fixture / "body.md"
+        authorize = fixture / "scripts/codex-review-request.sh"
         for role in ("author", "reviewer"):
             result = subprocess.run(["bash", str(fixture / f"scripts/gh-as-{role}.sh"), "--", "gh", "pr", "comment", "123", "--body-file", str(body)], env=env, capture_output=True, timeout=10)
             self.assertNotEqual(0, result.returncode, result.stderr)
@@ -294,6 +315,48 @@ class TriggerGuardTests(unittest.TestCase):
         result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "  @CoDeX  review\n"], env=env, capture_output=True, timeout=10)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["pr comment 123 --repo o/r --body @codex review"], (fixture / "writes").read_text().splitlines())
+
+    def test_real_wrappers_execute_frozen_read_inputs_and_clean_snapshots(self):
+        fixture, env = self.wrapper_fixture()
+        runtime = fixture / "runtime"
+        runtime.mkdir()
+        env["TMPDIR"] = str(runtime)
+        checker = fixture / "scripts/identity-check.sh"
+        checker.write_text('#!/bin/sh\ncp "$REPLACEMENT" "$ORIGINAL"\n')
+        gh = fixture / "bin/gh"
+        gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+name = args[args.index("--input") + 1] if "--input" in args else next(a[7:] for a in args if a.startswith("query=@"))
+Path(os.environ["WRITE_LOG"]).write_text(json.dumps({"input": name, "body": Path(name).read_text()}))
+''')
+        safe = "query { viewer { login } }"
+        mutation = 'mutation { addComment(input:{subjectId:"P",body:"@codex review"}) { clientMutationId } }'
+        original = fixture / "original"
+        replacement = fixture / "replacement"
+        for role in ("author", "reviewer"):
+            for json_input in (False, True):
+                with self.subTest(role=role, json_input=json_input):
+                    (fixture / "writes").unlink(missing_ok=True)
+                    original.write_text(json.dumps({"query": safe}) if json_input else safe)
+                    replacement.write_text(json.dumps({"query": mutation}) if json_input else mutation)
+                    env.update(ORIGINAL=str(original), REPLACEMENT=str(replacement))
+                    fields = ["--input", str(original)] if json_input else ["-F", "query=@" + str(original)]
+                    result = subprocess.run(["bash", str(fixture / f"scripts/gh-as-{role}.sh"), "--", "gh", "api", "graphql", *fields], env=env, capture_output=True, timeout=10)
+                    self.assertFalse(list(runtime.glob("gh-comment-guard.*")), "wrapper exit must clean snapshots on success or refusal")
+                    if role == "author":
+                        # Author API grammar separately forbids opaque GraphQL.
+                        self.assertEqual(2, result.returncode, result.stderr)
+                        self.assertIn(b"require one literal query", result.stderr)
+                        self.assertFalse((fixture / "writes").exists())
+                        continue
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual(replacement.read_text(), original.read_text())
+                    written = json.loads((fixture / "writes").read_text())
+                    self.assertNotEqual(str(original), written["input"])
+                    self.assertEqual(safe, json.loads(written["body"])["query"] if json_input else written["body"])
+                    self.assertFalse(Path(written["input"]).parent.exists(), "wrapper exit must remove the snapshot directory")
 
     def test_attached_short_options_preserve_supported_spellings(self):
         body = self.root / "attached.md"
