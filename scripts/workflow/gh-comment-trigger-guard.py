@@ -43,11 +43,17 @@ def graphql_comment_document(query):
                 unsupported_literal = True
         else:
             tokens.append(token)
-    comment = any(
-        token in GRAPHQL_COMMENTS and index + 1 < len(tokens) and tokens[index + 1] == "("
-        and (index == 0 or tokens[index - 1] not in ("query", "mutation", "subscription"))
-        for index, token in enumerate(tokens)
-    )
+    comment, depth = False, 0
+    for index, token in enumerate(tokens):
+        operation_name = (depth == 0 and index > 0
+                          and tokens[index - 1] in ("query", "mutation", "subscription"))
+        if (token in GRAPHQL_COMMENTS and index + 1 < len(tokens)
+                and tokens[index + 1] == "(" and not operation_name):
+            comment = True
+        if token == "{":
+            depth += 1
+        elif token == "}":
+            depth -= 1
     if comment and unsupported_literal:
         raise Refused("Unsupported GraphQL string escape in a comment mutation; no write performed.")
     return comment, literals
@@ -261,6 +267,8 @@ def inspect(argv, role, state=None):
             for value, at, prefix, typed in fields:
                 key, separator, body = value.partition("=")
                 if not separator:
+                    if len(key) > 2 and key.endswith("[]"):
+                        continue  # gh's valueless empty array has no body text.
                     raise Refused("GraphQL fields require an explicit key=value.")
                 if typed and body.startswith("@"):
                     body, replacement = file_body(body[1:])
