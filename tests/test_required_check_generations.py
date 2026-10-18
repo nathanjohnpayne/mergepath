@@ -472,6 +472,19 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
                             f"rcg_close owner/repo 7 {HEAD} '{CONTEXT}' \"$id\" success title clean")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(recovery.PREFIX, self.state()["runs"][0]["output"]["summary"])
+        self.assertEqual(self.state()["writes"], [["POST", 1], ["PATCH", 1]])
+        self.assertEqual(self.state()["runs"][0]["conclusion"], "failure")
+
+    def test_wrong_report_tuple_without_final_drift_cannot_publish_success(self):
+        report = self.path / "report.json"
+        report.write_text(json.dumps(dict(repo="owner/repo", pr=7, head="c" * 40,
+                                         revision=REVISION, state="readable")))
+        self.env["CR_EVIDENCE_REPORT"] = str(report)
+        result = self.shell(f"id=$(rcg_open owner/repo 7 {HEAD} '{CONTEXT}')\n"
+                            f"rcg_close owner/repo 7 {HEAD} '{CONTEXT}' \"$id\" success title clean")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state()["writes"], [["POST", 1]])
+        self.assertEqual(self.state()["runs"][0]["status"], "in_progress")
 
     def test_real_legacy_sweep_and_dispatch_open_before_evaluation(self):
         for filename, job, needle in [
@@ -489,6 +502,11 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
                 self.assertEqual(self.state()["writes"], [["POST", 1], ["PATCH", 1]])
 
     def test_legacy_sweep_closes_original_generation_when_head_moves_after_open(self):
+        (self.path / ".github").mkdir()
+        (self.path / ".github/review-policy.yml").write_text("coderabbit:\n  severity_gate:\n    enabled: true\n")
+        gate = self.path / "scripts/coderabbit-severity-gate.sh"
+        gate.write_text(gate.read_text().replace("echo 'Merge clearance: PASS'",
+                        f'exec "{ROOT}/scripts/coderabbit-severity-gate.sh" "$@"'))
         state = self.state()
         state["move_after_open"] = "c" * 40
         (self.path / "state.json").write_text(json.dumps(state))
