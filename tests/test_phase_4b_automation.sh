@@ -1021,7 +1021,7 @@ for adapter_state in absent non-executable; do
       P4B_FAKE_CAPTURE_FAIL="$missing_capture_fail" \
       P4B_ACCT_STATE_DIR="$WORK/missing-$adapter_state-$missing_case-state" \
       P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
-      bash "$ORCH" 1757 --repo o/r --author claude --reviewer nathanpayne-codex "${missing_args[@]}" \
+      bash "$ORCH" 1757 --repo o/r --author claude --reviewer nathanpayne-codex ${missing_args[@]+"${missing_args[@]}"} \
       --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
       2>"$WORK/missing-$adapter_state-$missing_case.stderr")" || rc=$?
     missing_payload_ok=false
