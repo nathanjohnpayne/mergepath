@@ -168,7 +168,8 @@ def escalate(repo, numbers):
         if not report or report.get("state") != "escalate":
             continue
         if (report["repo"], report["pr"], report["head"], report["revision"]) != (repo, number, head, tip):
-            raise ValueError("escalation tuple changed")
+            print(f"escalation tuple changed for PR #{number}; skipping", file=sys.stderr)
+            continue
         marker = f"<!-- mergepath-coderabbit-escalation:v1 {report['episode']} {report['fingerprint']} -->"
         comments = pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
         if any(c.get("user", {}).get("login") == "github-actions[bot]" and

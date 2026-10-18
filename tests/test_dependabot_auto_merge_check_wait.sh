@@ -583,7 +583,7 @@ run_pin() {  # <pr json> <commits json> <files json|-> <mode> [extra helper args
   ( cd "$ROOT" && PATH="$PIN_DIR/bin:$PATH" PIN_LOG="$PIN_DIR/gh.log" \
       PIN_PR="$pr" PIN_PR_MOVED="$PIN_DIR/pr-moved.json" PIN_COMMITS="$commits" \
       PIN_FILES="${files/#-/$PIN_DIR/files-real.json}" PIN_MODE="$mode" \
-      bash "$PIN_HELPER" --repo owner/repo --pr 1 "${files_arg[@]}" "$@" )
+      bash "$PIN_HELPER" --repo owner/repo --pr 1 ${files_arg[@]+"${files_arg[@]}"} "$@" )
 }
 
 pin_case() {  # <label> <expected rc> <expected status> <reason substring> <pr> <commits> <files|-> <mode> [args...]

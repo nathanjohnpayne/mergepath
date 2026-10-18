@@ -207,6 +207,38 @@ class Recovery(unittest.TestCase):
 
 
 class Escalation(unittest.TestCase):
+    def test_stale_first_nomination_does_not_prevent_later_current_escalation(self):
+        posts = []
+        heads = {7: HEAD, 8: "c" * 40}
+
+        def api(path):
+            if path.endswith("/commits/HEAD"):
+                return {"sha": REVISION}
+            number = int(path.rsplit("/", 1)[1])
+            return {"number": number, "head": {"sha": heads[number]}}
+
+        def pages(path, field=None):
+            if "/check-runs?" not in path:
+                return []
+            number = 7 if HEAD in path else 8
+            report = dict(repo="owner/repo", pr=number, head=heads[number],
+                          revision="d" * 40 if number == 7 else REVISION,
+                          fingerprint="f" * 64, episode=100, state="escalate",
+                          kind="unreadable", recovery_token="exact recovery token")
+            return [dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
+                '<!-- mergepath-generation:v1 {} -->\n' + recovery.PREFIX + json.dumps(report) + " -->"})]
+
+        def write(path, body):
+            posts.append((path, body))
+            return body
+
+        with mock.patch.object(recovery, "api", side_effect=api), \
+                mock.patch.object(recovery, "pages", side_effect=pages), \
+                mock.patch.object(recovery, "write", side_effect=write):
+            recovery.escalate("owner/repo", "7 8")
+        self.assertEqual([path for path, _ in posts], ["repos/owner/repo/issues/8/comments"])
+        self.assertIn(heads[8], posts[0][1]["body"])
+
     def exercise(self, existing=False, already_posted=False):
         report = dict(repo="owner/repo", pr=7, head=HEAD, revision=REVISION, fingerprint="f" * 64,
                       episode=100, state="escalate", kind="unrecognized", recovery_token="exact recovery token")
@@ -309,7 +341,10 @@ elif method=='PATCH':
  r=next(r for r in s['runs'] if r['id']==int(endpoint.rsplit('/',1)[1])); r.update(status=fields['status'],conclusion=fields['conclusion'],output={'summary':fields['output[summary]'],'title':fields['output[title]']}); s['writes'].append([method,r['id']])
 elif '/check-runs/' in endpoint: r=next(r for r in s['runs'] if r['id']==int(endpoint.rsplit('/',1)[1]))
 elif endpoint.endswith('/commits/HEAD'): r={'sha':s['revision']}
-elif endpoint.endswith('/pulls/7'): r={'head':{'sha':s['head']}}
+elif endpoint.endswith('/pulls/7'):
+ if s.get('move_after_open') and s['runs']:
+  s['head']=s.pop('move_after_open')
+ r={'head':{'sha':s['head']}}
 elif endpoint.endswith('/pulls'): r=[{'number':n,'head':{'sha':s['head']}} for n in s['heads']]
 elif endpoint.endswith('/pulls/7/comments') and s.get('provider_blocked'):
  r=[{'id':2001,'user':{'login':'coderabbitai[bot]'},'commit_id':s['head'],'body':'**⚠️ Potential issue** | **Major**\\nThis pointer can be null.','path':'file.sh','line':1}]
@@ -440,6 +475,20 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.state()["evaluated"], [1])
                 self.assertEqual(self.state()["writes"], [["POST", 1], ["PATCH", 1]])
+
+    def test_legacy_sweep_closes_original_generation_when_head_moves_after_open(self):
+        state = self.state()
+        state["move_after_open"] = "c" * 40
+        (self.path / "state.json").write_text(json.dumps(state))
+        self.env["PRS"] = "7"
+        result = self.shell(self.workflow_step("coderabbit-severity-gate.yml", "scheduled-sweep", "cr_surface_fp()"))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = self.state()
+        self.assertEqual(state["evaluated"], [1])
+        self.assertEqual(state["writes"], [["POST", 1], ["PATCH", 1]])
+        self.assertEqual(state["runs"][0]["head_sha"], HEAD)
+        self.assertEqual(state["runs"][0]["conclusion"], "failure")
+        self.assertIn("generation input changed", state["runs"][0]["output"]["title"])
 
     def test_consolidated_gate_opens_every_selected_context_before_evaluation(self):
         program = self.workflow_step("required-check-publisher.yml", "publish", "gate() {")
