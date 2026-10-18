@@ -173,7 +173,7 @@ fetch_history_array() {
 # request or cap reset; an unanswered expired request permits timeout fallback.
 ensure_codex_idle() {
   local repo="$1" num="$2" head="$3" policy_json="$4"
-  local bot author timeout comments reviews inline summary trigger response committed floor since enabled failure
+  local bot author timeout comments reviews inline summary trigger response timeline transition floor since enabled failure
   bot=$(jq -er '.codex.bot_login // "chatgpt-codex-connector[bot]" | select(type == "string" and length > 0)' <<<"$policy_json") || exit 3
   author=$(crqe_policy_author "$policy_json") || exit 3
   timeout=$(jq -er '.codex.review_timeout_seconds // 1800 | select(type == "number" and . > 0 and floor == .)' <<<"$policy_json") || exit 3
@@ -189,11 +189,13 @@ ensure_codex_idle() {
     [ $response, (.[] | select(.reviewed_shas == [$head]) | .created_at) ] | max // ""') || exit 3
   trigger=null
   if [[ "$enabled" != false ]]; then
-    committed=$(gh api "repos/$repo/commits/$head" --jq .commit.committer.date) || exit 3
-    [[ -n "$committed" && "$committed" != null ]] || exit 3
+    timeline=$(fetch_history_array "repos/$repo/issues/$num/timeline") || exit 3
+    transition=$(crqe_latest_head_transition "$timeline") || exit 3
     floor=$(($(date +%s) - timeout))
     since=$(date -u -r "$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$floor" +%Y-%m-%dT%H:%M:%SZ) || exit 3
-    [[ "$since" > "$committed" ]] || since="$committed"
+    # Only GitHub's transition can exclude a request on a prior forced head.
+    # Commit dates may be old or future; neither proves when this head arrived.
+    [[ "$since" > "$transition" ]] || since="$transition"
     trigger=$(crqe_select_trigger "$comments" "$author" "$since") || exit 3
     # A provider-owned refusal answers this request without claiming a review.
     # Older refusals and other identities cannot end a renewed request's wait.

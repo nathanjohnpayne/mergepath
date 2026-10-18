@@ -26,6 +26,9 @@ Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger
 
 CodeRabbit's exact outside-diff section headings do not contribute finding severity; nested findings keep their own badges and configured policy. The bounded shared-classifier contract and regression coverage are documented in `specs/coderabbit_review_sensing.md` and `specs/review_feedback_accounting.md` (#1407).
 
+Manual Phase 4b handoff request sensing uses the latest trusted force-push transition and its existing timeout window, independently of author-controlled commit dates. Fresh actual running/unknown reviews still hold rendering; unreadable transitions fail closed. The contract and native renderer coverage are in `specs/codex_request_evidence.md` and `tests/test_post_phase_4b_handoff.sh` (#2342).
+
+
 The CodeRabbit parser reports included-review availability through its mutable-comment freshness anchor and safety buffer. Agent-driven polling hands a refusal to Codex immediately, including when its duration is missing or malformed; current-head request deduplication remains intact. The timing contract and production-parser/virtual-clock coverage live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_wait_ratelimit_window.sh` (#2031).
 
 The waiter’s missing-deadline controls exercise real polling and probe consumers of an unknown duration, verify freshness fixture changes, and check successful, failed and opted-out Codex failover before the stall. Unsupported duration presentation remains fail-safe and documented in `specs/coderabbit_review_sensing.md`; the regression coverage is in `tests/test_coderabbit_wait_ratelimit_window.sh` (#2093–#2097).

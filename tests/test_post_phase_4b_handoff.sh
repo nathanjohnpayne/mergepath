@@ -117,6 +117,11 @@ if [ "$1" = "api" ]; then
     if [ -f "$f" ]; then jq -s '.' "$f"; else printf '[[]]'; fi
     exit 0
   fi
+  if [[ "$endpoint" == repos/*/issues/*/timeline ]]; then
+    [ "${MOCK_TIMELINE_UNREADABLE:-0}" != 1 ] || exit 1
+    printf '[%s]' "${MOCK_TIMELINE_JSON:-[]}"
+    exit 0
+  fi
   if [[ "$endpoint" == repos/*/commits/* ]]; then
     printf '%s' "${MOCK_HEAD_TIME:-2026-01-01T00:00:00Z}"
     exit 0
@@ -499,11 +504,26 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REQUEST=$(jq -nc --arg now "$NOW" '[{id:801,user:{login:"nathanjohnpayne"},created_at:$now,body:"@codex review"}]')
 RUNNING=$(jq -nc --arg now "$NOW" --arg head "$HEAD" \
   '[{id:802,user:{login:"chatgpt-codex-connector[bot]"},created_at:$now,updated_at:$now,body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `" + $head + "` | New commits |")}]')
-for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal; do
-  history='[]'; reviews='[]'; expected=0
+for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal before-force after-force running-after-force future-date-request future-date-running future-date-timeout timeline-unreadable malformed-transition; do
+  history='[]'; reviews='[]'; expected=0; timeline='[]'; head_time=2026-01-01T00:00:00Z
   case "$scenario" in
     running|batch-running) history="$RUNNING"; expected=5 ;;
     requested) history="$REQUEST"; expected=5 ;;
+    before-force|after-force|running-after-force|malformed-transition)
+      history="$REQUEST"
+      timeline=$(jq -nc --arg now "$NOW" --arg scenario "$scenario" '
+        [{event:"head_ref_force_pushed",created_at:(if $scenario == "malformed-transition" then "invalid"
+          else ($now | fromdateiso8601) + (if $scenario == "after-force" then -1 else 1 end) | todateiso8601 end)}]')
+      case "$scenario" in
+        after-force) expected=5 ;;
+        running-after-force) history=$(jq -nc --argjson request "$REQUEST" --argjson running "$RUNNING" '$request + $running'); expected=5 ;;
+        malformed-transition) expected=3 ;;
+      esac
+      ;;
+    future-date-request) history="$REQUEST"; head_time=2999-01-01T00:00:00Z; expected=5 ;;
+    future-date-running) history="$RUNNING"; head_time=2999-01-01T00:00:00Z; expected=5 ;;
+    future-date-timeout) history=$(jq '.[0].created_at="2026-01-02T00:00:00Z"' <<<"$REQUEST"); head_time=2999-01-01T00:00:00Z ;;
+    timeline-unreadable) history="$REQUEST"; expected=3 ;;
     terminal-usage|terminal-connection|stale-terminal|spoofed-terminal|renewed-request|terminal-after-running|running-after-terminal)
       history=$(jq -nc --argjson request "$REQUEST" --arg scenario "$scenario" --argjson running "$RUNNING" --arg now "$NOW" '
         ($now | fromdateiso8601) as $epoch
@@ -537,6 +557,8 @@ for scenario in running requested completed stale-summary timed-out history-unre
   [ "$scenario" != invalid-accounting ] || gate=true
   rc=0
   OUT=$(MOCK_HISTORY_UNREADABLE="$([ "$scenario" = history-unreadable ] && echo 1 || echo 0)" \
+    MOCK_TIMELINE_UNREADABLE="$([ "$scenario" = timeline-unreadable ] && echo 1 || echo 0)" \
+    MOCK_TIMELINE_JSON="$timeline" MOCK_HEAD_TIME="$head_time" \
     MOCK_HEAD_MOVED="$([ "$scenario" = head-moved ] && echo 1 || echo 0)" \
     MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \
     "$SCRIPT" "${refs[@]}" 2>"$WORKDIR/error") || rc=$?
