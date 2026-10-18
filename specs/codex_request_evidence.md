@@ -1,5 +1,7 @@
 # Blocked Codex request evidence (#1276)
 
+The moving-head CI-pickup override resolves `codex.request_requires_check` through the shared YAML parser, including flow mappings and quoted keys. An absent key retains the repo-lint workflow signal, a nonempty string selects that exact check name, and an explicit empty string or null disables the signal. Validation occurs only inside the new-request write guard, preserving disabled and no-request exits. An unreadable or invalid present setting fails that write path before a trigger is posted; an absent bootstrap policy file retains the workflow default.
+
 The requester's entry decision reads `codex.enabled` and `codex.request_by_default` from the target repository's governing base policy, materialized by `resolve_base_policy.sh` even when the script runs from a different checkout (#2273). Existing defaults and field readers remain: disabled Codex skips; an enabled gated PR requests; an enabled under-threshold PR follows `request_by_default`; an unreadable governing policy requests conservatively without waiving the later write-budget fence. `tests/test_codex_review_request_entry.sh` exercises conflicting foreign-checkout and target settings.
 
 The normal external merge-clearance delegate opts into informational request evidence on approval/external-clearance blocks. The existing BLOCKED reason, approval and clearance predicates, exit statuses, carry-forward, query modes, readiness and successful paths remain unchanged. No acknowledgement reads occur outside this opted-in block path.
