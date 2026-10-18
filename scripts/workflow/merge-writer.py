@@ -28,6 +28,21 @@ URL = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
               'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
+# Reviewed enrollment in the trusted installed launcher, never target policy.
+# Immutable repository/owner IDs prevent a reused name or transferred repo from
+# selecting credentialed checker code. New targets require explicit enrollment.
+TRUSTED_TARGETS = {
+    'nathanjohnpayne/mergepath': (1190939344, 23488723),
+    'nathanjohnpayne/matchline': (1218653054, 23488723),
+    'nathanjohnpayne/nathanpaynedotcom': (1165945000, 23488723),
+    'nathanjohnpayne/overridebroadway': (1165157491, 23488723),
+    'nathanjohnpayne/friends-and-family-billing': (1165945849, 23488723),
+    'nathanjohnpayne/swipewatch': (1165945748, 23488723),
+    'nathanjohnpayne/tadlockpsychiatry': (1226654565, 23488723),
+    'nathanjohnpayne/fiveacross': (1292606950, 23488723),
+}
+
+SYSTEM_PATH = ('/usr/bin', '/bin', '/usr/sbin', '/sbin')
 TIMEOUT = 300
 
 
@@ -51,6 +66,12 @@ def trusted_tools(argv):
     for name, value in tools.items():
         if not value or not Path(value).is_absolute() or ROOT in Path(value).resolve().parents:
             raise ValueError(f'trusted operator toolchain is missing {name}')
+    # Optional YAML acceleration is part of the explicit operator tool set.
+    yq = shutil.which('yq')
+    if yq:
+        if not Path(yq).is_absolute() or ROOT in Path(yq).resolve().parents:
+            raise ValueError('trusted operator toolchain has an unsafe yq')
+        tools['yq'] = yq
     return tools
 
 
@@ -138,7 +159,8 @@ def merge_preflight(argv, command, tools, task):
     tool_dir.mkdir()
     for name, executable in tools.items():
         (tool_dir / name).symlink_to(executable)
-    environment['PATH'] = str(tool_dir) + os.pathsep + environment['PATH']
+    # Unlisted helpers use fixed OS search directories, never inherited PATH.
+    environment['PATH'] = os.pathsep.join((str(tool_dir), *SYSTEM_PATH))
 
     def read(*args):
         result = subprocess.run([gh, *args], env=environment, text=True,
@@ -171,6 +193,13 @@ def merge_preflight(argv, command, tools, task):
     repository = read('api', f'repos/{repo}')
     if repository.get('full_name', '').lower() != repo.lower() or not repository.get('default_branch'):
         raise ValueError('target repository/default branch is unreadable')
+    enrolled = TRUSTED_TARGETS.get(repo.lower())
+    target_owner = repository.get('owner')
+    if (not enrolled or type(repository.get('id')) is not int or not isinstance(target_owner, dict)
+            or type(target_owner.get('id')) is not int
+            or (repository['id'], target_owner['id']) != enrolled
+            or target_owner.get('login') != os.environ.get('GH_AS_AUTHOR_RECORD_IDENTITY')):
+        raise ValueError('repository is not an enrolled target for this verified author; refusing checker download')
     from urllib.parse import quote
     commit = read('api', f'repos/{repo}/commits/{quote(repository["default_branch"], safe="")}')
     source_sha = commit.get('sha', '')
