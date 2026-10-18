@@ -43,6 +43,11 @@ mkdir -p "$TMP/bin" "$TMP/fixtures"
 
 cat >"$TMP/bin/gh" <<'GH'
 #!/usr/bin/env bash
+if [ "${1:-}" = api ] && [ "${2:-}" = --help ]; then
+  # This integration fixture models a successfully detected legacy CLI.
+  printf 'Usage: gh api <endpoint> [flags]\n'
+  exit 0
+fi
 set -euo pipefail
 
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
