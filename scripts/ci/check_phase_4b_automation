@@ -44,6 +44,9 @@ REQUIRED_FILES=(
   "scripts/phase-4b/heartbeat.sh"
   "tests/test_phase_4b_heartbeat.sh"
   "tests/test_phase_4b_immutable_input.sh"
+  "tests/test_coderabbit_wait_status_probe.sh"
+  "tests/fixtures/coderabbit_status_refusal.json"
+  "tests/fixtures/coderabbit_quota_refusal.json"
   "scripts/phase-4b/verdict.schema.json"
   "scripts/lib/codex-failure-markers.sh"
   "scripts/lib/gh-api-array.sh"
@@ -143,6 +146,7 @@ bash "$REPO_ROOT/$TEST" --rate-limit-only
 bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-refusal-only
 bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --marker-led-heading-only
 bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-active-only
+bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --phase4b-quota-only
 "$REPO_ROOT/$TEST"
 bash "$REPO_ROOT/$TEST" --heartbeat-only
 bash "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh"

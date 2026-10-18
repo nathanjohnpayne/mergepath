@@ -14,6 +14,8 @@ When you add a `tests/test_*` reference to a wrapper that the graph declares, de
 
 The fast lane is itself a shard matrix balanced by measured step time: a new check step in `lint_fast` is pinned to exactly one shard with `if: matrix.shard == N` (pick the shard with the smallest measured sum), and `tests/test_repo_lint_optimization.sh` fails on an unpinned check or a pin naming a shard the matrix does not declare.
 
+The Phase 4b self-test wrapper runs all four focused CodeRabbit refusal modes: status refusal, marker-led heading, active status and Phase 4b quota refusal. Its live check requires the probe script and both native refusal fixtures; the dependency graph maps fixture changes to that wrapper so the existing deep CI step reruns their probes. The propagation manifest already carries the paired fixtures with the probe and CI kit.
+
 Checks with separable repository assertions and implementation regression suites should expose explicit live and self-test modes. The fast lane invokes the live mode, deep CI invokes the self-test mode, and the no-argument behavior remains compatible for consumers during propagation skew. The canonical contract and regression coverage live in `specs/repo_lint_execution.md` and `tests/test_repo_lint_optimization.sh`.
 
 ## Pre-push hook

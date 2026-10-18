@@ -1227,18 +1227,38 @@ fi
 REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds)
 REQUEST_MIN_HEAD_AGE_SECONDS=${REQUEST_MIN_HEAD_AGE_SECONDS:-300}
 # REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
-# off (key present and empty). codex_field returns empty for both absent and
-# empty, so the presence test is made separately.
+# off (key present and empty). Resolve value and presence together as YAML
+# inside the write guard, preserving disabled/no-request entry paths.
 REQUEST_WORKFLOW_NAME=repo-lint
 REQUEST_WORKFLOW_PATH=.github/workflows/repo_lint.yml
-REQUEST_REQUIRES_CHECK=$(codex_field request_requires_check)
-if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
-  REQUEST_SIGNAL_MODE=check
-elif [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; then
-  REQUEST_SIGNAL_MODE=off
-else
-  REQUEST_SIGNAL_MODE=workflow
-fi
+REQUEST_REQUIRES_CHECK=""
+REQUEST_SIGNAL_MODE=workflow
+resolve_request_check_signal() {
+  local policy selection
+  # Preserve the bootstrap default when there is no policy file.
+  [ -f "$CONFIG" ] || return 0
+  policy=$(policy_yaml_to_json "$CONFIG") || {
+    echo "ERROR: codex.request_requires_check policy could not be parsed" >&2
+    exit 3
+  }
+  selection=$(printf '%s' "$policy" | jq -ce '
+    if . == null then {} else . end
+    | if type != "object" then error("policy must be a mapping") else . end
+    | (.codex // {})
+    | if type != "object" then error("codex must be a mapping") else . end
+    | if has("request_requires_check") then
+        .request_requires_check
+        | if . == null or . == "" then {mode:"off",name:""}
+          elif type == "string" then {mode:"check",name:.}
+          else error("request_requires_check must be a check name or empty") end
+      else {mode:"workflow",name:""} end
+  ') || {
+    echo "ERROR: codex.request_requires_check must name a check or be empty" >&2
+    exit 3
+  }
+  REQUEST_SIGNAL_MODE=$(printf '%s' "$selection" | jq -r .mode)
+  REQUEST_REQUIRES_CHECK=$(printf '%s' "$selection" | jq -r .name)
+}
 
 POLL_INTERVAL_SECONDS=15
 ACK_POLL_INTERVAL_SECONDS=5
@@ -2212,6 +2232,7 @@ MOVING_HEAD_CHECK_STATUS=""
 MOVING_HEAD_ANCHOR=""
 refuse_moving_head_unless_allowed() {
   local reasons="" pushed_epoch now_epoch age runs status allow=false
+  resolve_request_check_signal
   # A malformed knob is a configuration error on the write path: refuse
   # before the guard's own reads and before any write (#2253; it used to be
   # checked at load time, which also failed the no-write paths).

@@ -1415,6 +1415,37 @@ test_guard_policy_knobs_disable_signals() {
   [ "$FAIL" -ne "$before" ] || pass "MH7: request_min_head_age_seconds / request_requires_check are honoured, and 0 / empty disable each signal"
 }
 
+# #2340: value and presence use YAML for flow mappings and quoted keys too.
+test_guard_check_signal_yaml_forms() {
+  refresh_head_dates
+  local dir rc shape before=$FAIL
+  for shape in flow-name quoted-name flow-empty flow-null flow-absent; do
+    dir=$(make_case "guard-yaml-$shape")
+    case "$shape" in
+      flow-name) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: not-lint}' >"$dir/.github/review-policy.yml" ;;
+      quoted-name) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex:' '  request_by_default: true' '  "request_requires_check": not-lint' >"$dir/.github/review-policy.yml" ;;
+      flow-empty) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: ""}' >"$dir/.github/review-policy.yml" ;;
+      flow-null) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: null}' >"$dir/.github/review-policy.yml" ;;
+      flow-absent) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true}' >"$dir/.github/review-policy.yml" ;;
+    esac
+    case "$shape" in
+      *name)
+        rc=$(CODEX_TEST_CHECK_RUNS=missing run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] || fail "$shape: missing named check must refuse (rc=$rc)"
+        ;;
+      flow-empty|flow-null)
+        rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+        [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] || fail "$shape: explicit empty must disable CI pickup (rc=$rc)"
+        ;;
+      flow-absent)
+        rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] || fail "$shape: absent key must retain the workflow signal (rc=$rc)"
+        ;;
+    esac
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2340: flow/quoted check names and absent/explicit-empty CI pickup meanings are preserved"
+}
+
 # MH8: an automatic caller (CI failover on a provider event) is exempt. It
 # fires on CodeRabbit's rate limit, not on a push the agent is amending, and a
 # refusal would strand the head with no caller left to re-request.
@@ -1671,6 +1702,7 @@ test_guard_reports_both_reasons
 test_guard_accepts_queued_check
 test_guard_unreadable_check_runs_fails_open
 test_guard_policy_knobs_disable_signals
+test_guard_check_signal_yaml_forms
 test_guard_exempts_automatic_caller
 test_guard_does_not_run_on_no_write_paths
 test_guard_applies_in_polling_mode
