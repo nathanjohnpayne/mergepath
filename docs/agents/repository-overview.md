@@ -12,6 +12,8 @@ The read-only credential-isolation audit reports matched authority names from it
 
 Owner-admin request sensing reuses the governing canonical Codex ledger for provably completed earlier-head requests, matching the unchanged observed request generation. Current-head review gates remain separate, and historical/current running or unknown work, ambiguity and edited evidence still block. Runtime/tests and ledger dependencies propagate together; `specs/codex_request_evidence.md` and `tests/test_owner_admin_override.py` own the contract and regression evidence (#2401).
 
+The ordinary merge writer enrolls safely selected optional Ruby and yq tools before replacing PATH, so an external Ruby/YAML fallback remains reachable. Candidate-owned or broken parser controls cannot authorize writes; `specs/codex_request_evidence.md` and `tests/test_merge_writer.py` own this narrow tool-enrollment contract (#2417).
+
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
