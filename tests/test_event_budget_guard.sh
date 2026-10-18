@@ -13,8 +13,8 @@
 #
 # Per workflow, the cases are:
 #   below the threshold   the run skips the evaluation, publishes no green,
-#                         and leaves the publisher's back-off red (or, for a
-#                         relay-free archive-relay source, nothing at all);
+#                         and leaves the publisher's back-off red; the archive relay
+#                         always attempts binding for every origin;
 #                         a job-native required run is non-failing only when
 #                         the Checks-API lineage is confirmed to block;
 #   above the threshold   the run evaluates as before;
@@ -383,7 +383,7 @@ printf 'resolver %s\n' "$2" >>"$GATE_LOG"
 if [ "${RESOLVER_MODE:-}" = ratelimit ]; then
   echo "gh: API rate limit exceeded for installation. (HTTP 403)" >&2; exit 3
 fi
-jq -nc '{publish_head_sha:"1111111111111111111111111111111111111111", is_fork:false, requires_relay:false, pr_actor:"x", source_event:"pull_request", source_head_sha:"1111111111111111111111111111111111111111"}'
+jq -nc '{publish_head_sha:"1111111111111111111111111111111111111111", is_fork:false, requires_relay:true, pr_actor:"x", source_event:"pull_request", source_head_sha:"1111111111111111111111111111111111111111"}'
 SH
 chmod +x "$T/resolver.sh"
 relay_event() {  # <event> <head repo id> <branch>
@@ -394,8 +394,8 @@ relay_event() {  # <event> <head repo id> <branch>
 relay() { step "$T/steps/relay-source.sh" GITHUB_EVENT_PATH="$T/relay-event.json" SOURCE_RUN_ID=501 SOURCE_RESOLVER="$T/resolver.sh" "$@"; }
 fresh; relay_event pull_request_review 100 feature/x
 relay "$SHORT" && rc=0 || rc=$?
-check "below the threshold: a same-repository source is not bound and nothing is written" \
-  '[ "$rc" = 0 ] && [ -z "$(gates)" ] && [ "$(output source_bound)" = false ] && [ "$(output requires_relay)" = false ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
+check "below the threshold: a same-repository source still binds its one-shot relay" \
+  '[ "$rc" = 0 ] && [ "$(gates)" = "resolver 41" ] && [ "$(output source_bound)" = true ] && [ "$(output requires_relay)" = true ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
 fresh; relay_event pull_request_review 100 feature/x
 relay "$PLENTY" && rc=0 || rc=$?
 check "above the threshold: the source is bound as before" '[ "$rc" = 0 ] && [ "$(gates)" = "resolver 41" ] && [ "$(output source_bound)" = true ]'
@@ -410,8 +410,8 @@ for shape in "fork:pull_request:200:feature/x" "issue_comment:issue_comment:100:
 done
 fresh; relay_event pull_request 100 feature/x
 relay "$PLENTY" RESOLVER_MODE=ratelimit && rc=0 || rc=$?
-check "rate limit mid-run, relay-free source: one binding attempt, no retry, no write, green" \
-  '[ "$rc" = 0 ] && [ "$(gates)" = "resolver 41" ] && [ "$(output source_bound)" = false ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
+check "rate limit mid-run, same-repository source: one binding attempt, no retry, no success" \
+  '[ "$rc" = 3 ] && [ "$(gates)" = "resolver 41" ] && [ -z "$(output source_bound)" ] && ! grep -qE "^(POST|PATCH)" "$T/state/calls"'
 fresh; relay_event pull_request 200 feature/x
 relay "$PLENTY" RESOLVER_MODE=ratelimit && rc=0 || rc=$?
 check "rate limit mid-run, relay-capable source: one binding attempt, then the failure path" '[ "$rc" = 3 ] && [ "$(gates)" = "resolver 41" ]'

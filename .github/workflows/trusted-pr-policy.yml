@@ -371,7 +371,7 @@ jobs:
           }
 
           MARKER="<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
-          ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
+          ALREADY=$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --jq '.[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
             # Fence the complete event pair before publishing its diagnostic
             # marker. Receivers independently verify the live pair.

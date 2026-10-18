@@ -115,18 +115,6 @@ jobs:
           REPO: ${{ github.repository }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
           SOURCE_RESOLVER: ${{ steps.source_resolver.outputs.path }}
-          # Budget guard knobs (#2286), read by
-          # scripts/workflow/installation-budget.sh. One binding costs one
-          # request (two when the run lists no PR; measured on #2294's
-          # source runs). The reserve is the publisher's own floor for one
-          # event-head evaluation (60 per PR plus its 100 reserve) plus room
-          # for the skip-path writes of the other gate workflows the same
-          # review event starts, so an event workflow stops spending before
-          # the publisher has to.
-          BUDGET_PER_EVAL_REQUESTS: "2"
-          BUDGET_RESERVE_REQUESTS: "200"
-          BUDGET_PER_EVAL_GRAPHQL_POINTS: "0"
-          BUDGET_GRAPHQL_RESERVE_POINTS: "0"
         run: |
           set -euo pipefail
           title=$(jq -r '.workflow_run.display_title // ""' "$GITHUB_EVENT_PATH")
@@ -138,60 +126,17 @@ jobs:
               ;;
           esac
           source_run=$(jq -c '.workflow_run' "$GITHUB_EVENT_PATH")
-          # Budget guard (#2286). This relay runs after EVERY Codex P1 Gate
-          # run, and for a same-repository PR it does nothing but bind the
-          # source (one or two requests) and find the PR's native gate job
-          # owns its check. In the 24 hours after #2225 that binding failed
-          # 209 times on an installation budget other workflows had already
-          # emptied. Whether a source run can need the relay at all is
-          # decided from the event payload alone, conservatively: only a
-          # pull_request* run whose head repository IS this repository, on a
-          # branch that is not Dependabot's, is relay-free (a fork head
-          # repository, a Dependabot branch, an issue_comment run, or any
-          # missing field keeps the relay). Only a relay-free source is ever
-          # skipped, and only while the budget cannot cover this binding plus
-          # the reserve kept for the gates, so the skip writes nothing and
-          # there is nothing for anything to re-evaluate. A relay-capable
-          # source always runs as before: the relay is the only writer of
-          # its PR's required context and of the one-shot archive records,
-          # which a skip would lose.
-          relay_free=false
-          src_event=$(jq -r '.workflow_run.event // ""' "$GITHUB_EVENT_PATH")
-          src_repo_id=$(jq -r '.workflow_run.repository.id // ""' "$GITHUB_EVENT_PATH")
-          src_head_repo_id=$(jq -r '.workflow_run.head_repository.id // ""' "$GITHUB_EVENT_PATH")
-          src_branch=$(jq -r '.workflow_run.head_branch // ""' "$GITHUB_EVENT_PATH")
-          case "$src_event" in
-            pull_request|pull_request_review|pull_request_review_comment)
-              if [[ "$src_repo_id" =~ ^[1-9][0-9]*$ ]] && [ "$src_head_repo_id" = "$src_repo_id" ] \
-                  && [ -n "$src_branch" ] && [[ "$src_branch" != dependabot* ]]; then
-                relay_free=true
-              fi
-              ;;
-          esac
-          if [ "$relay_free" = true ]; then
-            if [ -r scripts/workflow/installation-budget.sh ]; then
-              # shellcheck source=scripts/workflow/installation-budget.sh
-              . scripts/workflow/installation-budget.sh
-              ib_read "$BUDGET_PER_EVAL_REQUESTS" "$BUDGET_RESERVE_REQUESTS" \
-                "$BUDGET_PER_EVAL_GRAPHQL_POINTS" "$BUDGET_GRAPHQL_RESERVE_POINTS"
-              if ! ib_affordable 1; then
-                echo "::notice::Budget guard (#2286): $rl_remaining REST request(s) remain until ${RATE_LIMIT_RESET_ISO:-the window resets}, short of this binding plus the $reserve-request reserve. Source run $SOURCE_RUN_ID is a same-repository, non-Dependabot $src_event run, so PR #$pr's native gate job owns its check and the relay has nothing to do; not binding it. Nothing is written."
-                echo "source_bound=false" >> "$GITHUB_OUTPUT"
-                echo "requires_relay=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            else
-              echo "::notice::scripts/workflow/installation-budget.sh is not on the default branch yet; binding without the budget guard (#2286)."
-            fi
-          fi
+          # Every origin needs the trusted relay for its required verdict
+          # and one-shot archive. A low budget cannot make a same-repository
+          # source relay-free; let indeterminate binding fail closed below.
           # The resolver's rc 3 means an API read was indeterminate and may be
           # retried; rc 0 (bound) and rc 4 (positively not bound) are verdicts.
           # A single transient 5xx here used to fail the whole relay and leave
           # the required gate to the scheduled sweep, so retry on the same
           # bounded schedule the failure publisher below already uses. An
           # installation rate-limit failure is not transient inside this run
-          # (#2286): it stops the retries, and for a relay-free source it ends
-          # the run with nothing to publish.
+          # (#2286): stop retries and retain the source-resolution failure
+          # path; never claim a relay-free success for an unbound source.
           binding=""
           bind_rc=3
           bind_err=$(mktemp)
@@ -205,12 +150,6 @@ jobs:
             [ "$bind_rc" -eq 0 ] && break
             [ "$bind_rc" -eq 4 ] && break
             if grep -qiE 'rate limit (already )?exceeded for installation' "$bind_err" 2>/dev/null; then
-              if [ "$relay_free" = true ]; then
-                echo "::notice::The installation API budget is exhausted (#2286); source run $SOURCE_RUN_ID is relay-free, so PR #$pr's native gate job owns its check. Stopping without a write."
-                echo "source_bound=false" >> "$GITHUB_OUTPUT"
-                echo "requires_relay=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
               echo "::error::The installation API budget is exhausted (#2286); not retrying the binding."
               break
             fi
