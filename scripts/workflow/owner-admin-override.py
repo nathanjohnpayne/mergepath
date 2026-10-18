@@ -247,7 +247,69 @@ def response_anchor(body, head):
     return bool(match and head.startswith(match[1].lower()))
 
 
-def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
+def historical_request_ledger(repository, number, head):
+    """Use the governing canonical timeline; never infer request heads."""
+    script = Path(__file__).resolve().parents[1] / 'codex-review-ledger.sh'
+    result = subprocess.run([str(script), '--repo', repository, '--expect-head', head, str(number)],
+                            capture_output=True, text=True, check=True, timeout=300)
+    return json.loads(result.stdout)
+
+
+def historical_requests_completed(ledger, comments, head, author, bot, at=None, repository=None):
+    """Terminal observation only, with the same observed request generation."""
+    try:
+        if (not isinstance(ledger, dict) or ledger['head_sha'] != head
+                or ledger['author'] != author or ledger['bot'] != bot
+                or (repository is not None and ledger['repo'] != repository)):
+            return False
+        observed = {}
+        for comment in comments:
+            if comment.get('user', {}).get('login') != author or comment.get('body', '').lower() != '@codex review':
+                continue
+            identity, created = comment['id'], comment['created_at']
+            if (type(identity) is not int or identity <= 0
+                    or comment.get('updated_at', created) != created):
+                return False
+            timestamp(created)
+            if identity in observed and observed[identity] != created:
+                return False
+            observed[identity] = created
+        requests, responses = ledger['requests'], ledger['responses']
+        if not observed or not isinstance(requests, list) or not isinstance(responses, list):
+            return False
+        counted = [row for row in requests if row['counted'] is True]
+        if (any(type(row['counted']) is not bool for row in requests)
+                or any(type(row['id']) is not int or row['id'] <= 0 for row in counted)):
+            return False
+        if len(counted) != len(observed) or {row['id']: row['created_at'] for row in counted} != observed:
+            return False
+        by_id = {row['rid']: row for row in responses}
+        if len(by_id) != len(responses):
+            return False
+        for request in requests:
+            if request['outcome'] != 'attributed' or not request['responses']:
+                return False
+            for identity in request['responses']:
+                response = by_id[identity]
+                if (not isinstance(response['anchor'], str) or not re.fullmatch('[0-9a-f]{40}', response['anchor'])
+                        or response['tie'] is not False or response['mixed_heads'] is not False
+                        or response['anchor_conflict'] is not False
+                        or timestamp(response['first_at']) <= timestamp(request['created_at'])
+                        or (at is not None and timestamp(response['first_at']) > timestamp(at))):
+                    return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def substantive_review(review, inline, bot):
+    replies = [comment for comment in inline if comment.get('pull_request_review_id') == review.get('id')]
+    return bool(review.get('body', '').strip() or not replies
+                or any(not comment.get('in_reply_to_id') and comment.get('user', {}).get('login') == bot
+                       for comment in replies))
+
+
+def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT, *, ledger=None, repository=None):
     """Observe unanswered requests without granting response clearance."""
     # Edited author/bot comments no longer prove their pre-merge request/status.
     # Keep that uncertainty blocking instead of deleting possible requests.
@@ -266,30 +328,76 @@ def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     requests = [comment['created_at'] for comment in comments
                 if comment.get('user', {}).get('login') == author
                 and comment.get('body', '').lower() == '@codex review']
-    responses = [review['submitted_at'] for review in reviews
-                 if review.get('user', {}).get('login') == bot and review.get('commit_id') == head
-                 and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
-                      or any(comment.get('pull_request_review_id') == review.get('id') and not comment.get('in_reply_to_id')
-                             and comment.get('user', {}).get('login') == bot for comment in inline))]
-    responses += [comment['created_at'] for comment in comments
-                  if comment.get('user', {}).get('login') == bot and response_anchor(comment.get('body', ''), head)]
+    if any(comment.get('user', {}).get('login') == author
+           and comment.get('body', '').lower() == '@codex review'
+           and comment.get('updated_at', comment.get('created_at')) != comment.get('created_at')
+           for comment in comments):
+        return True
+    def response_times(anchor):
+        return ([review['submitted_at'] for review in reviews
+                 if review.get('user', {}).get('login') == bot and review.get('commit_id') == anchor
+                 and substantive_review(review, inline, bot)]
+                + [comment['created_at'] for comment in comments
+                   if comment.get('user', {}).get('login') == bot and response_anchor(comment.get('body', ''), anchor)])
+
+    responses = response_times(head)
     summaries = []
+    historical_summaries = {}
+    known_heads = {head} | {review['commit_id'] for review in reviews
+                            if isinstance(review.get('commit_id'), str)
+                            and re.fullmatch('[0-9a-f]{40}', review['commit_id'])}
     for comment in comments:
         body = comment.get('body', '')
         if comment.get('user', {}).get('login') != bot or not body.startswith('<!-- codex-pull-request-review-summary -->'):
             continue
         row = re.search(r'(?m)^\|\s*📝\s*\*\*Code Review\*\*\s*\|([^|\n]+)\|\s*`([0-9a-f]{7,40})`\s*\|[^|\n]+\|\s*$', body, re.I)
-        if row and head.lower().startswith(row[2].lower()):
+        if not row:
+            return True  # Unreadable provider status cannot prove idleness.
+        if row:
             status = 'completed' if re.search(r'\*\*Completed\*\*', row[1], re.I) else 'running' if re.search(r'\*\*Running\*\*', row[1], re.I) else 'unknown'
-            summaries.append((comment.get('updated_at', comment['created_at']), comment.get('id', 0), status))
+            item = (comment.get('updated_at', comment['created_at']), comment.get('id', 0), status)
+            anchor = row[2].lower()
+            matches = [known for known in known_heads if known.startswith(anchor)]
+            if len(matches) > 1:
+                return True
+            anchor = matches[0] if matches else anchor
+            historical_summaries[anchor] = max(item, historical_summaries.get(anchor, item))
+            if head.lower().startswith(anchor):
+                summaries.append(item)
+    for anchor, item in historical_summaries.items():
+        if item[2] not in ('running', 'unknown'):
+            continue
+        terminal = response_times(anchor)
+        if not terminal or item[0] >= max(terminal):
+            return True
     summary = max(summaries) if summaries else None
     if summary and summary[2] == 'completed':
         responses.append(summary[0])  # Terminal delivery, never merge clearance.
     if requests and (not responses or max(requests) >= max(responses)):
-        return True
+        return not historical_requests_completed(ledger, comments, head, author, bot, at, repository)
     if summary and summary[2] == 'running' and (not responses or summary[0] >= max(responses)):
         return True
     return False
+
+
+def observe_codex_inflight(comments, reviews, inline, head, author, repository, number, at=None, bot=BOT):
+    if not codex_inflight(comments, reviews, inline, head, author, at, bot):
+        return False
+    # Only a durable historical response warrants the extra canonical read.
+    # Summary-only history remains ambiguous; it cannot manufacture a response.
+    if not any(review.get('user', {}).get('login') == bot and review.get('commit_id') != head
+               and substantive_review(review, inline, bot) for review in reviews) and not any(
+               comment.get('user', {}).get('login') == bot and re.search('reviewed commit', comment.get('body', ''), re.I)
+               for comment in comments):
+        return True
+    try:
+        ledger = historical_request_ledger(repository, number, head)
+        if not isinstance(ledger, dict) or type(ledger.get('pr')) is not int or ledger['pr'] != int(number):
+            return True
+    except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return True
+    return codex_inflight(comments, reviews, inline, head, author, at, bot,
+                          ledger=ledger, repository=repository)
 
 
 def governing_bot(gh, repository, base):
@@ -474,7 +582,8 @@ def prepare(argv, *, check_only=False):
         comments = pages(f'issues/{number}/comments')
         reviews = pages(f'pulls/{number}/reviews')
         inline = pages(f'pulls/{number}/comments')
-        inflight = codex_inflight(comments, reviews, inline, head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'], bot=bot)
+        inflight = observe_codex_inflight(comments, reviews, inline, head,
+                                         os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'], repository, number, bot=bot)
         if inflight and not record['allow_codex_inflight']:
             raise ValueError('an unanswered Codex request requires explicit owner authorization')
         return comments, escalation, inflight
@@ -548,9 +657,13 @@ def audit(payload):
                 continue
             if (record['observed_fresh_escalation'] or payload.get('needs_human_review_at_merge') is True) and not record['allow_needs_human_review']:
                 continue
-            if (record['observed_codex_inflight'] or codex_inflight(
+            match = re.fullmatch(r'https://github.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)', pr['html_url'])
+            if not match:
+                continue
+            if (record['observed_codex_inflight'] or observe_codex_inflight(
                     payload['comments'], payload['reviews'], payload['inline_comments'],
-                    pr['head']['sha'], author, pr['merged_at'], bot=record['observed_codex_bot_login'])) and not record['allow_codex_inflight']:
+                    pr['head']['sha'], author, *match.groups(), pr['merged_at'],
+                    bot=record['observed_codex_bot_login'])) and not record['allow_codex_inflight']:
                 continue
             return {'recorded_override': True, 'comment_url': comment['html_url'], 'record': record}
         except (ValueError, KeyError, TypeError):

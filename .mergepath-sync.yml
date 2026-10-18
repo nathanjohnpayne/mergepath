@@ -1229,6 +1229,7 @@ paths:
     consumers: all
     requires:
       - "scripts/workflow/owner-admin-override.py"
+      - "scripts/lib/codex-review-ledger.sh"  # native attribution fixtures (#2401)
       - "scripts/gh-as-author.sh"  # production writer-boundary regressions
 
   - path: tests/test_gh_as_author.sh
@@ -2742,6 +2743,8 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/codex-review-ledger.sh"  # governing historical completion observations (#2401)
+      - "tests/test_owner_admin_override.py"  # pair historical observation runtime and regressions
       - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
