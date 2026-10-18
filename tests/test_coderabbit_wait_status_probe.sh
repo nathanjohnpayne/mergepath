@@ -1624,8 +1624,11 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 
 # #2120: status-only refusal controls, expected ~20s, outer timeout 45s.
 test_2360_same_second_status_ordering() {
-  local shape dir fixture rc expected
-  for shape in ${CODERABBIT_TEST_STATUS_ID_CASES:-refusal reversed completed wrong-author malformed-id}; do
+  local shape dir fixture rc expected helpers record
+  helpers="$WORKDIR/2360-carry-reader.sh"
+  sed -n '/^CRW_STATUS_RECORD_UNREADABLE=/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
+  sed -n '/^crw_carry_status_record() {$/,/^# BEGIN coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
+  for shape in ${CODERABBIT_TEST_STATUS_ID_CASES:-refusal reversed completed wrong-author malformed-id missing-id fractional-id}; do
     dir=$(make_case "2360-$shape" 1 false 0 0)
     sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
     fixture="$dir/statuses.json"
@@ -1638,10 +1641,12 @@ test_2360_same_second_status_ordering() {
         elif $shape == "completed" then map(.description = (if .id == 2 then "Review completed" else "Review rate limited" end))
         elif $shape == "wrong-author" then .[0].creator.login = "someone-else"
         elif $shape == "malformed-id" then .[0].id = "invalid"
+        elif $shape == "missing-id" then del(.[0].id)
+        elif $shape == "fractional-id" then .[0].id = 1.5
         else . end
       | {statuses: .}' >"$fixture"
     expected=5
-    case "$shape" in completed|wrong-author) expected=0 ;; malformed-id) expected=3 ;; esac
+    case "$shape" in completed|wrong-author) expected=0 ;; malformed-id|missing-id|fractional-id) expected=3 ;; esac
     rc=$(CODERABBIT_TEST_NATIVE_REFUSAL=true CODERABBIT_TEST_STATUS_FIXTURE="$fixture" \
       CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
       CODEX_STUB_LOG="$dir/state/codex-stub.log" run_case "$dir" probe_review_on_head)
@@ -1650,6 +1655,25 @@ test_2360_same_second_status_ordering() {
     else
       fail "#2360 same-second $shape: polling rc=$rc expected=$expected; $(tail -2 "$dir/err.log")"
     fi
+    case "$shape" in malformed-id|missing-id|fractional-id)
+      record=$(
+        # Exercise the production carry reader directly: the general reader
+        # can reject malformed evidence before a full probe reaches it.
+        # shellcheck disable=SC1090
+        . "$helpers"
+        BOT_LOGIN='coderabbitai[bot]'
+        REPO=owner/repo
+        HEAD_SHA=head-sha
+        fetch_api_array() { printf 'read\n' >>"$dir/carry-fetches"; jq -c '.statuses' "$fixture"; }
+        crw_carry_status_record
+      )
+      if [ -s "$dir/carry-fetches" ] && jq -e '.state == "unreadable"' <<<"$record" >/dev/null 2>&1; then
+        pass "#2360 carry-forward $shape: unusable trusted ordering is unreadable"
+      else
+        fail "#2360 carry-forward $shape: expected unreadable, got $record"
+      fi
+      ;;
+    esac
   done
 }
 

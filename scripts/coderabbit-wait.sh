@@ -4637,9 +4637,10 @@ crw_carry_status_record() {
   statuses=$(fetch_api_array "repos/$REPO/commits/$HEAD_SHA/statuses" "statuses (carry-forward)") || {
     printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"; return 0; }
   out=$(printf '%s' "$statuses" | jq -c --arg bot "$BOT_LOGIN" '
-    [ .[]? | select(.context == "CodeRabbit") | select((.creator.login // "") == $bot)
-      | select((.id | type) == "number") ]
-    | sort_by(.id) | last
+    [ .[]? | select(.context == "CodeRabbit") | select((.creator.login // "") == $bot) ]
+    | if any(.[]; (.id | type) != "number" or .id < 1 or (.id | floor) != .id)
+      then error("invalid trusted status ID") else sort_by(.id) end
+    | last
     | if . == null then {id: null, state: "missing", created_at: "", updated_at: "", description: ""}
       else {id, state: (.state // "missing"), created_at: (.created_at // ""),
             updated_at: (.updated_at // .created_at // ""), description: (.description // "")}
