@@ -56,13 +56,23 @@ class Evidence:
         self._escape_flag = None
 
     def escape_flag(self):
-        if self._escape_flag is None:
+        if self._escape_flag is not None:
+            return self._escape_flag
+        # A failed help probe says nothing about CLI support. Retry once,
+        # charging both attempts to the same provenance-read allowance.
+        for _ in range(2):
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReadBudgetExhausted('relay provenance read budget exhausted')
             try:
-                usage = subprocess.run([self.gh, 'api', '--help'], capture_output=True, text=True, timeout=10)
-                self._escape_flag = ESCAPE_FLAG in usage.stdout + usage.stderr
+                usage = subprocess.run([self.gh, 'api', '--help'], capture_output=True,
+                                       text=True, timeout=min(remaining, 10))
             except (OSError, subprocess.TimeoutExpired):
-                self._escape_flag = False
-        return self._escape_flag
+                continue
+            if usage.returncode == 0:
+                self._escape_flag = ESCAPE_FLAG in usage.stdout + usage.stderr
+                return self._escape_flag
+        raise ValueError('could not determine relay GitHub CLI escape support after two probes')
 
     def api(self, endpoint, *, pages=False, text=False):
         key = endpoint, pages, text
