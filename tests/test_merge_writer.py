@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Production writer + trusted dispatcher/generation evaluator; fake API only."""
+import ast
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
+import sys
 import tarfile
 import time
 import tempfile
@@ -207,6 +210,77 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertFalse(marker.exists(), 'inherited unpinned utility executed inside credentialed checker')
         self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()), 1)
+
+    def ruby_only_toolchain(self, *, broken=False, unsafe=False):
+        writer = self.candidate/'scripts/workflow/merge-writer.py'
+        source = writer.read_text()
+        start = source.index('SYSTEM_PATH = ')
+        end = source.index('\n', start)
+        system_paths = ast.literal_eval(source[start + len('SYSTEM_PATH = '):end])
+        os_bin = self.path/'os-bin'
+        os_bin.mkdir()
+        # Model an OS without a system YAML parser, independently of the
+        # host's installed Ruby/yq. Keep its other fixed utilities real.
+        for directory in system_paths:
+            for executable in Path(directory).iterdir():
+                target = os_bin/executable.name
+                if executable.name not in ('ruby', 'yq', 'python3') and executable.is_file() \
+                        and os.access(executable, os.X_OK) and not target.exists():
+                    target.symlink_to(executable)
+        writer.write_text(source[:start] + 'SYSTEM_PATH = ' + repr((str(os_bin),)) + source[end:])
+        operator_bin = self.path/'bin'
+        for name in ('bash', 'git', 'jq', 'node'):
+            target = shutil.which(name)
+            self.assertIsNotNone(target, name)
+            (operator_bin/name).symlink_to(target)
+        python = operator_bin/'python3'
+        python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -S "$@"\n')
+        python.chmod(0o755)
+        self.assertNotEqual(subprocess.run([str(python), '-c', 'import yaml'],
+                            capture_output=True).returncode, 0)
+        # Prepare the fixture result through the host's existing production
+        # parser choices. The guard harness can run Python without PyYAML.
+        # The fake CLI binds those semantics to exact policy bytes; this tests
+        # enrollment/dispatch rather than Ruby's YAML engine.
+        policy_json = subprocess.check_output([
+            '/bin/bash', '-c', '. "$1"; policy_yaml_to_json "$2"', '_',
+            str(ROOT/'scripts/lib/feedback-policy-helpers.sh'),
+            str(self.path/'governing-policy.yml')], text=True)
+        code = ('import json, pathlib, sys\n'
+                f'root = pathlib.Path({str(self.path)!r})\n'
+                'with (root/"ruby-calls.jsonl").open("a") as log: log.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                'if (root/"ruby-broken").exists(): raise SystemExit(1)\n'
+                'assert "-ryaml" in sys.argv and "-rjson" in sys.argv\n'
+                f'assert pathlib.Path(sys.argv[-1]).read_text() == {POLICY!r}\n'
+                f'print({policy_json!r})\n')
+        ruby = self.candidate/'unsafe-ruby' if unsafe else operator_bin/'ruby'
+        ruby.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -c ' + shlex.quote(code) + ' "$@"\n')
+        ruby.chmod(0o755)
+        if unsafe:
+            (operator_bin/'ruby').symlink_to(ruby)
+        if broken:
+            (self.path/'ruby-broken').touch()
+        path = os.pathsep.join((str(operator_bin), str(os_bin)))
+        self.assertIsNone(shutil.which('yq', path=path))
+        self.assertIsNone(shutil.which('ruby', path=str(os_bin)))
+        return path
+
+    def test_enrolled_external_ruby_survives_fixed_path_policy_loading(self):
+        self.state['generation'] = [123,124]
+        result = self.run_writer(PATH=self.ruby_only_toolchain())
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertTrue((self.path/'ruby-calls.jsonl').exists())
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()), 1)
+
+    def test_broken_external_ruby_cannot_authorize_a_merge(self):
+        self.state['generation'] = [123,124]
+        self.assert_blocked(self.run_writer(PATH=self.ruby_only_toolchain(broken=True)))
+        self.assertTrue((self.path/'ruby-calls.jsonl').exists())
+
+    def test_candidate_controlled_ruby_is_rejected_before_execution(self):
+        self.state['generation'] = [123,124]
+        self.assert_blocked(self.run_writer(PATH=self.ruby_only_toolchain(unsafe=True)), 'unsafe ruby')
+        self.assertFalse((self.path/'ruby-calls.jsonl').exists())
 
     def test_stale_green_claim_and_candidate_poison_do_not_authorize(self):
         self.assert_blocked(self.run_writer(), 'outside the request generation')

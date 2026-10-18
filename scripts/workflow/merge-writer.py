@@ -66,12 +66,14 @@ def trusted_tools(argv):
     for name, value in tools.items():
         if not value or not Path(value).is_absolute() or ROOT in Path(value).resolve().parents:
             raise ValueError(f'trusted operator toolchain is missing {name}')
-    # Optional YAML acceleration is part of the explicit operator tool set.
-    yq = shutil.which('yq')
-    if yq:
-        if not Path(yq).is_absolute() or ROOT in Path(yq).resolve().parents:
-            raise ValueError('trusted operator toolchain has an unsafe yq')
-        tools['yq'] = yq
+    # Keep both supported optional YAML tools in the explicit operator set,
+    # including a Ruby installed outside the fixed OS search directories.
+    for name in ('yq', 'ruby'):
+        executable = shutil.which(name)
+        if executable:
+            if not Path(executable).is_absolute() or ROOT in Path(executable).resolve().parents:
+                raise ValueError(f'trusted operator toolchain has an unsafe {name}')
+            tools[name] = executable
     return tools
 
 
