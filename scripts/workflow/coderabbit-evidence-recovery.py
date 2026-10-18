@@ -167,8 +167,16 @@ def escalate(repo, numbers):
         report = observation(newest)
         if not report or report.get("state") != "escalate":
             continue
+        if (not isinstance(report.get("repo"), str)
+                or not re.fullmatch(r"[\w.-]+/[\w.-]+", report["repo"])
+                or type(report.get("pr")) is not int or report["pr"] <= 0
+                or any(not isinstance(report.get(key), str)
+                       or not re.fullmatch(r"[0-9a-f]{40}", report[key])
+                       for key in ("head", "revision"))):
+            raise ValueError("malformed escalation tuple")
         if (report["repo"], report["pr"], report["head"], report["revision"]) != (repo, number, head, tip):
-            raise ValueError("escalation tuple changed")
+            print(f"escalation tuple changed for PR #{number}; skipping", file=sys.stderr)
+            continue
         marker = f"<!-- mergepath-coderabbit-escalation:v1 {report['episode']} {report['fingerprint']} -->"
         comments = pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
         if any(c.get("user", {}).get("login") == "github-actions[bot]" and

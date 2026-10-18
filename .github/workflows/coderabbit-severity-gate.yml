@@ -511,15 +511,8 @@ jobs:
               continue
             fi
 
-            # Look up the PR's head SHA so the check_run lands on the
-            # branch-protection-relevant commit (NOT the schedule's
-            # default-branch HEAD).
-            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
-              echo "::endgroup::"
-              continue
-            fi
+            # Keep the head bound by rcg_open. Its final live-head fence
+            # closes this same generation red if the PR moves meanwhile.
 
             # STALE-SNAPSHOT GUARD (Codex round 4 + Phase 4b P1 on #886).
             # Two comment events close together produce two concurrent sweeps,
