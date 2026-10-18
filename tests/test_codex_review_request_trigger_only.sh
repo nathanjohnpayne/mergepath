@@ -494,7 +494,9 @@ test_missing_governing_codex_block_defaults_request_cap() {
   local dir rc before=$FAIL
   dir=$(make_case "request-cap-base-no-codex")
   printf 'author_identity: nathanjohnpayne\n' > "$dir/state/base-review-policy.yml"
-  rc=$(run_trigger_only "$dir" cap_at_limit)
+  # An absent request_by_default now belongs to the governing target too.
+  # Explicit gating reaches the cap whose default this case exercises.
+  rc=$(run_trigger_only "$dir" cap_at_limit true)
   [ "$rc" = 7 ] || fail "#813 missing governing codex: expected default-cap exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#813 missing governing codex: posted despite default cap exhaustion"
   grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
@@ -1490,14 +1492,12 @@ test_guard_anchors_on_push_dispatch() {
   [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the latest repo-lint dispatch for the head on the PR branch, not only the commit date"
 }
 
-# MH12 (Codex P2 on #2175): the policy is read from the SCRIPT's checkout.
-# Launched from a subdirectory, or by absolute path from another directory,
-# a cwd-relative read found no policy and silently restored
-# request_by_default: true. Under-threshold (not gated) + false => exit 5.
+# MH12 (#2175, #2273): the target policy governs from a subdirectory or a
+# foreign cwd, even when the script checkout requests by default.
 test_policy_resolved_from_script_checkout() {
   local dir rc before=$FAIL
   dir=$(make_case "policy-subdir")
-  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/state/base-review-policy.yml"
   rc=0
   ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
@@ -1505,14 +1505,14 @@ test_policy_resolved_from_script_checkout() {
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
   dir=$(make_case "policy-foreign-cwd")
-  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/state/base-review-policy.yml"
   rc=0
   ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12b: by absolute path from a foreign cwd, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir"))"
-  [ "$FAIL" -ne "$before" ] || pass "MH12: the requester reads the policy from its own checkout, not the caller cwd"
+  [ "$FAIL" -ne "$before" ] || pass "MH12: the governing target policy wins over both checkout and caller cwd"
 }
 
 # MH13: the CI-pickup signal is the repo-lint WORKFLOW RUN, which survives job

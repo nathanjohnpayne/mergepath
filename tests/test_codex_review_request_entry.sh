@@ -9,8 +9,8 @@
 #
 # Runs the real script from a temp repo with stubbed gh + gh-as-author so
 # the tests exercise the production entry-gate without touching GitHub.
-# The skip cases (exit 5) short-circuit BEFORE any gh call, so the stubs
-# only matter on the trigger-posting cases.
+# Skip cases (exit 5) still read the governing entry policy, then stop before
+# review polling or comment writes. Every API call remains fixture-only.
 
 set -euo pipefail
 
@@ -86,12 +86,11 @@ make_case() {
     printf '  ack_wait_seconds: 0\n'
     printf '  max_ack_retries: 0\n'
   } >"$dir/.github/review-policy.yml"
-  cat >"$dir/state/base-review-policy.yml" <<'EOF'
-author_identity: nathanjohnpayne
-codex:
-  bot_login: "chatgpt-codex-connector[bot]"
-  max_review_rounds: 10
-EOF
+  {
+    printf 'author_identity: nathanjohnpayne\ncodex:\n'
+    printf '%s\n' "$codex_block"
+    printf '  bot_login: "chatgpt-codex-connector[bot]"\n  max_review_rounds: 10\n'
+  } >"$dir/state/base-review-policy.yml"
 
   # gh-as-author records triggers and Phase 4a terminal markers separately.
   # The real wrapper receives either --body or --body-file after `--`.
@@ -148,7 +147,9 @@ case "$endpoint" in
     # decision was to request. CODEX_TEST_FAIL_PR_FETCH=N refuses the Nth
     # metadata read: 1 for a decision that reads nothing, 3 when the #2257
     # derivation reads the metadata and re-reads the head inside it.
-    n=0
+    # Read zero materializes the governing entry policy (#2273). Existing
+    # derivation/failure controls count the reads after that authority lookup.
+    n=-1
     [ -f "$CODEX_TEST_STATE_DIR/pr-fetch-count" ] && n=$(cat "$CODEX_TEST_STATE_DIR/pr-fetch-count")
     n=$((n + 1))
     printf '%s\n' "$n" >"$CODEX_TEST_STATE_DIR/pr-fetch-count"
@@ -297,6 +298,28 @@ terminal_body() {
   [ -f "$dir/state/terminal-body" ] && cat "$dir/state/terminal-body" || true
 }
 
+# #2273: a real checkout for another repository must not decide the target's
+# entry switches. All API and comment writes remain fake fixture operations.
+test_target_entry_policy() {
+  local name=$1 local_enabled=$2 local_default=$3 target_enabled=$4 target_default=$5 gated=$6 expected=$7 posts=$8
+  local dir rc
+  dir=$(make_case "target-entry-$name" "  enabled: $local_enabled"$'\n'"  request_by_default: $local_default")
+  git -C "$dir" init -q
+  git -C "$dir" remote add origin https://github.com/other/checkout.git
+  printf 'author_identity: nathanjohnpayne\ncodex:\n  enabled: %s\n  request_by_default: %s\n  max_review_rounds: 10\n' \
+    "$target_enabled" "$target_default" > "$dir/state/base-review-policy.yml"
+  rc=$(run_case "$dir" "$gated")
+  if [ "$rc" = "$expected" ] && [ "$(trigger_count "$dir")" = "$posts" ]; then
+    pass "#2273 $name: target policy governs a foreign checkout"
+  else
+    fail "#2273 $name: expected rc=$expected/posts=$posts, got rc=$rc/posts=$(trigger_count "$dir"): $(cat "$dir/err.log")"
+  fi
+}
+test_target_entry_policy enabled-target-on false true true true true 4 1
+test_target_entry_policy enabled-target-off true true false true true 5 0
+test_target_entry_policy default-target-on true false true true '' 4 1
+test_target_entry_policy default-target-off true true true false '' 5 0
+
 # --- defaults: absent keys on a gated PR ⇒ trigger + durable timeout ------
 # Absent enabled/request_by_default on a Phase-4a-gated PR: the request is
 # made (the gate does not depend on request_by_default, #2240) and its
@@ -366,22 +389,25 @@ test_request_by_default_true_triggers_under_threshold() {
 }
 
 # --- unreadable request_by_default ⇒ request, with a warning naming why -----
-# #2240: an unreadable policy never opts out. Each shape must post the
-# trigger on an UNGATED PR (so only the fail-safe can drive it) and warn with
-# its cause. Args: <case> <expected cause substring> <codex block>
+# #2240: an unreadable policy never opts out. Each shape must choose a request
+# on an UNGATED PR and warn with its cause. Stop before the write-budget fence
+# independently refuses an invalid governing policy. Args: <case> <cause> <block>
 # [extra top-level YAML appended after the codex: block].
 assert_unreadable_requests() {
   local name=$1 cause=$2 block=$3 extra=${4:-} dir rc count
   dir=$(make_case "rbd-$name" "$block")
   if [ -n "$extra" ]; then
     printf '%s\n' "$extra" >>"$dir/.github/review-policy.yml"
+    printf '%s\n' "$extra" >>"$dir/state/base-review-policy.yml"
   fi
-  rc=$(run_case "$dir" false)
+  # Stop after the conservative entry decision, before an invalid governing
+  # policy would independently fail the later write-budget fence.
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
   count=$(trigger_count "$dir")
-  if [ "$rc" != "4" ]; then
-    fail "rbd $name: exit $rc, expected 4 (fail-safe request, then timeout); stderr=$(cat "$dir/err.log")"
-  elif [ "$count" != "1" ]; then
-    fail "rbd $name: trigger count $count, expected 1 (an unreadable policy must request)"
+  if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
+    fail "rbd $name: exit $rc, expected 3 after a conservative request decision; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "0" ]; then
+    fail "rbd $name: trigger count $count, expected 0 before the write-budget fence"
   elif ! grep -F 'WARN: cannot read codex.request_by_default' "$dir/err.log" | grep -Fq "$cause"; then
     fail "rbd $name: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
   else
@@ -442,6 +468,7 @@ assert_policy_requests_at_fetch() {
   local name=$1 cause=$2 policy=$3 dir rc
   dir=$(make_case "rbd-$name" "  enabled: true")
   printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  printf '%s\n' "$policy" >"$dir/state/base-review-policy.yml"
   rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
   if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
     fail "rbd $name: exit $rc, expected 3 at the PR fetch past a request decision; stderr=$(cat "$dir/err.log")"
@@ -458,6 +485,7 @@ assert_policy_skips_unset() {
   local name=$1 policy=$2 dir rc
   dir=$(make_case "rbd-$name" "  enabled: true")
   printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  printf '%s\n' "$policy" >"$dir/state/base-review-policy.yml"
   # Reads 1 and 2 are the #2257 derivation (metadata, head re-read).
   rc=$(CODEX_TEST_FAIL_PR_FETCH=3 run_case "$dir" false)
   if [ "$rc" != "5" ]; then
@@ -501,11 +529,12 @@ test_request_by_default_missing_policy_requests() {
   for gated in false true; do
     dir=$(make_case "rbd-missing-$gated" "  enabled: true")
     rm -f "$dir/.github/review-policy.yml"
+    rm -f "$dir/state/base-review-policy.yml"
     rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" "$gated")
     if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
       fail "rbd missing (gated=$gated): exit $rc, expected 3 at the PR fetch past a request decision; stderr=$(cat "$dir/err.log")"
-    elif [ "$gated" = false ] && ! grep -q 'WARN: cannot read codex.request_by_default: policy file not found' "$dir/err.log"; then
-      fail "rbd missing (gated=$gated): missing the policy-not-found warning; stderr=$(cat "$dir/err.log")"
+    elif ! grep -q 'could not resolve the governing policy for owner/repo#999' "$dir/err.log"; then
+      fail "rbd missing (gated=$gated): missing the governing-policy warning; stderr=$(cat "$dir/err.log")"
     else
       pass "missing policy file (gated=$gated) ⇒ Codex requested (#2240)"
     fi
@@ -670,9 +699,9 @@ assert_failsafe_request() {
 # exit 3 past "fetching HEAD commit metadata", which still proves the
 # decision was to request. Args: <label> <dir> <rc> <cause substring>
 assert_failsafe_request_at_fetch() {
-  local label=$1 dir=$2 rc=$3 cause=$4
+  local label=$1 dir=$2 rc=$3 cause=$4 prefix=${5:-'WARN: cannot derive the Phase 4 gate:'}
   if [ "$rc" = "3" ] && grep -q 'fetching HEAD commit metadata' "$dir/err.log" \
-     && grep -F 'WARN: cannot derive the Phase 4 gate:' "$dir/err.log" | grep -Fq "$cause"; then
+     && grep -F "$prefix" "$dir/err.log" | grep -Fq "$cause"; then
     pass "#2257 derive fail-safe: $label ⇒ requested with a warning naming the cause"
   else
     fail "derive fail-safe $label: exit $rc, expected 3 past a request decision with a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
@@ -758,7 +787,7 @@ test_derive_failsafe() {
   # The metadata read after the decision fails too, so the run ends with exit 3
   # at "fetching HEAD commit metadata": proof the decision was to request.
   if [ "$rc" = "3" ] && grep -q 'fetching HEAD commit metadata' "$dir/err.log" \
-     && grep -q 'WARN: cannot derive the Phase 4 gate: could not read the PR metadata' "$dir/err.log"; then
+     && grep -q 'could not resolve the governing policy for owner/repo#999' "$dir/err.log"; then
     pass "#2257 derive fail-safe: unreadable PR metadata ⇒ requested with a warning naming the cause"
   else
     fail "derive fail-safe metadata: exit $rc, expected 3 past a request decision with the warning; stderr=$(cat "$dir/err.log")"
@@ -851,10 +880,10 @@ test_derive_failsafe() {
   assert_failsafe_request "a duplicated external_review_threshold" "$dir" "$rc" "appears on 2 top-level lines"
   dir=$(derive_case base-policy-unread)
   rc=$(CODEX_TEST_BASE_POLICY=fail run_case "$dir" false)
-  assert_failsafe_request_at_fetch "an unreadable governing base policy" "$dir" "$rc" "could not resolve the governing review policy at main@base-sha"
+  assert_failsafe_request_at_fetch "an unreadable governing base policy" "$dir" "$rc" "could not resolve the governing policy for owner/repo#999" 'WARN: cannot read codex.request_by_default:'
   dir=$(derive_case meta-no-base)
   rc=$(CODEX_TEST_PR_META=no-base run_case "$dir" false)
-  assert_failsafe_request_at_fetch "PR metadata without a base" "$dir" "$rc" "has no readable head sha, base ref, base sha or default branch"
+  assert_failsafe_request_at_fetch "PR metadata without a base" "$dir" "$rc" "could not resolve the governing policy for owner/repo#999" 'WARN: cannot read codex.request_by_default:'
   # Snapshot fence: the re-read before a skip sees another PR, so the
   # under-threshold verdict no longer describes it.
   local mode
