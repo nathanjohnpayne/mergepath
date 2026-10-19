@@ -306,9 +306,12 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     existing one-hop depth, including quiet sampled patterns. Nested patterns,
     substitutions, quotes, brackets, braces and unescaped whitespace/control
     syntax retain their prior reading. No runtime pattern value is inferred.
-    Four inherited assignment-tilde misses are version-qualified: Linux
-    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
-    preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
+    Assignment-shaped tilde operands use the same source-only uncertainty
+    treatment (#2228): unquoted tilde after assignment equals or colon,
+    including append and escaped-newline forms. The four retained bodies
+    leak on measured Linux Bash 5.2.15, but are conservative flags on measured
+    Mac Bash 5.3.20. Only actual quiet results enter that report; HOME is not
+    resolved and other opaque operands retain their existing fallback.
     Irreducible eval operands retain independent
     scanning of known literal fragments. Trap actions and callback operands
     remain separate. The operand is
@@ -2908,7 +2911,8 @@ def _literal_extglob_end(text, start):
     return None
 
 
-def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False):
+def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False,
+                          _only_assignment_tilde=False):
     """Does this command word carry an UNQUOTED expansion the shell performs?
 
     `_unquote_command_word` reduces a word to its literal text, which is the
@@ -2976,6 +2980,8 @@ def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False):
                              or unquoted.get(index - 1) == ":")
                         for char, index in meta)):
             return True
+    if _only_assignment_tilde:
+        return False
     if eval_extglob:
         # Refuse an unquoted extglob opener even when the existing lexer
         # splits its later whitespace; no path or option state is reconstructed.
@@ -5198,7 +5204,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
             hit, why = reaches_output(ref, helpers, (routed_any, routed_fd1))
             if not hit and _uncertain_eval_output:
                 hit, why = True, (
-                    "uncertain pre-eval pattern expansion may change how this "
+                    "uncertain pre-eval expansion may change how this "
                     "known literal credential reference reaches output"
                 )
             if not hit and xtrace_at.get(
@@ -5222,8 +5228,15 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
                             seg.sid, effective_xtrace
                         ),
                         _uncertain_eval_output=(
-                            seg.eval_pattern_uncertain
-                            and resolve_command(seg)[0] == "eval"
+                            resolve_command(seg)[0] == "eval" and (
+                                seg.eval_pattern_uncertain
+                                or any(_command_word_expands(
+                                    raw, eval_assignment_tilde=True,
+                                    _only_assignment_tilde=True,
+                                ) for raw, _literal in _command_arguments(
+                                    seg.words, seg._cmd_index + 1
+                                ))
+                            )
                         ),
                     )
                     # A discovery error inside the deferred text is discovery
@@ -15434,21 +15447,16 @@ KNOWN_BROADER.update({cid: HEREDOC_ECHO_CONSERVATISM
                       for cid in HEREDOC_ECHO_CONSERVATIVE_CASES})
 
 # Owner-approved #1465 scope: these inherited misses remain tracked in #2228.
-# Qualification is the exact quiet build measured, not every Bash 5.3 release.
-EVAL_ASSIGNMENT_TILDE_MISSES = frozenset(('eval-assignment-tilde-inherited-tilde-equal', 'eval-assignment-tilde-inherited-tilde-colon', 'eval-assignment-tilde-inherited-tilde-append', 'eval-assignment-tilde-inherited-tilde-escaped-continuation'))
-EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
-    "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)"
-)
-CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
-KNOWN_MISSES.update({cid: (
-    "Inherited assignment-tilde eval miss: Linux Bash 5.2.15 leaked in the "
-    "paired sample; the measured Mac Bash 5.3.20 build was quiet. Main and "
-    "the pre-guard candidate both missed the Linux leak. The literal-only "
-    "#1465 contract refuses joining, preserving independent known-literal "
-    "fragment fallback; no dynamic prefix reconstruction or leak fix is "
-    "claimed. Owner-approved scope disposition; actual repair is tracked in "
-    "https://github.com/nathanjohnpayne/mergepath/issues/2228"
-) for cid in EVAL_ASSIGNMENT_TILDE_MISSES})
+# These fixed bodies leak on measured Linux Bash 5.2.15 and are quiet on
+# measured Mac Bash 5.3.20. Only actual quiet measurements are conservatism.
+EVAL_ASSIGNMENT_TILDE_CASES = frozenset(('eval-assignment-tilde-inherited-tilde-equal', 'eval-assignment-tilde-inherited-tilde-colon', 'eval-assignment-tilde-inherited-tilde-append', 'eval-assignment-tilde-inherited-tilde-escaped-continuation'))
+CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'flag', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'flag', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'flag', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'flag', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
+ORACLE_DEPENDENT_CONSERVATISM = {cid: (
+    "Source-only assignment-tilde eval uncertainty retains the known literal "
+    "credential reference as potential output without resolving HOME. The "
+    "observed Mac Bash 5.3.20 body is quiet; Linux Bash 5.2.15 leaks. This "
+    "entry is reported only when the current oracle is quiet (#2228)."
+) for cid in EVAL_ASSIGNMENT_TILDE_CASES}
 
 # Eval-only extglob proof refuses potentially expanded words without modelling
 # enabled options or matching paths; retain per-known-literal fallback.
@@ -15506,7 +15514,8 @@ def _corpus_id_cases():
             )
         seen[cid] = body
     for registry, label in ((KNOWN_MISSES, "KNOWN_MISSES"),
-                            (KNOWN_BROADER, "KNOWN_BROADER")):
+                            (KNOWN_BROADER, "KNOWN_BROADER"),
+                            (ORACLE_DEPENDENT_CONSERVATISM, "ORACLE_DEPENDENT_CONSERVATISM")):
         for cid in sorted(registry):
             if cid not in seen:
                 failures.append(
@@ -16088,12 +16097,17 @@ def _ansi_c_quote_cases():
 CORPUS += [('eval-alternative-at', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-quoted', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'@(\\;echo|safe)\' \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-escaped', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\@\\(\\;echo\\|safe\\) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf %s @(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-no-match', 'flag', 'shopt -s extglob\neval : @(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-matched-safe', 'flag', 'shopt -s extglob\ntouch safe\neval : @(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-length', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"${#GH_TOKEN}"\'\n'), ('eval-alternative-at-constant', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"${GH_TOKEN:+set}"\'\n'), ('eval-alternative-at-inner-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) "\'\\$GH_TOKEN\'"\n'), ('eval-alternative-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-quoted', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+(\\;echo|safe)\' \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-escaped', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\+\\(\\;echo\\|safe\\) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf %s +(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-no-match', 'flag', 'shopt -s extglob\neval : +(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-matched-safe', 'flag', 'shopt -s extglob\ntouch safe\neval : +(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-length', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"${#GH_TOKEN}"\'\n'), ('eval-alternative-plus-constant', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"${GH_TOKEN:+set}"\'\n'), ('eval-alternative-plus-inner-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) "\'\\$GH_TOKEN\'"\n')]
 KNOWN_BROADER.update({cid: "A literal extglob operand makes pre-eval input uncertain; known credential references remain potential output even when the observed pattern is unmatched or expands only to safe data. No filesystem expansion is reconstructed (#2234)." for cid, _rule, _body in CORPUS if cid.startswith("eval-alternative-") and cid.endswith(("-no-match", "-matched-safe"))})
 
+
+# #2228: paired quote, escape, non-prefix and redaction controls.
+CORPUS += [('eval-assignment-tilde-control-single-quoted', 'clean', 'HOME=\'; echo\'\neval X=\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-double-quoted', 'clean', 'HOME=\'; echo\'\neval X="~" \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-escaped', 'clean', 'HOME=\'; echo\'\neval X=\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-whole-quoted', 'clean', 'HOME=\'; echo\'\neval \'X=~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-quoted', 'clean', 'HOME=\'; echo\'\neval X=prefix:\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-escaped', 'clean', 'HOME=\'; echo\'\neval X=prefix:\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-name-quoted', 'clean', 'HOME=\'; echo\'\neval "X"=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-equal-escaped', 'clean', 'HOME=\'; echo\'\neval X\\=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-not-prefix', 'clean', 'HOME=\'; echo\'\neval X=prefix~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-safe-home', 'flag', 'HOME=safe\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-length', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${#GH_TOKEN}"\'\n'), ('eval-assignment-tilde-constant', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${GH_TOKEN:+set}"\'\n')]
+KNOWN_BROADER["eval-assignment-tilde-safe-home"] = "A written assignment-tilde operand retains source-only eval uncertainty even when this oracle supplies a safe HOME value; no runtime value propagation is modeled (#2228)."
+
 def self_test():
     failures = []
     passed = 0
     tp = fn = fp = tn = 0
     bash_path, bash_text, _bash_ver = oracle_bash()
-    quiet_eval_tilde_samples = set()
+    observed_eval_tilde_conservatism = {}
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
@@ -16163,7 +16177,7 @@ def self_test():
                     )
             elif (not leaked) and flagged:
                 fp += 1
-                if cid not in KNOWN_BROADER:
+                if cid not in KNOWN_BROADER and cid not in ORACLE_DEPENDENT_CONSERVATISM:
                     failures.append(
                         "FALSE POSITIVE (undeclared): %s\n"
                         "    source: %s\n"
@@ -16178,15 +16192,12 @@ def self_test():
             else:
                 tn += 1
 
-            # Only the four inherited tilde cases on the exact observed quiet
-            # build qualify; every other declaration retains normal stale checks.
-            if (cid in EVAL_ASSIGNMENT_TILDE_MISSES
-                    and bash_text == EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE
-                    and not leaked and not flagged):
-                quiet_eval_tilde_samples.add(cid)
+            if (cid in ORACLE_DEPENDENT_CONSERVATISM
+                    and not leaked and flagged):
+                observed_eval_tilde_conservatism[cid] = ORACLE_DEPENDENT_CONSERVATISM[cid]
             minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
             unsupported_miss = (minimum_bash is not None and _bash_ver is not None
-                                and _bash_ver < minimum_bash) or cid in quiet_eval_tilde_samples
+                                and _bash_ver < minimum_bash)
             if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
@@ -16257,16 +16268,15 @@ def self_test():
         unsupported_miss = (minimum_bash is not None and _bash_ver is not None
                             and _bash_ver < minimum_bash)
         label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
-        if cid in quiet_eval_tilde_samples:
-            label = "quiet observed Bash 5.3.20 sample; inherited Linux Bash 5.2 miss"
         print(
             "check_no_token_in_output:   %s: %s -- %s"
             % (label, cid, KNOWN_MISSES[cid])
         )
-    for cid in sorted(KNOWN_BROADER):
+    measured_broader = dict(KNOWN_BROADER, **observed_eval_tilde_conservatism)
+    for cid in sorted(measured_broader):
         print(
             "check_no_token_in_output:   measured conservatism: %s -- %s"
-            % (cid, KNOWN_BROADER[cid])
+            % (cid, measured_broader[cid])
         )
     if failures:
         for f in failures:
@@ -16506,7 +16516,7 @@ def _deferred_shell_cases():
             failures.append("eval extglob segment ownership: " + body)
         if uncertain and (len(marked) != 1 or "@(\\;echo|safe)" not in marked[0].words):
             failures.append("eval extglob alternative lost its operand: " + body)
-    # Assignment-shaped tilde refusal changes literal proof, not fallback.
+    # The uncertainty trigger reuses the exact assignment-tilde proof predicate.
     for raw, expands in [
         ('X=~', True),
         ('X=prefix:~', True),
@@ -16534,9 +16544,14 @@ def _deferred_shell_cases():
     ]:
         if _command_word_expands(raw) or _command_word_expands(raw, eval_assignment_tilde=True) != expands:
             failures.append("eval assignment tilde inventory: " + repr(raw))
+        if _command_word_expands(raw, eval_assignment_tilde=True, _only_assignment_tilde=True) != expands:
+            failures.append("eval assignment tilde uncertainty: " + repr(raw))
         literal = _unquote_command_word(raw, allow_empty=True, eval_literal=True)
         if (literal is None) != expands:
             failures.append("eval assignment tilde literal proof: " + repr(raw))
+    for raw in ("*", "?", "[x]", "{x,y}", "~", "$HOME", "X=prefix~"):
+        if _command_word_expands(raw, eval_assignment_tilde=True, _only_assignment_tilde=True):
+            failures.append("eval tilde uncertainty widened: " + raw)
     # Ordinary decoding remains exact; only proven eval arguments opt in.
     if (_unquote_command_word(r'": \; echo"') != ': ; echo'
             or _unquote_command_word(r'": \; echo"', eval_literal=True) != r': \; echo'):
