@@ -468,8 +468,8 @@ fi
 
 TREE="$TMP/tree"
 mkdir -p "$TREE/scripts/workflow" "$TREE/scripts/lib" "$TMP/bin" "$TMP/fixture"
-cp "$FINDER" "$RESUME" "$TREE/scripts/workflow/"
-cp "$ROOT/scripts/lib/gh-api-array.sh" "$TREE/scripts/lib/"
+cp "$FINDER" "$RESUME" "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TREE/scripts/workflow/"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$TREE/scripts/lib/"
 # The repository's required head checks: `lint` only. Review-policy checks
 # (Label Gate, Merge clearance gate) are deliberately NOT in this list.
 cat > "$TREE/scripts/required-head-checks.sh" <<'SH'
@@ -494,12 +494,28 @@ args="$*"
 echo "$args" >> "$GH_LOG"
 [ -n "${GH_TOKEN:-}" ] || { echo "gh shim: no GH_TOKEN in this process" >&2; exit 1; }
 case "$args" in
+  *"/contents/.github/review-policy.yml?ref="*)
+    [ "${FINDER_POLICY_FAIL:-0}" != 1 ] || { echo 'gh: policy unavailable (HTTP 500)' >&2; exit 1; }
+    case "${FINDER_POLICY_FORMAT:-block}" in
+      flow) printf 'codex: {bot_login: "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      quoted) printf '"codex": {"bot_login": "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      malformed) printf 'codex: [broken\n' ;;
+      invalid-type) printf 'codex: {bot_login: false}\n' ;;
+      whitespace) printf 'codex:\n  bot_login: |\n    partner-review[bot]\n' ;;
+      multiple) printf 'codex: {}\n---\ncodex: {}\n' ;;
+      *) printf 'codex:\n  bot_login: "%s"\n' "${FINDER_BOT_LOGIN:-chatgpt-codex-connector[bot]}" ;;
+    esac ;;
   *"api graphql"*)          echo "gh shim: no GraphQL read is expected (CI state comes from the check runs)" >&2; exit 1 ;;
   *"/activity?"*)          cat "$FIXTURE/activity-$(printf '%s' "$args" | sed -n 's/.*feat%2F\([0-9]*\).*/\1/p').json" ;;
   *"/check-runs"*)          cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
   *"/commits/"*)            echo "gh shim: the commit date must never be read for push time" >&2; exit 1 ;;
   *"/pulls?state=open"*)    cat "$FIXTURE/pulls.json" ;;
   *"/pulls/41/reviews"*)    echo '[{"id":9,"state":"APPROVED","submitted_at":"2026-10-13T07:00:00Z","commit_id":"4141414141414141414141414141414141414141","body":"LGTM","user":{"login":"nathanpayne-claude","type":"User"}}]' ;;
+  *"/pulls/42/reviews"*)
+    if [ -n "${FINDER_REVIEW_LOGIN:-}" ]; then
+      jq -cn --arg login "$FINDER_REVIEW_LOGIN" --arg type "${FINDER_REVIEW_TYPE:-Bot}" \
+        '[{id:42,state:"COMMENTED",submitted_at:"2026-10-13T05:00:00Z",commit_id:"4242424242424242424242424242424242424242",body:"review round body",user:{login:$login,type:$type}}]'
+    else echo '[]'; fi ;;
   *"/reviews"*)             echo '[]' ;;
   *"/issues/45/comments"*)  echo '[{"id":451,"created_at":"2026-10-13T05:10:00Z","updated_at":"2026-10-13T05:10:00Z","body":"@codex review","user":{"login":"nathanjohnpayne","type":"User"}}]' ;;
   *"/issues/"*"/comments"*) echo '[]' ;;
@@ -510,19 +526,19 @@ SH
 chmod +x "$TMP/bin/gh"
 cat > "$TMP/fixture/pulls.json" <<'JSON'
 [{"number":41,"title":"Approved and idle","html_url":"https://github.com/octo/demo/pull/41","draft":false,
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"size:S"}]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"size:S"}]},
  {"number":42,"title":"Pushed and forgotten","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]},
  {"number":43,"title":"Draft","html_url":"https://github.com/octo/demo/pull/43","draft":true,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,"updated_at":"2026-10-13T05:00:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":45,"title":"Request never answered","html_url":"https://github.com/octo/demo/pull/45","draft":false,"updated_at":"2026-10-13T05:10:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4545454545454545454545454545454545454545","ref":"feat/45","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4545454545454545454545454545454545454545","ref":"feat/45","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":46,"title":"Lint red, review gates red by design","html_url":"https://github.com/octo/demo/pull/46","draft":false,"updated_at":"2026-10-13T05:30:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4646464646464646464646464646464646464646","ref":"feat/46","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4646464646464646464646464646464646464646","ref":"feat/46","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]},
  {"number":42,"title":"Pushed and forgotten (repeated by a page boundary)","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]}]
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]}]
 JSON
 # 41: three check runs on the head, the merge gate newest and green; 42: no
 # check runs at all (push time falls back to the commit date); 43: draft;
@@ -611,6 +627,94 @@ if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .n
 else
   fail "--dump did not write a stalled-prs/v1 snapshot with the gate result recorded"
 fi
+
+# Governing bot identity is materialized from the target, including when the
+# local checkout advertises a different bot. One shared base needs one read.
+mkdir -p "$TREE/.github"
+printf 'codex:\n  bot_login: "local-only[bot]"\n' > "$TREE/.github/review-policy.yml"
+mkdir -p "$TMP/no-parser-bin"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/no-parser-bin/$parser"
+  chmod +x "$TMP/no-parser-bin/$parser"
+done
+mkdir -p "$TMP/ruby-only-bin"
+for parser in yq python3; do
+  cp "$TMP/no-parser-bin/$parser" "$TMP/ruby-only-bin/$parser"
+done
+bot_cases=(configured flow quoted upper-policy upper-api wrong-login wrong-type unreadable malformed invalid-type whitespace multiple no-parser)
+if ruby -ryaml -rjson -e 'YAML.safe_load("codex: {}")' >/dev/null 2>&1; then
+  bot_cases+=(ruby-flow ruby-multiple)
+fi
+for bot_case in "${bot_cases[@]}"; do
+  configured_login='partner-review[bot]'; review_login='partner-review[bot]'; review_type=Bot; policy_fail=0; policy_format=block; parser_prefix=''
+  [ "$bot_case" != upper-policy ] || configured_login='PARTNER-REVIEW[bot]'
+  [ "$bot_case" != upper-api ] || review_login='PARTNER-REVIEW[bot]'
+  [ "$bot_case" != wrong-login ] || review_login="$CODEX"
+  [ "$bot_case" != wrong-type ] || review_type=User
+  [ "$bot_case" != unreadable ] || policy_fail=1
+  case "$bot_case" in flow|quoted|malformed|invalid-type|whitespace|multiple) policy_format="$bot_case" ;; esac
+  [ "$bot_case" != no-parser ] || parser_prefix="$TMP/no-parser-bin:"
+  case "$bot_case" in ruby-flow) policy_format=flow; parser_prefix="$TMP/ruby-only-bin:" ;; ruby-multiple) policy_format=multiple; parser_prefix="$TMP/ruby-only-bin:" ;; esac
+  : > "$TMP/gh.log"
+  set +e
+  PATH="$parser_prefix$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+    FINDER_BOT_LOGIN="$configured_login" FINDER_REVIEW_LOGIN="$review_login" \
+    FINDER_REVIEW_TYPE="$review_type" FINDER_POLICY_FAIL="$policy_fail" FINDER_POLICY_FORMAT="$policy_format" \
+    bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --no-gate --json --now "$NOW" \
+    --dump "$TMP/bot-$bot_case-dump.json" > "$TMP/bot-$bot_case.json" 2> "$TMP/bot-$bot_case.err"
+  bot_rc=$?
+  set -e
+  if [[ "$bot_case" =~ ^(unreadable|malformed|invalid-type|whitespace|multiple|no-parser|ruby-multiple)$ ]]; then
+    if [ "$bot_rc" -eq 3 ] && [ ! -s "$TMP/bot-$bot_case.json" ]; then
+      pass "unknown governing bot policy fails closed without a local identity fallback: $bot_case"
+    else fail "unknown governing bot policy $bot_case: rc=$bot_rc"; fi
+  elif [ "$bot_rc" -eq 1 ] \
+     && jq -e --argjson signal "$([[ "$bot_case" =~ ^(configured|flow|quoted|upper-policy|upper-api|ruby-flow)$ ]] && echo true || echo false)" \
+       '[.prs[] | select(.number == 42)][0].codex_signal_on_head == $signal' "$TMP/bot-$bot_case.json" >/dev/null \
+     && jq -e --arg login "$configured_login" 'all(.prs[]; .codex_bot_login == $login)' "$TMP/bot-$bot_case-dump.json" >/dev/null \
+     && [ "$(grep -c '/contents/.github/review-policy.yml?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$TMP/gh.log")" -eq 1 ]; then
+    pass "governing exact bot and Bot provenance: $bot_case; cached once per base"
+  else fail "governing bot $bot_case (rc=$bot_rc): $(cat "$TMP/bot-$bot_case.err")"; fi
+done
+
+# Prefix lookalikes and User provenance are not Codex evidence. The old
+# findings are answered before a later push, leaving the stale head unrequested.
+while IFS='|' read -r bot_case actor actor_type configured expected_signal; do
+  pr 140 '2026-10-13T07:00:00Z' SUCCESS '.reviews=[$rev] | .review_comments=[$finding,$reply] | .codex_bot_login=$configured | .reviews[].user.type=$type | .review_comments[0].user.type=$type' \
+    --argjson rev "$(review 140 "$actor" COMMENTED '2026-10-13T06:00:00Z' "$(sha 140)")" \
+    --argjson finding "$(inline 140 "$actor" '2026-10-13T06:01:00Z' "$(sha 140)" null)" \
+    --argjson reply "$(inline 141 "$AUTHOR" '2026-10-13T06:02:00Z' "$(sha 140)" 140)" \
+    --arg configured "$configured" --arg type "$actor_type" \
+    | jq -s --arg repo "$REPO" '{schema:"stalled-prs/v1",repo:$repo,prs:.}' > "$TMP/identity-$bot_case.json"
+  set +e
+  bash "$FINDER" --input "$TMP/identity-$bot_case.json" --no-gate --json --now "$NOW" > "$TMP/identity-$bot_case-report.json"
+  bot_rc=$?
+  set -e
+  if [ "$bot_rc" -eq 1 ] && jq -e --argjson signal "$expected_signal" \
+    '.prs[0] | .codex_signal_on_head == $signal and (if $signal then .reason != "head-unrequested" else .reason == "head-unrequested" and .next_action == "request codex" end)' "$TMP/identity-$bot_case-report.json" >/dev/null; then
+    pass "replay exact bot and provenance: $bot_case"
+  else fail "replay bot identity $bot_case: $(cat "$TMP/identity-$bot_case-report.json")"; fi
+done <<'CASES'
+prefix-user|chatgpt-codex-connector-fake|User|chatgpt-codex-connector[bot]|false
+prefix-bot|chatgpt-codex-connector-fake[bot]|Bot|chatgpt-codex-connector[bot]|false
+exact-user|chatgpt-codex-connector[bot]|User|chatgpt-codex-connector[bot]|false
+real-bot|chatgpt-codex-connector[bot]|Bot|chatgpt-codex-connector[bot]|true
+custom-bot|partner-review[bot]|Bot|partner-review[bot]|true
+custom-wrong|chatgpt-codex-connector[bot]|Bot|partner-review[bot]|false
+upper-policy|chatgpt-codex-connector[bot]|Bot|ChatGPT-Codex-Connector[bot]|true
+upper-api|PARTNER-REVIEW[bot]|Bot|partner-review[bot]|true
+CASES
+
+# A lookalike's real human feedback still requires action when newly posted.
+jq '.prs[0] |= (.reviews[0].submitted_at="2026-10-13T07:10:00Z" | .review_comments=[.review_comments[0]] | .review_comments[0].created_at="2026-10-13T07:11:00Z" | .review_comments[0].updated_at="2026-10-13T07:11:00Z")' \
+  "$TMP/identity-prefix-user.json" > "$TMP/human-feedback.json"
+set +e
+bash "$FINDER" --input "$TMP/human-feedback.json" --no-gate --json --now "$NOW" > "$TMP/human-feedback-report.json"
+bot_rc=$?
+set -e
+if [ "$bot_rc" -eq 1 ] && jq -e '.prs[0] | .codex_signal_on_head == false and .next_action == "push fix"' "$TMP/human-feedback-report.json" >/dev/null; then
+  pass 'rejecting a Codex lookalike preserves actionable human feedback'
+else fail 'lookalike human feedback was discarded'; fi
 
 # The printed Codex request mirrors the policy so the session can run it as
 # shown: Phase-4a-gated only for a needs-external-review PR, trigger-only for

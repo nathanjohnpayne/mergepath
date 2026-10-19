@@ -89,7 +89,9 @@ with open(sys.argv[1], encoding="utf-8") as source:
 ' "$cfg" 2>/dev/null || return 1
   elif command -v ruby >/dev/null 2>&1; then
     ruby -ryaml -rjson -e '
-value = YAML.safe_load(File.read(ARGV[0]), permitted_classes: [], permitted_symbols: [], aliases: false)
+source = File.read(ARGV[0])
+raise "multiple YAML documents" if YAML.parse_stream(source).children.length > 1
+value = YAML.safe_load(source, permitted_classes: [], permitted_symbols: [], aliases: false)
 puts JSON.generate(value)
 ' "$cfg" 2>/dev/null || return 1
   else

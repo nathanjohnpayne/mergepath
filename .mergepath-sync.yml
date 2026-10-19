@@ -881,6 +881,7 @@ paths:
       - "scripts/workflow/"
       - "scripts/ci/check_stalled_pr_resume"
       - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
@@ -2342,6 +2343,8 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
       - "scripts/required-head-checks.sh"        # which checks count as CI (not the review-policy gates)
       - "scripts/codex-review-check.sh"          # merge-readiness delegate (gate), run only for stalled PRs
   - path: scripts/workflow/resume-stalled-pr.sh
