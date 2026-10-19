@@ -883,6 +883,108 @@ metadata_run_and_assert \
   "Co-Authored-By: Cursor <noreply@cursor.com>" \
   MERGEPATH_AGENT=cursor \
 
+# #2473: inspect production-generated bodies for a bundle containing tests and
+# security-sensitive tooling, in both ordinary sync and sync-all. Keep this
+# source separate so the existing scope/idempotency fixture stays unchanged.
+REVIEW_MP="$metadata_workdir/review-source"
+git clone -q "$META_MP" "$REVIEW_MP"
+mkdir -p "$REVIEW_MP/tests" "$REVIEW_MP/.github/workflows"
+cat >>"$REVIEW_MP/.mergepath-sync.yml" <<'YAML'
+  - {path: tests/test_canonical.sh, type: canonical, consumers: all}
+  - {path: scripts/credential-helper.sh, type: canonical, consumers: all}
+  - {path: .github/workflows/fixture.yml, type: canonical, consumers: all}
+YAML
+printf '#!/usr/bin/env bash\nexit 0\n' >"$REVIEW_MP/tests/test_canonical.sh"
+cp "$REVIEW_MP/tests/test_canonical.sh" "$REVIEW_MP/scripts/credential-helper.sh"
+printf 'name: fixture\non: workflow_dispatch\njobs: {}\n' >"$REVIEW_MP/.github/workflows/fixture.yml"
+git -C "$REVIEW_MP" add -A
+git -C "$REVIEW_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'add canonical test and tooling bundle'
+review_sha=$(git -C "$REVIEW_MP" rev-parse HEAD)
+for review_mode in ordinary sync-all; do
+  review_id=641
+  review_args=("$review_sha")
+  if [ "$review_mode" = sync-all ]; then
+    review_id=642
+    review_args=(--sync-all)
+  fi
+  review_remote="$metadata_workdir/review-${review_mode}.git"
+  setup_metadata_remote "$review_remote" "$metadata_workdir/review-${review_mode}-seed"
+  set +e
+  review_out=$(env PATH="$META_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$REVIEW_MP" MERGEPATH_AGENT=codex \
+    MERGEPATH_TEST_REMOTE_ALPHA="$review_remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" MERGEPATH_TEST_RUN="$review_id" \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" "${review_args[@]}" --repos alpha 2>&1)
+  review_rc=$?
+  set -e
+  [ "$review_rc" -eq 0 ] || fail "$review_mode review bundle failed: $review_out"
+  review_branch=$(git --git-dir="$review_remote" for-each-ref --format='%(refname)' 'refs/heads/mergepath-sync/*')
+  [[ -n "$review_branch" && "$review_branch" != *$'\n'* ]] \
+    || fail "$review_mode expected exactly one pushed sync branch: $review_branch"
+  review_commit="$META_CAPTURE/commit-body-${review_id}.md"
+  git --git-dir="$review_remote" log -1 --format=%B "$review_branch" >"$review_commit"
+  for review_path in tests/test_canonical.sh scripts/credential-helper.sh .github/workflows/fixture.yml; do
+    git --git-dir="$review_remote" show "$review_branch:$review_path" | cmp - "$REVIEW_MP/$review_path" \
+      || fail "$review_mode did not deliver selected artifact $review_path"
+  done
+  for review_body in "$review_commit" "$META_CAPTURE/pr-body-${review_id}.md"; do
+    grep -qF "https://github.com/nathanjohnpayne/mergepath/commit/$review_sha" "$review_body" \
+      || fail "$review_mode body lost its full source binding"
+    grep -qx 'Authoring-Agent: codex' "$review_body" \
+      || fail "$review_mode body lost its authoring identity"
+    for review_path in tests/test_canonical.sh scripts/credential-helper.sh .github/workflows/fixture.yml; do
+      grep -qF "$review_path" "$review_body" || fail "$review_mode body omitted $review_path"
+    done
+    review_section=$(sed -n '/^## Self-Review$/,/^$/p' "$review_body")
+    for review_field in Correctness 'Regression risk' Style 'Test coverage' Security; do
+      grep -q "^- $review_field:" <<<"$review_section" || fail "$review_mode missing $review_field"
+    done
+    if grep -Eiq 'no test changes shipped|no new attack surface|already[- ]reviewed|has been reviewed|regression risk: low|CI passed' <<<"$review_section"; then
+      fail "$review_mode self-review made an unsupported test, review or security claim: $review_section"
+    fi
+    grep -Eq 'Test coverage:.*tests and fixtures.*consumer CI.*head' <<<"$review_section" \
+      || fail "$review_mode self-review omitted selected tests or current-head CI evidence"
+    grep -Eq 'Security:.*can change.*workflow.*review.*credential' <<<"$review_section" \
+      || fail "$review_mode self-review omitted tooling security effects"
+  done
+done
+
+# A manifest-retained canonical test can be deleted by an ordinary source
+# commit. Inspect the actual pushed deletion and both serialized bodies.
+delete_remote="$metadata_workdir/review-delete.git"
+delete_seed="$metadata_workdir/review-delete-seed"
+setup_metadata_remote "$delete_remote" "$delete_seed"
+mkdir -p "$delete_seed/tests"
+git -C "$REVIEW_MP" show "$review_sha:tests/test_canonical.sh" >"$delete_seed/tests/test_canonical.sh"
+git -C "$delete_seed" add tests/test_canonical.sh
+git -C "$delete_seed" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'seed consumer test'
+git -C "$delete_seed" push -q origin main
+git -C "$REVIEW_MP" rm -q tests/test_canonical.sh
+git -C "$REVIEW_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'remove selected canonical test'
+delete_sha=$(git -C "$REVIEW_MP" rev-parse HEAD)
+set +e
+delete_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$REVIEW_MP" MERGEPATH_AGENT=codex \
+  MERGEPATH_TEST_REMOTE_ALPHA="$delete_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN=643 MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" "$delete_sha" --repos alpha 2>&1)
+delete_rc=$?
+set -e
+[ "$delete_rc" -eq 0 ] || fail "canonical test deletion failed: $delete_out"
+delete_branch="refs/heads/mergepath-sync/${delete_sha:0:7}"
+delete_operation=$(git --git-dir="$delete_remote" diff --name-status "$delete_branch^" "$delete_branch" -- tests/test_canonical.sh)
+[ "$delete_operation" = $'D\ttests/test_canonical.sh' ] || fail "expected actual canonical test deletion: $delete_operation"
+git --git-dir="$delete_remote" log -1 --format=%B "$delete_branch" >"$META_CAPTURE/commit-body-643.md"
+for delete_body in "$META_CAPTURE/commit-body-643.md" "$META_CAPTURE/pr-body-643.md"; do
+  grep -qF 'tests/test_canonical.sh (source absent; removal)' "$delete_body" \
+    || fail "generated deletion body lost its operation: $(cat "$delete_body")"
+  grep -qF 'can add, update or remove canonical tests and fixtures' "$delete_body" \
+    || fail 'deletion self-review omitted test-removal semantics'
+  if grep -Eq 'copies selected artifacts|tests and fixtures are copied' "$delete_body"; then
+    fail 'deletion self-review claimed a canonical copy'
+  fi
+done
+
 # #1150: a legacy SHA-only sync-all branch may have delivered a partial scope.
 # It must not suppress the new full-scope key at the same source SHA. Once the
 # scope-aware branch itself is completed, the exact repeat remains idempotent.
@@ -2845,6 +2947,7 @@ source=Path(sys.argv[1]).read_text()
 begin=source.index('  local pr_url\n',source.index('sync_all_open_pr()'))
 end=source.index('\n}\n',begin)
 progress=source.index('sync_progress()');progress_end=source.index('\n}\n',progress)+3
+review=source.index('sync_self_review()');review_end=source.index('\n}\n',review)+3
 Path(sys.argv[2]).write_text('''set -euo pipefail
 SCRIPT_VERSION=fixture;SYNC_PROGRESS_JSON=1
 consumer_name=alpha;consumer_repo=example/alpha;branch=fixture;sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;short_sha=aaaaaaa
@@ -2852,7 +2955,7 @@ canonical_lines=README.md;kit_lines=;templated_lines=;override_note=;authoring_a
 sync_coderabbit_ignore_block(){ :; }
 err(){ printf '%s\\n' "$*" >&2; }
 sync_author_gh(){ /bin/bash "$MERGEPATH_TEST_ACTUAL_WRAPPER" -- gh "$@"; }
-'''+source[progress:progress_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
+'''+source[progress:progress_end]+source[review:review_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
 PY
 for telemetry_mode in verified wrong duplicate mixed malformed missing failed; do
   set +e
