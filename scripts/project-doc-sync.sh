@@ -314,14 +314,14 @@ is_generated_mirror() {
   local head
   head=$(generated_header_lines "$file")
   [ -n "$head" ] || return 1
-  printf '%s\n' "$head" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" || return 1
+  grep -Fqx "generated_by: scripts/project-doc-sync.sh" <<<"$head" || return 1
   # An empty source_repo skips that field (the whole-project-removal sweep
   # no longer knows the owning repo); the project + class headers still gate it.
   if [ -n "$source_repo" ]; then
-    printf '%s\n' "$head" | grep -Fqx "source_repo: ${source_repo}" || return 1
+    grep -Fqx "source_repo: ${source_repo}" <<<"$head" || return 1
   fi
-  printf '%s\n' "$head" | grep -Fqx "project: ${project}" || return 1
-  printf '%s\n' "$head" | grep -Fqx "document_class: ${class}"
+  grep -Fqx "project: ${project}" <<<"$head" || return 1
+  grep -Fqx "document_class: ${class}" <<<"$head"
 }
 
 handle_orphan_mirror() {

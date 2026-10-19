@@ -318,11 +318,11 @@ fi
 run_audit_step 0 ""
 if [ "$STEP_RC" -eq 0 ]; then
   fail "empty BRANCH_PROTECTION_AUDIT_TOKEN must fail the job, got rc=0"
-elif ! echo "$STEP_TEXT" | grep -q "BRANCH_PROTECTION_AUDIT_TOKEN"; then
+elif ! grep -q "BRANCH_PROTECTION_AUDIT_TOKEN" <<<"$STEP_TEXT"; then
   fail "empty-token diagnostic must name the secret; got: $STEP_TEXT"
 elif ! echo "$STEP_TEXT" | grep -q "Administration:read"; then
   fail "empty-token diagnostic must name the required scope; got: $STEP_TEXT"
-elif echo "$STEP_TEXT" | grep -q "stub fleet audit ran"; then
+elif grep -q "stub fleet audit ran" <<<"$STEP_TEXT"; then
   fail "empty-token guard must run BEFORE the audit"
 elif echo "$STEP_OUTPUTS" | grep -q "^result="; then
   fail "empty-token path must NOT set a result: [$STEP_OUTPUTS]"
@@ -397,9 +397,9 @@ fi
 run_audit_step 0 "   "
 if [ "$STEP_RC" -eq 0 ]; then
   fail "a whitespace-only BRANCH_PROTECTION_AUDIT_TOKEN must fail the job, got rc=0"
-elif echo "$STEP_TEXT" | grep -q "stub fleet audit ran"; then
+elif grep -q "stub fleet audit ran" <<<"$STEP_TEXT"; then
   fail "a whitespace-only token must be rejected BEFORE the audit runs"
-elif ! echo "$STEP_TEXT" | grep -q "BRANCH_PROTECTION_AUDIT_TOKEN"; then
+elif ! grep -q "BRANCH_PROTECTION_AUDIT_TOKEN" <<<"$STEP_TEXT"; then
   fail "whitespace-token diagnostic must name the secret; got: $STEP_TEXT"
 elif [ -z "$STEP_SUMMARY" ]; then
   fail "a whitespace-only token must write the same self-describing job summary"

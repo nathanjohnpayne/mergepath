@@ -1398,9 +1398,9 @@ echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (canonical)" \
   || fail "--sync-all plan missing canonical path scripts/hooks/the-hook.sh"
 echo "$sa_out" | grep -q "scripts/coderabbit-wait.sh (canonical)" \
   || fail "--sync-all plan missing canonical path scripts/coderabbit-wait.sh"
-echo "$sa_out" | grep -q "scripts/ci/ (kit, allow-extras)" \
+grep -q "scripts/ci/ (kit, allow-extras)" <<<"$sa_out" \
   || fail "--sync-all plan missing kit path scripts/ci/"
-echo "$sa_out" | grep -q "templated, rendered per consumer facts" \
+grep -q "templated, rendered per consumer facts" <<<"$sa_out" \
   || fail "--sync-all plan should note templated paths are rendered per consumer facts"
 
 # 2) --sync-all honors .sync-overrides.yml. gamma registered a skip of
