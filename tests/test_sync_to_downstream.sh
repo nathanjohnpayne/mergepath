@@ -883,6 +883,73 @@ metadata_run_and_assert \
   "Co-Authored-By: Cursor <noreply@cursor.com>" \
   MERGEPATH_AGENT=cursor \
 
+# #2473: inspect production-generated bodies for a bundle containing tests and
+# security-sensitive tooling, in both ordinary sync and sync-all. Keep this
+# source separate so the existing scope/idempotency fixture stays unchanged.
+REVIEW_MP="$metadata_workdir/review-source"
+git clone -q "$META_MP" "$REVIEW_MP"
+mkdir -p "$REVIEW_MP/tests" "$REVIEW_MP/.github/workflows"
+cat >>"$REVIEW_MP/.mergepath-sync.yml" <<'YAML'
+  - {path: tests/test_canonical.sh, type: canonical, consumers: all}
+  - {path: scripts/credential-helper.sh, type: canonical, consumers: all}
+  - {path: .github/workflows/fixture.yml, type: canonical, consumers: all}
+YAML
+printf '#!/usr/bin/env bash\nexit 0\n' >"$REVIEW_MP/tests/test_canonical.sh"
+cp "$REVIEW_MP/tests/test_canonical.sh" "$REVIEW_MP/scripts/credential-helper.sh"
+printf 'name: fixture\non: workflow_dispatch\njobs: {}\n' >"$REVIEW_MP/.github/workflows/fixture.yml"
+git -C "$REVIEW_MP" add -A
+git -C "$REVIEW_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'add canonical test and tooling bundle'
+review_sha=$(git -C "$REVIEW_MP" rev-parse HEAD)
+for review_mode in ordinary sync-all; do
+  review_id=641
+  review_args=("$review_sha")
+  if [ "$review_mode" = sync-all ]; then
+    review_id=642
+    review_args=(--sync-all)
+  fi
+  review_remote="$metadata_workdir/review-${review_mode}.git"
+  setup_metadata_remote "$review_remote" "$metadata_workdir/review-${review_mode}-seed"
+  set +e
+  review_out=$(env PATH="$META_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$REVIEW_MP" MERGEPATH_AGENT=codex \
+    MERGEPATH_TEST_REMOTE_ALPHA="$review_remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" MERGEPATH_TEST_RUN="$review_id" \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" "${review_args[@]}" --repos alpha 2>&1)
+  review_rc=$?
+  set -e
+  [ "$review_rc" -eq 0 ] || fail "$review_mode review bundle failed: $review_out"
+  review_branch=$(git --git-dir="$review_remote" for-each-ref --format='%(refname)' 'refs/heads/mergepath-sync/*')
+  [[ -n "$review_branch" && "$review_branch" != *$'\n'* ]] \
+    || fail "$review_mode expected exactly one pushed sync branch: $review_branch"
+  review_commit="$META_CAPTURE/commit-body-${review_id}.md"
+  git --git-dir="$review_remote" log -1 --format=%B "$review_branch" >"$review_commit"
+  for review_path in tests/test_canonical.sh scripts/credential-helper.sh .github/workflows/fixture.yml; do
+    git --git-dir="$review_remote" show "$review_branch:$review_path" | cmp - "$REVIEW_MP/$review_path" \
+      || fail "$review_mode did not deliver selected artifact $review_path"
+  done
+  for review_body in "$review_commit" "$META_CAPTURE/pr-body-${review_id}.md"; do
+    grep -qF "https://github.com/nathanjohnpayne/mergepath/commit/$review_sha" "$review_body" \
+      || fail "$review_mode body lost its full source binding"
+    grep -qx 'Authoring-Agent: codex' "$review_body" \
+      || fail "$review_mode body lost its authoring identity"
+    for review_path in tests/test_canonical.sh scripts/credential-helper.sh .github/workflows/fixture.yml; do
+      grep -qF "$review_path" "$review_body" || fail "$review_mode body omitted $review_path"
+    done
+    review_section=$(sed -n '/^## Self-Review$/,/^$/p' "$review_body")
+    for review_field in Correctness 'Regression risk' Style 'Test coverage' Security; do
+      grep -q "^- $review_field:" <<<"$review_section" || fail "$review_mode missing $review_field"
+    done
+    if grep -Eiq 'no test changes shipped|no new attack surface|already[- ]reviewed|has been reviewed|regression risk: low|CI passed' <<<"$review_section"; then
+      fail "$review_mode self-review made an unsupported test, review or security claim: $review_section"
+    fi
+    grep -Eq 'Test coverage:.*tests and fixtures.*consumer CI.*head' <<<"$review_section" \
+      || fail "$review_mode self-review omitted selected tests or current-head CI evidence"
+    grep -Eq 'Security:.*can change.*workflow.*review.*credential' <<<"$review_section" \
+      || fail "$review_mode self-review omitted tooling security effects"
+  done
+done
+
 # #1150: a legacy SHA-only sync-all branch may have delivered a partial scope.
 # It must not suppress the new full-scope key at the same source SHA. Once the
 # scope-aware branch itself is completed, the exact repeat remains idempotent.
