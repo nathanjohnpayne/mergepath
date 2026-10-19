@@ -663,6 +663,28 @@ BROKEN_RC=0
 policy_block_field_parsed code_scanning bot_login "$CFG_BROKEN" >/dev/null 2>&1 || BROKEN_RC=$?
 eq 1 "$BROKEN_RC" "policy_block_field_parsed: unparseable YAML is rc 1 (unknown), not a silent empty"
 
+# Exercise the actual optional Ruby branch independently of whichever parser
+# this runner normally selects. Parsing only document1 must not discard later
+# policy documents before a caller can reject them.
+if ruby -ryaml -rjson -e 'YAML.safe_load("codex: {}")' >/dev/null 2>&1; then
+  RUBY_ONLY="$WORKDIR/ruby-only-bin"
+  mkdir -p "$RUBY_ONLY"
+  for parser in yq python3; do
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$RUBY_ONLY/$parser"
+    chmod +x "$RUBY_ONLY/$parser"
+  done
+  RUBY_JSON=$(PATH="$RUBY_ONLY:$PATH" policy_yaml_to_json "$CFG_FLOW")
+  eq custom-ghas\[bot\] "$(printf '%s' "$RUBY_JSON" | jq -r '.code_scanning.bot_login')" \
+    "Ruby fallback preserves a valid flow mapping"
+  for suffix in 'code_scanning: {}' '[broken'; do
+    printf 'code_scanning: {}\n---\n%s\n' "$suffix" > "$WORKDIR/ruby-multiple.yml"
+    RUBY_RC=0
+    RUBY_JSON=$(PATH="$RUBY_ONLY:$PATH" policy_yaml_to_json "$WORKDIR/ruby-multiple.yml") || RUBY_RC=$?
+    eq 1 "$RUBY_RC" "Ruby fallback rejects additional YAML documents: $suffix"
+    eq '' "$RUBY_JSON" "Ruby fallback emits no partial document: $suffix"
+  done
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "feedback-policy-helpers: $PASS passed, $FAIL failed"

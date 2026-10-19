@@ -386,7 +386,7 @@ CLASSIFY_JQ='
   def strip_markup: norm | gsub("[`*_~>]"; "");
   def login: (.user.login // "");
   def is_bot: ((.user.type // "") == "Bot") or (login | endswith("[bot]"));
-  def is_codex($bot_login): (.user.type // "") == "Bot" and login == $bot_login;
+  def is_codex($bot_login): (.user.type // "") == "Bot" and (login | ascii_downcase) == ($bot_login | ascii_downcase);
   def actor_class($author): if is_bot then "bot" elif login == $author then "author" else "human" end;
   def is_trigger:
     (strip_markup | test("@codex[[:space:]]+review"; "i"))

@@ -637,30 +637,41 @@ for parser in yq python3 ruby; do
   printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/no-parser-bin/$parser"
   chmod +x "$TMP/no-parser-bin/$parser"
 done
-for bot_case in configured flow quoted wrong-login wrong-type unreadable malformed invalid-type whitespace multiple no-parser; do
-  review_login='partner-review[bot]'; review_type=Bot; policy_fail=0; policy_format=block; parser_prefix=''
+mkdir -p "$TMP/ruby-only-bin"
+for parser in yq python3; do
+  cp "$TMP/no-parser-bin/$parser" "$TMP/ruby-only-bin/$parser"
+done
+bot_cases=(configured flow quoted upper-policy upper-api wrong-login wrong-type unreadable malformed invalid-type whitespace multiple no-parser)
+if ruby -ryaml -rjson -e 'YAML.safe_load("codex: {}")' >/dev/null 2>&1; then
+  bot_cases+=(ruby-flow ruby-multiple)
+fi
+for bot_case in "${bot_cases[@]}"; do
+  configured_login='partner-review[bot]'; review_login='partner-review[bot]'; review_type=Bot; policy_fail=0; policy_format=block; parser_prefix=''
+  [ "$bot_case" != upper-policy ] || configured_login='PARTNER-REVIEW[bot]'
+  [ "$bot_case" != upper-api ] || review_login='PARTNER-REVIEW[bot]'
   [ "$bot_case" != wrong-login ] || review_login="$CODEX"
   [ "$bot_case" != wrong-type ] || review_type=User
   [ "$bot_case" != unreadable ] || policy_fail=1
   case "$bot_case" in flow|quoted|malformed|invalid-type|whitespace|multiple) policy_format="$bot_case" ;; esac
   [ "$bot_case" != no-parser ] || parser_prefix="$TMP/no-parser-bin:"
+  case "$bot_case" in ruby-flow) policy_format=flow; parser_prefix="$TMP/ruby-only-bin:" ;; ruby-multiple) policy_format=multiple; parser_prefix="$TMP/ruby-only-bin:" ;; esac
   : > "$TMP/gh.log"
   set +e
   PATH="$parser_prefix$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
-    FINDER_BOT_LOGIN='partner-review[bot]' FINDER_REVIEW_LOGIN="$review_login" \
+    FINDER_BOT_LOGIN="$configured_login" FINDER_REVIEW_LOGIN="$review_login" \
     FINDER_REVIEW_TYPE="$review_type" FINDER_POLICY_FAIL="$policy_fail" FINDER_POLICY_FORMAT="$policy_format" \
     bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --no-gate --json --now "$NOW" \
     --dump "$TMP/bot-$bot_case-dump.json" > "$TMP/bot-$bot_case.json" 2> "$TMP/bot-$bot_case.err"
   bot_rc=$?
   set -e
-  if [[ "$bot_case" =~ ^(unreadable|malformed|invalid-type|whitespace|multiple|no-parser)$ ]]; then
+  if [[ "$bot_case" =~ ^(unreadable|malformed|invalid-type|whitespace|multiple|no-parser|ruby-multiple)$ ]]; then
     if [ "$bot_rc" -eq 3 ] && [ ! -s "$TMP/bot-$bot_case.json" ]; then
       pass "unknown governing bot policy fails closed without a local identity fallback: $bot_case"
     else fail "unknown governing bot policy $bot_case: rc=$bot_rc"; fi
   elif [ "$bot_rc" -eq 1 ] \
-     && jq -e --argjson signal "$([[ "$bot_case" =~ ^(configured|flow|quoted)$ ]] && echo true || echo false)" \
+     && jq -e --argjson signal "$([[ "$bot_case" =~ ^(configured|flow|quoted|upper-policy|upper-api|ruby-flow)$ ]] && echo true || echo false)" \
        '[.prs[] | select(.number == 42)][0].codex_signal_on_head == $signal' "$TMP/bot-$bot_case.json" >/dev/null \
-     && jq -e 'all(.prs[]; .codex_bot_login == "partner-review[bot]")' "$TMP/bot-$bot_case-dump.json" >/dev/null \
+     && jq -e --arg login "$configured_login" 'all(.prs[]; .codex_bot_login == $login)' "$TMP/bot-$bot_case-dump.json" >/dev/null \
      && [ "$(grep -c '/contents/.github/review-policy.yml?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$TMP/gh.log")" -eq 1 ]; then
     pass "governing exact bot and Bot provenance: $bot_case; cached once per base"
   else fail "governing bot $bot_case (rc=$bot_rc): $(cat "$TMP/bot-$bot_case.err")"; fi
@@ -690,6 +701,8 @@ exact-user|chatgpt-codex-connector[bot]|User|chatgpt-codex-connector[bot]|false
 real-bot|chatgpt-codex-connector[bot]|Bot|chatgpt-codex-connector[bot]|true
 custom-bot|partner-review[bot]|Bot|partner-review[bot]|true
 custom-wrong|chatgpt-codex-connector[bot]|Bot|partner-review[bot]|false
+upper-policy|chatgpt-codex-connector[bot]|Bot|ChatGPT-Codex-Connector[bot]|true
+upper-api|PARTNER-REVIEW[bot]|Bot|partner-review[bot]|true
 CASES
 
 # A lookalike's real human feedback still requires action when newly posted.
