@@ -59,6 +59,12 @@ def observation(run):
 def select(request, runs, comments, transitions, now):
     repo, pr, head = request["repo"], request["pr"], request["head"]
     kind = request["kind"]
+    author = request.get("author_identity", "nathanjohnpayne")
+    if not isinstance(author, str) or not author:
+        raise ValueError("invalid recovery author identity")
+    base = request.get("base_sha")
+    if "base_sha" in request and (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
+        raise ValueError("invalid recovery policy base")
     if kind not in ("unreadable", "unrecognized"):
         raise ValueError("not a recoverable evidence state")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or type(pr) is not int or pr <= 0:
@@ -69,7 +75,7 @@ def select(request, runs, comments, transitions, now):
         raise ValueError("unreadable CodeRabbit timing")
     fingerprint = digest({"repo": repo, "pr": pr, "head": head, "kind": kind,
                           "revision": request["revision"], "evidence": request["evidence"],
-                          "head_transitions": transitions})
+                          "head_transitions": transitions, "author_identity": author, "base_sha": base})
     candidates = [r for r in runs if r.get("name") == CONTEXT and r.get("head_sha") == head
                   and r.get("app", {}).get("id") == 15368 and not r.get("external_id")]
     if not candidates or any(type(r.get("id")) is not int or r["id"] <= 0 for r in candidates):
@@ -119,7 +125,7 @@ def select(request, runs, comments, transitions, now):
         body = comment.get("body")
         if not isinstance(body, str) or body.splitlines()[:1] != [token]:
             continue
-        if comment.get("user", {}).get("login") != "nathanjohnpayne":
+        if comment.get("user", {}).get("login") != author:
             continue
         # Reposting an older episode, or editing an old comment into a release,
         # is not a fresh decision. Both timestamps must follow the hold.
@@ -267,7 +273,8 @@ def main():
     # A recovery is never issued for a different live PR/head or old trusted code.
     live = api(f"repos/{repo}/pulls/{pr}")
     tip = api(f"repos/{repo}/commits/HEAD")
-    if live["head"]["sha"] != head or tip["sha"] != request["revision"]:
+    if (live["head"]["sha"] != head or tip["sha"] != request["revision"]
+            or ("base_sha" in request and live["base"]["sha"] != request["base_sha"])):
         raise ValueError("recovery binding changed")
     json.dump(result, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")

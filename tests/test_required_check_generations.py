@@ -112,6 +112,62 @@ class Recovery(unittest.TestCase):
         self.assertEqual(second["state"], "escalate")
         return second
 
+    def test_configured_author_can_release_but_unrelated_and_legacy_authors_cannot(self):
+        self.request["author_identity"] = "configured-owner"
+        report = self.confirmed()
+        custom = self.release(report, user={"login": "configured-owner"})
+        self.assertEqual(self.observe(1002, [custom])["state"], "recovery")
+        for login in ("unrelated-user", "nathanjohnpayne"):
+            with self.subTest(login=login):
+                self.assertEqual(self.observe(1002, [dict(custom, user={"login": login})])["state"], "escalate")
+
+    def test_unset_author_retains_the_legacy_fallback(self):
+        report = self.confirmed()
+        self.assertEqual(self.observe(1002, [self.release(report)])["state"], "recovery")
+
+    def test_malformed_explicit_author_is_unreadable(self):
+        for author in (None, "", True, 7, [], {}):
+            with self.subTest(author=author), self.assertRaisesRegex(ValueError, "recovery author"):
+                self.request["author_identity"] = author
+                self.observe()
+
+    def test_author_change_starts_a_new_bound_episode(self):
+        self.confirmed()
+        self.request["author_identity"] = "configured-owner"
+        self.assertEqual(self.observe(1002)["state"], "pending")
+
+    def test_policy_base_change_cannot_release_recovery(self):
+        self.request["base_sha"] = "c" * 40
+        report = self.confirmed()
+        comment = self.release(report)
+        def pages(path, field=None):
+            if "/check-runs?" in path:
+                return self.runs
+            return [comment] if "/comments?" in path else []
+        for actual in ("c" * 40, "d" * 40):
+            with self.subTest(actual=actual), \
+                    mock.patch.object(recovery, "pages", side_effect=pages), \
+                    mock.patch.object(recovery, "api", side_effect=lambda path:
+                        {"sha": REVISION} if path.endswith("/commits/HEAD") else
+                        {"head":{"sha":HEAD},"base":{"sha":actual}}), \
+                    mock.patch.object(recovery.time, "time", return_value=1002), \
+                    mock.patch.object(sys, "argv", [str(MODULE)]), \
+                    mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.request))), \
+                    mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+                if actual == "c" * 40:
+                    self.assertEqual(recovery.main(), 0)
+                    self.assertEqual(json.loads(output.getvalue())["state"], "recovery")
+                else:
+                    with self.assertRaisesRegex(ValueError, "binding changed"):
+                        recovery.main()
+                    self.assertEqual(output.getvalue(), "")
+
+    def test_malformed_explicit_policy_base_is_unreadable(self):
+        for base in (None, "", True, "short", [], {}):
+            with self.subTest(base=base), self.assertRaisesRegex(ValueError, "policy base"):
+                self.request["base_sha"] = base
+                self.observe()
+
     def test_unrecognized_requires_a_second_identical_observation(self):
         self.confirmed()
 
@@ -255,6 +311,68 @@ class RecoverySubprocessDeadline(unittest.TestCase):
                 self.assertEqual(sum("--method" in call for call in attempts), mode == "write")
                 if mode == "read":
                     self.assertEqual(len(attempts), 1)
+
+
+class RecoveryAuthorCaller(unittest.TestCase):
+    def call(self, policy, fail_resolver=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            workflow = scripts / "workflow"
+            workflow.mkdir(parents=True)
+            governing = root / "governing.yml"
+            governing.write_text(policy)
+            materialized = root / "materialized.yml"
+            config = root / "checkout.yml"
+            config.write_text("author_identity: wrong-checkout-owner\ncoderabbit: {max_wait_seconds: 1245}\n")
+            resolver = workflow / "resolve_base_policy.sh"
+            arguments = root / "resolver-args.json"
+            resolver.write_text("#!" + sys.executable + "\nimport json,shutil,sys\n" +
+                "from pathlib import Path\nPath(" + repr(str(arguments)) +
+                ").write_text(json.dumps(sys.argv[1:]))\n" +
+                "if " + repr(fail_resolver) + ": sys.exit(2)\n" +
+                "shutil.copyfile(" + repr(str(governing)) + "," + repr(str(materialized)) + ")\n" +
+                "print(" + repr(str(materialized)) + ")\n")
+            resolver.chmod(0o755)
+            captured = root / "request.json"
+            (workflow / "coderabbit-evidence-recovery.py").write_text(
+                "import sys\nfrom pathlib import Path\nPath(" + repr(str(captured)) +
+                ").write_text(sys.stdin.read())\nsys.exit(3)\n")
+            source = (ROOT / "scripts/coderabbit-severity-gate.sh").read_text()
+            start = source.index("cr_recovery_author() (")
+            end = source.index("\ncr_fingerprint_hold() {", start)
+            # All runtime functions and YAML parsing are production code. Only
+            # policy resolution and the API-consuming helper are substituted.
+            script = 'source "$1"; CONFIG="$2"; SCRIPT_ROOT="$3"; PR_JSON="$4"; REPO=owner/repo; PR_NUMBER=7; HEAD_SHA=' + HEAD + "; CR_FINDINGS_KNOWN_CLEAN=1; " + source[start:end] + "\ncr_evidence_hold unrecognized fixture"
+            result = subprocess.run(["bash", "-c", script, "fixture",
+                str(ROOT / "scripts/lib/feedback-policy-helpers.sh"), str(config), str(scripts),
+                json.dumps({"base":{"sha":"c" * 40,"ref":"release","repo":{"default_branch":"main"}}})],
+                cwd=ROOT, capture_output=True, text=True, timeout=20)
+            args = json.loads(arguments.read_text())
+            self.assertEqual(args, ["--repo", "owner/repo", "--base-ref", "release", "--base-sha", "c" * 40, "--default-branch", "main", "--default-config", str(config), "--materialize-default"])
+            self.assertFalse(materialized.exists(), "materialized policy must be cleaned up")
+            return result, json.loads(captured.read_text()) if captured.exists() else None
+
+    def test_caller_uses_governing_author_and_keeps_typed_default(self):
+        for policy, author in (("author_identity: configured-owner\n", "configured-owner"),
+                               ("{}\n", "nathanjohnpayne")):
+            with self.subTest(policy=policy):
+                result, request = self.call(policy)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(request["author_identity"], author)
+                self.assertEqual(request["base_sha"], "c" * 40)
+                self.assertEqual(request["repo"], "owner/repo")
+                self.assertEqual(request["pr"], 7)
+                self.assertEqual(request["head"], HEAD)
+
+    def test_unreadable_or_malformed_governing_policy_never_calls_recovery(self):
+        for policy, failed in (("{}", True), ("[invalid", False), ("[]", False),
+                               ("author_identity: null", False), ("author_identity: false", False),
+                               ('author_identity: ""', False)):
+            with self.subTest(policy=policy, failed=failed):
+                result, request = self.call(policy, failed)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIsNone(request)
 
 
 class Escalation(unittest.TestCase):
