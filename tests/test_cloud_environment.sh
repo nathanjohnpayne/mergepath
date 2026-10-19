@@ -268,11 +268,15 @@ done
 cat >"$HBIN_REAL/timeout" <<'REALTIMEOUT'
 #!/usr/bin/env bash
 seconds="$1"; shift
+printf '%s\n' "$seconds" "$@" >"$TEST_TIMEOUT_COMMAND"
 exec perl -e '
   my $seconds = shift;
   my $pid = fork();
   die "fork failed" unless defined $pid;
-  if (!$pid) { exec @ARGV or die "exec failed: $!"; }
+  if (!$pid) {
+    sleep($ENV{TEST_TIMEOUT_CHILD_START_DELAY} || 0);
+    exec @ARGV or die "exec failed: $!";
+  }
 $SIG{ALRM} = sub {
   my $sent = kill "TERM", $pid;
   if ($sent) {
@@ -293,15 +297,24 @@ $SIG{ALRM} = sub {
 ' "$seconds" "$@"
 REALTIMEOUT
 chmod +x "$HBIN_REAL/timeout"
-started="$(date +%s)"
-out="$(CLAUDE_CODE_REMOTE=true MERGEPATH_CLOUD_PROBE_TIMEOUT=1 PROBE_SLEEP_LOG="$WORKDIR/probe-start.log" TEST_TIMEOUT_MARKER="$WORKDIR/alarm.log" PATH="$HBIN_REAL" bash "$HFIX_SLEEP/scripts/hooks/cloud-session-start.sh")"; rc=$?
-elapsed=$(( $(date +%s) - started ))
-if [ "$rc" -eq 0 ] && [ "$elapsed" -le 3 ] && [ -s "$WORKDIR/probe-start.log" ] \
-   && [ "$(cat "$WORKDIR/alarm.log")" = "124" ] && printf '%s' "$out" | grep -q 'capabilities unknown'; then
-  pass "hook, sleeping probe: invoked sleeper, recorded alarm/124, and printed the unknown summary within the shortened bound"
-else
-  fail "hook sleeping probe: rc=$rc elapsed=${elapsed}s start=$(cat "$WORKDIR/probe-start.log" 2>/dev/null) alarm=$(cat "$WORKDIR/alarm.log" 2>/dev/null) out=$out"
-fi
+# A correct deadline may expire before the child gets scheduled. Verify the
+# exact dispatched command rather than requiring the child's first write.
+printf '1\n%s\n--quiet\n' "$HFIX_SLEEP/scripts/agent-capability-probe.sh" >"$WORKDIR/expected-probe-command"
+for startup_delay in 0 2; do
+  rm -f "$WORKDIR/probe-start.log" "$WORKDIR/alarm.log" "$WORKDIR/probe-command.log"
+  started="$(date +%s)"
+  out="$(CLAUDE_CODE_REMOTE=true MERGEPATH_CLOUD_PROBE_TIMEOUT=1 PROBE_SLEEP_LOG="$WORKDIR/probe-start.log" TEST_TIMEOUT_MARKER="$WORKDIR/alarm.log" TEST_TIMEOUT_COMMAND="$WORKDIR/probe-command.log" TEST_TIMEOUT_CHILD_START_DELAY="$startup_delay" PATH="$HBIN_REAL" bash "$HFIX_SLEEP/scripts/hooks/cloud-session-start.sh")"; rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  if [ "$rc" -eq 0 ] && [ "$elapsed" -le 3 ] \
+     && cmp -s "$WORKDIR/probe-command.log" "$WORKDIR/expected-probe-command" \
+     && [ "$(cat "$WORKDIR/alarm.log")" = "124" ] \
+     && printf '%s' "$out" | grep 'capabilities unknown' >/dev/null \
+     && { [ "$startup_delay" -eq 0 ] || [ ! -s "$WORKDIR/probe-start.log" ]; }; then
+    pass "hook, sleeping probe (startup delay ${startup_delay}s): exact dispatch, alarm/124 and unknown summary within the shortened bound"
+  else
+    fail "hook sleeping probe: delay=$startup_delay rc=$rc elapsed=${elapsed}s command=$(cat "$WORKDIR/probe-command.log" 2>/dev/null) start=$(cat "$WORKDIR/probe-start.log" 2>/dev/null) alarm=$(cat "$WORKDIR/alarm.log" 2>/dev/null) out=$out"
+  fi
+done
 fi
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' \
