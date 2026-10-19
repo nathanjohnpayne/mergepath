@@ -496,7 +496,15 @@ echo "$args" >> "$GH_LOG"
 case "$args" in
   *"/contents/.github/review-policy.yml?ref="*)
     [ "${FINDER_POLICY_FAIL:-0}" != 1 ] || { echo 'gh: policy unavailable (HTTP 500)' >&2; exit 1; }
-    printf 'codex:\n  bot_login: "%s"\n' "${FINDER_BOT_LOGIN:-chatgpt-codex-connector[bot]}" ;;
+    case "${FINDER_POLICY_FORMAT:-block}" in
+      flow) printf 'codex: {bot_login: "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      quoted) printf '"codex": {"bot_login": "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      malformed) printf 'codex: [broken\n' ;;
+      invalid-type) printf 'codex: {bot_login: false}\n' ;;
+      whitespace) printf 'codex:\n  bot_login: |\n    partner-review[bot]\n' ;;
+      multiple) printf 'codex: {}\n---\ncodex: {}\n' ;;
+      *) printf 'codex:\n  bot_login: "%s"\n' "${FINDER_BOT_LOGIN:-chatgpt-codex-connector[bot]}" ;;
+    esac ;;
   *"api graphql"*)          echo "gh shim: no GraphQL read is expected (CI state comes from the check runs)" >&2; exit 1 ;;
   *"/activity?"*)          cat "$FIXTURE/activity-$(printf '%s' "$args" | sed -n 's/.*feat%2F\([0-9]*\).*/\1/p').json" ;;
   *"/check-runs"*)          cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
@@ -624,26 +632,33 @@ fi
 # local checkout advertises a different bot. One shared base needs one read.
 mkdir -p "$TREE/.github"
 printf 'codex:\n  bot_login: "local-only[bot]"\n' > "$TREE/.github/review-policy.yml"
-for bot_case in configured wrong-login wrong-type unreadable; do
-  review_login='partner-review[bot]'; review_type=Bot; policy_fail=0
+mkdir -p "$TMP/no-parser-bin"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/no-parser-bin/$parser"
+  chmod +x "$TMP/no-parser-bin/$parser"
+done
+for bot_case in configured flow quoted wrong-login wrong-type unreadable malformed invalid-type whitespace multiple no-parser; do
+  review_login='partner-review[bot]'; review_type=Bot; policy_fail=0; policy_format=block; parser_prefix=''
   [ "$bot_case" != wrong-login ] || review_login="$CODEX"
   [ "$bot_case" != wrong-type ] || review_type=User
   [ "$bot_case" != unreadable ] || policy_fail=1
+  case "$bot_case" in flow|quoted|malformed|invalid-type|whitespace|multiple) policy_format="$bot_case" ;; esac
+  [ "$bot_case" != no-parser ] || parser_prefix="$TMP/no-parser-bin:"
   : > "$TMP/gh.log"
   set +e
-  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+  PATH="$parser_prefix$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
     FINDER_BOT_LOGIN='partner-review[bot]' FINDER_REVIEW_LOGIN="$review_login" \
-    FINDER_REVIEW_TYPE="$review_type" FINDER_POLICY_FAIL="$policy_fail" \
+    FINDER_REVIEW_TYPE="$review_type" FINDER_POLICY_FAIL="$policy_fail" FINDER_POLICY_FORMAT="$policy_format" \
     bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --no-gate --json --now "$NOW" \
     --dump "$TMP/bot-$bot_case-dump.json" > "$TMP/bot-$bot_case.json" 2> "$TMP/bot-$bot_case.err"
   bot_rc=$?
   set -e
-  if [ "$bot_case" = unreadable ]; then
+  if [[ "$bot_case" =~ ^(unreadable|malformed|invalid-type|whitespace|multiple|no-parser)$ ]]; then
     if [ "$bot_rc" -eq 3 ] && [ ! -s "$TMP/bot-$bot_case.json" ]; then
-      pass 'unreadable governing bot policy fails closed without a local identity fallback'
-    else fail "unreadable governing bot policy: rc=$bot_rc"; fi
+      pass "unknown governing bot policy fails closed without a local identity fallback: $bot_case"
+    else fail "unknown governing bot policy $bot_case: rc=$bot_rc"; fi
   elif [ "$bot_rc" -eq 1 ] \
-     && jq -e --argjson signal "$([ "$bot_case" = configured ] && echo true || echo false)" \
+     && jq -e --argjson signal "$([[ "$bot_case" =~ ^(configured|flow|quoted)$ ]] && echo true || echo false)" \
        '[.prs[] | select(.number == 42)][0].codex_signal_on_head == $signal' "$TMP/bot-$bot_case.json" >/dev/null \
      && jq -e 'all(.prs[]; .codex_bot_login == "partner-review[bot]")' "$TMP/bot-$bot_case-dump.json" >/dev/null \
      && [ "$(grep -c '/contents/.github/review-policy.yml?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$TMP/gh.log")" -eq 1 ]; then

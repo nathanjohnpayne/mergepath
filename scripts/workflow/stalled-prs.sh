@@ -267,7 +267,17 @@ else
         --materialize-default 2>"$WORK/policy.err") \
         || infra "PR #$number governing policy unreadable: $(cat "$WORK/policy.err")"
       [ -r "$policy_path" ] || infra "PR #$number materialized policy is unreadable"
-      codex_login=$(read_policy_block_field codex bot_login "$policy_path") \
+      policy_yaml_to_json "$policy_path" >"$WORK/bot-policy.json" \
+        || infra "PR #$number governing policy could not be parsed; a supported YAML parser is required"
+      codex_login=$(jq -ers '
+        if length != 1 then error("expected one policy document") else .[0] end
+        | if type != "object" then error("policy must be a mapping") else .codex end
+        | if . == null then {} else . end
+        | if type != "object" then error("codex must be a mapping") else .bot_login end
+        | if . == null or . == "" then "chatgpt-codex-connector[bot]"
+          elif type == "string" and (test("[[:space:]]") | not) then .
+          else error("bot_login must be a string without whitespace") end
+      ' "$WORK/bot-policy.json") \
         || infra "PR #$number configured Codex login unreadable"
       printf '%s\n' "${codex_login:-chatgpt-codex-connector[bot]}" >"$WORK/bot-$base_sha"
     fi
