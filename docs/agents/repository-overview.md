@@ -158,3 +158,5 @@ Parser-drift escalation reuses only marker-prefixed non-PR work items attributed
 CodeRabbit recovery-helper GitHub reads and writes are bounded to30 seconds per subprocess; a timeout retains the evidence hold with exit3 and does not retry an uncertain write.
 
 CodeRabbit evidence escalation continues later nominated PRs after an expected per-PR failure, emits a PR-bound diagnostic and retains a failing final status. Immutable tuples, owner recovery and uncertain-write behavior remain enforced.
+
+CodeRabbit recovery releases use the governing base policy author identity, with the existing absent-field fallback. The typed identity and full policy base bind the evidence episode; a changed live base prevents recovery output.

@@ -319,8 +319,27 @@ die() {
 # Narrow recovery runs only after an evidence failure, never after a readable
 # blocking verdict. The report file lets the owned publisher place machine
 # evidence ahead of quoted provider text in its check summary.
+# The release author is a governing-base identity, never candidate policy.
+cr_recovery_author() (
+  local policy json base ref default_branch
+  base=$(printf '%s' "$PR_JSON" | jq -er '.base.sha | select(type == "string" and test("^[0-9a-f]{40}$"))') || return 1
+  ref=$(printf '%s' "$PR_JSON" | jq -er '.base.ref | select(type == "string" and length > 0)') || return 1
+  default_branch=$(printf '%s' "$PR_JSON" | jq -er '.base.repo.default_branch | select(type == "string" and length > 0)') || return 1
+  policy=$("$SCRIPT_ROOT/workflow/resolve_base_policy.sh" --repo "$REPO" --base-ref "$ref" --base-sha "$base" --default-branch "$default_branch" \
+    --default-config "$CONFIG" --materialize-default) || return 1
+  [ -n "$policy" ] && [ -r "$policy" ] || return 1
+  trap '[ "$policy" = "$CONFIG" ] || rm -f "$policy"' EXIT
+  json=$(policy_yaml_to_json "$policy") || return 1
+  printf '%s' "$json" | jq -ce --arg base "$base" '
+    if type != "object" then error("policy")
+    elif has("author_identity") then
+      (if (.author_identity | type) == "string" and (.author_identity | length) > 0
+       then .author_identity else error("author_identity") end)
+    else "nathanjohnpayne" end | {author_identity:.,base_sha:$base}'
+)
+
 cr_evidence_hold() {
-  local kind="$1" evidence="$2" revision budget report result probe retry_after=0 rc=0
+  local kind="$1" evidence="$2" revision budget authority report result probe retry_after=0 rc=0
   if [ "${CR_FINDINGS_KNOWN_CLEAN:-0}" -ne 1 ]; then
     [ "${BLOCKING_COUNT:-0}" -eq 0 ] && [ "${SUMMARY_BLOCKING_COUNT:-0}" -eq 0 ] || return 3
   fi
@@ -341,10 +360,11 @@ cr_evidence_hold() {
   # Stream provider bodies through a fixed stdlib hash, so a long review
   # history never crosses the operating system's per-argument size limit.
   evidence=$(printf '%s' "$evidence" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || return 3
+  authority=$(cr_recovery_author) || return 3
   report=$(jq -nc --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
-    --arg revision "$revision" --arg kind "$kind" --arg evidence "$evidence" \
+    --arg revision "$revision" --arg kind "$kind" --arg evidence "$evidence" --argjson authority "$authority" \
     --argjson budget "$budget" --argjson retry "$retry_after" \
-    '{repo:$repo,pr:$pr,head:$head,revision:$revision,kind:$kind,evidence:$evidence,max_wait_seconds:$budget,retry_after:$retry}') || return 3
+    '{repo:$repo,pr:$pr,head:$head,revision:$revision,kind:$kind,evidence:$evidence,max_wait_seconds:$budget,retry_after:$retry} + $authority') || return 3
   result=$(printf '%s' "$report" | python3 "$SCRIPT_ROOT/workflow/coderabbit-evidence-recovery.py") || rc=$?
   if [ -n "$result" ] && jq -e 'type == "object" and (.state | IN("pending","escalate","recovery"))' <<<"$result" >/dev/null; then
     if [ -n "${CR_EVIDENCE_REPORT:-}" ]; then
