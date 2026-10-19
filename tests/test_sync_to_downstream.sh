@@ -2912,6 +2912,7 @@ source=Path(sys.argv[1]).read_text()
 begin=source.index('  local pr_url\n',source.index('sync_all_open_pr()'))
 end=source.index('\n}\n',begin)
 progress=source.index('sync_progress()');progress_end=source.index('\n}\n',progress)+3
+review=source.index('sync_self_review()');review_end=source.index('\n}\n',review)+3
 Path(sys.argv[2]).write_text('''set -euo pipefail
 SCRIPT_VERSION=fixture;SYNC_PROGRESS_JSON=1
 consumer_name=alpha;consumer_repo=example/alpha;branch=fixture;sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;short_sha=aaaaaaa
@@ -2919,7 +2920,7 @@ canonical_lines=README.md;kit_lines=;templated_lines=;override_note=;authoring_a
 sync_coderabbit_ignore_block(){ :; }
 err(){ printf '%s\\n' "$*" >&2; }
 sync_author_gh(){ /bin/bash "$MERGEPATH_TEST_ACTUAL_WRAPPER" -- gh "$@"; }
-'''+source[progress:progress_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
+'''+source[progress:progress_end]+source[review:review_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
 PY
 for telemetry_mode in verified wrong duplicate mixed malformed missing failed; do
   set +e
