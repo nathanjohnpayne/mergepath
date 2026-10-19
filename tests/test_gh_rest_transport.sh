@@ -175,6 +175,21 @@ case "$method $endpoint" in
   "POST repos/$REPO/pulls")
     [ -z "${STUB_CREATE_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
     jq -n --arg url "$(url_of 42)" --arg login "$write_login" '{number: 42, html_url: $url, user: {login: $login}}' ;;
+  "POST repos/$REPO/issues")
+    [ -z "${STUB_CREATE_FAIL:-}" ] || { echo 'gh: Validation Failed (HTTP 422)' >&2; exit 1; }
+    jq -n --argjson payload "$input" --arg login "$write_login" --arg repo "$REPO" '
+      $payload + {number:42,html_url:("https://github.com/"+$repo+"/issues/42"),user:{login:$login},
+        labels:($payload.labels|map({name:.})),assignees:($payload.assignees|map({login:.}))}' >"$STATE/created-issue.json"
+    if [ -n "${STUB_ISSUE_BAD_RESPONSE:-}" ]; then printf '{}\n'; else cat "$STATE/created-issue.json"; fi ;;
+  "GET repos/$REPO/issues/42")
+    [ -z "${STUB_ISSUE_READBACK_FAIL:-}" ] || { echo 'gh: HTTP 502' >&2; exit 1; }
+    jq --arg who "${STUB_ISSUE_READBACK_LOGIN:-$write_login}" --arg drop "${STUB_ISSUE_DROP_LABELS:-}" \
+      --arg upper "${STUB_ISSUE_METADATA_UPCASE:-}" --arg assignee "${STUB_ISSUE_READBACK_ASSIGNEE:-}" '
+      .user.login=$who
+      | (if $drop == "" then . else .labels=[] end)
+      | (if $upper == "" then . else .labels |= map(.name |= ascii_upcase)
+         | .assignees |= map(.login |= ascii_upcase) end)
+      | if $assignee == "" then . else .assignees=[{login:$assignee}] end' "$STATE/created-issue.json" ;;
   "POST repos/$REPO/issues/"*"/comments")
     [ -z "${STUB_COMMENT_FAIL:-}" ] || { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; }
     num="$(number_of "$endpoint")"
@@ -1697,6 +1712,82 @@ if [ "$rc" -eq 3 ] && log_lacks 'POST' && log_lacks $'pr\tcomment'; then
 else
   fail "placeholder on cloud: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
+
+# #2335: the exact observation-filer command runs as one REST issue create,
+# then verifies the author and requested state through an independent GET.
+ISSUE_BODY="$WORKDIR/observation-body.md"
+printf '%s\n\n' 'Advisory observation: "quoted" text and café.' >"$ISSUE_BODY"
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+  --title '[Post-Review] observation' --body-file "$ISSUE_BODY" \
+  --label post-review --label observation --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ] \
+   && log_has $'POST\trepos/o/r/issues\t--input\t' && log_has $'gh\tapi\trepos/o/r/issues/42' \
+   && log_token_clean ghp_author-token \
+   && jq -e --rawfile body "$ISSUE_BODY" '.body==$body and .title=="[Post-Review] observation"
+      and ([.labels[].name]|sort)==["observation","post-review"]
+      and [.assignees[].login]==["nathanjohnpayne"]' "$STATE/created-issue.json" >/dev/null; then
+  pass "#2335: exact observation-filer issue create uses REST, preserves body bytes and verifies readback"
+else fail "#2335: observation issue create rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+
+# GitHub preserves existing label/login display case. Only metadata names
+# normalize; the author, number, title and exact body still have their fences.
+for metadata_mode in mixed-case wrong-assignee; do
+  new_case
+  set +e
+  out="$(STUB_ISSUE_METADATA_UPCASE=1 \
+    STUB_ISSUE_READBACK_ASSIGNEE="$( [ "$metadata_mode" != wrong-assignee ] || printf 'OtherUser' )" \
+    MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+      --title '[Post-Review] observation' --body-file "$ISSUE_BODY" \
+      --label post-review --label observation --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+  set -e
+  if [ "$(grep -c $'POST\trepos/o/r/issues\t' "$LOGF")" = 1 ] \
+     && log_has $'gh\tapi\trepos/o/r/issues/42' \
+     && { { [ "$metadata_mode" = mixed-case ] && [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ]; } \
+          || { [ "$metadata_mode" = wrong-assignee ] && [ "$rc" = 5 ]; }; }; then
+    pass "#2335: $metadata_mode metadata readback honors case but retains requested identity"
+  else fail "#2335: $metadata_mode metadata readback rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+done
+
+for mode in wrong-author unreadable changed-metadata bad-response api-failure; do
+  new_case
+  set +e
+  out="$(STUB_ISSUE_READBACK_LOGIN="$( [ "$mode" != wrong-author ] || printf 'claude[bot]' )" \
+    STUB_ISSUE_READBACK_FAIL="$( [ "$mode" != unreadable ] || printf 1 )" \
+    STUB_ISSUE_DROP_LABELS="$( [ "$mode" != changed-metadata ] || printf 1 )" \
+    STUB_ISSUE_BAD_RESPONSE="$( [ "$mode" != bad-response ] || printf 1 )" \
+    STUB_CREATE_FAIL="$( [ "$mode" != api-failure ] || printf 1 )" \
+    MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+      --title observation --body-file "$ISSUE_BODY" --label post-review 2>"$WORKDIR/err")"; rc=$?
+  set -e
+  if [ "$rc" != 0 ] && [ "$(grep -c $'POST\trepos/o/r/issues\t' "$LOGF")" = 1 ]; then
+    case "$mode" in
+      api-failure) [ "$rc" = 1 ] && log_lacks $'gh\tapi\trepos/o/r/issues/42' ;;
+      *) [ "$rc" = 5 ] ;;
+    esac && pass "#2335: $mode refuses without a duplicate create" || fail "#2335: $mode unexpected rc=$rc"
+  else fail "#2335: $mode must refuse after one attempted create (rc=$rc)"; fi
+ done
+
+for variant in no-repo no-title no-body stdin-body extra-flag bad-assignee; do
+  new_case
+  args=(--repo o/r --title observation --body-file "$ISSUE_BODY")
+  case "$variant" in
+    no-repo) args=(--title observation --body-file "$ISSUE_BODY") ;;
+    no-title) args=(--repo o/r --body-file "$ISSUE_BODY") ;;
+    no-body) args=(--repo o/r --title observation) ;;
+    stdin-body) args=(--repo o/r --title observation --body-file -) ;;
+    extra-flag) args+=(--web) ;;
+    bad-assignee) args+=(--assignee @me) ;;
+  esac
+  set +e
+  MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create "${args[@]}" >"$WORKDIR/out" 2>"$WORKDIR/err"; rc=$?
+  set -e
+  if [ "$rc" != 0 ] && log_lacks $'POST\trepos/o/r/issues\t'; then
+    pass "#2335: $variant grammar refuses before create"
+  else fail "#2335: $variant must refuse before write (rc=$rc)"; fi
+ done
 
 echo ""
 echo "test_gh_rest_transport: $PASS passed, $FAIL failed"

@@ -39,6 +39,8 @@
 #                [--add-assignee USER]... [--remove-assignee USER]...
 #   gh pr close N --repo OWNER/REPO [--comment TEXT] [--delete-branch]
 #   gh issue comment N --repo OWNER/REPO (--body B | --body-file F)
+#   gh issue create --repo OWNER/REPO --title T --body-file F
+#                   [--label L]... [--assignee USER]...
 #
 # --head defaults to the checked-out branch, qualified owner:branch when its
 # push remote is another repository (a fork), and is refused when the branch
@@ -1107,6 +1109,68 @@ gh_rest_pr_create() {
   return 0
 }
 
+gh_rest_issue_create() {
+  GH_REST_FORM='gh issue create --repo OWNER/REPO --title T --body-file F [--label L]... [--assignee USER]...' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
+  local repo="" title="" labels="" assignees=""
+  GH_REST_BODY_FILE=""
+  GH_REST_BODY_SET=0
+  gh_rest_parse_init "$@"
+  while [ "$GH_REST_I" -lt "${#GH_REST_ARGS[@]}" ]; do
+    gh_rest_opt || return 1
+    case "$GH_REST_OPT" in
+      --repo) gh_rest_value || return 1; repo="$GH_REST_VAL" ;;
+      --title) gh_rest_value || return 1; title="$GH_REST_VAL" ;;
+      --body-file) gh_rest_value || return 1; gh_rest_body_from "$GH_REST_OPT" "$GH_REST_VAL" || return 1 ;;
+      --label) gh_rest_value || return 1; gh_rest_check_csv --label "$GH_REST_VAL" || return 1; labels="$labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --assignee) gh_rest_value || return 1; gh_rest_check_csv --assignee "$GH_REST_VAL" || return 1; assignees="$assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      *) gh_rest_refuse "option or argument '${GH_REST_OPT:-$GH_REST_VAL}' is not accepted"; return 1 ;;
+    esac
+    GH_REST_I=$((GH_REST_I + 1))
+  done
+  gh_rest_check_repo "$repo" || return 1
+  [ -n "$title" ] || { gh_rest_refuse "--title is required"; return 1; }
+  [ "$GH_REST_BODY_SET" -eq 1 ] || { gh_rest_refuse "--body-file is required"; return 1; }
+  local labels_json assignees_json input response number url created actual
+  labels_json="$(gh_rest_lines_json "$labels")" || return 1
+  assignees_json="$(gh_rest_lines_json "$assignees")" || return 1
+  gh_rest_each "$assignees_json" gh_rest_check_login_what "--assignee" || return 1
+  input="$(gh_rest_json_file --arg title "$title" --rawfile body "$GH_REST_BODY_FILE" \
+    --argjson labels "$labels_json" --argjson assignees "$assignees_json" \
+    '{title:$title,body:$body,labels:$labels,assignees:$assignees}')" || return 1
+  response="$(gh_rest_api POST "repos/$repo/issues" "$input")" || return $?
+  number="$(printf '%s' "$response" | jq -r \
+    '.number | select(type == "number" and . > 0 and . == floor)' 2>/dev/null)" || number=""
+  url="$(printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null)"
+  if [ -z "$number" ] || ! printf '%s' "$url" | jq -eRs --arg r "$repo" --arg n "$number" \
+    'ascii_downcase == ("https://github.com/" + $r + "/issues/" + $n | ascii_downcase)' >/dev/null; then
+    gh_rest_err "ERROR could not identify the created issue; it may exist, so verify manually before retrying."
+    return 5
+  fi
+  created="$(gh_rest_api GET "repos/$repo/issues/$number" 2>/dev/null || true)"
+  actual="$(printf '%s' "$created" | jq -r '.user.login // empty' 2>/dev/null)"
+  if [ -z "$actual" ]; then
+    gh_rest_err "ERROR could not read the author of $url back; inspect it before retrying."
+    printf '%s\n' "$url"
+    return 5
+  fi
+  if [ "$actual" != "$GH_REST_EXPECTED" ]; then
+    gh_rest_err "ERROR issue $url author readback was '$actual', expected '$GH_REST_EXPECTED'."
+    gh_rest_recovery "the issue" "$url"
+    printf '%s\n' "$url"
+    return 5
+  fi
+  if ! printf '%s' "$created" | jq -e --slurpfile sent "$input" --argjson n "$number" '
+    .number == $n and .title == $sent[0].title and .body == $sent[0].body
+    and ((($sent[0].labels | map(ascii_downcase)) - [.labels[]?.name | ascii_downcase]) | length) == 0
+    and ((($sent[0].assignees | map(ascii_downcase)) - [.assignees[]?.login | ascii_downcase]) | length) == 0' >/dev/null; then
+    gh_rest_err "ERROR issue $url was created, but requested content/metadata could not be verified; inspect it before retrying."
+    printf '%s\n' "$url"
+    return 5
+  fi
+  gh_rest_err "verified issue #$number author=$actual (matches expected $GH_REST_EXPECTED)"
+  printf '%s\n' "$url"
+}
+
 gh_rest_comment() { # <pr|issue> <args...>
   local kind="$1" number="" repo=""
   shift
@@ -1591,12 +1655,13 @@ gh_rest_run() {
     "pr create"|"pr new") shift 2; gh_rest_pr_create "$@" || rc=$? ;;
     "pr comment") shift 2; gh_rest_comment pr "$@" || rc=$? ;;
     "issue comment") shift 2; gh_rest_comment issue "$@" || rc=$? ;;
+    "issue create") shift 2; gh_rest_issue_create "$@" || rc=$? ;;
     "pr review") shift 2; gh_rest_pr_review "$@" || rc=$? ;;
     "pr edit") shift 2; gh_rest_pr_edit "$@" || rc=$? ;;
     "pr close") shift 2; gh_rest_pr_close "$@" || rc=$? ;;
     "pr merge") gh_rest_merge_refused; rc=$GH_REST_MERGE_CEILING_EXIT ;;
     "pr "*|"issue "*)
-      GH_REST_FORM='gh pr create|comment|review|edit|close ... or gh issue comment ..., with the verb first and the number next' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
+      GH_REST_FORM='gh pr create|comment|review|edit|close ... or gh issue create|comment ..., with the verb first' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
       gh_rest_refuse "'gh ${1:-} ${2:-}' is not a form the REST transport runs"
       rc=1
       ;;
