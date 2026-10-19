@@ -712,23 +712,62 @@ SH
   fi
 done
 
-# Shorten only the clock constant in an isolated copy to make the real process-
-# group deadline observable quickly; do not wait three minutes in every CI run.
+# Arm a real communicate timeout after bounded descendant readiness. A slow
+# launcher must not spend that interval before the child can advertise itself.
+# The checked-in driver's clock, kill handler and failure lease stay intact.
 dir="$TMP/deadline"
 make_sweep_fixture "$dir"
-sed 's/^SECONDS = 180$/SECONDS = 1/' "$dir/scripts/workflow/codex-p1-snapshot-retry.py" > "$dir/short-driver"
-mv "$dir/short-driver" "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+mv "$dir/scripts/workflow/codex-p1-snapshot-retry.py" "$dir/scripts/workflow/deadline-driver.py"
+cat > "$dir/scripts/workflow/codex-p1-snapshot-retry.py" <<'PYTHON'
+#!/usr/bin/env python3
+from pathlib import Path
+import os, runpy, signal, subprocess, time
+
+root = Path(os.environ['FIXTURE_LOG'])
+original_popen = subprocess.Popen
+
+def popen(command, *args, **kwargs):
+    process = original_popen(command, *args, **kwargs)
+    if command[0] == 'scripts/codex-p1-gate.sh':
+        original_communicate = process.communicate
+        armed = False
+        def communicate(input=None, timeout=None):
+            nonlocal armed
+            if not armed:
+                ready_end = time.monotonic() + 10
+                while not (root / 'deadline-descendant.pid').exists():
+                    if process.poll() is not None:
+                        raise RuntimeError('evaluator exited before descendant readiness')
+                    if time.monotonic() >= ready_end:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=2)
+                        raise RuntimeError('descendant readiness exceeded ten seconds')
+                    time.sleep(0.02)
+                (root / 'readiness-observation.log').write_text('ready before timeout armed\n')
+                armed = True
+                timeout = 1
+            return original_communicate(input=input, timeout=timeout)
+        process.communicate = communicate
+    return process
+
+subprocess.Popen = popen
+runpy.run_path(str(Path(__file__).with_name('deadline-driver.py')), run_name='__main__')
+PYTHON
 chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
 cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
 #!/usr/bin/env bash
+# Deliberately exceed the old fixture's entire one-second deadline.
+sleep 1.5
 # Closed stdio lets a leader-only kill return without waiting for this child.
 # The child stays in the evaluator's group and advertises readiness first.
 python3 - "$FIXTURE_LOG" <<'PYTHON' >/dev/null 2>&1 &
 from pathlib import Path
 import os, sys, time
 root = Path(sys.argv[1])
-(root / 'deadline-descendant.pid').write_text(str(os.getpid()))
-end = time.monotonic() + 8
+pending_pid = root / 'deadline-descendant.pid.pending'
+pending_pid.write_text(str(os.getpid()))
+pending_pid.replace(root / 'deadline-descendant.pid')
+end = time.monotonic() + 20
 while not (root / 'release-descendant').exists() and time.monotonic() < end:
     time.sleep(0.02)
 # A survivor acknowledges release, or its own bounded escape timeout.
@@ -737,7 +776,9 @@ PYTHON
 wait
 SH
 if run_event "$dir"; then rc=0; else rc=$?; fi
-if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" && [ -s "$dir/deadline-descendant.pid" ]; then
+if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" \
+   && [ -s "$dir/deadline-descendant.pid" ] \
+   && grep -Fxq 'ready before timeout armed' "$dir/readiness-observation.log"; then
   pass 'shared deadline kills evaluation and reserves fail-closed lease closure'
 else
   fail 'shared deadline kills evaluation and reserves fail-closed lease closure' "rc=$rc"
