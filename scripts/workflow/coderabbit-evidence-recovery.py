@@ -16,6 +16,7 @@ import time
 
 CONTEXT = "CodeRabbit unresolved blocking findings"
 PREFIX = "<!-- mergepath-coderabbit-evidence:v1 "
+GH_API_TIMEOUT_SECONDS = 30
 
 
 def digest(value):
@@ -23,7 +24,8 @@ def digest(value):
 
 
 def api(path, *args):
-    result = subprocess.run(["gh", "api", *args, path], check=True, capture_output=True, text=True)
+    result = subprocess.run(["gh", "api", *args, path], check=True, capture_output=True, text=True,
+                            timeout=GH_API_TIMEOUT_SECONDS)
     return json.loads(result.stdout)
 
 
@@ -144,7 +146,8 @@ def select(request, runs, comments, transitions, now):
 
 def write(path, body, method="POST"):
     result = subprocess.run(["gh", "api", "--method", method, path, "--input", "-"],
-                            input=json.dumps(body), check=True, capture_output=True, text=True)
+                            input=json.dumps(body), check=True, capture_output=True, text=True,
+                            timeout=GH_API_TIMEOUT_SECONDS)
     return json.loads(result.stdout)
 
 
@@ -263,6 +266,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"CodeRabbit recovery evidence unreadable: {type(error).__name__}", file=sys.stderr)
         sys.exit(3)
