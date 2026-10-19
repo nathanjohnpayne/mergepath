@@ -478,9 +478,9 @@ An array assignment's parenthesised list is data, and a `$( )` among its
 elements is a capture under that assignment.
 
 Inside double quotes, the bounded ordinary-name `:-` default-word reader treats
-apostrophes as literal and retains plain named or numbered positional expansions
-(#1452). Ordinary-name heads retain raw offsets across backslash-LF continuations
-in the name or between the colon and minus; special parameters remain excluded.
+apostrophes as literal and retains plain named, numbered positional and unbraced
+$@/$* expansions (#1452; #2236). Ordinary-name heads retain raw offsets across backslash-LF continuations
+in the name or between the colon and minus; special-parameter heads remain excluded.
 An admitted plain word expansion also consumes immediate backslash-LF suffixes;
 other word escapes retain the existing fallback.
 Unquoted single-quote suppression and the measured non-expanding `:?` diagnostic
@@ -2513,7 +2513,7 @@ def _double_quoted_default_word_start(text, i):
     """Raw word offset for an ordinary-name :- head, or None.
 
     Reuse the existing identifier continuation rule; only backslash-LF may
-    separate the colon and minus. Other operators and special parameters
+    separate the colon and minus. Other operators and special-parameter heads
     retain the previous bounded-reader fallback.
     """
     if not text.startswith("${", i):
@@ -2530,8 +2530,8 @@ def _double_quoted_default_word_start(text, i):
 def _simple_parameter_end(text, i):
     """End of a double-quoted `${ }` span, with bounded :- word support.
 
-    Only ordinary-name defaults admit literal apostrophes and plain named or
-    numbered positional expansions. Their immediate backslash-LF suffixes
+    Only ordinary-name defaults admit literal apostrophes and plain named,
+    numbered positional and unbraced $@/$* expansions. Their immediate backslash-LF suffixes
     retain raw offsets; other escapes and nested constructs keep the fallback.
     """
     word_start = _double_quoted_default_word_start(text, i)
@@ -2547,7 +2547,7 @@ def _simple_parameter_end(text, i):
                 j += 1  # Literal inside the demonstrated double-quoted default.
                 continue
             if c == "$":
-                plain = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)", text[j + 1:])
+                plain = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*|[@*])", text[j + 1:])
                 if plain:
                     j += 1 + plain.end()
                     while text[j:j + 2] == "\\\n":
@@ -6119,6 +6119,19 @@ CORPUS = [
         MUST_NOT_FLAG,
         "SET_VALUE=present\necho ${UNSET_VALUE:-'$GH_TOKEN'} ${SET_VALUE:?'$GH_TOKEN'}\n",
     ),
+    # #2236: aggregate references in this bounded quoted default word.
+    ('quoted-default-word-aggregate-at-quoted', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-\'$@\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-at-unquoted', MUST_NOT_FLAG, 'leak() { echo ${UNSET_VALUE:-\'$@\'}; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-at-plain', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-$@}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-at-diagnostic', MUST_NOT_FLAG, 'leak() { : "${UNSET_VALUE:?\'$@\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-at-continuation', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-\'$@\\\n\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-at-escaped', MUST_NOT_FLAG, 'leak() { echo "${UNSET_VALUE:-\'\\$@\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-quoted', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-\'$*\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-unquoted', MUST_NOT_FLAG, 'leak() { echo ${UNSET_VALUE:-\'$*\'}; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-plain', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-$*}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-diagnostic', MUST_NOT_FLAG, 'leak() { : "${UNSET_VALUE:?\'$*\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-continuation', MUST_FLAG, 'leak() { echo "${UNSET_VALUE:-\'$*\\\n\'}"; }\nleak "$GH_TOKEN"\n'),
+    ('quoted-default-word-aggregate-star-escaped', MUST_NOT_FLAG, 'leak() { echo "${UNSET_VALUE:-\'\\$*\'}"; }\nleak "$GH_TOKEN"\n'),
     # #1452: apostrophes in a demonstrated double-quoted :- default word
     # are literal; unquoted defaults and :? diagnostics keep their own rules.
     (
@@ -15758,6 +15771,21 @@ def _quoted_default_head_cases():
     if (not _word_has_verbatim_positional(quoted_tail)
             or _word_has_verbatim_positional(unquoted_tail)):
         failures.append("quoted default positional continuation quote boundary")
+    for symbol in ("@", "*"):
+        for suffix in ('', '\\\n'):
+            raw = "${UNSET_VALUE:-'$" + symbol + suffix + "'}"
+            text = 'prefix "' + raw + '" suffix'
+            start = text.index("${")
+            try:
+                if _simple_parameter_end(text, start) != text.index("}") + 1:
+                    failures.append("aggregate default span lost raw offsets: " + repr(raw))
+            except _ExactReadUnavailable:
+                failures.append("aggregate default span not admitted: " + repr(raw))
+        quoted = 'leak() { echo "${UNSET_VALUE:-\'$' + symbol + '\'}"; }\nleak "$GH_TOKEN"\n'
+        unquoted = 'leak() { echo ${UNSET_VALUE:-\'$' + symbol + '\'}; }\nleak "$GH_TOKEN"\n'
+        if ("leak" not in discover_emitter_helpers(quoted)
+                or "leak" in discover_emitter_helpers(unquoted)):
+            failures.append("aggregate default helper discovery lost quote boundary: " + symbol)
     return failures
 
 
