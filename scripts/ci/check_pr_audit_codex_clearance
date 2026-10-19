@@ -529,8 +529,8 @@ fi
 # materialised review arrays — they can't catch a pagination bug at
 # the API call site. If the workflow regresses to the unpaginated
 # `github.rest.pulls.listReviews({...})` form, this canary fails.
-if grep -qE 'github\.paginate\(\s*$' "$WORKFLOW" && \
-   grep -A1 'github\.paginate(' "$WORKFLOW" | grep -qF 'github.rest.pulls.listReviews,'; then
+if grep -qE '(github\.paginate|auditPaginate)\(\s*$' "$WORKFLOW" && \
+   grep -A1 -E '(github\.paginate|auditPaginate)\(' "$WORKFLOW" | grep -qF 'github.rest.pulls.listReviews,'; then
   pass=$((pass + 1))
   echo "  PASS: $WORKFLOW paginates pulls.listReviews via github.paginate (PR #255 P2)"
 else
@@ -570,10 +570,10 @@ const end = source.indexOf('));', start) + 3;
 if (start < 0 || end < start) throw new Error('workflow resolver call missing');
 const body = 'é'.repeat(600000) + '\nReviewed commit: ' + 'a'.repeat(40);
 const comments = [{user: {login: 'chatgpt-codex-connector[bot]'}, body}];
-const invoke = new Function('execFileSync', 'issueComments', 'context', 'codexBotLogin',
+const invoke = new Function('execFileSync', 'issueComments', 'context', 'codexBotLogin', 'auditTimeout',
   source.slice(start, end) + '\nreturn issueComments;');
 const result = invoke(execFileSync, comments, {repo: {owner: 'owner', repo: 'repo'}},
-  'chatgpt-codex-connector[bot]');
+  'chatgpt-codex-connector[bot]', maximum => maximum);
 if (result.length !== 1 || result[0].body !== body) throw new Error('large resolver output was lost');
 NODE
 then
