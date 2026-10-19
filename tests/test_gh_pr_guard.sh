@@ -536,6 +536,45 @@ STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":false}' \
   assert_rc_contains "typed false guard metadata permits a read" 0 "" 'gh repo view'
 STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":true}' \
   assert_rc_contains "typed true guard metadata requires the wrapper" 2 "token-verifying wrapper" 'gh api repos/o/r/issues/123/comments -f body=Done'
+
+# A controlled missing-entry copy preserves actual classification and runtime
+# helpers but removes the index assignment. Relocate only its helper root;
+# production receives no fault-injection switch.
+missing_index_hook="$WORKDIR/missing-index.sh"
+python3 - "$HOOK" "$missing_index_hook" "$ROOT/scripts/hooks" <<'PYTHON'
+from pathlib import Path
+import shlex, sys
+source, target, helper_root = sys.argv[1:]
+text = Path(source).read_text()
+root_line = next(line for line in text.splitlines() if line.startswith('HOOK_DIR='))
+text = text.replace(root_line, 'HOOK_DIR=' + shlex.quote(helper_root), 1)
+assignment = '      COMMENT_GUARDED_BY_INDEX[$i]="$comment_guard_boolean"'
+assert text.count(assignment) == 1, 'missing-entry control lost its injection point'
+Path(target).write_text(text.replace(assignment, '      : # controlled missing classification', 1))
+PYTHON
+original_hook="$HOOK"
+for guarded_command in \
+  'gh repo view' \
+  'env FIXTURE=value command gh repo view' \
+  'time -p gh repo view' \
+  'echo ready; gh repo view' \
+  'gh repo view && gh api repos/o/r --method GET' \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'env FIXTURE=value command scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'echo ready; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done'; do
+  HOOK="$original_hook"
+  assert_rc_contains "matching command-position scans permit: $guarded_command" 0 "" "$guarded_command"
+  HOOK="$missing_index_hook"
+  assert_rc_contains "missing classification refuses: $guarded_command" 2 "missing comment-write classification" "$guarded_command"
+done
+for inspected_hook in "$original_hook" "$missing_index_hook"; do
+  HOOK="$inspected_hook"
+  assert_rc_contains 'non-command gh arguments need no classification' 0 "" 'echo gh repo view'
+  assert_rc_contains 'missing-index control cannot authorize reserved trigger prose' 2 'Reword the comment' \
+    'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "Do not quote @codex review here."'
+done
+HOOK="$original_hook"
+
 assert_rc_contains "canonical requester invocation remains allowed" 0 "" \
   'scripts/codex-review-request.sh 123 o/r'
 assert_rc_contains "comment-free issue close retains existing hook scope" 0 "" \
