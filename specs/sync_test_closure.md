@@ -7,3 +7,5 @@ The materializer does not expand a selection. A coupled test must be selected or
 A test-only selection retains its forward runtime dependencies. Unrelated slices have no reverse obligation. Whole test kits do not imply a test-to-script relation, and undeclared relationships are not inferred from file contents. Existing template logical identities and rendered artifact proof remain authoritative.
 
 Coverage: `tests/test_sync_overrides.sh` exercises consumer scopes, selected kits, rendered script identities, unrelated slices and skipped tests. `tests/test_sync_to_downstream.sh` runs the production materializer against disposable Git repositories: stale and missing tests refuse, paired/current tests pass, and disabling the reverse obligation in the fake hub makes the stale-test case reach PR creation.
+
+This specification and its mapped tests describe hub-only materialization. Bootstrap excludes the specification and removes its `spec_test_map` entry, retaining unrelated consumer mappings. The consumer replay models the same absence; it still runs the portable spec-to-test alignment check.

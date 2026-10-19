@@ -143,6 +143,10 @@ CONSUMER_ABSENT=(
   # Same class again: the bootstrap source-revision spec (#1056) describes
   # hub-only provenance machinery no consumer runs.
   "specs/bootstrap_source_attribution.md"
+  # Hub-only synchronization specs and their mapped tests are excluded by
+  # bootstrap. Both specs are absent on all ten live consumers (2026-10-19).
+  "specs/sync_test_closure.md"
+  "specs/project_doc_sync.md"
   "bugs/screenshots"
   ".github/screenshots"
   # #774 fleet branch-protection audit — the two paths NO consumer has.
