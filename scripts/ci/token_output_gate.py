@@ -295,13 +295,17 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     empty-literal and double-quote escape opt-ins only for eval arguments;
     default command-word decoding stays unchanged. Existing unquoted glob,
     brace, leading-tilde, assignment-tilde, extglob and ANSI-C inventories refuse
-    the joined path. The inherited per-literal fallback remains unchanged.
+    the joined path. Other irreducible operands keep per-literal fallback.
     Eval-only extglob refusal uses unquoted operator/open-parenthesis inventory;
     quoted and escaped patterns stay literal. Safe or unmatched path samples
     retain the opaque fallback's declared conservatism without resolving paths.
     Opener refusal covers later whitespace splits within an eval segment.
-    Existing pipe-separated alternation misses remain inherited (#2234); no
-    extglob grammar or fragment reconstruction is added.
+    A closed single-level literal extglob span in an eval operand retains
+    its internal alternative pipe in that segment (#2234). Such an operand
+    marks known literal credential references as potential output at the
+    existing one-hop depth, including quiet sampled patterns. Nested patterns,
+    substitutions, quotes, brackets, braces and unescaped whitespace/control
+    syntax retain their prior reading. No runtime pattern value is inferred.
     Four inherited assignment-tilde misses are version-qualified: Linux
     Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
     preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
@@ -1025,7 +1029,7 @@ class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
-        "_function_binding",
+        "_function_binding", "eval_pattern_uncertain",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -1058,6 +1062,7 @@ class Segment:
         self._cmd_index = None
         self._cmd_literal = None
         self._function_binding = None
+        self.eval_pattern_uncertain = False
 
 
 class Ref:
@@ -2021,6 +2026,18 @@ class Lexer:
                 i = close + 1
                 continue
 
+            # Keep a proved, literal extglob span inside its eval operand.
+            # Its value remains unknown: this is lexical extent, not expansion.
+            if c in "?*+@!" and text[i + 1:i + 2] == "(":
+                probe = Segment(-1, None, False, line)
+                probe.words = list(cur_level()["seg"].words)
+                end = _literal_extglob_end(text, i)
+                if end is not None and resolve_command(probe)[0] == "eval":
+                    cur_level()["word"].append(text[i:end])
+                    cur_level()["seg"].eval_pattern_uncertain = True
+                    i = end
+                    continue
+
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
@@ -2869,6 +2886,26 @@ def _iter_refs_at(s):
 # ==========================================================================
 
 UNRESOLVED = "<unresolved>"
+
+
+def _literal_extglob_end(text, start):
+    """End of a single literal pattern; unsupported grammar keeps prior lexing."""
+    if text[start:start + 1] not in "?*+@!" or text[start + 1:start + 2] != "(":
+        return None
+    i = start + 2
+    while i < len(text):
+        char = text[i]
+        if char == "\\":
+            if i + 1 == len(text) or text[i + 1] == "\n":
+                return None
+            i += 2
+            continue
+        if char == ")":
+            return i + 1
+        if char in "('\\\"$`<>;& \t\n[]{}":
+            return None
+        i += 1
+    return None
 
 
 def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False):
@@ -5009,7 +5046,8 @@ def _text_enables_xtrace(text, outer_only=False):
     return False
 
 
-def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
+def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
+              _uncertain_eval_output=False):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
@@ -5158,6 +5196,11 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             if ref.line in exempt_lines or ref.seg in exempt_segments:
                 continue
             hit, why = reaches_output(ref, helpers, (routed_any, routed_fd1))
+            if not hit and _uncertain_eval_output:
+                hit, why = True, (
+                    "uncertain pre-eval pattern expansion may change how this "
+                    "known literal credential reference reaches output"
+                )
             if not hit and xtrace_at.get(
                 ref.seg.sid if ref.seg is not None else None, xtrace
             ):
@@ -5177,6 +5220,10 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
                         inner, path=path, _depth=_depth + 1,
                         _initial_xtrace=effective_xtrace_at.get(
                             seg.sid, effective_xtrace
+                        ),
+                        _uncertain_eval_output=(
+                            seg.eval_pattern_uncertain
+                            and resolve_command(seg)[0] == "eval"
                         ),
                     )
                     # A discovery error inside the deferred text is discovery
@@ -16036,6 +16083,11 @@ def _ansi_c_quote_cases():
     return failures
 
 
+
+# #2234: bounded literal extglob extent and explicit eval uncertainty.
+CORPUS += [('eval-alternative-at', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-quoted', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'@(\\;echo|safe)\' \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-escaped', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\@\\(\\;echo\\|safe\\) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf %s @(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-no-match', 'flag', 'shopt -s extglob\neval : @(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-matched-safe', 'flag', 'shopt -s extglob\ntouch safe\neval : @(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-at-length', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"${#GH_TOKEN}"\'\n'), ('eval-alternative-at-constant', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) \'"${GH_TOKEN:+set}"\'\n'), ('eval-alternative-at-inner-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo|safe) "\'\\$GH_TOKEN\'"\n'), ('eval-alternative-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-quoted', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+(\\;echo|safe)\' \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-escaped', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\+\\(\\;echo\\|safe\\) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf %s +(\\;echo|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-no-match', 'flag', 'shopt -s extglob\neval : +(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-matched-safe', 'flag', 'shopt -s extglob\ntouch safe\neval : +(absent|safe) \'"$GH_TOKEN"\'\n'), ('eval-alternative-plus-length', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"${#GH_TOKEN}"\'\n'), ('eval-alternative-plus-constant', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) \'"${GH_TOKEN:+set}"\'\n'), ('eval-alternative-plus-inner-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo|safe) "\'\\$GH_TOKEN\'"\n')]
+KNOWN_BROADER.update({cid: "A literal extglob operand makes pre-eval input uncertain; known credential references remain potential output even when the observed pattern is unmatched or expands only to safe data. No filesystem expansion is reconstructed (#2234)." for cid, _rule, _body in CORPUS if cid.startswith("eval-alternative-") and cid.endswith(("-no-match", "-matched-safe"))})
+
 def self_test():
     failures = []
     passed = 0
@@ -16434,6 +16486,26 @@ def _deferred_shell_cases():
                 or not _command_word_expands(raw, eval_extglob=True)
                 or _unquote_command_word(raw, eval_literal=True) is not None):
             failures.append("eval extglob prefix/continuation: " + repr(raw))
+    for pattern in (r"@(\;echo|safe)", r"+(\;echo|safe)", "!(safe|other)"):
+        if _literal_extglob_end(pattern, 0) != len(pattern):
+            failures.append("eval extglob extent: " + pattern)
+    for pattern in ("@(x", "@((x)|y)", "@('x'|y)", '@("x"|y)',
+                    "@($X|y)", "@(`x`|y)", "@(x y)", "@(x;y)", "@([x]|y)"):
+        if _literal_extglob_end(pattern, 0) is not None:
+            failures.append("eval extglob refused extent: " + pattern)
+    for body, uncertain in [
+        (r"eval : @(\;echo|safe) 'o'", True),
+        (r"eval : '@(\;echo|safe)' 'o'", False),
+        (r"eval : \@\(\;echo\|safe\) 'o'", False),
+        (r"printf %s @(\;echo|safe) 'o'", False),
+    ]:
+        lx = Lexer(body)
+        marked = [seg for ll in lx.logical for seg in ll.segments
+                  if seg.eval_pattern_uncertain]
+        if bool(marked) != uncertain:
+            failures.append("eval extglob segment ownership: " + body)
+        if uncertain and (len(marked) != 1 or "@(\\;echo|safe)" not in marked[0].words):
+            failures.append("eval extglob alternative lost its operand: " + body)
     # Assignment-shaped tilde refusal changes literal proof, not fallback.
     for raw, expands in [
         ('X=~', True),
