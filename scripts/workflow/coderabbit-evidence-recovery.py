@@ -151,97 +151,108 @@ def write(path, body, method="POST"):
     return json.loads(result.stdout)
 
 
+def escalate_one(repo, number, tip):
+    pr = api(f"repos/{repo}/pulls/{number}")
+    if type(pr["number"]) is not int or pr["number"] != number:
+        raise ValueError("escalation target changed")
+    head = pr["head"]["sha"]
+    runs = pages(f"repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100", "check_runs")
+    runs = [r for r in runs if r.get("name") == CONTEXT and r.get("app", {}).get("id") == 15368
+            and not r.get("external_id")]
+    if not runs:
+        return
+    newest = max(runs, key=lambda r: r["id"])
+    report = observation(newest)
+    if not report or report.get("state") != "escalate":
+        return
+    if (not isinstance(report.get("repo"), str)
+            or not re.fullmatch(r"[\w.-]+/[\w.-]+", report["repo"])
+            or type(report.get("pr")) is not int or report["pr"] <= 0
+            or any(not isinstance(report.get(key), str)
+                   or not re.fullmatch(r"[0-9a-f]{40}", report[key])
+                   for key in ("head", "revision"))):
+        raise ValueError("malformed escalation tuple")
+    if (report["repo"], report["pr"], report["head"], report["revision"]) != (repo, number, head, tip):
+        print(f"escalation tuple changed for PR #{number}; skipping", file=sys.stderr)
+        return
+    marker = f"<!-- mergepath-coderabbit-escalation:v1 {report['episode']} {report['fingerprint']} -->"
+    comments = pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    if any(c.get("user", {}).get("login") == "github-actions[bot]" and
+           (c.get("body") or "").startswith(marker + "\n") for c in comments):
+        return
+    drift = ""
+    if report["kind"] == "unrecognized":
+        drift_marker = "<!-- mergepath-coderabbit-parser-drift:v1 -->"
+        issues = pages(f"repos/{repo}/issues?state=open&per_page=100")
+        matches = [i for i in issues if not i.get("pull_request") and
+                   isinstance(i.get("user"), dict) and
+                   i["user"].get("login") == "github-actions[bot]" and
+                   (i.get("body") or "").startswith(drift_marker + "\n")]
+        if len(matches) > 1:
+            raise ValueError("ambiguous parser-drift work item")
+        item = matches[0] if matches else write(f"repos/{repo}/issues", {
+            "title": "CodeRabbit review serialization drift",
+            "body": f"{drift_marker}\nConfirmed persistent unrecognized review evidence on "
+                    f"PR #{number}, head `{head}`, trusted revision `{tip}`. "
+                    f"Evidence fingerprint `{report['fingerprint']}`.\n\n"
+                    "Repair and test the parser at the canonical source, then propagate and verify consumers. "
+                    "Elapsed time and this issue do not clear the required gate. "
+                    "[Source contract](https://github.com/nathanjohnpayne/mergepath/issues/906)."})
+        if matches:
+            update_marker = f"<!-- mergepath-coderabbit-drift-evidence:v1 {number} {head} {report['fingerprint']} -->"
+            updates = pages(f"repos/{repo}/issues/{item['number']}/comments?per_page=100")
+            if not any(c.get("user", {}).get("login") == "github-actions[bot]" and
+                       (c.get("body") or "").startswith(update_marker + "\n") for c in updates):
+                update_body = (f"{update_marker}\nAlso observed on PR #{number}, full head `{head}`, "
+                               f"trusted revision `{tip}`. The evidence hold remains blocked; "
+                               "this record provides no review or merge clearance.")
+                updated = write(f"repos/{repo}/issues/{item['number']}/comments", {"body": update_body})
+                if updated.get("body") != update_body:
+                    raise ValueError("parser-drift update readback mismatch")
+        drift = f"\n\nParser-drift work: {item['html_url']}"
+    body = (f"{marker}\n## CodeRabbit evidence requires a decision\n\n"
+            f"{report['kind'].capitalize()} evidence persists on PR #{number}, full head `{head}`. "
+            "This gate remains blocked; all other gates remain required. "
+            "Elapsed time has not produced a clean provider verdict.\n\n"
+            "For an explicit narrow recovery, the owner posts a new comment with these three lines, "
+            "then replaces the Decision value with the link to that same comment:\n\n"
+            f"```text\n{report['recovery_token']}\nReason: <concrete reason>\n"
+            "Decision: <link to this new comment>\n```\n\n"
+            "This comment refreshes the API lineage only. If the native `CodeRabbit unresolved blocking findings` "
+            "check failed, rerun that native job/workflow for this exact unchanged full head after the API recovery "
+            "is visible; verify both native and API checks. A push changes the head and invalidates this decision. "
+            "API recovery alone does not clear a native failure, and the rerun remains labeled recovery in its output. "
+            "Later readable blocking evidence overrides recovery. Author attribution carries the accepted "
+            "shared-token forgery residual "
+            "([#928](https://github.com/nathanjohnpayne/mergepath/issues/928) / "
+            "[#2129](https://github.com/nathanjohnpayne/mergepath/issues/2129)); "
+            "it is not independent human identity proof."
+            + drift)
+    posted = write(f"repos/{repo}/issues/{number}/comments", {"body": body})
+    if posted.get("body") != body:
+        raise ValueError("escalation comment readback mismatch")
+
+
 def escalate(repo, numbers):
-    """Actions-only follow-up, with issues:write isolated from evaluation."""
+    """Actions-only follow-up; one damaged target cannot suppress the rest."""
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
         raise ValueError("invalid repository")
-    tip = api(f"repos/{repo}/commits/HEAD")["sha"]
     if not re.fullmatch(r"[1-9][0-9]*( [1-9][0-9]*)*", numbers):
         raise ValueError("invalid escalation target list")
-    prs = [api(f"repos/{repo}/pulls/{number}") for number in sorted(set(numbers.split()), key=int)]
-    for pr in prs:
-        number, head = pr["number"], pr["head"]["sha"]
-        runs = pages(f"repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100", "check_runs")
-        runs = [r for r in runs if r.get("name") == CONTEXT and r.get("app", {}).get("id") == 15368
-                and not r.get("external_id")]
-        if not runs:
-            continue
-        newest = max(runs, key=lambda r: r["id"])
-        report = observation(newest)
-        if not report or report.get("state") != "escalate":
-            continue
-        if (not isinstance(report.get("repo"), str)
-                or not re.fullmatch(r"[\w.-]+/[\w.-]+", report["repo"])
-                or type(report.get("pr")) is not int or report["pr"] <= 0
-                or any(not isinstance(report.get(key), str)
-                       or not re.fullmatch(r"[0-9a-f]{40}", report[key])
-                       for key in ("head", "revision"))):
-            raise ValueError("malformed escalation tuple")
-        if (report["repo"], report["pr"], report["head"], report["revision"]) != (repo, number, head, tip):
-            print(f"escalation tuple changed for PR #{number}; skipping", file=sys.stderr)
-            continue
-        marker = f"<!-- mergepath-coderabbit-escalation:v1 {report['episode']} {report['fingerprint']} -->"
-        comments = pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
-        if any(c.get("user", {}).get("login") == "github-actions[bot]" and
-               (c.get("body") or "").startswith(marker + "\n") for c in comments):
-            continue
-        drift = ""
-        if report["kind"] == "unrecognized":
-            drift_marker = "<!-- mergepath-coderabbit-parser-drift:v1 -->"
-            issues = pages(f"repos/{repo}/issues?state=open&per_page=100")
-            matches = [i for i in issues if not i.get("pull_request") and
-                       isinstance(i.get("user"), dict) and
-                       i["user"].get("login") == "github-actions[bot]" and
-                       (i.get("body") or "").startswith(drift_marker + "\n")]
-            if len(matches) > 1:
-                raise ValueError("ambiguous parser-drift work item")
-            item = matches[0] if matches else write(f"repos/{repo}/issues", {
-                "title": "CodeRabbit review serialization drift",
-                "body": f"{drift_marker}\nConfirmed persistent unrecognized review evidence on "
-                        f"PR #{number}, head `{head}`, trusted revision `{tip}`. "
-                        f"Evidence fingerprint `{report['fingerprint']}`.\n\n"
-                        "Repair and test the parser at the canonical source, then propagate and verify consumers. "
-                        "Elapsed time and this issue do not clear the required gate. "
-                        "[Source contract](https://github.com/nathanjohnpayne/mergepath/issues/906)."})
-            if matches:
-                update_marker = f"<!-- mergepath-coderabbit-drift-evidence:v1 {number} {head} {report['fingerprint']} -->"
-                updates = pages(f"repos/{repo}/issues/{item['number']}/comments?per_page=100")
-                if not any(c.get("user", {}).get("login") == "github-actions[bot]" and
-                           (c.get("body") or "").startswith(update_marker + "\n") for c in updates):
-                    update_body = (f"{update_marker}\nAlso observed on PR #{number}, full head `{head}`, "
-                                   f"trusted revision `{tip}`. The evidence hold remains blocked; "
-                                   "this record provides no review or merge clearance.")
-                    updated = write(f"repos/{repo}/issues/{item['number']}/comments", {"body": update_body})
-                    if updated.get("body") != update_body:
-                        raise ValueError("parser-drift update readback mismatch")
-            drift = f"\n\nParser-drift work: {item['html_url']}"
-        body = (f"{marker}\n## CodeRabbit evidence requires a decision\n\n"
-                f"{report['kind'].capitalize()} evidence persists on PR #{number}, full head `{head}`. "
-                "This gate remains blocked; all other gates remain required. "
-                "Elapsed time has not produced a clean provider verdict.\n\n"
-                "For an explicit narrow recovery, the owner posts a new comment with these three lines, "
-                "then replaces the Decision value with the link to that same comment:\n\n"
-                f"```text\n{report['recovery_token']}\nReason: <concrete reason>\n"
-                "Decision: <link to this new comment>\n```\n\n"
-                "This comment refreshes the API lineage only. If the native `CodeRabbit unresolved blocking findings` "
-                "check failed, rerun that native job/workflow for this exact unchanged full head after the API recovery "
-                "is visible; verify both native and API checks. A push changes the head and invalidates this decision. "
-                "API recovery alone does not clear a native failure, and the rerun remains labeled recovery in its output. "
-                "Later readable blocking evidence overrides recovery. Author attribution carries the accepted "
-                "shared-token forgery residual "
-                "([#928](https://github.com/nathanjohnpayne/mergepath/issues/928) / "
-                "[#2129](https://github.com/nathanjohnpayne/mergepath/issues/2129)); "
-                "it is not independent human identity proof."
-                + drift)
-        posted = write(f"repos/{repo}/issues/{number}/comments", {"body": body})
-        if posted.get("body") != body:
-            raise ValueError("escalation comment readback mismatch")
-
+    tip = api(f"repos/{repo}/commits/HEAD")["sha"]
+    failed = False
+    for number in sorted({int(n) for n in numbers.split()}):
+        try:
+            escalate_one(repo, number, tip)
+        except (AttributeError, KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            detail = f": {error}" if isinstance(error, ValueError) else ""
+            print(f"CodeRabbit recovery evidence unreadable: {type(error).__name__}{detail} (PR #{number})", file=sys.stderr)
+            failed = True
+    return 3 if failed else 0
 
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--escalate":
-        escalate(sys.argv[2], sys.argv[3])
-        return 0
+        return escalate(sys.argv[2], sys.argv[3])
     request = json.load(sys.stdin)
     repo, pr, head = request["repo"], request["pr"], request["head"]
     timeline = pages(f"repos/{repo}/issues/{pr}/timeline")

@@ -152,3 +152,5 @@ Requester commit timestamps are validated before trigger writes against the exis
 Parser-drift escalation reuses only marker-prefixed non-PR work items attributed to `github-actions[bot]`; unrelated markers cannot capture evidence or create ambiguity. The bounded attribution contract and native controls live in `specs/required_check_publisher.md` and `tests/test_required_check_generations.py` (#2449).
 
 CodeRabbit recovery-helper GitHub reads and writes are bounded to30 seconds per subprocess; a timeout retains the evidence hold with exit3 and does not retry an uncertain write.
+
+CodeRabbit evidence escalation continues later nominated PRs after an expected per-PR failure, emits a PR-bound diagnostic and retains a failing final status. Immutable tuples, owner recovery and uncertain-write behavior remain enforced.
