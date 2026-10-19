@@ -2606,10 +2606,21 @@ for i in "${!TOKENS[@]}"; do
       continue
       ;;
     gh|*/gh)
-      if [ -z "$WRAPPER_KIND" ] && [ "${COMMENT_GUARDED_BY_INDEX[$i]:-}" = true ]; then
-        echo "BLOCKED: comment/review writes must use a token-verifying wrapper and its runtime body guard." >&2
-        exit 2
-      fi
+      # Both walks must recognize the same command-position token. Unknown
+      # classification is an incomplete inspection, never a read-only result.
+      case "${COMMENT_GUARDED_BY_INDEX[$i]:-missing}" in
+        true)
+          if [ -z "$WRAPPER_KIND" ]; then
+            echo "BLOCKED: comment/review writes must use a token-verifying wrapper and its runtime body guard." >&2
+            exit 2
+          fi
+          ;;
+        false) ;;
+        *)
+          echo "BLOCKED: missing comment-write classification for a command-position gh invocation." >&2
+          exit 2
+          ;;
+      esac
       SAW_GH=1
       continue
       ;;
