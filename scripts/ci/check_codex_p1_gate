@@ -299,7 +299,11 @@ if gate.is_a?(Hash)
       close_env.fetch("FINGERPRINT_AVAILABLE", "").to_s.include?("steps.gate.outputs.fingerprint_available") &&
       close_run.include?('scripts/workflow/codex-p1-snapshot-retry.py') &&
       close_run.include?('"$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode"') &&
-      close_run.include?('driver_rc=${PIPESTATUS[0]}') && close_run.include?('exit "$driver_rc"') &&
+      close_run.include?('if scripts/workflow/codex-p1-snapshot-retry.py') &&
+      close_run.include?('driver_status=("${PIPESTATUS[@]}")') &&
+      close_run.include?('[ "${driver_status[1]}" -ne 0 ]') &&
+      close_run.include?('exit "${driver_status[1]}"') &&
+      close_run.include?('driver_rc=${driver_status[0]}') && close_run.include?('exit "$driver_rc"') &&
       close_run.include?('"$GATE_READY" = true') &&
       close_run.include?('"$ARCHIVE_RESULT" != failure') && close_run.include?('"$ARCHIVE_RESULT" != cancelled'),
     "codex-p1-gate does not bind native completion and its original lease to bounded snapshot recovery"

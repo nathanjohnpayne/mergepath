@@ -311,7 +311,7 @@ step() {
     export RUNNER_TEMP="$T/state" REPO=acme/widget GH_TOKEN=installation-token
     export GH_RETRY_BACKOFF_SECONDS=0
     for kv in "$@"; do export "${kv?}"; done
-    bash "$script"
+    bash -e "$script"
   ) >"$T/out" 2>&1 || rc=$?
   return "$rc"
 }
@@ -439,6 +439,16 @@ check "above the threshold: the driver evaluates and publishes the verdict" \
   '[ "$rc" = 0 ] && grep -q "^codex-p1-gate.sh 41" "$T/state/gates" && [ "$(newest "Codex P1 unresolved threads" | cut -d"|" -f1-2)" = "completed|success" ]'
 fresh; p1 RL_REMAINING=fail NATIVE_RUN_ID=9001 && rc=0 || rc=$?
 check "unreadable budget: the driver evaluates as before" '[ "$rc" = 0 ] && grep -q "^codex-p1-gate.sh 41" "$T/state/gates"'
+# A successful driver cannot erase the existing pipeline failure from tee.
+cat >"$T/bin/tee" <<'TEE_FAILURE'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 46
+TEE_FAILURE
+chmod +x "$T/bin/tee"
+fresh; p1 "$PLENTY" NATIVE_RUN_ID=9001 && rc=0 || rc=$?
+check "a failed driver-output capture remains a native step failure" '[ "$rc" = 46 ]'
+rm -f "$T/bin/tee"
 fresh; p1 "$PLENTY" NATIVE_RUN_ID=9001 P1_MODE=ratelimit RL_AFTER_FAIL=healthy EXHAUST_ONLY_TOKEN=nobody && rc=0 || rc=$?
 check "rate limit mid-run: the gate runs once and no fingerprint or gate call follows it" \
   '[ "$(grep -c "^codex-p1-gate.sh" "$T/state/gates")" = 1 ] && [ "$(sed -n "/^codex-p1-gate.sh/,\$p" "$T/state/gates" | grep -c "^fingerprint")" = 0 ]'
