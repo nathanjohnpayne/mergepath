@@ -352,7 +352,11 @@ while IFS= read -r pattern; do
   case "$pattern" in
     '.github/**'|'.github/workflows/**') continue ;;
   esac
-  narrow_match=$(printf '%s\n' "$CHANGED_NAMES" | bash "$MATCHER" "$pattern" 2>/dev/null || true)
+  match_rc=0
+  narrow_match=$(printf '%s\n' "$CHANGED_NAMES" | bash "$MATCHER" "$pattern" 2>/dev/null) || match_rc=$?
+  if [ "$match_rc" -ne 0 ]; then
+    unreadable "protected path matcher failed (rc=$match_rc); narrower protection cannot be ruled out"
+  fi
   narrow_match=${narrow_match%%$'\n'*}
   if [ -n "$narrow_match" ]; then
     not_exempt "file $narrow_match matches protected path pattern '$pattern', which is not the broad .github/** rule the lane carves out; that protection is retained"

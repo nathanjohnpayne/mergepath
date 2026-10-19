@@ -1142,5 +1142,7 @@ jobs:
             jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$EVIDENCE"
             printf '\nThis marker is diagnostic. Any other change under `.github/**`, a commit not produced by Dependabot, or a new head re-enters the ordinary protected-path review. The PR still needs CI green and the Dependabot reviewer-identity `APPROVED` on this head (Merge clearance gate).\n\n> Automated check per .github/review-policy.yml\n'
           } >"$BODY"
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$BODY"
+          if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$BODY"; then
+            echo "::warning::Could not publish optional pin-bump diagnostic marker."
+          fi
           rm -f "$BODY"
