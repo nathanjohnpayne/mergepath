@@ -262,31 +262,40 @@ def historical_requests_completed(ledger, comments, head, author, bot, at=None, 
                 or ledger['author'] != author or ledger['bot'] != bot
                 or (repository is not None and ledger['repo'] != repository)):
             return False
+        cutoff = timestamp(at) if at is not None else None
         observed = {}
         for comment in comments:
             if comment.get('user', {}).get('login') != author or comment.get('body', '').lower() != '@codex review':
                 continue
             identity, created = comment['id'], comment['created_at']
-            if (type(identity) is not int or identity <= 0
-                    or comment.get('updated_at', created) != created):
+            created_at = timestamp(created)
+            if type(identity) is not int or identity <= 0:
                 return False
-            timestamp(created)
+            if cutoff is not None and created_at > cutoff:
+                continue
+            if comment.get('updated_at', created) != created:
+                return False
             if identity in observed and observed[identity] != created:
                 return False
             observed[identity] = created
         requests, responses = ledger['requests'], ledger['responses']
         if not observed or not isinstance(requests, list) or not isinstance(responses, list):
             return False
-        counted = [row for row in requests if row['counted'] is True]
-        if (any(type(row['counted']) is not bool for row in requests)
-                or any(type(row['id']) is not int or row['id'] <= 0 for row in counted)):
-            return False
+        scoped = []
+        for row in requests:
+            if (not isinstance(row, dict) or type(row['counted']) is not bool
+                    or type(row['id']) is not int or row['id'] <= 0):
+                return False
+            created_at = timestamp(row['created_at'])
+            if cutoff is None or created_at <= cutoff:
+                scoped.append(row)
+        counted = [row for row in scoped if row['counted']]
         if len(counted) != len(observed) or {row['id']: row['created_at'] for row in counted} != observed:
             return False
         by_id = {row['rid']: row for row in responses}
         if len(by_id) != len(responses):
             return False
-        for request in requests:
+        for request in scoped:
             if request['outcome'] != 'attributed' or not request['responses']:
                 return False
             for identity in request['responses']:
@@ -295,7 +304,7 @@ def historical_requests_completed(ledger, comments, head, author, bot, at=None, 
                         or response['tie'] is not False or response['mixed_heads'] is not False
                         or response['anchor_conflict'] is not False
                         or timestamp(response['first_at']) <= timestamp(request['created_at'])
-                        or (at is not None and timestamp(response['first_at']) > timestamp(at))):
+                        or (cutoff is not None and timestamp(response['first_at']) > cutoff)):
                     return False
         return True
     except (KeyError, TypeError, ValueError):
