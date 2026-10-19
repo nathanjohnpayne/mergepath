@@ -144,7 +144,8 @@ CONSUMER_ABSENT=(
   # hub-only provenance machinery no consumer runs.
   "specs/bootstrap_source_attribution.md"
   # Hub-only synchronization specs and their mapped tests are excluded by
-  # bootstrap. Both specs are absent on all ten live consumers (2026-10-19).
+  # bootstrap. Both specs are absent on all nine checked consumer repositories
+  # (2026-10-19; the legacy gaycruisebingo URL redirects to Five Across).
   "specs/sync_test_closure.md"
   "specs/project_doc_sync.md"
   "bugs/screenshots"
