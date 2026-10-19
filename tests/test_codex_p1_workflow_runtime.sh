@@ -721,15 +721,55 @@ mv "$dir/short-driver" "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
 chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
 cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
 #!/usr/bin/env bash
-sleep 5
-# If the descendant survived timeout it would leave this evidence later.
-touch "$FIXTURE_LOG/escaped-deadline"
+# Closed stdio lets a leader-only kill return without waiting for this child.
+# The child stays in the evaluator's group and advertises readiness first.
+python3 - "$FIXTURE_LOG" <<'PYTHON' >/dev/null 2>&1 &
+from pathlib import Path
+import os, sys, time
+root = Path(sys.argv[1])
+(root / 'deadline-descendant.pid').write_text(str(os.getpid()))
+end = time.monotonic() + 8
+while not (root / 'release-descendant').exists() and time.monotonic() < end:
+    time.sleep(0.02)
+# A survivor acknowledges release, or its own bounded escape timeout.
+(root / 'escaped-deadline').touch()
+PYTHON
+wait
 SH
 if run_event "$dir"; then rc=0; else rc=$?; fi
-if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" && ! [ -e "$dir/escaped-deadline" ]; then
+if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" && [ -s "$dir/deadline-descendant.pid" ]; then
   pass 'shared deadline kills evaluation and reserves fail-closed lease closure'
 else
   fail 'shared deadline kills evaluation and reserves fail-closed lease closure' "rc=$rc"
+fi
+if python3 - "$dir" >"$dir/descendant-observation.log" 2>&1 <<'PYTHON'
+from pathlib import Path
+import subprocess, sys, time
+root = Path(sys.argv[1])
+pid = int((root / 'deadline-descendant.pid').read_text())
+assert pid > 1, 'invalid descendant identity'
+(root / 'release-descendant').touch()
+end = time.monotonic() + 5
+while True:
+    assert not (root / 'escaped-deadline').exists(), 'descendant escaped process-group termination'
+    state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='],
+                           capture_output=True, text=True, timeout=1)
+    status = state.stdout.strip()
+    absent = state.returncode == 1 and not status and not state.stderr.strip()
+    zombie = state.returncode == 0 and status.startswith('Z')
+    if absent or zombie:
+        # Recheck after observing death: an exited survivor may have just acked.
+        assert not (root / 'escaped-deadline').exists(), 'exited descendant acknowledged escape'
+        print(f'descendant {pid} terminated; release cannot resume it')
+        break
+    assert state.returncode == 0 and status, f'unreadable descendant status: {state}'
+    assert time.monotonic() < end, f'descendant {pid} remained live after release'
+    time.sleep(0.02)
+PYTHON
+then
+  pass 'deadline descendant death is observed before asserting no escape'
+else
+  fail 'deadline descendant death is observed before asserting no escape' "$(cat "$dir/descendant-observation.log")"
 fi
 
 # Real transaction ceiling: force more than 200 commands from one evaluator.
