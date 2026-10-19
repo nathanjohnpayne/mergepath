@@ -152,7 +152,7 @@ out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
 rc=$?
 set -e
 
-if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL count mismatch"; then
+if [ "$rc" = "2" ] && grep -q "GraphQL count mismatch" <<<"$out"; then
   pass=$((pass + 1))
   echo "  PASS: totalCount > returned → exit 2 with count-mismatch error"
 else
@@ -284,7 +284,7 @@ out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
 rc=$?
 set -e
 
-if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL count mismatch"; then
+if [ "$rc" = "2" ] && grep -q "GraphQL count mismatch" <<<"$out"; then
   pass=$((pass + 1))
   echo "  PASS: returned > totalCount → exit 2 with count-mismatch error"
 else

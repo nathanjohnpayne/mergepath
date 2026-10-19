@@ -2209,7 +2209,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "single-star include must not cross '/': exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "no rulesets target release/a/b"; then
+elif ! grep -q "no rulesets target release/a/b" <<<"$out"; then
   fail "single-star include: expected 'no rulesets target release/a/b'; output: $out"
 else
   pass "refs/heads/release/* does NOT govern release/a/b (* does not cross '/')"

@@ -378,7 +378,7 @@ PATHS_DEST_DOTDOT="examples/x.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_DEST_DOTDOT" "$PATHS_DEST_DOTDOT"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "containing a '..' segment"; then
+if [ "$rc" = "1" ] && grep -q "containing a '..' segment" <<<"$out"; then
   pass "Case 12: dest with '..' rejected"
 else
   fail "Case 12 unexpected (rc=$rc): $out"
