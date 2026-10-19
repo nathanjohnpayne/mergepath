@@ -183,8 +183,13 @@ case "$method $endpoint" in
     if [ -n "${STUB_ISSUE_BAD_RESPONSE:-}" ]; then printf '{}\n'; else cat "$STATE/created-issue.json"; fi ;;
   "GET repos/$REPO/issues/42")
     [ -z "${STUB_ISSUE_READBACK_FAIL:-}" ] || { echo 'gh: HTTP 502' >&2; exit 1; }
-    jq --arg who "${STUB_ISSUE_READBACK_LOGIN:-$write_login}" --arg drop "${STUB_ISSUE_DROP_LABELS:-}" '
-      .user.login=$who | if $drop == "" then . else .labels=[] end' "$STATE/created-issue.json" ;;
+    jq --arg who "${STUB_ISSUE_READBACK_LOGIN:-$write_login}" --arg drop "${STUB_ISSUE_DROP_LABELS:-}" \
+      --arg upper "${STUB_ISSUE_METADATA_UPCASE:-}" --arg assignee "${STUB_ISSUE_READBACK_ASSIGNEE:-}" '
+      .user.login=$who
+      | (if $drop == "" then . else .labels=[] end)
+      | (if $upper == "" then . else .labels |= map(.name |= ascii_upcase)
+         | .assignees |= map(.login |= ascii_upcase) end)
+      | if $assignee == "" then . else .assignees=[{login:$assignee}] end' "$STATE/created-issue.json" ;;
   "POST repos/$REPO/issues/"*"/comments")
     [ -z "${STUB_COMMENT_FAIL:-}" ] || { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; }
     num="$(number_of "$endpoint")"
@@ -1726,6 +1731,25 @@ if [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ] \
       and [.assignees[].login]==["nathanjohnpayne"]' "$STATE/created-issue.json" >/dev/null; then
   pass "#2335: exact observation-filer issue create uses REST, preserves body bytes and verifies readback"
 else fail "#2335: observation issue create rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+
+# GitHub preserves existing label/login display case. Only metadata names
+# normalize; the author, number, title and exact body still have their fences.
+for metadata_mode in mixed-case wrong-assignee; do
+  new_case
+  set +e
+  out="$(STUB_ISSUE_METADATA_UPCASE=1 \
+    STUB_ISSUE_READBACK_ASSIGNEE="$( [ "$metadata_mode" != wrong-assignee ] || printf 'OtherUser' )" \
+    MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+      --title '[Post-Review] observation' --body-file "$ISSUE_BODY" \
+      --label post-review --label observation --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+  set -e
+  if [ "$(grep -c $'POST\trepos/o/r/issues\t' "$LOGF")" = 1 ] \
+     && log_has $'gh\tapi\trepos/o/r/issues/42' \
+     && { { [ "$metadata_mode" = mixed-case ] && [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ]; } \
+          || { [ "$metadata_mode" = wrong-assignee ] && [ "$rc" = 5 ]; }; }; then
+    pass "#2335: $metadata_mode metadata readback honors case but retains requested identity"
+  else fail "#2335: $metadata_mode metadata readback rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+done
 
 for mode in wrong-author unreadable changed-metadata bad-response api-failure; do
   new_case

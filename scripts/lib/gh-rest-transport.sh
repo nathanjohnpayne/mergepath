@@ -1161,8 +1161,8 @@ gh_rest_issue_create() {
   fi
   if ! printf '%s' "$created" | jq -e --slurpfile sent "$input" --argjson n "$number" '
     .number == $n and .title == $sent[0].title and .body == $sent[0].body
-    and (($sent[0].labels - [.labels[]?.name]) | length) == 0
-    and (($sent[0].assignees - [.assignees[]?.login]) | length) == 0' >/dev/null; then
+    and ((($sent[0].labels | map(ascii_downcase)) - [.labels[]?.name | ascii_downcase]) | length) == 0
+    and ((($sent[0].assignees | map(ascii_downcase)) - [.assignees[]?.login | ascii_downcase]) | length) == 0' >/dev/null; then
     gh_rest_err "ERROR issue $url was created, but requested content/metadata could not be verified; inspect it before retrying."
     printf '%s\n' "$url"
     return 5
