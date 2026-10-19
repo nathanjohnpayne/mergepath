@@ -624,9 +624,13 @@ print(json.dumps(result))
         self.assertEqual(self.run_prepare().returncode, 0)
         posted = json.loads((self.path / 'posted.json').read_text())
         workflow = (ROOT / '.github/workflows/pr-audit.yml').read_text()
-        # The PR-loop closing brace bounds collection independently of any
+        # The per-PR audit closing brace bounds collection independently of any
         # declarations or conditions added to the later report renderer.
         collection = workflow.split('              let recordedOverride = null;', 1)[1].split('\n            }\n', 1)[0]
+        # The extracted collection uses the real API/deadline wrappers too.
+        # Exercise those dependencies rather than an unbound fragment or stubs.
+        budget = workflow.split('            const PR_BODY_PARSE_TIMEOUT_MS', 1)[1].split('\n            function parsePrBodyContract', 1)[0]
+        budget = 'const PR_BODY_PARSE_TIMEOUT_MS' + budget
         rendering = workflow.split('              if (recordedOverrides.length > 0) {', 1)[1].split('              body += `\\n---', 1)[0]
         pr = {'number': 123, 'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'}
         setup = '''const context={repo:{owner:'example',repo:'repo'}};
@@ -637,7 +641,7 @@ const authorIdentity='nathanjohnpayne',codexBotLogin='chatgpt-codex-connector[bo
 const core={warning:message=>{throw new Error(message)}};
 const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews',listReviewComments:'inline'}},paginate:async endpoint=>endpoint==='comments'?[posted]:[]};
 '''
-        code = 'const pr=' + json.dumps(pr) + ',posted=' + json.dumps(posted) + ';\n' + setup
+        code = 'const pr=' + json.dumps(pr) + ',posted=' + json.dumps(posted) + ';\n' + setup + budget
         code += '(async()=>{let recordedOverride=null;' + collection
         code += '\nlet body="";if(recordedOverrides.length>0){' + rendering
         code += '\nconsole.log(JSON.stringify({recordedOverrides,violations,body,auditedPRCount}));})().catch(e=>{console.error(e);process.exit(1)});'

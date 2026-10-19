@@ -1145,6 +1145,7 @@ paths:
       # assertions to a consumer still holding the previous workflow, and they
       # would fail there against a file this PR never delivered.
       - ".github/workflows/pr-review-policy.yml"
+      - ".github/workflows/pr-audit.yml"  # native deadline/report fixtures execute this workflow (#2336)
       # Read rather than executed, but equally load-bearing: the suite sources a
       # function out of gh-as-author.sh and greps the other two. Pre-existing
       # couplings, declared now because they are the same defect class as the

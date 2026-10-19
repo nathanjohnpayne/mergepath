@@ -154,6 +154,10 @@ spec_test_map:
     - tests/test_bootstrap_github_infra.sh
   bootstrap_source_attribution:
     - tests/test_bootstrap_template_mirror.sh
+  sync_test_closure:
+    - tests/test_sync_overrides.sh
+    - tests/test_sync_to_downstream.sh
+  project_doc_sync: tests/test_project_doc_sync.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -252,6 +256,8 @@ echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
 # #1056: hub-only bootstrap source-attribution spec, seeded for the same
 # vacuous-test reason as the line above.
 echo "source attribution spec" >"$FAKE_MP/specs/bootstrap_source_attribution.md"
+echo "sync test closure spec" >"$FAKE_MP/specs/sync_test_closure.md"
+echo "project documentation sync spec" >"$FAKE_MP/specs/project_doc_sync.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
@@ -464,6 +470,8 @@ for excluded in \
   'specs/mergepath_playground.md' \
   'specs/bootstrap_label_seeding.md' \
   'specs/bootstrap_source_attribution.md' \
+  'specs/sync_test_closure.md' \
+  'specs/project_doc_sync.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -1626,6 +1634,8 @@ assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.
 assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
 # The source-attribution entry must be gone for the same reason (#1056).
 assert_spec_map_key_removed bootstrap_source_attribution "$TARGET/.repo-template.yml"
+assert_spec_map_key_removed sync_test_closure "$TARGET/.repo-template.yml"
+assert_spec_map_key_removed project_doc_sync "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \

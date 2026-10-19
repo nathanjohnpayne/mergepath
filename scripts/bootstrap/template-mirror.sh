@@ -183,6 +183,9 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # Bootstrap source-attribution spec (#1056): same class and same failure
   # as the entries above.
   'specs/bootstrap_source_attribution.md'
+  # Hub-only synchronization specs map exclusively to tests excluded above.
+  'specs/sync_test_closure.md'
+  'specs/project_doc_sync.md'
 
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
@@ -1217,6 +1220,8 @@ bootstrap::_yq_clean_repo_template() {
   # Drop the bootstrap source-attribution spec_test_map entry (#1056), for
   # the same reason as the lines above.
   yq -i 'del(.spec_test_map.bootstrap_source_attribution)' "$f"
+  # These synchronization specs and their tests are hub-only too.
+  yq -i 'del(.spec_test_map.sync_test_closure, .spec_test_map.project_doc_sync)' "$f"
   # Credential isolation is audited centrally and its suite is hub-only.
   yq -i 'del(.spec_test_map.credential_isolation)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
