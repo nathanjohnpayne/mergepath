@@ -2343,7 +2343,9 @@ refuse_moving_head_unless_allowed() {
           -F per_page=100 2>/dev/null) || suites=""
         suites=$(printf '%s' "$suites" | jq -c -s --arg b "$HEAD_REF" '
           if length > 0 and all(.[]; type == "object" and ((.check_suites | type) == "array"))
-          then [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ]
+          then {known: [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ],
+                unknown: [ .[].check_suites[]
+                           | select((.head_branch | type) != "string" or .head_branch == "") | .id ]}
           else "unreadable" end' 2>/dev/null) || suites='"unreadable"'
         [ -n "$suites" ] || suites='"unreadable"'
       fi
@@ -2352,11 +2354,19 @@ refuse_moving_head_unless_allowed() {
       else
         runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_REQUIRES_CHECK" --argjson ids "$suites" '
           if length > 0 and all(.[]; type == "object" and ((.check_runs | type) == "array"))
-          then [ .[].check_runs[] | select((.name // "") == $n)
-                 | select($ids == null or ((.check_suite.id // null) as $s | ($ids | index($s)) != null)) ]
+          then [ .[].check_runs[] | select((.name // "") == $n) ] as $named
+             | [ $named[] | select($ids == null or
+                 ((.check_suite.id // null) as $s | ($ids.known | index($s)) != null)) ] as $known
+             | if ($known | length) > 0 then $known
+               elif $ids != null and any($named[];
+                 (.check_suite.id // null) as $s | ($ids.unknown | index($s)) != null)
+               then "branch-unavailable"
+               else [] end
           else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
         if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
           status=unreadable
+        elif [ "$runs" = '"branch-unavailable"' ]; then
+          status=branch-unavailable
         else
           status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "missing"' 2>/dev/null) || status=unreadable
           [ "$status" != null ] || status=missing
@@ -2364,7 +2374,7 @@ refuse_moving_head_unless_allowed() {
       fi
       # Latest run, as in the workflow path: an earlier run of the same SHA
       # must not date the current push.
-      if [ "$status" != unreadable ] && [ "$status" != missing ]; then
+      if [ "$status" != unreadable ] && [ "$status" != missing ] && [ "$status" != branch-unavailable ]; then
         dispatched_at=$(printf '%s' "$runs" | jq -r '
           [.[] | (.started_at // empty)
            | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
@@ -2378,6 +2388,8 @@ refuse_moving_head_unless_allowed() {
     case "$status" in
       unreadable)
         log "moving-head guard: CI-pickup signal ('$signal_label') for $HEAD_SHA unreadable; not enforced" ;;
+      branch-unavailable)
+        log "moving-head guard: matching '$signal_label' check has unavailable suite branch attribution; CI-pickup signal not enforced" ;;
       no-workflow)
         log "WARNING: moving-head guard: this repository has no '$REQUEST_WORKFLOW_NAME' workflow ($REQUEST_WORKFLOW_PATH), so the CI-pickup signal cannot be observed; not enforced (set codex.request_requires_check to name another check)" ;;
       missing)

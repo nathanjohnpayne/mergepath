@@ -186,7 +186,11 @@ case "$endpoint" in
     esac ;;
   repos/owner/repo/commits/*/check-suites)
     # Suite 100 is the PR branch (head.ref "feature"); suite 200 another branch.
-    printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
+    case "${CODEX_TEST_SUITE_BRANCH:-known}" in
+      unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":null},{"id":200,"head_branch":"other"}]}\n' ;;
+      unrelated-unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":null}]}\n' ;;
+      *) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
+    esac ;;
   repos/owner/repo/commits/*/check-runs)
     # The codex.request_requires_check OVERRIDE path (exact check-run name).
     # Runs carry check_suite.id 100 (the PR branch) unless the shape says not.
@@ -1674,6 +1678,44 @@ test_guard_runs_after_the_cap_branch() {
 }
 
 
+# #2200: fork check suites may not identify their branch. Unknown attribution
+# is an unavailable advisory signal, never proof that a check is missing.
+test_guard_unknown_suite_branch() {
+  refresh_head_dates
+  local variant dir rc head scenario check_run before=$FAIL
+  for variant in old young unrelated known-other; do
+    dir=$(make_case "unknown-suite-$variant")
+    printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+    head=$OLD_HEAD
+    scenario=unknown
+    check_run=completed
+    [ "$variant" != young ] || head=$YOUNG_HEAD
+    [ "$variant" != unrelated ] || scenario=unrelated-unknown
+    [ "$variant" != known-other ] || scenario=known
+    [ "$variant" != known-other ] || check_run=othersuite
+    rc=$(CODEX_TEST_SUITE_BRANCH="$scenario" CODEX_TEST_CHECK_RUNS="$check_run" \
+      run_guard "$dir" fresh "$head" completed "" --trigger-only)
+    case "$variant" in
+      old)
+        [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] \
+          && grep -q 'unavailable suite branch attribution' "$dir/err.log" \
+          || fail "#2200: unknown fork branch must fail open distinctly (rc=$rc)" ;;
+      young)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] \
+          && [ "$(jqf "$dir" '.moving_head.check_status')" = branch-unavailable ] \
+          && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+          || fail "#2200: unavailable branch must not mask the age guard (rc=$rc)" ;;
+      unrelated)
+        [ "$rc" = 0 ] && grep -q "'lint-fast' is completed" "$dir/err.log" \
+          || fail "#2200: unrelated unknown suite must retain known matching signal" ;;
+      known-other)
+        [ "$rc" = 8 ] && [ "$(jqf "$dir" '.moving_head.check_status')" = missing ] \
+          || fail "#2200: known other-branch suite must still be missing" ;;
+    esac
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2200: unknown fork attribution is unavailable; known branch and age signals retain behavior"
+}
+
 # #2158: fresh write-boundary authorization shares the production budgets,
 # performs no POST, and cannot authorize a different expected head.
 test_write_boundary_authorization() {
@@ -1716,6 +1758,7 @@ test_write_boundary_authorization() {
   [ "$FAIL" -ne "$before" ] || pass "write-boundary authorization enforces budget and head without a POST"
 }
 
+test_guard_unknown_suite_branch
 test_write_boundary_authorization
 
 test_fresh_posts_once_no_poll

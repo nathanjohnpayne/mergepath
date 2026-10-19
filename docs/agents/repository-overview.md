@@ -26,7 +26,7 @@ Manual Phase 4b handoffs hold while a current-head Codex review is in flight and
 
 Requester freshness decisions retain the governing base tuple and resolved freshness value, then revalidate before reuse or new trigger/acknowledgement writes. Changed or unreadable evidence refuses for a fresh invocation; unchanged no-spend paths still do not validate request caps. The contract and production-requester controls are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_trigger_only.sh` (#2027).
 
-The requester reads its moving-head check override as YAML, preserving absent, exact-name and explicitly empty meanings across block and flow styles. The write-only validation boundary and native controls are documented in `specs/codex_request_evidence.md` (#2340).
+The requester reads its moving-head check override as YAML, preserving absent, exact-name and explicitly empty meanings across block and flow styles. The write-only validation boundary and native controls are documented in `specs/codex_request_evidence.md` (#2340). A matching check with unavailable suite branch attribution is reported as an unavailable advisory pickup signal; it does not invent a missing check or disable the independent age guard (#2200).
 
 Provider-block diagnostics use the latest exact author request and same-second comment ordering rather than reusing an earlier account refusal. Requester and checker share that filter and retain newer Running/unknown holds; the contract and native cases are in `specs/codex_request_evidence.md` (#2337).
 
