@@ -712,24 +712,125 @@ SH
   fi
 done
 
-# Shorten only the clock constant in an isolated copy to make the real process-
-# group deadline observable quickly; do not wait three minutes in every CI run.
+# Arm a real communicate timeout after bounded descendant readiness. A slow
+# launcher must not spend that interval before the child can advertise itself.
+# Check the driver's shared timeout before shortening the real wait. Its clock
+# calculation, kill handler and failure lease stay intact in the source copy.
 dir="$TMP/deadline"
 make_sweep_fixture "$dir"
-sed 's/^SECONDS = 180$/SECONDS = 1/' "$dir/scripts/workflow/codex-p1-snapshot-retry.py" > "$dir/short-driver"
-mv "$dir/short-driver" "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+mv "$dir/scripts/workflow/codex-p1-snapshot-retry.py" "$dir/scripts/workflow/deadline-driver.py"
+cat > "$dir/scripts/workflow/codex-p1-snapshot-retry.py" <<'PYTHON'
+#!/usr/bin/env python3
+from pathlib import Path
+import os, runpy, signal, subprocess, time
+
+root = Path(os.environ['FIXTURE_LOG'])
+original_popen = subprocess.Popen
+original_monotonic = time.monotonic
+clock_started = False
+
+def clock():
+    global clock_started
+    if not clock_started:
+        clock_started = True
+        return 0
+    return 10
+
+def popen(command, *args, **kwargs):
+    process = original_popen(command, *args, **kwargs)
+    if command[0] == 'scripts/codex-p1-gate.sh':
+        original_communicate = process.communicate
+        armed = False
+        def communicate(input=None, timeout=None):
+            nonlocal armed
+            if not armed:
+                # Production must pass its 180-second bound minus the ten
+                # elapsed seconds from the controlled clock. A missing,
+                # constant or miswired timeout must fail before we replace it.
+                if timeout != 170:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+                    raise AssertionError(f'production shared timeout is {timeout!r}, expected170')
+                (root / 'production-timeout.log').write_text('remaining=170\n')
+                ready_end = original_monotonic() + 10
+                while not (root / 'deadline-descendant.pid').exists():
+                    if process.poll() is not None:
+                        raise RuntimeError('evaluator exited before descendant readiness')
+                    if original_monotonic() >= ready_end:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=2)
+                        raise RuntimeError('descendant readiness exceeded ten seconds')
+                    time.sleep(0.02)
+                (root / 'readiness-observation.log').write_text('ready before timeout armed\n')
+                armed = True
+                timeout = 1
+            return original_communicate(input=input, timeout=timeout)
+        process.communicate = communicate
+    return process
+
+subprocess.Popen = popen
+time.monotonic = clock
+runpy.run_path(str(Path(__file__).with_name('deadline-driver.py')), run_name='__main__')
+PYTHON
 chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
 cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
 #!/usr/bin/env bash
-sleep 5
-# If the descendant survived timeout it would leave this evidence later.
-touch "$FIXTURE_LOG/escaped-deadline"
+# Deliberately exceed the old fixture's entire one-second deadline.
+sleep 1.5
+# Closed stdio lets a leader-only kill return without waiting for this child.
+# The child stays in the evaluator's group and advertises readiness first.
+python3 - "$FIXTURE_LOG" <<'PYTHON' >/dev/null 2>&1 &
+from pathlib import Path
+import os, sys, time
+root = Path(sys.argv[1])
+pending_pid = root / 'deadline-descendant.pid.pending'
+pending_pid.write_text(str(os.getpid()))
+pending_pid.replace(root / 'deadline-descendant.pid')
+end = time.monotonic() + 20
+while not (root / 'release-descendant').exists() and time.monotonic() < end:
+    time.sleep(0.02)
+# A survivor acknowledges release, or its own bounded escape timeout.
+(root / 'escaped-deadline').touch()
+PYTHON
+wait
 SH
 if run_event "$dir"; then rc=0; else rc=$?; fi
-if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" && ! [ -e "$dir/escaped-deadline" ]; then
+if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" \
+   && [ -s "$dir/deadline-descendant.pid" ] \
+   && grep -Fxq 'remaining=170' "$dir/production-timeout.log" \
+   && grep -Fxq 'ready before timeout armed' "$dir/readiness-observation.log"; then
   pass 'shared deadline kills evaluation and reserves fail-closed lease closure'
 else
   fail 'shared deadline kills evaluation and reserves fail-closed lease closure' "rc=$rc"
+fi
+if python3 - "$dir" >"$dir/descendant-observation.log" 2>&1 <<'PYTHON'
+from pathlib import Path
+import subprocess, sys, time
+root = Path(sys.argv[1])
+pid = int((root / 'deadline-descendant.pid').read_text())
+assert pid > 1, 'invalid descendant identity'
+(root / 'release-descendant').touch()
+end = time.monotonic() + 5
+while True:
+    assert not (root / 'escaped-deadline').exists(), 'descendant escaped process-group termination'
+    state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='],
+                           capture_output=True, text=True, timeout=1)
+    status = state.stdout.strip()
+    absent = state.returncode == 1 and not status and not state.stderr.strip()
+    zombie = state.returncode == 0 and status.startswith('Z')
+    if absent or zombie:
+        # Recheck after observing death: an exited survivor may have just acked.
+        assert not (root / 'escaped-deadline').exists(), 'exited descendant acknowledged escape'
+        print(f'descendant {pid} terminated; release cannot resume it')
+        break
+    assert state.returncode == 0 and status, f'unreadable descendant status: {state}'
+    assert time.monotonic() < end, f'descendant {pid} remained live after release'
+    time.sleep(0.02)
+PYTHON
+then
+  pass 'deadline descendant death is observed before asserting no escape'
+else
+  fail 'deadline descendant death is observed before asserting no escape' "$(cat "$dir/descendant-observation.log")"
 fi
 
 # Real transaction ceiling: force more than 200 commands from one evaluator.
