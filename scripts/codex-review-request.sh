@@ -835,15 +835,28 @@ esac
 # candidate's edit costs a Codex request, never a skipped one.
 #
 # The own copy still runs through run_policy_helper, which starts it with an
-# empty environment plus PATH (to find bash and awk) and LC_ALL=C.UTF-8:
+# empty environment plus PATH (to find bash and awk) and a verified LC_ALL:
 # neither helper reads anything else, and an empty environment keeps a
-# future helper from silently depending on a credential. The locale is
-# UTF-8, not C, because the matcher compiles `?` to `[^/]`; under C a
+# future helper from silently depending on a credential. Probe UTF-8
+# character semantics instead of trusting a locale spelling (#2315): the
+# matcher compiles `?` to `[^/]`; under C a
 # multibyte character in a file name is several characters, so `?` would
 # match LESS than the labeler: the unsafe direction. The EXCLUDE_RE read
 # executes nothing (jq decodes the file and sed extracts one line).
 run_policy_helper() {  # <script> [args...]; stdin passes through
-  env -i PATH="$PATH" LC_ALL=C.UTF-8 bash "$@"
+  local policy_locale
+  for policy_locale in C.UTF-8 en_US.UTF-8; do
+    # The child must evaluate the sample under its own effective locale.
+    # shellcheck disable=SC2016
+    if env -i PATH="$PATH" LC_ALL="$policy_locale" bash -c \
+      'sample=$(printf "\303\251"); [ "${#sample}" -eq 1 ] && [[ $sample =~ ^[^/]$ ]]' \
+      >/dev/null 2>&1; then
+      env -i PATH="$PATH" LC_ALL="$policy_locale" bash "$@"
+      return $?
+    fi
+  done
+  echo "[codex-review-request] no verified UTF-8 locale for policy helpers" >&2
+  return 2
 }
 # Fetch a base helper as data and confirm it is byte-identical to this
 # requester's own copy. Prints nothing; returns 0 when identical, else sets

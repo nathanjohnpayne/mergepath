@@ -1023,7 +1023,7 @@ plant_env_dump() {  # <dir> <where: base|both>
   done
 }
 assert_helper_env_clean() {  # <label> <dir> <helper>
-  local label=$1 dir=$2 helper=$3 dump="$2/state/$3-env.txt" leaked
+  local label=$1 dir=$2 helper=$3 dump="$2/state/$3-env.txt" leaked helper_locale
   if [ ! -s "$dump" ]; then
     fail "helper env $label: the identical $helper never ran (no $dump); stderr=$(cat "$dir/err.log")"
     return
@@ -1034,12 +1034,50 @@ assert_helper_env_clean() {  # <label> <dir> <helper>
   fi
   # grep -v exits 1 when nothing leaked; that is the passing case.
   leaked=$(cut -d= -f1 "$dump" | { grep -vxE 'PATH|LC_ALL|PWD|OLDPWD|SHLVL|_' || true; } | tr '\n' ' ')
+  # The child Bash evaluates the literal probe under the recorded locale.
+  # shellcheck disable=SC2016
   if [ -n "$leaked" ]; then
     fail "helper env $label: the $helper inherited variables beyond PATH/LC_ALL: $leaked"
-  elif ! grep -qx 'LC_ALL=C.UTF-8' "$dump"; then
-    fail "helper env $label: the $helper must run under LC_ALL=C.UTF-8; got $(grep '^LC_ALL=' "$dump" || echo 'no LC_ALL')"
+  elif ! helper_locale=$(sed -n 's/^LC_ALL=//p' "$dump") \
+    || ! env -i PATH="$PATH" LC_ALL="$helper_locale" bash -c \
+      'sample=$'"'"'\303\251'"'"'; [ "${#sample}" -eq 1 ] && [[ $sample =~ ^[^/]$ ]]'; then
+    fail "helper env $label: the $helper did not retain verified UTF-8 semantics"
   else
     pass "#2272: $label: the $helper ran with no inherited credentials"
+  fi
+}
+
+plant_locale_bash() {  # <dir> <all-bad|first-bad>
+  local dir=$1 mode=$2 real_bash
+  real_bash=$(command -v bash)
+  {
+    printf '#!%s\n' "$real_bash"
+    # This string is generated child-shell code, not a parent expansion.
+    # shellcheck disable=SC2016
+    printf 'case "${LC_ALL-}" in\n  C.UTF-8) export LC_ALL=C ;;\n'
+    [ "$mode" != all-bad ] || printf '  en_US.UTF-8) export LC_ALL=C ;;\n'
+    printf 'esac\nexec %q "$@"\n' "$real_bash"
+  } > "$dir/bin/bash"
+  chmod +x "$dir/bin/bash"
+}
+
+test_policy_helpers_verify_locale_semantics() {
+  local dir rc protected='external_review_paths:'$'\n''  - "docs/a?b.md"'
+  dir=$(derive_case helper-locale-unavailable "$protected")
+  plant_locale_bash "$dir" all-bad
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/app.ts","additions":1,"deletions":0}]' run_case "$dir" false)
+  assert_failsafe_request "no effective UTF-8 locale" "$dir" "$rc" "the policy list parser failed on external_review_paths (rc=2)"
+
+  dir=$(derive_case helper-locale-fallback "$protected")
+  plant_locale_bash "$dir" first-bad
+  rc=$(CODEX_TEST_FILES_JSON="$(jq -cn --arg f "docs/a$(printf '\303\251')b.md" '[{filename:$f,additions:1,deletions:0}]')" run_case "$dir" false)
+  # The child Bash evaluates the literal probe under its own locale.
+  # shellcheck disable=SC2016
+  if env -i PATH="$PATH" LC_ALL=en_US.UTF-8 bash -c \
+    'sample=$'"'"'\303\251'"'"'; [ "${#sample}" -eq 1 ] && [[ $sample =~ ^[^/]$ ]]' 2>/dev/null; then
+    assert_derived_request "verified fallback preserves a multibyte protected path" "$dir" "$rc" "protected paths changed: docs/a"
+  else
+    assert_failsafe_request "unavailable fallback also requests safely" "$dir" "$rc" "the policy list parser failed on external_review_paths (rc=2)"
   fi
 }
 run_case_with_credentials() {  # <dir> <files json>: run_case with every credential variable set
@@ -1199,6 +1237,7 @@ test_derive_reads_governing_policy
 test_derive_threshold_parity
 test_derive_paths_parity
 test_derive_helpers_get_no_credentials
+test_policy_helpers_verify_locale_semantics
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
