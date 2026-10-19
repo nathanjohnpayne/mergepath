@@ -714,7 +714,8 @@ done
 
 # Arm a real communicate timeout after bounded descendant readiness. A slow
 # launcher must not spend that interval before the child can advertise itself.
-# The checked-in driver's clock, kill handler and failure lease stay intact.
+# Check the driver's shared timeout before shortening the real wait. Its clock
+# calculation, kill handler and failure lease stay intact in the source copy.
 dir="$TMP/deadline"
 make_sweep_fixture "$dir"
 mv "$dir/scripts/workflow/codex-p1-snapshot-retry.py" "$dir/scripts/workflow/deadline-driver.py"
@@ -725,6 +726,15 @@ import os, runpy, signal, subprocess, time
 
 root = Path(os.environ['FIXTURE_LOG'])
 original_popen = subprocess.Popen
+original_monotonic = time.monotonic
+clock_started = False
+
+def clock():
+    global clock_started
+    if not clock_started:
+        clock_started = True
+        return 0
+    return 10
 
 def popen(command, *args, **kwargs):
     process = original_popen(command, *args, **kwargs)
@@ -734,11 +744,19 @@ def popen(command, *args, **kwargs):
         def communicate(input=None, timeout=None):
             nonlocal armed
             if not armed:
-                ready_end = time.monotonic() + 10
+                # Production must pass its 180-second bound minus the ten
+                # elapsed seconds from the controlled clock. A missing,
+                # constant or miswired timeout must fail before we replace it.
+                if timeout != 170:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+                    raise AssertionError(f'production shared timeout is {timeout!r}, expected170')
+                (root / 'production-timeout.log').write_text('remaining=170\n')
+                ready_end = original_monotonic() + 10
                 while not (root / 'deadline-descendant.pid').exists():
                     if process.poll() is not None:
                         raise RuntimeError('evaluator exited before descendant readiness')
-                    if time.monotonic() >= ready_end:
+                    if original_monotonic() >= ready_end:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait(timeout=2)
                         raise RuntimeError('descendant readiness exceeded ten seconds')
@@ -751,6 +769,7 @@ def popen(command, *args, **kwargs):
     return process
 
 subprocess.Popen = popen
+time.monotonic = clock
 runpy.run_path(str(Path(__file__).with_name('deadline-driver.py')), run_name='__main__')
 PYTHON
 chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
@@ -778,6 +797,7 @@ SH
 if run_event "$dir"; then rc=0; else rc=$?; fi
 if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" \
    && [ -s "$dir/deadline-descendant.pid" ] \
+   && grep -Fxq 'remaining=170' "$dir/production-timeout.log" \
    && grep -Fxq 'ready before timeout armed' "$dir/readiness-observation.log"; then
   pass 'shared deadline kills evaluation and reserves fail-closed lease closure'
 else
