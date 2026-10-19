@@ -55,3 +55,5 @@ The generated runtime disables ESLint rules for that artifact and removes microm
 ## Regression coverage
 
 `tests/test_pr_body_contract_parity.sh` verifies the stable CLI result and all existing consumers' shared-parser use. Its #1192 corpus covers renderer-confirmed quote-first-block, list-transition, nested-list, comment, code, and malformed-heading outcomes. Focused private-helper assertions also verify indented flow-comment stripping and code preservation directly, because unchanged membership results alone do not establish this internal consistency.
+
+The parity suite's propagation entry requires the audit workflow alongside its native deadline/report fixtures, so a path-scoped sync cannot deliver those assertions against a stale workflow.
