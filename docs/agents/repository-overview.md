@@ -150,3 +150,5 @@ The native approval hook requires an explicit canonical `OWNER/REPO` in `REVIEW_
 Requester commit timestamps are validated before trigger writes against the existing whole-second UTC diagnostic format. Unsupported metadata refuses before mutation; valid future dates and provider-block diagnostics retain their behavior. The source contract and native controls are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_trigger_only.sh` (#2317).
 
 Parser-drift escalation reuses only marker-prefixed non-PR work items attributed to `github-actions[bot]`; unrelated markers cannot capture evidence or create ambiguity. The bounded attribution contract and native controls live in `specs/required_check_publisher.md` and `tests/test_required_check_generations.py` (#2449).
+
+CodeRabbit recovery-helper GitHub reads and writes are bounded to30 seconds per subprocess; a timeout retains the evidence hold with exit3 and does not retry an uncertain write.

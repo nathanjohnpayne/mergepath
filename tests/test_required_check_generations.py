@@ -206,6 +206,56 @@ class Recovery(unittest.TestCase):
         self.assertEqual(self.observe()["observations"], 1)
 
 
+class RecoverySubprocessDeadline(unittest.TestCase):
+    def test_real_read_and_uncertain_write_time_out_without_clearance_or_retry(self):
+        # Exercise the CLI and actual subprocess deadline; no credential or API
+        # access is possible because gh is replaced by this bounded fixture.
+        for mode in ("read", "write"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                calls = root / "calls.jsonl"
+                fake = root / "gh"
+                report = dict(repo="owner/repo", pr=7, head=HEAD, revision=REVISION,
+                              episode=100, fingerprint="f" * 64, state="escalate",
+                              kind="unrecognized", recovery_token="exact token")
+                run = dict(id=101, name=CONTEXT, app={"id": 15368},
+                           output={"summary": '<!-- mergepath-generation:v1 {} -->\n' +
+                                   recovery.PREFIX + json.dumps(report) + " -->"})
+                fake.write_text("#!" + sys.executable + "\n" +
+                    "import json,sys,time\nfrom pathlib import Path\n" +
+                    "args=sys.argv[1:]; path=args[-1]\n" +
+                    "writing='--method' in args\n" +
+                    "with Path(" + repr(str(calls)) + ").open('a') as out: " +
+                    "out.write(json.dumps(args)+'\\n')\n" +
+                    "if writing or " + repr(mode == "read") + ":\n" +
+                    " print('{\"state\":\"recovery\"}',flush=True);time.sleep(120)\n" +
+                    "elif path.endswith('/commits/HEAD'): print(json.dumps({'sha':" + repr(REVISION) + "}))\n" +
+                    "elif '/pulls/' in path: print(json.dumps({'number':7,'head':{'sha':" + repr(HEAD) + "}}))\n" +
+                    "elif '/check-runs?' in path: print(json.dumps([{'check_runs':[" + repr(run) + "]}]))\n" +
+                    "else: print('[[]]')\n")
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"])
+                command = [sys.executable, str(MODULE)]
+                if mode == "write":
+                    command += ["--escalate", "owner/repo", "7"]
+                process = subprocess.Popen(command, env=env, text=True,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
+                try:
+                    stdout, stderr = process.communicate(json.dumps(dict(repo="owner/repo", pr=7, head=HEAD)), timeout=45)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    stdout, stderr = process.communicate()
+                    self.fail("recovery helper exceeded its per-call deadline")
+                self.assertEqual(process.returncode, 3, stderr)
+                self.assertEqual(stdout, "")
+                self.assertIn("CodeRabbit recovery evidence unreadable: TimeoutExpired", stderr)
+                attempts = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual(sum("--method" in call for call in attempts), mode == "write")
+                if mode == "read":
+                    self.assertEqual(len(attempts), 1)
+
+
 class Escalation(unittest.TestCase):
     def exercise_two_nominations(self, first_override=None):
         posts = []
