@@ -268,7 +268,7 @@ done
 cat >"$HBIN_REAL/timeout" <<'REALTIMEOUT'
 #!/usr/bin/env bash
 seconds="$1"; shift
-printf '%s\n' "$@" >"$TEST_TIMEOUT_COMMAND"
+printf '%s\n' "$seconds" "$@" >"$TEST_TIMEOUT_COMMAND"
 exec perl -e '
   my $seconds = shift;
   my $pid = fork();
@@ -299,7 +299,7 @@ REALTIMEOUT
 chmod +x "$HBIN_REAL/timeout"
 # A correct deadline may expire before the child gets scheduled. Verify the
 # exact dispatched command rather than requiring the child's first write.
-printf '%s\n--quiet\n' "$HFIX_SLEEP/scripts/agent-capability-probe.sh" >"$WORKDIR/expected-probe-command"
+printf '1\n%s\n--quiet\n' "$HFIX_SLEEP/scripts/agent-capability-probe.sh" >"$WORKDIR/expected-probe-command"
 for startup_delay in 0 2; do
   rm -f "$WORKDIR/probe-start.log" "$WORKDIR/alarm.log" "$WORKDIR/probe-command.log"
   started="$(date +%s)"
