@@ -147,6 +147,9 @@ case "\$1" in
         if grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
           # A failed marker write must not resolve an explicit selection.
           [ "\${GH_STUB_TAG_FAIL:-}" = tag-failure ] && exit 1
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-stdout-failure ]; then echo 'marker write refused'; exit 1; fi
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-stderr-failure ]; then echo 'marker write refused' >&2; exit 1; fi
+          [ "\${GH_STUB_TAG_FAIL:-}" != tag-warning ] || echo 'gh diagnostic warning' >&2
           if [ "\${GH_STUB_TAG_FAIL:-}" = tag-null ]; then echo '{"data":{"addPullRequestReviewThreadReply":null},"errors":[{"message":"refused"}]}'; exit 0; fi
           # Tag-reply mutation — return a minimal success response.
           echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C_kwT1"}}}}'
@@ -2316,7 +2319,7 @@ TARGET_THREADS=$(jq -c '
        | .commentsFirst.nodes[0].databaseId=2001)]
   | .data.repository.pullRequest.reviewThreads.totalCount=2
 ' <<<"$THREADS_T1")
-for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
+for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-stdout-failure tag-stderr-failure tag-warning tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
   fixture="$TARGET_THREADS"
   args=(--thread 1001 --disposition fixed --commit abc1234567)
   expected_tag=addressed-elsewhere
@@ -2333,7 +2336,7 @@ for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing
     ambiguous-selector) fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[1].commentsFirst.nodes[0].databaseId=1001' <<<"$fixture"); expected_rc=1 ;;
     human|agent) login=real-human; [ "$scenario" = agent ] && login=nathanpayne-claude
       fixture=$(jq -c --arg login "$login" '.data.repository.pullRequest.reviewThreads.nodes[0].commentsFirst.nodes[0].author.login=$login' <<<"$fixture"); expected_rc=3 ;;
-    tag-failure|tag-null|readback-failure) expected_rc=2 ;;
+    tag-failure|tag-stdout-failure|tag-stderr-failure|tag-null|readback-failure) expected_rc=2 ;;
     dry-run) expected_rc=3; args+=(--dry-run) ;;
     bulk-conflict) args+=(--auto-resolve-bots); expected_rc=1 ;;
     list-conflict) args+=(--list); expected_rc=1 ;;
@@ -2347,7 +2350,9 @@ for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing
   make_gh_stub "$SCRATCH/gh-real" "$fixture" "$FILES_T1" "$COMMITS_T1" "$commit_map"
   make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
   set +e
+  mkdir -p "$SCRATCH/target-tag-tmp"
   out=$(GH_ARGV_LOG="$GH_ARGV_LOG" GH_STUB_TAG_FAIL="$scenario" \
+    TMPDIR="$SCRATCH/target-tag-tmp" \
     GH_STUB_READBACK_UNRESOLVED="$([ "$scenario" = readback-failure ] && echo PRT_1)" \
     PATH="$SCRATCH:$PATH" env -u GH_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
     bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo "${args[@]}" 2>&1)
@@ -2355,6 +2360,8 @@ for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing
   set -e
   ok=true
   [ "$rc" -eq "$expected_rc" ] || ok=false
+  if compgen -G "$SCRATCH/target-tag-tmp/resolve-pr-thread-tag-stderr.*" >/dev/null; then ok=false; fi
+  if [ "$scenario" = tag-warning ] && ! grep -Fq 'gh diagnostic warning' <<<"$out"; then ok=false; fi
   if [ "$expected_rc" -eq 0 ] && [ "$scenario" != already-resolved ]; then
     tag_before_resolve "$GH_ARGV_LOG" || ok=false
     grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || ok=false
@@ -2365,7 +2372,7 @@ for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing
   elif [ "$scenario" != readback-failure ]; then
     if grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then ok=false; fi
     case "$scenario" in
-      tag-failure|tag-null) ;; # The marker attempt fails before resolution.
+      tag-failure|tag-stdout-failure|tag-stderr-failure|tag-null) ;; # The marker attempt fails before resolution.
       *) if grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then ok=false; fi ;;
     esac
   fi
