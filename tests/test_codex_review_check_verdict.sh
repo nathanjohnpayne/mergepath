@@ -621,6 +621,25 @@ else
   fail "#1121: non-shared-author markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
 fi
 
+# Direct callers have the same structured-parser prerequisite as dispatcher
+# callers. Shadow every supported implementation with an unavailable tool;
+# execute the actual checker, retaining all other native fixture utilities.
+mkdir -p "$BEHAVIOR_TMP/no-parsers"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$BEHAVIOR_TMP/no-parsers/$parser"
+  chmod +x "$BEHAVIOR_TMP/no-parsers/$parser"
+done
+fixture_result="$(PATH="$BEHAVIOR_TMP/no-parsers:$PATH" run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'governing policy author_identity could not be read' <<<"$fixture_output" \
+   && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2314: direct checker without a working YAML parser refuses before commit lookup"
+else
+  fail "#2314: missing parser did not fail closed (rc=$fixture_rc output=$fixture_output)"
+fi
+
 fixture_result="$(run_body_fixture nathanjohnpayne '' 'Authoring-Agent: unknown')"
 fixture_rc="${fixture_result%%$'\n'*}"
 fixture_output="${fixture_result#*$'\n'}"
