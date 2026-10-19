@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # scripts/codex-review-check.sh — Phase 4 external-review merge gate
 #
+# Runtime prerequisite: one working structured YAML parser, selected by
+# policy_yaml_to_json: mikefarah yq v4, Python3 with PyYAML, or Ruby YAML/JSON.
+# This applies to direct callers as well as the merge-clearance dispatcher.
+# Missing/broken parsers remain configuration errors (exit3), never clearance.
+# Caller inventory and an environment probe: docs/agents/testing-requirements.md
+# section "Direct checker runtime prerequisites" (#2314).
+#
 # Verifies that a pull request is ready to merge under the Phase 4
 # external-review flow. Read-only. Never merges, labels, or comments
 # on the PR.
