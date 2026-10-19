@@ -86,6 +86,10 @@ if [ "$MODE" = "list" ]; then
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────
+RUNS_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/head-check-runs.sh"
+[ -r "$RUNS_LIB" ] || infra "missing shared check-run reducer"
+# shellcheck source=lib/head-check-runs.sh
+. "$RUNS_LIB"
 # Grouped by STABLE WORKFLOW IDENTITY, not by check suite. Two groupings are
 # wrong in opposite directions:
 #
@@ -113,6 +117,7 @@ fi
 suite_map=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
   --jq '.workflow_runs[] | {suite: .check_suite_id, wf: .workflow_id}' 2>/dev/null) \
   || infra "could not read workflow runs for $SHA"
+suite_json=$(printf '%s\n' "$suite_map" | jq -s '.') || infra "could not parse workflow runs for $SHA"
 
 rc=0
 while IFS= read -r name; do
@@ -125,31 +130,12 @@ while IFS= read -r name; do
   # cheaper query keeps the gate from breaking the merge it protects.
   runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
     -f check_name="$name" --paginate \
-    --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started: .started_at}' 2>/dev/null) \
+    --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at}' 2>/dev/null) \
     || infra "could not read check runs named '$name' for $SHA"
-
-  verdict=$(jq -n -r --arg n "$name" \
-    --slurpfile r <(printf '%s\n' "$runs") \
-    --slurpfile m <(printf '%s\n' "$suite_map") '
-    ($m | map({key: (.suite|tostring), value: (.wf|tostring)}) | from_entries) as $bysuite
-    | [ $r[] | select(.name == $n)
-        | . + {wf: ($bysuite[(.suite|tostring)] // ("suite:" + (.suite|tostring)))} ]
-    | if length == 0 then "absent"
-      else
-        group_by(.wf)
-        # Any non-completed run in a group means that workflow is still
-        # working, regardless of ordering. Reducing to the latest FIRST
-        # would miss a queued re-run whose started_at is null and therefore
-        # does not sort last -- reporting green while a re-run is pending.
-        | map(if any(.status != "completed") then "pending"
-              else (sort_by(.started) | last
-                    | if (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped")
-                      then "green" else "failed" end)
-              end)
-        | if any(. == "pending") then "pending"
-          elif all(. == "green") then "green"
-          else "failed" end
-      end')
+  runs_json=$(printf '%s\n' "$runs" | jq -s '.') || infra "could not parse check runs named '$name'"
+  summary=$(head_check_runs_reduce "$name" <(printf '%s\n' "$runs_json") <(printf '%s\n' "$suite_json")) \
+    || infra "could not reduce check runs named '$name'"
+  verdict=$(jq -r '.state' <<<"$summary")
   case "$verdict" in
     green) echo "required-head-checks: OK   $name" ;;
     *)     echo "required-head-checks: WAIT $name ($verdict)"; rc=1 ;;

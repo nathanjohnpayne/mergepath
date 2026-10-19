@@ -469,7 +469,7 @@ fi
 TREE="$TMP/tree"
 mkdir -p "$TREE/scripts/workflow" "$TREE/scripts/lib" "$TMP/bin" "$TMP/fixture"
 cp "$FINDER" "$RESUME" "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TREE/scripts/workflow/"
-cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$TREE/scripts/lib/"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$ROOT/scripts/lib/head-check-runs.sh" "$TREE/scripts/lib/"
 # The repository's required head checks: `lint` only. Review-policy checks
 # (Label Gate, Merge clearance gate) are deliberately NOT in this list.
 cat > "$TREE/scripts/required-head-checks.sh" <<'SH'
@@ -494,6 +494,12 @@ args="$*"
 echo "$args" >> "$GH_LOG"
 [ -n "${GH_TOKEN:-}" ] || { echo "gh shim: no GH_TOKEN in this process" >&2; exit 1; }
 case "$args" in
+  'api repos/octo/demo --jq .default_branch') echo main; exit 0 ;;
+  *'/contents/.github/required-head-checks?ref=main'*) printf 'lint\n' | base64; exit 0 ;;
+  *"/actions/runs?head_sha="*)
+    [ "${FINDER_WORKFLOW_FAIL:-0}" != 1 ] || { echo 'workflow runs unavailable' >&2; exit 1; }
+    [ ! -f "$FIXTURE/workflow-runs.json" ] || cat "$FIXTURE/workflow-runs.json"
+    exit 0 ;;
   *"/contents/.github/review-policy.yml?ref="*)
     [ "${FINDER_POLICY_FAIL:-0}" != 1 ] || { echo 'gh: policy unavailable (HTTP 500)' >&2; exit 1; }
     case "${FINDER_POLICY_FORMAT:-block}" in
@@ -630,6 +636,51 @@ fi
 
 # Governing bot identity is materialized from the target, including when the
 # local checkout advertises a different bot. One shared base needs one read.
+# Queued runs have no started_at. Compare the complete producer groups rather
+# than letting an older completed run or an unrelated workflow hide them.
+cp "$TMP/fixture/check-runs-41.json" "$TMP/fixture/check-runs-41.original"
+for check_case in queued-required queued-gate cross-workflow-fail same-workflow-recovery neutral-gate skipped-gate workflow-read-failure; do
+  jq -cn --arg mode "$check_case" '
+    {name:"lint",status:"completed",conclusion:(if $mode | IN("cross-workflow-fail","same-workflow-recovery") then "failure" else "success" end),suite:100,started_at:"2026-10-13T06:00:00Z"},
+    {name:"Merge clearance gate",status:"completed",conclusion:(if $mode == "neutral-gate" then "neutral" elif $mode == "skipped-gate" then "skipped" else "success" end),suite:300,started_at:"2026-10-13T07:05:00Z"},
+    (if $mode == "queued-required" then {name:"lint",status:"queued",conclusion:null,suite:101,started_at:null}
+     elif $mode == "queued-gate" then {name:"Merge clearance gate",status:"queued",conclusion:null,suite:301,started_at:null}
+     elif $mode | IN("cross-workflow-fail","same-workflow-recovery") then {name:"lint",status:"completed",conclusion:"success",suite:(if $mode == "cross-workflow-fail" then 200 else 101 end),started_at:"2026-10-13T07:00:00Z"}
+     else empty end)' > "$TMP/fixture/check-runs-41.json"
+  printf '%s\n' '{"suite":100,"wf":10}' '{"suite":101,"wf":10}' '{"suite":200,"wf":20}' '{"suite":300,"wf":30}' '{"suite":301,"wf":30}' > "$TMP/fixture/workflow-runs.json"
+  workflow_fail=0; [ "$check_case" != workflow-read-failure ] || workflow_fail=1
+  : > "$TMP/gh.log"
+  set +e
+  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+    FINDER_WORKFLOW_FAIL="$workflow_fail" bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --json --now "$NOW" \
+    > "$TMP/check-$check_case.json" 2> "$TMP/check-$check_case.err"
+  check_rc=$?
+  set -e
+  set +e
+  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" \
+    FINDER_WORKFLOW_FAIL="$workflow_fail" bash "$ROOT/scripts/required-head-checks.sh" --repo "$REPO" \
+    --verify --sha 4141414141414141414141414141414141414141 > "$TMP/required-$check_case.txt" 2>&1
+  required_rc=$?
+  set -e
+  case "$check_case" in queued-required|cross-workflow-fail) expected_required=1 ;; workflow-read-failure) expected_required=3 ;; *) expected_required=0 ;; esac
+  if [ "$required_rc" -eq "$expected_required" ]; then
+    pass "actual required-head verifier retains producer semantics: $check_case"
+  else fail "actual required-head verifier $check_case: rc=$required_rc: $(cat "$TMP/required-$check_case.txt")"; fi
+  if [ "$workflow_fail" -eq 1 ]; then
+    if [ "$check_rc" -eq 3 ] && [ ! -s "$TMP/check-$check_case.json" ]; then
+      pass 'unreadable workflow provenance fails closed'
+    else fail "workflow provenance read failure: rc=$check_rc"; fi
+  else
+    case "$check_case" in queued-required) expected_ci=PENDING; expected_gate=success ;; queued-gate) expected_ci=SUCCESS; expected_gate=pending ;; cross-workflow-fail) expected_ci=FAILURE; expected_gate=success ;; same-workflow-recovery) expected_ci=SUCCESS; expected_gate=success ;; neutral-gate) expected_ci=SUCCESS; expected_gate=neutral ;; skipped-gate) expected_ci=SUCCESS; expected_gate=skipped ;; esac
+    if [ "$check_rc" -eq 1 ] && jq -e --arg ci "$expected_ci" --arg gate "$expected_gate" --arg mode "$check_case" \
+      '[.prs[] | select(.number == 41)][0] | .ci_state == $ci and .merge_gate_check == $gate and (if $mode == "same-workflow-recovery" then .next_action == "merge" else .next_action != "merge" end)' "$TMP/check-$check_case.json" >/dev/null; then
+      pass "producer-aware check reduction: $check_case"
+    else fail "producer-aware check reduction $check_case (rc=$check_rc): $(cat "$TMP/check-$check_case.err")"; fi
+  fi
+done
+mv "$TMP/fixture/check-runs-41.original" "$TMP/fixture/check-runs-41.json"
+rm "$TMP/fixture/workflow-runs.json"
+
 mkdir -p "$TREE/.github"
 printf 'codex:\n  bot_login: "local-only[bot]"\n' > "$TREE/.github/review-policy.yml"
 mkdir -p "$TMP/no-parser-bin"
