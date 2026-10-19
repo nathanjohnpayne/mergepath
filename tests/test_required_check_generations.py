@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline #906 production-helper, reader and narrow recovery regressions."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -257,7 +258,7 @@ class RecoverySubprocessDeadline(unittest.TestCase):
 
 
 class Escalation(unittest.TestCase):
-    def exercise_two_nominations(self, first_override=None):
+    def exercise_two_nominations(self, first_override=None, first_failure=None, failure_at="api", missing_field=None, first_run_override=None):
         posts = []
         heads = {7: HEAD, 8: "c" * 40}
 
@@ -265,43 +266,88 @@ class Escalation(unittest.TestCase):
             if path.endswith("/commits/HEAD"):
                 return {"sha": REVISION}
             number = int(path.rsplit("/", 1)[1])
+            if number == 7 and first_failure is not None and failure_at == "api":
+                raise first_failure
             return {"number": number, "head": {"sha": heads[number]}}
 
         def pages(path, field=None):
             if "/check-runs?" not in path:
                 return []
             number = 7 if HEAD in path else 8
+            if number == 7 and first_failure is not None and failure_at == "pages":
+                raise first_failure
             report = dict(repo="owner/repo", pr=number, head=heads[number],
                           revision="d" * 40 if number == 7 else REVISION,
                           fingerprint="f" * 64, episode=100, state="escalate",
                           kind="unreadable", recovery_token="exact recovery token")
             if number == 7 and first_override is not None:
                 report.update(first_override)
-            return [dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
-                '<!-- mergepath-generation:v1 {} -->\n' + recovery.PREFIX + json.dumps(report) + " -->"})]
+            if number == 7 and missing_field is not None:
+                report.pop(missing_field)
+            run = dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
+                '<!-- mergepath-generation:v1 {} -->\n' + recovery.PREFIX + json.dumps(report) + " -->"})
+            if number == 7 and first_run_override is not None:
+                run.update(first_run_override)
+            return [run]
 
         def write(path, body):
             posts.append((path, body))
+            if path.endswith("/7/comments") and first_failure is not None and failure_at == "write":
+                raise first_failure
             return body
 
         with mock.patch.object(recovery, "api", side_effect=api), \
                 mock.patch.object(recovery, "pages", side_effect=pages), \
-                mock.patch.object(recovery, "write", side_effect=write):
-            recovery.escalate("owner/repo", "7 8")
-        return posts
+                mock.patch.object(recovery, "write", side_effect=write), \
+                mock.patch.object(sys, "argv", [str(MODULE), "--escalate", "owner/repo", "7 8"]), \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as diagnostics:
+            code = recovery.main()
+        return posts, code, diagnostics.getvalue()
 
     def test_stale_first_nomination_does_not_prevent_later_current_escalation(self):
-        posts = self.exercise_two_nominations()
+        posts, code, _ = self.exercise_two_nominations()
+        self.assertEqual(code, 0)
         self.assertEqual([path for path, _ in posts], ["repos/owner/repo/issues/8/comments"])
         self.assertIn("c" * 40, posts[0][1]["body"])
 
-    def test_malformed_first_tuple_retains_fail_closed_error(self):
+    def assert_later_target_survives(self, **kwargs):
+        posts, code, diagnostic = self.exercise_two_nominations(**kwargs)
+        self.assertEqual(code, 3)
+        self.assertEqual(posts[-1][0], "repos/owner/repo/issues/8/comments")
+        self.assertIn("PR #7", diagnostic)
+        # A failed write may already have happened; it must not be retried.
+        self.assertLessEqual(sum(path.endswith("/7/comments") for path, _ in posts), 1)
+        return diagnostic
+
+    def test_malformed_first_tuple_fails_command_but_allows_later_escalation(self):
         for override in ({"repo": None}, {"repo": "owner"}, {"pr": "7"}, {"pr": True},
                          {"pr": 0}, {"head": "short"}, {"revision": None}):
-            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "malformed escalation tuple"):
-                self.exercise_two_nominations(override)
+            with self.subTest(override=override):
+                diagnostic = self.assert_later_target_survives(first_override=override)
+                self.assertIn("ValueError", diagnostic)
 
-    def exercise(self, existing=False, already_posted=False, issues=None):
+    def test_missing_first_tuple_fields_do_not_suppress_later_target(self):
+        for field in ("pr", "head", "revision", "repo"):
+            with self.subTest(field=field):
+                self.assert_later_target_survives(missing_field=field)
+
+    def test_malformed_nested_first_observation_does_not_suppress_later_target(self):
+        for record in ({"output": None}, {"output": []}, {"app": None}, {"app": []}):
+            with self.subTest(record=record):
+                self.assert_later_target_survives(first_run_override=record)
+
+    def test_first_target_transport_and_evidence_errors_are_isolated(self):
+        errors = [KeyError("head"), TypeError("malformed header"), ValueError("damaged evidence"),
+                  OSError("transport unavailable"), subprocess.CalledProcessError(1, ["gh", "api"]),
+                  subprocess.TimeoutExpired(["gh", "api"], 30)]
+        for stage in ("api", "pages", "write"):
+            for error in errors:
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    diagnostic = self.assert_later_target_survives(
+                        first_override={"revision": REVISION}, first_failure=error, failure_at=stage)
+                    self.assertIn(type(error).__name__, diagnostic)
+
+    def exercise(self, existing=False, already_posted=False, issues=None, expected_code=0):
         report = dict(repo="owner/repo", pr=7, head=HEAD, revision=REVISION, fingerprint="f" * 64,
                       episode=100, state="escalate", kind="unrecognized", recovery_token="exact recovery token")
         run = dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
@@ -333,8 +379,12 @@ class Escalation(unittest.TestCase):
 
         with mock.patch.object(recovery, "api", side_effect=api), \
                 mock.patch.object(recovery, "pages", side_effect=pages), \
-                mock.patch.object(recovery, "write", side_effect=write):
-            recovery.escalate("owner/repo", "7")
+                mock.patch.object(recovery, "write", side_effect=write), \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as diagnostic, \
+                mock.patch.object(sys, "argv", [str(MODULE), "--escalate", "owner/repo", "7"]):
+            code = recovery.main()
+        self.assertEqual(code, expected_code)
+        self.last_escalation_diagnostic = diagnostic.getvalue()
         return posts
 
     def test_persistent_unknown_opens_parser_work_and_reports_only_the_affected_gate(self):
@@ -381,9 +431,11 @@ class Escalation(unittest.TestCase):
                                  ["repos/owner/repo/issues", "repos/owner/repo/issues/7/comments"])
 
     def test_multiple_actions_work_items_remain_ambiguous(self):
-        with self.assertRaisesRegex(ValueError, "ambiguous parser-drift work item"):
-            self.exercise(issues=[self.parser_work(55, "github-actions[bot]"),
-                                 self.parser_work(56, "github-actions[bot]")])
+        posts = self.exercise(issues=[self.parser_work(55, "github-actions[bot]"),
+                                     self.parser_work(56, "github-actions[bot]")], expected_code=3)
+        self.assertFalse(posts)
+        self.assertIn("ambiguous parser-drift work item", self.last_escalation_diagnostic)
+        self.assertIn("PR #7", self.last_escalation_diagnostic)
 
     def test_actions_pull_request_marker_does_not_capture_parser_work(self):
         posts = self.exercise(issues=[self.parser_work(88, "github-actions[bot]",
