@@ -1,5 +1,7 @@
 # Repository Overview
 
+Targeted review-thread disposition confirms JSON mutation stdout independently of diagnostic stderr; successful warnings do not trigger duplicate marker retries. Failure detection and cleanup are specified in `specs/review_feedback_accounting.md` and exercised by `tests/test_resolve_pr_threads_rationale_tag.sh` (#2448).
+
 Automated Phase4b routes deterministic egregious-case alarms to human review before model dispatch. The literal alarms, conservative sensitive-path inventory and accepted hostile-diff residual are specified in `specs/phase_4b_escalation.md`.
 
 This repository is **Mergepath**, the reference implementation of the AI Agent Tooling Standard. It provides a canonical starting structure for projects that require consistent behavior across multiple AI coding agents and development tools.

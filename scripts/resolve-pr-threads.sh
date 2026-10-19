@@ -3203,12 +3203,11 @@ post_tag_reply() {
   local rationale="$3"
   local body
   body="[mergepath-resolve: $class] $rationale"
-  # Capture BOTH streams: `gh api` writes an HTTP error BODY to stdout and
-  # only a summary to stderr, so the proxy's refusal phrase can be in either
-  # (Codex P2 on #1529). On success the captured mutation response is simply
-  # unused; it is only read on the failure path below.
-  local err
-  if ! err=$(gh_pat api graphql \
+  # Keep successful JSON separate from diagnostics, but inspect both streams
+  # on failure: the proxy's refusal phrase can be in either (#1529).
+  local response err stderr_file status=0
+  stderr_file=$(mktemp "${TMPDIR:-/tmp}/resolve-pr-thread-tag-stderr.XXXXXX") || return 1
+  response=$(gh_pat api graphql \
     -f query='mutation($id: ID!, $body: String!) {
       addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
         comment { id }
@@ -3216,14 +3215,23 @@ post_tag_reply() {
     }' \
     -F id="$thread_id" \
     -F body="$body" \
-    2>&1); then
+    2>"$stderr_file") || status=$?
+  if ! err=$(cat "$stderr_file"); then
+    rm -f "$stderr_file"
+    echo "tag-reply diagnostic capture could not be read" >&2
+    return 1
+  fi
+  rm -f "$stderr_file"
+  if [ "$status" -ne 0 ]; then
+    err="$response"$'\n'"$err"
     # Called in the main shell (`if post_tag_reply ...`), so the refusal ends
     # the run before any thread is resolved without its disposition tag.
     graphql_ceiling_hit "$err" && graphql_ceiling_refuse resolve-pr-threads "posting the disposition reply on review thread $thread_id"
     printf 'tag-reply mutation failed: %s\n' "$err" >&2
     return 1
   fi
-  if [ "$MODE" = "resolve-targeted" ] && ! printf '%s' "$err" | jq -e '
+  [ -z "$err" ] || printf '%s\n' "$err" >&2
+  if [ "$MODE" = "resolve-targeted" ] && ! printf '%s' "$response" | jq -e '
     ((.errors // []) | length) == 0 and
     (.data.addPullRequestReviewThreadReply.comment.id | type == "string" and length > 0)
   ' >/dev/null 2>&1; then
