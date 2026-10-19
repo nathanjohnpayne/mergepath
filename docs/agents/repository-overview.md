@@ -148,3 +148,5 @@ The native GitHub comment hook inspects every command-position invocation before
 The native approval hook requires an explicit canonical `OWNER/REPO` in `REVIEW_REPO` or inherited `GH_REPO` before lending the cached reviewer PAT to a metadata read. Missing or noncanonical repository context keeps the CLI's own credential path; the contract and native fake-CLI controls live in `specs/review_feedback_accounting.md` and `tests/test_gh_pr_guard.sh` (#2312).
 
 Requester commit timestamps are validated before trigger writes against the existing whole-second UTC diagnostic format. Unsupported metadata refuses before mutation; valid future dates and provider-block diagnostics retain their behavior. The source contract and native controls are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_trigger_only.sh` (#2317).
+
+Parser-drift escalation reuses only marker-prefixed non-PR work items attributed to `github-actions[bot]`; unrelated markers cannot capture evidence or create ambiguity. The bounded attribution contract and native controls live in `specs/required_check_publisher.md` and `tests/test_required_check_generations.py` (#2449).

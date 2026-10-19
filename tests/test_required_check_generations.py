@@ -251,7 +251,7 @@ class Escalation(unittest.TestCase):
             with self.subTest(override=override), self.assertRaisesRegex(ValueError, "malformed escalation tuple"):
                 self.exercise_two_nominations(override)
 
-    def exercise(self, existing=False, already_posted=False):
+    def exercise(self, existing=False, already_posted=False, issues=None):
         report = dict(repo="owner/repo", pr=7, head=HEAD, revision=REVISION, fingerprint="f" * 64,
                       episode=100, state="escalate", kind="unrecognized", recovery_token="exact recovery token")
         run = dict(id=101, name=CONTEXT, app={"id": 15368}, output={"summary":
@@ -267,7 +267,10 @@ class Escalation(unittest.TestCase):
             if "/check-runs?" in path:
                 return [run]
             if path.endswith("/issues?state=open&per_page=100"):
+                if issues is not None:
+                    return issues
                 return [{"number": 55, "html_url": "https://github.com/owner/repo/issues/55",
+                         "user": {"login": "github-actions[bot]"},
                          "body": "<!-- mergepath-coderabbit-parser-drift:v1 -->\nExisting work"}] if existing else []
             if already_posted and "/issues/7/comments?" in path:
                 return [{"user": {"login": "github-actions[bot]"}, "body":
@@ -296,6 +299,48 @@ class Escalation(unittest.TestCase):
         posts = self.exercise(existing=True)
         self.assertEqual([path for path, _ in posts], ["repos/owner/repo/issues/55/comments", "repos/owner/repo/issues/7/comments"])
         self.assertFalse(self.exercise(existing=True, already_posted=True))
+
+    def parser_work(self, number, login=None, **extra):
+        issue = dict(number=number, html_url=f"https://github.com/owner/repo/issues/{number}",
+                     body="<!-- mergepath-coderabbit-parser-drift:v1 -->\nExisting work", **extra)
+        if login is not None:
+            issue["user"] = {"login": login}
+        return issue
+
+    def test_unrelated_marker_authors_cannot_capture_parser_work(self):
+        for login in (None, "unrelated-user", "nathanpayne-claude", "another[bot]"):
+            with self.subTest(login=login):
+                posts = self.exercise(issues=[self.parser_work(88, login)])
+                self.assertEqual([path for path, _ in posts],
+                                 ["repos/owner/repo/issues", "repos/owner/repo/issues/7/comments"])
+                self.assertIn("issues/55", posts[-1][1]["body"])
+
+    def test_unrelated_markers_do_not_make_one_actions_work_item_ambiguous(self):
+        posts = self.exercise(issues=[self.parser_work(88, "unrelated-user"),
+                                     self.parser_work(55, "github-actions[bot]")])
+        self.assertEqual([path for path, _ in posts],
+                         ["repos/owner/repo/issues/55/comments", "repos/owner/repo/issues/7/comments"])
+
+    def test_unreadable_author_cannot_capture_parser_work(self):
+        for user in (None, "github-actions[bot]"):
+            with self.subTest(user=user):
+                issue = self.parser_work(88)
+                issue["user"] = user
+                posts = self.exercise(issues=[issue])
+                self.assertEqual([path for path, _ in posts],
+                                 ["repos/owner/repo/issues", "repos/owner/repo/issues/7/comments"])
+
+    def test_multiple_actions_work_items_remain_ambiguous(self):
+        with self.assertRaisesRegex(ValueError, "ambiguous parser-drift work item"):
+            self.exercise(issues=[self.parser_work(55, "github-actions[bot]"),
+                                 self.parser_work(56, "github-actions[bot]")])
+
+    def test_actions_pull_request_marker_does_not_capture_parser_work(self):
+        posts = self.exercise(issues=[self.parser_work(88, "github-actions[bot]",
+                                                     pull_request={"url": "https://api.github.com/repos/owner/repo/pulls/88"}),
+                                     self.parser_work(55, "github-actions[bot]")])
+        self.assertEqual([path for path, _ in posts],
+                         ["repos/owner/repo/issues/55/comments", "repos/owner/repo/issues/7/comments"])
 
 
 class OwnedGeneration(unittest.TestCase):

@@ -187,6 +187,8 @@ def escalate(repo, numbers):
             drift_marker = "<!-- mergepath-coderabbit-parser-drift:v1 -->"
             issues = pages(f"repos/{repo}/issues?state=open&per_page=100")
             matches = [i for i in issues if not i.get("pull_request") and
+                       isinstance(i.get("user"), dict) and
+                       i["user"].get("login") == "github-actions[bot]" and
                        (i.get("body") or "").startswith(drift_marker + "\n")]
             if len(matches) > 1:
                 raise ValueError("ambiguous parser-drift work item")
