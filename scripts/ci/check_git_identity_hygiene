@@ -1750,12 +1750,31 @@ scan_unscoped_identity_writes() {
       if (quote != "" || i > length(w) + 1) return ""
       value = dequote_word(w); literal_valid = 1; return value
     }
-    function repo_config_assignment(word,   value) {
-      sub(/^[^=]*=/, "", word)
-      value = literal_word(word)
-      if (!literal_valid) return 0
+    function repo_config_value(value) {
       return (value == ".git/config" || value == "./.git/config" || value == root ".git/config" ||
               value == ".git/config.worktree" || value == "./.git/config.worktree" || value == root ".git/config.worktree")
+    }
+    function repo_config_path(word,   value) {
+      value = literal_word(word)
+      return literal_valid && repo_config_value(value)
+    }
+    function repo_config_assignment(word) {
+      sub(/^[^=]*=/, "", word)
+      return repo_config_path(word)
+    }
+    function repo_config_file_operand(s, pos, flag,   value, end) {
+      value = literal_word(flag)
+      if (!literal_valid) return 0
+      if (value == "-f" || value == "--file" || value == "--fil") {
+        while (substr(s, pos, 1) ~ /[[:space:]]/) pos++
+        end = word_end(s, pos)
+        return repo_config_path(substr(s, pos, end - pos))
+      }
+      if (value ~ /^--fil(e)?=/) sub(/^[^=]*=/, "", value)
+      else if (value ~ /^-f./) value = substr(value, 3)
+      else return 0
+      # A short -f=path operand begins with =; do not treat it as long syntax.
+      return repo_config_value(value)
     }
     function leading_config_overrides(s,   i, end, word) {
       override_global = 0; override_system = 0; i = 1
@@ -1767,13 +1786,13 @@ scan_unscoped_identity_writes() {
         if (word ~ /^GIT_CONFIG_SYSTEM=/) override_system = repo_config_assignment(word)
       }
     }
-    function safe_option_region(s, global_override, system_override,   i, end, word, skip, options, config, action, operand, nextword, selector, negated, global_scope, system_scope, file_scope, blob_scope, read_modes, mode) {
+    function safe_option_region(s, global_override, system_override,   i, end, word, skip, options, config, action, operand, nextword, selector, negated, global_scope, system_scope, file_scope, blob_scope, read_modes, mode, raw) {
       i = 1; skip = 0; options = 1; config = 0; action = 0
       global_scope = 0; system_scope = 0; file_scope = 0; blob_scope = 0
       split("", read_modes)
       while (i <= length(s)) {
         if (substr(s, i, 1) ~ /[[:space:]()<>]/) { i++; continue }
-        end = word_end(s, i); word = dequote_word(substr(s, i, end - i)); i = end
+        end = word_end(s, i); raw = substr(s, i, end - i); word = dequote_word(raw); i = end
         if (skip) { skip--; continue }
         if (word == "--") { options = 0; continue }
         if (!options) continue
@@ -1795,7 +1814,8 @@ scan_unscoped_identity_writes() {
           if (selector ~ /^--gl(o(b(a(l)?)?)?)?$/) { global_scope = !negated; continue }
           if (selector ~ /^--sy(s(t(e(m)?)?)?)?$/) { system_scope = !negated; continue }
           if (selector ~ /^(-f|--fil(e)?)(=|$)/ || selector ~ /^-f[^=]/) {
-            file_scope = !negated; skip = option_operands(word, config); continue
+            file_scope = !negated && !repo_config_file_operand(s, i, raw)
+            skip = option_operands(word, config); continue
           }
           if (selector ~ /^--blob(=|$)/) {
             blob_scope = !negated; skip = option_operands(word, config); continue
