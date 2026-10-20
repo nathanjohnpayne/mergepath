@@ -22,6 +22,10 @@ The Phase 4b self-test wrapper runs all four focused CodeRabbit refusal modes: s
 
 Checks with separable repository assertions and implementation regression suites should expose explicit live and self-test modes. The fast lane invokes the live mode, deep CI invokes the self-test mode, and the no-argument behavior remains compatible for consumers during propagation skew. The canonical contract and regression coverage live in `specs/repo_lint_execution.md` and `tests/test_repo_lint_optimization.sh`.
 
+## Phase 4b automation suite
+
+Run `tests/test_phase_4b_automation.sh` with stdin closed (`bash tests/test_phase_4b_automation.sh < /dev/null`). Its tripwire case (#1757) drives `phase-4b-review.sh` against a fake handoff that reads stdin, so a session that leaves stdin open, such as an agent's backgrounded shell, blocks that case forever at 0% CPU instead of failing. A run that sits on one case for minutes is this hang, not a slow suite: kill it and rerun with `< /dev/null`.
+
 ## Pre-push hook
 
 Install the repo-lint pre-push hook once per clone with `scripts/install-git-hooks.sh` (hub only; consumers do not receive it). The installer is idempotent and writes one key, `core.hooksPath=scripts/git-hooks`, to the clone's local git config, which every worktree of that clone shares; `--check` reports whether it is installed, `--uninstall` removes it, and it refuses to replace a different `core.hooksPath` without `--force`. From then on `git push` runs `scripts/repo-lint-prepush.sh` before anything leaves the machine, and a failing selected check blocks the push with the check named and its log tail printed.

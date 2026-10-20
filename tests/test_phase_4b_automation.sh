@@ -11,6 +11,9 @@
 # CODEX_BIN / CLAUDE_BIN fakes; PR metadata is injected via orchestrator
 # override flags (--author/--head/--diff-file) and a scratch
 # review-policy.yml via MERGEPATH_REVIEW_POLICY_PATH. Bash 3.2 portable.
+#
+# Run with stdin closed (< /dev/null): the tripwire case reads stdin, so an
+# open stdin hangs it forever. See docs/agents/testing-requirements.md.
 
 set -euo pipefail
 

@@ -10,6 +10,10 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 PHRASE = re.compile(r"@codex\s+review", re.IGNORECASE)
 COMMAND = re.compile(r"\s*@codex\s+review\s*", re.IGNORECASE)
+# A well-formed owner tiebreak marker (#2511). Only the owner may type one, so
+# no agent-authored body may carry it, in prose or in a code fence. Placeholders
+# such as <PR-URL>@<full-head-sha>#<finding-id> do not match.
+TIEBREAK = re.compile(r"TIEBREAK_REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+", re.IGNORECASE)
 GRAPHQL_COMMENTS = frozenset({
     "addComment", "addDiscussionComment", "addPullRequestReview",
     "addPullRequestReviewComment", "addPullRequestReviewThread",
@@ -325,6 +329,8 @@ def inspect(argv, role, state=None):
     else:
         return original_args, {"guarded": False, "trigger": False}
 
+    if any(TIEBREAK.search(body) for body in bodies):
+        raise Refused("Reserved owner tiebreak text is not allowed in an agent-authored comment; the owner posts it.")
     hits = [body for body in bodies if PHRASE.search(body)]
     metadata = {"guarded": True, "trigger": False, "deferred": deferred, "cli_stdin": cli_stdin}
     if not hits:
