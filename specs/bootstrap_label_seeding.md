@@ -1,6 +1,6 @@
 # Bootstrap Label Seeding
 
-Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every entry of `BOOTSTRAP_LABELS` into the new remote, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit, to 20 when #1555 added `needs-local-agent`, and to 21 with `status:blocked`, which every repository's board uses in place of a blocked lane.
+Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every entry of `BOOTSTRAP_LABELS` into the new remote, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit, to 20 when #1555 added `needs-local-agent`, and to 21 with `status:blocked`, which marks a blocker that no issue can point at under the same lane rule on every repository's board.
 
 ## Acceptance criteria
 
@@ -25,7 +25,7 @@ Feature: the canonical issue-label set a bootstrapped repo starts with, and the 
 ### Deliberate exclusions
 
 - `size:XL` is not seeded. It existed in `nathanpaynedotcom` and was applied to zero issues, open or closed.
-- `area:*`, every `status:*` value other than `status:blocked`, and repo-local `type:*` values are not seeded. They are per-repo vocabulary; imposing the hub's scheme on a repo with a handful of open issues is bureaucracy rather than standardization. `status:blocked` is the exception because blocked is a label rather than a lane on every board (`scripts/gh-projects/README.md` § Status lanes), so it must mean the same thing in every repository.
+- `area:*`, every `status:*` value other than `status:blocked`, and repo-local `type:*` values are not seeded. They are per-repo vocabulary; imposing the hub's scheme on a repo with a handful of open issues is bureaucracy rather than standardization. `status:blocked` is the exception because it marks a blocker that no issue can point at, such as a vendor or an outside event, under the same lane rule on every board (`scripts/gh-projects/README.md` § Status lanes), so it must mean the same thing in every repository.
 
 ## Preservation boundaries
 
