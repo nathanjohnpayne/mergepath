@@ -96,6 +96,28 @@ crqe_latest_head_transition() { # timeline-json
     end'
 }
 
+# Positive ordinary-push evidence only. Missing/delayed Events API rows do
+# not prove anything. Bind the event to the source repository, branch and
+# complete current head; never substitute a commit's author/committer date.
+crqe_latest_matching_head_push() { # events-json repo repo-id branch head observed-at
+  printf '%s' "$1" | jq -er --arg repo "$2" --argjson id "$3" \
+    --arg ref "refs/heads/$4" --arg head "$5" --arg now "$6" '
+    if type != "array" then error("push events") else
+      [.[] | select(.type == "PushEvent" and .repo.id == $id)
+       | select((.repo.name | ascii_downcase) == ($repo | ascii_downcase))
+       | select(.payload.ref == $ref and .payload.head == $head)
+       | if (.payload.before | type) != "string"
+            or (.payload.before | test("^[0-9a-f]{40}$") | not)
+            or .payload.before == "0000000000000000000000000000000000000000"
+            or .payload.before == .payload.head
+            or (.created_at | type) != "string"
+            or (try (.created_at | fromdateiso8601 | todateiso8601) catch "") != .created_at
+            or .created_at > $now
+         then error("head push evidence") else .created_at end]
+      | max // ""
+    end'
+}
+
 # Compute the request freshness anchor shared by the requester and Phase 4b
 # cap sensing. Inputs are already-read evidence so each caller retains its own
 # API failure action. Prints the full anchor record as JSON.

@@ -117,6 +117,11 @@ if [ "$1" = "api" ]; then
     if [ -f "$f" ]; then jq -s '.' "$f"; else printf '[[]]'; fi
     exit 0
   fi
+  if [[ "$endpoint" == repos/*/events?per_page=100 ]]; then
+    [ "${MOCK_EVENTS_UNREADABLE:-0}" != 1 ] || exit 1
+    printf '[%s]' "${MOCK_EVENTS_JSON:-[]}"
+    exit 0
+  fi
   if [[ "$endpoint" == repos/*/issues/*/timeline ]]; then
     [ "${MOCK_TIMELINE_UNREADABLE:-0}" != 1 ] || exit 1
     printf '[%s]' "${MOCK_TIMELINE_JSON:-[]}"
@@ -174,7 +179,7 @@ write_pr_fixture() {
 {
   "html_url": "https://github.com/${owner}/${repo}/pull/${num}",
   "commits": ${commits},
-  "head": { "sha": "${head_sha}", "ref": "${head_ref}" },
+  "head": { "sha": "${head_sha}", "ref": "${head_ref}", "repo": {"id":12345,"full_name":"${owner}/${repo}"} },
   "base": { "sha": "${base_sha}", "ref": "main", "repo": {"default_branch": "main"} }
 }
 EOF
@@ -504,9 +509,33 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REQUEST=$(jq -nc --arg now "$NOW" '[{id:801,user:{login:"nathanjohnpayne"},created_at:$now,body:"@codex review"}]')
 RUNNING=$(jq -nc --arg now "$NOW" --arg head "$HEAD" \
   '[{id:802,user:{login:"chatgpt-codex-connector[bot]"},created_at:$now,updated_at:$now,body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `" + $head + "` | New commits |")}]')
-for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal before-force after-force running-after-force future-date-request future-date-running future-date-timeout timeline-unreadable malformed-transition; do
-  history='[]'; reviews='[]'; expected=0; timeline='[]'; head_time=2026-01-01T00:00:00Z
+for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal before-force after-force running-after-force future-date-request future-date-running future-date-timeout timeline-unreadable malformed-transition ordinary-before ordinary-after ordinary-same-second ordinary-running ordinary-unknown ordinary-wrong-id ordinary-wrong-name ordinary-wrong-ref ordinary-wrong-head ordinary-short-head ordinary-malformed ordinary-unavailable ordinary-absent ordinary-no-change ordinary-created-branch ordinary-out-of-order; do
+  history='[]'; reviews='[]'; expected=0; timeline='[]'; events='[]'; head_time=2026-01-01T00:00:00Z
   case "$scenario" in
+    ordinary-*)
+      history="$REQUEST"; expected=5
+      events=$(jq -nc --arg now "$NOW" --arg head "$HEAD" --arg scenario "$scenario" '
+        [{type:"PushEvent",repo:{id:12345,name:"nathanjohnpayne/mergepath"},
+          payload:{ref:"refs/heads/feat/some-feature",head:$head,before:"4444444444444444444444444444444444444444"},
+          created_at:($now | fromdateiso8601 | . + (if $scenario == "ordinary-after" then -1 elif $scenario == "ordinary-same-second" then 0 else 1 end) | todateiso8601)}]
+        | if $scenario == "ordinary-wrong-id" then .[0].repo.id=98765
+          elif $scenario == "ordinary-wrong-name" then .[0].repo.name="other/fork"
+          elif $scenario == "ordinary-wrong-ref" then .[0].payload.ref="refs/heads/other"
+          elif $scenario == "ordinary-wrong-head" then .[0].payload.head=.[0].payload.before
+          elif $scenario == "ordinary-short-head" then .[0].payload.head=($head[0:12])
+          elif $scenario == "ordinary-malformed" then .[0].created_at="invalid"
+          elif $scenario == "ordinary-no-change" then .[0].payload.before=$head
+          elif $scenario == "ordinary-created-branch" then .[0].payload.before="0000000000000000000000000000000000000000"
+          elif $scenario == "ordinary-absent" then []
+          elif $scenario == "ordinary-out-of-order" then [.[0] | .created_at=($now | fromdateiso8601 | .-1 | todateiso8601)] + .
+          else . end')
+      case "$scenario" in
+        ordinary-before|ordinary-out-of-order) expected=0; head_time=2999-01-01T00:00:00Z ;;
+        ordinary-running|ordinary-unknown)
+          history=$(jq -nc --argjson request "$REQUEST" --argjson running "$RUNNING" --arg scenario "$scenario" \
+            '$request + (if $scenario == "ordinary-unknown" then $running | .[0].body |= sub("Running";"Unrecognized") else $running end)') ;;
+      esac
+      ;;
     running|batch-running) history="$RUNNING"; expected=5 ;;
     requested) history="$REQUEST"; expected=5 ;;
     before-force|after-force|running-after-force|malformed-transition)
@@ -558,6 +587,8 @@ for scenario in running requested completed stale-summary timed-out history-unre
   rc=0
   OUT=$(MOCK_HISTORY_UNREADABLE="$([ "$scenario" = history-unreadable ] && echo 1 || echo 0)" \
     MOCK_TIMELINE_UNREADABLE="$([ "$scenario" = timeline-unreadable ] && echo 1 || echo 0)" \
+    MOCK_EVENTS_UNREADABLE="$([ "$scenario" = ordinary-unavailable ] && echo 1 || echo 0)" \
+    MOCK_EVENTS_JSON="$events" \
     MOCK_TIMELINE_JSON="$timeline" MOCK_HEAD_TIME="$head_time" \
     MOCK_HEAD_MOVED="$([ "$scenario" = head-moved ] && echo 1 || echo 0)" \
     MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \

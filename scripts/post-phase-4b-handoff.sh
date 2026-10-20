@@ -173,7 +173,9 @@ fetch_history_array() {
 # request or cap reset; an unanswered expired request permits timeout fallback.
 ensure_codex_idle() {
   local repo="$1" num="$2" head="$3" policy_json="$4"
+  local source_repo="${5:-}" source_id="${6:-0}" head_ref="${7:-}"
   local bot author timeout comments reviews inline summary trigger response timeline transition floor since enabled failure
+  local events push_transition
   bot=$(jq -er '.codex.bot_login // "chatgpt-codex-connector[bot]" | select(type == "string" and length > 0)' <<<"$policy_json") || exit 3
   author=$(crqe_policy_author "$policy_json") || exit 3
   timeout=$(jq -er '.codex.review_timeout_seconds // 1800 | select(type == "number" and . > 0 and floor == .)' <<<"$policy_json") || exit 3
@@ -191,9 +193,22 @@ ensure_codex_idle() {
   if [[ "$enabled" != false ]]; then
     timeline=$(fetch_history_array "repos/$repo/issues/$num/timeline") || exit 3
     transition=$(crqe_latest_head_transition "$timeline") || exit 3
+    # Events may arrive late or be absent from the bounded feed. Only a
+    # positive, exact source/head match can narrow the existing wait window;
+    # unavailable evidence retains the force-push/timeout behavior.
+    if [[ "$source_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ \
+       && "$source_id" =~ ^[1-9][0-9]*$ && -n "$head_ref" ]]; then
+      if events=$(fetch_history_array "repos/$source_repo/events?per_page=100" 2>/dev/null) \
+         && push_transition=$(crqe_latest_matching_head_push "$events" "$source_repo" "$source_id" \
+              "$head_ref" "$head" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null); then
+        [[ "$push_transition" < "$transition" ]] || transition="$push_transition"
+      else
+        echo "post-phase-4b-handoff.sh: ordinary-push evidence unavailable; retaining the existing request window" >&2
+      fi
+    fi
     floor=$(($(date +%s) - timeout))
     since=$(date -u -r "$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$floor" +%Y-%m-%dT%H:%M:%SZ) || exit 3
-    # Only GitHub's transition can exclude a request on a prior forced head.
+    # Only GitHub's bound transition can exclude a prior-head request.
     # Commit dates may be old or future; neither proves when this head arrived.
     [[ "$since" > "$transition" ]] || since="$transition"
     trigger=$(crqe_select_trigger "$comments" "$author" "$since") || exit 3
@@ -334,7 +349,9 @@ fetch_pr_metadata() {
     exit 3
   fi
 
-  ensure_codex_idle "$repo" "$num" "$head_sha" "$policy_json"
+  ensure_codex_idle "$repo" "$num" "$head_sha" "$policy_json" \
+    "$(jq -r '.head.repo.full_name // ""' <<<"$json")" \
+    "$(jq -r '.head.repo.id // 0' <<<"$json")" "$head_ref"
   unresolved=$(awk -F '\t' -v repo="$repo" -v num="$num" '$1 == repo && $2 == num {print $3; exit}' <<<"$ACCOUNTING_TSV")
   [[ "$unresolved" =~ ^[0-9]+$ ]] || exit 3
   live_head=$(gh api "repos/$repo/pulls/$num" --jq .head.sha) || exit 3
