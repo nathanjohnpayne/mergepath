@@ -163,6 +163,10 @@ cd "$ROOT"
 if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
   records=$(cat)
   common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+  # Capture the owning repository first, then detach hook-local index/worktree
+  # overrides before creating or inspecting any snapshot.
+  # shellcheck disable=SC2046
+  unset $(git rev-parse --local-env-vars) 2>/dev/null || true
   primary_root=$(dirname "$common_dir")
   snapshots="$(dirname "$primary_root")/.$(basename "$primary_root")-worktrees"
   mkdir -p "$snapshots"

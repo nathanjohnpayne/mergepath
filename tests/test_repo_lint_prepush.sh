@@ -598,6 +598,11 @@ rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/other 2>&1) |
 check "push of a non-HEAD tip: checks exact committed tree" "$rc" "0"
 check "non-HEAD remote receives pushed tip" "$(remote_tip feat/other)" "$(git -C "$FIX" rev-parse feat/pass)"
 check "original checkout HEAD retained" "$(git -C "$FIX" symbolic-ref --short HEAD)" "main"
+index_before=$(git hash-object "$FIX/.git/index")
+rc=0; out=$(cd "$FIX" && GIT_DIR="$FIX/.git" GIT_WORK_TREE="$FIX" GIT_INDEX_FILE="$FIX/.git/index" git push origin feat/pass:refs/heads/feat/hook-env 2>&1) || rc=$?
+check "explicit hook-local git environment: exact non-HEAD tip passes" "$rc" "0"
+check "hook-local index remains unchanged" "$(git hash-object "$FIX/.git/index")" "$index_before"
+check "hook-local environment remote receives exact tip" "$(remote_tip feat/hook-env)" "$(git -C "$FIX" rev-parse feat/pass)"
 
 # A deleted tracked requirement, recreated only as an untracked local file,
 # must fail exactly as CI does. The old checkout-based runner passes this.
