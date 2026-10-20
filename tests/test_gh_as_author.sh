@@ -411,12 +411,25 @@ if [ "${1:-}" = "pr" ] && { [ "${2:-}" = "create" ] || [ "${2:-}" = "new" ]; }; 
   echo "${GH_CREATE_PR_URL:-https://github.com/example/repo/pull/42}"
   exit "${GH_CREATE_PR_RC:-0}"
 fi
+# `gh [global flags] pr create` is the same write with a repository flag before
+# the verb (#2562); real gh prints the created URL for it too.
+if [ "${1:-}" != "pr" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "pr" ] && { [ "$a" = "create" ] || [ "$a" = "new" ]; }; then
+      echo "${GH_CREATE_PR_URL:-https://github.com/example/repo/pull/42}"
+      exit "${GH_CREATE_PR_RC:-0}"
+    fi
+    prev=$a
+  done
+fi
 
-# The duplicate-link check (#2562) lists open PRs: `gh pr list` without a
-# repository, `gh api --paginate --slurp repos/<repo>/pulls` with one.
-if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
-  [ -z "${GH_PR_LIST_RC:-}" ] || exit "$GH_PR_LIST_RC"
-  printf '%s\n' "${GH_PR_LIST_JSON:-[]}"
+# The duplicate-link check (#2562) resolves the repository with `gh repo view`
+# when the command names none, then reads `gh api --paginate --slurp
+# repos/<repo>/pulls` (slurped pages: an array of arrays).
+if [ "${1:-}" = "repo" ] && [ "${2:-}" = "view" ]; then
+  [ -z "${GH_REPO_VIEW_RC:-}" ] || exit "$GH_REPO_VIEW_RC"
+  printf '%s\n' "${GH_REPO_VIEW:-example/repo}"
   exit 0
 fi
 if [ "${1:-}" = "api" ] && [ "${2:-}" = "--paginate" ]; then
@@ -543,37 +556,80 @@ dup_case() {
     pass "duplicate link: $name"
   fi
 }
-GH_PR_LIST_JSON='[{"number":40,"body":"Authoring-Agent: claude\n\nCloses #12\n"},{"number":41,"body":"Refs #120"}]' \
+PULLS_40_CLOSES='[[{"number":40,"body":"Authoring-Agent: claude\n\nCloses #12\n"},{"number":41,"body":"Refs #120"}]]'
+GH_API_PULLS_JSON="$PULLS_40_CLOSES" \
   dup_case "an open PR closing the same issue refuses the create" 7 no "$DUP_BODY"
 echo "$DUP_ERR" | grep -q '#40 links #12' || fail "duplicate link: refusal does not name the other PR and the issue: $DUP_ERR"
-GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+# Without a repository flag the check resolves the checkout's repository and
+# reads the same paginated endpoint; a capped `gh pr list` is never used.
+grep -q $'gh\trepo\tview\t--json\tnameWithOwner' "$WORKDIR/calls.log" \
+  || fail "duplicate link: implicit form did not resolve the repository with gh repo view: $(cat "$WORKDIR/calls.log")"
+grep -q $'gh\tapi\t--paginate\t--slurp\trepos/example/repo/pulls?state=open&per_page=100' "$WORKDIR/calls.log" \
+  || fail "duplicate link: implicit form did not read the paginated pulls endpoint: $(cat "$WORKDIR/calls.log")"
+grep -q $'gh\tpr\tlist' "$WORKDIR/calls.log" && fail "duplicate link: a capped gh pr list was used"
+GH_API_PULLS_JSON="$PULLS_40_CLOSES" GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
   dup_case "naming that PR in the override lets the create run" 0 yes "$DUP_BODY"
-GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=41 \
+GH_API_PULLS_JSON="$PULLS_40_CLOSES" GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=41 \
   dup_case "an override naming another PR still refuses" 7 no "$DUP_BODY"
-GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"},{"number":43,"body":"Refs #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40,43 \
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12"}],[{"number":243,"body":"Refs #12"}]]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+  dup_case "a linking PR on a later page is seen and still refuses" 7 no "$DUP_BODY"
+echo "$DUP_ERR" | grep -q '#243 links #12' || fail "duplicate link: refusal does not name the later-page PR: $DUP_ERR"
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12"},{"number":43,"body":"Refs #12"}]]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40,43 \
   dup_case "an override naming every linking PR lets the create run" 0 yes "$DUP_BODY"
-GH_PR_LIST_JSON='[{"number":40,"body":"Part one.\r\n  refs #12\r\n"}]' \
+GH_API_PULLS_JSON='[[{"number":40,"body":"Part one.\r\n  refs #12\r\n"}]]' \
   dup_case "a Refs link on the other PR counts, case and CRLF included" 7 no "$DUP_BODY"
-GH_PR_LIST_JSON='[{"number":40,"body":"see #12 for context; fixes #120 too"}]' \
+GH_API_PULLS_JSON='[[{"number":40,"body":"see #12 for context; fixes #120 too"}]]' \
   dup_case "a prose mention or another number is not a link" 0 yes "$DUP_BODY"
-GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' \
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12"}]]' \
   dup_case "a cross-repository link in the new body is not checked" 0 yes \
   $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n\nCloses other/repo#12\n'
-GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' \
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12"}]]' \
   dup_case "a Refs link in the new body is checked like Closes" 7 no \
   $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n\nRefs #12\n'
-GH_PR_LIST_RC=1 dup_case "an unreadable open-PR list refuses rather than passes" 1 no "$DUP_BODY"
+GH_API_PULLS_RC=1 dup_case "an unreadable open-PR list refuses rather than passes" 1 no "$DUP_BODY"
 echo "$DUP_ERR" | grep -q 'could not list open pull requests' || fail "duplicate link: unreadable-list refusal lacks its diagnostic: $DUP_ERR"
-GH_PR_LIST_RC=1 dup_case "a body with no link never reads the list" 0 yes \
+GH_REPO_VIEW_RC=1 dup_case "a repository that cannot be resolved refuses rather than passes" 1 no "$DUP_BODY"
+GH_REPO_VIEW=not-a-slug dup_case "a resolved name that is not OWNER/REPO refuses" 1 no "$DUP_BODY"
+GH_API_PULLS_RC=1 GH_REPO_VIEW_RC=1 dup_case "a body with no link never reads the list" 0 yes \
   $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n'
-grep -q $'gh\tpr\tlist' "$WORKDIR/calls.log" && fail "duplicate link: an unlinked body listed open PRs"
+grep -q $'gh\tapi\t--paginate' "$WORKDIR/calls.log" && fail "duplicate link: an unlinked body listed open PRs"
+grep -q $'gh\trepo\tview' "$WORKDIR/calls.log" && fail "duplicate link: an unlinked body resolved the repository"
 GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
   dup_case "with --repo the check reads the REST pulls list" 7 no "$DUP_BODY" --repo example/repo
 grep -q $'gh\tapi\t--paginate\t--slurp\trepos/example/repo/pulls?state=open&per_page=100' "$WORKDIR/calls.log" \
   || fail "duplicate link: --repo form did not read repos/example/repo/pulls: $(cat "$WORKDIR/calls.log")"
+grep -q $'gh\trepo\tview' "$WORKDIR/calls.log" && fail "duplicate link: --repo form resolved the repository it was given"
 GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
   dup_case "with --repo=OWNER/REPO the override is honored" 0 yes "$DUP_BODY" --repo=example/repo
 GH_API_PULLS_RC=1 dup_case "with --repo an unreadable REST list refuses" 1 no "$DUP_BODY" --repo example/repo
+# gh accepts the repository flag before the verb (`gh --repo o/r pr create`);
+# the check must read that repository, not the checkout's (Codex on #2576).
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
+  dup_case "a --repo given before the verb is read by the check" 7 no "$DUP_BODY" --repo other/repo
+reset_log
+set +e
+OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_VIEW_AUTHOR="nathanjohnpayne" GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
+  run_wrapper -- gh --repo other/repo pr create --title "t" --body "$DUP_BODY" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 7 ]; then
+  fail "duplicate link: global --repo before the verb: rc=$rc expected 7"
+elif ! grep -q $'repos/other/repo/pulls?state=open&per_page=100' "$WORKDIR/calls.log"; then
+  fail "duplicate link: global --repo before the verb did not read repos/other/repo/pulls: $(cat "$WORKDIR/calls.log")"
+else
+  pass "duplicate link: a global --repo before the verb names the repository the check reads"
+fi
+reset_log
+set +e
+OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_VIEW_AUTHOR="nathanjohnpayne" GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+  run_wrapper -- gh -Rother/repo pr create --title "t" --body "$DUP_BODY" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ] || ! grep -q $'repos/other/repo/pulls?state=open&per_page=100' "$WORKDIR/calls.log"; then
+  fail "duplicate link: attached -R before the verb: rc=$rc; calls: $(cat "$WORKDIR/calls.log")"
+else
+  pass "duplicate link: an attached -R before the verb is read and the override honored"
+fi
 
 # Every prefix shape the pre-write guard delegates to this wrapper must still
 # enter the create-only validation path. Otherwise an invalid body reaches the

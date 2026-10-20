@@ -195,10 +195,24 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
     PR_BODY="${PR_BODY%x}"
   }
 
+  PR_CREATE_REPO=""
+  PRE_VERB_REPO_PENDING=0
   while [ "$#" -gt 0 ]; do
     argument="$1"
     shift
     if [ "$COMMAND_INDEX" -le "$PR_CREATE_VERB_INDEX" ]; then
+      # gh accepts the repository flag before the verb too (`gh --repo o/r pr
+      # create`); the duplicate-link check must see it wherever it sits.
+      if [ "$PRE_VERB_REPO_PENDING" -eq 1 ]; then
+        PR_CREATE_REPO="$argument"
+        PRE_VERB_REPO_PENDING=0
+      else
+        case "$argument" in
+          -R|--repo) PRE_VERB_REPO_PENDING=1 ;;
+          --repo=*) PR_CREATE_REPO="${argument#--repo=}" ;;
+          -R?*) PR_CREATE_REPO="${argument#-R}"; PR_CREATE_REPO="${PR_CREATE_REPO#=}" ;;
+        esac
+      fi
       NORMALIZED_COMMAND+=("$argument")
       COMMAND_INDEX=$((COMMAND_INDEX + 1))
       continue
@@ -294,18 +308,22 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   # pr_create_duplicate_links <body> <repo-or-empty>: prints one
   # "#<other> links #<n>" line per open pull request that links an issue the
   # body links; prints nothing when none does; returns 2 when the list is
-  # unreadable. The read uses the verified author token, and the REST form
-  # when the command names its repository (the cloud surface requires that).
+  # unreadable. The read uses the verified author token through one fully
+  # paginated REST path: the repository the command names, or, when it names
+  # none, the one `gh repo view` resolves for the checkout (the cloud surface
+  # requires the flag, so it never reaches the resolution). A capped list such
+  # as `gh pr list --limit N` would hide every pull request past the cap.
   pr_create_duplicate_links() {
-    local links open n
+    local links open n repo
     links="$(pr_body_issue_links "$1")"
     [ -n "$links" ] || return 0
-    if [ -n "$2" ]; then
-      open="$(GH_TOKEN="$TOKEN" gh api --paginate --slurp "repos/$2/pulls?state=open&per_page=100" 2>/dev/null)" || return 2
-      open="$(printf '%s' "$open" | jq -c 'add // [] | map({number, body})' 2>/dev/null)" || return 2
-    else
-      open="$(GH_TOKEN="$TOKEN" gh pr list --state open --limit 200 --json number,body 2>/dev/null)" || return 2
+    repo="$2"
+    if [ -z "$repo" ]; then
+      repo="$(GH_TOKEN="$TOKEN" gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || return 2
+      case "$repo" in */*) ;; *) return 2 ;; esac
     fi
+    open="$(GH_TOKEN="$TOKEN" gh api --paginate --slurp "repos/$repo/pulls?state=open&per_page=100" 2>/dev/null)" || return 2
+    open="$(printf '%s' "$open" | jq -c 'add // [] | map({number, body})' 2>/dev/null)" || return 2
     printf '%s' "$open" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
     while read -r n; do
       [ -n "$n" ] || continue
