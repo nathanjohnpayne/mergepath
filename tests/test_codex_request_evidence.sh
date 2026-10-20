@@ -149,8 +149,16 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
     fi
   fi
   if [ "$name" = requested ]; then
-    grep -Eq 'age=[0-9]+s; configured ack_wait_seconds=30; review_timeout_seconds=840' "$DIR/out"
-    grep -q 'not immutable SHA attribution' "$DIR/out"
+    if ! grep -Eq 'age=[0-9]+s; configured ack_wait_seconds=30; review_timeout_seconds=840' "$DIR/out"; then
+      echo 'FAIL requested case missing age/ack-wait/timeout diagnostic:'
+      cat "$DIR/out"
+      exit 1
+    fi
+    if ! grep -q 'not immutable SHA attribution' "$DIR/out"; then
+      echo 'FAIL requested case missing immutable-SHA attribution diagnostic:'
+      cat "$DIR/out"
+      exit 1
+    fi
   fi
   case "$name" in
     completed-*)
@@ -229,7 +237,12 @@ CARRY_FIXTURE='{"carried":true,"source_time":"2026-09-14T00:00:00Z","source_comm
   MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1 \
   bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || { cat "$DIR/out"; exit 1; }
 if grep -q 'request evidence' "$DIR/out"; then echo 'FAIL: diagnostic on success'; exit 1; fi
-[ "$(grep -c '/issues/comments/' "$DIR/calls" || true)" = 0 ]
+carry_forward_api_calls=$(grep -c '/issues/comments/' "$DIR/calls" || true)
+if [ "$carry_forward_api_calls" != 0 ]; then
+  echo "FAIL carry-forward expected zero issue-comment API calls, got $carry_forward_api_calls:"
+  cat "$DIR/calls"
+  exit 1
+fi
 
 # The count and authority fence share one exact-command generation selector.
 # It is ID-stable, case-insensitive for the complete command, de-duplicates a
