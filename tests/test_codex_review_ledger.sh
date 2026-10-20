@@ -593,6 +593,69 @@ stop_check "barrier: an owner marker on the PR clears it, and the result records
 stop_check "barrier: unreadable comments leave the stop standing" "$(barrier_stops FAIL)" \
   '.state == "stop" and .stops == ["untested-rebuttal"]'
 
+# A separate owner decision settles runaway without changing either budget.
+IN_RUN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+L_RUN=$(crl_ledger "$IN_RUN" | jq -c '.max_blocking_reviews = 10')
+ST_RUN=$(crl_human_stops "$L_RUN" "$HEAD_A" nathanjohnpayne 10 2)
+RUN_MARK="TIEBREAK_RUNAWAY_ACCEPTED=$PR_URL@$HEAD_A"
+RUN_C=$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$RUN_MARK" | arr)
+runaway_tb() {
+  crl_apply_owner_tiebreaks "$ST_RUN" "$L_RUN" \
+    "$(crl_owner_tiebreaks "$1" nathanjohnpayne "$PR_URL" "$HEAD_A")"
+}
+stop_check "runaway tiebreak: current owner decision clears only runaway and preserves counts" "$(runaway_tb "$RUN_C")" \
+  '.stops == [] and .blocking_reviews == 2 and .max_blocking_reviews == 10
+   and .request_ceiling == 2 and .counted_requests == 2 and .blocking_windows == 2
+   and .owner_tiebreaks == [{kind:"runaway",comment_id:20,at:"2026-09-25T03:00:00Z"}]'
+for _run_bad in \
+  "$(cm 20 nathanpayne-claude 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$RUN_MARK" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:01:00Z "$RUN_MARK" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T02:00:00Z 2026-09-25T02:00:00Z "$RUN_MARK" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T02:10:00Z 2026-09-25T02:10:00Z "$RUN_MARK" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "${RUN_MARK/$HEAD_A/$HEAD_B}" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "${RUN_MARK/pull\/1/pull\/2}" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "${RUN_MARK}#100" | arr)" \
+  "$(cm 20 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "> $RUN_MARK" | arr)" \
+  '[]' "$C"; do
+  stop_check "runaway tiebreak: foreign, edited, stale, mismatched or unrelated marker retains stop" "$(runaway_tb "$_run_bad")" \
+    '.stops == ["runaway"] and .owner_tiebreaks == []'
+done
+L_RUN_LATE=$(printf '%s' "$L_RUN" | jq -c '.responses[-1].last_at = "2026-09-25T03:30:00Z"')
+ST_RUN_LATE=$(crl_human_stops "$L_RUN_LATE" "$HEAD_A" nathanjohnpayne 10 2)
+stop_check "runaway tiebreak: later contributing evidence voids the prior owner decision" \
+  "$(crl_apply_owner_tiebreaks "$ST_RUN_LATE" "$L_RUN_LATE" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and .owner_tiebreaks == []'
+L_RUN_FRACTION=$(printf '%s' "$L_RUN" | jq -c '.responses[-1].last_at = "2026-09-25T03:00:00.5Z"')
+ST_RUN_FRACTION=$(crl_human_stops "$L_RUN_FRACTION" "$HEAD_A" nathanjohnpayne 10 2)
+stop_check "runaway tiebreak: a same-second owner timestamp cannot outrank fractional response evidence" \
+  "$(crl_apply_owner_tiebreaks "$ST_RUN_FRACTION" "$L_RUN_FRACTION" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and .owner_tiebreaks == []'
+RUN_NEXT=$(cm 21 nathanjohnpayne 2026-09-25T03:00:01Z 2026-09-25T03:00:01Z "$RUN_MARK" | arr)
+stop_check "runaway tiebreak: a next-second owner timestamp postdates fractional response evidence" \
+  "$(crl_apply_owner_tiebreaks "$ST_RUN_FRACTION" "$L_RUN_FRACTION" "$(crl_owner_tiebreaks "$RUN_NEXT" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == [] and .owner_tiebreaks[0].comment_id == 21'
+stop_check "runaway tiebreak: a malformed owner timestamp cannot settle the stop" \
+  "$(runaway_tb "$(cm 20 nathanjohnpayne not-a-time not-a-time "$RUN_MARK" | arr)")" \
+  '.stops == ["runaway"] and .owner_tiebreaks == []'
+L_BOTH=$(crl_ledger "$(printf '%s' "$IN_RUN" | jq -c --argjson rb "$RB" '.rebuttals = $rb')" | jq -c '.max_blocking_reviews = 10')
+ST_BOTH=$(crl_human_stops "$L_BOTH" "$HEAD_A" nathanjohnpayne 10 2)
+stop_check "runaway tiebreak: a separate disagreement remains blocking" \
+  "$(crl_apply_owner_tiebreaks "$ST_BOTH" "$L_BOTH" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["disagreement"] and (.disagreements | length) == 1'
+L_BUDGET=$(printf '%s' "$L_RUN" | jq -c '.max_blocking_reviews = 2')
+ST_BUDGET=$(crl_human_stops "$L_BUDGET" "$HEAD_A" nathanjohnpayne 2 2)
+stop_check "runaway tiebreak: blocking-budget remains blocking" \
+  "$(crl_apply_owner_tiebreaks "$ST_BUDGET" "$L_BUDGET" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["blocking-budget"] and .owner_tiebreaks == []'
+
+# The real barrier must read the owner decision for a runaway-only stop, and
+# retain that stop on read failure. Its normal downstream fences remain in use.
+printf '%s' "$L_RUN" | jq -c '.policy_fingerprint = "1-2"' >"$TB_DIR/ledger.json"
+stop_check "barrier: a current runaway owner marker clears the runaway-only stop" "$(barrier_stops "$RUN_C")" \
+  '.state == "clear" and .stops == [] and .owner_tiebreaks[0].kind == "runaway"'
+stop_check "barrier: unreadable runaway owner comments retain the stop" "$(barrier_stops FAIL)" \
+  '.state == "stop" and .stops == ["runaway"]'
+
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
 make_cli_case() {

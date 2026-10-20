@@ -40,8 +40,10 @@ class TriggerGuardTests(unittest.TestCase):
 
     def test_owner_tiebreak_marker_is_refused_for_every_role_and_channel(self):
         head = "a" * 40
-        marker = f"TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/7@{head}#4320643605"
-        for body in (marker, f"Owner says:\n```\n{marker.lower()}\n```", f"x {marker} y"):
+        markers = (f"TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/7@{head}#4320643605",
+                   f"TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/o/r/pull/7@{head}")
+        for body in (body for marker in markers
+                     for body in (marker, f"Owner says:\n```\n{marker.lower()}\n```", f"x {marker} y")):
             for role in ("reviewer", "author", "hook"):
                 for noun, verb in (("pr", "comment"), ("pr", "review"), ("issue", "comment")):
                     with self.subTest(body=body, role=role, channel=(noun, verb)), self.assertRaises(guard.Refused):
@@ -49,11 +51,27 @@ class TriggerGuardTests(unittest.TestCase):
 
     def test_owner_tiebreak_placeholders_and_prose_remain_allowed(self):
         for body in ("Post TIEBREAK_REBUTTAL_ACCEPTED=<PR-URL>@<full-head-sha>#<finding-id> to settle it.",
+                     "Post TIEBREAK_RUNAWAY_ACCEPTED=<PR-URL>@<full-head-sha> to authorize external review.",
                      "The TIEBREAK_REBUTTAL_ACCEPTED marker names a finding.",
                      "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/7@abc#12"):
             with self.subTest(body=body):
                 args, meta = self.check(["pr", "comment", "7", "--body", body])
                 self.assertTrue(meta["guarded"])
+
+    def test_owner_runaway_marker_file_rest_and_graphql_sources(self):
+        marker = "TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/o/r/pull/7@" + "a" * 40
+        body = self.root / "owner.md"
+        body.write_text(marker)
+        payload = self.root / "owner.json"
+        payload.write_text(json.dumps({"body": marker}))
+        query = 'mutation Post($text: String!) { addComment(input: {subjectId: "P", body: $text}) { clientMutationId } }'
+        forms = (["pr", "comment", "7", "--body-file", str(body)],
+                 ["api", "repos/o/r/issues/7/comments", "--input", str(payload)],
+                 ["api", "graphql", "-f", "query=" + query, "-f", "text=" + marker])
+        for role in ("author", "reviewer", "hook"):
+            for args in forms:
+                with self.subTest(role=role, args=args), self.assertRaises(guard.Refused):
+                    self.check(args, role=role)
 
     def test_files_and_json_sources(self):
         body = self.root / "comment.md"
