@@ -4398,7 +4398,7 @@ PY878
         ;;
       advisory-null)
         [ -s "$dir/state/tier-read-failures" ] || bad="$bad advisory-never-injected"
-        jq -e '.status == "findings" and .blocking_tier_unresolved == null' "$dir/out.json" >/dev/null \
+        jq -e '.status == "findings" and .blocking_tier_unresolved == null and .discretionary_tier_unresolved == null' "$dir/out.json" >/dev/null \
           || bad="$bad advisory-not-null"
         ;;
       *)
@@ -4420,6 +4420,61 @@ PY878
   fi
 }
 
+test_1673_discretionary_counts() {
+  local dir route rc expected bad=""
+  for route in hub absent all timeout resolver-failure; do
+    dir=$(make_case "1673-$route" 0 false 0 0)
+    # Retain the existing exact-head findings run and summary, changing only
+    # its inline evidence to the hub acceptance fixture: one P1, two P2s.
+    python3 - "$dir/bin/gh" <<'PY1673'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+marker = '  repos/owner/repo/pulls/999/comments)\n'
+s = s.replace(marker, marker + '''    if [ "$scenario" = badge_only_inline_finding ]; then
+      jq -nc --arg bot "$bot" --arg time "$head_time" '
+        ["_🟠 Major_ required", "_🟡 Minor_ discretionary", "_🟡 Minor_ also discretionary"]
+        | to_entries | map({id: (.key + 9712), user: {login: $bot},
+          created_at: $time, updated_at: $time, commit_id: "head-sha",
+          pull_request_review_id: 9711, in_reply_to_id: null, body: .value})'
+      exit 0
+    fi
+''', 1)
+p.write_text(s)
+PY1673
+    case "$route" in
+      hub|timeout|resolver-failure) printf '\nfeedback_policy:\n  mode: by-priority\n  priorities:\n    p0: required\n    p1: required\n    p2: discretionary\n    p3: discretionary\n    nitpick: discretionary\n' >>"$dir/.github/review-policy.yml" ;;
+      all) printf '\nfeedback_policy:\n  mode: address-all\n' >>"$dir/.github/review-policy.yml" ;;
+    esac
+    if [ "$route" = resolver-failure ]; then
+      # A failure introduced only by the new policy read must not erase the
+      # historical numeric blocking count or change the terminal exit.
+      printf '\nresolve_tiers_by_disposition() { return 2; }\n' >>"$dir/scripts/lib/feedback-policy-helpers.sh"
+    fi
+    if [ "$route" = timeout ]; then
+      rc=$(run_case "$dir" no_comment)
+      expected=4
+    else
+      rc=$(run_case "$dir" badge_only_inline_finding)
+      expected=2
+    fi
+    [ "$rc" = "$expected" ] || bad="$bad $route-rc=$rc"
+    case "$route" in
+      hub) jq -e '.status == "findings" and .potential_issue_count == 1 and .blocking_tier_unresolved == 1 and .discretionary_tier_unresolved == 2' "$dir/out.json" >/dev/null || bad="$bad hub-counts" ;;
+      all) jq -e '.status == "findings" and .blocking_tier_unresolved == 3 and .discretionary_tier_unresolved == 0' "$dir/out.json" >/dev/null || bad="$bad all-counts" ;;
+      resolver-failure) jq -e '.status == "findings" and .potential_issue_count == 1 and .blocking_tier_unresolved == 1 and .discretionary_tier_unresolved == null' "$dir/out.json" >/dev/null || bad="$bad resolver-failure-preservation" ;;
+      *) jq -e 'has("discretionary_tier_unresolved") and .blocking_tier_unresolved == null and .discretionary_tier_unresolved == null' "$dir/out.json" >/dev/null || bad="$bad $route-null" ;;
+    esac
+  done
+  if [ -z "$bad" ]; then
+    pass "#1673: real waiter reports independent hub/address-all counts and absent-policy/timeout nulls without exit changes"
+  else
+    fail "#1673 disposition counts:$bad"
+  fi
+}
+
+test_1673_discretionary_counts
 if test_878_nested_tier_errors; then
   pass "#878: nested marker predicates preserve extraction errors separately from absence and API failure"
 else

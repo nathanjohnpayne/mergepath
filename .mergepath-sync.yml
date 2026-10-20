@@ -1571,6 +1571,7 @@ paths:
     requires:
       - "scripts/codex-review-request.sh"   # #1550, asserts fetch_scan_array and scan_codex_state statuses
       - "scripts/lib/gh-retry-helpers.sh"   # #1550, sourced for the transient-read classifier cases
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1673, production disposition setup in finding fixtures
   # Write-token / keyring-fallback regression (#737): the `@codex review`
   # trigger must resolve a token from the gh keyring when the op-preflight
   # cache has lapsed, and fail loud (never silently no-op) when it cannot.

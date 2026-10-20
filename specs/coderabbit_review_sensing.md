@@ -8,6 +8,12 @@ The required publisher and legacy sweep open an owned generation before evaluati
 
 ## Acceptance criteria
 
+### Advisory disposition counts (#1673)
+
+Polling and probe result JSON includes `discretionary_tier_unresolved` beside the existing `blocking_tier_unresolved`. Both count the same unaddressed inline HEAD findings from one candidate snapshot, using the existing CodeRabbit tier classifier. The blocking count retains `resolve_required_tiers`; the discretionary count independently uses `resolve_tiers_by_disposition discretionary`, excluding ignored and unmarked tiers rather than complementing the required set. With the hub policy, one Major and two Minor findings report blocking `1` and discretionary `2`. Address-all reports discretionary `0`.
+
+Both counts remain `null` without a feedback-policy block, on terminals other than `findings`/`cleared`, and when the advisory candidate read, shape validation or tier classification fails. An unavailable discretionary-policy read also leaves its count unknown. Counts are report-only: no terminal exit, clearance, request authority or provider budget changes. `tests/test_coderabbit_wait_status_probe.sh` exercises the real waiter for the hub counts, absent-policy and non-findings nulls, and classifier-failure nulls.
+
 ### Outside-diff section headings (#1407)
 
 The shared tier extractor treats exact bold or HTML `summary` lines headed `Outside diff range comments (N)` as structure, optionally carrying `⚠️`, blockquote presentation and a trailing opening `blockquote` on an HTML summary. It excludes the heading's warning and category markers while retaining every nested finding's own severity. Unknown counts, changed wording and extra finding text on the same line retain classification. This bounded line exclusion applies equally to whole-body extraction and the severity gate's numbered-line scan; it changes neither run selection nor original bodies, acknowledgement fingerprints or reported line numbers. The helper, production severity-gate and complete-history accounting suites cover Minor containers, required Major controls and unrecognized heading shapes.
