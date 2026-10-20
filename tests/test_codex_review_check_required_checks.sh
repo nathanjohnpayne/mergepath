@@ -140,7 +140,7 @@ fi
 # $ROLLUP_JSON -- decoupling the two consumers entirely rather than trying
 # to special-case the wiping branch.
 if grep -q 'ANNEX_SCAN_ROLLUP_JSON="\$ROLLUP_JSON"' "$SCRIPT" \
-   && grep -q 'ANNEX_WORKFLOW_MATCHES=\$(echo "\$ANNEX_SCAN_ROLLUP_JSON"' "$SCRIPT"; then
+   && grep -q 'ANNEX_WORKFLOW_SUITE_MATCHES=\$(echo "\$ANNEX_SCAN_ROLLUP_JSON"' "$SCRIPT"; then
   pass "codex-review-check.sh freezes a pristine rollup copy for the workflow-wide scan, immune to later required-checks-driven wiping (#655 round 7)"
 else
   fail "codex-review-check.sh's workflow-wide scan is not decoupled from ROLLUP_JSON wiping (#655 round 7)"
@@ -999,36 +999,60 @@ bad_checks() {
 }
 
 # Workflow-wide bad-conclusion scan (#655 round 5), replacing MISSING-
-# injection. Round 13 added two refinements, both mirrored here: (a)
-# matching switched from the freely-editable .workflowName display string
-# to the stable, file-derived .workflowPath (Finding 5 -- closes a
-# collision when two workflow files declare the same top-level `name:`),
-# and (b) matches are grouped by check name with a pending-preferred /
-# latest-completed winner picked per name before judging bad-ness (Finding
-# 3 -- so a stale failed rerun superseded by a later success no longer
-# blocks forever). KEEP IN SYNC with scripts/codex-review-check.sh's
-# ANNEX_WORKFLOW_MATCHES / ANNEX_WORKFLOW_BAD computation.
+# injection. Round 13 added two refinements: (a) matching switched from the
+# freely-editable .workflowName display string to the stable, file-derived
+# .workflowPath (Finding 5 -- closes a collision when two workflow files
+# declare the same top-level `name:`), and (b) matches are grouped by check
+# name with a pending-preferred / latest-completed winner picked per name
+# before judging bad-ness (Finding 3 -- so a stale failed rerun superseded by
+# a later success no longer blocks forever). #2563 added a third: only
+# job-native entries (lineage != "api") count as the annex's own.
+#
+# The three jq programs are EXTRACTED from scripts/codex-review-check.sh and
+# executed, not copied: a copy kept "in sync" by hand can pass while the
+# shipped scan is broken (the #1193 class), and the #2563 lineage filter lives
+# in the shipped program alone. Exact-line anchors, as the #1193 block below
+# uses: a `{` in an ERE is an interval expression whose escaping is not
+# portable across BSD awk and gawk. Projected-shape fixtures below therefore
+# carry the `lineage` the real projection would have derived from externalId.
+ANNEX_JQ_DIR=$(mktemp -d)
+cat > "$ANNEX_JQ_DIR/suite.awk" <<'AWK'
+BEGIN { start = "  ANNEX_WORKFLOW_SUITE_MATCHES=$(echo \"$ANNEX_SCAN_ROLLUP_JSON\" | jq --arg workflow_path \"repo_lint_local.yml\" '"; stop = "  ')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+cat > "$ANNEX_JQ_DIR/jobs.awk" <<'AWK'
+BEGIN { start = "  ANNEX_WORKFLOW_MATCHES=$(echo \"$ANNEX_WORKFLOW_SUITE_MATCHES\" | jq '"; stop = "  ')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+cat > "$ANNEX_JQ_DIR/bad.awk" <<'AWK'
+BEGIN { start = "    ANNEX_WORKFLOW_BAD=$(echo \"$ANNEX_WORKFLOW_MATCHES\" | jq '"; stop = "    ')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+awk -f "$ANNEX_JQ_DIR/suite.awk" "$SCRIPT" > "$ANNEX_JQ_DIR/suite.jq"
+awk -f "$ANNEX_JQ_DIR/jobs.awk"  "$SCRIPT" > "$ANNEX_JQ_DIR/jobs.jq"
+awk -f "$ANNEX_JQ_DIR/bad.awk"   "$SCRIPT" > "$ANNEX_JQ_DIR/bad.jq"
+ANNEX_EXTRACTION_OK=1
+if [ ! -s "$ANNEX_JQ_DIR/suite.jq" ] || [ ! -s "$ANNEX_JQ_DIR/jobs.jq" ] || [ ! -s "$ANNEX_JQ_DIR/bad.jq" ]; then
+  ANNEX_EXTRACTION_OK=0
+  fail "#2563: could not extract the annex workflow-wide scan (suite match / job filter / bad-conclusion winners) from $SCRIPT: the anchor lines moved, so the annex assertions below test nothing"
+elif ! printf '{"statusCheckRollup":[]}' | jq --arg workflow_path x -f "$ANNEX_JQ_DIR/suite.jq" >/dev/null 2>&1 \
+  || ! printf '[]' | jq -f "$ANNEX_JQ_DIR/jobs.jq" >/dev/null 2>&1 \
+  || ! printf '[]' | jq -f "$ANNEX_JQ_DIR/bad.jq" >/dev/null 2>&1; then
+  ANNEX_EXTRACTION_OK=0
+  fail "#2563: an extracted annex scan program does not compile as jq: extraction captured the wrong span"
+else
+  pass "#2563: the annex workflow-wide scan's three jq programs are extracted from the real script and compile"
+fi
+# rollup_json workflow_path -> the entries the scan admits as the annex's own
+annex_workflow_matches() {
+  printf '%s' "$1" | jq -c --arg workflow_path "$2" -f "$ANNEX_JQ_DIR/suite.jq" | jq -c -f "$ANNEX_JQ_DIR/jobs.jq"
+}
+# rollup_json workflow_path -> the non-passing winners among those entries
 annex_workflow_bad() {
-  local rollup_json=$1 workflow_path=$2
-  printf '%s' "$rollup_json" | jq --arg workflow_path "$workflow_path" '
-    [.statusCheckRollup[] | select((.workflowPath // "") == $workflow_path)]
-    | group_by(.name // .context // "?")
-    | [
-        .[]
-        | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
-        | if ($pending | length) > 0
-          then $pending[0]
-          else (sort_by(.completedAt // .startedAt // "") | last)
-          end
-      ] as $winners
-    | [$winners[]
-        | {
-            label: (.name // .context // "?"),
-            workflow: (.workflowName // ""),
-            result: (.conclusion // .state // "")
-          }
-        | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-      ]'
+  annex_workflow_matches "$1" "$2" | jq -c -f "$ANNEX_JQ_DIR/bad.jq"
 }
 
 # ── 3. Inline logic: the workflow-wide bad-conclusion scan (#655 round 5),
@@ -1037,7 +1061,7 @@ annex_workflow_bad() {
 #      leg/never-reported/skipped) keep exercising the same conceptual
 #      points -- workflow-scoped matching, immune to check-name collision
 #      -- through the new mechanism.
-ROLLUP_ANNEX_REPORTED_GOOD='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","workflowPath":"repo_lint_local.yml","conclusion":"SUCCESS"}]}'
+ROLLUP_ANNEX_REPORTED_GOOD='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","lineage":"native","workflowPath":"repo_lint_local.yml","conclusion":"SUCCESS"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_ANNEX_REPORTED_GOOD" "repo_lint_local.yml")
 if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
   pass "workflow-wide scan: a green annex report -> no bad entries"
@@ -1045,7 +1069,7 @@ else
   fail "workflow-wide scan (green): expected 0 bad entries, got $GOT"
 fi
 
-ROLLUP_ANNEX_REPORTED_BAD='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","workflowPath":"repo_lint_local.yml","conclusion":"FAILURE"}]}'
+ROLLUP_ANNEX_REPORTED_BAD='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","lineage":"native","workflowPath":"repo_lint_local.yml","conclusion":"FAILURE"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_ANNEX_REPORTED_BAD" "repo_lint_local.yml" | jq -c '[.[].label]')
 if [ "$GOT" = '["repo-lint-local"]' ]; then
   pass "workflow-wide scan: a red annex report blocks (round 1 scenario, now via workflow scan too)"
@@ -1057,7 +1081,7 @@ fi
 # requirement (matrix jobs are excluded from ANNEX_CHECKS_JSON), but its
 # REPORTED failure still carries the annex's own workflow identity, so the
 # workflow-wide scan catches it regardless.
-ROLLUP_MATRIX_LEG_FAILED='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"checks (18)","workflowName":"consumer-annex","workflowPath":"consumer-annex.yml","conclusion":"SUCCESS"},{"name":"checks (20)","workflowName":"consumer-annex","workflowPath":"consumer-annex.yml","conclusion":"FAILURE"}]}'
+ROLLUP_MATRIX_LEG_FAILED='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"checks (18)","workflowName":"consumer-annex","lineage":"native","workflowPath":"consumer-annex.yml","conclusion":"SUCCESS"},{"name":"checks (20)","workflowName":"consumer-annex","lineage":"native","workflowPath":"consumer-annex.yml","conclusion":"FAILURE"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_MATRIX_LEG_FAILED" "consumer-annex.yml" | jq -c '[.[].label]')
 if [ "$GOT" = '["checks (20)"]' ]; then
   pass "workflow-wide scan: a reported matrix-leg failure is caught by workflow identity, without needing its expanded name (#655 round 5 P2)"
@@ -1095,7 +1119,7 @@ else
 fi
 
 # Skipped/neutral reports still pass, consistent with everywhere else.
-ROLLUP_ANNEX_SKIPPED='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","workflowPath":"repo_lint_local.yml","conclusion":"SKIPPED"}]}'
+ROLLUP_ANNEX_SKIPPED='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","lineage":"native","workflowPath":"repo_lint_local.yml","conclusion":"SKIPPED"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_ANNEX_SKIPPED" "repo_lint_local.yml")
 if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
   pass "workflow-wide scan: a SKIPPED annex report does not block, consistent with SUCCESS/SKIPPED/NEUTRAL elsewhere"
@@ -1107,7 +1131,7 @@ fi
 # rerun"): a stale FAILURE for a check name, superseded by a LATER
 # completed SUCCESS of the SAME name, must not block forever -- only the
 # latest-completed entry per name is judged.
-ROLLUP_STALE_RERUN='{"statusCheckRollup":[{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-01T01:05:00Z"}]}'
+ROLLUP_STALE_RERUN='{"statusCheckRollup":[{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-01T01:05:00Z"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_STALE_RERUN" "repo_lint_local.yml")
 if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
   pass "workflow-wide scan: a stale FAILURE superseded by a later SUCCESS of the same name is not blocking (#655 round 13, Finding 3)"
@@ -1116,7 +1140,7 @@ else
 fi
 # The reverse must still block: a stale SUCCESS followed by a LATER
 # FAILURE of the same name is genuinely currently broken.
-ROLLUP_NEWLY_BROKEN='{"statusCheckRollup":[{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T01:05:00Z"}]}'
+ROLLUP_NEWLY_BROKEN='{"statusCheckRollup":[{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T01:05:00Z"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_NEWLY_BROKEN" "repo_lint_local.yml" | jq -c '[.[].result]')
 if [ "$GOT" = '["FAILURE"]' ]; then
   pass "workflow-wide scan: a stale SUCCESS followed by a later FAILURE of the same name still blocks (#655 round 13, Finding 3 sanity)"
@@ -1127,7 +1151,7 @@ fi
 # COMPLETED failure of the same name -- the winner is the pending entry,
 # not the stale completed one, so gate (a) correctly waits rather than
 # either wrongly clearing or wrongly reporting the OLD conclusion.
-ROLLUP_PENDING_RERUN='{"statusCheckRollup":[{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","workflowPath":"repo_lint_local.yml","status":"IN_PROGRESS","conclusion":null}]}'
+ROLLUP_PENDING_RERUN='{"statusCheckRollup":[{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-01T00:05:00Z"},{"name":"lint-python","lineage":"native","workflowPath":"repo_lint_local.yml","status":"IN_PROGRESS","conclusion":null}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_PENDING_RERUN" "repo_lint_local.yml" | jq -c '[.[].result]')
 if [ "$GOT" = '[""]' ]; then
   pass "workflow-wide scan: a still-in-progress rerun outranks an older completed failure of the same name (#655 round 13, Finding 3)"
@@ -1151,7 +1175,7 @@ fi
 # workflowPath instead of workflowName must not be confused by the
 # collision -- only the entry whose workflowPath actually matches the
 # target is caught, regardless of a shared workflowName.
-ROLLUP_WORKFLOWNAME_COLLISION='{"statusCheckRollup":[{"name":"build","workflowName":"CI","workflowPath":"repo_lint_local.yml","conclusion":"FAILURE"},{"name":"deploy","workflowName":"CI","workflowPath":"some-other-ci.yml","conclusion":"FAILURE"}]}'
+ROLLUP_WORKFLOWNAME_COLLISION='{"statusCheckRollup":[{"name":"build","workflowName":"CI","lineage":"native","workflowPath":"repo_lint_local.yml","conclusion":"FAILURE"},{"name":"deploy","workflowName":"CI","lineage":"native","workflowPath":"some-other-ci.yml","conclusion":"FAILURE"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_WORKFLOWNAME_COLLISION" "repo_lint_local.yml" | jq -c '[.[].label]')
 if [ "$GOT" = '["build"]' ]; then
   pass "workflow-wide scan: matches by workflowPath even when workflowName collides across two different workflow files (#655 round 13, Finding 5)"
@@ -1171,11 +1195,12 @@ fi
 # eventually report), zero matches means "not scheduled yet", not "may
 # never run" -- a synthetic PENDING entry is unioned in instead of
 # silently passing. KEEP IN SYNC with scripts/codex-review-check.sh's
-# ANNEX_WORKFLOW_MATCHES / unfiltered-zero-match branch.
+# unfiltered-zero-match branch (the match count itself comes from the
+# extracted programs above; only the PENDING synthesis is mirrored here).
 annex_workflow_bad_or_pending() {
   local rollup_json=$1 workflow_path=$2 unfiltered=$3
   local match_count
-  match_count=$(printf '%s' "$rollup_json" | jq --arg workflow_path "$workflow_path" '[.statusCheckRollup[] | select((.workflowPath // "") == $workflow_path)] | length')
+  match_count=$(annex_workflow_matches "$rollup_json" "$workflow_path" | jq 'length')
   if [ "$match_count" -eq 0 ] && [ "$unfiltered" = "true" ]; then
     jq -n --arg workflow_path "$workflow_path" '[{label: "(not yet reported)", workflow: $workflow_path, result: "PENDING"}]'
   else
@@ -1269,7 +1294,7 @@ fi
 # filter at all -- but the ANNEX's own "test" job is STILL correctly
 # caught if red, via the workflow-wide scan matching by workflow identity
 # (immune to the name collision the unrelated check shares).
-ROLLUP_NAME_COLLISION='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"test","workflowName":"Consumer Annex","workflowPath":"consumer-annex.yml","conclusion":"FAILURE"},{"name":"test","workflowName":"Some Unrelated Optional Workflow","workflowPath":"some-unrelated-optional-workflow.yml","conclusion":"FAILURE"}]}'
+ROLLUP_NAME_COLLISION='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"test","workflowName":"Consumer Annex","lineage":"native","workflowPath":"consumer-annex.yml","conclusion":"FAILURE"},{"name":"test","workflowName":"Some Unrelated Optional Workflow","lineage":"native","workflowPath":"some-unrelated-optional-workflow.yml","conclusion":"FAILURE"}]}'
 GOT=$(bad_checks "$ROLLUP_NAME_COLLISION" "$BRANCH_PROTECTION_NAMES" | jq -c '[.[].workflow]')
 if [ "$GOT" = '[]' ]; then
   pass "end-to-end (Finding 2): the name-scoped filter alone does not see EITHER same-named 'test' check, since neither is in required_names post-round-10"
@@ -2239,6 +2264,119 @@ EOF2
     fail "#1215: a check-run publisher emits a context missing from LINEAGE_SPLIT_CONTEXTS_JSON ($G1215_UNLISTED) — that context would keep the pre-fix single winner while its publisher goes unguarded"
   fi
 fi
+
+# ── #2563: the annex workflow-wide scan admits only the annex's own JOB runs.
+#
+# A check run POSTed through the Checks API with the Actions token coalesces
+# into whichever Actions suite was created first on the head (#1215). On
+# nathanjohnpayne/fiveacross#1953, head ab17bfa2, 2026-10-20, that suite was
+# the repo-lint-local push run, so the Codex P1 gate's in-flight lease (check
+# run "Codex P1 unresolved threads", conclusion null, titled "Codex feedback
+# gate (leased re-evaluation)") carried workflowPath repo_lint_local.yml and
+# gate (a) failed with "repo-lint-local/Codex P1 unresolved threads=" on a
+# head where the annex itself was green. The fixtures enter as raw GraphQL
+# union nodes, pass through the script's own projection (where `lineage` is
+# derived from externalId) and then through the extracted annex scan, so a
+# drift in either half fails here rather than in a copy.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ] && [ "$ANNEX_EXTRACTION_OK" -eq 1 ]; then
+  G2563_SUITE='"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":39480653125,"workflow":{"name":"repo-lint-local","resourcePath":"/o/r/actions/workflows/repo_lint_local.yml"}}}'
+  # The annex's own job: Actions stamps a UUID externalId on it.
+  G2563_ANNEX_OK='{"__typename":"CheckRun","databaseId":118828000001,"name":"repo-lint-local","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T19:05:00Z","completedAt":"2026-10-20T19:09:00Z","externalId":"7a3f9c2e-4b1d-4e8a-9c6f-2d5e8b1a0c4f","isRequired":false,'"$G2563_SUITE"'}'
+  G2563_ANNEX_BAD='{"__typename":"CheckRun","databaseId":118828000002,"name":"repo-lint-local","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-20T19:05:00Z","completedAt":"2026-10-20T19:09:00Z","externalId":"7a3f9c2e-4b1d-4e8a-9c6f-2d5e8b1a0c4f","isRequired":false,'"$G2563_SUITE"'}'
+  # The Codex P1 gate's leases: Checks-API POSTs with an empty externalId,
+  # filed by GitHub into the annex run's suite. One in flight, one completed.
+  G2563_LEASE_LIVE='{"__typename":"CheckRun","databaseId":118834614032,"name":"Codex P1 unresolved threads","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-10-20T19:20:09Z","completedAt":null,"externalId":"","isRequired":true,'"$G2563_SUITE"'}'
+  G2563_LEASE_DONE='{"__typename":"CheckRun","databaseId":118832817469,"name":"Codex P1 unresolved threads","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T19:16:00Z","completedAt":"2026-10-20T19:16:31Z","externalId":"","isRequired":true,'"$G2563_SUITE"'}'
+
+  # nodes_json -> projected rollup, exactly as the script builds it
+  g2563_rollup() { printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq"; }
+
+  G2563_FIVEACROSS=$(g2563_rollup "[$G2563_ANNEX_OK,$G2563_LEASE_LIVE,$G2563_LEASE_DONE]")
+  GOT=$(annex_workflow_bad "$G2563_FIVEACROSS" "repo_lint_local.yml" | jq -c '[.[].label]')
+  if [ "$GOT" = '[]' ]; then
+    pass "#2563: an in-flight Codex P1 lease filed under the annex suite is not read as a non-passing annex check (the fiveacross#1953 false red)"
+  else
+    fail "#2563: the annex scan still judges Checks-API runs filed under its suite, got $GOT"
+  fi
+  GOT=$(annex_workflow_matches "$G2563_FIVEACROSS" "repo_lint_local.yml" | jq -c '[.[] | "\(.name):\(.lineage)"]')
+  if [ "$GOT" = '["repo-lint-local:native"]' ]; then
+    pass "#2563: the scan admits exactly the annex's job-native run and nothing else from its suite"
+  else
+    fail "#2563: expected only the native annex run to be admitted, got $GOT"
+  fi
+
+  # The filter must not go blind: the annex's own red job still blocks, and
+  # it is the job that gets named, not the lease beside it.
+  GOT=$(annex_workflow_bad "$(g2563_rollup "[$G2563_ANNEX_BAD,$G2563_LEASE_LIVE]")" "repo_lint_local.yml" | jq -c '[.[] | "\(.workflow)/\(.label)=\(.result)"]')
+  if [ "$GOT" = '["repo-lint-local/repo-lint-local=FAILURE"]' ]; then
+    pass "#2563: a red annex job is still caught, and it is the job that is named, not the lease beside it"
+  else
+    fail "#2563: expected only the annex job failure, got $GOT"
+  fi
+
+  # A suite holding only API-POSTed runs has no annex report in it: zero
+  # matches, so the unfiltered branch holds PENDING on the annex instead of
+  # judging a foreign run under the annex's name.
+  GOT=$(annex_workflow_bad_or_pending "$(g2563_rollup "[$G2563_LEASE_LIVE]")" "repo_lint_local.yml" "true" | jq -c '[.[] | "\(.label)=\(.result)"]')
+  if [ "$GOT" = '["(not yet reported)=PENDING"]' ]; then
+    pass "#2563: a lease-only annex suite reads as the annex not having reported, so an unfiltered annex is held, not judged on the lease"
+  else
+    fail "#2563: expected the not-yet-reported PENDING hold for a lease-only suite, got $GOT"
+  fi
+
+  # Revert net. Strip the lineage filter from the extracted job program and
+  # rerun the fiveacross rollup: the lease must come back, proving the fixture
+  # discriminates and the filter is what removes it. If the strip changes
+  # nothing, the filter's text moved and this guard is inert.
+  sed 's/| select((\.lineage \/\/ "") != "api")//' "$ANNEX_JQ_DIR/jobs.jq" > "$ANNEX_JQ_DIR/jobs-reverted.jq"
+  if cmp -s "$ANNEX_JQ_DIR/jobs.jq" "$ANNEX_JQ_DIR/jobs-reverted.jq"; then
+    fail "#2563: the lineage filter text was not found in the extracted job program, so the revert net is inert"
+  else
+    GOT=$(printf '%s' "$G2563_FIVEACROSS" | jq -c --arg workflow_path repo_lint_local.yml -f "$ANNEX_JQ_DIR/suite.jq" | jq -c -f "$ANNEX_JQ_DIR/jobs-reverted.jq" | jq -c -f "$ANNEX_JQ_DIR/bad.jq" | jq -c '[.[].label]')
+    if [ "$GOT" = '["Codex P1 unresolved threads"]' ]; then
+      pass "#2563: with the lineage filter stripped the lease is judged again, so the fixture would catch a revert"
+    else
+      fail "#2563: the reverted program did not reproduce the lease false red (expected [\"Codex P1 unresolved threads\"]), got $GOT: the fixture does not discriminate"
+    fi
+  fi
+  if grep -qF 'select((.lineage // "") != "api")' "$ANNEX_JQ_DIR/jobs.jq" && ! grep -qF '== "native"' "$ANNEX_JQ_DIR/jobs.jq"; then
+    pass "#2563: the job filter excludes lineage \"api\" rather than requiring \"native\", so an unclassified entry degrades to the pre-#2563 scan, not to a blind one"
+  else
+    fail "#2563: the job filter is not the fail-closed != \"api\" form"
+  fi
+else
+  echo "SKIP: #2563 annex lineage fixtures (extraction failed above)"; SKIP=$((SKIP + 1))
+fi
+
+# ── #2563: the FAIL line counts what it lists.
+#
+# BAD_CHECKS keeps one winner per surface and, for the guarded contexts, per
+# lineage, so a required context red on both its job-native and Checks-API
+# lineages stands there twice and prints as one line. The count used to be
+# taken from the entries ("3 non-passing check(s)") over a list of two.
+cat > "$ANNEX_JQ_DIR/summary.awk" <<'AWK'
+BEGIN { start = "BAD_SUMMARY_LINES=$(echo \"$BAD_CHECKS\" | jq -c '"; stop = "')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+awk -f "$ANNEX_JQ_DIR/summary.awk" "$SCRIPT" > "$ANNEX_JQ_DIR/summary.jq"
+if [ ! -s "$ANNEX_JQ_DIR/summary.jq" ] || ! printf '[]' | jq -f "$ANNEX_JQ_DIR/summary.jq" >/dev/null 2>&1; then
+  fail "#2563: could not extract a compiling BAD_SUMMARY_LINES program from $SCRIPT (anchor moved?)"
+else
+  G2563_TWO_LINEAGES='[{"label":"Codex P1 unresolved threads","workflow":"Codex P1 Gate","result":"FAILURE","kind":"CheckRun","lineage":"native"},{"label":"Codex P1 unresolved threads","workflow":"Codex P1 Gate","result":"FAILURE","kind":"CheckRun","lineage":"api"},{"label":"lint","workflow":"repo-lint","result":"FAILURE","kind":"StatusContext","lineage":""}]'
+  GOT=$(printf '%s' "$G2563_TWO_LINEAGES" | jq -c -f "$ANNEX_JQ_DIR/summary.jq")
+  if [ "$GOT" = '["Codex P1 Gate/Codex P1 unresolved threads=FAILURE","repo-lint/lint (commit status)=FAILURE"]' ]; then
+    pass "#2563: two lineages of one red context print once, the #1193 commit-status annotation is kept, and that list is what gets counted"
+  else
+    fail "#2563: unexpected summary lines, got $GOT"
+  fi
+  if grep -qF "BAD_COUNT=\$(echo \"\$BAD_SUMMARY_LINES\" | jq 'length')" "$SCRIPT" && ! grep -qF "BAD_COUNT=\$(echo \"\$BAD_CHECKS\" | jq" "$SCRIPT"; then
+    pass "#2563: BAD_COUNT is the length of the deduplicated printed list, not of BAD_CHECKS"
+  else
+    fail "#2563: BAD_COUNT is not taken from BAD_SUMMARY_LINES, so the FAIL line can announce more checks than it lists"
+  fi
+fi
+rm -rf "$ANNEX_JQ_DIR"
 
 rm -rf "$G1193_DIR"
 trap - EXIT
