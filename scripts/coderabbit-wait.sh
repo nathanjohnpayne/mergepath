@@ -1403,7 +1403,7 @@ parse_rate_limit_window() {
 #   rate_limit | paused | in_progress | status_probe | review
 #
 # Pure: string predicates over the passed body, reading only the marker
-# constants above. No globals beyond those and no I/O — extracted by sentinel
+# constants above (including SUMMARY_MARKER). No other globals or I/O — extracted by sentinel
 # and sourced directly by tests/test_coderabbit_wait_status_probe.sh, the same
 # pattern as the coderabbit_summary_helpers block below.
 #
@@ -1469,7 +1469,12 @@ classify_comment() {
     echo "status_probe"
     return
   fi
-  if grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
+  # #1569: the persistent summary's walkthrough and release notes narrate the
+  # PR's own changes, so these phrases there are content, not live state.
+  # Use the same byte-zero marker prefix as the summary selector. Actual
+  # in-progress markers and narration retain their earlier precedence; unmarked
+  # standalone status notices retain this legacy fallback.
+  if [[ "$body" != "$SUMMARY_MARKER"* ]] && grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
     echo "in_progress"
     return
   fi

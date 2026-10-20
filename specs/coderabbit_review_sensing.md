@@ -59,6 +59,12 @@ A later trusted refusal on the same SHA supersedes an older or same-second clean
 
 Acceptance covers the no-artifact and refreshed-walkthrough reproductions, no-sleep/no-CodeRabbit-POST controls, failover opt-out/failure/idempotence, recovered and unreadable status, and preserved earlier verdicts.
 
+### Generated summary prose is not active-review evidence (#1569)
+
+`classify_comment` does not apply its legacy `review in progress`, `currently reviewing` or `commits? under review` prose fallback to a persistent summary whose body starts with `SUMMARY_MARKER`, matching the summary selector. Generated walkthrough and release-notes prose may describe those states as the subject of the PR. A real `IN_PROGRESS_MARKER` still classifies the summary as `in_progress`, even with a successful per-head status; rate-limit and pause precedence, narration classification and genuine unmarked status notices retain their existing order. Head anchoring, completed-summary evidence and trusted pending-status vetoes remain unchanged: excluding generated prose does not itself prove completion or create a review object.
+
+`tests/test_coderabbit_wait_status_probe.sh` covers each phrase alternative, real-marker and standalone controls, narration and rate/pause ordering, plus the real `--probe` path with exact-head success and a completed head-anchored summary without a review object. The existing #1005 200-KiB unmarked in-progress control remains active.
+
 ### Probe rc-7 evidence contract
 
 - rc 7 (PROBE_NO_REVIEW) is `--probe`-only: no terminal signal on this head; `probe.observed` names the surface the scan landed on (`none | rate_limit | paused | in_progress | summary-without-head-review | awaiting-summary`), and the JSON may still carry head-anchored evidence for the barrier to weigh. Polling mode never exits 7.

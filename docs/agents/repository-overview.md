@@ -1,6 +1,6 @@
 # Repository Overview
 
-Requester findings report an independent discretionary flag, and CodeRabbit results report discretionary counts alongside existing blocking counts. Both additions are advisory; the output contracts and native coverage are owned by `specs/codex_request_evidence.md`, `specs/coderabbit_review_sensing.md`, `tests/test_codex_review_request_verdict.sh` and `tests/test_coderabbit_wait_status_probe.sh` (#1673).
+Requester findings report an independent discretionary flag, and CodeRabbit results report discretionary counts alongside existing blocking counts. Both additions are advisory; the output contracts and native coverage are owned by `specs/codex_request_evidence.md`, `specs/coderabbit_review_sensing.md`, `tests/test_codex_review_request_verdict.sh` and `tests/test_coderabbit_wait_status_probe.sh` (#1673). CodeRabbit summary walkthrough and release-notes prose does not establish an active review; actual in-progress markers, standalone notices and existing completion/head checks retain their authority (`specs/coderabbit_review_sensing.md`, #1569).
 
 Targeted review-thread disposition confirms JSON mutation stdout independently of diagnostic stderr; successful warnings do not trigger duplicate marker retries. Failure detection and cleanup are specified in `specs/review_feedback_accounting.md` and exercised by `tests/test_resolve_pr_threads_rationale_tag.sh` (#2448).
 

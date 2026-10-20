@@ -850,6 +850,11 @@ _⚠️ Potential issue_ | _🟠 Major_ carried only by this summary." ;;
         # the retired grep could not see.
         printf '[{"id":8721,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n<details>\\n<summary>scripts/foo.sh (1)</summary>\\n\\n_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
+      probe_summary_release_notes)
+        # #1569: completed current-head summary, deliberately no review object.
+        jq -nc --arg bot "$bot" --arg at "$reply_time" --arg phrase "${CODERABBIT_TEST_SUMMARY_PHRASE:?}" \
+          '[{id:15691,user:{login:$bot},created_at:$at,updated_at:$at,body:("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\nNo actionable comments were generated in the recent review.\nReviewing files between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and head-sha.\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n## Summary by CodeRabbit\n- Fixes: " + $phrase + " on the current changes.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->")}]'
+        ;;
       probe_clean_incremental)
         # #851 fixtures: no review object (reviews endpoint falls to its []
         # default); the summarize comment is the only head evidence. Prior-head
@@ -2947,6 +2952,59 @@ Reviewing files that changed from the base of the PR and between $b40 and $h40."
   fi
 }
 
+test_1569_summary_prose_classifier_unit() {
+  local snip="$WORKDIR/1569-classifier.sh" phrase body bad=""
+  local source=${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}
+  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' "$source")"
+  awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' "$source" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+  for phrase in 'review in progress' 'currently reviewing' 'commits under review' 'commit under review'; do
+    body="$SUMMARY_MARKER
+## Walkthrough
+- Resumes when $phrase matches the current changes.
+<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+## Summary by CodeRabbit
+- Fixes: $phrase on the current changes."
+    [ "$(classify_comment "$body")" = review ] || bad="$bad summary:$phrase"
+    [ "$(classify_comment "$body
+<!-- This is an auto-generated comment: $IN_PROGRESS_MARKER -->")" = in_progress ] || bad="$bad active-marker:$phrase"
+    [ "$(classify_comment "$phrase on this pull request.")" = in_progress ] || bad="$bad standalone:$phrase"
+  done
+  [ "$(classify_comment "$SUMMARY_MARKER
+$RATE_LIMIT_MARKER
+$PAUSED_MARKER
+$IN_PROGRESS_MARKER")" = rate_limit ] || bad="$bad rate-limit-order"
+  [ "$(classify_comment "$SUMMARY_MARKER
+$PAUSED_MARKER
+$IN_PROGRESS_MARKER")" = paused ] || bad="$bad pause-order"
+  [ "$(classify_comment "$SUMMARY_MARKER
+Here's a summary of where things stand: currently reviewing.")" = status_probe ] || bad="$bad narration"
+  [ "$(classify_comment "Here's a summary of where things stand: review in progress.")" = status_probe ] || bad="$bad standalone-narration"
+  if [ -z "$bad" ]; then
+    pass "#1569: summary prose is content; active markers, standalone notices and narration retain precedence"
+  else
+    fail "#1569 classifier:$bad"
+  fi
+}
+
+test_1569_completed_summary_release_notes_probe() {
+  local phrase dir rc n=0
+  for phrase in 'review in progress' 'currently reviewing' 'commits under review'; do
+    n=$((n + 1))
+    dir=$(make_case "1569-summary-prose-$n" 0 false 0 0)
+    enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_SUMMARY_PHRASE="$phrase" CODERABBIT_TEST_STATUS=success \
+      CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' run_probe_case "$dir" probe_summary_release_notes)
+    if [ "$rc" = 0 ] && jq -e '.status == "reported" and .head_sha == "head-sha" and .probe.observed == "terminal" and .review.endpoint == "issues" and .review.id == 15691' "$dir/out.json" >/dev/null \
+      && [ "$(probe_count "$dir")" = 0 ]; then
+      pass "#1569: completed summary with '$phrase' release notes clears without a review object or POST"
+    else
+      fail "#1569 completed summary '$phrase': rc=$rc json=$(cat "$dir/out.json")"
+    fi
+  done
+}
+
 test_1005_classifier_pipe_buffer_unit() {
   # #1005. `classify_comment` is a pure classifier, so drive it directly from
   # the extracted sentinel block rather than through a stub-gh fixture: the
@@ -2967,7 +3025,7 @@ test_1005_classifier_pipe_buffer_unit() {
   # CodeRabbit reads as a completed clean report.
   local snip="$WORKDIR/comment-classifier.sh" mut="$WORKDIR/comment-classifier-piped.sh"
   local bad="" pad big_rl big_rl_prose big_paused big_prog big_probe big_prog_prose
-  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
@@ -4530,6 +4588,8 @@ test_851_summary_evidence_matrix
 test_851_review_object_premerge_shares_strip
 test_851_summary_helpers_unit
 test_968_summary_head_claim_unit
+test_1569_summary_prose_classifier_unit
+test_1569_completed_summary_release_notes_probe
 test_1005_classifier_pipe_buffer_unit
 test_1003_head_run_evidence_unit
 test_1031_rung_binds_to_the_graded_run
