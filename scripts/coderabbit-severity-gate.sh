@@ -102,8 +102,8 @@
 #       known blocking finding or a finding count. An event-driven caller treats
 #       the hold as non-green; the scheduled / issue_comment publisher must
 #       DECLINE TO PUBLISH rather than report success from an earlier result.
-#       The run object's own body is an acceptor, so a lagging walkthrough
-#       comment alone does not trigger the first case.
+#       The primary acceptor reads the summary from the run object's own body,
+#       so a lagging walkthrough comment alone does not trigger the first case.
 #
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API.
