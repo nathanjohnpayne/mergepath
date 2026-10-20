@@ -90,7 +90,7 @@ The Cockpit header shows nathanjohnpayne’s author GraphQL allowance first, obt
 
 The propagated publisher structural fence also prevents scheduled and manually dispatched runs of the native body/label gate. Its parsed-YAML contract is in `specs/required_check_publisher.md` and its mutation cases are in `tests/test_merge_clearance_gate.sh`.
 
-The required lint lane checks blocking-label parity between Label Gate and the shared shell predicate. Its literal-source contract and add/remove mutation coverage are documented in `specs/repo_lint_execution.md` and `tests/test_pr_review_policy_nudge.sh`.
+The required lint lane checks blocking-label parity between Label Gate and the shared shell predicate. The nudge's recovery guard also requires each producer's complete decoded condition to match its verified allowlist and refuses embedded newlines before matching; supported YAML scalar representations retain their decoded-expression behavior (#1258). The literal-source and recovery contracts, label mutations and condition regressions are documented in `specs/repo_lint_execution.md` and `tests/test_pr_review_policy_nudge.sh`.
 
 Phase 4b adapter availability uses the manual-handoff status independently of immutable-input integrity refusals. Missing reviewer CLI/schema and unavailable subscription auth use exit 4; missing jq remains an orchestrator prerequisite with exit 3; binding and live head/base refusals retain exit 3 and cannot enable wave fan-out. See [`specs/phase_4b_immutable_input.md`](../../specs/phase_4b_immutable_input.md).
 

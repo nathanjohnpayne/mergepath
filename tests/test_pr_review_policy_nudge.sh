@@ -671,10 +671,14 @@ printf '%s\n' "${STUB_WRAPPER_ROOT:?}"
 STUB
 chmod +x "$TMP/wrapper-bin/git"
 
-check_wrapper_condition() { # <condition> <expected status> <description>
-  local condition=$1 expected=$2 description=$3 rc=0
-  CONDITION="$condition" yq -i '.jobs.label-gate.if = strenv(CONDITION)' \
+check_wrapper_condition() { # <condition> <expected status> <description> [style] [job]
+  local condition=$1 expected=$2 description=$3 style=${4:-} job=${5:-label-gate} rc=0
+  CONDITION="$condition" CONDITION_JOB="$job" yq -i '.jobs[strenv(CONDITION_JOB)].if = strenv(CONDITION)' \
     "$WRAPPER_FIXTURE/.github/workflows/pr-review-policy.yml"
+  if [ -n "$style" ]; then
+    CONDITION_STYLE="$style" CONDITION_JOB="$job" yq -i '.jobs[strenv(CONDITION_JOB)].if style = strenv(CONDITION_STYLE)' \
+      "$WRAPPER_FIXTURE/.github/workflows/pr-review-policy.yml"
+  fi
   if [ "$condition" = false ]; then
     yq -i '.jobs.label-gate.if = false' "$WRAPPER_FIXTURE/.github/workflows/pr-review-policy.yml"
   fi
@@ -696,6 +700,22 @@ check_wrapper_condition "github.event.action == 'edited'" 0 \
   "the live wrapper preserves an explicitly supported edited condition"
 check_wrapper_condition "always()" 0 \
   "the live wrapper accepts a dependent job that always reports its result"
+
+# A newline in grep's pattern is an alternative, not part of one complete
+# expression (#1258). Exercise the real YAML reader and guard for every job.
+for job in self-review-check label-gate external-review-labeling; do
+  check_wrapper_condition $'github.event.action == \'edited\'\n&& false' 1 \
+    "the live wrapper rejects an allowed fragment followed by false for $job" literal "$job"
+  # Restore this producer so each following probe has one changed condition.
+  check_wrapper_condition "github.event.action == 'edited'" 0 \
+    "the live wrapper retains a complete allowed expression for $job" '' "$job"
+done
+check_wrapper_condition $'false &&\ngithub.event.action == \'edited\'' 1 \
+  "the live wrapper rejects false followed by an allowed fragment" literal
+for style in single double literal folded; do
+  check_wrapper_condition "github.event.action == 'edited'" 0 \
+    "the live wrapper accepts a complete allowed expression in $style YAML style" "$style"
+done
 
 # #1241: either direction of one-copy drift must fail the named live assertion.
 # Mutate inert source fixtures, restoring both copies before each probe.
