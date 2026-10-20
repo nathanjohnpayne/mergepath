@@ -146,7 +146,7 @@ set +e
 out="$(run STUB_LABEL_MISSING=1 STUB_LABEL_CREATE_FAIL=1 -- --blocked graphql --next x 2>"$WORKDIR/err")"; rc=$?
 set -e
 if [ "$rc" -eq 4 ] && ! grep -q $'POST\trepos/o/r/issues/12/comments' "$WORKDIR/gh.log" \
-   && printf '%s' "$out" | grep -q "## Needs a local agent" && grep -q "nothing was posted" "$WORKDIR/err"; then
+   && grep -q "## Needs a local agent" <<<"$out" && grep -q "nothing was posted" "$WORKDIR/err"; then
   pass "label cannot be created: exit 4, nothing posted (no duplicate on retry), body on stdout"
 else
   fail "label create failure: rc=$rc err=$(cat "$WORKDIR/err")"
@@ -181,9 +181,9 @@ out="$(run STUB_SURFACE=codex-cloud -- --blocked graphql --next x --print 2>/dev
 out2="$(run STUB_SURFACE=codex-cloud -- --blocked graphql --next x --session-url https://chatgpt.com/codex/tasks/task_e_1 --print 2>/dev/null)"; r2=$?
 run -- --blocked graphql --next x --session-url javascript:alert --print >/dev/null 2>&1; r3=$?
 set -e
-if [ "$r1" -eq 0 ] && printf '%s' "$out" | grep -q 'Session:\*\* `codex-cloud` session; no transcript URL was supplied (pass --session-url)' \
-   && ! printf '%s' "$out" | grep -qi 'not a cloud session' \
-   && [ "$r2" -eq 0 ] && printf '%s' "$out2" | grep -q 'Session:\*\* https://chatgpt.com/codex/tasks/task_e_1' \
+if [ "$r1" -eq 0 ] && grep -q 'Session:\*\* `codex-cloud` session; no transcript URL was supplied (pass --session-url)' <<<"$out" \
+   && ! grep -qi 'not a cloud session' <<<"$out" \
+   && [ "$r2" -eq 0 ] && grep -q 'Session:\*\* https://chatgpt.com/codex/tasks/task_e_1' <<<"$out2" \
    && [ "$r3" -eq 1 ]; then
   pass "a Codex task records its surface, takes --session-url, and refuses a non-https URL"
 else
@@ -224,7 +224,7 @@ fi
 set +e
 out="$(run STUB_POST_FAIL=1 -- --blocked author-writes --next x 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 4 ] && printf '%s' "$out" | grep -q "## Needs a local agent"; then
+if [ "$rc" -eq 4 ] && grep -q "## Needs a local agent" <<<"$out"; then
   pass "post failure: exit 4 with the rendered handback on stdout"
 else
   fail "post failure: rc=$rc out=$out"
@@ -245,7 +245,7 @@ fi
 set +e
 out="$(run -- --blocked cross-repo --next "scripts/sync-to-downstream.sh --apply" --print 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'blocked=cross-repo' && ! grep -q -- "-X"$'\t'"POST" "$WORKDIR/gh.log"; then
+if [ "$rc" -eq 0 ] && grep -q 'blocked=cross-repo' <<<"$out" && ! grep -q -- "-X"$'\t'"POST" "$WORKDIR/gh.log"; then
   pass "--print renders the handback and posts nothing"
 else
   fail "--print: rc=$rc"
@@ -297,9 +297,9 @@ if [ -r "$LANE" ] && yq --version 2>/dev/null | grep -q 'mikefarah/yq'; then
     fail "lane run-name drifted: $(yq -r '."run-name"' "$LANE")"
   fi
   run_step="$(yq -r '.jobs.resolve.steps[] | select(.name == "Resolve actioned threads") | .run' "$LANE")"
-  if printf '%s' "$run_step" | grep -q -- '--resolve-actioned' \
-     && ! printf '%s' "$run_step" | grep -q -- '--auto-resolve-bots' \
-     && ! printf '%s' "$run_step" | grep -q -- '--resolve-verified-propagation'; then
+  if grep -q -- '--resolve-actioned' <<<"$run_step" \
+     && ! grep -q -- '--auto-resolve-bots' <<<"$run_step" \
+     && ! grep -q -- '--resolve-verified-propagation' <<<"$run_step"; then
     pass "lane resolves only demonstrably-actioned threads; deferral stays a local decision"
   else
     fail "lane runs a resolve mode other than --resolve-actioned"
@@ -415,8 +415,8 @@ assert_invalid_dispatch() { # <label> <diagnostic needle> <drun arguments...>
   drun "$@" >/dev/null 2>"$DFIX/err"; rc=$?
   calls="$(cat "$DFIX/d.log")"
   error="$(cat "$DFIX/err")"
-  if [ "$rc" -eq 1 ] && printf '%s' "$error" | grep -q -e "$needle" \
-     && ! printf '%s' "$calls" | grep -q $'\t-X\tPOST'; then
+  if [ "$rc" -eq 1 ] && grep -q -e "$needle" <<<"$error" \
+     && ! grep -q $'\t-X\tPOST' <<<"$calls"; then
     pass "$label is rejected as a whole value before dispatch"
   else
     fail "$label: rc=$rc err=$error calls=$calls"
@@ -458,22 +458,22 @@ assert_invalid_dispatch "DISPATCH_LANE_POLL_INTERVAL with trailing newline" "DIS
 drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
 drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
 drun D_APPEAR_AT=1 D_RUN_HANGS=1 -- --watch-timeout 2 >/dev/null 2>/dev/null; r_hang=$?
-# Request time counts against the deadline: with 2s requests and a 3s
-# budget, sleep-only accounting would poll about four times (8s+).
-t0=$SECONDS
+# Request time counts against the watch deadline: 2s requests and a 3s
+# budget allow one or two requests; sleep-only accounting polls about four.
+# Count before drun resets the stub, excluding author-wrapper startup time.
 drun D_APPEAR_AT=1 D_RUN_HANGS=1 D_SLOW_REQUEST=2 -- --watch-timeout 3 >/dev/null 2>/dev/null; r_slow=$?
-t_slow=$(( SECONDS - t0 ))
+slow_watch_calls="$(cat "$DFIX/d.log.w" 2>/dev/null || echo 0)"
 out="$(drun D_APPEAR_AT=1 -- --no-wait 2>/dev/null)"; r_nowait=$?
 set -e
-if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] && [ "$r_slow" -eq 9 ] && [ "$t_slow" -le 6 ] \
-   && [ "$r_appear_zero" -eq 1 ] && printf '%s' "$appear_err" | grep -q -e '--appear-timeout' && ! printf '%s' "$appear_calls" | grep -q $'\t-X\tPOST' \
-   && [ "$r_watch_zero" -eq 1 ] && printf '%s' "$watch_err" | grep -q -e '--watch-timeout' && ! printf '%s' "$watch_calls" | grep -q $'\t-X\tPOST' \
-   && [ "$r_poll_text" -eq 1 ] && printf '%s' "$poll_text_err" | grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' && ! printf '%s' "$poll_text_calls" | grep -q $'\t-X\tPOST' \
-   && [ "$r_poll_zero" -eq 1 ] && printf '%s' "$poll_zero_err" | grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' && ! printf '%s' "$poll_zero_calls" | grep -q $'\t-X\tPOST' \
+if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] && [ "$r_slow" -eq 9 ] && [ "$slow_watch_calls" -ge 1 ] && [ "$slow_watch_calls" -le 2 ] \
+   && [ "$r_appear_zero" -eq 1 ] && grep -q -e '--appear-timeout' <<<"$appear_err" && ! grep -q $'\t-X\tPOST' <<<"$appear_calls" \
+   && [ "$r_watch_zero" -eq 1 ] && grep -q -e '--watch-timeout' <<<"$watch_err" && ! grep -q $'\t-X\tPOST' <<<"$watch_calls" \
+   && [ "$r_poll_text" -eq 1 ] && grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' <<<"$poll_text_err" && ! grep -q $'\t-X\tPOST' <<<"$poll_text_calls" \
+   && [ "$r_poll_zero" -eq 1 ] && grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' <<<"$poll_zero_err" && ! grep -q $'\t-X\tPOST' <<<"$poll_zero_calls" \
    && [ "$r_fail" -eq 8 ] && [ "$r_refused" -eq 4 ] && [ "$r_nowait" -eq 0 ] && [ "$out" = "222" ]; then
   pass "dispatch validates positive decimal timeouts and poll intervals before dispatch; own run never listed -> 6; run failed -> 8; never completes -> 9; dispatch refused -> 4; --no-wait prints the run id"
 else
-  fail "dispatch exits: invalid appear=$r_appear_zero watch=$r_watch_zero poll_text=$r_poll_text poll_zero=$r_poll_zero; none=$r_none hang=$r_hang slow=$r_slow/${t_slow}s fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
+  fail "dispatch exits: invalid appear=$r_appear_zero watch=$r_watch_zero poll_text=$r_poll_text poll_zero=$r_poll_zero; none=$r_none hang=$r_hang slow=$r_slow/${slow_watch_calls}requests fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
 fi
 
 # Nothing sent is not GitHub refusing: a missing author token is named as
