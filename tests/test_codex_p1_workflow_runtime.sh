@@ -1024,7 +1024,7 @@ for driver_state in missing nonexec; do
 done
 
 # The lease title names which question failed (#2536). The check keeps the
-# historical "Codex P1" name, but a feedback-accounting red is about any
+# historical "Codex P1" name, but a feedback-accounting red can be another
 # provider's undispositioned finding, so its title must not send the author
 # looking for a Codex P1 thread. Drive the shipped driver directly.
 for verdict in accounting legacy clear; do
@@ -1069,7 +1069,7 @@ SH
   ) >"$dir/out" 2>&1 || rc=$?
   title=$(cat "$dir/title.log" 2>/dev/null || true)
   case "$verdict" in
-    accounting) want_rc=1 want='Review feedback unaccounted (any provider, any tier): run scripts/review-feedback-accounting.sh <PR#>' ;;
+    accounting) want_rc=1 want='Review feedback unaccounted: run scripts/review-feedback-accounting.sh <PR#>' ;;
     legacy) want_rc=1 want='Codex blocking-tier review threads unresolved on the current head' ;;
     clear) want_rc=0 want='Codex feedback gate (leased re-evaluation)' ;;
   esac

@@ -37,7 +37,10 @@ def transport():
 
 # codex-p1-gate.sh's die() text for a feedback-accounting failure. The check
 # keeps its historical name, so the title must say which question failed: an
-# undispositioned finding from any provider, or a legacy Codex thread (#2536).
+# undispositioned finding in the accounting inventory, whichever provider
+# raised it, or a legacy Codex thread (#2536). The inventory's scope (the
+# recognized providers and non-ignored tiers) is the accounting spec's, so the
+# title does not restate it.
 ACCOUNTING_FAILURE = 'review feedback is unaccounted'
 
 
@@ -45,7 +48,7 @@ def verdict_title(gate_rc, gate_text):
     if gate_rc == 0:
         return 'Codex feedback gate (leased re-evaluation)'
     if ACCOUNTING_FAILURE in gate_text:
-        return ('Review feedback unaccounted (any provider, any tier): '
+        return ('Review feedback unaccounted: '
                 'run scripts/review-feedback-accounting.sh <PR#>')
     return 'Codex blocking-tier review threads unresolved on the current head'
 
