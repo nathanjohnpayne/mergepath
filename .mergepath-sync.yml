@@ -1122,10 +1122,14 @@ paths:
   # Parity suite: asserts every identity consumer reads through the shared
   # parser and that none reintroduces a first-raw-line matcher. The property is
   # AGREEMENT between consumers, which no single consumer's own suite can test.
+  - path: tests/test_pr_body_workflow_bounds.py
+    type: canonical
+    consumers: all
   - path: tests/test_pr_body_contract_parity.sh
     type: canonical
     consumers: all
     requires:
+      - "tests/test_pr_body_workflow_bounds.py"  # enclosing YAML floor fixtures (#1622)
       - "scripts/lib/gh-command-classifier.sh"  # sourced for wrapper-shape parity
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
