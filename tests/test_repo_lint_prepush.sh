@@ -22,6 +22,11 @@
 # runs only on opt-in, the concurrency cap and nice level hold, no GIT_*
 # variable leaks into a check, and the hub-only soft-passes.
 #
+# Part 3, one hook run per machine (#2581): a second push waits for the
+# running one and names it, the wait is bounded, a dead holder is reaped, a
+# killed run's snapshot is retired under the lock, and the default
+# concurrency follows the load average.
+#
 # Hermetic: fixtures under one mktemp dir, GIT_CONFIG_GLOBAL=/dev/null.
 
 set -euo pipefail
@@ -48,7 +53,8 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 # Every runner control, so a suite run from inside the hook (check_repo_lint_prepush
 # under MERGEPATH_PREPUSH_LIVE=all, say) does not leak its opt-ins into the fixtures.
 unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
-  MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS GITHUB_OUTPUT 2>/dev/null || true
+  MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
+  GITHUB_OUTPUT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -520,6 +526,9 @@ printf '#!/bin/sh\nexit 0\n' > "$TMP/python-ok"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/python-bad"
 chmod +x "$TMP/python-ok" "$TMP/python-bad"
 export MERGEPATH_PREPUSH_PYTHON="$TMP/python-ok"
+# The machine-wide hook lock lives under the cache directory (#2581): the
+# fixture pushes take their own, never the machine's.
+export XDG_CACHE_HOME="$TMP/xdg"
 
 export PROBE_DIR="$TMP/probe"
 reset_probe() { rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"; }
@@ -796,6 +805,170 @@ case "$out" in *"SKIP"*) ok "missing runner reports SKIP" ;; *) bad "missing run
 cp "$RUNNER" "$CONS/scripts/"
 rc=0; out=$(cd "$CONS" && printf '' | bash scripts/repo-lint-prepush.sh --paths-from - 2>&1) || rc=$?
 check "consumer without the scripts/ci kit: runner soft-passes" "$rc" "0"
+
+echo "Part 3: one hook run per machine, load-sized jobs, stale snapshots (#2581)"
+
+LOCK_DIR="$XDG_CACHE_HOME/mergepath"
+LOCK_FILE="$LOCK_DIR/prepush.lock"
+LOCK_HOLD="$LOCK_DIR/prepush.lock.d"
+lock_field() { { sed -n "s/^$1=//p" "$LOCK_FILE" 2>/dev/null || true; } | head -n 1; }
+peak_concurrency() { sort -n "$PROBE_DIR/concurrency" | tail -n 1; }
+# A helper process that is not a job of this shell, so killing it later
+# prints no termination notice. Prints its pid.
+detach() { ( "$@" >/dev/null 2>&1 & printf '%s\n' "$!" ); }
+slow_all() { for c in check_ok check_flag check_env; do touch "$PROBE_DIR/slow.$c"; done; }
+wait_for_lock_field() {  # $1 = field, $2 = glob it must match; up to 60 s
+  local i=0
+  while [ "$i" -lt 600 ]; do
+    # shellcheck disable=SC2254 # the caller passes a glob on purpose
+    case "$(lock_field "$1")" in $2) return 0 ;; esac
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
+# Every Part 2 push took and released the lock: a clean release leaves an
+# empty record and no token.
+check "a finished run leaves an empty lock record" "$(cat "$LOCK_FILE" 2>/dev/null)" ""
+if [ ! -d "$LOCK_HOLD" ]; then ok "a finished run leaves no lock token"; else bad "a lock token survived a finished run"; fi
+help_out=$(bash "$RUNNER" --help)
+for want in MERGEPATH_PREPUSH_LOCK_WAIT 'load average' 'take turns'; do
+  case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
+done
+
+# Contention. Three slow live checks at jobs=1 hold the lock for about twelve
+# seconds; a second push arriving meanwhile waits, names the holder, runs
+# only after it, and both pushes land.
+reset_probe; slow_all
+commit_change feat/lock-a README.md
+commit_change feat/lock-b README.md
+(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a.out" 2>&1 &
+A_PID=$!
+if wait_for_lock_field branch feat/lock-a; then ok "the running hook records its branch in the lock file"; else bad "the lock record never named feat/lock-a: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
+holder_pid=$(lock_field pid)
+case "$holder_pid" in ''|*[!0-9]*) bad "lock record pid: '$holder_pid'" ;; *) ok "the lock record carries the holder's pid" ;; esac
+case "$(lock_field started)" in [0-9][0-9]:[0-9][0-9]' UTC') ok "the lock record carries the start time" ;; *) bad "lock record start time: '$(lock_field started)'" ;; esac
+(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b) > "$TMP/lock-b.out" 2>&1 &
+B_PID=$!
+if wait_for_lock_field progress '[1-3] of 3'; then ok "the holder refreshes its progress per completed check"; else bad "the progress never advanced: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
+rc_a=0; wait "$A_PID" || rc_a=$?
+rc_b=0; wait "$B_PID" || rc_b=$?
+out=$(cat "$TMP/lock-b.out")
+check "the first push passes" "$rc_a" "0"
+check "a second push waits for the running hook, then succeeds" "$rc_b" "0"
+case "$out" in *"waiting for the run of feat/lock-a (pid $holder_pid, started "[0-9][0-9]:[0-9][0-9]" UTC, "*) ok "the waiter names the holder's branch, pid and start time" ;; *) bad "waiter output: $out" ;; esac
+case "$out" in *" UTC, "[0-9]*" of 3 checks)"*|*" UTC, preparing)"*) ok "the waiter reports the holder's progress" ;; *) bad "waiter progress: $out" ;; esac
+check "both tips reached the remote" "$(remote_tip feat/lock-a) $(remote_tip feat/lock-b)" "$(git -C "$FIX" rev-parse feat/lock-a) $(git -C "$FIX" rev-parse feat/lock-b)"
+check "the two runs' checks never overlapped" "$(peak_concurrency)" "1"
+check "the waiter's checks all ran after the holder's" "$(sed -n '1,3p' "$PROBE_DIR/start-order" | sort | tr '\n' ' ')" "check_env check_flag check_ok "
+
+# The wait is bounded: a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up
+# nonzero, says so, pushes nothing, and leaves the holder undisturbed.
+reset_probe; slow_all
+git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m hold
+git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m late
+(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a2.out" 2>&1 &
+A_PID=$!
+wait_for_lock_field branch feat/lock-a || bad "the second holder never recorded itself"
+before_b=$(remote_tip feat/lock-b)
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_WAIT=2 git push origin feat/lock-b 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up nonzero (exit $rc)"; else bad "the waiter did not give up"; fi
+case "$out" in *"gave up after "*" s waiting for the run of feat/lock-a (pid "*"MERGEPATH_PREPUSH_LOCK_WAIT"*) ok "the give-up message names the holder and the bound" ;; *) bad "give-up output: $out" ;; esac
+check "the push that gave up did not reach the remote" "$(remote_tip feat/lock-b)" "$before_b"
+rc_a=0; wait "$A_PID" || rc_a=$?
+check "the holder is undisturbed by a waiter that gave up" "$rc_a" "0"
+check "the undisturbed holder's tip reached the remote" "$(remote_tip feat/lock-a)" "$(git -C "$FIX" rev-parse feat/lock-a)"
+check "a waiter that gave up ran no check" "$(peak_concurrency)" "1"
+
+# A killed run leaves its record behind (and, where flock is absent, its
+# token). The next run reaps it by name and proceeds.
+dead_pid=$(bash -c 'echo $$')
+mkdir -p "$LOCK_HOLD"
+printf 'branch=feat/ghost\npid=%s\nstarted=00:00 UTC\nprogress=1 of 9\n' "$dead_pid" > "$LOCK_FILE"
+reset_probe
+commit_change feat/reap README.md
+rc=0; out=$(cd "$FIX" && git push origin feat/reap 2>&1) || rc=$?
+check "a dead holder's lock is reaped and the push proceeds" "$rc" "0"
+case "$out" in *"reaping the lock"*"pid $dead_pid (feat/ghost), which is no longer running"*) ok "the reaped holder is named" ;; *) bad "reap output: $out" ;; esac
+if command -v flock >/dev/null 2>&1; then
+  rm -rf "$LOCK_HOLD"   # unused where flock holds the lock
+else
+  if [ ! -d "$LOCK_HOLD" ]; then ok "the dead holder's token is removed"; else bad "the dead holder's token survived"; fi
+fi
+check "the reaped record is replaced, then released" "$(cat "$LOCK_FILE")" ""
+# A live process that is not a hook run (the kernel reused the pid) holds nothing either.
+SLEEPER=$(detach sleep 300)
+mkdir -p "$LOCK_HOLD"
+printf 'branch=feat/reused\npid=%s\nstarted=00:00 UTC\nprogress=preparing\n' "$SLEEPER" > "$LOCK_FILE"
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m reused
+rc=0; out=$(cd "$FIX" && git push origin feat/reap 2>&1) || rc=$?
+kill "$SLEEPER" 2>/dev/null || true
+check "a reused pid that is not a hook run does not hold the lock" "$rc" "0"
+case "$out" in *"reaping the lock"*"pid $SLEEPER (feat/reused), which is no longer running"*) ok "the reused pid is reaped by name" ;; *) bad "reused-pid output: $out" ;; esac
+rm -rf "$LOCK_HOLD"
+
+# Snapshot hygiene under the lock. The hook keeps its snapshots beside the
+# primary checkout, in a hidden folder named after it; a prepush-* worktree
+# nobody is working in is retired, one a (pre-lock) `--committed-snapshot`
+# run is working in is left alone, and a worktree that is not a snapshot is
+# never touched.
+SNAPS=$(cd "$TMP/.fix-worktrees" && pwd -P)
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-deadbeefcafe.stale" main
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-feedfacebeef.busy" main
+git -C "$FIX" worktree add -q -b other/session "$SNAPS/other-session" main
+# shellcheck disable=SC2016 # the $1 is the inner bash's, not ours
+BUSY_PID=$(detach bash -c 'cd "$1" && sleep 300; :' --committed-snapshot "$SNAPS/prepush-feedfacebeef.busy")
+sleep 1
+reset_probe
+commit_change feat/snapshots README.md
+rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
+pkill -P "$BUSY_PID" 2>/dev/null || true; kill "$BUSY_PID" 2>/dev/null || true
+check "a push with leftover snapshots around succeeds" "$rc" "0"
+case "$out" in *"retired stale snapshot "*"/prepush-deadbeefcafe.stale (left by an interrupted run)"*) ok "the stale snapshot is retired, with a message" ;; *) bad "retirement output: $out" ;; esac
+if [ ! -d "$SNAPS/prepush-deadbeefcafe.stale" ]; then ok "the stale snapshot directory is gone"; else bad "the stale snapshot directory remains"; fi
+case "$out" in *"leaving snapshot "*"/prepush-feedfacebeef.busy: a hook run is still working in it"*) ok "a snapshot a run is working in is left alone, with a message" ;; *) bad "busy snapshot output: $out" ;; esac
+if [ -d "$SNAPS/prepush-feedfacebeef.busy" ]; then ok "the busy snapshot directory survives"; else bad "the busy snapshot was removed"; fi
+if [ -d "$SNAPS/other-session" ]; then ok "another checkout beside the snapshots is untouched"; else bad "the other checkout was removed"; fi
+registered=$(git -C "$FIX" worktree list --porcelain | sed -n 's/^worktree //p')
+case "$registered" in *prepush-deadbeefcafe.stale*) bad "the stale snapshot is still registered" ;; *) ok "the stale snapshot is unregistered" ;; esac
+case "$registered" in *prepush-feedfacebeef.busy*) ok "the busy snapshot stays registered" ;; *) bad "the busy snapshot was unregistered" ;; esac
+case "$registered" in *other-session*) ok "the other checkout stays registered" ;; *) bad "the other checkout was unregistered" ;; esac
+git -C "$FIX" worktree remove --force "$SNAPS/prepush-feedfacebeef.busy" 2>/dev/null || true
+
+# The default parallelism follows the machine. A fake sysctl/nproc first on
+# PATH reports 4 CPUs and the load each push chooses; the running line
+# prints both.
+FAKEBIN="$TMP/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/sysctl" <<'SH'
+#!/bin/sh
+case "$2" in
+  hw.ncpu) echo 4 ;;
+  vm.loadavg) echo "{ ${FAKE_LOAD:-0.50} 0.00 0.00 }" ;;
+  *) exit 1 ;;
+esac
+SH
+printf '#!/bin/sh\necho 4\n' > "$FAKEBIN/nproc"
+chmod +x "$FAKEBIN/sysctl" "$FAKEBIN/nproc"
+reset_probe; slow_all
+commit_change feat/load README.md
+rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=0.50 git push origin feat/load 2>&1) || rc=$?
+check "quiet machine: push succeeds" "$rc" "0"
+case "$out" in *"(jobs=2, nice=10, load 0.50 on 4 CPUs)"*) ok "load below the CPU count defaults to jobs=2, and both are printed" ;; *) bad "quiet-machine running line: $out" ;; esac
+check "quiet machine: two checks run at once" "$(peak_concurrency)" "2"
+reset_probe; slow_all
+git -C "$FIX" commit -q --allow-empty -m loaded
+rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=4.00 git push origin feat/load 2>&1) || rc=$?
+check "loaded machine: push succeeds" "$rc" "0"
+case "$out" in *"(jobs=1, nice=10, load 4.00 on 4 CPUs)"*) ok "load at the CPU count defaults to jobs=1, and both are printed" ;; *) bad "loaded-machine running line: $out" ;; esac
+check "loaded machine: checks run one at a time" "$(peak_concurrency)" "1"
+reset_probe; slow_all
+git -C "$FIX" commit -q --allow-empty -m override
+rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=512.25 MERGEPATH_PREPUSH_JOBS=2 git push origin feat/load 2>&1) || rc=$?
+check "MERGEPATH_PREPUSH_JOBS overrides the load-derived default" "$rc" "0"
+case "$out" in *"(jobs=2, nice=10, load 512.25 on 4 CPUs)"*) ok "the override is printed beside the load" ;; *) bad "override running line: $out" ;; esac
+check "override: two checks run at once" "$(peak_concurrency)" "2"
 
 echo ""
 echo "test_repo_lint_prepush: $PASS passed, $FAIL failed"

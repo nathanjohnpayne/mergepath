@@ -55,7 +55,9 @@
 #   --plan          print the scope and the selected steps; run nothing
 #   --deep          also run the selected deep-lane steps
 #   --all-live      run CI's whole fast lane, unselected wrappers included
-#   --jobs N       concurrency cap (default MERGEPATH_PREPUSH_JOBS or 2)
+#   --jobs N        concurrency cap (default MERGEPATH_PREPUSH_JOBS, else 2
+#                   while the one-minute load average is below the CPU
+#                   count and 1 once it is not)
 #   --event NAME    classifier event (default pull_request; a push to the
 #                   remote default branch is classified as `push`, like CI)
 #   --head-ref REF  branch name handed to the classifier (mergepath-sync/*
@@ -64,14 +66,23 @@
 #   MERGEPATH_PREPUSH_SKIP=1    bypass entirely (as does git push --no-verify)
 #   MERGEPATH_PREPUSH_DEEP=1    run the selected deep-lane steps too
 #   MERGEPATH_PREPUSH_LIVE=all  run the unselected graph wrappers too
-#   MERGEPATH_PREPUSH_JOBS=N    concurrency cap, default 2
+#   MERGEPATH_PREPUSH_JOBS=N    concurrency cap; default 2 below one CPU's
+#                               worth of load per core, 1 at or above it
 #   MERGEPATH_PREPUSH_NICE=N    nice level for every check, default 10
 #   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
 #                               and markdown-it-py for the deep lane)
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
+#   MERGEPATH_PREPUSH_LOCK_WAIT=S  wait up to S seconds for another hook run
+#                               on this machine to finish (default 3600)
 # Hook checks run in tool-owned detached worktrees of each pushed tip, so
 # working-tree modifications and untracked files cannot affect their result.
 # Python package metadata must equal the committed workflow pins.
+# Hook runs on one machine take turns (#2581): a run holds an exclusive lock
+# under ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/ from before its first
+# snapshot until its last check, a second push waits for it, naming the
+# holder's branch, pid, start time and progress every 30 s, and gives up
+# after the bound above; a snapshot left by a killed run is retired under
+# that lock.
 # Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment
 # (including missing or mismatched CI packages).
 
@@ -112,6 +123,203 @@ if [ "${MERGEPATH_PREPUSH_SKIP:-0}" = "1" ]; then
   exit 0
 fi
 
+# ── one hook run per machine, parallelism sized to the load (#2581) ──
+# Six pre-push hooks running at once drove the host load average past 500
+# and stretched a 21-check run from 27 minutes to over an hour, so hook runs
+# on one machine take turns. The lock is an exclusive `flock` on
+# ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush.lock where that tool
+# exists (the kernel drops it with the holder); elsewhere an atomic `mkdir`
+# of prepush.lock.d stands in, and a token whose recorded holder pid is gone
+# is reaped. The lock file carries the holder's branch, pid, start time and
+# progress, refreshed per completed check, so a waiter's message is specific.
+# A waiter polls every second, speaks every 30 s and gives up after
+# MERGEPATH_PREPUSH_LOCK_WAIT seconds (default 3600) rather than run
+# concurrently. Manual runs (--paths-from, HEAD vs merge-base, --plan) do
+# not lock: only the hook runs checks on a shared machine unattended.
+LOCK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
+LOCK_FILE="$LOCK_DIR/prepush.lock"
+LOCK_HOLD="$LOCK_DIR/prepush.lock.d"
+LOCK_MODE=''      # flock | mkdir while this process holds the lock
+LOCK_RECORD=''    # the record this run refreshes: the holder's, or via --lock-record
+LOCK_START=''
+
+lock_field() {   # $1 field; empty when the record is absent (first run on a machine)
+  [ -f "$LOCK_FILE" ] || return 0
+  sed -n "/^$1=/{s/^$1=//p;q;}" "$LOCK_FILE" 2>/dev/null || true
+}
+
+# One write, in place: in flock mode the lock lives on this inode, so the
+# file is never replaced, only rewritten.
+lock_write_record() {   # $1 branch, $2 pid, $3 started, $4 progress
+  printf 'branch=%s\npid=%s\nstarted=%s\nprogress=%s\n' "$1" "$2" "$3" "$4" > "$LOCK_FILE" 2>/dev/null || true
+}
+
+# A recorded holder is alive when its pid exists and still runs this tool;
+# a pid the kernel reused for something else is as gone as a dead one.
+holder_alive() {   # $1 pid
+  local cmd
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  cmd=$(ps -o command= -p "$1" 2>/dev/null) || return 0
+  case "$cmd" in *repo-lint-prepush*) return 0 ;; *) return 1 ;; esac
+}
+
+holder_description() {   # "the run of <branch> (pid N, started HH:MM UTC, k of n checks)"
+  local branch pid started progress
+  branch=$(lock_field branch); pid=$(lock_field pid)
+  started=$(lock_field started); progress=$(lock_field progress)
+  case "$progress" in ''|preparing) progress=preparing ;; *) progress="$progress checks" ;; esac
+  printf 'the run of %s (pid %s, started %s, %s)' "${branch:-?}" "${pid:-?}" "${started:-?}" "$progress"
+}
+
+prepush_lock_acquire() {   # $1 = the pushed branch this run checks
+  local bound="${MERGEPATH_PREPUSH_LOCK_WAIT:-3600}" mode t0 now last pid unrecorded=0
+  case "$bound" in ''|*[!0-9]*) die "MERGEPATH_PREPUSH_LOCK_WAIT must be a whole number of seconds (got '$bound')" ;; esac
+  mkdir -p "$LOCK_DIR" 2>/dev/null || die "cannot create $LOCK_DIR for the machine-wide hook lock"
+  if command -v flock >/dev/null 2>&1; then
+    mode='flock'
+    exec 9>>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
+  else
+    mode='mkdir'
+  fi
+  t0=$(date +%s); last=$((t0 - 30))
+  while :; do
+    if [ "$mode" = flock ]; then
+      flock -n 9 && break
+    else
+      mkdir "$LOCK_HOLD" 2>/dev/null && break
+    fi
+    pid=$(lock_field pid)
+    if [ "$mode" = mkdir ]; then
+      if [ -n "$pid" ] && ! holder_alive "$pid"; then
+        echo "$PREFIX: reaping the lock of pid $pid ($(lock_field branch)), which is no longer running"
+        : > "$LOCK_FILE" 2>/dev/null || true
+        rm -rf "$LOCK_HOLD"
+        continue
+      fi
+      # A token without a record: its taker died before writing one, or is
+      # about to. Ten seconds is plenty for the second case.
+      if [ -z "$pid" ]; then
+        unrecorded=$((unrecorded + 1))
+        if [ "$unrecorded" -ge 10 ]; then
+          echo "$PREFIX: reaping a lock token whose holder never recorded itself"
+          rm -rf "$LOCK_HOLD"
+          unrecorded=0
+          continue
+        fi
+      fi
+    fi
+    now=$(date +%s)
+    if [ $((now - t0)) -ge "$bound" ]; then
+      echo "$PREFIX: gave up after $((now - t0)) s waiting for $(holder_description); MERGEPATH_PREPUSH_LOCK_WAIT=<seconds> waits longer, MERGEPATH_PREPUSH_SKIP=1 or --no-verify bypasses" >&2
+      exit 2
+    fi
+    if [ $((now - last)) -ge 30 ]; then
+      echo "$PREFIX: waiting for $(holder_description)"
+      last=$now
+    fi
+    sleep 1
+  done
+  # Held. A clean release leaves an empty record, so a record naming a dead
+  # holder here means that run was killed (flock mode: the kernel already
+  # freed its lock).
+  LOCK_MODE="$mode"
+  pid=$(lock_field pid)
+  if [ -n "$pid" ] && [ "$pid" != "$$" ] && ! holder_alive "$pid"; then
+    echo "$PREFIX: reaping the lock record of pid $pid ($(lock_field branch)), which is no longer running"
+  fi
+  LOCK_START="$(date -u +%H:%M) UTC"
+  LOCK_RECORD="$LOCK_FILE"
+  lock_write_record "$1" "$$" "$LOCK_START" preparing
+}
+
+# Invoked indirectly by the hook's EXIT trap.
+# shellcheck disable=SC2329
+prepush_lock_release() {
+  [ -n "$LOCK_MODE" ] || return 0
+  : > "$LOCK_FILE" 2>/dev/null || true
+  if [ "$LOCK_MODE" = mkdir ]; then
+    rm -rf "$LOCK_HOLD"
+  else
+    exec 9>&-
+  fi
+  LOCK_MODE=''
+}
+
+prepush_lock_progress() {   # $1 completed, $2 total: refresh the record's progress line in place
+  local rec
+  [ -n "$LOCK_RECORD" ] && [ -f "$LOCK_RECORD" ] || return 0
+  rec=$(grep -v '^progress=' "$LOCK_RECORD" 2>/dev/null || true)
+  printf '%s\nprogress=%s of %s\n' "$rec" "$1" "$2" > "$LOCK_RECORD" 2>/dev/null || true
+}
+
+# The default concurrency follows the machine: two checks at once while the
+# one-minute load average is below the CPU count, one once it is not. Either
+# reading unavailable keeps the historical default of 2. Sets DEFAULT_JOBS,
+# LOAD_1 and CPU_N (the last two are printed on the `running` line).
+LOAD_1=''
+CPU_N=''
+DEFAULT_JOBS=2
+prepush_default_jobs() {
+  CPU_N=$(sysctl -n hw.ncpu 2>/dev/null) || CPU_N=$(nproc 2>/dev/null) || CPU_N=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || CPU_N=''
+  LOAD_1=$({ sysctl -n vm.loadavg 2>/dev/null || true; } | awk '{ print $2 }')
+  [ -n "$LOAD_1" ] || LOAD_1=$(awk '{ print $1 }' /proc/loadavg 2>/dev/null || true)
+  case "$CPU_N" in ''|*[!0-9]*) CPU_N='' ;; esac
+  case "$LOAD_1" in ''|*[!0-9.]*|*.*.*|.) LOAD_1='' ;; esac
+  if [ -n "$CPU_N" ] && [ -n "$LOAD_1" ] && awk -v l="$LOAD_1" -v c="$CPU_N" 'BEGIN { exit !(l + 0 >= c + 0) }'; then
+    DEFAULT_JOBS=1
+  else
+    DEFAULT_JOBS=2
+  fi
+}
+
+# Snapshot hygiene. A prepush-<sha>.* worktree is only ever created by this
+# tool, and under the lock no other run of this version is live, so a
+# leftover one belongs to a run that was killed. A run of an older version
+# of this script, which took no lock, could still be working in it: such a
+# run has a `--committed-snapshot` process whose working directory is the
+# snapshot, and that process is looked for before anything is removed. A
+# worktree that is not a snapshot (another session's checkout) is never
+# touched.
+process_cwd() {   # $1 pid; status 2 when nothing on this host can tell
+  if [ -d /proc/self ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    { lsof -a -p "$1" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p;'
+    return 0
+  fi
+  return 2
+}
+
+snapshot_in_use() {   # $1 snapshot path
+  local real pid cwd
+  real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  for pid in $(pgrep -f -- '[-]-committed-snapshot' 2>/dev/null); do
+    [ "$pid" != "$$" ] || continue
+    cwd=$(process_cwd "$pid") || return 0
+    case "$cwd" in "$real"|"$real"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lock
+  local wt
+  while IFS= read -r wt; do
+    case "$wt" in "$1"/prepush-*) ;; *) continue ;; esac
+    if snapshot_in_use "$wt"; then
+      echo "$PREFIX: leaving snapshot $wt: a hook run is still working in it"
+      continue
+    fi
+    if git worktree remove --force "$wt" 2>/dev/null; then
+      echo "$PREFIX: retired stale snapshot $wt (left by an interrupted run)"
+    else
+      echo "$PREFIX: could not retire stale snapshot $wt" >&2
+    fi
+  done < <(git worktree list --porcelain | sed -n 's/^worktree //p')
+}
+
 ORIGINAL_ARGS=("$@")
 SNAPSHOT=0
 TIMINGS_ROOT=''
@@ -123,7 +331,7 @@ PLAN=0
 DEEP="${MERGEPATH_PREPUSH_DEEP:-0}"
 ALL_LIVE=0
 [ "${MERGEPATH_PREPUSH_LIVE:-selected}" = "all" ] && ALL_LIVE=1
-JOBS="${MERGEPATH_PREPUSH_JOBS:-2}"
+JOBS="${MERGEPATH_PREPUSH_JOBS:-}"
 NICE="${MERGEPATH_PREPUSH_NICE:-10}"
 EVENT=''
 HEAD_REF=''
@@ -138,6 +346,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --committed-snapshot) SNAPSHOT=1; shift ;;
     --timings-root) [ "$#" -ge 2 ] || die "--timings-root needs a path"; TIMINGS_ROOT="$2"; shift 2 ;;
+    --lock-record) [ "$#" -ge 2 ] || die "--lock-record needs a path"; LOCK_RECORD="$2"; shift 2 ;;
     --base) [ "$#" -ge 2 ] || die "--base needs a ref"; BASE_REF="$2"; shift 2 ;;
     --paths-from) [ "$#" -ge 2 ] || die "--paths-from needs a file or -"; MODE=paths; PATHS_FROM="$2"; shift 2 ;;
     --plan) PLAN=1; shift ;;
@@ -150,6 +359,8 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+prepush_default_jobs
+[ -n "$JOBS" ] || JOBS="$DEFAULT_JOBS"
 case "$JOBS" in ''|*[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
 case "$NICE" in ''|*[!0-9]*) die "MERGEPATH_PREPUSH_NICE must be a non-negative integer (got '$NICE')" ;; esac
 case "$DEEP" in 1|true) DEEP=1 ;; *) DEEP=0 ;; esac
@@ -183,11 +394,20 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
         [ "$rc" -ne 0 ] || rc=2
       fi
     fi
+    prepush_lock_release
     exit "$rc"
   }
   trap cleanup_snapshot EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  # One hook run per machine (#2581): the lock covers everything from the
+  # first snapshot to the last check. A push with no branch update needs none.
+  lock_branch=$(printf '%s\n' "$records" \
+    | awk '$2 != "0000000000000000000000000000000000000000" && $3 ~ /^refs\/heads\// { sub("refs/heads/", "", $3); print $3; exit }')
+  if [ -n "$lock_branch" ]; then
+    prepush_lock_acquire "$lock_branch"
+    retire_stale_snapshots "$snapshots"
+  fi
   saw=0
   while read -r local_ref local_sha remote_ref remote_sha; do
     [ -n "${local_ref:-}" ] || continue
@@ -198,14 +418,18 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
     git -c core.hooksPath=/dev/null worktree add --quiet --detach "$snapshot" "$local_sha"
     [ "$(git -C "$snapshot" rev-parse HEAD)" = "$local_sha" ] || die "snapshot tip mismatch"
     echo "$PREFIX: checking committed tree $local_sha (${remote_ref#refs/heads/})"
+    lock_write_record "${remote_ref#refs/heads/}" "$$" "$LOCK_START" preparing
     (
       # Git's hook-local repository/index variables must not redirect the
       # detached tree or any test-created fixture back into the push checkout.
       # shellcheck disable=SC2046
       unset $(git rev-parse --local-env-vars) 2>/dev/null || true
       cd "$snapshot"
-      bash "$SELF" --committed-snapshot --timings-root "$ROOT" "${ORIGINAL_ARGS[@]}" \
-        <<<"$local_ref $local_sha $remote_ref $remote_sha"
+      # The inner run refreshes the lock record's progress but holds no lock
+      # of its own: fd 9 is closed so no check's stray child can keep the
+      # machine-wide lock alive after this run ends.
+      bash "$SELF" --committed-snapshot --timings-root "$ROOT" --lock-record "$LOCK_FILE" "${ORIGINAL_ARGS[@]}" \
+        <<<"$local_ref $local_sha $remote_ref $remote_sha" 9>&-
     )
     git worktree remove --force "$snapshot"
     snapshot=''
@@ -499,7 +723,7 @@ while IFS= read -r step; do
   printf '%s\t%s\n' "$prev" "$sid" >> "$RUN_DIR/order"
 done < <(printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))")
 
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, load ${LOAD_1:-unknown} on ${CPU_N:-unknown} CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
 fi
@@ -508,9 +732,17 @@ if [ "$DEEP" -ne 1 ] && [ "$DEEP_N" -gt 0 ]; then
   printf '%s\n' "$PLAN_JSON" | jq -r 'select(.lane == "deep") | "    \(.job): \(.name)"'
 fi
 
+expected=$(wc -l < "$RUN_DIR/order" | tr -d ' ')
+prepush_lock_progress 0 "$expected"
 T0=$(date +%s)
 sort -t "$(printf '\t')" -k1,1nr -k2,2 "$RUN_DIR/order" | cut -f2 \
-  | xargs -P "$JOBS" -n 1 bash "$SELF" --exec-step "$RUN_DIR"
+  | xargs -P "$JOBS" -n 1 bash "$SELF" --exec-step "$RUN_DIR" \
+  | while IFS= read -r line; do
+      # Each worker prints one result line; the lock record follows them so a
+      # push waiting on this run can report its progress.
+      printf '%s\n' "$line"
+      prepush_lock_progress "$(find "$RUN_DIR/results" -type f | wc -l | tr -d ' ')" "$expected"
+    done
 ELAPSED=$(( $(date +%s) - T0 ))
 
 failed=0
@@ -521,7 +753,6 @@ for f in "$RUN_DIR"/results/*; do
   rc=$(cut -f1 "$f")
   [ "$rc" = "0" ] || failed=$((failed + 1))
 done
-expected=$(wc -l < "$RUN_DIR/order" | tr -d ' ')
 if [ "$total" -ne "$expected" ]; then
   echo "$PREFIX: only $total of $expected checks reported a result; treating the run as failed" >&2
   failed=$((failed + 1))
