@@ -68,10 +68,11 @@
 #   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
 #                               and markdown-it-py for the deep lane)
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
-# The checks run on the checkout, so a hook run refuses a push whose tip is
-# not HEAD or a checkout with uncommitted changes to tracked files.
-# Exit: 0 pass or skipped, 1 a selected check failed or the checkout is not
-# the pushed commit, 2 usage or environment (including missing CI packages).
+# Hook checks run in tool-owned detached worktrees of each pushed tip, so
+# working-tree modifications and untracked files cannot affect their result.
+# Python package metadata must equal the committed workflow pins.
+# Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment
+# (including missing or mismatched CI packages).
 
 set -euo pipefail
 
@@ -110,6 +111,9 @@ if [ "${MERGEPATH_PREPUSH_SKIP:-0}" = "1" ]; then
   exit 0
 fi
 
+ORIGINAL_ARGS=("$@")
+SNAPSHOT=0
+TIMINGS_ROOT=''
 MODE=range
 HOOK_REMOTE=''
 BASE_REF=''
@@ -131,6 +135,8 @@ while [ "$#" -gt 0 ]; do
       # git passes the URL as a second argument; it is not needed.
       if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then shift; fi
       ;;
+    --committed-snapshot) SNAPSHOT=1; shift ;;
+    --timings-root) [ "$#" -ge 2 ] || die "--timings-root needs a path"; TIMINGS_ROOT="$2"; shift 2 ;;
     --base) [ "$#" -ge 2 ] || die "--base needs a ref"; BASE_REF="$2"; shift 2 ;;
     --paths-from) [ "$#" -ge 2 ] || die "--paths-from needs a file or -"; MODE=paths; PATHS_FROM="$2"; shift 2 ;;
     --plan) PLAN=1; shift ;;
@@ -149,6 +155,60 @@ case "$DEEP" in 1|true) DEEP=1 ;; *) DEEP=0 ;; esac
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
 cd "$ROOT"
+
+# Hook checks get a detached tree per pushed branch. In particular, an
+# untracked copy of a committed deletion cannot satisfy a check that CI will
+# run without that file. These unique worktrees belong to this tool's
+# lifecycle; never reuse or clean another session's checkout.
+if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
+  records=$(cat)
+  common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+  primary_root=$(dirname "$common_dir")
+  snapshots="$(dirname "$primary_root")/.$(basename "$primary_root")-worktrees"
+  mkdir -p "$snapshots"
+  snapshot=''
+  # Invoked indirectly by the EXIT trap.
+  # shellcheck disable=SC2329
+  cleanup_snapshot() {
+    local rc=$?
+    trap - EXIT
+    if [ -n "$snapshot" ]; then
+      if ! git -C "$ROOT" worktree remove --force "$snapshot"; then
+        echo "$PREFIX: could not retire owned snapshot $snapshot" >&2
+        [ "$rc" -ne 0 ] || rc=2
+      fi
+    fi
+    exit "$rc"
+  }
+  trap cleanup_snapshot EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  saw=0
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_ref:-}" ] || continue
+    [ "$local_sha" != 0000000000000000000000000000000000000000 ] || continue
+    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
+    git cat-file -e "$local_sha^{commit}" || die "pushed tip is not an available commit"
+    snapshot=$(mktemp -d "$snapshots/prepush-${local_sha:0:12}.XXXXXX")
+    git -c core.hooksPath=/dev/null worktree add --quiet --detach "$snapshot" "$local_sha"
+    [ "$(git -C "$snapshot" rev-parse HEAD)" = "$local_sha" ] || die "snapshot tip mismatch"
+    echo "$PREFIX: checking committed tree $local_sha (${remote_ref#refs/heads/})"
+    (
+      # Git's hook-local repository/index variables must not redirect the
+      # detached tree or any test-created fixture back into the push checkout.
+      # shellcheck disable=SC2046
+      unset $(git rev-parse --local-env-vars) 2>/dev/null || true
+      cd "$snapshot"
+      bash "$SELF" --committed-snapshot --timings-root "$ROOT" "${ORIGINAL_ARGS[@]}" \
+        <<<"$local_ref $local_sha $remote_ref $remote_sha"
+    )
+    git worktree remove --force "$snapshot"
+    snapshot=''
+    saw=1
+  done <<<"$records"
+  [ "$saw" -ne 0 ] || echo "$PREFIX: no branch updates in this push; nothing to lint"
+  exit 0
+fi
 CLASSIFIER=scripts/ci/repo-lint-scope.sh
 WORKFLOW=.github/workflows/repo_lint.yml
 
@@ -238,26 +298,12 @@ case "$MODE" in
       echo "$PREFIX: no branch updates in this push; nothing to lint"
       exit 0
     fi
-    # The checks run on this checkout, so it must hold exactly the bytes
-    # being pushed; otherwise a pass or a failure would be about something
-    # else. A plan runs nothing, so it is exempt.
     if [ "$PLAN" -eq 0 ]; then
-      head_sha=$(git rev-parse HEAD)
+      [ "$SNAPSHOT" -eq 1 ] || die "hook checks require a committed snapshot"
       while read -r sha ref; do
         [ -n "$sha" ] || continue
-        if [ "$sha" != "$head_sha" ]; then
-          echo "$PREFIX: this push updates ${ref#refs/heads/} to ${sha:0:12}, but the checkout is at ${head_sha:0:12}; the checks run on the checkout and would not test what is pushed." >&2
-          echo "$PREFIX: check out the branch being pushed and push from there (one branch per push), or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1 (CI lint still gates the merge)." >&2
-          exit 1
-        fi
+        [ "$sha" = "$(git rev-parse HEAD)" ] || die "snapshot does not contain the pushed tip for $ref"
       done <<<"$PUSHED"
-      if ! git diff --quiet HEAD -- 2>/dev/null; then
-        echo "$PREFIX: the checkout has uncommitted changes to tracked files, so the checks would not test the pushed commit; commit or stash them first (or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1)." >&2
-        exit 1
-      fi
-      if [ -n "$(git ls-files --others --exclude-standard | head -n 1)" ]; then
-        echo "$PREFIX: note: untracked files are present; checks that read the working tree may see them, CI will not"
-      fi
     fi
     ;;
   range)
@@ -363,14 +409,24 @@ fi
 
 echo "$PREFIX: scope deep=$S_DEEP full=$S_FULL consumer_replay=$S_REPLAY self_tests=$S_SELF checks=$S_CHECKS"
 
-# The Python packages CI provisions (PyYAML, markdown-it-py). Several checks
-# skip assertions, and exit 0, when a module is missing, so running without
-# them would report a pass CI does not give: that is an environment error.
-# The live and selected lanes need PyYAML; markdown-it-py is read only by
-# deep-lane suites, so it is required when the deep lane runs. The first
-# interpreter that has what this run needs is exposed as python3.
-PY_PKGS='import yaml'
-[ "$DEEP" -eq 1 ] && PY_PKGS='import yaml, markdown_it'
+# Read literal CI pins from the committed workflow instead of maintaining a
+# second version list. Missing/conflicting pins are an environment error.
+CI_PY_PINS=$(jq -er '
+  [ .[] | .steps[]? | select(.name == "install_python_ci_dependencies")
+    | (.run // "") | scan("(?i)(PyYAML|markdown-it-py)==([0-9][A-Za-z0-9.+_-]*)")
+    | {name: (.[0] | ascii_downcase), version: .[1]} ]
+  | group_by(.name) | map({key: .[0].name, value: (map(.version) | unique)}) | from_entries
+  | if ((.pyyaml | length) == 1 and (.["markdown-it-py"] | length) == 1)
+    then {PyYAML: .pyyaml[0], "markdown-it-py": .["markdown-it-py"][0]}
+    else error("missing or conflicting CI Python package pins") end
+' <<<"$JOBS_JSON") || die "cannot resolve pinned CI Python packages from $WORKFLOW"
+PY_PROBE='import importlib.metadata as m, json, sys
+pins=json.loads(sys.argv[1])
+import yaml
+assert m.version("PyYAML") == pins["PyYAML"]
+if sys.argv[2] == "1":
+ import markdown_it
+ assert m.version("markdown-it-py") == pins["markdown-it-py"]'
 PY_SHIM=''
 PY_OK=0
 # An explicit MERGEPATH_PREPUSH_PYTHON is the only candidate when set.
@@ -380,15 +436,15 @@ else
   PY_CANDIDATES='python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3'
 fi
 for cand in $PY_CANDIDATES; do
-  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "$PY_PKGS" >/dev/null 2>&1; then
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -I -c "$PY_PROBE" "$CI_PY_PINS" "$DEEP" >/dev/null 2>&1; then
     PY_SHIM=$(command -v "$cand")
     PY_OK=1
     break
   fi
 done
 if [ "$PY_OK" -ne 1 ]; then
-  echo "$PREFIX: no python3 with the CI packages ($PY_PKGS) was found; without them several checks skip assertions and pass, so the run would not mean what CI means." >&2
-  echo "$PREFIX: install CI's pinned versions for some python3 (for example python3 -m pip install --user 'PyYAML==6.0.3' 'markdown-it-py==4.2.0') and point MERGEPATH_PREPUSH_PYTHON at it, or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1." >&2
+  echo "$PREFIX: no python3 with the CI packages at workflow pins ($CI_PY_PINS) was found; without them several checks skip assertions and pass, so the run would not mean what CI means." >&2
+  echo "$PREFIX: install the displayed workflow pins for some python3 and point MERGEPATH_PREPUSH_PYTHON at it, or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1." >&2
   exit 2
 fi
 
@@ -412,7 +468,7 @@ fi
 
 # Longest-first ordering from the previous run's timings, so the slowest
 # check starts first and the concurrency cap is used evenly.
-TIMINGS="$ROOT/.mergepath/prepush-timings.tsv"
+TIMINGS="${TIMINGS_ROOT:-$ROOT}/.mergepath/prepush-timings.tsv"
 lanes='"live","selected"'
 [ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"unselected\""
 [ "$DEEP" -eq 1 ] && lanes="$lanes,\"deep\""
@@ -461,7 +517,7 @@ if [ "$total" -ne "$expected" ]; then
 fi
 
 # Remember durations for the next run's ordering (best effort).
-if mkdir -p "$ROOT/.mergepath" 2>/dev/null; then
+if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
   {
     cat "$RUN_DIR"/results/* 2>/dev/null | awk -F'\t' '{ print $3 "\t" $2 }'
     [ -f "$TIMINGS" ] && cat "$TIMINGS"
