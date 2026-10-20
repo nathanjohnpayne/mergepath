@@ -92,6 +92,14 @@ for _field in requests.0.created_at requests.0.eyes_at reviews.0.submitted_at \
   _path=$(jq -nc --arg f "$_field" '$f | split(".") | map(tonumber? // .)')
   timestamp_refused "timestamp: $_field rejects a malformed instant" \
     "$(jq -c --argjson p "$_path" 'setpath($p; "!")' <<<"$TIMED_INPUT")"
+  # The parser removes the first fraction anywhere; syntax must establish
+  # that it belongs to seconds before that conversion (#2528 review).
+  for _instant in 2026-09-25T00:00:01Z.123 2026.123-09-25T00:00:01Z; do
+    timestamp_refused "timestamp: $_field rejects misplaced fraction $_instant" \
+      "$(jq -c --argjson p "$_path" --arg t "$_instant" 'setpath($p; $t)' <<<"$TIMED_INPUT")"
+  done
+  L=$(crl_ledger "$(jq -c --argjson p "$_path" 'setpath($p; "2026-09-25T00:00:01.123Z")' <<<"$TIMED_INPUT")")
+  check "timestamp: $_field accepts a seconds fraction" "$L" '.summary.requests == 1'
   # eyes_at alone is nullable; every other present record requires its instant.
   for _bad in missing null number boolean array object; do
     if [ "$_field" = requests.0.eyes_at ] && { [ "$_bad" = missing ] || [ "$_bad" = null ]; }; then continue; fi

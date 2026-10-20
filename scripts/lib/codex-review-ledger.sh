@@ -54,7 +54,9 @@ crl_ledger() {
   printf '%s\n' "$1" | jq -c '
     def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
     def valid_instant:
-      type == "string" and (try (epoch | type == "number") catch false);
+      type == "string"
+      and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
+      and (try (epoch | type == "number") catch false);
     def same_head($a; $b):
       ($a | ascii_downcase) as $x | ($b | ascii_downcase) as $y
       | ($x | startswith($y)) or ($y | startswith($x));
