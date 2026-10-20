@@ -411,6 +411,126 @@ IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '
 stop_check "stops: every stop that holds is reported, blocking budget first" "$(stops "$IN" "$RB" 2)" \
   '.stops == ["blocking-budget", "disagreement"]'
 
+# ---- Owner tiebreak (#2511) ----------------------------------------------------
+
+PR_URL=https://github.com/o/r/pull/1
+# cm <id> <login> <created> <updated> <body>
+cm() { jq -nc --argjson id "$1" --arg u "$2" --arg c "$3" --arg up "$4" --arg b "$5" \
+  '{id: $id, user: {login: $u}, created_at: $c, updated_at: $up, body: $b}'; }
+mark() { printf 'TIEBREAK_REBUTTAL_ACCEPTED=%s@%s#%s' "${2:-$PR_URL}" "${3:-$HEAD_A}" "$1"; }
+# tb_stops <ledger-inputs> <rebuttals> <comments-json> -> applied stops
+tb_stops() {
+  local l st marks
+  l=$(crl_ledger "$(printf '%s' "$1" | jq -c --argjson rb "$2" '.rebuttals = $rb')" | jq -c '.max_blocking_reviews = 10') || return 1
+  st=$(crl_human_stops "$l" "$HEAD_A" nathanjohnpayne 10) || return 1
+  marks=$(crl_owner_tiebreaks "$3" nathanjohnpayne "$PR_URL" "$HEAD_A") || return 1
+  crl_apply_owner_tiebreaks "$st" "$l" "$marks"
+}
+
+# #579's shape: one blocking finding, rebutted, no Codex response afterwards.
+IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]')
+M100=$(mark 100)
+C=$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$M100")" | arr)
+stop_check "tiebreak: an owner marker for the finding clears an untested rebuttal" "$(tb_stops "$IN" "$RB" "$C")" \
+  '.stops == [] and .untested_rebuttals == [] and .owner_tiebreaks == [{kind: "untested", finding: 100}]'
+stop_check "tiebreak: markers on a multi-line comment, with CRLF and indentation, are read" \
+  "$(tb_stops "$IN" "$RB" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(printf 'Accepting the rebuttal.\r\n  %s\r\n' "$M100")")" | arr)")" '.stops == []'
+stop_check "tiebreak: the PR URL compares case-insensitively" \
+  "$(tb_stops "$IN" "$RB" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(mark 100 HTTPS://GITHUB.COM/O/R/pull/1)")" | arr)")" '.stops == []'
+
+# Everything below must leave the stop standing.
+no_clear() { # <name> <comments-json>
+  stop_check "tiebreak: $1 does not clear the stop" "$(tb_stops "$IN" "$RB" "$2")" \
+    '.stops == ["untested-rebuttal"] and (.owner_tiebreaks | length) == 0'
+}
+no_clear "a marker by another account" "$(printf '%s\n' "$(cm 1 nathanpayne-claude 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$M100")" | arr)"
+no_clear "an edited marker comment" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:05:00Z "$M100")" | arr)"
+no_clear "a marker posted before the rebuttal" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T00:30:00Z 2026-09-25T00:30:00Z "$M100")" | arr)"
+no_clear "a marker for another head" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(mark 100 "$PR_URL" "$HEAD_B")")" | arr)"
+no_clear "a marker for another PR" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(mark 100 https://github.com/o/r/pull/2)")" | arr)"
+no_clear "a marker for another finding" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(mark 101)")" | arr)"
+no_clear "a marker quoted or fenced rather than on its own line" "$(printf '%s\n' \
+  "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "> $M100")" \
+  "$(cm 2 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "see $M100 for the rule")" \
+  "$(cm 3 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=<PR-URL>@<full-head-sha>#<finding-id>")" | arr)"
+no_clear "no comments" '[]'
+if crl_owner_tiebreaks '{"not":"an array"}' nathanjohnpayne "$PR_URL" "$HEAD_A" >/dev/null; then
+  fail "tiebreak: a comments payload that is not an array was accepted"
+else
+  pass "tiebreak: a comments payload that is not an array fails"
+fi
+
+# A budget stop is not a dispute: the marker never clears it.
+IN3=$(inputs "$R4" "$CCBB" '[]' '[]' '[]')
+l=$(crl_ledger "$(printf '%s' "$IN3" | jq -c '.rebuttals = []')" | jq -c '.max_blocking_reviews = 2')
+st=$(crl_human_stops "$l" "$HEAD_A" nathanjohnpayne 2)
+stop_check "tiebreak: a marker leaves blocking-budget standing" \
+  "$(crl_apply_owner_tiebreaks "$st" "$l" "$(crl_owner_tiebreaks "$C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" '.stops == ["blocking-budget"]'
+
+# Disagreement: Codex re-raised after the rebuttal. A marker must be newer than
+# the re-raise as well as the rebuttal.
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "tiebreak: a marker older than the re-raise leaves a disagreement standing" \
+  "$(tb_stops "$IN" "$RB" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T01:30:00Z 2026-09-25T01:30:00Z "$M100")" | arr)")" \
+  '.stops == ["disagreement"] and (.owner_tiebreaks | length) == 0'
+stop_check "tiebreak: a marker newer than the re-raise clears the disagreement" "$(tb_stops "$IN" "$RB" "$C")" \
+  '.stops == [] and .disagreements == [] and .owner_tiebreaks == [{kind: "disagreement", finding: 100}]'
+
+# A response group can gain a later signal after its first one; the marker must
+# postdate that last signal too (CodeRabbit on #2515).
+IN_D=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+L_D=$(crl_ledger "$(printf '%s' "$IN_D" | jq -c --argjson rb "$RB" '.rebuttals = $rb')" | jq -c '.max_blocking_reviews = 10')
+if printf '%s' "$L_D" | jq -e 'all(.responses[]; .last_at >= .first_at)' >/dev/null; then
+  pass "tiebreak: every response records last_at, never before first_at"
+else
+  fail "tiebreak: a response is missing last_at or has it before first_at"
+fi
+LATE=$(printf '%s' "$L_D" | jq -c '.responses |= map(if .first_at == "2026-09-25T02:10:00Z" then .last_at = "2026-09-25T03:30:00Z" else . end)')
+ST_D=$(crl_human_stops "$LATE" "$HEAD_A" nathanjohnpayne 10)
+stop_check "tiebreak: a marker older than a response's last signal leaves the disagreement standing" \
+  "$(crl_apply_owner_tiebreaks "$ST_D" "$LATE" "$(crl_owner_tiebreaks "$C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["disagreement"] and (.owner_tiebreaks | length) == 0'
+stop_check "tiebreak: a ledger without last_at falls back to first_at" \
+  "$(crl_apply_owner_tiebreaks "$ST_D" "$(printf '%s' "$LATE" | jq -c 'del(.responses[].last_at)')" "$(crl_owner_tiebreaks "$C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == []'
+
+# Two disputes: settling one leaves the other, and the stop names what remains.
+IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" \
+  "$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["x.sh","p1"],["y.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+RB2=$(printf '%s\n' "$(rebut 100 x.sh 2026-09-25T01:00:00Z)" "$(rebut 101 y.sh 2026-09-25T01:00:00Z)" | arr)
+stop_check "tiebreak: settling one of two rebuttals leaves the stop standing" "$(tb_stops "$IN" "$RB2" "$C")" \
+  '.stops == ["untested-rebuttal"] and (.untested_rebuttals | map(.finding)) == [101]'
+stop_check "tiebreak: a marker line per finding settles both" \
+  "$(tb_stops "$IN" "$RB2" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(printf '%s\n%s' "$M100" "$(mark 101)")")" | arr)")" '.stops == []'
+
+# The barrier's own reader (p4b_codex_human_stops) applies markers it reads from
+# the PR's comments, and leaves the stop standing when it cannot read them.
+TB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ledger-tiebreak.XXXXXX")
+IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]')
+crl_ledger "$(printf '%s' "$IN" | jq -c --argjson rb "$RB" '.rebuttals = $rb')" \
+  | jq -c '.max_blocking_reviews = 10 | .policy_fingerprint = "1-2"' >"$TB_DIR/ledger.json"
+printf '#!/usr/bin/env bash\ncat "%s"\n' "$TB_DIR/ledger.json" >"$TB_DIR/ledger-stub.sh"
+chmod +x "$TB_DIR/ledger-stub.sh"
+# barrier_stops <comments-json|FAIL>
+barrier_stops() (
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$ROOT/scripts/phase-4b/lib.sh"
+  p4b_config() { echo /dev/null; }
+  p4b_top_field() { echo nathanjohnpayne; }
+  p4b_pr_policy_tuple() { jq -nc --arg h "$HEAD_A" '{head_sha: $h, base_ref: "main", base_sha: "b", default_branch: "main"}'; }
+  crqe_governing_budget() { jq -nc '{max_blocking_reviews: 10, max_request_attempts: 2, policy_fingerprint: "1-2"}'; }
+  gh_api_array() { [ "$1" != FAIL ] || return 1; printf '%s' "$TB_COMMENTS"; }
+  TB_COMMENTS=$1
+  [ "$1" != FAIL ] || gh_api_array() { return 1; }
+  P4B_CODEX_LEDGER="$TB_DIR/ledger-stub.sh" p4b_codex_human_stops o/r 1 "$HEAD_A"
+)
+stop_check "barrier: no marker leaves the untested rebuttal standing" "$(barrier_stops '[]')" \
+  '.state == "stop" and .stops == ["untested-rebuttal"]'
+stop_check "barrier: an owner marker on the PR clears it, and the result records the tiebreak" "$(barrier_stops "$C")" \
+  '.state == "clear" and .stops == [] and .owner_tiebreaks == [{kind: "untested", finding: 100}]'
+stop_check "barrier: unreadable comments leave the stop standing" "$(barrier_stops FAIL)" \
+  '.state == "stop" and .stops == ["untested-rebuttal"]'
+
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
 make_cli_case() {
@@ -487,7 +607,7 @@ run_cli() { # <dir> [args...]
 }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/codex-review-ledger.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK" "$TB_DIR"' EXIT
 
 D="$WORK/ok"; make_cli_case "$D"
 jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},

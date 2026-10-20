@@ -148,6 +148,7 @@ crl_ledger() {
               window: $w, unsolicited: ($w == 0),
               anchor: $grp.anchor,
               first_at: ([$grp.sigs[].t] | min),
+              last_at: ([$grp.sigs[].t] | max),
               blocking_paths: ([ $grp.sigs[] | select(.kind == "review") | .blocking_paths[] ] | unique),
               blocking_unlocated: ($c.class == "unknown_tier" or $c.conflicting
                                    or any($grp.sigs[]; .kind == "review" and .blocking_unlocated)),
@@ -404,4 +405,71 @@ crl_human_stops() {
                    (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr >= \$ceiling and \$nw >= \$nr then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
                    (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
+}
+
+# ---- Owner tiebreak on a dispute stop (#2511) ---------------------------------
+# An untested rebuttal or a disagreement stops Phase 4b at a spent request
+# ceiling for the human (crl_human_stops). On an owner-authored PR the owner
+# cannot record a decision through GitHub's review state, because GitHub
+# rejects a self-approval, so the decision needs its own carrier: one PR
+# comment, typed by the owner, with a line per finding it settles:
+#
+#   TIEBREAK_REBUTTAL_ACCEPTED=<canonical-https-PR-URL>@<full-head-sha>#<finding-id>
+#
+# <finding-id> is the `finding` of the stop entry: the inline root comment id
+# of a rebutted thread, or the review id of a body finding. The marker clears
+# only that entry, only on that head, and never `blocking-budget` or `runaway`.
+# It approves nothing: the stop's waiver still sends the head to the Phase 4b
+# adapter, and every other gate still applies. A marker counts only if its
+# comment is by the configured author, was never edited, and is newer than the
+# dispute it settles (for a disagreement, newer than every counted response
+# too), so a decision cannot be pre-recorded or stretched over a later
+# re-raise. Agents cannot write the marker: the comment guard refuses
+# well-formed marker text in any agent-authored body. As with the scoped admin
+# override, GitHub cannot show the owner (rather than an operator holding the
+# owner credential) typed it; the record preserves who posted what and when.
+
+# crl_owner_tiebreaks <issue-comments-json> <author> <pr-url> <head>
+# Prints [{finding, comment_id, at}] for every well-formed marker; fails on
+# input that is not one array of comments.
+crl_owner_tiebreaks() {
+  printf '%s\n' "$1" | jq -sec --arg author "$2" --arg url "$3" --arg head "$4" '
+    if length != 1 or (.[0] | type) != "array" then error("comments") else .[0] end
+    | [ .[]
+        | select(type == "object" and (.user.login // "") == $author
+                 and (.created_at | type) == "string"
+                 # An edited comment could have been rewritten after the fact.
+                 and .updated_at == .created_at
+                 and (.body | type) == "string")
+        | . as $c
+        | ($c.body | split("\n")[]
+           | rtrimstr("\r")
+           | capture("^[ \\t]*TIEBREAK_REBUTTAL_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})#(?<finding>[0-9]+)[ \\t]*$")
+           | select((.url | ascii_downcase) == ($url | ascii_downcase) and .head == $head)
+           | {finding: (.finding | tonumber), comment_id: $c.id, at: $c.created_at}) ]' 2>/dev/null
+}
+
+# crl_apply_owner_tiebreaks <stops-json> <ledger-json> <tiebreaks-json>
+# Drops each untested-rebuttal / disagreement entry that a newer owner marker
+# settles, recomputes `stops`, and records what it applied in
+# `owner_tiebreaks`. The input is crl_human_stops' output for the same ledger.
+crl_apply_owner_tiebreaks() {
+  jq -nec --argjson stops "$1" --argjson ledger "$2" --argjson tb "$3" '
+    def settled($e; $floor):
+      any($tb[]; (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
+    def latest_response($e):
+      ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
+    ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
+    | ($stops.disagreements | map(. as $e
+        | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements
+    | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at))
+         | {kind: "untested", finding: $e.finding})) as $a
+    | ($stops.disagreements | map(. as $e | select(settled($e; ([$e.at, latest_response($e)] | max)))
+         | {kind: "disagreement", finding: $e.finding})) as $b
+    | $stops
+    | .untested_rebuttals = $untested
+    | .disagreements = $disagreements
+    | .owner_tiebreaks = ($a + $b)
+    | .stops = [ .stops[] | select((. == "untested-rebuttal" and ($untested | length) == 0) | not)
+                          | select((. == "disagreement" and ($disagreements | length) == 0) | not) ]' 2>/dev/null
 }
