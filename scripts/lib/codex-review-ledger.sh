@@ -44,14 +44,19 @@
 #                  reply_markers: [...]}],
 #     rebuttals: [{finding, path, at, sources: [...]}],  # optional (slice 3)
 #     verdicts:  [{comment_id, created_at, reviewed_shas: [...], affirmative}],
-#     reactions: [],                            # legacy input, ignored
+#     reactions: [{created_at, ...}],             # legacy; timestamps only
 #     blocks:    [{comment_id, created_at, reason}],
 #     summary:   null | {status, commit, observed_at, ...}
 #   }
-# Prints the ledger JSON. Pure jq; returns jq's status.
+# Prints the ledger JSON. Invalid named timestamps fail before any output.
+# Pure jq; returns jq's status.
 crl_ledger() {
   printf '%s\n' "$1" | jq -c '
     def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+    def valid_instant:
+      type == "string"
+      and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
+      and (try (epoch | type == "number") catch false);
     def same_head($a; $b):
       ($a | ascii_downcase) as $x | ($b | ascii_downcase) as $y
       | ($x | startswith($y)) or ($y | startswith($x));
@@ -62,6 +67,19 @@ crl_ledger() {
       else null end;
 
     . as $in
+    # Validate all temporal inputs before lexical windowing can turn malformed
+    # evidence into an unsolicited response or a missed human stop. Reactions
+    # remain non-evidence; optional collections keep their existing defaults.
+    | if all(( $in.requests[].created_at,
+               ($in.requests[].eyes_at | select(. != null)),
+               $in.reviews[].submitted_at,
+               $in.verdicts[].created_at,
+               $in.blocks[].created_at,
+               ($in.reactions // [])[].created_at,
+               ($in.rebuttals // [])[].at,
+               (if $in.summary != null then $in.summary.observed_at else empty end) );
+             valid_instant)
+      then . else error("invalid ledger timestamp") end
     | ($in.required_tiers // []) as $required
     | def blocking_tier($t): $t == "p0" or ($required | index($t)) != null;
 

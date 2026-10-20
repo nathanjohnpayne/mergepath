@@ -70,6 +70,68 @@ T3=2026-09-25T00:15:00Z
 T4=2026-09-25T00:20:00Z
 T5=2026-09-25T00:25:00Z
 
+# ---- Input timestamps (#1578) ----------------------------------------------
+# Every named field is populated so each mutation exercises exactly one bad
+# instant in an otherwise valid input to the production pure library.
+TIMED_INPUT=$(inputs "$(req 1 "$T0" "$T1" | arr)" "$(review 10 "$T2" "$HEAD_A" '["p1"]' | arr)" \
+  "$(verdict 20 "$T3" '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' true | arr)" \
+  "$(reaction 30 "$T4" | arr)" "$(block 40 "$T5" usage_limit | arr)" \
+  | jq -c --arg t "$T5" '.rebuttals = [{finding: 100, path: null, at: $t, sources: []}]
+                         | .summary = {status: "completed", observed_at: $t}')
+timestamp_refused() { # name input: no successful or partial ledger is usable
+  local output rc=0
+  output=$(crl_ledger "$2" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ] && [ -z "$output" ]; then
+    pass "$1"
+  else
+    fail "$1: rc=$rc output=$output"
+  fi
+}
+for _field in requests.0.created_at requests.0.eyes_at reviews.0.submitted_at \
+  verdicts.0.created_at blocks.0.created_at reactions.0.created_at rebuttals.0.at summary.observed_at; do
+  _path=$(jq -nc --arg f "$_field" '$f | split(".") | map(tonumber? // .)')
+  timestamp_refused "timestamp: $_field rejects a malformed instant" \
+    "$(jq -c --argjson p "$_path" 'setpath($p; "!")' <<<"$TIMED_INPUT")"
+  # The parser removes the first fraction anywhere; syntax must establish
+  # that it belongs to seconds before that conversion (#2528 review).
+  for _instant in 2026-09-25T00:00:01Z.123 2026.123-09-25T00:00:01Z; do
+    timestamp_refused "timestamp: $_field rejects misplaced fraction $_instant" \
+      "$(jq -c --argjson p "$_path" --arg t "$_instant" 'setpath($p; $t)' <<<"$TIMED_INPUT")"
+  done
+  L=$(crl_ledger "$(jq -c --argjson p "$_path" 'setpath($p; "2026-09-25T00:00:01.123Z")' <<<"$TIMED_INPUT")")
+  check "timestamp: $_field accepts a seconds fraction" "$L" '.summary.requests == 1'
+  # eyes_at alone is nullable; every other present record requires its instant.
+  for _bad in missing null number boolean array object; do
+    if [ "$_field" = requests.0.eyes_at ] && { [ "$_bad" = missing ] || [ "$_bad" = null ]; }; then continue; fi
+    timestamp_refused "timestamp: $_field rejects $_bad" \
+      "$(jq -c --argjson p "$_path" --arg bad "$_bad" '
+        if $bad == "missing" then delpaths([$p])
+        else setpath($p; ({null: null, number: 17, boolean: true, array: [], object: {}}[$bad])) end' <<<"$TIMED_INPUT")"
+  done
+done
+L=$(crl_ledger "$(jq -c 'walk(if type == "string" and test("Z$") then sub("Z$"; ".123Z") else . end)' <<<"$TIMED_INPUT")")
+check "timestamp: fractional UTC instants remain valid in every field" "$L" \
+  '.summary.requests == 1 and .summary.blocking_responses_solicited == 1 and .requests[0].eyes_at == "2026-09-25T00:05:00.123Z"'
+L=$(crl_ledger "$(jq -c '.requests[0].eyes_at = null' <<<"$TIMED_INPUT")")
+check "timestamp: null eyes remain valid" "$L" '.summary.eyes_now == 0 and .summary.blocking_responses_solicited == 1'
+L=$(crl_ledger "$(jq -c 'del(.reactions, .rebuttals, .summary) | .metadata = {created_at: "!"}' <<<"$TIMED_INPUT")")
+check "timestamp: absent optional evidence and unrelated metadata remain valid" "$L" \
+  '.rebuttals == [] and .current_summary == null and .summary.blocking_responses_solicited == 1'
+L=$(crl_ledger "$(jq -c 'del(.requests[0].eyes_at) | .reactions = null | .rebuttals = null | .summary = null' <<<"$TIMED_INPUT")")
+check "timestamp: absent eyes and null optional evidence retain their defaults" "$L" \
+  '.requests[0].eyes_at == null and .rebuttals == [] and .current_summary == null and .summary.blocking_responses_solicited == 1'
+# Budget impact: the valid blocking review counts as one; changing only its
+# instant must refuse the ledger, never turn it into window 0 / count zero.
+_budget_input=$(inputs "$(req 1 "$T0" | arr)" "$(review 10 "$T1" "$HEAD_A" '["p1"]' | arr)" '[]' '[]' '[]')
+L=$(crl_ledger "$_budget_input")
+if [ "$(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)" = 1 ]; then
+  pass "timestamp: valid solicited review consumes the blocking budget"
+else
+  fail "timestamp: valid solicited review did not consume the blocking budget"
+fi
+timestamp_refused "timestamp: malformed blocking review cannot escape the budget as unsolicited" \
+  "$(jq -c '.reviews[0].submitted_at = "!"' <<<"$_budget_input")"
+
 # ---- Part 1: attribution rules ---------------------------------------------
 
 L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p1","p2"]' | arr)" '[]' '[]' '[]')
@@ -723,6 +785,21 @@ if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'no submitted_at' "$D/err"; the
 else
   fail "CLI null submitted_at: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
+
+# A present malformed instant reaches the pure library; its refusal must keep
+# the CLI error boundary (exit 3, no partial JSON or summary output).
+D="$WORK/bad-submitted-at"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "!", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: "P1: blocking"}]' >"$D/reviews.json"
+for _mode in json summary; do
+  _args=(); [ "$_mode" != summary ] || _args+=(--summary)
+  RC=$(run_cli "$D" "${_args[@]}")
+  if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'ledger computation failed' "$D/err"; then
+    pass "CLI: malformed submitted_at refuses $_mode output"
+  else
+    fail "CLI malformed submitted_at ($_mode): rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
 
 # Rebuttal collection (#1560 slice 3): a tagged thread, and a thumbs-down on
 # the root, are rebuttals; the bot's own thumbs-down and a rollup that rules
