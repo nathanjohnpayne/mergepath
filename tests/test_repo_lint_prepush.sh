@@ -15,6 +15,14 @@
 # documented per-runner bookends the hook does not run locally. The
 # evaluator shares no code with the runner: the runner selects by structure
 # (step pins, wrapper names, scope bits), the evaluator by the `if:` text.
+# One documented difference (#2580): CI's classifier fails closed to the
+# complete surface for a changed path nothing declares, and the hook does
+# not run that expansion. Each case names its undeclared paths; the hook's
+# runnable lanes (`selected`, `deep`) must equal what CI executes for the
+# same push WITHOUT those paths (CI's classify step run on a second commit
+# that touches only the rest), and the expansion must sit in the
+# `fallback` / `deep_fallback` lanes, so the plan still covers every step
+# CI executes.
 #
 # Part 2, behaviour, through real `git push` into a bare remote with the hook
 # installed by scripts/install-git-hooks.sh: a failing selected check blocks
@@ -224,21 +232,44 @@ if ! grep -q 'repo-lint-scope.sh' "$TMP/ci_classify.sh"; then
   exit 1
 fi
 
-# id | branch | ;-separated changed paths
-CASES='docs|feat/docs|README.md;docs/guide.md
-script|feat/script|scripts/coderabbit-wait.sh
-wrapper|feat/wrapper|scripts/ci/check_cockpit
-fastonly|feat/fastonly|scripts/ci/check_bootstrap_sh
-governance|feat/governance|docs/agents/testing-requirements.md
-replay|feat/replay|.mergepath-sync.yml
-full|feat/full|scripts/ci/repo-lint-scope.sh
-unknown|feat/unknown|scripts/brand-new-tool.sh
-prose|feat/prose|scripts/ci/README.md;tests/README.md
-sync|mergepath-sync/wave-1|README.md
-mixed|feat/mixed|scripts/ci/check_doc_ownership;scripts/merge-clearance-gate.sh;BRAND.md
-self|feat/self|scripts/repo-lint-prepush.sh;scripts/git-hooks/pre-push;tests/test_repo_lint_prepush.sh'
+# id | branch | ;-separated changed paths | ;-separated undeclared paths
+CASES='docs|feat/docs|README.md;docs/guide.md|
+script|feat/script|scripts/coderabbit-wait.sh|
+wrapper|feat/wrapper|scripts/ci/check_cockpit|
+fastonly|feat/fastonly|scripts/ci/check_bootstrap_sh|
+governance|feat/governance|docs/agents/testing-requirements.md|
+replay|feat/replay|.mergepath-sync.yml|
+full|feat/full|scripts/ci/repo-lint-scope.sh|
+unknown|feat/unknown|scripts/brand-new-tool.sh|scripts/brand-new-tool.sh
+unknownmixed|feat/unknown-mixed|scripts/brand-new-tool.sh;scripts/coderabbit-wait.sh;tests/test_brand_new_tool.sh|scripts/brand-new-tool.sh;tests/test_brand_new_tool.sh
+unknowntrigger|feat/unknown-trigger|scripts/brand-new-tool.sh;scripts/ci/repo-lint-scope.sh|
+prose|feat/prose|scripts/ci/README.md;tests/README.md|
+sync|mergepath-sync/wave-1|README.md;scripts/brand-new-tool.sh|
+mixed|feat/mixed|scripts/ci/check_doc_ownership;scripts/merge-clearance-gate.sh;BRAND.md|
+hot|feat/hot|scripts/gh-as-author.sh;scripts/codex-review-check.sh|
+self|feat/self|scripts/repo-lint-prepush.sh;scripts/git-hooks/pre-push;tests/test_repo_lint_prepush.sh|'
 
-while IFS='|' read -r id branch paths; do
+lanes_only() { awk -F'\t' '$1 ~ /^(live|selected|fallback|unselected|deep|deep_fallback)$/'; }
+graph_keys=$(jq -c '.wrappers | keys' "$HUB/scripts/ci/repo-lint-dependencies.json")
+ci_wrappers() {  # $1 = scope file: the graph wrappers CI selects for it
+  jq -r --argjson checks "$(sed -n 's/^checks=//p' "$1")" --argjson full "$(sed -n 's/^full=//p' "$1")" \
+     --argjson graph "$graph_keys" '
+    [.lint_fast.steps[] | select((.if // "") | test("^matrix\\.shard == "))
+      | [(.run // "") | capture("^\\./scripts/ci/(?<w>check_[A-Za-z0-9_]+)") | .w] | first
+      | . as $w
+      | select($w != null and ($graph | index($w)) != null)
+      | select($full or ($checks | index($w)) != null)] | unique | .[]' "$TMP/jobs.json"
+}
+hook_wrappers() {  # $1 = plan file, $2 = lane: the wrappers of that lane's steps
+  awk -F'\t' -v l="$2" '$1 == l { print $3 }' "$1" > "$TMP/lane_names"
+  jq -r --rawfile names "$TMP/lane_names" '
+    ($names | split("\n") | map(select(length > 0))) as $n
+    | [.lint_fast.steps[] | select(.name as $x | $n | index($x) != null)
+      | [(.run // "") | capture("^\\./scripts/ci/(?<w>check_[A-Za-z0-9_]+)") | .w] | first] | unique | .[]' \
+    "$TMP/jobs.json"
+}
+
+while IFS='|' read -r id branch paths undeclared; do
   [ -n "$id" ] || continue
   git -C "$HUB" checkout -q -B "$branch" main
   printf '%s\n' "$paths" | tr ';' '\n' | while IFS= read -r p; do
@@ -254,16 +285,53 @@ while IFS='|' read -r id branch paths; do
   (cd "$HUB" && EVENT_NAME=pull_request BASE_SHA="$base" HEAD_SHA="$head" HEAD_REF="$branch" \
      GITHUB_OUTPUT="$TMP/ci_scope.$id" bash -e "$TMP/ci_classify.sh") > /dev/null
   printf 'refs/heads/%s %s refs/heads/%s %s\n' "$branch" "$head" "$branch" "$ZERO" \
-    | (cd "$HUB" && bash scripts/repo-lint-prepush.sh --hook origin "$REMOTE" --plan) > "$TMP/plan.$id"
+    | (cd "$HUB" && bash scripts/repo-lint-prepush.sh --hook origin "$REMOTE" --plan 2>"$TMP/plan_err.$id") > "$TMP/plan.$id"
+
+  # CI's selection minus the undeclared-path expansion: CI's own classify
+  # step on a sibling commit that touches every path except the undeclared.
+  if [ -n "$undeclared" ]; then
+    git -C "$HUB" checkout -q -B "$branch-declared" main
+    printf '%s\n' "$paths" | tr ';' '\n' | LC_ALL=C sort -u \
+      | LC_ALL=C comm -23 - <(printf '%s\n' "$undeclared" | tr ';' '\n' | LC_ALL=C sort -u) \
+      | while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          mkdir -p "$HUB/$(dirname "$p")"
+          printf '\n# prepush parity touch\n' >> "$HUB/$p"
+        done
+    git -C "$HUB" add -A
+    git -C "$HUB" commit -q --allow-empty -m "case $id, declared paths only"
+    : > "$TMP/ci_local_scope.$id"
+    (cd "$HUB" && EVENT_NAME=pull_request BASE_SHA="$base" HEAD_SHA="$(git -C "$HUB" rev-parse HEAD)" HEAD_REF="$branch" \
+       GITHUB_OUTPUT="$TMP/ci_local_scope.$id" bash -e "$TMP/ci_classify.sh") > /dev/null
+  else
+    cp "$TMP/ci_scope.$id" "$TMP/ci_local_scope.$id"
+  fi
 
   ci_scope=$(sort "$TMP/ci_scope.$id" | tr '\n' ' ')
   hook_scope=$(sed -n 's/^scope\t//p' "$TMP/plan.$id" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')
   check "[$id] scope bits equal the CI scope job" "$hook_scope" "$ci_scope"
 
+  # The undeclared paths the hook names are the case's, and its local scope
+  # is CI's scope for the declared paths alone.
+  check "[$id] the hook names exactly the undeclared paths" \
+    "$(sed -n 's/^undeclared\t//p' "$TMP/plan.$id" | LC_ALL=C sort | tr '\n' ';')" \
+    "$(printf '%s' "$undeclared" | tr ';' '\n' | sed '/^$/d' | LC_ALL=C sort | tr '\n' ';')"
+  if [ -n "$undeclared" ]; then
+    check "[$id] the local scope equals CI's scope without the undeclared paths" \
+      "$(sed -n 's/^local_scope\t//p' "$TMP/plan.$id" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')" \
+      "$(sort "$TMP/ci_local_scope.$id" | tr '\n' ' ')"
+    case "$(cat "$TMP/plan_err.$id")" in
+      *"UNDECLARED PATH: "*"CI's lint runs the complete surface"*) ok "[$id] the undeclared path is announced" ;;
+      *) bad "[$id] no undeclared-path notice: $(cat "$TMP/plan_err.$id")" ;;
+    esac
+  else
+    check "[$id] no local scope without an undeclared path" "$(grep -c '^local_scope' "$TMP/plan.$id" || true)" "0"
+  fi
+
   # (a) Coverage: every check step CI executes is in exactly the hook's plan
-  # (live, selected, unselected or deep lane), nothing more.
+  # (any lane, the undeclared-path fallback lanes included), nothing more.
   python3 -I "$TMP/ci_eval.py" "$TMP/jobs.json" "$TMP/ci_scope.$id" | expected_hook_steps > "$TMP/ci_steps.$id"
-  awk -F'\t' '$1 != "scope" { print $2 "\t" $3 }' "$TMP/plan.$id" | LC_ALL=C sort -u > "$TMP/hook_steps.$id"
+  lanes_only < "$TMP/plan.$id" | awk -F'\t' '{ print $2 "\t" $3 }' | LC_ALL=C sort -u > "$TMP/hook_steps.$id"
   if diff -u "$TMP/ci_steps.$id" "$TMP/hook_steps.$id" > "$TMP/diff.$id"; then
     ok "[$id] the plan covers exactly the check steps CI executes ($(wc -l < "$TMP/hook_steps.$id" | tr -d ' '))"
   else
@@ -271,37 +339,36 @@ while IFS='|' read -r id branch paths; do
     sed 's/^/        /' "$TMP/diff.$id"
   fi
 
-  # (b) Deep lane: the self-test and harness steps the hook selects are the
-  # deep-job steps whose if: expressions CI evaluates true.
-  awk -F'\t' '$1 != "lint_fast"' "$TMP/ci_steps.$id" > "$TMP/ci_deep.$id"
+  # (b) Deep lane: the deep steps the hook runs on opt-in are the deep-job
+  # steps whose if: expressions CI evaluates true for the push minus the
+  # undeclared-path fallback; the rest of CI's deep steps are deep_fallback.
+  python3 -I "$TMP/ci_eval.py" "$TMP/jobs.json" "$TMP/ci_local_scope.$id" | expected_hook_steps \
+    | awk -F'\t' '$1 != "lint_fast"' > "$TMP/ci_deep.$id"
   awk -F'\t' '$1 == "deep" { print $2 "\t" $3 }' "$TMP/plan.$id" | LC_ALL=C sort -u > "$TMP/hook_deep.$id"
   if diff -u "$TMP/ci_deep.$id" "$TMP/hook_deep.$id" > "$TMP/diff.$id"; then
-    ok "[$id] deep-lane selection equals CI's ($(wc -l < "$TMP/hook_deep.$id" | tr -d ' ') steps)"
+    ok "[$id] deep-lane selection equals CI's minus the undeclared-path fallback ($(wc -l < "$TMP/hook_deep.$id" | tr -d ' ') steps)"
   else
-    bad "[$id] deep-lane selection differs from CI's (- CI, + hook):"
+    bad "[$id] deep-lane selection differs from CI's minus the undeclared-path fallback (- CI, + hook):"
     sed 's/^/        /' "$TMP/diff.$id"
   fi
+  awk -F'\t' '$1 != "lint_fast"' "$TMP/ci_steps.$id" | LC_ALL=C comm -23 - "$TMP/ci_deep.$id" > "$TMP/ci_deepfb.$id"
+  awk -F'\t' '$1 == "deep_fallback" { print $2 "\t" $3 }' "$TMP/plan.$id" | LC_ALL=C sort -u > "$TMP/hook_deepfb.$id"
+  check "[$id] deep_fallback holds exactly CI's undeclared-path deep expansion" \
+    "$(tr '\n' ' ' < "$TMP/hook_deepfb.$id")" "$(tr '\n' ' ' < "$TMP/ci_deepfb.$id")"
 
   # (c) Wrappers: the fast-lane wrappers the hook runs as `selected` are the
-  # CI scope job's `checks` (every graph wrapper when CI selects the
-  # complete surface), and the always-run `live` lane holds no graph wrapper.
-  ci_full=$(sed -n 's/^full=//p' "$TMP/ci_scope.$id")
-  ci_checks=$(sed -n 's/^checks=//p' "$TMP/ci_scope.$id")
-  jq -r --argjson checks "$ci_checks" --argjson full "$ci_full" \
-     --argjson graph "$(jq -c '.wrappers | keys' "$HUB/scripts/ci/repo-lint-dependencies.json")" '
-    [.lint_fast.steps[] | select((.if // "") | test("^matrix\\.shard == "))
-      | [(.run // "") | capture("^\\./scripts/ci/(?<w>check_[A-Za-z0-9_]+)") | .w] | first
-      | . as $w
-      | select($w != null and ($graph | index($w)) != null)
-      | select($full or ($checks | index($w)) != null)] | unique | .[]' "$TMP/jobs.json" > "$TMP/ci_wrappers.$id"
-  awk -F'\t' '$1 == "selected" { print $3 }' "$TMP/plan.$id" > "$TMP/hook_sel_names.$id"
-  jq -r --rawfile names "$TMP/hook_sel_names.$id" '
-    ($names | split("\n") | map(select(length > 0))) as $n
-    | [.lint_fast.steps[] | select(.name as $x | $n | index($x) != null)
-      | [(.run // "") | capture("^\\./scripts/ci/(?<w>check_[A-Za-z0-9_]+)") | .w] | first] | unique | .[]' \
-    "$TMP/jobs.json" > "$TMP/hook_wrappers.$id"
-  check "[$id] selected fast-lane wrappers equal the CI scope job's checks" \
+  # CI scope job's `checks` for the push minus the undeclared-path fallback
+  # (every graph wrapper when CI selects the complete surface for another
+  # reason); the `fallback` lane holds the rest of CI's selection; the
+  # always-run `live` lane holds no graph wrapper.
+  ci_wrappers "$TMP/ci_local_scope.$id" > "$TMP/ci_wrappers.$id"
+  hook_wrappers "$TMP/plan.$id" selected > "$TMP/hook_wrappers.$id"
+  check "[$id] selected fast-lane wrappers equal the CI scope job's checks minus the undeclared-path fallback" \
     "$(tr '\n' ' ' < "$TMP/hook_wrappers.$id")" "$(tr '\n' ' ' < "$TMP/ci_wrappers.$id")"
+  ci_wrappers "$TMP/ci_scope.$id" | LC_ALL=C comm -23 - <(LC_ALL=C sort "$TMP/ci_wrappers.$id") > "$TMP/ci_fb_wrappers.$id"
+  hook_wrappers "$TMP/plan.$id" fallback > "$TMP/hook_fb_wrappers.$id"
+  check "[$id] fallback wrappers are exactly CI's undeclared-path expansion" \
+    "$(tr '\n' ' ' < "$TMP/hook_fb_wrappers.$id")" "$(tr '\n' ' ' < "$TMP/ci_fb_wrappers.$id")"
   live_graph=$(awk -F'\t' '$1 == "live" { print $3 }' "$TMP/plan.$id" \
     | jq -R -r --argjson graph "$(jq -c '.wrappers | keys' "$HUB/scripts/ci/repo-lint-dependencies.json")" \
         'split(" ")[0] as $w | select(($graph | index($w)) != null) | $w')
@@ -314,9 +381,29 @@ done <<<"$CASES"
 check "docs case is fast-lane only" "$(grep -c '^deep' "$TMP/plan.docs" || true)" "0"
 check "docs case selects no graph wrapper" "$(grep -c '^selected' "$TMP/plan.docs" || true)" "0"
 check "self case selects the mirror's own wrapper" "$(awk -F'\t' '$1 == "selected" { print $3 }' "$TMP/plan.self")" "check_repo_lint_prepush"
-check "script case selects exactly its self-test" \
-  "$(awk -F'\t' '$2 == "deep_self_tests" { print $3 }' "$TMP/plan.script" | tr '\n' ' ')" "check_coderabbit_wait --self-test "
+# coderabbit-wait.sh is declared under both enrolled wrappers whose suites
+# name it (#2580), so exactly those two self-tests run.
+check "script case selects exactly its self-tests" \
+  "$(awk -F'\t' '$2 == "deep_self_tests" { print $3 }' "$TMP/plan.script" | LC_ALL=C sort | tr '\n' ' ')" "check_coderabbit_wait --self-test check_phase_4b_automation --self-test "
 check "full case selects the consumer replay" "$(grep -c 'deep_consumer_replay' "$TMP/plan.full" || true)" "1"
+# #2580: an undeclared path runs no graph wrapper and no deep step here, a
+# full trigger or a propagation head beside one still selects everything,
+# and the hot review scripts select by path rather than by fallback.
+check "unknown case runs no graph wrapper locally" "$(grep -c '^selected' "$TMP/plan.unknown" || true)" "0"
+check "unknown case runs no deep step locally" "$(grep -c '^deep	' "$TMP/plan.unknown" || true)" "0"
+if [ "$(grep -c '^fallback' "$TMP/plan.unknown" || true)" -gt 0 ]; then ok "unknown case keeps CI's expansion in the fallback lane"; else bad "unknown case lost CI's expansion"; fi
+check "unknown case states the reason" "$(sed -n 's/^selection\t//p' "$TMP/plan.unknown")" \
+  "0 wrappers selected by path, $(grep -c '^fallback' "$TMP/plan.unknown") by undeclared-path fallback"
+check "unknownmixed case still runs the declared path's wrapper" \
+  "$(hook_wrappers "$TMP/plan.unknownmixed" selected | tr '\n' ' ')" "$(ci_wrappers "$TMP/ci_local_scope.unknownmixed" | tr '\n' ' ')"
+check "a full trigger beside an undeclared path keeps the complete surface" "$(grep -c '^fallback' "$TMP/plan.unknowntrigger" || true)" "0"
+case "$(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" in *"complete-surface rule (a full trigger"*) ok "the full-trigger reason is printed" ;; *) bad "full-trigger reason: $(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" ;; esac
+check "a propagation head beside an undeclared path keeps the complete surface" "$(grep -c '^fallback' "$TMP/plan.sync" || true)" "0"
+check "the hot review scripts fall back to nothing" "$(grep -c '^fallback' "$TMP/plan.hot" || true)" "0"
+case " $(hook_wrappers "$TMP/plan.hot" selected | tr '\n' ' ') " in
+  *" check_codex_scripts "*" check_gh_as_author "*) ok "the hot review scripts select the wrappers that exercise them" ;;
+  *) bad "hot selection: $(hook_wrappers "$TMP/plan.hot" selected | tr '\n' ' ')" ;;
+esac
 
 # A push to the default branch is a `push` event in CI: the complete surface.
 git -C "$HUB" checkout -q main
@@ -621,6 +708,30 @@ commit_change feat/graphed other/input.txt
 rc=0; out=$(cd "$FIX" && git push origin feat/graphed 2>&1) || rc=$?
 check "graph-selected wrapper: push succeeds" "$rc" "0"
 [ -f "$PROBE_DIR/ran.check_graphed" ] && ok "a selected graph wrapper runs" || bad "selected graph wrapper did not run"
+
+# #2580: a path nothing declares (the hub catch-all, scripts/*) makes CI
+# select the complete surface. The hook runs the live assertions only,
+# names the path in one loud line and says why each wrapper was selected;
+# MERGEPATH_PREPUSH_LIVE=all still runs CI's complete fast lane.
+reset_probe
+commit_change feat/undeclared scripts/new-tool.sh
+rc=0; out=$(cd "$FIX" && git push origin feat/undeclared 2>&1) || rc=$?
+check "undeclared path: push succeeds" "$rc" "0"
+for c in check_ok check_flag check_env; do
+  if [ -f "$PROBE_DIR/ran.$c" ]; then ok "undeclared path: live check $c ran"; else bad "undeclared path: live check $c did not run"; fi
+done
+if [ ! -f "$PROBE_DIR/ran.check_graphed" ]; then ok "undeclared path: the fallback wrapper is not run"; else bad "undeclared path expanded to the complete surface locally"; fi
+case "$out" in
+  *"UNDECLARED PATH: scripts/new-tool.sh is in no wrapper's declared inputs"*"CI's lint runs the complete surface for it"*) ok "undeclared path: one loud line names the path" ;;
+  *) bad "undeclared path notice missing: $out" ;;
+esac
+case "$out" in *"selection: 0 wrappers selected by path, 1 by undeclared-path fallback"*) ok "undeclared path: the selection reason is printed" ;; *) bad "selection reason missing: $out" ;; esac
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m undeclared-all-live
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LIVE=all git push origin feat/undeclared 2>&1) || rc=$?
+check "undeclared path, MERGEPATH_PREPUSH_LIVE=all: push succeeds" "$rc" "0"
+if [ -f "$PROBE_DIR/ran.check_graphed" ]; then ok "MERGEPATH_PREPUSH_LIVE=all runs the fallback wrapper"; else bad "fallback wrapper not run under LIVE=all"; fi
+case "$out" in *"1 fallback wrappers"*) ok "MERGEPATH_PREPUSH_LIVE=all counts the fallback wrappers it runs" ;; *) bad "LIVE=all running line: $out" ;; esac
 
 # A failing selected check blocks the push and names the check.
 reset_probe
