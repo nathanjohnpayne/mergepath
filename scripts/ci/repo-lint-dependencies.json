@@ -187,6 +187,7 @@
     ],
     "check_dependabot_coupled_groups": [
       ".github/dependabot.yml",
+      ".github/workflows/repo_lint.yml",
       "scripts/ci/dependabot_coupled_groups.py",
       "scripts/ci/dependabot-coupled-families.json",
       "scripts/lib/ci-check-modes.sh",

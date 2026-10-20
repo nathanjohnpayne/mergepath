@@ -651,5 +651,92 @@ else
   FAIL=$((FAIL + 1)); echo "  FAIL [$N] --fix edited a config it should leave alone" >&2
 fi
 
+# #2464: execute the actual lint-fast setup body against a depth-one clone.
+# The closed transport shim changes only the GitHub fetch URL to a local bare
+# remote; configuration loading, ref selection, fetch flags and checker reads
+# are production behavior.
+N=$((N + 1))
+if python3 - "$ROOT" "$WORKDIR" <<'PYT'
+import json, os, pathlib, shutil, subprocess, sys, yaml
+root, work = map(pathlib.Path, sys.argv[1:])
+workflow = yaml.safe_load((root / '.github/workflows/repo_lint.yml').read_text())
+steps = workflow['jobs']['lint_fast']['steps']
+setup = next(s for s in steps if s.get('name') == 'fetch_dependabot_target_refs')
+assert setup['if'] == 'matrix.shard == 1' and setup['timeout-minutes'] == 3
+assert steps.index(setup) < next(i for i, s in enumerate(steps) if s.get('name') == 'check_dependabot_coupled_groups')
+checkout = next(s for s in steps if s.get('uses', '').startswith('actions/checkout@'))
+assert checkout['with']['persist-credentials'] is False
+assert checkout['with'].get('fetch-depth', 1) == 1
+
+area = work / 'workflow-target-refs'; area.mkdir()
+real_git = shutil.which('git')
+def git(cwd, *args):
+    return subprocess.run([real_git, '-C', str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+seed = area / 'seed'; seed.mkdir(); git(seed, 'init', '-q', '-b', 'main')
+git(seed, 'config', 'user.name', 'fixture'); git(seed, 'config', 'user.email', 'fixture@example.invalid')
+git(seed, 'config', 'commit.gpgsign', 'false')
+(seed / 'package.json').write_text('{"dependencies":{"react":"*"}}')
+git(seed, 'add', '.'); git(seed, 'commit', '-qm', 'main')
+git(seed, 'checkout', '-qb', 'release')
+(seed / 'package.json').write_text('{"dependencies":{"firebase":"*"},"devDependencies":{"@firebase/rules-unit-testing":"*"}}')
+git(seed, 'commit', '-qam', 'release'); git(seed, 'checkout', '-q', 'main')
+remote = area / 'remote.git'; git(area, 'clone', '--bare', str(seed), str(remote))
+clone = area / 'checkout'; git(area, 'clone', '--depth=1', '--no-tags', '--branch', 'main', remote.as_uri(), str(clone))
+(clone / '.github').mkdir(); (clone / 'scripts/ci').mkdir(parents=True)
+shutil.copy2(root / 'scripts/ci/dependabot_coupled_groups.py', clone / 'scripts/ci')
+config = clone / '.github/dependabot.yml'
+def write_config(branch=None):
+    entry = {'package-ecosystem':'npm','directory':'/','schedule':{'interval':'weekly'},
+             'groups':{'dev':{'dependency-type':'development'},'prod':{'dependency-type':'production'}}}
+    if branch is not None: entry['target-branch'] = branch
+    config.write_text(yaml.safe_dump({'version':2,'updates':[entry, dict(entry),
+        dict(entry, **{'target-branch':'disabled','open-pull-requests-limit':0})]}))
+log = area / 'calls.jsonl'; shim = area / 'bin'; shim.mkdir()
+(shim / 'git').write_text('''#!/usr/bin/env python3
+import json, os, sys
+args=sys.argv[1:]
+with open(os.environ['TARGET_REF_LOG'],'a') as f:
+    f.write(json.dumps({'args':args,'auth':os.environ.get('GIT_CONFIG_COUNT')=='3',
+        'no_helper':os.environ.get('GIT_CONFIG_VALUE_0')==''})+'\\n')
+if args and args[0]=='fetch':
+    assert args[1:4]==['--no-tags','--depth=1','--']
+    assert args[4]=='https://github.com/example/fixture.git'
+    assert os.environ['GIT_CONFIG_VALUE_2'].startswith('AUTHORIZATION: basic ')
+    args[4]=os.environ['TARGET_REF_REMOTE']
+os.execv(os.environ['TARGET_REF_GIT'],[os.environ['TARGET_REF_GIT'],*args])
+'''); (shim / 'git').chmod(0o755)
+env = dict(os.environ, PATH=str(shim)+os.pathsep+os.environ['PATH'], GITHUB_BASE_REF='main',
+    GITHUB_REF_NAME='123/merge', GITHUB_SERVER_URL='https://github.com', GITHUB_REPOSITORY='example/fixture',
+    GITHUB_TOKEN='synthetic-read-token', TARGET_REF_REMOTE=remote.as_uri(), TARGET_REF_LOG=str(log), TARGET_REF_GIT=real_git)
+def run_setup(expected):
+    before = (clone / '.git/config').read_bytes()
+    p = subprocess.run(['bash','-e'], input=setup['run'], cwd=clone, env=env, capture_output=True, text=True, timeout=15)
+    assert p.returncode == expected, (p.returncode,p.stdout,p.stderr)
+    assert 'synthetic-read-token' not in p.stdout+p.stderr
+    assert (clone / '.git/config').read_bytes() == before
+    return p
+write_config(); run_setup(0); assert not log.exists(), 'default target fetched unnecessarily'
+write_config('main'); run_setup(0); assert not log.exists(), 'base target fetched unnecessarily'
+write_config('release')
+checker = [sys.executable,str(root/'scripts/ci/dependabot_coupled_groups.py'),'--root',str(clone)]
+p = subprocess.run(checker, env=env, capture_output=True, text=True)
+assert p.returncode == 2 and 'not available' in p.stderr
+run_setup(0)
+calls = [json.loads(x) for x in log.read_text().splitlines()]
+fetches = [x for x in calls if x['args'][0]=='fetch']
+assert len(fetches)==1 and fetches[0]['auth'] and fetches[0]['no_helper']
+assert fetches[0]['args'][-1] == '+refs/heads/release:refs/remotes/origin/release'
+assert git(clone, 'rev-list','--count','refs/remotes/origin/release') == '1'
+p = subprocess.run(checker, env=env, capture_output=True, text=True)
+assert p.returncode == 1 and 'reading manifests from target-branch ref refs/remotes/origin/release' in p.stdout
+write_config('missing'); run_setup(2)
+count = len([x for x in log.read_text().splitlines() if json.loads(x)['args'][0]=='fetch'])
+write_config('bad branch'); run_setup(2)
+assert len([x for x in log.read_text().splitlines() if json.loads(x)['args'][0]=='fetch']) == count
+print('default/base no-fetch, alternate depth-one read, dedup/disabled filtering, missing/invalid refusal, unchanged git config')
+PYT
+then PASS=$((PASS + 1)); echo "  PASS [$N] actual lint-fast target-ref setup supplies bounded alternate inputs"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] actual lint-fast target-ref setup contract" >&2; fi
+
 echo "dependabot coupled-family group tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
