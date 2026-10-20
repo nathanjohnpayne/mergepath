@@ -240,7 +240,9 @@ for job in self-review-check label-gate external-review-labeling; do
   # same empty string as an absent condition and silently accept a skipped job.
   JOB_IF=$(yq -r ".jobs.\"$job\".if | select(. != null)" "$GATE_WORKFLOW")
   [ -z "$JOB_IF" ] && continue
-  if ! printf '%s\n' "$JOB_CONDITIONS_VERIFIED_FOR_EDITED" | grep -Fxq "$JOB_IF"; then
+  # grep treats embedded pattern newlines as alternatives, so refuse them
+  # before matching one complete decoded expression against the allowlist.
+  if [[ "$JOB_IF" == *$'\n'* ]] || ! printf '%s\n' "$JOB_CONDITIONS_VERIFIED_FOR_EDITED" | grep -Fxq -- "$JOB_IF"; then
     echo "check_pr_review_policy_nudge: $GATE_WORKFLOW job '$job' has a condition this check has not verified runs for 'edited':" >&2
     echo "    $JOB_IF" >&2
     echo "  Confirm a body edit still runs it, then add the expression to JOB_CONDITIONS_VERIFIED_FOR_EDITED." >&2
