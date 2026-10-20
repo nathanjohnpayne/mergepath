@@ -512,14 +512,17 @@ crl_apply_owner_tiebreaks() {
       if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
       then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
       else null end;
-    def later_second($at; $floor):
-      ($at | seconds) as $a | ($floor | seconds) as $f
-      | ($a | type) == "number" and ($f | type) == "number" and $a > $f;
     # The runaway formed with the latest request or response, so the marker
-    # must postdate every one of them.
-    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ] | max // "") as $runaway_floor
+    # must postdate every one of them. Every candidate is converted before
+    # the maximum is taken: a textual max would discard a malformed candidate
+    # that sorts below a valid one, so one bad instant anywhere makes the
+    # floor null, and a null floor holds.
+    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ]
+     | map(seconds)
+     | if length == 0 or any(.[]; type != "number") then null else max end) as $runaway_floor
     | (($stops.stops | index("runaway")) != null
-       and any($tb[]; .kind == "runaway" and later_second(.at; $runaway_floor))) as $runaway
+       and ($runaway_floor | type) == "number"
+       and any($tb[]; .kind == "runaway" and ((.at | seconds) as $a | ($a | type) == "number" and $a > $runaway_floor))) as $runaway
     | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements

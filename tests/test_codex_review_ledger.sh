@@ -683,6 +683,12 @@ rw_no_clear "a marker whose comment timestamp sorts above every instant" "$(prin
 stop_check "runaway tiebreak: a floor that is not an instant leaves the runaway standing" \
   "$(crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$(printf '%s' "$L_RW_FRAC" | jq -c '.responses[-1].last_at = "later"')" "$(crl_owner_tiebreaks "$RWC" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
   '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+# A malformed candidate that is NOT the maximum ("!" sorts below every digit)
+# must hold too: a textual max would discard it before the floor is checked
+# (Codex on #2567).
+stop_check "runaway tiebreak: a malformed candidate below the maximum still leaves the runaway standing" \
+  "$(crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$(printf '%s' "$L_RW_FRAC" | jq -c '.responses[0].last_at = "!"')" "$(crl_owner_tiebreaks "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$RM")" | arr)" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
 # last_at feeds the floor, so a non-string value fails the ledger rather than
 # dropping that response out of the floor; an absent last_at still falls back
 # to first_at (L_RW's last response: last_at 03:30, first_at 01:10).
