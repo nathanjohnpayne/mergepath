@@ -707,9 +707,17 @@ jobs:
             fi
             if [ -x scripts/workflow/codex-p1-snapshot-retry.py ]; then
               driver_out=$(mktemp)
-              scripts/workflow/codex-p1-snapshot-retry.py \
-                "$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode" 2>&1 | tee "$driver_out"
-              driver_rc=${PIPESTATUS[0]}
+              if scripts/workflow/codex-p1-snapshot-retry.py \
+                "$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode" 2>&1 | tee "$driver_out"; then
+                driver_rc=0
+              else
+                driver_status=("${PIPESTATUS[@]}")
+                if [ "${driver_status[1]}" -ne 0 ]; then
+                  echo "::error::Driver output capture failed (rc=${driver_status[1]})." >&2
+                  exit "${driver_status[1]}"
+                fi
+                driver_rc=${driver_status[0]}
+              fi
               # The driver stops at the first gate or read error (no retry on
               # anything but feedback drift) and closes the lease red, or
               # leaves it pending when even that write is refused. When the

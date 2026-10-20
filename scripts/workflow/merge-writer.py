@@ -26,8 +26,23 @@ SPEC.loader.exec_module(OWNER)
 SHA = re.compile(r'[0-9a-f]{40}')
 URL = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)')
 CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
-              'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
+              'scripts/codex-review-ledger.sh', 'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
+# Reviewed enrollment in the trusted installed launcher, never target policy.
+# Immutable repository/owner IDs prevent a reused name or transferred repo from
+# selecting credentialed checker code. New targets require explicit enrollment.
+TRUSTED_TARGETS = {
+    'nathanjohnpayne/mergepath': (1190939344, 23488723),
+    'nathanjohnpayne/matchline': (1218653054, 23488723),
+    'nathanjohnpayne/nathanpaynedotcom': (1165945000, 23488723),
+    'nathanjohnpayne/overridebroadway': (1165157491, 23488723),
+    'nathanjohnpayne/friends-and-family-billing': (1165945849, 23488723),
+    'nathanjohnpayne/swipewatch': (1165945748, 23488723),
+    'nathanjohnpayne/tadlockpsychiatry': (1226654565, 23488723),
+    'nathanjohnpayne/fiveacross': (1292606950, 23488723),
+}
+
+SYSTEM_PATH = ('/usr/bin', '/bin', '/usr/sbin', '/sbin')
 TIMEOUT = 300
 
 
@@ -51,6 +66,14 @@ def trusted_tools(argv):
     for name, value in tools.items():
         if not value or not Path(value).is_absolute() or ROOT in Path(value).resolve().parents:
             raise ValueError(f'trusted operator toolchain is missing {name}')
+    # Keep both supported optional YAML tools in the explicit operator set,
+    # including a Ruby installed outside the fixed OS search directories.
+    for name in ('yq', 'ruby'):
+        executable = shutil.which(name)
+        if executable:
+            if not Path(executable).is_absolute() or ROOT in Path(executable).resolve().parents:
+                raise ValueError(f'trusted operator toolchain has an unsafe {name}')
+            tools[name] = executable
     return tools
 
 
@@ -138,7 +161,8 @@ def merge_preflight(argv, command, tools, task):
     tool_dir.mkdir()
     for name, executable in tools.items():
         (tool_dir / name).symlink_to(executable)
-    environment['PATH'] = str(tool_dir) + os.pathsep + environment['PATH']
+    # Unlisted helpers use fixed OS search directories, never inherited PATH.
+    environment['PATH'] = os.pathsep.join((str(tool_dir), *SYSTEM_PATH))
 
     def read(*args):
         result = subprocess.run([gh, *args], env=environment, text=True,
@@ -154,8 +178,12 @@ def merge_preflight(argv, command, tools, task):
     # and the final writer use the canonical URL and explicit repository.
     if 'GH_REPO' in os.environ:
         environment['GH_REPO'] = os.environ['GH_REPO']
-    fields = 'url,headRefOid,baseRefOid,baseRefName,state'
+    fields = 'url,headRefOid,baseRefOid,baseRefName,state,labels'
     pr = read(*query, '--json', fields)
+    initial_labels = pr.pop('labels')
+    if not isinstance(initial_labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in initial_labels):
+        raise ValueError('initial blocking labels are unreadable')
+    initial_labels = {label['name'] for label in initial_labels}
     environment.pop('GH_REPO', None)
     match = URL.fullmatch(pr.get('url', ''))
     head, base = pr.get('headRefOid', ''), pr.get('baseRefOid', '')
@@ -167,6 +195,13 @@ def merge_preflight(argv, command, tools, task):
     repository = read('api', f'repos/{repo}')
     if repository.get('full_name', '').lower() != repo.lower() or not repository.get('default_branch'):
         raise ValueError('target repository/default branch is unreadable')
+    enrolled = TRUSTED_TARGETS.get(repo.lower())
+    target_owner = repository.get('owner')
+    if (not enrolled or type(repository.get('id')) is not int or not isinstance(target_owner, dict)
+            or type(target_owner.get('id')) is not int
+            or (repository['id'], target_owner['id']) != enrolled
+            or target_owner.get('login') != os.environ.get('GH_AS_AUTHOR_RECORD_IDENTITY')):
+        raise ValueError('repository is not an enrolled target for this verified author; refusing checker download')
     from urllib.parse import quote
     commit = read('api', f'repos/{repo}/commits/{quote(repository["default_branch"], safe="")}')
     source_sha = commit.get('sha', '')
@@ -229,6 +264,16 @@ def merge_preflight(argv, command, tools, task):
                        MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY='false')
     subprocess.run([tools['bash'], str(task / 'scripts/merge-clearance-gate.sh'), number, repo],
                    env=environment, cwd=task, check=True, timeout=TIMEOUT)
+    # The label may disappear while the threshold gate reads metadata, then
+    # return before the final snapshot. Bind an initial explicit requirement
+    # to the full checker, which does not derive scope from mutable labels.
+    codex_policy = policy_data.get('codex') or {}
+    external_gate = codex_policy.get('external_review_gate') or {}
+    if 'needs-external-review' in initial_labels and external_gate.get('enabled', False) is not False:
+        subprocess.run([tools['bash'], str(task / 'scripts/codex-review-check.sh'), number, repo],
+                       env=dict(environment, CODEX_REVIEW_CHECK_SKIP_CI='1',
+                                CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD='1'),
+                       cwd=task, check=True, timeout=TIMEOUT)
     # Re-read mutable CI, reviewer and queue predicates only after clearance
     # has finished, immediately before the final tuple/hold snapshot.
     environment.update(GH_AS_AUTHOR_IDENTITY=author, GH_PR_GUARD_EXPECTED_AUTHOR=author,
@@ -237,12 +282,14 @@ def merge_preflight(argv, command, tools, task):
     subprocess.run([tools['bash'], str(task / 'scripts/hooks/gh-pr-guard.sh')], input=payload,
                    env=environment, cwd=task, text=True, check=True, timeout=TIMEOUT)
     environment.pop('CODEX_CLEARED', None)
-    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields + ',labels')
+    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields)
     labels = fresh.pop('labels')
     if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in labels):
         raise ValueError('final blocking labels are unreadable')
     if {'human-hold', 'needs-human-review', 'policy-violation'} & {label['name'] for label in labels}:
         raise ValueError('a human-controlled hold is present in the final snapshot')
+    if 'needs-external-review' in {label['name'] for label in labels} - initial_labels:
+        raise ValueError('external-review requirement appeared during clearance; rerun against the final requirement')
     if fresh != pr:
         raise ValueError('PR target/head/base/state changed during final clearance')
     return normalized, environment

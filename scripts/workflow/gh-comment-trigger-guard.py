@@ -6,14 +6,57 @@ import os
 from pathlib import Path
 import re
 import sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 PHRASE = re.compile(r"@codex\s+review", re.IGNORECASE)
 COMMAND = re.compile(r"\s*@codex\s+review\s*", re.IGNORECASE)
+GRAPHQL_COMMENTS = frozenset({
+    "addComment", "addDiscussionComment", "addPullRequestReview",
+    "addPullRequestReviewComment", "addPullRequestReviewThread",
+    "addPullRequestReviewThreadReply", "submitPullRequestReview",
+    "updateDiscussionComment", "updateIssueComment",
+    "updatePullRequestReview", "updatePullRequestReviewComment",
+})
+GRAPHQL_TOKENS = re.compile(
+    r'"""(?:\\"""|(?!"""|\\""")[\s\S])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*|[_A-Za-z][_0-9A-Za-z]*|[^\s,]'
+)
 
 
 class Refused(ValueError):
     pass
+
+
+def graphql_comment_document(query):
+    """Recognize known comment calls without interpreting GraphQL execution."""
+    tokens, literals = [], []
+    unsupported_literal = False
+    for match in GRAPHQL_TOKENS.finditer(query):
+        token = match.group()
+        if token.startswith("#") or token == "\ufeff":
+            continue
+        if token.startswith('"""'):
+            literals.append(token[3:-3].replace('\\"""', '"""'))
+        elif token.startswith('"'):
+            try:
+                literals.append(json.loads(token))
+            except ValueError:
+                unsupported_literal = True
+        else:
+            tokens.append(token)
+    comment, depth = False, 0
+    for index, token in enumerate(tokens):
+        operation_name = (depth == 0 and index > 0
+                          and tokens[index - 1] in ("query", "mutation", "subscription"))
+        if (token in GRAPHQL_COMMENTS and index + 1 < len(tokens)
+                and tokens[index + 1] == "(" and not operation_name):
+            comment = True
+        if token == "{":
+            depth += 1
+        elif token == "}":
+            depth -= 1
+    if comment and unsupported_literal:
+        raise Refused("Unsupported GraphQL string escape in a comment mutation; no write performed.")
+    return comment, literals
 
 
 def inspect(argv, role, state=None):
@@ -27,6 +70,8 @@ def inspect(argv, role, state=None):
 
     def file_body(value, json_input=False):
         nonlocal serial, deferred
+        if state is None:
+            deferred = True  # Only the runtime wrapper can freeze execution bytes.
         if state is None and (value in ("-", "/dev/stdin", "/dev/fd/0") or not Path(value).is_file()):
             deferred = True
             return None, value
@@ -45,16 +90,18 @@ def inspect(argv, role, state=None):
                 output.write(raw)
         return parsed, replacement
 
-    def json_bodies(value):
+    def json_bodies(value, all_strings=False):
         if isinstance(value, dict):
             for key, child in value.items():
                 if key == "body" and isinstance(child, str):
                     bodies.append(child)
                 else:
-                    json_bodies(child)
+                    json_bodies(child, all_strings)
         elif isinstance(value, list):
             for child in value:
-                json_bodies(child)
+                json_bodies(child, all_strings)
+        elif all_strings and isinstance(value, str):
+            bodies.append(value)
 
     def option(index, names):
         value = args[index]
@@ -210,25 +257,71 @@ def inspect(argv, role, state=None):
             i += 1
         path = unquote(urlsplit(endpoint).path).lstrip("/")
         method = method.upper() if method else ("POST" if fields or inputs else "GET")
-        if method not in ("POST", "PATCH", "PUT") or not re.fullmatch(
+        if path.rstrip("/") == "graphql":
+            channel = "graphql-comment"
+            queries = []
+            for key, value in parse_qsl(urlsplit(endpoint).query, keep_blank_values=True):
+                bodies.append(value)
+                if key == "query":
+                    queries.append(value)
+                elif key == "variables":
+                    json_bodies(json.loads(value), all_strings=True)
+            for value, at, prefix, typed in fields:
+                key, separator, body = value.partition("=")
+                if not separator:
+                    if len(key) > 2 and key.endswith("[]"):
+                        continue  # gh's valueless empty array has no body text.
+                    raise Refused("GraphQL fields require an explicit key=value.")
+                if typed and body.startswith("@"):
+                    body, replacement = file_body(body[1:])
+                    args[at] = prefix + key + "=@" + replacement
+                if body is not None:
+                    bodies.append(body)
+                    if key == "query":
+                        queries.append(body)
+            for value, at, prefix in inputs:
+                payload, replacement = file_body(value, json_input=True)
+                args[at] = prefix + replacement
+                if payload is None:
+                    continue
+                if not isinstance(payload, dict):
+                    raise Refused("GraphQL input must be a JSON object.")
+                json_bodies(payload, all_strings=True)
+                if "query" in payload:
+                    if not isinstance(payload["query"], str):
+                        raise Refused("GraphQL query must be a string.")
+                    queries.append(payload["query"])
+            comment = False
+            for query in queries:
+                writes_comment, literals = graphql_comment_document(query)
+                comment = comment or writes_comment
+                bodies.extend(literals)
+            if not comment:
+                # Freeze even read inputs: a later file edit cannot turn the
+                # inspected query into a comment mutation before execution.
+                return args, {"guarded": deferred, "trigger": False, "deferred": deferred}
+            # Raw GraphQL is never the canonical requester's authorized CLI
+            # comment channel, even when its body is the complete command.
+        elif method not in ("POST", "PATCH", "PUT") or not re.fullmatch(
             r"repos/[^/]+/[^/]+/(?:issues/(?:[0-9]+/comments|comments/[0-9]+)|pulls/(?:[0-9]+/(?:comments(?:/[0-9]+/replies)?|reviews(?:/[0-9]+(?:/events)?)?)|comments/[0-9]+))", path
         ):
             return original_args, {"guarded": False, "trigger": False}
-        channel = "api-comment"
-        for value, at, prefix, typed in fields:
-            key, separator, body = value.partition("=")
-            if not separator or not re.search(r"(?:^body$|\[body\]$)", key):
-                continue
-            if typed and body.startswith("@"):
-                body, replacement = file_body(body[1:])
-                args[at] = prefix + key + "=@" + replacement
-            if body is not None:
-                bodies.append(body)
-        for value, at, prefix in inputs:
-            body, replacement = file_body(value, json_input=True)
-            if body is not None:
-                json_bodies(body)
-            args[at] = prefix + replacement
+        if channel != "graphql-comment":
+            channel = "api-comment"
+            for value, at, prefix, typed in fields:
+                key, separator, body = value.partition("=")
+                if not separator or not re.search(r"(?:^body$|\[body\]$)", key):
+                    continue
+                if typed and body.startswith("@"):
+                    body, replacement = file_body(body[1:])
+                    args[at] = prefix + key + "=@" + replacement
+                if body is not None:
+                    bodies.append(body)
+            for value, at, prefix in inputs:
+                body, replacement = file_body(value, json_input=True)
+                if body is not None:
+                    json_bodies(body)
+                args[at] = prefix + replacement
     else:
         return original_args, {"guarded": False, "trigger": False}
 

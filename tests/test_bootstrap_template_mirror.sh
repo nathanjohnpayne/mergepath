@@ -154,6 +154,10 @@ spec_test_map:
     - tests/test_bootstrap_github_infra.sh
   bootstrap_source_attribution:
     - tests/test_bootstrap_template_mirror.sh
+  sync_test_closure:
+    - tests/test_sync_overrides.sh
+    - tests/test_sync_to_downstream.sh
+  project_doc_sync: tests/test_project_doc_sync.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -252,6 +256,8 @@ echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
 # #1056: hub-only bootstrap source-attribution spec, seeded for the same
 # vacuous-test reason as the line above.
 echo "source attribution spec" >"$FAKE_MP/specs/bootstrap_source_attribution.md"
+echo "sync test closure spec" >"$FAKE_MP/specs/sync_test_closure.md"
+echo "project documentation sync spec" >"$FAKE_MP/specs/project_doc_sync.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
@@ -464,6 +470,8 @@ for excluded in \
   'specs/mergepath_playground.md' \
   'specs/bootstrap_label_seeding.md' \
   'specs/bootstrap_source_attribution.md' \
+  'specs/sync_test_closure.md' \
+  'specs/project_doc_sync.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -536,7 +544,7 @@ for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_fa
   chk_out=$(bash "$TARGET/scripts/ci/$chk" 2>&1)
   chk_ec=$?
   set -e
-  if [ "$chk_ec" -eq 0 ] && printf '%s' "$chk_out" | grep -q "SKIP"; then
+  if [ "$chk_ec" -eq 0 ] && printf '%s' "$chk_out" | grep "SKIP" >/dev/null; then
     pass "$chk takes consumer-SKIP path on bootstrapped tree"
   else
     fail "$chk should SKIP on bootstrapped tree; rc=$chk_ec, out: $chk_out"
@@ -961,7 +969,7 @@ fi
 # NOTHING else. Under the old hand-maintained array this leaked; the
 # derived set has to pick it up with no code edit at all.
 derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/newly-hub-only.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
-if [ "$DERIVE_RC" = "0" ] && printf '%s\n' "$DERIVE_OUT" | grep -qx 'docs/agents/newly-hub-only.md'; then
+if [ "$DERIVE_RC" = "0" ] && printf '%s\n' "$DERIVE_OUT" | grep -x 'docs/agents/newly-hub-only.md' >/dev/null; then
   pass "a newly classified hub-only doc is excluded with no edit to BOOTSTRAP_MIRROR_EXCLUDES (#797 review)"
 else
   fail "derivation missed a newly classified hub-only doc (rc=$DERIVE_RC): $DERIVE_OUT $DERIVE_ERR"
@@ -978,21 +986,21 @@ fi
 # derivation that returns 0 with an empty set would mirror hub-only
 # content into the new repo silently, which is the whole hazard.
 derive_case 'rm .mergepath-sync.yml'
-if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'source .mergepath-sync.yml missing'; then
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep 'source .mergepath-sync.yml missing' >/dev/null; then
   pass "derivation fails closed when the source manifest is absent"
 else
   fail "derivation should fail closed without a source manifest (rc=$DERIVE_RC): $DERIVE_ERR"
 fi
 
 derive_case 'printf "version: 1\n" > .mergepath-sync.yml'
-if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no valid doc_ownership list'; then
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep 'no valid doc_ownership list' >/dev/null; then
   pass "derivation fails closed when doc_ownership is absent"
 else
   fail "derivation should fail closed without a doc_ownership list (rc=$DERIVE_RC): $DERIVE_ERR"
 fi
 
 derive_case 'printf "doc_ownership:\n  - path: docs/agents/x.md\n    class: canonical\n" > .mergepath-sync.yml'
-if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no .class: hub-only. doc'; then
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep 'no .class: hub-only. doc' >/dev/null; then
   pass "derivation fails closed when the inventory yields no hub-only doc (the class name moved)"
 else
   fail "derivation should refuse an empty hub-only set (rc=$DERIVE_RC): $DERIVE_ERR"
@@ -1001,7 +1009,7 @@ fi
 # A wildcard would be honored by rsync: `docs/agents/*.md` strips every
 # canonical agent doc from the new repo. Reject it at the source.
 derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/*.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
-if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'wildcard metacharacter'; then
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep 'wildcard metacharacter' >/dev/null; then
   pass "derivation rejects a wildcard hub-only path before it reaches rsync"
 else
   fail "derivation should reject a wildcard hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
@@ -1018,7 +1026,7 @@ fi
   || fail "a rejected derivation left patterns on stdout that a caller could mirror with: $DERIVE_OUT"
 
 derive_case 'yq -i '\''.doc_ownership += [{"path":"scripts/secret.sh","class":"hub-only"}]'\'' .mergepath-sync.yml'
-if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q "only for 'docs/agents/\*\.md' paths"; then
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep "only for 'docs/agents/\*\.md' paths" >/dev/null; then
   pass "derivation fails closed on a hub-only path outside the inventory's documented scope"
 else
   fail "derivation should refuse an out-of-scope hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
@@ -1092,7 +1100,7 @@ symlink_rsync_rc=$?
 set -e
 if [ "$symlink_rsync_rc" != "0" ] \
    && [ -f "$symlink_outside/newly-hub-only.md" ] \
-   && printf '%s' "$symlink_rsync_out" | grep -q 'symlink ancestor'; then
+   && printf '%s' "$symlink_rsync_out" | grep 'symlink ancestor' >/dev/null; then
   pass "bootstrap::_rsync_template rejects a symlink ancestor without deleting outside the target"
 else
   fail "symlinked target ancestry must fail closed and preserve the outside file (rc=$symlink_rsync_rc): $symlink_rsync_out"
@@ -1118,7 +1126,7 @@ root_symlink_rc=$?
 set -e
 if [ "$root_symlink_rc" != "0" ] \
    && [ -f "$root_symlink_outside/docs/agents/newly-hub-only.md" ] \
-   && printf '%s' "$root_symlink_out" | grep -q 'target root.*symbolic link'; then
+   && printf '%s' "$root_symlink_out" | grep 'target root.*symbolic link' >/dev/null; then
   pass "bootstrap::_rsync_template rejects a symlinked target root without deleting outside it"
 else
   fail "symlinked target root must fail closed and preserve the outside file (rc=$root_symlink_rc): $root_symlink_out"
@@ -1172,7 +1180,7 @@ blind_rsync_rc=$?
 set -e
 blind_copied=$(find "$blind_dst" -type f | head -1)
 if [ "$blind_rsync_rc" != "0" ] && [ -z "$blind_copied" ] \
-   && printf '%s' "$blind_rsync_out" | grep -q 'refusing to rsync without the hub-only exclusions'; then
+   && printf '%s' "$blind_rsync_out" | grep 'refusing to rsync without the hub-only exclusions' >/dev/null; then
   pass "bootstrap::_rsync_template aborts, copying nothing, when the hub-only exclusions cannot be derived"
 else
   fail "rsync should abort with an empty destination on an underivable inventory (rc=$blind_rsync_rc, copied='$blind_copied'): $blind_rsync_out"
@@ -1211,7 +1219,7 @@ done
   || fail "docs/agents/operating-rules.md missing from the new repo"
 
 live_overlay_banner=$(sed -n '/^>/,/^$/p' "$ROOT/docs/agents/operating-rules.md")
-if printf '%s\n' "$live_overlay_banner" | grep -Eiq "mergepath|#[0-9]+"; then
+if printf '%s\n' "$live_overlay_banner" | grep -Ei "mergepath|#[0-9]+" >/dev/null; then
   fail "live operating-rules banner is not consumer-neutral"
 else
   pass "live operating-rules banner is consumer-neutral for bootstrap seeding"
@@ -1271,42 +1279,42 @@ res=$(verify_case "control" ":")
   || fail "verifier control unexpectedly failed: ${res#*|}"
 
 res=$(verify_case "derived-required-set" ":" 'yq -i '\''.doc_ownership += [{"path":"docs/agents/new-canonical.md","class":"canonical"}]'\'' .mergepath-sync.yml')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "docs/agents/new-canonical.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "docs/agents/new-canonical.md" >/dev/null; then
   pass "verifier derives newly backed canonical docs from the source manifest (#780)"
 else
   fail "verifier should require a newly backed canonical doc without a copied array update; got: $res"
 fi
 
 res=$(verify_case "missing-doc" 'rm docs/agents/shared-operating-rules.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs missing"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "canonical agent docs missing" >/dev/null; then
   pass "verifier fails closed when a canonical agent doc is absent (#780)"
 else
   fail "verifier should fail on a missing canonical doc; got: $res"
 fi
 
 res=$(verify_case "stale-canonical" 'printf "stale receiver copy\n" > docs/agents/shared-operating-rules.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "canonical agent docs differ" >/dev/null; then
   pass "verifier rejects a stale receiver-side canonical document (#780)"
 else
   fail "verifier should compare canonical document bytes, not merely existence; got: $res"
 fi
 
 res=$(verify_case "wrong-canonical-mode" 'chmod +x docs/agents/shared-operating-rules.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "canonical agent docs differ" >/dev/null; then
   pass "verifier rejects a canonical document whose receiver Git mode differs (#780)"
 else
   fail "verifier should compare canonical document modes, not merely existence; got: $res"
 fi
 
 res=$(verify_case "wrong-order" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "BEFORE docs/agents/shared-operating-rules.md" >/dev/null; then
   pass "verifier fails closed when AGENTS.md lists the local overlay first (#780)"
 else
   fail "verifier should fail on a shared-after-local AGENTS.md; got: $res"
 fi
 
 res=$(verify_case "same-line-wrong-order" 'printf "## Sections\n\n1. Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "BEFORE docs/agents/shared-operating-rules.md" >/dev/null; then
   pass "verifier compares columns when both AGENTS.md links share a line (#780)"
 else
   fail "verifier should fail when the local link precedes shared on one line; got: $res"
@@ -1320,21 +1328,21 @@ else
 fi
 
 res=$(verify_case "raw-occurrence-before-index" 'printf "<!-- docs/agents/shared-operating-rules.md -->\nProse example: docs/agents/shared-operating-rules.md.\n\n## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "BEFORE docs/agents/shared-operating-rules.md" >/dev/null; then
   pass "verifier ignores raw comment/prose occurrences and checks the visible reading-order links"
 else
   fail "raw occurrences must not mask a reversed visible AGENTS.md index; got: $res"
 fi
 
 res=$(verify_case "unlinked" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/shared-operating-rules.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "does not reference docs/agents/shared-operating-rules.md" >/dev/null; then
   pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"
 else
   fail "verifier should fail on an AGENTS.md with no shared-rules link; got: $res"
 fi
 
 res=$(verify_case "local-unlinked" 'printf "## Sections\n\n1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
-if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/operating-rules.md"; then
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "does not reference docs/agents/operating-rules.md" >/dev/null; then
   pass "verifier fails closed when AGENTS.md never links the local overlay (#780)"
 else
   fail "verifier should fail on an AGENTS.md with no local-overlay link; got: $res"
@@ -1413,7 +1421,7 @@ pg_out=$(bash -c '
   echo "RC=$?"
 ' 2>&1)
 set -e
-echo "$pg_out" | grep -q "RC=0" \
+echo "$pg_out" | grep "RC=0" >/dev/null \
   && pass "README.md scrub allows a consumer-owned Playground name (rc=0)" \
   || fail "README.md scrub rejected a consumer-owned Playground name; out: $pg_out"
 grep -qF "# Playground" "$pg_target/README.md" \
@@ -1508,7 +1516,7 @@ hw_out=$(bash -c '
   echo "RC=$?"
 ' 2>&1)
 set -e
-echo "$hw_out" | grep -q "RC=0" \
+echo "$hw_out" | grep "RC=0" >/dev/null \
   && pass "scaffold helper handles the hard-wrapped fixture (rc=0)" \
   || fail "scaffold helper failed on hard-wrapped fixture; out: $hw_out"
 hw_leak=""
@@ -1562,7 +1570,7 @@ nb_out=$(bash -c '
   echo "RC=$?"
 ' 2>&1)
 set -e
-echo "$nb_out" | grep -q "RC=0" \
+echo "$nb_out" | grep "RC=0" >/dev/null \
   && pass "scaffold helper handles the no-blank-line-before-heading fixture (rc=0)" \
   || fail "scaffold helper failed on no-blank-line-before-heading fixture; out: $nb_out"
 grep -q "^### Phase 4: External Review" "$nb_target/REVIEW_POLICY.md" \
@@ -1626,6 +1634,8 @@ assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.
 assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
 # The source-attribution entry must be gone for the same reason (#1056).
 assert_spec_map_key_removed bootstrap_source_attribution "$TARGET/.repo-template.yml"
+assert_spec_map_key_removed sync_test_closure "$TARGET/.repo-template.yml"
+assert_spec_map_key_removed project_doc_sync "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
@@ -1660,7 +1670,7 @@ fixture_dirty=$(git -C "$FAKE_MP" status --porcelain 2>/dev/null | wc -l | tr -d
   || fail "mergepath fixture is dirty: $(git -C "$FAKE_MP" status --porcelain)"
 # No new branch should be left behind.
 fixture_branches=$(git -C "$FAKE_MP" branch --format='%(refname:short)' | sort)
-echo "$fixture_branches" | grep -q "^bootstrap/" \
+echo "$fixture_branches" | grep "^bootstrap/" >/dev/null \
   && fail "stray bootstrap/* branch left on fixture: $fixture_branches" \
   || pass "no stray bootstrap/* branch on fixture"
 
@@ -1704,7 +1714,7 @@ set -e
 [ ! -e "$dry_target/README.md" ] \
   && pass "dry-run did not actually rsync into target" \
   || fail "dry-run materialized README.md unexpectedly"
-echo "$dry_out" | grep -q "DRY-RUN" \
+echo "$dry_out" | grep "DRY-RUN" >/dev/null \
   && pass "dry-run output includes [DRY-RUN] tags" \
   || fail "dry-run output missing [DRY-RUN]: $dry_out"
 
@@ -1883,10 +1893,10 @@ EOF
   set -e
   # The helper should return non-zero (rc=2 per the impl) AND emit a
   # diagnostic mentioning yq.
-  echo "$no_yq_out" | grep -q "yq is required" \
+  echo "$no_yq_out" | grep "yq is required" >/dev/null \
     && pass "_clean_repo_template_yml errors with 'yq is required' diagnostic when yq missing" \
     || fail "expected 'yq is required' diagnostic; got: $no_yq_out"
-  echo "$no_yq_out" | grep -q "RC=2" \
+  echo "$no_yq_out" | grep "RC=2" >/dev/null \
     && pass "_clean_repo_template_yml returns rc=2 when yq missing (fails closed)" \
     || fail "expected RC=2 in subshell; got: $no_yq_out"
   # Verify the .repo-template.yml content is UNCHANGED (the helper
@@ -1947,7 +1957,7 @@ else
   [ "$pf_ec" -ne 0 ] \
     && pass "wizard preflight rejects missing yq (rc=$pf_ec)" \
     || fail "wizard should reject missing yq; got rc=$pf_ec, out: $pf_out"
-  echo "$pf_out" | grep -q "missing required dependency: yq" \
+  echo "$pf_out" | grep "missing required dependency: yq" >/dev/null \
     && pass "wizard preflight emits 'missing required dependency: yq' diagnostic" \
     || fail "expected 'missing required dependency: yq'; got: $pf_out"
 fi
@@ -2032,7 +2042,7 @@ trap_out=$(
 )
 trap_ec=$?
 set -e
-if [ "$trap_ec" -eq 0 ] && echo "$trap_out" | grep -q "SURVIVED-RETURN"; then
+if [ "$trap_ec" -eq 0 ] && echo "$trap_out" | grep "SURVIVED-RETURN" >/dev/null; then
   pass "live _anchor_insert + bootstrap::run return survives under set -u (#733)"
 else
   fail "leaked RETURN trap regression: rc=$trap_ec, out: $trap_out"

@@ -301,6 +301,8 @@
       "tests/test_phase_4b_heartbeat.sh",
       "tests/test_phase_4b_escalation.cjs",
       "tests/test_coderabbit_wait_status_probe.sh",
+      "tests/fixtures/coderabbit_status_refusal.json",
+      "tests/fixtures/coderabbit_quota_refusal.json",
       "tests/test_phase_4b_immutable_input.sh"
     ],
     "check_phase_4b_classifier": [
@@ -425,7 +427,8 @@
       "tests/test_dependabot_auto_merge_check_wait.sh",
       "tests/test_655_repo_lint_local_observed.sh",
       "tests/test_load_review_config.sh",
-      "scripts/ci/fixtures/workflow-parsers/*"
+      "scripts/ci/fixtures/workflow-parsers/*",
+      "scripts/lib/head-check-runs.sh"
     ],
     "check_workflow_verify_propagation_templated": [
       "tests/test_verify_propagation_pr_templated.sh"

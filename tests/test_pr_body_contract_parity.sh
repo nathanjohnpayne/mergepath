@@ -1399,7 +1399,7 @@ while IFS= read -r wf; do
   # One declared bound per file, and it must equal the lib's. Counting the
   # timeout options rather than just grepping for the constant means a file that
   # declares the constant but forgets to pass it to a second call still fails.
-  wf_opts="$(grep -cE 'timeout: PR_BODY_PARSE_TIMEOUT_MS' "$wf")"
+  wf_opts="$(grep -cE 'timeout: (PR_BODY_PARSE_TIMEOUT_MS|auditTimeout\(PR_BODY_PARSE_TIMEOUT_MS\))' "$wf")"
   wf_declared="$(sed -n 's/.*PR_BODY_PARSE_TIMEOUT_MS = \([0-9]*\);.*/\1/p' "$wf" | head -1)"
   if [ -z "$wf_declared" ]; then
     bad "#1281: $wf_name invokes the parser directly with no declared timeout -- unbounded, the spec's claim does not hold there"
@@ -1408,7 +1408,7 @@ while IFS= read -r wf; do
   elif [ "$wf_opts" -lt "$wf_calls" ]; then
     bad "#1281: $wf_name has $wf_calls parser call(s) but passes the timeout to only $wf_opts -- at least one is unbounded"
   else
-    ok "#1281: $wf_name bounds all $wf_calls parser call(s) at ${wf_declared}ms, matching the lib"
+    ok "#1281: $wf_name bounds all $wf_calls parser call(s) at most ${wf_declared}ms, matching the lib"
   fi
 done <<< "$wf_sites"
 
@@ -1429,49 +1429,113 @@ const pr = (number, login = 'nathanjohnpayne', body = 'valid') => ({
   merged_at: new Date(startTime).toISOString(), labels: [],
   head: { sha: 'a'.repeat(40), ref: 'fixture', repo: { full_name: 'owner/repo' } },
 });
-async function audit(prs, { expireAfterFirst = false } = {}) {
+async function audit(prs, options = {}) {
+  const {expireAfterFirst = false, budgetMs = 25 * 60 * 1000, reserveMs = 60000,
+    elapsedClock = false, stalledEndpoint = '', failCreate = false, failSummary = false,
+    verifier = '', verifierRemainingMs = 70} = options;
   let now = startTime;
+  const wallStart = Date.now();
+  const readNow = () => now + (elapsedClock ? Date.now() - wallStart : 0);
   const parsed = [], reviewed = [], reports = [], failures = [], messages = [];
+  const requests = [], createAttempts = [], summaryBodies = [], verifierTimeouts = [];
+  let aborted = false;
   class Clock extends Date {
-    constructor(...args) { super(...(args.length ? args : [now])); }
-    static now() { return now; }
+    constructor(...args) { super(...(args.length ? args : [readNow()])); }
+    static now() { return readNow(); }
   }
   const endpoints = {
-    pulls: { list: 'prs', listReviews: 'reviews' },
-    issues: { listEvents: 'events', listComments: 'comments',
-      create: async report => reports.push(report) },
+    pulls: {list: 'prs', listReviews: 'reviews', listReviewComments: 'inline'},
+    issues: {listEvents: 'events', listComments: 'comments', create: async report => {
+      createAttempts.push(report);
+      if (failCreate) throw new Error('report publication unavailable');
+      reports.push(report);
+    }},
   };
-  const github = { rest: endpoints, paginate: async (endpoint, args) => {
-    if (endpoint === 'prs') return prs;
-    if (endpoint === 'reviews') reviewed.push(args.pull_number);
+  const github = {rest: endpoints, paginate: async (endpoint, args) => {
+    requests.push({endpoint, args});
+    if (endpoint === stalledEndpoint) {
+      args.request?.signal?.addEventListener('abort', () => { aborted = true; });
+      return new Promise(() => {}); // Native watchdog makes a missing bound fail.
+    }
+    if (endpoint === 'prs') return verifier === 'anchor'
+      ? prs.map(pr => ({...pr, labels: [{name: 'needs-external-review'}]})) : prs;
+    if (endpoint === 'reviews') {
+      reviewed.push(args.pull_number);
+      return verifier === 'anchor' ? [{user: {login: 'chatgpt-codex-connector[bot]'},
+        state: 'COMMENTED', commit_id: 'a'.repeat(40), body: 'Codex review completed',
+        submitted_at: new Date(startTime - 1000).toISOString()}] : [];
+    }
+    if (endpoint === 'events' && verifier === 'anchor') return [{event: 'labeled',
+      label: {name: 'needs-external-review'}, created_at: new Date(startTime - 2000).toISOString()}];
+    if (endpoint === 'comments' && verifier === 'anchor' || endpoint === 'inline' && verifier === 'owner') {
+      now = startTime + budgetMs - reserveMs - verifierRemainingMs;
+    }
+    if (endpoint === 'comments' && verifier === 'owner') return [{user: {login: 'nathanjohnpayne'},
+      body: '<!-- mergepath-owner-admin-override:v1 -->'}];
     return [];
-  } };
+  }, graphql: async (_query, args) => {
+    requests.push({endpoint: 'graphql', args});
+    return {repository: {pullRequest: {reviewThreads: {nodes: [], pageInfo: {hasNextPage: false}}}}};
+  }};
   const mockedRequire = name => {
-    if (name === 'fs') return { readFileSync: () => 'policy' };
-    if (name === 'js-yaml') return { load: () => ({
+    if (name === 'fs') return {readFileSync: () => 'policy'};
+    if (name === 'js-yaml') return {load: () => ({
       available_reviewers: ['nathanpayne-codex'], author_identity: 'nathanjohnpayne',
-    }) };
-    if (name === 'child_process') return { execFileSync: (command, args, options) => {
-      assert.equal(args[0], 'scripts/lib/pr-body-contract.mjs');
-      assert.equal(options.timeout, 120000);
-      assert.equal(options.killSignal, 'SIGKILL');
-      parsed.push(options.input);
-      if (expireAfterFirst && parsed.length === 1) now += 25 * 60 * 1000;
-      if (options.input.startsWith('timeout')) {
-        now += options.timeout;
-        throw Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
+    })};
+    if (name === 'child_process') return {execFileSync: (command, args, opts) => {
+      if (args[0] === 'scripts/lib/pr-body-contract.mjs') {
+        assert.ok(opts.timeout > 0 && opts.timeout <= 120000, 'parser bound must be positive and capped');
+        if (budgetMs === 25 * 60 * 1000) assert.equal(opts.timeout, 120000);
+        assert.equal(opts.killSignal, 'SIGKILL');
+        parsed.push(opts.input);
+        if (expireAfterFirst && parsed.length === 1) now += 25 * 60 * 1000;
+        if (opts.input.startsWith('timeout')) {
+          now += opts.timeout;
+          // Exercise Node's actual emitted error code, not an assumed shape.
+          // Shorten only this child wait after checking the production options.
+          return require('node:child_process').execFileSync(process.execPath,
+            ['-e', 'setInterval(() => {}, 1000)'], {...opts, timeout: 100});
+        }
+        if (opts.input === 'ordinary') throw new Error('ordinary parser failure');
+        return JSON.stringify({author: 'codex', authorCount: 1, hasSelfReview: true});
       }
-      if (options.input === 'ordinary') throw new Error('ordinary parser failure');
-      return JSON.stringify({ author: 'codex', authorCount: 1, hasSelfReview: true });
-    } };
+      assert.equal(command, 'python3');
+      assert.ok(args[0].includes(verifier === 'anchor' ? 'resolve-codex-verdict-anchors.py' : 'owner-admin-override.py'));
+      verifierTimeouts.push({timeout: opts.timeout, killSignal: opts.killSignal});
+      // The fake child ends after five seconds; only a real remaining-budget
+      // subprocess bound can stop it promptly. Grade the actual passed options.
+      return require('node:child_process').execFileSync(process.execPath,
+        ['-e', 'setTimeout(() => console.log("[]"), 5000)'],
+        opts);
+    }};
     throw new Error(`Unexpected require: ${name}`);
   };
-  await execute(mockedRequire, github, { repo: { owner: 'owner', repo: 'repo' } },
-    { setFailed: message => failures.push(message) }, Clock,
-    { log: message => messages.push(message) });
-  return { parsed, reviewed, reports, failures, messages };
+  const boundedScript = script.replace('Date.now() + 25 * 60 * 1000', `Date.now() + ${budgetMs}`)
+    .replace('AUDIT_REPORT_RESERVE_MS = 60000', `AUDIT_REPORT_RESERVE_MS = ${reserveMs}`);
+  const invoke = new AsyncFunction('require', 'github', 'context', 'core', 'Date', 'console', boundedScript);
+  const summary = {addRaw: body => {
+    summaryBodies.push(body);
+    return {write: async () => { if (failSummary) throw new Error('summary unavailable'); }};
+  }};
+  await invoke(mockedRequire, github, {repo: {owner: 'owner', repo: 'repo'}},
+    {setFailed: message => failures.push(message), warning: message => messages.push(message), summary},
+    Clock, {log: message => messages.push(message)});
+  const chunks = messages.filter(message => message.startsWith('PR_AUDIT_REPORT_BASE64 '));
+  const encoded = chunks.map((message, index) => {
+    const match = message.match(/^PR_AUDIT_REPORT_BASE64 (\d+)\/(\d+) ([A-Za-z0-9+/=]+)$/);
+    assert.ok(match, 'report log is an encoded data record, not a runner command');
+    assert.equal(Number(match[1]), index + 1);
+    assert.equal(Number(match[2]), chunks.length, 'all report chunks must survive');
+    return match[3];
+  }).join('');
+  const loggedBody = encoded ? Buffer.from(encoded, 'base64').toString('utf8') : '';
+  if (summaryBodies.length && loggedBody) assert.equal(loggedBody, summaryBodies[0], 'UTF-8 report round-trip');
+  const durableBody = reports[0]?.body || loggedBody;
+  return {parsed, reviewed, reports, failures, messages, durableBody, requests, aborted,
+    createAttempts, summaryBodies, verifierTimeouts, elapsedMs: Date.now() - wallStart};
 }
-(async () => {
+
+async function legacyCases() {
   const mixed = await audit([
     pr(1, 'nathanjohnpayne', 'timeout-author'),
     pr(2, 'dependabot[bot]', 'timeout-dependabot'), pr(3),
@@ -1490,10 +1554,10 @@ async function audit(prs, { expireAfterFirst = false } = {}) {
 
   const budget = await audit([pr(4), pr(5), pr(6, 'dependabot[bot]')], { expireAfterFirst: true });
   assert.equal(budget.parsed.length, 1, 'spent budget must stop starting PR audits');
-  assert.equal(budget.reports.length, 1);
-  assert.match(budget.reports[0].body, /Audit coverage:\*\* incomplete/);
-  assert.match(budget.reports[0].body, /Unaudited PRs/);
-  for (const number of [5, 6]) assert.match(budget.reports[0].body, new RegExp(`\\*\\*#${number}\\*\\*`));
+  assert.equal(budget.reports.length, 0, 'an expired report allowance must not start an issue write');
+  assert.match(budget.durableBody, /Audit coverage:\*\* incomplete/);
+  assert.match(budget.durableBody, /Unaudited PRs/);
+  for (const number of [5, 6]) assert.match(budget.durableBody, new RegExp(`\\*\\*#${number}\\*\\*`));
   assert.equal(budget.failures.length, 1);
 
   const ordinary = await audit([pr(7, 'nathanjohnpayne', 'ordinary')]);
@@ -1505,7 +1569,60 @@ async function audit(prs, { expireAfterFirst = false } = {}) {
   assert.equal(valid.reports.length, 0);
   assert.equal(valid.failures.length, 0);
   assert.ok(valid.messages.includes('No policy violations found for the past 7 days.'));
-})().catch(error => { console.error(error); process.exitCode = 1; });
+}
+
+async function deadlineCases(only = '') {
+  if (!only || only === 'zero') {
+    const zero = await audit([pr(10)], {budgetMs: 0, reserveMs: 0});
+    assert.equal(zero.parsed.length, 0);
+    assert.equal(zero.requests.length, 0, 'zero budget cannot start a read');
+    assert.match(zero.durableBody, /incomplete.*0\/unknown total/);
+    assert.equal(zero.failures.length, 1);
+  }
+  if (!only || only === 'short') {
+    const fast = await audit([pr(11)], {budgetMs: 120000});
+    assert.equal(fast.parsed.length, 1, 'a fast PR need not reserve the full parser maximum');
+    assert.equal(fast.failures.length, 0);
+    assert.ok(fast.requests.every(r => r.args.request?.signal), 'every paginated read carries cancellation');
+  }
+  if (!only || only === 'stalled') {
+    const stalled = await audit([pr(12), pr(13)], {budgetMs: 150, reserveMs: 50,
+      elapsedClock: true, stalledEndpoint: 'reviews'});
+    assert.ok(stalled.aborted, 'the in-flight API signal must be aborted');
+    assert.match(stalled.durableBody, /Audit infrastructure errors/);
+    assert.match(stalled.durableBody, /\*\*#12\*\*/);
+    assert.match(stalled.durableBody, /\*\*#13\*\*/);
+    assert.equal(stalled.failures.length, 1);
+    assert.ok(stalled.elapsedMs < 1500, 'a stalled paginated read stays bounded');
+  }
+  for (const kind of ['anchor', 'owner']) {
+    if (only && only !== kind) continue;
+    const slow = await audit([pr(14, 'nathanjohnpayne', kind === 'owner' ? 'ordinary' : 'valid')],
+      {verifier: kind, elapsedClock: true});
+    assert.equal(slow.verifierTimeouts.length, 1, `${kind} real verifier path must execute`);
+    assert.ok(slow.verifierTimeouts[0].timeout > 0 && slow.verifierTimeouts[0].timeout <= 70);
+    assert.equal(slow.verifierTimeouts[0].killSignal, 'SIGKILL');
+    assert.match(slow.durableBody, /Audit infrastructure errors/);
+    assert.equal(slow.failures.length, 1);
+  }
+  if (!only || only === 'publication') {
+    const item = {...pr(15, 'nathanjohnpayne', 'ordinary'), title: 'Ω report\n::error::DO_NOT_EMIT_RAW'};
+    assert.ok(item.title.includes(String.fromCharCode(10)), 'fixture must contain an actual newline');
+    const failed = await audit([item], {failCreate: true, failSummary: true});
+    assert.equal(failed.createAttempts.length, 1, 'an uncertain report write is not retried');
+    assert.equal(failed.failures.length, 1);
+    assert.match(failed.durableBody, /Ω report\n::error::DO_NOT_EMIT_RAW/);
+    assert.ok(!failed.messages.some(message => message.includes('::error::DO_NOT_EMIT_RAW')));
+  }
+}
+const watchdog = setTimeout(() => {console.error('actual audit exceeded the native test watchdog'); process.exit(1);}, 10000);
+(async () => {
+  const only = process.argv[3] || '';
+  if (!only) await legacyCases();
+  await deadlineCases(only);
+})().then(() => clearTimeout(watchdog)).catch(error => {
+  clearTimeout(watchdog); console.error(error); process.exitCode = 1;
+});
 NODE
 then
   ok "#1613: weekly audit records each timeout, audits later PRs, reports budget gaps and fails incomplete runs"

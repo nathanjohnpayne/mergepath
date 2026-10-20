@@ -117,6 +117,11 @@ if [ "$1" = "api" ]; then
     if [ -f "$f" ]; then jq -s '.' "$f"; else printf '[[]]'; fi
     exit 0
   fi
+  if [[ "$endpoint" == repos/*/issues/*/timeline ]]; then
+    [ "${MOCK_TIMELINE_UNREADABLE:-0}" != 1 ] || exit 1
+    printf '[%s]' "${MOCK_TIMELINE_JSON:-[]}"
+    exit 0
+  fi
   if [[ "$endpoint" == repos/*/commits/* ]]; then
     printf '%s' "${MOCK_HEAD_TIME:-2026-01-01T00:00:00Z}"
     exit 0
@@ -225,15 +230,15 @@ write_threads_fixture nathanjohnpayne mergepath 281 2
 
 OUT="$("$SCRIPT" nathanjohnpayne/mergepath#281 2>"$WORKDIR/render-error")"
 if [ ! -s "$WORKDIR/render-error" ] \
-   && printf '%s' "$OUT" | grep -q "PR ready for external review (Phase 4b):" \
-   && printf '%s' "$OUT" | grep -q "verbatim mirror of mergepath@abcdef123456" \
-   && printf '%s' "$OUT" | grep -q "https://github.com/nathanjohnpayne/mergepath/pull/281" \
-   && printf '%s' "$OUT" | grep -q "head 1111111" \
-   && printf '%s' "$OUT" | grep -q "(base 2222222)" \
-   && printf '%s' "$OUT" | grep -q "Threads: 0 undispositioned findings" \
-   && printf '%s' "$OUT" | grep -q "resolve addressed bot or agent-reviewer" \
-   && printf '%s' "$OUT" | grep -q "(b) APPROVED as nathanpayne-claude on the listed HEAD, AND" \
-   && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
+   && printf '%s' "$OUT" | grep "PR ready for external review (Phase 4b):" >/dev/null \
+   && printf '%s' "$OUT" | grep "verbatim mirror of mergepath@abcdef123456" >/dev/null \
+   && printf '%s' "$OUT" | grep "https://github.com/nathanjohnpayne/mergepath/pull/281" >/dev/null \
+   && printf '%s' "$OUT" | grep "head 1111111" >/dev/null \
+   && printf '%s' "$OUT" | grep "(base 2222222)" >/dev/null \
+   && printf '%s' "$OUT" | grep "Threads: 0 undispositioned findings" >/dev/null \
+   && printf '%s' "$OUT" | grep "resolve addressed bot or agent-reviewer" >/dev/null \
+   && printf '%s' "$OUT" | grep "(b) APPROVED as nathanpayne-claude on the listed HEAD, AND" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "reaction newer" >/dev/null; then
   pass "single-PR mirror render contains expected fields"
 else
   fail "single-PR mirror render missing expected fields"
@@ -251,7 +256,7 @@ write_pr_fixture nathanjohnpayne mergepath 283 \
   1
 write_threads_fixture nathanjohnpayne mergepath 283 0
 SCOPED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#283)"
-printf '%s' "$SCOPED_OUT" | grep -q "verbatim mirror of mergepath@abcdef123456" \
+printf '%s' "$SCOPED_OUT" | grep "verbatim mirror of mergepath@abcdef123456" >/dev/null \
   && pass "scoped sync-all branch retains mirror classification" \
   || fail "scoped sync-all branch was not classified as a mirror"
 
@@ -262,7 +267,7 @@ write_pr_fixture nathanjohnpayne mergepath 286 \
   1
 write_threads_fixture nathanjohnpayne mergepath 286 0
 UPPER_SCOPED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#286)"
-printf '%s' "$UPPER_SCOPED_OUT" | grep -q "novel work" \
+printf '%s' "$UPPER_SCOPED_OUT" | grep "novel work" >/dev/null \
   && pass "uppercase source SHA is rejected in the scoped sync-all form" \
   || fail "uppercase source SHA widened the scoped sync-all grammar"
 
@@ -273,7 +278,7 @@ write_pr_fixture nathanjohnpayne mergepath 284 \
   1
 write_threads_fixture nathanjohnpayne mergepath 284 0
 MALFORMED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#284)"
-printf '%s' "$MALFORMED_OUT" | grep -q "novel work" \
+printf '%s' "$MALFORMED_OUT" | grep "novel work" >/dev/null \
   && pass "malformed sync-all scope suffix is not trusted as a mirror" \
   || fail "malformed sync-all scope suffix widened mirror classification"
 
@@ -284,7 +289,7 @@ write_pr_fixture nathanjohnpayne mergepath 285 \
   1
 write_threads_fixture nathanjohnpayne mergepath 285 0
 SHORT_SHA_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#285)"
-printf '%s' "$SHORT_SHA_OUT" | grep -q "novel work" \
+printf '%s' "$SHORT_SHA_OUT" | grep "novel work" >/dev/null \
   && pass "short source sha in scoped sync-all branch is not trusted as a mirror" \
   || fail "short source sha widened scoped mirror classification"
 
@@ -299,10 +304,10 @@ write_pr_fixture nathanjohnpayne mergepath 42 \
 write_threads_fixture nathanjohnpayne mergepath 42 0
 
 OUT="$("$SCRIPT" nathanjohnpayne/mergepath#42)"
-if printf '%s' "$OUT" | grep -q "Context: novel work" \
-   && printf '%s' "$OUT" | grep -q "head 3333333" \
-   && printf '%s' "$OUT" | grep -q "(base 4444444)" \
-   && printf '%s' "$OUT" | grep -q "Threads: 0 undispositioned findings"; then
+if printf '%s' "$OUT" | grep "Context: novel work" >/dev/null \
+   && printf '%s' "$OUT" | grep "head 3333333" >/dev/null \
+   && printf '%s' "$OUT" | grep "(base 4444444)" >/dev/null \
+   && printf '%s' "$OUT" | grep "Threads: 0 undispositioned findings" >/dev/null; then
   pass "single-PR novel-work render contains expected fields"
 else
   fail "single-PR novel-work render missing expected fields"
@@ -329,14 +334,14 @@ write_pr_fixture nathanjohnpayne swipewatch 200 \
 write_threads_fixture nathanjohnpayne swipewatch 200 0
 
 OUT="$("$SCRIPT" nathanjohnpayne/matchline#100 nathanjohnpayne/swipewatch#200)"
-if printf '%s' "$OUT" | grep -q "| Repo | PR # | HEAD short SHA | Undispositioned findings | Content note | Reviewer |" \
-   && printf '%s' "$OUT" | grep -q "nathanjohnpayne/matchline" \
-   && printf '%s' "$OUT" | grep -q "nathanjohnpayne/swipewatch" \
-   && printf '%s' "$OUT" | grep -q "Context: verbatim mirror of mergepath@abcdef123456" \
-   && printf '%s' "$OUT" | grep -q "real-human threads automatically" \
-   && ! printf '%s' "$OUT" | grep -q "Context: mixed" \
-   && printf '%s' "$OUT" | grep -q "(c) a HEAD-anchored Codex clearance" \
-   && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
+if printf '%s' "$OUT" | grep "| Repo | PR # | HEAD short SHA | Undispositioned findings | Content note | Reviewer |" >/dev/null \
+   && printf '%s' "$OUT" | grep "nathanjohnpayne/matchline" >/dev/null \
+   && printf '%s' "$OUT" | grep "nathanjohnpayne/swipewatch" >/dev/null \
+   && printf '%s' "$OUT" | grep "Context: verbatim mirror of mergepath@abcdef123456" >/dev/null \
+   && printf '%s' "$OUT" | grep "real-human threads automatically" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "Context: mixed" >/dev/null \
+   && printf '%s' "$OUT" | grep "(c) a HEAD-anchored Codex clearance" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "reaction newer" >/dev/null; then
   pass "batch all-same-mirror render surfaces shared context"
 else
   fail "batch all-same-mirror render missing expected shared context"
@@ -362,9 +367,9 @@ write_pr_fixture nathanjohnpayne swipewatch 201 \
 write_threads_fixture nathanjohnpayne swipewatch 201 2
 
 OUT="$("$SCRIPT" nathanjohnpayne/matchline#101 nathanjohnpayne/swipewatch#201)"
-if printf '%s' "$OUT" | grep -q "Context: mixed" \
-   && printf '%s' "$OUT" | grep -q "verbatim mirror of mergepath@" \
-   && printf '%s' "$OUT" | grep -q "novel work"; then
+if printf '%s' "$OUT" | grep "Context: mixed" >/dev/null \
+   && printf '%s' "$OUT" | grep "verbatim mirror of mergepath@" >/dev/null \
+   && printf '%s' "$OUT" | grep "novel work" >/dev/null; then
   pass "batch mixed render flags 'mixed — see table above'"
 else
   fail "batch mixed render did not flag mixed context"
@@ -416,8 +421,8 @@ OUT=$(MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$BLOCK_GATE" \
 rc=$?
 set -e
 if [ "$rc" -eq 4 ] \
-   && printf '%s' "$OUT" | grep -q "no handoff rendered" \
-   && ! printf '%s' "$OUT" | grep -q "PR ready for external review"; then
+   && printf '%s' "$OUT" | grep "no handoff rendered" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "PR ready for external review" >/dev/null; then
   pass "unaccounted feedback blocks the manual Phase 4b handoff"
 else
   fail "unaccounted feedback returned rc=$rc or rendered a handoff"
@@ -430,24 +435,38 @@ write_pr_fixture nathanjohnpayne mergepath 43 feat/claude \
   4444444444444444444444444444444444444444 1 'Authoring-Agent: claude'
 write_threads_fixture nathanjohnpayne mergepath 43 0
 OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
-if printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-codex' \
-   && ! printf '%s' "$OUT" | grep -q 'HEAD, OR'; then
+if printf '%s' "$OUT" | grep '(b) APPROVED as nathanpayne-codex' >/dev/null \
+   && ! printf '%s' "$OUT" | grep 'HEAD, OR' >/dev/null; then
   pass "Claude author selects a registered cross-agent reviewer and AND gate"
 else
   fail "Claude author got an invalid reviewer or gate"
 fi
 OUT=$("$SCRIPT" nathanjohnpayne/mergepath#42 nathanjohnpayne/mergepath#43)
-if printf '%s' "$OUT" | grep -q 'head 3333333.*reviewer nathanpayne-claude' \
-   && printf '%s' "$OUT" | grep -q 'head 3333333.*reviewer nathanpayne-codex' \
-   && printf '%s' "$OUT" | grep -q 'its listed reviewer on HEAD, AND'; then
+if printf '%s' "$OUT" | grep 'head 3333333.*reviewer nathanpayne-claude' >/dev/null \
+   && printf '%s' "$OUT" | grep 'head 3333333.*reviewer nathanpayne-codex' >/dev/null \
+   && printf '%s' "$OUT" | grep 'its listed reviewer on HEAD, AND' >/dev/null; then
   pass "mixed-author batch retains each PR's cross-agent reviewer"
 else
   fail "mixed-author batch lost its reviewer association or conjunction"
 fi
 OUT=$(PHASE_4B_REVIEWER_IDENTITY=nathanpayne-cursor "$SCRIPT" nathanjohnpayne/mergepath#42)
-printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-cursor' \
+printf '%s' "$OUT" | grep '(b) APPROVED as nathanpayne-cursor' >/dev/null \
   && pass "registered cross-agent override is honored" \
   || fail "valid cross-agent override was lost"
+# The governing default wins over list order, but cannot select the author.
+cp "$FIXTURE_DIR/review-policy.yml" "$WORKDIR/default-policy.yml"
+printf '\ndefault_external_reviewer: nathanpayne-cursor\n' >> "$FIXTURE_DIR/review-policy.yml"
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
+printf '%s' "$OUT" | grep '(b) APPROVED as nathanpayne-cursor' >/dev/null \
+  && pass "governing default reviewer wins over available-reviewer order" \
+  || fail "configured default reviewer was ignored"
+cp "$WORKDIR/default-policy.yml" "$FIXTURE_DIR/review-policy.yml"
+printf '\ndefault_external_reviewer: nathanpayne-claude\n' >> "$FIXTURE_DIR/review-policy.yml"
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
+printf '%s' "$OUT" | grep '(b) APPROVED as nathanpayne-codex' >/dev/null \
+  && pass "same-author default falls back to a registered cross-agent reviewer" \
+  || fail "same-author default bypassed cross-agent selection"
+cp "$WORKDIR/default-policy.yml" "$FIXTURE_DIR/review-policy.yml"
 for override in nathanpayne-codex NathanPayne-Codex unregistered-reviewer; do
   rc=0
   OUT=$(PHASE_4B_REVIEWER_IDENTITY="$override" "$SCRIPT" nathanjohnpayne/mergepath#42 2>"$WORKDIR/error") || rc=$?
@@ -485,11 +504,40 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REQUEST=$(jq -nc --arg now "$NOW" '[{id:801,user:{login:"nathanjohnpayne"},created_at:$now,body:"@codex review"}]')
 RUNNING=$(jq -nc --arg now "$NOW" --arg head "$HEAD" \
   '[{id:802,user:{login:"chatgpt-codex-connector[bot]"},created_at:$now,updated_at:$now,body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `" + $head + "` | New commits |")}]')
-for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled; do
-  history='[]'; reviews='[]'; expected=0
+for scenario in running requested completed stale-summary timed-out history-unreadable head-moved batch-running invalid-accounting stale-response newer-response malformed-history disabled terminal-usage terminal-connection stale-terminal spoofed-terminal renewed-request terminal-after-running running-after-terminal before-force after-force running-after-force future-date-request future-date-running future-date-timeout timeline-unreadable malformed-transition; do
+  history='[]'; reviews='[]'; expected=0; timeline='[]'; head_time=2026-01-01T00:00:00Z
   case "$scenario" in
     running|batch-running) history="$RUNNING"; expected=5 ;;
     requested) history="$REQUEST"; expected=5 ;;
+    before-force|after-force|running-after-force|malformed-transition)
+      history="$REQUEST"
+      timeline=$(jq -nc --arg now "$NOW" --arg scenario "$scenario" '
+        [{event:"head_ref_force_pushed",created_at:(if $scenario == "malformed-transition" then "invalid"
+          else ($now | fromdateiso8601) + (if $scenario == "after-force" then -1 else 1 end) | todateiso8601 end)}]')
+      case "$scenario" in
+        after-force) expected=5 ;;
+        running-after-force) history=$(jq -nc --argjson request "$REQUEST" --argjson running "$RUNNING" '$request + $running'); expected=5 ;;
+        malformed-transition) expected=3 ;;
+      esac
+      ;;
+    future-date-request) history="$REQUEST"; head_time=2999-01-01T00:00:00Z; expected=5 ;;
+    future-date-running) history="$RUNNING"; head_time=2999-01-01T00:00:00Z; expected=5 ;;
+    future-date-timeout) history=$(jq '.[0].created_at="2026-01-02T00:00:00Z"' <<<"$REQUEST"); head_time=2999-01-01T00:00:00Z ;;
+    timeline-unreadable) history="$REQUEST"; expected=3 ;;
+    terminal-usage|terminal-connection|stale-terminal|spoofed-terminal|renewed-request|terminal-after-running|running-after-terminal)
+      history=$(jq -nc --argjson request "$REQUEST" --arg scenario "$scenario" --argjson running "$RUNNING" --arg now "$NOW" '
+        ($now | fromdateiso8601) as $epoch
+        | (if $scenario == "stale-terminal" then $epoch - 1 else $epoch + 1 end | todateiso8601) as $failed
+        | ($epoch + 2 | todateiso8601) as $later
+        | {id:804,user:{login:(if $scenario == "spoofed-terminal" then "someone-else" else "chatgpt-codex-connector[bot]" end)},created_at:$failed,
+           body:(if $scenario == "terminal-connection" then "To use Codex here, configure an environment." else "You have reached your Codex usage limits for code reviews." end)} as $failure
+        | $request + [$failure]
+        + (if $scenario == "renewed-request" then [$request[0] | .id=805 | .created_at=$later]
+           elif $scenario == "terminal-after-running" then $running
+           elif $scenario == "running-after-terminal" then [$running[0] | .updated_at=$later]
+           else [] end)')
+      case "$scenario" in stale-terminal|spoofed-terminal|renewed-request|running-after-terminal) expected=5 ;; esac
+      ;;
     completed) history="$REQUEST"; reviews=$(jq -nc --arg now "$NOW" --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$now,commit_id:$head,state:"COMMENTED",body:"Completed review"}]') ;;
     stale-response) history="$REQUEST"; expected=5; reviews=$(jq -nc --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:"2026-01-02T00:00:00Z",commit_id:$head,state:"COMMENTED",body:"Old same-head review"}]') ;;
     newer-response) history=$(jq '.[0].updated_at="2026-01-02T00:00:00Z"' <<<"$RUNNING"); reviews=$(jq -nc --arg now "$NOW" --arg head "$HEAD" '[{id:803,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:$now,commit_id:$head,state:"COMMENTED",body:"Completed review"}]') ;;
@@ -509,6 +557,8 @@ for scenario in running requested completed stale-summary timed-out history-unre
   [ "$scenario" != invalid-accounting ] || gate=true
   rc=0
   OUT=$(MOCK_HISTORY_UNREADABLE="$([ "$scenario" = history-unreadable ] && echo 1 || echo 0)" \
+    MOCK_TIMELINE_UNREADABLE="$([ "$scenario" = timeline-unreadable ] && echo 1 || echo 0)" \
+    MOCK_TIMELINE_JSON="$timeline" MOCK_HEAD_TIME="$head_time" \
     MOCK_HEAD_MOVED="$([ "$scenario" = head-moved ] && echo 1 || echo 0)" \
     MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \
     "$SCRIPT" "${refs[@]}" 2>"$WORKDIR/error") || rc=$?

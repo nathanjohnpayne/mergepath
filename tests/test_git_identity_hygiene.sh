@@ -4125,7 +4125,6 @@ for SCOPE in GLOBAL SYSTEM; do
     "GIT_CONFIG_$SCOPE=fixture/config git config --$FLAG user.email fixture@example.invalid" \
     "GIT_CONFIG_$SCOPE=\"\$FIX/.git/config\" git config --$FLAG user.email fixture@example.invalid" \
     "GIT_CONFIG_$SCOPE=.git/config git -C fixture config --$FLAG user.email fixture@example.invalid" \
-    "GIT_CONFIG_$SCOPE=.git/config git config --file=.git/config user.email fixture@example.invalid" \
     "GIT_CONFIG_$SCOPE=.git/config git config --$FLAG user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: owning fixture"; do
     run_on_fixture tests/scope-file-control.sh "$SOURCE
 "
@@ -4133,6 +4132,31 @@ for SCOPE in GLOBAL SYSTEM; do
       fail "scope-file control rejected: source='$SOURCE' rc=$RC out=$OUT"
     fi
   done
+done
+
+# Literal file operands cannot disguise a same-repository identity write.
+for OPTIONS in \
+  '--file .git/config' '--file=./.git/config' '-f.git/config' '-f .git/config' \
+  '--file ".git/config"' '"--file=.git/config"' '--fil=.git/config' \
+  '--file .git/config.worktree' '-f./.git/config.worktree'; do
+  run_on_fixture tests/literal-config-file.sh "git config $OPTIONS user.email fixture@example.invalid
+"
+  if [ "$RC" = 1 ]; then pass "literal repo config file operand is not a scope exemption"; else
+    fail "literal file operand escaped: options='$OPTIONS' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config --file fixture/config user.email fixture@example.invalid' \
+  'git config -ffixture/config user.email fixture@example.invalid' \
+  'git config -f=.git/config user.email fixture@example.invalid' \
+  'git config --file "$FIX/.git/config" user.email fixture@example.invalid' \
+  'git -C fixture config --file .git/config user.email fixture@example.invalid' \
+  'git config --file .git/config --get user.email fixture@example.invalid'; do
+  run_on_fixture tests/literal-config-file-control.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "external/runtime/other-target/read file control retains exemption"; else
+    fail "file operand control rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
 done
 
 # These private tracked-index controls exercise the production enumeration
@@ -4144,7 +4168,7 @@ cp "$CHECK" "$LITERAL_CONSUMER/scripts/ci/check_git_identity_hygiene"
 cp "$ROOT/tests/test_git_identity_hygiene.sh" "$LITERAL_CONSUMER/tests/"
 cp "$LITERAL_CONSUMER/.git/config" "$WORKDIR/literal-config-before"
 LITERAL_PHYSICAL_ROOT="$(cd "$LITERAL_CONSUMER" && pwd -P)"
-for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-override runtime-glob literal-glob; do
+for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-file absolute-worktree-file absolute-override runtime-glob literal-glob; do
   REL=REVIEW_POLICY.md; EXPECTED=1
   case "$CONTROL" in
     prose) SOURCE='**git config user.email fixture@example.invalid**' ;;
@@ -4168,7 +4192,9 @@ for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-
     runtime) SOURCE='Run $git config user.email fixture@example.invalid'; EXPECTED=0 ;;
     option-data) SOURCE="Run git -c core.editor='git config user.email fixture@example.invalid' status"; EXPECTED=0 ;;
     ordinary-global) SOURCE='git config --global user.email fixture@example.invalid'; EXPECTED=0 ;;
-    explicit-file) SOURCE='git config --file=.git/config user.email fixture@example.invalid'; EXPECTED=0 ;;
+    explicit-file) SOURCE='git config --file=.git/config user.email fixture@example.invalid' ;;
+    absolute-file) REL=literal.sh; SOURCE="git config --file='$LITERAL_PHYSICAL_ROOT/.git/config' user.email fixture@example.invalid" ;;
+    absolute-worktree-file) REL=literal.sh; SOURCE="git config -f '$LITERAL_PHYSICAL_ROOT/.git/config.worktree' user.email fixture@example.invalid" ;;
   esac
   rm -f "$LITERAL_CONSUMER/REVIEW_POLICY.md" "$LITERAL_CONSUMER/literal.sh"
   printf '%s\n' "$SOURCE" > "$LITERAL_CONSUMER/$REL"

@@ -296,6 +296,37 @@ expect 136 '.class == "waiting-on-human" and .reason == "handoff posted"'
 expect 137 '.class == "waiting-on-human" and .reason == "handoff posted"'
 expect 135 '.class == "stalled" and .rate_limited == false and .reason == "unanswered-verdict"'
 
+# A pending check must not mask the same head-anchored feedback that already
+# routes to a fix with completed CI. Positive, answered/stale and hold cases
+# reuse the original snapshot records, preserving the main ordering fixture.
+while IFS='~' read -r mode source_number overlay expected_class expected_reason expected_action expected_turn; do
+  jq --argjson n "$source_number" '[.prs[] | select(.number == $n)][0] | .ci_state="PENDING" | '"$overlay" \
+    "$TMP/snapshot.json" | jq -s --arg repo "$REPO" '{schema:"stalled-prs/v1",repo:$repo,prs:.}' > "$TMP/pending-$mode.json"
+  set +e
+  bash "$FINDER" --input "$TMP/pending-$mode.json" --no-gate --json --now "$NOW" \
+    > "$TMP/pending-$mode-report.json" 2> "$TMP/pending-$mode.err"
+  pending_rc=$?
+  set -e
+  if [ "$pending_rc" -le 1 ] && jq -e --arg class "$expected_class" --arg reason "$expected_reason" --arg action "$expected_action" --arg turn "$expected_turn" \
+    '.prs[0] | .class == $class and .reason == $reason and .next_action == $action and .turn == $turn and .next_action != "merge"' \
+    "$TMP/pending-$mode-report.json" >/dev/null; then
+    pass "pending CI verdict precedence: $mode"
+  else fail "pending CI verdict precedence $mode (rc=$pending_rc): $(cat "$TMP/pending-$mode-report.json") $(cat "$TMP/pending-$mode.err")"; fi
+done <<'CASES'
+findings~101~.~stalled~unanswered-verdict~push fix~agent
+fresh-findings~102~.~live~newest event younger than the threshold~push fix~agent
+changes~114~.~stalled~unanswered-verdict~push fix~agent
+edited~130~.~stalled~unanswered-verdict~push fix~agent
+old-changes~119~.~stalled~ci-pending-stale~investigate~machine
+approval~105~.~stalled~ci-pending-stale~investigate~machine
+answered~101~.review_comments += [.review_comments[] | .in_reply_to_id=.id | .id += 100 | .user={login:"nathanpayne-codex",type:"User"} | .created_at="2026-10-13T01:50:00Z" | .updated_at=.created_at]~stalled~ci-pending-stale~investigate~machine
+active-summary~101~.issue_comments += [{id:100,user:{login:"chatgpt-codex-connector[bot]",type:"Bot"},created_at:"2026-10-13T11:45:00Z",updated_at:"2026-10-13T11:45:00Z",body:("<!-- codex-pull-request-review-summary -->\n| | Status | Commit | Trigger |\n|---|---|---|---|\n| 📝 **Code Review** | **Running** | `" + .head_sha + "` | @codex review |")}]~waiting-on-bot~Codex reports the head Running~wait~machine
+before-push~101~.head_pushed_at="2026-10-13T03:00:00Z"~stalled~ci-pending-stale~investigate~machine
+same-second~101~.reviews[].submitted_at=.head_pushed_at | .review_comments[] |= (.created_at="2026-10-13T01:00:00Z" | .updated_at=.created_at)~stalled~ci-pending-stale~investigate~machine
+stale-anchor~101~.reviews[].commit_id="old-head" | .review_comments[] |= (.commit_id="old-head" | .original_commit_id="old-head")~stalled~ci-pending-stale~investigate~machine
+human-hold~101~.labels=["human-hold"]~waiting-on-human~label human-hold~wait~human
+CASES
+
 if jq -e '[.prs[] | .number] == [101, 116, 129, 131, 132, 111, 122, 126, 133, 123, 134, 125, 130, 135, 110, 112, 119, 105, 114, 117, 118, 106, 128, 127, 137, 108, 121, 124, 120, 136, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else
@@ -376,6 +407,59 @@ else
   fail "resume --pr 105 (rc=$rc): $(cat "$TMP/resume-105.txt")"
 fi
 
+# The real merge work order must select and wait for the advisory provider,
+# including refusal/failover routing, before advertising the author merge.
+if grep -Fq 'scripts/coderabbit-should-invoke.sh 105 --repo octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/coderabbit-wait.sh 105 octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq 'selector: 0 invoke, 1 skip; other exits stop' "$TMP/resume-105.txt" \
+   && grep -Fq '2: address findings' "$TMP/resume-105.txt" \
+   && grep -Fq 'Wait exit 4: advisory timeout' "$TMP/resume-105.txt" \
+   && grep -Fq 'codex_failover_requested:true and current-head Codex/Phase 4 clearance' "$TMP/resume-105.txt" \
+   && grep -Fq 'otherwise stop and alert the human' "$TMP/resume-105.txt" \
+   && grep -Fq 'Wait exit 6: repair the paused/non-base-branch/draft cause' "$TMP/resume-105.txt"; then
+  pass "merge work order includes the configured CodeRabbit selector, wait and routing outcomes"
+else
+  fail "merge work order omits CodeRabbit selection, waiting or a required routing outcome"
+fi
+if awk '
+  /scripts\/coderabbit-should-invoke.sh 105 --repo octo\/demo/ {selector=NR}
+  /scripts\/coderabbit-wait.sh 105 octo\/demo/ {waiter=NR}
+  /gh pr merge 105 --repo octo\/demo/ {merger=NR}
+  END {exit !(selector > 0 && waiter > selector && merger > waiter)}
+' "$TMP/resume-105.txt"; then
+  pass "selected CodeRabbit wait precedes the author merge command"
+else
+  fail "author merge is advertised before the CodeRabbit selector and selected wait"
+fi
+
+# #2424: a quota refusal found after an earlier approval needs a replacement
+# approval after exact-head Codex clearance, not merely another plain gate.
+if grep -Fq -- "--approve --body 'CodeRabbit rate-limited; cleared by Codex on $(sha 105).'" "$TMP/resume-105.txt" \
+   && grep -Fq 'NEW approval AFTER that clearance' "$TMP/resume-105.txt" \
+   && grep -Fq 'Any earlier approval cannot carry the failover' "$TMP/resume-105.txt"; then
+  pass "under-threshold failover names a new audited approval with provider and full head"
+else
+  fail "under-threshold failover omits the later approval or its provider/full-head audit body"
+fi
+if awk '
+  /CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=0 scripts\/codex-review-check.sh --require-codex-on-head 105 octo\/demo/ {clearance=NR}
+  /scripts\/gh-as-reviewer.sh -- gh pr review 105 --repo octo\/demo --approve/ {approval=NR}
+  /CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 scripts\/codex-review-check.sh --require-codex-on-head 105 octo\/demo/ {strict=NR}
+  /gh pr merge 105 --repo octo\/demo/ {merger=NR}
+  END {exit !(clearance > 0 && approval > clearance && strict > approval && merger > strict)}
+' "$TMP/resume-105.txt"; then
+  pass "failover clearance, replacement approval and strict verification precede merge in order"
+else
+  fail "failover approval sequence lacks its exact-head or post-clearance verification"
+fi
+if grep -Fq 'Under-threshold exit-5 failover only' "$TMP/resume-105.txt" \
+   && grep -Fq 'Above-threshold exit-5 failover continues through Phase 4 instead' "$TMP/resume-105.txt" \
+   && grep -Fq 'do not add a same-agent approval' "$TMP/resume-105.txt"; then
+  pass "replacement self-peer approval is scoped to under-threshold failover"
+else
+  fail "failover approval work order blurs the external-review threshold"
+fi
+
 set +e
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --pr 102 >/dev/null 2>"$TMP/resume-102.err"; rc_live=$?
 bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --threshold-minutes 720 >/dev/null 2>"$TMP/resume-none.err"; rc_none=$?
@@ -415,8 +499,8 @@ fi
 
 TREE="$TMP/tree"
 mkdir -p "$TREE/scripts/workflow" "$TREE/scripts/lib" "$TMP/bin" "$TMP/fixture"
-cp "$FINDER" "$RESUME" "$TREE/scripts/workflow/"
-cp "$ROOT/scripts/lib/gh-api-array.sh" "$TREE/scripts/lib/"
+cp "$FINDER" "$RESUME" "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TREE/scripts/workflow/"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$ROOT/scripts/lib/head-check-runs.sh" "$TREE/scripts/lib/"
 # The repository's required head checks: `lint` only. Review-policy checks
 # (Label Gate, Merge clearance gate) are deliberately NOT in this list.
 cat > "$TREE/scripts/required-head-checks.sh" <<'SH'
@@ -441,12 +525,34 @@ args="$*"
 echo "$args" >> "$GH_LOG"
 [ -n "${GH_TOKEN:-}" ] || { echo "gh shim: no GH_TOKEN in this process" >&2; exit 1; }
 case "$args" in
+  'api repos/octo/demo --jq .default_branch') echo main; exit 0 ;;
+  *'/contents/.github/required-head-checks?ref=main'*) printf 'lint\n' | base64; exit 0 ;;
+  *"/actions/runs?head_sha="*)
+    [ "${FINDER_WORKFLOW_FAIL:-0}" != 1 ] || { echo 'workflow runs unavailable' >&2; exit 1; }
+    [ ! -f "$FIXTURE/workflow-runs.json" ] || cat "$FIXTURE/workflow-runs.json"
+    exit 0 ;;
+  *"/contents/.github/review-policy.yml?ref="*)
+    [ "${FINDER_POLICY_FAIL:-0}" != 1 ] || { echo 'gh: policy unavailable (HTTP 500)' >&2; exit 1; }
+    case "${FINDER_POLICY_FORMAT:-block}" in
+      flow) printf 'codex: {bot_login: "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      quoted) printf '"codex": {"bot_login": "%s"}\n' "$FINDER_BOT_LOGIN" ;;
+      malformed) printf 'codex: [broken\n' ;;
+      invalid-type) printf 'codex: {bot_login: false}\n' ;;
+      whitespace) printf 'codex:\n  bot_login: |\n    partner-review[bot]\n' ;;
+      multiple) printf 'codex: {}\n---\ncodex: {}\n' ;;
+      *) printf 'codex:\n  bot_login: "%s"\n' "${FINDER_BOT_LOGIN:-chatgpt-codex-connector[bot]}" ;;
+    esac ;;
   *"api graphql"*)          echo "gh shim: no GraphQL read is expected (CI state comes from the check runs)" >&2; exit 1 ;;
   *"/activity?"*)          cat "$FIXTURE/activity-$(printf '%s' "$args" | sed -n 's/.*feat%2F\([0-9]*\).*/\1/p').json" ;;
   *"/check-runs"*)          cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
   *"/commits/"*)            echo "gh shim: the commit date must never be read for push time" >&2; exit 1 ;;
   *"/pulls?state=open"*)    cat "$FIXTURE/pulls.json" ;;
   *"/pulls/41/reviews"*)    echo '[{"id":9,"state":"APPROVED","submitted_at":"2026-10-13T07:00:00Z","commit_id":"4141414141414141414141414141414141414141","body":"LGTM","user":{"login":"nathanpayne-claude","type":"User"}}]' ;;
+  *"/pulls/42/reviews"*)
+    if [ -n "${FINDER_REVIEW_LOGIN:-}" ]; then
+      jq -cn --arg login "$FINDER_REVIEW_LOGIN" --arg type "${FINDER_REVIEW_TYPE:-Bot}" \
+        '[{id:42,state:"COMMENTED",submitted_at:"2026-10-13T05:00:00Z",commit_id:"4242424242424242424242424242424242424242",body:"review round body",user:{login:$login,type:$type}}]'
+    else echo '[]'; fi ;;
   *"/reviews"*)             echo '[]' ;;
   *"/issues/45/comments"*)  echo '[{"id":451,"created_at":"2026-10-13T05:10:00Z","updated_at":"2026-10-13T05:10:00Z","body":"@codex review","user":{"login":"nathanjohnpayne","type":"User"}}]' ;;
   *"/issues/"*"/comments"*) echo '[]' ;;
@@ -457,19 +563,19 @@ SH
 chmod +x "$TMP/bin/gh"
 cat > "$TMP/fixture/pulls.json" <<'JSON'
 [{"number":41,"title":"Approved and idle","html_url":"https://github.com/octo/demo/pull/41","draft":false,
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"size:S"}]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"size:S"}]},
  {"number":42,"title":"Pushed and forgotten","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]},
  {"number":43,"title":"Draft","html_url":"https://github.com/octo/demo/pull/43","draft":true,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,"updated_at":"2026-10-13T05:00:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":45,"title":"Request never answered","html_url":"https://github.com/octo/demo/pull/45","draft":false,"updated_at":"2026-10-13T05:10:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4545454545454545454545454545454545454545","ref":"feat/45","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4545454545454545454545454545454545454545","ref":"feat/45","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[]},
  {"number":46,"title":"Lint red, review gates red by design","html_url":"https://github.com/octo/demo/pull/46","draft":false,"updated_at":"2026-10-13T05:30:00Z",
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4646464646464646464646464646464646464646","ref":"feat/46","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4646464646464646464646464646464646464646","ref":"feat/46","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]},
  {"number":42,"title":"Pushed and forgotten (repeated by a page boundary)","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]}]
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main","repo":{"full_name":"octo/demo","default_branch":"main"}},"labels":[{"name":"needs-external-review"}]}]
 JSON
 # 41: three check runs on the head, the merge gate newest and green; 42: no
 # check runs at all (push time falls back to the commit date); 43: draft;
@@ -558,6 +664,139 @@ if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .n
 else
   fail "--dump did not write a stalled-prs/v1 snapshot with the gate result recorded"
 fi
+
+# Governing bot identity is materialized from the target, including when the
+# local checkout advertises a different bot. One shared base needs one read.
+# Queued runs have no started_at. Compare the complete producer groups rather
+# than letting an older completed run or an unrelated workflow hide them.
+cp "$TMP/fixture/check-runs-41.json" "$TMP/fixture/check-runs-41.original"
+for check_case in queued-required queued-gate cross-workflow-fail same-workflow-recovery neutral-gate skipped-gate workflow-read-failure; do
+  jq -cn --arg mode "$check_case" '
+    {name:"lint",status:"completed",conclusion:(if $mode | IN("cross-workflow-fail","same-workflow-recovery") then "failure" else "success" end),suite:100,started_at:"2026-10-13T06:00:00Z"},
+    {name:"Merge clearance gate",status:"completed",conclusion:(if $mode == "neutral-gate" then "neutral" elif $mode == "skipped-gate" then "skipped" else "success" end),suite:300,started_at:"2026-10-13T07:05:00Z"},
+    (if $mode == "queued-required" then {name:"lint",status:"queued",conclusion:null,suite:101,started_at:null}
+     elif $mode == "queued-gate" then {name:"Merge clearance gate",status:"queued",conclusion:null,suite:301,started_at:null}
+     elif $mode | IN("cross-workflow-fail","same-workflow-recovery") then {name:"lint",status:"completed",conclusion:"success",suite:(if $mode == "cross-workflow-fail" then 200 else 101 end),started_at:"2026-10-13T07:00:00Z"}
+     else empty end)' > "$TMP/fixture/check-runs-41.json"
+  printf '%s\n' '{"suite":100,"wf":10}' '{"suite":101,"wf":10}' '{"suite":200,"wf":20}' '{"suite":300,"wf":30}' '{"suite":301,"wf":30}' > "$TMP/fixture/workflow-runs.json"
+  workflow_fail=0; [ "$check_case" != workflow-read-failure ] || workflow_fail=1
+  : > "$TMP/gh.log"
+  set +e
+  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+    FINDER_WORKFLOW_FAIL="$workflow_fail" bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --json --now "$NOW" \
+    > "$TMP/check-$check_case.json" 2> "$TMP/check-$check_case.err"
+  check_rc=$?
+  set -e
+  set +e
+  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" \
+    FINDER_WORKFLOW_FAIL="$workflow_fail" bash "$ROOT/scripts/required-head-checks.sh" --repo "$REPO" \
+    --verify --sha 4141414141414141414141414141414141414141 > "$TMP/required-$check_case.txt" 2>&1
+  required_rc=$?
+  set -e
+  case "$check_case" in queued-required|cross-workflow-fail) expected_required=1 ;; workflow-read-failure) expected_required=3 ;; *) expected_required=0 ;; esac
+  if [ "$required_rc" -eq "$expected_required" ]; then
+    pass "actual required-head verifier retains producer semantics: $check_case"
+  else fail "actual required-head verifier $check_case: rc=$required_rc: $(cat "$TMP/required-$check_case.txt")"; fi
+  if [ "$workflow_fail" -eq 1 ]; then
+    if [ "$check_rc" -eq 3 ] && [ ! -s "$TMP/check-$check_case.json" ]; then
+      pass 'unreadable workflow provenance fails closed'
+    else fail "workflow provenance read failure: rc=$check_rc"; fi
+  else
+    case "$check_case" in queued-required) expected_ci=PENDING; expected_gate=success ;; queued-gate) expected_ci=SUCCESS; expected_gate=pending ;; cross-workflow-fail) expected_ci=FAILURE; expected_gate=success ;; same-workflow-recovery) expected_ci=SUCCESS; expected_gate=success ;; neutral-gate) expected_ci=SUCCESS; expected_gate=neutral ;; skipped-gate) expected_ci=SUCCESS; expected_gate=skipped ;; esac
+    if [ "$check_rc" -eq 1 ] && jq -e --arg ci "$expected_ci" --arg gate "$expected_gate" --arg mode "$check_case" \
+      '[.prs[] | select(.number == 41)][0] | .ci_state == $ci and .merge_gate_check == $gate and (if $mode == "same-workflow-recovery" then .next_action == "merge" else .next_action != "merge" end)' "$TMP/check-$check_case.json" >/dev/null; then
+      pass "producer-aware check reduction: $check_case"
+    else fail "producer-aware check reduction $check_case (rc=$check_rc): $(cat "$TMP/check-$check_case.err")"; fi
+  fi
+done
+mv "$TMP/fixture/check-runs-41.original" "$TMP/fixture/check-runs-41.json"
+rm "$TMP/fixture/workflow-runs.json"
+
+mkdir -p "$TREE/.github"
+printf 'codex:\n  bot_login: "local-only[bot]"\n' > "$TREE/.github/review-policy.yml"
+mkdir -p "$TMP/no-parser-bin"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/no-parser-bin/$parser"
+  chmod +x "$TMP/no-parser-bin/$parser"
+done
+mkdir -p "$TMP/ruby-only-bin"
+for parser in yq python3; do
+  cp "$TMP/no-parser-bin/$parser" "$TMP/ruby-only-bin/$parser"
+done
+bot_cases=(configured flow quoted upper-policy upper-api wrong-login wrong-type unreadable malformed invalid-type whitespace multiple no-parser)
+if ruby -ryaml -rjson -e 'YAML.safe_load("codex: {}")' >/dev/null 2>&1; then
+  bot_cases+=(ruby-flow ruby-multiple)
+fi
+for bot_case in "${bot_cases[@]}"; do
+  configured_login='partner-review[bot]'; review_login='partner-review[bot]'; review_type=Bot; policy_fail=0; policy_format=block; parser_prefix=''
+  [ "$bot_case" != upper-policy ] || configured_login='PARTNER-REVIEW[bot]'
+  [ "$bot_case" != upper-api ] || review_login='PARTNER-REVIEW[bot]'
+  [ "$bot_case" != wrong-login ] || review_login="$CODEX"
+  [ "$bot_case" != wrong-type ] || review_type=User
+  [ "$bot_case" != unreadable ] || policy_fail=1
+  case "$bot_case" in flow|quoted|malformed|invalid-type|whitespace|multiple) policy_format="$bot_case" ;; esac
+  [ "$bot_case" != no-parser ] || parser_prefix="$TMP/no-parser-bin:"
+  case "$bot_case" in ruby-flow) policy_format=flow; parser_prefix="$TMP/ruby-only-bin:" ;; ruby-multiple) policy_format=multiple; parser_prefix="$TMP/ruby-only-bin:" ;; esac
+  : > "$TMP/gh.log"
+  set +e
+  PATH="$parser_prefix$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+    FINDER_BOT_LOGIN="$configured_login" FINDER_REVIEW_LOGIN="$review_login" \
+    FINDER_REVIEW_TYPE="$review_type" FINDER_POLICY_FAIL="$policy_fail" FINDER_POLICY_FORMAT="$policy_format" \
+    bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --no-gate --json --now "$NOW" \
+    --dump "$TMP/bot-$bot_case-dump.json" > "$TMP/bot-$bot_case.json" 2> "$TMP/bot-$bot_case.err"
+  bot_rc=$?
+  set -e
+  if [[ "$bot_case" =~ ^(unreadable|malformed|invalid-type|whitespace|multiple|no-parser|ruby-multiple)$ ]]; then
+    if [ "$bot_rc" -eq 3 ] && [ ! -s "$TMP/bot-$bot_case.json" ]; then
+      pass "unknown governing bot policy fails closed without a local identity fallback: $bot_case"
+    else fail "unknown governing bot policy $bot_case: rc=$bot_rc"; fi
+  elif [ "$bot_rc" -eq 1 ] \
+     && jq -e --argjson signal "$([[ "$bot_case" =~ ^(configured|flow|quoted|upper-policy|upper-api|ruby-flow)$ ]] && echo true || echo false)" \
+       '[.prs[] | select(.number == 42)][0].codex_signal_on_head == $signal' "$TMP/bot-$bot_case.json" >/dev/null \
+     && jq -e --arg login "$configured_login" 'all(.prs[]; .codex_bot_login == $login)' "$TMP/bot-$bot_case-dump.json" >/dev/null \
+     && [ "$(grep -c '/contents/.github/review-policy.yml?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$TMP/gh.log")" -eq 1 ]; then
+    pass "governing exact bot and Bot provenance: $bot_case; cached once per base"
+  else fail "governing bot $bot_case (rc=$bot_rc): $(cat "$TMP/bot-$bot_case.err")"; fi
+done
+
+# Prefix lookalikes and User provenance are not Codex evidence. The old
+# findings are answered before a later push, leaving the stale head unrequested.
+while IFS='|' read -r bot_case actor actor_type configured expected_signal; do
+  pr 140 '2026-10-13T07:00:00Z' SUCCESS '.reviews=[$rev] | .review_comments=[$finding,$reply] | .codex_bot_login=$configured | .reviews[].user.type=$type | .review_comments[0].user.type=$type' \
+    --argjson rev "$(review 140 "$actor" COMMENTED '2026-10-13T06:00:00Z' "$(sha 140)")" \
+    --argjson finding "$(inline 140 "$actor" '2026-10-13T06:01:00Z' "$(sha 140)" null)" \
+    --argjson reply "$(inline 141 "$AUTHOR" '2026-10-13T06:02:00Z' "$(sha 140)" 140)" \
+    --arg configured "$configured" --arg type "$actor_type" \
+    | jq -s --arg repo "$REPO" '{schema:"stalled-prs/v1",repo:$repo,prs:.}' > "$TMP/identity-$bot_case.json"
+  set +e
+  bash "$FINDER" --input "$TMP/identity-$bot_case.json" --no-gate --json --now "$NOW" > "$TMP/identity-$bot_case-report.json"
+  bot_rc=$?
+  set -e
+  if [ "$bot_rc" -eq 1 ] && jq -e --argjson signal "$expected_signal" \
+    '.prs[0] | .codex_signal_on_head == $signal and (if $signal then .reason != "head-unrequested" else .reason == "head-unrequested" and .next_action == "request codex" end)' "$TMP/identity-$bot_case-report.json" >/dev/null; then
+    pass "replay exact bot and provenance: $bot_case"
+  else fail "replay bot identity $bot_case: $(cat "$TMP/identity-$bot_case-report.json")"; fi
+done <<'CASES'
+prefix-user|chatgpt-codex-connector-fake|User|chatgpt-codex-connector[bot]|false
+prefix-bot|chatgpt-codex-connector-fake[bot]|Bot|chatgpt-codex-connector[bot]|false
+exact-user|chatgpt-codex-connector[bot]|User|chatgpt-codex-connector[bot]|false
+real-bot|chatgpt-codex-connector[bot]|Bot|chatgpt-codex-connector[bot]|true
+custom-bot|partner-review[bot]|Bot|partner-review[bot]|true
+custom-wrong|chatgpt-codex-connector[bot]|Bot|partner-review[bot]|false
+upper-policy|chatgpt-codex-connector[bot]|Bot|ChatGPT-Codex-Connector[bot]|true
+upper-api|PARTNER-REVIEW[bot]|Bot|partner-review[bot]|true
+CASES
+
+# A lookalike's real human feedback still requires action when newly posted.
+jq '.prs[0] |= (.reviews[0].submitted_at="2026-10-13T07:10:00Z" | .review_comments=[.review_comments[0]] | .review_comments[0].created_at="2026-10-13T07:11:00Z" | .review_comments[0].updated_at="2026-10-13T07:11:00Z")' \
+  "$TMP/identity-prefix-user.json" > "$TMP/human-feedback.json"
+set +e
+bash "$FINDER" --input "$TMP/human-feedback.json" --no-gate --json --now "$NOW" > "$TMP/human-feedback-report.json"
+bot_rc=$?
+set -e
+if [ "$bot_rc" -eq 1 ] && jq -e '.prs[0] | .codex_signal_on_head == false and .next_action == "push fix"' "$TMP/human-feedback-report.json" >/dev/null; then
+  pass 'rejecting a Codex lookalike preserves actionable human feedback'
+else fail 'lookalike human feedback was discarded'; fi
 
 # The printed Codex request mirrors the policy so the session can run it as
 # shown: Phase-4a-gated only for a needs-external-review PR, trigger-only for

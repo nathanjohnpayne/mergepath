@@ -13,6 +13,111 @@ import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/workflow/verified-relay-markers.py'
+
+
+class ReadBudget(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(str(SCRIPT))
+        self.now = 0.0
+        self.probe_seconds = 0.0
+        self.probe_results = []
+        self.calls = []
+        for patcher in (
+                mock.patch.object(self.module['time'], 'monotonic', side_effect=lambda: self.now),
+                mock.patch.object(self.module['shutil'], 'which', return_value='/fixture/gh'),
+                mock.patch.object(self.module['subprocess'], 'run', side_effect=self.fake_run)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.evidence = self.module['Evidence']('owner/repo', 7)
+
+    def fake_run(self, args, **kwargs):
+        self.calls.append((args, kwargs['timeout']))
+        if args[-1] == '--help':
+            self.now += self.probe_seconds
+            if self.probe_results:
+                result = self.probe_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return subprocess.CompletedProcess(args, *result)
+            return subprocess.CompletedProcess(args, 0, self.module['ESCAPE_FLAG'], '')
+        return subprocess.CompletedProcess(args, 0, '{}', '')
+
+    def test_slow_probe_leaves_only_fresh_remaining_api_allowance(self):
+        self.now, self.probe_seconds = 55.0, 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1][1], 2.0)
+
+    def test_probe_exhaustion_prevents_api_subprocess(self):
+        self.now, self.probe_seconds = 55.0, 6.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0][-1], '--help')
+
+    def test_initial_exhaustion_prevents_even_the_probe(self):
+        self.now = 61.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(self.calls, [])
+
+    def test_json_read_needs_no_probe(self):
+        self.now = 55.0
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], 5.0)
+
+    def test_cached_read_still_needs_no_subprocess(self):
+        self.evidence.read_cache['actions/jobs/901/logs', False, True] = 'cached log'
+        self.now = 61.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), 'cached log')
+        self.assertEqual(self.calls, [])
+
+    def test_api_timeout_keeps_twenty_second_cap(self):
+        self.probe_seconds = 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(self.calls[1][1], 20)
+
+    def test_timeout_then_success_retries_with_fresh_probe_and_api_allowances(self):
+        self.now, self.probe_seconds = 55.0, 1.0
+        self.probe_results = [subprocess.TimeoutExpired('help', 1),
+                              (0, self.module['ESCAPE_FLAG'], '')]
+        self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual([timeout for _, timeout in self.calls], [5.0, 4.0, 3.0])
+        self.assertIn(self.module['ESCAPE_FLAG'], self.calls[-1][0])
+
+    def test_persistent_timeout_stays_unknown_and_never_reads_text(self):
+        self.probe_results = [subprocess.TimeoutExpired('help', 10)] * 2
+        with self.assertRaisesRegex(ValueError, 'after two probes'):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertIsNone(self.evidence._escape_flag)
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(all(args[-1] == '--help' for args, _ in self.calls))
+
+    def test_failed_help_output_cannot_claim_support(self):
+        self.probe_results = [(1, self.module['ESCAPE_FLAG'], 'failed')] * 2
+        with self.assertRaisesRegex(ValueError, 'after two probes'):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertIsNone(self.evidence._escape_flag)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_os_error_then_successful_legacy_result_is_cached(self):
+        self.probe_results = [OSError('temporary executable failure'), (0, 'legacy help', '')]
+        self.evidence.api('actions/jobs/901/logs', text=True)
+        self.evidence.api('actions/jobs/902/logs', text=True)
+        self.assertIs(self.evidence._escape_flag, False)
+        self.assertEqual(len(self.calls), 4)
+        self.assertTrue(all(self.module['ESCAPE_FLAG'] not in args for args, _ in self.calls[2:]))
+
+    def test_exhaustion_between_attempts_prevents_retry_and_text_read(self):
+        self.now, self.probe_seconds = 59.0, 1.0
+        self.probe_results = [subprocess.TimeoutExpired('help', 1)]
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], 1.0)
+
+
 REPO = 'acme/widget'
 MARKER = '<!-- mergepath-feedback-archive-relay:v2 run=12345 publisher=900 status=complete -->'
 LOG = '''2026-10-09T00:00:00Z ##[group]Run set -euo pipefail
@@ -69,11 +174,16 @@ from pathlib import Path
 root=Path(os.environ['PROVENANCE_CASE'])
 mode=(root/'gh_mode').read_text().strip() if (root/'gh_mode').exists() else 'modern'
 if sys.argv[1:3]==['api','--help']:
+    count=root/'help_calls'
+    attempt=int(count.read_text())+1 if count.exists() else 1
+    count.write_text(str(attempt))
+    if mode=='probe-fails' or mode=='probe-once' and attempt==1:
+        sys.stderr.write('temporary help failure'); raise SystemExit(1)
     print('Usage: gh api <endpoint> [flags]')
-    if mode=='modern': print('      --allow-escape-sequences   Allow printing terminal escape sequences')
+    if mode in ('modern','probe-once'): print('      --allow-escape-sequences   Allow printing terminal escape sequences')
     raise SystemExit(0)
 allow='--allow-escape-sequences' in sys.argv
-if allow and mode!='modern':
+if allow and mode not in ('modern','probe-once'):
     sys.stderr.write('unknown flag: --allow-escape-sequences'); raise SystemExit(1)
 endpoint=sys.argv[-1]
 with (root/'calls').open('a') as out: out.write(endpoint+'\\n')
@@ -82,7 +192,7 @@ if value is None:
     sys.stderr.write('Not Found (HTTP 404)'); raise SystemExit(1)
 if isinstance(value,dict) and '_error' in value:
     sys.stderr.write(value['_error']); raise SystemExit(1)
-if mode=='modern' and isinstance(value,str) and chr(27) in value and not allow:
+if mode in ('modern','probe-once') and isinstance(value,str) and chr(27) in value and not allow:
     sys.stderr.write('the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway'); raise SystemExit(1)
 print(value if isinstance(value,str) else json.dumps(value))
 ''')
@@ -99,6 +209,21 @@ print(value if isinstance(value,str) else json.dumps(value))
         code, comments, error = self.invoke()
         self.assertEqual(code, 0, error)
         self.assertEqual(comments[0]['body'], '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->')
+
+    def test_fake_cli_transient_help_failure_retries_before_escaped_log(self):
+        (self.path / 'gh_mode').write_text('probe-once')
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = RUNNER_LOG
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        self.assertEqual((self.path / 'help_calls').read_text(), '2')
+
+    def test_fake_cli_persistent_help_failure_never_promotes_completion(self):
+        (self.path / 'gh_mode').write_text('probe-fails')
+        code, comments, error = self.invoke()
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertEqual((self.path / 'help_calls').read_text(), '2')
+        self.assertNotIn('repos/' + REPO + '/actions/jobs/901/logs',
+                         (self.path / 'calls').read_text().splitlines())
 
     def test_default_branch_qualified_workflow_path_promotes_completion(self):
         self.run['path'] += '@main'

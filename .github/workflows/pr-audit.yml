@@ -76,6 +76,56 @@ jobs:
             // for the parser's full bound and publication of partial coverage.
             const AUDIT_DEADLINE_MS = Date.now() + 25 * 60 * 1000;
             const AUDIT_REPORT_RESERVE_MS = 60000;
+            let auditExpired = false;
+            let reportDeadlineMs = AUDIT_DEADLINE_MS;
+
+            function auditDeadlineError() {
+              return Object.assign(new Error('Audit time allowance exhausted'), {code: 'AUDIT_DEADLINE'});
+            }
+            function auditRemainingMs(reporting = false) {
+              return Math.floor((reporting ? reportDeadlineMs : AUDIT_DEADLINE_MS - AUDIT_REPORT_RESERVE_MS) - Date.now());
+            }
+            function requireAuditTime() {
+              if (auditExpired || auditRemainingMs() <= 0) throw auditDeadlineError();
+            }
+            function auditTimeout(maximum) {
+              requireAuditTime();
+              return Math.max(1, Math.min(maximum, auditRemainingMs()));
+            }
+            async function boundedAuditCall(invoke, reporting = false) {
+              const allowance = auditRemainingMs(reporting);
+              if ((!reporting && auditExpired) || allowance <= 0) throw auditDeadlineError();
+              const controller = new AbortController();
+              let timer;
+              let timedOut = false;
+              const expiration = new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                  timedOut = true;
+                  if (!reporting) auditExpired = true;
+                  reject(auditDeadlineError());
+                  controller.abort();
+                }, allowance);
+              });
+              try {
+                return await Promise.race([Promise.resolve().then(() => invoke(controller.signal)), expiration]);
+              } catch (error) {
+                if (timedOut) throw auditDeadlineError();
+                throw error;
+              } finally {
+                clearTimeout(timer);
+              }
+            }
+            async function auditPaginate(endpoint, options = {}) {
+              return boundedAuditCall(signal => github.paginate(endpoint, {
+                ...options, request: {...options.request, signal},
+              }));
+            }
+            async function auditGraphql(query, variables = {}) {
+              return boundedAuditCall(signal => github.graphql(query, {
+                ...variables, request: {...variables.request, signal},
+              }));
+            }
+
 
             function parsePrBodyContract(body) {
               return JSON.parse(execFileSync(
@@ -83,7 +133,7 @@ jobs:
                 ['scripts/lib/pr-body-contract.mjs', '--json'],
                 {
                   input: body || '', encoding: 'utf8',
-                  timeout: PR_BODY_PARSE_TIMEOUT_MS, killSignal: 'SIGKILL',
+                  timeout: auditTimeout(PR_BODY_PARSE_TIMEOUT_MS), killSignal: 'SIGKILL',
                 }
               ));
             }
@@ -150,17 +200,25 @@ jobs:
             const today = new Date().toISOString().split('T')[0];
 
             // Get merged PRs from the past 7 days
-            const prs = await github.paginate(
-              github.rest.pulls.list,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'closed',
-                sort: 'updated',
-                direction: 'desc',
-                per_page: 100,
-              }
-            );
+            let prs = [];
+            let discoveryError = '';
+            try {
+              prs = await auditPaginate(
+                github.rest.pulls.list,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'closed',
+                  sort: 'updated',
+                  direction: 'desc',
+                  per_page: 100,
+                }
+              );
+              if (!Array.isArray(prs)) throw new Error('Unreadable PR inventory');
+            } catch (error) {
+              discoveryError = error.message;
+            }
+
 
             const mergedPRs = prs.filter(
               pr => pr.merged_at && new Date(pr.merged_at) >= since
@@ -169,11 +227,13 @@ jobs:
             const violations = [];
             const recordedOverrides = [];
             const parserErrors = [];
+            const auditErrors = [];
+            let reportPublicationError = "";
             let unauditedPRs = [];
             let auditedPRCount = 0;
 
             async function labelWasPresentAtMerge(pr, labelName) {
-              const events = await github.paginate(
+              const events = await auditPaginate(
                 github.rest.issues.listEvents,
                 {
                   owner: context.repo.owner,
@@ -202,11 +262,7 @@ jobs:
               return present;
             }
 
-            for (const [index, pr] of mergedPRs.entries()) {
-              if (Date.now() + PR_BODY_PARSE_TIMEOUT_MS + AUDIT_REPORT_RESERVE_MS >= AUDIT_DEADLINE_MS) {
-                unauditedPRs = mergedPRs.slice(index);
-                break;
-              }
+            async function auditOnePR(pr) {
               const prViolations = [];
               const isDependabot = pr.user.login === 'dependabot[bot]';
               let bodyContract = { author: '', authorCount: 0, hasSelfReview: false };
@@ -216,12 +272,13 @@ jobs:
                 // A timeout makes this PR's policy audit incomplete, even
                 // for Dependabot. Do not classify the unparsed body as a
                 // missing declaration or heading, or let an override excuse it.
+                if (e?.code === 'AUDIT_DEADLINE') throw e;
                 if (e?.code === 'ETIMEDOUT') {
                   parserErrors.push({
                     number: pr.number, title: pr.title, author: pr.user.login,
                     issues: ['PR body parser timed out (ETIMEDOUT); policy audit incomplete for this PR.'],
                   });
-                  continue;
+                  return;
                 }
                 if (!isDependabot) {
                   prViolations.push('Could not parse PR body contract');
@@ -257,7 +314,7 @@ jobs:
               // matches the patterns already used at the
               // `pulls.list` and `pulls.listReviewComments` call
               // sites in this file.
-              const reviews = await github.paginate(
+              const reviews = await auditPaginate(
                 github.rest.pulls.listReviews,
                 {
                   owner: context.repo.owner,
@@ -433,7 +490,7 @@ jobs:
                 // comment databaseId (same join as scripts/codex-p1-gate.sh).
                 let inlineComments = [];
                 try {
-                  inlineComments = await github.paginate(
+                  inlineComments = await auditPaginate(
                     github.rest.pulls.listReviewComments,
                     {
                       owner: context.repo.owner,
@@ -475,7 +532,7 @@ jobs:
                 try {
                   let cursor = null;
                   for (;;) {
-                    const tresp = await github.graphql(
+                    const tresp = await auditGraphql(
                       `query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
                          repository(owner:$owner,name:$name){
                            pullRequest(number:$pr){
@@ -540,7 +597,7 @@ jobs:
                 // would have decided differently.
                 let issueComments = null;
                 try {
-                  issueComments = await github.paginate(
+                  issueComments = await auditPaginate(
                     github.rest.issues.listComments,
                     {
                       owner: context.repo.owner,
@@ -563,9 +620,10 @@ jobs:
                       'scripts/workflow/resolve-codex-verdict-anchors.py',
                       '--repo', `${context.repo.owner}/${context.repo.repo}`,
                       '--bot', codexBotLogin,
-                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: 35000,
+                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: auditTimeout(35000), killSignal: 'SIGKILL',
                       maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(JSON.stringify(issueComments), 'utf8') * 6)}));
                   } catch (e) {
+                    if (e?.code === 'ETIMEDOUT' || e?.code === 'AUDIT_DEADLINE') throw e;
                     issueComments = null; // Missing/unreadable resolver cannot grant clearance.
                     console.log(`WARNING: Codex anchor resolution failed for PR #${pr.number}`);
                   }
@@ -964,30 +1022,32 @@ jobs:
               let recordedOverride = null;
               if (!hadHumanHold && !hadPolicyViolation) {
                 try {
-                  const comments = await github.paginate(github.rest.issues.listComments, {
+                  const comments = await auditPaginate(github.rest.issues.listComments, {
                     owner: context.repo.owner, repo: context.repo.repo,
                     issue_number: pr.number, per_page: 100,
                   });
                   if (comments.some(comment => comment.user?.login === authorIdentity &&
                       (comment.body || '').startsWith('<!-- mergepath-owner-admin-override:v1 -->'))) {
                     const { execFileSync } = require('child_process');
-                    const overrideReviews = await github.paginate(github.rest.pulls.listReviews, {
+                    const overrideReviews = await auditPaginate(github.rest.pulls.listReviews, {
                       owner: context.repo.owner, repo: context.repo.repo,
                       pull_number: pr.number, per_page: 100,
                     });
-                    const overrideInline = await github.paginate(github.rest.pulls.listReviewComments, {
+                    const overrideInline = await auditPaginate(github.rest.pulls.listReviewComments, {
                       owner: context.repo.owner, repo: context.repo.repo,
                       pull_number: pr.number, per_page: 100,
                     });
                     const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
-                      input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8',
+                      input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8', timeout: auditTimeout(35000), killSignal: 'SIGKILL',
                     }));
                     if (result.recorded_override) recordedOverride = result;
                   }
                 } catch (e) {
+                  if (e?.code === 'ETIMEDOUT' || e?.code === 'AUDIT_DEADLINE') throw e;
                   core.warning(`Owner override record unreadable for #${pr.number}: ${e.message}`);
                 }
               }
+              requireAuditTime();
               if (recordedOverride) {
                 recordedOverrides.push({number: pr.number, issues: prViolations, record: recordedOverride});
               } else if (prViolations.length > 0) {
@@ -1001,12 +1061,26 @@ jobs:
               auditedPRCount += 1;
             }
 
-            const incomplete = parserErrors.length > 0 || unauditedPRs.length > 0;
+            for (const [index, pr] of mergedPRs.entries()) {
+              if (auditExpired || auditRemainingMs() <= 0) {
+                unauditedPRs = mergedPRs.slice(index);
+                break;
+              }
+              try {
+                await auditOnePR(pr);
+              } catch (error) {
+                auditErrors.push({number: pr.number, title: pr.title, author: pr.user.login,
+                  issues: [`PR audit infrastructure failure (${error.code || error.name}): ${error.message}`]});
+              }
+            }
+
+            const incomplete = Boolean(discoveryError) || parserErrors.length > 0 || auditErrors.length > 0 || unauditedPRs.length > 0;
+            reportDeadlineMs = Math.min(AUDIT_DEADLINE_MS, Date.now() + AUDIT_REPORT_RESERVE_MS);
             if (violations.length > 0 || recordedOverrides.length > 0 || incomplete) {
               let body = `## PR Review Policy Violations\n\n`;
               body += `**Audit period:** ${sinceISO.split('T')[0]} to ${today}\n`;
               body += `**Violations found:** ${violations.length}\n\n`;
-              body += `**Audit coverage:** ${incomplete ? 'incomplete' : 'complete'} (${auditedPRCount}/${mergedPRs.length} PRs audited)\n`;
+              body += `**Audit coverage:** ${incomplete ? 'incomplete' : 'complete'} (${auditedPRCount}/${discoveryError ? 'unknown total' : mergedPRs.length} PRs audited)\n`;
               body += `**Parser infrastructure errors:** ${parserErrors.length}\n\n`;
               body += `### Details\n\n`;
 
@@ -1017,6 +1091,14 @@ jobs:
                 }
               }
 
+              if (discoveryError) body += `\n### PR discovery incomplete\n\n${discoveryError}\n`;
+              if (auditErrors.length > 0) {
+                body += `\n### Audit infrastructure errors\n\n`;
+                for (const error of auditErrors) {
+                  body += `- **#${error.number}** — ${error.title} (by ${error.author})\n`;
+                  for (const issue of error.issues) body += `  - ${issue}\n`;
+                }
+              }
               if (parserErrors.length > 0) {
                 body += `\n### Parser infrastructure errors\n\n`;
                 for (const error of parserErrors) {
@@ -1046,18 +1128,35 @@ jobs:
               }
               body += `cc @nathanjohnpayne`;
 
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `Weekly PR Audit — ${today}`,
-                body: body,
-                labels: ['audit'],
-              });
-
-              console.log(`Created audit issue with ${violations.length} violations.`);
+              // Preserve the entire report before its issue write. Base64 chunks keep
+              // untrusted titles from becoming runner commands and round-trip UTF-8.
+              const encodedReport = Buffer.from(body, 'utf8').toString('base64');
+              const chunks = encodedReport.match(/.{1,4096}/g) || [''];
+              chunks.forEach((chunk, index) => console.log(`PR_AUDIT_REPORT_BASE64 ${index + 1}/${chunks.length} ${chunk}`));
+              try {
+                if (core.summary) await boundedAuditCall(() => core.summary.addRaw(body).write(), true);
+              } catch (error) {
+                core.warning(`Job-summary publication failed; encoded report retained in the log: ${error.message}`);
+              }
+              try {
+                await boundedAuditCall(signal => github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Weekly PR Audit — ${today}`,
+                  body,
+                  labels: ['audit'],
+                  request: {signal},
+                }), true);
+                console.log(`Created audit issue with ${violations.length} violations.`);
+              } catch (error) {
+                reportPublicationError = `Audit issue publication failed; report retained in summary/log (${error.code || error.name}).`;
+              }
             } else {
               console.log('No policy violations found for the past 7 days.');
             }
+            const failureReasons = [];
             if (incomplete) {
-              core.setFailed(`PR audit incomplete: ${parserErrors.length} parser timeouts; ${unauditedPRs.length} PRs unaudited after the time budget.`);
+              failureReasons.push(`PR audit incomplete: ${parserErrors.length} parser timeouts; ${auditErrors.length} audit errors; ${unauditedPRs.length} PRs unaudited; discovery ${discoveryError ? 'incomplete' : 'complete'}.`);
             }
+            if (reportPublicationError) failureReasons.push(reportPublicationError);
+            if (failureReasons.length > 0) core.setFailed(failureReasons.join(' '));

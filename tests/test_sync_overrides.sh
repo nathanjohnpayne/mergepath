@@ -1004,9 +1004,13 @@ REASON_PARITY_TARGET='odd "quote"\path.sh' \
   reason_parity_case literal-path 1 1 '"null"' '"ordinary"'
 # No-skip metadata keeps the same active direct edge and does not disturb the
 # permissive reader's cross-call output variable.
-for reason_empty in absent empty; do
+for reason_empty in absent empty version-only null-skips; do
   reason_file="$WORKDIR/reason-$reason_empty.yml"
-  if [ "$reason_empty" = empty ]; then printf 'skip_paths: []\n' >"$reason_file"; fi
+  case "$reason_empty" in
+    empty) printf 'skip_paths: []\n' >"$reason_file" ;;
+    version-only) printf 'version: 1\n' >"$reason_file" ;;
+    null-skips) printf 'version: 1\nskip_paths: null\n' >"$reason_file" ;;
+  esac
   OVERRIDE_SKIP_REASON=reason-parity-preserved
   rc=0
   override_requires_load "$reason_manifest" "$reason_file" || rc=$?
@@ -1019,6 +1023,44 @@ for reason_empty in absent empty; do
     && pass "reason parity $reason_empty: no-skip edge preserved" \
     || fail "reason parity $reason_empty: expected active direct edge"
 done
+
+# Reverse script/test coupling (#2256) respects scope, selected kits and
+# rendered script identities; it never makes an unrelated slice grow.
+paired_manifest="$WORKDIR/paired-tests.yml"
+cat >"$paired_manifest" <<'YAML'
+consumers: [{name: alpha}, {name: beta}]
+paths:
+  - {path: scripts/paired.sh, type: canonical, consumers: all}
+  - {path: scripts/, type: kit, consumers: all}
+  - {path: tests/test_alpha.sh, type: canonical, consumers: [alpha], requires: [scripts/paired.sh]}
+  - {path: tests/test_beta.sh, type: canonical, consumers: [beta], requires: [scripts/paired.sh]}
+  - {path: other.txt, type: canonical, consumers: all}
+  - {path: templates/script.in, dest: scripts/rendered.sh, type: templated, consumers: all}
+  - {path: tests/test_rendered.sh, type: canonical, consumers: all, requires: [templates/script.in]}
+YAML
+override_requires_load "$paired_manifest" '' || fail 'paired test metadata rejected'
+for paired_consumer in alpha beta; do
+  override_requires_check "$paired_consumer" scripts/paired.sh || fail "$OVERRIDE_REQUIRES_DETAIL"
+  [ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = "scripts/paired.sh"$'\t'"tests/test_$paired_consumer.sh" ] \
+    && pass "paired test reverse edge respects $paired_consumer scope" || fail 'reverse test edge absent or cross-consumer'
+done
+override_requires_check alpha scripts/ || fail "$OVERRIDE_REQUIRES_DETAIL"
+[[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" == *$'scripts/paired.sh\ttests/test_alpha.sh'* ]] \
+  && pass 'selected kit carries a declared script test edge' || fail 'kit lost reverse test edge'
+override_requires_check alpha templates/script.in || fail "$OVERRIDE_REQUIRES_DETAIL"
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'templates/script.in\ttests/test_rendered.sh' ] \
+  && pass 'rendered script keeps its logical reverse edge' || fail 'rendered script lost its test'
+override_requires_check alpha other.txt || fail "$OVERRIDE_REQUIRES_DETAIL"
+[ -z "$OVERRIDE_REQUIRES_ACTIVE_EDGES" ] && pass 'unrelated selection has no reverse obligation' || fail 'unrelated selection grew'
+override_requires_check alpha tests/test_alpha.sh || fail "$OVERRIDE_REQUIRES_DETAIL"
+[ "$OVERRIDE_REQUIRES_ACTIVE_EDGES" = $'tests/test_alpha.sh\tscripts/paired.sh' ] \
+  && pass 'test-only selection retains its forward dependency' || fail 'test-only selection changed'
+paired_skip="$WORKDIR/paired-skip.yml"
+printf 'version: 1\nskip_paths: [{path: tests/test_alpha.sh, reason: custom test}]\n' >"$paired_skip"
+override_requires_load "$paired_manifest" "$paired_skip" || fail 'paired test skip metadata rejected'
+rc=0; override_requires_check alpha scripts/paired.sh || rc=$?
+[ "$rc" = 1 ] && [[ "$OVERRIDE_REQUIRES_DETAIL" == *'tests/test_alpha.sh'*'scripts/paired.sh'* ]] \
+  && pass 'skipped coupled test blocks the script with named paths' || fail 'skipped test allowed its script'
 
 # ---------------------------------------------------------------------------
 # Summary

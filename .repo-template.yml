@@ -10,6 +10,7 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  project_doc_sync: tests/test_project_doc_sync.sh
   git_identity_hygiene: tests/test_git_identity_hygiene.sh
   approval_triage:
     - tests/test_self_approval_detector.sh
@@ -48,6 +49,9 @@ spec_test_map:
     - tests/test_cockpit_prs.py
     - tests/test_cockpit_prs_ui.cjs
   sync_audit_json: tests/test_sync_audit_json.sh
+  sync_test_closure:
+    - tests/test_sync_overrides.sh
+    - tests/test_sync_to_downstream.sh
   phase_4b_immutable_input: tests/test_phase_4b_immutable_input.sh
   phase_4b_escalation:
     - tests/test_phase_4b_escalation.cjs

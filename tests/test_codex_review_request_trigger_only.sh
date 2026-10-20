@@ -106,7 +106,7 @@ scenario=${CODEX_TEST_SCENARIO:?}
 head_sha=${CODEX_TEST_HEAD:-head-sha}
 author='nathanjohnpayne'
 reviewer='nathanpayne-codex'
-t=${CODEX_TEST_HEAD_DATE:-2026-06-04T00:00:00Z}
+t=${CODEX_TEST_HEAD_DATE-2026-06-04T00:00:00Z}
 old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
@@ -119,8 +119,15 @@ case "$endpoint" in
   # labels and changed_files feed the #2257 Phase 4 gate derivation, which the
   # request_by_default: false cases reach; the default PR is under-threshold.
   repos/owner/repo/pulls/999)
+    freshness_base=base-sha
+    if [ -f "$CODEX_TEST_STATE_DIR/freshness-scan-complete" ]; then
+      case "${CODEX_TEST_FRESHNESS_TRANSITION:-}" in
+        shrink|expand|base-only) freshness_base=base-next ;;
+        unreadable-pr) echo 'simulated changed-base metadata read failure' >&2; exit 1 ;;
+      esac
+    fi
     if [ "${2:-}" = "--jq" ]; then printf '%s\n' "$head_sha"   # the #2257 head re-read
-    else jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
+    else jq -cn --arg h "$head_sha" --arg b "$freshness_base" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:$b,repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
   repos/owner/repo/pulls/999/files)      printf '%s\n' '[{"filename":"src/app.ts","additions":10,"deletions":2}]' ;;
   repos/owner/repo/branches/main)        printf '%s\n' '{"name":"main","commit":{"sha":"main-sha-1"}}' ;;  # #2257 default-branch pin
   'repos/owner/repo/contents/scripts/workflow/parse_policy_list.sh?ref=base-sha')
@@ -130,11 +137,17 @@ case "$endpoint" in
   'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
     # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
     jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
-  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha'|'repos/owner/repo/contents/.github/review-policy.yml?ref=base-next')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
       echo 'simulated governing policy read failure' >&2
       exit 1
+    fi
+    if [ -f "$CODEX_TEST_STATE_DIR/freshness-scan-complete" ]; then
+      case "${CODEX_TEST_FRESHNESS_TRANSITION:-}" in
+        unreadable-policy) echo 'simulated governing policy read failure after scan' >&2; exit 1 ;;
+        shrink|expand|cap-change) cat "$CODEX_TEST_STATE_DIR/base-review-policy-next.yml"; exit 0 ;;
+      esac
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
@@ -159,10 +172,11 @@ case "$endpoint" in
       # LATEST dispatch on the PR branch.
       dispatched) jq -cn --arg o "${CODEX_TEST_CHECK_OTHER:-$(jq -rn 'now - 10800 | floor | todate')}" \
                     --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
+                    --arg first_event "${CODEX_TEST_CHECK_EVENT-pull_request}" --arg last_event "${CODEX_TEST_CHECK_RERUN_EVENT-push}" \
                     '{total_count:3,workflow_runs:[
-                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",status:"completed",created_at:$o},
-                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$a},
-                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$b}]}' ;;
+                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",event:"push",status:"completed",created_at:$o},
+                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",event:$first_event,status:"completed",created_at:$a},
+                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",event:$last_event,status:"completed",created_at:$b}]}' ;;
       *)          jq -cn --arg st "${CODEX_TEST_LINT_RUNS:-completed}" '{total_count:1,workflow_runs:[{id:2,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:$st}]}' ;;
     esac ;;
   repos/owner/repo/actions/workflows)
@@ -173,12 +187,22 @@ case "$endpoint" in
     esac ;;
   repos/owner/repo/commits/*/check-suites)
     # Suite 100 is the PR branch (head.ref "feature"); suite 200 another branch.
-    printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
+    case "${CODEX_TEST_SUITE_BRANCH:-known}" in
+      unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":null},{"id":200,"head_branch":"other"}]}\n' ;;
+      unrelated-unknown) printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":null}]}\n' ;;
+      *) jq -cn --arg t "${CODEX_TEST_SUITE_CREATED:-}" '{total_count:2,check_suites:[
+           {id:100,head_branch:"feature",created_at:(if $t == "" then null else $t end)},
+           {id:200,head_branch:"other",created_at:"2020-01-01T00:00:00Z"}]}' ;;
+    esac ;;
   repos/owner/repo/commits/*/check-runs)
     # The codex.request_requires_check OVERRIDE path (exact check-run name).
     # Runs carry check_suite.id 100 (the PR branch) unless the shape says not.
     case "${CODEX_TEST_CHECK_RUNS:-completed}" in
       unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
+      dated) jq -cn --arg c "${CODEX_TEST_RUN_CREATED:-}" --arg t "${CODEX_TEST_RUN_STARTED:-}" '
+               {total_count:1,check_runs:[{id:1,name:"lint-fast",status:(if $t == "" then "queued" else "completed" end),check_suite:{id:100},
+                 created_at:(if $c == "" then null else $c end),
+                 started_at:(if $t == "" then null else $t end)}]}' ;;
       missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
       othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed","check_suite":{"id":100}}]}\n' ;;
       # The deep `lint` job alone must not satisfy an exact `lint-fast`.
@@ -213,7 +237,9 @@ case "$endpoint" in
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
-      freshness_author) jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      freshness_author)
+        [ -z "${CODEX_TEST_FRESHNESS_TRANSITION:-}" ] || touch "$CODEX_TEST_STATE_DIR/freshness-scan-complete"
+        jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author_upper) jq -cn --arg who "$author" --arg t "$t" '[{id:7002,user:{login:$who},created_at:$t,body:"@CODEX REVIEW"}]' ;;
       author_prose)     jq -cn --arg who "$author" --arg t "$t" '[{id:7003,user:{login:$who},created_at:$t,body:"Status: @codex review was already requested."}]' ;;
@@ -221,6 +247,12 @@ case "$endpoint" in
       author_padded)    jq -cn --arg who "$author" --arg t "$t" '[{id:7005,user:{login:$who},created_at:$t,body:"@codex review "}]' ;;
       stale_author)     jq -cn --arg who "$author" --arg t "$old" '[{id:7006,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       reviewer_only)    jq -cn --arg who "$reviewer" --arg t "$t" '[{id:7007,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      known_usage_limit) jq -cn --arg t "$t" '[{id:8061,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      known_not_connected) jq -cn --arg t "$t" '[{id:8062,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
+      stale_usage_limit) jq -cn --arg t "$old" '[{id:8063,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      stale_not_connected) jq -cn --arg t "$old" '[{id:8064,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
+      current_usage_limit) jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:8065,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      current_not_connected) jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:8066,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"To use Codex here, create a Codex account and connect to GitHub, then comment @codex review."}]' ;;
       cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
       cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
@@ -488,7 +520,9 @@ test_missing_governing_codex_block_defaults_request_cap() {
   local dir rc before=$FAIL
   dir=$(make_case "request-cap-base-no-codex")
   printf 'author_identity: nathanjohnpayne\n' > "$dir/state/base-review-policy.yml"
-  rc=$(run_trigger_only "$dir" cap_at_limit)
+  # An absent request_by_default now belongs to the governing target too.
+  # Explicit gating reaches the cap whose default this case exercises.
+  rc=$(run_trigger_only "$dir" cap_at_limit true)
   [ "$rc" = 7 ] || fail "#813 missing governing codex: expected default-cap exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#813 missing governing codex: posted despite default cap exhaustion"
   grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
@@ -535,6 +569,37 @@ test_governing_request_freshness() {
       || fail "#1567 $scenario: rc=$rc posts=$(trig_count "$dir") expected=$expected_posts; err=$(cat "$dir/err.log")"
     [ "$FAIL" -ne "$before" ] || pass "#1567: $scenario uses governing freshness for actual request reuse"
   done
+}
+
+# #2027: advance the governing base after the initial signal scan. A bounded
+# refusal avoids either reusing a stale window or spending from the old one.
+test_governing_freshness_revalidation() {
+  local variant dir rc initial next expected posts trigger_at before=$FAIL
+  trigger_at=$(jq -rn 'now - 3600 | floor | todate')
+  for variant in shrink expand base-only unreadable-pr unreadable-policy unchanged-wide unchanged-short malformed-cap cap-change; do
+    dir=$(make_case "freshness-fence-$variant")
+    initial=7200; next=7200; expected=3; posts=0
+    case "$variant" in
+      shrink) next=1800 ;;
+      expand) initial=1800 ;;
+      unchanged-wide|malformed-cap|cap-change) expected=0 ;;
+      unchanged-short) initial=1800; next=1800; expected=0; posts=1 ;;
+    esac
+    sed -i.bak "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $initial/" "$dir/state/base-review-policy.yml"
+    sed "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $next/" \
+      "$dir/state/base-review-policy.yml" >"$dir/state/base-review-policy-next.yml"
+    [ "$variant" != malformed-cap ] || printf '  max_review_rounds: invalid\n' >>"$dir/state/base-review-policy.yml"
+    [ "$variant" != cap-change ] || printf '  max_review_rounds: invalid\n' >>"$dir/state/base-review-policy-next.yml"
+    rc=$(CODEX_TEST_FRESHNESS_TRANSITION="$variant" CODEX_TEST_TRIGGER_AT="$trigger_at" \
+      CODEX_TEST_HEAD_DATE=1999-01-01T00:00:00Z run_trigger_only "$dir" freshness_author)
+    [ "$rc" = "$expected" ] && [ "$(trig_count "$dir")" = "$posts" ] \
+      || fail "#2027: $variant expected rc=$expected posts=$posts, got rc=$rc posts=$(trig_count "$dir") ($(cat "$dir/err.log"))"
+    if [ "$expected" = 3 ]; then
+      grep -q 'governing request freshness' "$dir/err.log" \
+        || fail "#2027: $variant must name the fresh evidence refusal"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2027: freshness/base drift refuses reuse or writes; unchanged and malformed-cap no-spend paths retain behavior"
 }
 
 test_governing_freshness_validation_preserves_no_spend_caps() {
@@ -1407,6 +1472,37 @@ test_guard_policy_knobs_disable_signals() {
   [ "$FAIL" -ne "$before" ] || pass "MH7: request_min_head_age_seconds / request_requires_check are honoured, and 0 / empty disable each signal"
 }
 
+# #2340: value and presence use YAML for flow mappings and quoted keys too.
+test_guard_check_signal_yaml_forms() {
+  refresh_head_dates
+  local dir rc shape before=$FAIL
+  for shape in flow-name quoted-name flow-empty flow-null flow-absent; do
+    dir=$(make_case "guard-yaml-$shape")
+    case "$shape" in
+      flow-name) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: not-lint}' >"$dir/.github/review-policy.yml" ;;
+      quoted-name) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex:' '  request_by_default: true' '  "request_requires_check": not-lint' >"$dir/.github/review-policy.yml" ;;
+      flow-empty) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: ""}' >"$dir/.github/review-policy.yml" ;;
+      flow-null) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true, request_requires_check: null}' >"$dir/.github/review-policy.yml" ;;
+      flow-absent) printf '%s\n' 'author_identity: nathanjohnpayne' 'codex: {request_by_default: true}' >"$dir/.github/review-policy.yml" ;;
+    esac
+    case "$shape" in
+      *name)
+        rc=$(CODEX_TEST_CHECK_RUNS=missing run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] || fail "$shape: missing named check must refuse (rc=$rc)"
+        ;;
+      flow-empty|flow-null)
+        rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+        [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] || fail "$shape: explicit empty must disable CI pickup (rc=$rc)"
+        ;;
+      flow-absent)
+        rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] || fail "$shape: absent key must retain the workflow signal (rc=$rc)"
+        ;;
+    esac
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2340: flow/quoted check names and absent/explicit-empty CI pickup meanings are preserved"
+}
+
 # MH8: an automatic caller (CI failover on a provider event) is exempt. It
 # fires on CodeRabbit's rate limit, not on a push the agent is amending, and a
 # refusal would strand the head with no caller left to re-request.
@@ -1484,14 +1580,41 @@ test_guard_anchors_on_push_dispatch() {
   [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the latest repo-lint dispatch for the head on the PR branch, not only the commit date"
 }
 
-# MH12 (Codex P2 on #2175): the policy is read from the SCRIPT's checkout.
-# Launched from a subdirectory, or by absolute path from another directory,
-# a cwd-relative read found no policy and silently restored
-# request_by_default: true. Under-threshold (not gated) + false => exit 5.
+# #2198: every workflow event proves pickup, but only PR/push dispatches
+# date the age guard. A later manual/scheduled run cannot reset a settled head.
+test_guard_workflow_event_anchors() {
+  refresh_head_dates
+  local dir rc event shape first expected before
+  for event in workflow_dispatch schedule '' pull_request push; do
+    for shape in mixed event-only; do
+      before=$FAIL
+      dir=$(make_case "guard-event-${event:-missing}-$shape")
+      first=pull_request; [ "$shape" != event-only ] || first=$event
+      rc=$(CODEX_TEST_CHECK_EVENT="$first" CODEX_TEST_CHECK_RERUN_EVENT="$event" \
+        CODEX_TEST_CHECK_STARTED="$OLD_HEAD" CODEX_TEST_CHECK_RERUN="$YOUNG_HEAD" \
+        run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+      case "$event" in
+        pull_request|push)
+          [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] \
+            && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+            && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+            || fail "#2198: fresh $event dispatch must retain age refusal ($shape, rc=$rc)" ;;
+        *)
+          [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] \
+            && grep -q "'repo-lint' is completed on HEAD" "$dir/err.log" \
+            || fail "#2198: ${event:-missing} event must prove pickup without resetting push age ($shape, rc=$rc)" ;;
+      esac
+      [ "$FAIL" -ne "$before" ] || pass "#2198: ${event:-missing} workflow age anchor ($shape)"
+    done
+  done
+}
+
+# MH12 (#2175, #2273): the target policy governs from a subdirectory or a
+# foreign cwd, even when the script checkout requests by default.
 test_policy_resolved_from_script_checkout() {
   local dir rc before=$FAIL
   dir=$(make_case "policy-subdir")
-  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/state/base-review-policy.yml"
   rc=0
   ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
@@ -1499,14 +1622,14 @@ test_policy_resolved_from_script_checkout() {
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
   dir=$(make_case "policy-foreign-cwd")
-  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/state/base-review-policy.yml"
   rc=0
   ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12b: by absolute path from a foreign cwd, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir"))"
-  [ "$FAIL" -ne "$before" ] || pass "MH12: the requester reads the policy from its own checkout, not the caller cwd"
+  [ "$FAIL" -ne "$before" ] || pass "MH12: the governing target policy wins over both checkout and caller cwd"
 }
 
 # MH13: the CI-pickup signal is the repo-lint WORKFLOW RUN, which survives job
@@ -1591,12 +1714,88 @@ test_guard_runs_after_the_cap_branch() {
 }
 
 
+# #2274: queued checks need creation metadata; a missing dispatch timestamp
+# makes age unavailable rather than laundering an old committer date.
+test_guard_dates_queued_checks() {
+  refresh_head_dates
+  local variant dir rc created started suite expected before=$FAIL
+  for variant in run-created suite-created started unavailable settled invalid-run; do
+    dir=$(make_case "queued-dating-$variant")
+    printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+    created=""; started=""; suite=""; expected=8
+    case "$variant" in
+      run-created) created=$YOUNG_HEAD; suite=$OLD_HEAD ;;
+      suite-created) suite=$YOUNG_HEAD ;;
+      started) started=$YOUNG_HEAD; suite=$OLD_HEAD ;;
+      unavailable) expected=0 ;;
+      settled) created=$OLD_HEAD; suite=$OLD_HEAD; expected=0 ;;
+      invalid-run) created=unreadable; suite=$YOUNG_HEAD ;;
+    esac
+    rc=$(CODEX_TEST_RUN_CREATED="$created" CODEX_TEST_RUN_STARTED="$started" \
+      CODEX_TEST_SUITE_CREATED="$suite" CODEX_TEST_CHECK_RUNS=dated \
+      run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+    [ "$rc" = "$expected" ] || fail "#2274: $variant expected exit $expected, got $rc ($(cat "$dir/err.log"))"
+    if [ "$expected" = 8 ]; then
+      [ "$(trig_count "$dir")" = 0 ] \
+        && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+        && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+        || fail "#2274: $variant must refuse from fresh dispatch metadata before POST"
+    else
+      [ "$(trig_count "$dir")" = 1 ] || fail "#2274: $variant must retain a settled/unavailable write"
+      [ "$variant" != unavailable ] || grep -q 'head-age signal unavailable, not enforced' "$dir/err.log" \
+        || fail "#2274: missing dispatch timestamps must report unavailable age"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2274: queued check creation and suite times date pickup; absent metadata makes age unavailable"
+}
+
+# #2200: fork check suites may not identify their branch. Unknown attribution
+# is an unavailable advisory signal, never proof that a check is missing.
+test_guard_unknown_suite_branch() {
+  refresh_head_dates
+  local variant dir rc head scenario check_run before=$FAIL
+  for variant in old young unrelated known-other; do
+    dir=$(make_case "unknown-suite-$variant")
+    printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+    head=$OLD_HEAD
+    scenario=unknown
+    check_run=completed
+    [ "$variant" != young ] || head=$YOUNG_HEAD
+    [ "$variant" != unrelated ] || scenario=unrelated-unknown
+    [ "$variant" != known-other ] || scenario=known
+    [ "$variant" != known-other ] || check_run=othersuite
+    rc=$(CODEX_TEST_SUITE_BRANCH="$scenario" CODEX_TEST_CHECK_RUNS="$check_run" \
+      run_guard "$dir" fresh "$head" completed "" --trigger-only)
+    case "$variant" in
+      old)
+        [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] \
+          && grep -q 'unavailable suite branch attribution' "$dir/err.log" \
+          || fail "#2200: unknown fork branch must fail open distinctly (rc=$rc)" ;;
+      young)
+        [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] \
+          && [ "$(jqf "$dir" '.moving_head.check_status')" = branch-unavailable ] \
+          && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+          || fail "#2200: unavailable branch must not mask the age guard (rc=$rc)" ;;
+      unrelated)
+        [ "$rc" = 0 ] && grep -q "'lint-fast' is completed" "$dir/err.log" \
+          || fail "#2200: unrelated unknown suite must retain known matching signal" ;;
+      known-other)
+        [ "$rc" = 8 ] && [ "$(jqf "$dir" '.moving_head.check_status')" = missing ] \
+          || fail "#2200: known other-branch suite must still be missing" ;;
+    esac
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2200: unknown fork attribution is unavailable; known branch and age signals retain behavior"
+}
+
 # #2158: fresh write-boundary authorization shares the production budgets,
 # performs no POST, and cannot authorize a different expected head.
 test_write_boundary_authorization() {
-  local scenario dir rc expected before=$FAIL
-  for scenario in fresh cap_at_limit stale_head; do
+  local scenario dir rc expected auto gate reason before=$FAIL
+  for scenario in fresh cap_at_limit stale_head body-P2 dup_author content-free; do
     dir=$(make_case "authorize-$scenario")
+    auto=false
+    gate=$(write_gate_stub "$dir" false)
+    [ "$scenario" != content-free ] || auto=true
     expected=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     [ "$scenario" != stale_head ] || expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     rc=0
@@ -1605,6 +1804,7 @@ test_write_boundary_authorization() {
       PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$expected" \
+        MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"
     ) || rc=$?
@@ -1614,12 +1814,23 @@ test_write_boundary_authorization() {
           || fail "authorization: fresh governing budget should authorize (rc=$rc; $(cat "$dir/err.log"))" ;;
       cap_at_limit) [ "$rc" = 7 ] || fail "authorization: spent request ceiling must refuse (rc=$rc)" ;;
       stale_head) [ "$rc" = 3 ] || fail "authorization: stale expected head must refuse (rc=$rc)" ;;
+      body-P2|dup_author|content-free)
+        case "$scenario" in
+          body-P2) reason=already-cleared ;;
+          dup_author) reason=existing-trigger ;;
+          content-free) reason=content-free-auto-trigger ;;
+        esac
+        [ "$rc" = 3 ] && jq -e --arg reason "$reason" \
+          '.authorized == false and .reason == $reason' "$dir/out.json" >/dev/null \
+          || fail "authorization: $scenario must explicitly refuse (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "authorization must never post ($scenario)"
   done
   [ "$FAIL" -ne "$before" ] || pass "write-boundary authorization enforces budget and head without a POST"
 }
 
+test_guard_dates_queued_checks
+test_guard_unknown_suite_branch
 test_write_boundary_authorization
 
 test_fresh_posts_once_no_poll
@@ -1637,6 +1848,7 @@ test_invalid_present_governing_codex_block_refuses_new_write
 test_missing_governing_codex_block_defaults_request_cap
 test_idempotent_skip_requires_governing_freshness
 test_governing_request_freshness
+test_governing_freshness_revalidation
 test_governing_freshness_validation_preserves_no_spend_caps
 test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only
@@ -1665,14 +1877,105 @@ test_guard_reports_both_reasons
 test_guard_accepts_queued_check
 test_guard_unreadable_check_runs_fails_open
 test_guard_policy_knobs_disable_signals
+test_guard_check_signal_yaml_forms
 test_guard_exempts_automatic_caller
 test_guard_does_not_run_on_no_write_paths
 test_guard_applies_in_polling_mode
 test_guard_anchors_on_push_dispatch
+test_guard_workflow_event_anchors
 test_policy_resolved_from_script_checkout
 test_guard_workflow_signal_shapes
 test_guard_override_paginates_and_scopes
 test_guard_runs_after_the_cap_branch
+
+test_trigger_only_preserves_known_provider_block() {
+  local reason dir rc before
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "known-block-$reason")
+    rc=$(run_trigger_only "$dir" "known_$reason")
+    [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = "$reason" ] \
+      && [ "$(trig_count "$dir")" = 1 ] \
+      || fail "trigger-only lost known $reason diagnostic; err=$(tail -3 "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "trigger-only preserves known $reason without changing request authority or budgets"
+  done
+}
+test_trigger_only_preserves_known_provider_block
+
+test_trigger_only_ignores_stale_provider_block() {
+  local reason dir rc before
+  for reason in usage_limit not_connected; do
+    before=$FAIL
+    dir=$(make_case "stale-block-$reason")
+    rc=$(run_trigger_only "$dir" "stale_$reason")
+    [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = null ] \
+      && [ "$(trig_count "$dir")" = 1 ] \
+      || fail "trigger-only retained stale $reason diagnostic; err=$(tail -3 "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "trigger-only ignores $reason before the current freshness threshold"
+  done
+}
+test_trigger_only_ignores_stale_provider_block
+
+test_trigger_only_future_head_preserves_recent_blocks() {
+  local reason age dir rc before expected
+  for reason in usage_limit not_connected; do
+    for age in current stale; do
+      before=$FAIL
+      dir=$(make_case "future-head-$age-$reason")
+      sed -i.bak 's/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: 1800/' \
+        "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
+      rc=$(run_guard "$dir" "${age}_$reason" 2099-01-01T00:00:00Z completed "" \
+        --trigger-only --allow-moving-head)
+      expected=$reason
+      [ "$age" != stale ] || expected=null
+      [ "$rc" = 0 ] && [ "$(jqf "$dir" '.blocked_reason')" = "$expected" ] \
+        && [ "$(trig_count "$dir")" = 1 ] \
+        || fail "future head mishandled $age $reason; err=$(tail -3 "$dir/err.log")"
+      [ "$FAIL" -ne "$before" ] || pass "future head preserves freshness distinction for $age $reason"
+    done
+  done
+}
+# #2317: metadata that the post-write diagnostic cannot parse must refuse
+# before a trigger mutation. Standard UTC, including future dates, stays valid.
+test_trigger_timestamp_validation() {
+  local variant dir timestamp rc expected before=$FAIL
+  for variant in empty invalid fractional offset invalid-date utc future; do
+    dir=$(make_case "timestamp-$variant")
+    expected=3
+    case "$variant" in
+      empty) timestamp="" ;;
+      invalid) timestamp=not-a-timestamp ;;
+      fractional) timestamp=2026-06-04T00:00:00.123Z ;;
+      offset) timestamp=2026-06-04T00:00:00+00:00 ;;
+      invalid-date) timestamp=2026-02-30T00:00:00Z ;;
+      utc) timestamp=2026-06-04T00:00:00Z; expected=0 ;;
+      future) timestamp=2099-06-04T00:00:00Z; expected=0 ;;
+    esac
+    rc=0
+    (
+      cd "$dir"
+      PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+        CODEX_TEST_SCENARIO=fresh CODEX_TEST_HEAD_DATE="$timestamp" \
+        ./scripts/codex-review-request.sh --trigger-only --allow-moving-head 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    ) || rc=$?
+    [ "$rc" = "$expected" ] || fail "#2317: $variant expected exit $expected, got $rc"
+    if [ "$expected" = 0 ]; then
+      [ "$(trig_count "$dir")" = 1 ] \
+        && jq -e --arg t "$timestamp" '.trigger_posted == true and .head_committer_date == $t' "$dir/out.json" >/dev/null \
+        || fail "#2317: $variant must preserve the post-write JSON contract"
+    else
+      [ "$(trig_count "$dir")" = 0 ] && [ ! -s "$dir/out.json" ] \
+        && grep -q 'unsupported commit timestamp' "$dir/err.log" \
+        || fail "#2317: $variant must refuse before POST with a metadata diagnostic (posts=$(trig_count "$dir"))"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#2317: unsupported commit metadata refuses before writes; canonical and future UTC keep JSON"
+}
+
+test_trigger_timestamp_validation
+
+test_trigger_only_future_head_preserves_recent_blocks
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

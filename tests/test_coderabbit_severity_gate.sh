@@ -3439,9 +3439,9 @@ $heading
     RC=$?
     set -e
     if [ "$RC" = "$expected" ] \
-      && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: $expected" \
-      && echo "$OUT" | grep -q 'markerless full-review summary in review object 8001' \
-      && { [ "$expected" = 0 ] || echo "$OUT" | grep -qF "[$expected_tier] (PR-level summary comment):5"; }; then
+      && grep -q "CodeRabbit blocking-tier unresolved: $expected" <<<"$OUT" \
+      && grep -q 'markerless full-review summary in review object 8001' <<<"$OUT" \
+      && { [ "$expected" = 0 ] || grep -qF "[$expected_tier] (PR-level summary comment):5" <<<"$OUT"; }; then
       pass "outside-diff heading preserves nested tier and policy: $heading / $tier_case"
     else
       fail "outside-diff heading expected rc=$expected, got rc=$RC: $heading / $finding"

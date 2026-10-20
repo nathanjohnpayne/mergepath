@@ -211,8 +211,8 @@ override_requires_load() {
     done
   done <<< "$OVERRIDE_REQUIRES_ENTRIES"
   if [ -n "$overrides" ] && [ -e "$overrides" ]; then
-    yq -e '(tag == "!!null") or ((tag == "!!map") and
-      ((.skip_paths | tag) == "!!null" or (.skip_paths | tag) == "!!seq"))' "$overrides" >/dev/null 2>&1 || return 2
+    yq -e '[select(tag != "!!null") | select(tag != "!!map")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
+    yq -e '[.skip_paths | select(tag != "!!null") | select(tag != "!!seq")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | select(tag != "!!map")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | (.path, .reason) | select(tag != "!!str")] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
     yq -e '[(.skip_paths // [])[] | .path | select(test("^[^\x00\t\r\n]+$") == false)] | length == 0' "$overrides" >/dev/null 2>&1 || return 2
@@ -292,6 +292,14 @@ override_requires_check() {
       }
       return 0
     }
+    function script_delivered(path,    k) {
+      if (!template_key[key(path)]) return substr(path, 1, 8) == "scripts/" && covered(path, 1)
+      for (k = 1; k <= n; k++) {
+        if (paths[k] == path && types[k] == "templated" && applies(scopes[k]) &&
+            substr(targets[k], 1, 8) == "scripts/" && !skipped[key(targets[k])] && covered(targets[k], 1)) return 1
+      }
+      return 0
+    }
     {
       kind = substr($0, 1, 1)
       value = substr($0, 3)
@@ -337,6 +345,24 @@ override_requires_check() {
             exit 1
           }
           output[++out_count] = paths[i] "\t" required
+          emitted[pair(paths[i], required)] = 1
+        }
+      }
+      # Individually declared tests also constrain delivery of their scripts.
+      # The artifact gate proves these reverse edges; this does not add paths.
+      for (i = 1; i <= n; i++) {
+        if (substr(paths[i], 1, 6) != "tests/" || types[i] == "kit" || !applies(scopes[i])) continue
+        for (j = 1; j <= count[key(paths[i])]; j++) {
+          required = edges[pair(paths[i], j)]
+          if (!script_delivered(required)) continue
+          if (!covered(paths[i], 0)) {
+            print "D\t" consumer ": " paths[i] " (test required by delivered script " required ") has no applicable unskipped manifest carrier; include the test or withhold the script"
+            exit 1
+          }
+          if (!emitted[pair(required, paths[i])]) {
+            output[++out_count] = required "\t" paths[i]
+            emitted[pair(required, paths[i])] = 1
+          }
         }
       }
       print "OK"

@@ -4,6 +4,10 @@
 - Do not delete tests to make a build pass.
 - Every spec file should have a corresponding test file or a documented exception explaining why one does not exist.
 
+The bare-write scanner admission and error contract is defined in the [canonical repo-lint specification](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/repo_lint_execution.md#bare-write-scanner-admission-and-errors). Its existing native regression corpus includes inert bytecode and scanner-error controls; run it when changing that surface.
+
+Captured-output assertions must retain both the expected exit and diagnostic without an early-closing pipeline reader changing the result. The observed lint predicates and project-document mirror ownership check use here-string input; keep pipefail and the original diagnostic/ownership conditions (#2488).
+
 ## Repo-lint execution
 
 The required `lint` context is an aggregator over a fast live-assertion lane and a change-aware deep lane of three `deep-safety (...)` jobs: the consumer-smoke and residue legs run for every deep selection, the sharded complete consumer replay runs when the consumer shape or the lane itself changes (and on every main push and scheduled run), and the self-test legs run when an affected wrapper is enrolled in them. Pull requests that change CI implementation, propagation, or tests select the wrappers the dependency graph declares for those paths, or fail closed to the complete surface when a path is undeclared; governance documents and specifications request the deep legs in smoke mode. Main pushes, the daily schedule, and manual runs always select the complete surface. Do not add path filters to the aggregator itself: every pull-request head must publish exactly one stable `lint` result, and the aggregator must keep reading every deep job's result against the scope bit that selected it.
@@ -11,6 +15,8 @@ The required `lint` context is an aggregator over a fast live-assertion lane and
 When you add a `tests/test_*` reference to a wrapper that the graph declares, declare that test under the wrapper in `scripts/ci/repo-lint-dependencies.json`; when you enrol a new `--self-test` step in the workflow, add the wrapper to the graph's `self_tests` list. `tests/test_repo_lint_optimization.sh` fails lint-fast on the hub until both are in step.
 
 The fast lane is itself a shard matrix balanced by measured step time: a new check step in `lint_fast` is pinned to exactly one shard with `if: matrix.shard == N` (pick the shard with the smallest measured sum), and `tests/test_repo_lint_optimization.sh` fails on an unpinned check or a pin naming a shard the matrix does not declare.
+
+The Phase 4b self-test wrapper runs all four focused CodeRabbit refusal modes: status refusal, marker-led heading, active status and Phase 4b quota refusal. Its live check requires the probe script and both native refusal fixtures; the dependency graph maps fixture changes to that wrapper so the existing deep CI step reruns their probes. The propagation manifest already carries the paired fixtures with the probe and CI kit.
 
 Checks with separable repository assertions and implementation regression suites should expose explicit live and self-test modes. The fast lane invokes the live mode, deep CI invokes the self-test mode, and the no-argument behavior remains compatible for consumers during propagation skew. The canonical contract and regression coverage live in `specs/repo_lint_execution.md` and `tests/test_repo_lint_optimization.sh`.
 
@@ -22,6 +28,30 @@ The hook computes the pushed range against the merge base with the remote defaul
 
 CI stays authoritative. Branch protection keeps requiring the Actions `lint` check, because a result reported from a developer machine cannot be trusted, and CI also runs everything the hook skips by default. Bypass the hook only in an emergency, with `git push --no-verify` or `MERGEPATH_PREPUSH_SKIP=1 git push`. `tests/test_repo_lint_prepush.sh` (run in the fast lane by `scripts/ci/check_repo_lint_prepush`) proves selection parity: for each changed-path list it runs the workflow's own classify step and evaluates every job and step `if:` expression independently, and fails when the hook's plan differs, so a workflow or classifier change that the hook does not follow fails on the PR that makes it.
 
+## Direct checker runtime prerequisites
+
+`scripts/codex-review-check.sh` needs one working structured YAML parser on the caller's PATH: mikefarah yq v4, Python3 with PyYAML, or Ruby with YAML and JSON. The shared `policy_yaml_to_json` selects them in that order; an installed executable alone does not prove its required modules or syntax work. Python's standard library does not include PyYAML. This requirement also applies to direct checker calls and approval continuation, without passing through `scripts/merge-clearance-gate.sh` (#2314).
+
+The canonical caller inventory below describes checked-in job declarations, not a promise about software bundled into a future hosted-runner image. Every listed job currently selects `ubuntu-latest`; auto-clear and approval continuation do not explicitly install a parser. Their runner provisioning must retain one supported implementation. Repo-lint provisions pinned PyYAML in its isolated CI environment; that installation does not provision another job. Local and custom runners have the same prerequisite.
+
+| Caller | Jobs / route |
+|---|---|
+| `auto-clear-blocking-labels.yml` | `evaluate-and-clear` and `scheduled-sweep`, including their approval-continuation calls |
+| `agent-review.yml` | `auto-merge-on-approval` readiness probe |
+| `pr-review-policy.yml` | `external-review-labeling` Codex substitution probe |
+| `merge-clearance-gate.yml` | `merge-clearance-gate`, `scheduled-sweep` and `dispatch-recheck`, through the dispatcher |
+| `required-check-publisher.yml` | `publish`, through the dispatcher |
+
+Before enabling these callers on a runner, run this read-only probe from its trusted checkout, under the same PATH as the checker. It exercises the actual shared parser and the checked-in policy; a nonzero result means parser or configuration trouble and grants no clearance. Provision a supported parser or repair the policy before retrying. A missing policy file remains a separate pre-existing configuration error.
+
+```bash
+bash -c 'source scripts/lib/feedback-policy-helpers.sh; policy_yaml_to_json .github/review-policy.yml >/dev/null'
+```
+
+Native checker fixtures verify that unavailable parsers refuse before the next commit lookup; parser availability does not weaken approval, head anchoring or feedback gates.
+
 ## Feedback snapshot recovery
 
 For Codex P1 workflow changes, run `tests/test_codex_p1_workflow_runtime.sh` and `scripts/ci/check_codex_p1_gate` with an outer timeout. The runtime suite extracts the checked-in event preparation/closing steps and scheduled loop, invokes them with the Actions default `bash -e` shell behavior, and verifies the native execution result together with the original lease. Cover stable blocked and configuration-error verdicts in the positive-reference-absence bootstrap window, plus missing/non-executable scheduled drivers across multiple readable PRs. A green check from a separate producer does not prove recovery. Exercise publisher launch failures and timeout/exit races in both event and scheduled paths, checking original-lease closure, the three-attempt failure-only reserve, and honest infrastructure status for unclosed leases. Preserve baseline failure receipts and known-bad controls for both snapshot comparisons; installed consumer acceptance follows canonical propagation and remains separate from hermetic transport evidence.
+
+The deadline descendant check verifies the timeout supplied by the production driver's shared deadline under a controlled clock before shortening its real wait. It waits for readiness, exercises a slow launcher, releases survivors and observes termination before accepting missing escape evidence. Its bounded observation must reject missing/miswired timeout and leader-only termination mutations; an early absence check alone does not establish process-group cleanup (#2462).

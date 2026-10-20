@@ -733,6 +733,13 @@ fall_back_to_manual() {
   # cleanup before a fallible feedback read can interrupt that path. This final
   # fence is unconditional so a missing helper cannot grant fallback via JSON.
   revalidate_codex_request_budget_authority pre-post
+  if [ "$handoff_rendered" = true ] && [ "$handoff_rc" -eq 5 ]; then
+    # The renderer observed actual ongoing review after the adapter fallback.
+    # Preserve the failed adapter's accounting, but do not publish a handoff.
+    printf '%s\n' "$handoff_output" >&2
+    hold_for_external_review "$(jq -nc \
+      '{decision:"pending",retry_after:30,codex:"not-yet",codex_evidence:"manual-handoff-review-in-flight",reason:"manual handoff renderer observed an active review"}')"
+  fi
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   if [ "$handoff_rendered" = true ]; then
     case "$handoff_rc" in

@@ -431,7 +431,7 @@ fi
 # an unreadable read, a head move, or a payload not bound to the pinned head is
 # not.
 # ---------------------------------------------------------------------------
-PIN_HELPER="$ROOT/scripts/workflow/dependabot_pin_bump_exemption.sh"
+PIN_HELPER="${PIN_HELPER:-$ROOT/scripts/workflow/dependabot_pin_bump_exemption.sh}"
 PIN_DIR="$WORK/pin"
 mkdir -p "$PIN_DIR/bin"
 PIN_HEAD=cccccccccccccccccccccccccccccccccccccccc
@@ -475,6 +475,21 @@ case "$1 ${2:-}" in
 esac
 SHIM
 chmod +x "$PIN_DIR/bin/gh"
+# Fault the actual matcher's child process, including partial stdout, without
+# replacing the exemption helper's proof or changing its production interface.
+cat >"$PIN_DIR/bin/bash" <<'SHIM'
+#!/bin/bash
+case "${1:-}" in
+  */match_protected_paths.sh)
+    case "${PIN_MODE:-}" in
+      matcher-fails) exit 43 ;;
+      matcher-partial-fails) printf '%s\n' .github/workflows/deploy.yml; exit 43 ;;
+    esac
+    ;;
+esac
+exec /bin/bash "$@"
+SHIM
+chmod +x "$PIN_DIR/bin/bash"
 
 pin_pr_json() {  # <author> <head> <base>
   jq -nc --arg a "$1" --arg h "$2" --arg b "$3" '{user:{login:$a}, head:{sha:$h}, base:{sha:$b}}'
@@ -583,7 +598,7 @@ run_pin() {  # <pr json> <commits json> <files json|-> <mode> [extra helper args
   ( cd "$ROOT" && PATH="$PIN_DIR/bin:$PATH" PIN_LOG="$PIN_DIR/gh.log" \
       PIN_PR="$pr" PIN_PR_MOVED="$PIN_DIR/pr-moved.json" PIN_COMMITS="$commits" \
       PIN_FILES="${files/#-/$PIN_DIR/files-real.json}" PIN_MODE="$mode" \
-      bash "$PIN_HELPER" --repo owner/repo --pr 1 "${files_arg[@]}" "$@" )
+      bash "$PIN_HELPER" --repo owner/repo --pr 1 ${files_arg[@]+"${files_arg[@]}"} "$@" )
 }
 
 pin_case() {  # <label> <expected rc> <expected status> <reason substring> <pr> <commits> <files|-> <mode> [args...]
@@ -779,6 +794,10 @@ pin_case "a pin bump in a separately protected workflow is not exempt" 1 not-exe
   "$(pin_fixture deploy "$(pin_file .github/workflows/deploy.yml "$PATCH_REAL" 1 1)")" ok --config "$PIN_DIR/policy-narrow.yml" >/dev/null
 pin_case "a pin bump in a workflow covered only by the broad rule stays exempt beside a narrower pattern" 0 exempt "1 pin(s)" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-narrow.yml" >/dev/null
+for matcher_mode in matcher-fails matcher-partial-fails; do
+  pin_case "a failed narrower matcher ($matcher_mode) is unreadable, regardless of stdout" 3 unreadable "protected path matcher failed (rc=43)" \
+    "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" "$matcher_mode" --config "$PIN_DIR/policy-narrow.yml" >/dev/null
+done
 printf 'external_review_paths:\n  - ".github/workflows/**"\n  - "**/*secret*"\n' >"$PIN_DIR/policy-secret.yml"
 pin_case "a pin bump in a workflow matching another protected pattern is not exempt" 1 not-exempt "matches protected path pattern '**/*secret*'" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
@@ -830,7 +849,7 @@ fi
 # default-branch checkout on BOTH clearing loops, before the merge-gate
 # evaluation, mapping an unreachable verdict to the infrastructure sentinel.
 # ---------------------------------------------------------------------------
-PRP_WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
+PRP_WORKFLOW="${PRP_WORKFLOW:-$ROOT/.github/workflows/pr-review-policy.yml}"
 AUTO_CLEAR_WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_WORKFLOW" ]; then
   CLASSIFIER=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$PRP_WORKFLOW")
@@ -897,6 +916,7 @@ case "$*" in
     [ "${LANE_MODE:-}" != pair-read-fails ] || exit 1
     cat "$LANE_PAIR" ;;
   "pr comment 1 --repo owner/repo --body-file "*)
+    [ "${LANE_MODE:-}" != comment-refused ] || { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; }
     cat "$7" >>"$LANE_DIR/comment-writes"
     printf '\n---\n' >>"$LANE_DIR/comment-writes" ;;
   *) echo "gh shim: unexpected command: $*" >&2; exit 90 ;;
@@ -934,6 +954,14 @@ SHIM
     pass "diagnostic step posts one marker comment naming the pair, the provenance and the pinned file, and touches no label"
   else
     fail "diagnostic step did not publish as expected (out=$(cat "$LANE_DIR/out") err=$(cat "$LANE_DIR/err") log=$(cat "$LANE_DIR/gh.log"))"
+  fi
+  if run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-current.json" comment-refused "$LANE_EVIDENCE" \
+     && [ ! -f "$LANE_DIR/comment-writes" ] \
+     && grep -Fq '::warning::Could not publish optional pin-bump diagnostic marker.' "$LANE_DIR/out" \
+     && [ "$(grep -c '^pr comment ' "$LANE_DIR/gh.log")" -eq 1 ]; then
+    pass "diagnostic comment refusal warns once without failing a valid pin-bump lane"
+  else
+    fail "optional diagnostic refusal changed the valid lane verdict (out=$(cat "$LANE_DIR/out") err=$(cat "$LANE_DIR/err"))"
   fi
   if run_lane "$LANE_DIR/marker-present.txt" "$LANE_DIR/pair-current.json" ok "$LANE_EVIDENCE" \
      && [ ! -f "$LANE_DIR/comment-writes" ]; then

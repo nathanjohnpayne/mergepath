@@ -48,9 +48,9 @@ cat >"$APP/specs/old.md" <<'EOF'
 Will be deleted to verify orphan mirror detection.
 EOF
 git init -q "$DOCS"
-(cd "$DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
+(cd "$DOCS" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m docs)
 git init -q "$APP"
-(cd "$APP" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m app)
+(cd "$APP" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m app)
 
 cat >"$MP/.mergepath-project-docs.yml" <<EOF
 version: 1
@@ -115,6 +115,45 @@ grep -q "source_repo: example/app" "$DOCS/projects/app/specs/feature.md" \
 out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "audit should pass after materialize (rc=$rc): $out"
+
+# Identical source commits render identical metadata across different object
+# stores and abbreviation settings; fetching does not create false drift.
+CLONE_A="$WORKDIR/app-clone-a"
+CLONE_B="$WORKDIR/app-clone-b"
+git clone -q "$APP" "$CLONE_A"
+git clone -q "$APP" "$CLONE_B"
+git -C "$CLONE_A" config core.abbrev 4
+git -C "$CLONE_B" config core.abbrev 12
+for object in $(seq 1 25); do
+  printf 'unreferenced fixture object %s\n' "$object" | git -C "$CLONE_B" hash-object -w --stdin >/dev/null
+done
+objects_a=$(git -C "$CLONE_A" count-objects -v)
+objects_b=$(git -C "$CLONE_B" count-objects -v)
+[ "$objects_a" != "$objects_b" ] || fail "reference fixtures must have different object stores"
+expected_ref=$(git -C "$APP" rev-parse HEAD)
+for clone in "$CLONE_A" "$CLONE_B"; do
+  PROJECT_DOC_SYNC_TEST_ROOT="$clone" yq -i '.projects[0].owner.path_hint = strenv(PROJECT_DOC_SYNC_TEST_ROOT)' "$MP/.mergepath-project-docs.yml"
+  MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+  grep -Eq '^source_ref: [0-9a-f]{40}$' "$DOCS/projects/app/specs/feature.md" \
+    || fail "clean source metadata must carry the full commit ID"
+  grep -Fqx "source_ref: $expected_ref" "$DOCS/projects/app/specs/feature.md" \
+    || fail "source metadata must name the shared source commit"
+  if [ "$clone" = "$CLONE_A" ]; then
+    cp "$DOCS/projects/app/specs/feature.md" "$WORKDIR/stable-source-ref.md"
+  else
+    cmp -s "$WORKDIR/stable-source-ref.md" "$DOCS/projects/app/specs/feature.md" \
+      || fail "object count and core.abbrev must not change rendered metadata"
+  fi
+done
+git -C "$CLONE_B" fetch -q "$CLONE_A" HEAD
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --projects app --no-clone >/dev/null \
+  || fail "fetching identical source content must not create drift"
+printf '# Untracked source\n' >"$CLONE_B/specs/untracked.md"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+grep -Fqx "source_ref: $expected_ref-dirty" "$DOCS/projects/app/specs/untracked.md" \
+  || fail "HEAD fallback must retain the full ID and existing dirty marker"
+PROJECT_DOC_SYNC_TEST_ROOT="$APP" yq -i '.projects[0].owner.path_hint = strenv(PROJECT_DOC_SYNC_TEST_ROOT)' "$MP/.mergepath-project-docs.yml"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
 
 LINK_TARGET="$WORKDIR/symlink-target.txt"
 printf 'do not clobber\n' >"$LINK_TARGET"
@@ -502,9 +541,9 @@ title: FM spec
 Implementation contract with front matter.
 EOF
 git init -q "$FM_DOCS"
-(cd "$FM_DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
+(cd "$FM_DOCS" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m docs)
 git init -q "$FM_APP"
-(cd "$FM_APP" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m app)
+(cd "$FM_APP" && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@example.com commit -q -m app)
 
 cat >"$FM_MP/.mergepath-project-docs.yml" <<EOF
 version: 1

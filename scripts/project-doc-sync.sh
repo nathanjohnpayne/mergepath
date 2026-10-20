@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Generated source_ref metadata uses full Git commit IDs, with the existing
+# -dirty marker or unknown fallback when applicable.
 # scripts/project-doc-sync.sh
 #
 # Audit or materialize project documentation mirrors declared in
@@ -176,12 +178,12 @@ repo_ref() {
   local root=$1 path=${2:-}
   local ref
   if [ -n "$path" ]; then
-    ref=$(git -C "$root" log -n 1 --format=%h -- "$path" 2>/dev/null || true)
+    ref=$(git -C "$root" log -n 1 --format=%H -- "$path" 2>/dev/null || true)
   else
     ref=""
   fi
   if [ -z "$ref" ]; then
-    ref=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')
+    ref=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'unknown')
   fi
   if [ "$ref" != "unknown" ]; then
     local path_args=()
@@ -312,14 +314,14 @@ is_generated_mirror() {
   local head
   head=$(generated_header_lines "$file")
   [ -n "$head" ] || return 1
-  printf '%s\n' "$head" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" || return 1
+  grep -Fqx "generated_by: scripts/project-doc-sync.sh" <<<"$head" || return 1
   # An empty source_repo skips that field (the whole-project-removal sweep
   # no longer knows the owning repo); the project + class headers still gate it.
   if [ -n "$source_repo" ]; then
-    printf '%s\n' "$head" | grep -Fqx "source_repo: ${source_repo}" || return 1
+    grep -Fqx "source_repo: ${source_repo}" <<<"$head" || return 1
   fi
-  printf '%s\n' "$head" | grep -Fqx "project: ${project}" || return 1
-  printf '%s\n' "$head" | grep -Fqx "document_class: ${class}"
+  grep -Fqx "project: ${project}" <<<"$head" || return 1
+  grep -Fqx "document_class: ${class}" <<<"$head"
 }
 
 handle_orphan_mirror() {

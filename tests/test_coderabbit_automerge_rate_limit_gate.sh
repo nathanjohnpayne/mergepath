@@ -86,7 +86,9 @@ make_stub() { # make_stub <name> <exit-code>
   local path="$STUB_DIR/$1"
   cat > "$path" <<'STUB'
 #!/usr/bin/env bash
-printf 'stub codex-review-check: pr=%s repo=%s skip_ci=%s head_pin=%s substitute=%s\n' \
+[ "${1:-}" = --require-codex-on-head ] || exit 3
+shift
+printf 'stub codex-review-check: exact_head=true pr=%s repo=%s skip_ci=%s head_pin=%s substitute=%s\n' \
   "$1" "$2" "${CODEX_REVIEW_CHECK_SKIP_CI:-}" \
   "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" \
   "${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-}" >&2
@@ -160,7 +162,7 @@ if [ "$rc" -eq 1 ]; then pass "#825 non-integer clearance budget → block (fail
 probe_env=$(CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$UNCLEARED_STUB" \
   CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=0 \
   bash "$GATE" "$ENGAGED" false 42 owner/repo 2>&1 || true)
-if printf '%s' "$probe_env" | grep -Fq 'pr=42 repo=owner/repo skip_ci=1 head_pin=1 substitute=false'; then
+if printf '%s' "$probe_env" | grep -Fq 'exact_head=true pr=42 repo=owner/repo skip_ci=1 head_pin=1 substitute=false'; then
   pass "#825 clearance probe passes PR/repo and runs SKIP_CI + REQUIRE_APPROVAL_ON_HEAD + ALLOW_PHASE_4B_SUBSTITUTE=false"
 else
   fail "#825 clearance probe environment (got: $(printf '%s' "$probe_env" | head -1))"

@@ -1406,12 +1406,14 @@ guard_review_gh() {
 # GH_REPO) or from a URL selector (Phase 4b on #2178). A repository value
 # must be a plain OWNER/REPO: gh also reads git@HOST:OWNER/REPO, URLs and
 # HOST/OWNER/REPO there, so screening for bad shapes misses forms. Anything
-# else keeps gh's own credentials, which fail closed.
+# else keeps gh's own credentials, which fail closed. A missing repository
+# is not canonical proof: gh may infer a different host from the checkout.
 guard_canonical_repo() {
   [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
 }
 guard_review_reads_github_com() {
   case "${GH_HOST:-github.com}" in github.com) ;; *) return 1 ;; esac
+  [ -n "${REVIEW_REPO:-}${GH_REPO:-}" ] || return 1
   if [ -n "${GH_REPO:-}" ] && ! guard_canonical_repo "$GH_REPO"; then return 1; fi
   if [ -n "${REVIEW_REPO:-}" ] && ! guard_canonical_repo "$REVIEW_REPO"; then return 1; fi
   case "${REVIEW_PR_SELECTOR:-}" in
@@ -1448,7 +1450,7 @@ guard_review_pr_json_rest() { # <selector> <repo>
     rm -f "$err"
     return 1
   fi
-  # --slurp needs gh 2.41 or later, as the merge path's review read does.
+  # --slurp needs gh 2.48 or later (cli/cli#8620), as the merge path's review read does.
   if ! pages=$(guard_review_gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>"$err") \
      || ! printf '%s' "$pages" | jq -e 'type == "array" and all(.[]; type == "array")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read the files of $repo#$sel over REST for the self-approve check." >&2
@@ -1809,6 +1811,7 @@ done
 COMPOUND_GH_COUNT=0
 COMPOUND_GUARDED_COUNT=0
 COMPOUND_GUARDED_EXAMPLES=""
+COMMENT_GUARDED_BY_INDEX=()
 SCAN_AT_COMMAND_POSITION=1
 SCAN_SKIP_PREFIX_VALUE=0
 SCAN_CURRENT_PREFIX=""
@@ -1870,6 +1873,24 @@ for i in "${!TOKENS[@]}"; do
       ;;
     gh|*/gh)
       COMPOUND_GH_COUNT=$((COMPOUND_GH_COUNT + 1))
+      # Inspect every invocation before the noun walk can stop at an
+      # earlier read. Runtime wrappers inspect deferred input again.
+      comment_guard_argv=()
+      for ((comment_arg=i; comment_arg<${#TOKENS[@]}; comment_arg++)); do
+        is_guard_separator "${TOKENS[$comment_arg]}" && break
+        comment_guard_argv+=("${TOKENS[$comment_arg]}")
+      done
+      comment_guard_result=$(python3 "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
+        --role hook -- "${comment_guard_argv[@]}") || exit 2
+      if ! comment_guard_boolean=$(printf '%s' "$comment_guard_result" | jq -ers '
+        if length == 1 and (.[0] | type) == "object" and
+           (.[0].guarded | type) == "boolean"
+        then .[0].guarded | tostring
+        else error("expected one object with Boolean guarded") end'); then
+        echo "BLOCKED: comment guard returned unreadable or invalid guarded metadata." >&2
+        exit 2
+      fi
+      COMMENT_GUARDED_BY_INDEX[$i]="$comment_guard_boolean"
       if guarded_label=$(guarded_gh_invocation_label "$i"); then
         COMPOUND_GUARDED_COUNT=$((COMPOUND_GUARDED_COUNT + 1))
         if [ -z "$COMPOUND_GUARDED_EXAMPLES" ]; then
@@ -1878,6 +1899,10 @@ for i in "${!TOKENS[@]}"; do
           COMPOUND_GUARDED_EXAMPLES="${COMPOUND_GUARDED_EXAMPLES}
 $guarded_label"
         fi
+      elif [ "$comment_guard_boolean" = true ]; then
+        COMPOUND_GUARDED_COUNT=$((COMPOUND_GUARDED_COUNT + 1))
+        COMPOUND_GUARDED_EXAMPLES="${COMPOUND_GUARDED_EXAMPLES}${COMPOUND_GUARDED_EXAMPLES:+
+}gh comment/review payload"
       fi
       SCAN_AT_COMMAND_POSITION=0
       continue
@@ -2581,22 +2606,21 @@ for i in "${!TOKENS[@]}"; do
       continue
       ;;
     gh|*/gh)
-      # #2158: inspect literal argv and readable body files before the
-      # noun walk can return early for raw REST writes. Runtime wrappers
-      # inspect again after expansion and snapshot any deferred input.
-      comment_guard_argv=()
-      for ((comment_arg=i; comment_arg<${#TOKENS[@]}; comment_arg++)); do
-        case "${TOKENS[$comment_arg]}" in
-          "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;;
-        esac
-        comment_guard_argv+=("${TOKENS[$comment_arg]}")
-      done
-      comment_guard_result=$(python3 "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
-        --role hook -- "${comment_guard_argv[@]}") || exit 2
-      if [ -z "$WRAPPER_KIND" ] && printf '%s' "$comment_guard_result" | jq -e '.guarded == true' >/dev/null; then
-        echo "BLOCKED: comment/review writes must use a token-verifying wrapper and its runtime body guard." >&2
-        exit 2
-      fi
+      # Both walks must recognize the same command-position token. Unknown
+      # classification is an incomplete inspection, never a read-only result.
+      case "${COMMENT_GUARDED_BY_INDEX[$i]:-missing}" in
+        true)
+          if [ -z "$WRAPPER_KIND" ]; then
+            echo "BLOCKED: comment/review writes must use a token-verifying wrapper and its runtime body guard." >&2
+            exit 2
+          fi
+          ;;
+        false) ;;
+        *)
+          echo "BLOCKED: missing comment-write classification for a command-position gh invocation." >&2
+          exit 2
+          ;;
+      esac
       SAW_GH=1
       continue
       ;;

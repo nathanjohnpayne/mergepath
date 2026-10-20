@@ -621,6 +621,25 @@ else
   fail "#1121: non-shared-author markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
 fi
 
+# Direct callers have the same structured-parser prerequisite as dispatcher
+# callers. Shadow every supported implementation with an unavailable tool;
+# execute the actual checker, retaining all other native fixture utilities.
+mkdir -p "$BEHAVIOR_TMP/no-parsers"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$BEHAVIOR_TMP/no-parsers/$parser"
+  chmod +x "$BEHAVIOR_TMP/no-parsers/$parser"
+done
+fixture_result="$(PATH="$BEHAVIOR_TMP/no-parsers:$PATH" run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'governing policy author_identity could not be read' <<<"$fixture_output" \
+   && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2314: direct checker without a working YAML parser refuses before commit lookup"
+else
+  fail "#2314: missing parser did not fail closed (rc=$fixture_rc output=$fixture_output)"
+fi
+
 fixture_result="$(run_body_fixture nathanjohnpayne '' 'Authoring-Agent: unknown')"
 fixture_rc="${fixture_result%%$'\n'*}"
 fixture_output="${fixture_result#*$'\n'}"
@@ -641,17 +660,16 @@ else
   fail "#814: bypass reference at line ${knob_last:-?} is not before gate (c) at ${gatec_at:-?}"
 fi
 
-# #842: the CANNOT-REPORT exit must be diagnostic-mode-only. The barrier reads
-# exit 2 as "Codex is account-blocked, waive it and let Phase 4b run"; a real
-# merge-gate caller must never reach it, because an account-blocked Codex has
-# cleared nothing and the gate has to keep failing closed on 1.
+# #842/#2139: only diagnostic and strict substitution modes may distinguish
+# cannot-report from pending. Ordinary merge-gate callers retain 0/1/3.
+# Native refusal and recovery controls live in the substitution suite.
 exit2_at=$(grep -n '^      exit 2$' "$SCRIPT" | head -1 | cut -d: -f1)
 guard_ok=0
 if [ -n "$exit2_at" ]; then
   # The guard must be within the few lines immediately above the exit, so a
   # later edit cannot leave the exit reachable from the gate path.
   guard_at=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
-    | grep -c 'DIAGNOSTIC_SIGNAL_ONLY" = "1"' || true)
+    | grep -Fc 'if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$REQUIRE_CODEX_ON_HEAD" = 1 ]; then' || true)
   # Proximity alone is not containment (CodeRabbit on #842): moving `fi` above
   # the exit would leave the guard text nearby while the exit sits outside the
   # block. Require that no `fi` closes between the guard and the exit.
@@ -659,11 +677,11 @@ if [ -n "$exit2_at" ]; then
     | grep -cE '^[[:space:]]*fi[[:space:]]*$' || true)
   [ "$guard_at" -ge 1 ] && [ "$fi_between" -eq 0 ] && guard_ok=1
 fi
-# And it must be the ONLY exit 2 in the script, so the documented 0/1/3
-# contract still holds for every non-diagnostic caller.
+# It remains the only literal exit 2; the earlier strict no-response route
+# is also exercised through the real checker by the substitution suite.
 n_exit2=$(grep -c '^[[:space:]]*exit 2$' "$SCRIPT" || true)
 if [ "$guard_ok" = 1 ] && [ "$n_exit2" = "1" ]; then
-  pass "#842: the CANNOT-REPORT exit is diagnostic-only and unique — the merge gate's 0/1/3 contract is unchanged"
+  pass "#842/#2139: CANNOT-REPORT is scoped to diagnostic/strict modes; the ordinary merge gate retains 0/1/3"
 else
   fail "#842: exit 2 is unguarded or duplicated (guard_ok=$guard_ok count=$n_exit2)"
 fi

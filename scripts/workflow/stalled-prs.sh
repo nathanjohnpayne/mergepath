@@ -106,8 +106,8 @@
 #   - A handoff marker anywhere on the PR keeps it waiting-on-human for as
 #     long as the marker is there (see waiting-on-human above).
 #
-# Read-only. The only GitHub calls are paginated GETs (plus the read-only
-# required-head-checks resolution); the gate it delegates to is read-only too.
+# Read-only. Collection uses paginated list GETs, governing-policy contents
+# GETs and required-head-checks resolution; the delegated gate is read-only too.
 #
 # Exit codes:
 #   0  ran; no stalled PR
@@ -191,6 +191,13 @@ else
   [ -r "$SCRIPT_DIR/lib/gh-api-array.sh" ] || infra "missing helper scripts/lib/gh-api-array.sh"
   # shellcheck source=../lib/gh-api-array.sh
   . "$SCRIPT_DIR/lib/gh-api-array.sh"
+  [ -r "$SCRIPT_DIR/lib/feedback-policy-helpers.sh" ] || infra "missing feedback policy reader"
+  # shellcheck source=../lib/feedback-policy-helpers.sh
+  . "$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
+  [ -r "$SCRIPT_DIR/lib/head-check-runs.sh" ] || infra "missing shared check-run reducer"
+  # shellcheck source=../lib/head-check-runs.sh
+  . "$SCRIPT_DIR/lib/head-check-runs.sh"
+  [ -f "$SCRIPT_DIR/workflow/resolve_base_policy.sh" ] || infra "missing governing policy resolver"
   # CI state is judged on the repository's own required head checks (the
   # build/test checks scripts/required-head-checks.sh resolves from the
   # default branch, `lint` by default), never on the aggregate check rollup:
@@ -223,16 +230,15 @@ else
   # The check-runs endpoint wraps its list in an object, so gh_api_array's
   # array-stream contract does not fit; same failure discipline (a failed
   # read is a status, never an empty list), applied here.
-  fetch_check_runs() {  # <sha> <label>
+  fetch_check_rows() {  # <endpoint> <row selector> <label>
     local raw err rc=0
     err=$(mktemp "${TMPDIR:-/tmp}/stalled-prs-cr.XXXXXX") || infra "mktemp failed"
-    raw=$(gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-            --jq '.check_runs[] | {name, status, conclusion, started_at, completed_at}' 2>"$err") || rc=$?
+    raw=$(gh api --paginate "$1" --jq "$2" 2>"$err") || rc=$?
     if [ "$rc" -ne 0 ]; then
-      infra "failed to fetch $2: $(tr '\n' ' ' < "$err")"
+      infra "failed to fetch $3: $(tr '\n' ' ' < "$err")"
     fi
     rm -f "$err"
-    printf '%s\n' "$raw" | jq -s '.' 2>/dev/null || infra "failed to parse $2"
+    printf '%s\n' "$raw" | jq -s '.' 2>/dev/null || infra "failed to parse $3"
   }
 
   # Large PR histories overflow the exec argument limit when passed as
@@ -251,10 +257,42 @@ else
     [ -n "$number" ] || continue
     jq -c --argjson n "$number" 'first(.[] | select(.number == $n))' "$WORK/pulls.json" > "$WORK/pr.json"
     head_sha=$(jq -r '.head.sha' "$WORK/pr.json")
+    # --repo may name another repository; never borrow this checkout's bot
+    # configuration. Materialize the governing base through the shared resolver
+    # and cache the scalar per base SHA for PRs targeting the same revision.
+    base_sha=$(jq -r '.base.sha // ""' "$WORK/pr.json")
+    [[ "$base_sha" =~ ^[0-9a-fA-F]{40}$ ]] || infra "PR #$number has no complete base SHA"
+    if [ ! -f "$WORK/bot-$base_sha" ]; then
+      policy_path=$(TMPDIR="$WORK" bash "$SCRIPT_DIR/workflow/resolve_base_policy.sh" \
+        --repo "$REPO" --base-ref "$(jq -r '.base.ref // ""' "$WORK/pr.json")" \
+        --base-sha "$base_sha" --default-branch "$(jq -r '.base.repo.default_branch // ""' "$WORK/pr.json")" \
+        --materialize-default 2>"$WORK/policy.err") \
+        || infra "PR #$number governing policy unreadable: $(cat "$WORK/policy.err")"
+      [ -r "$policy_path" ] || infra "PR #$number materialized policy is unreadable"
+      policy_yaml_to_json "$policy_path" >"$WORK/bot-policy.json" \
+        || infra "PR #$number governing policy could not be parsed; a supported YAML parser is required"
+      codex_login=$(jq -ers '
+        if length != 1 then error("expected one policy document") else .[0] end
+        | if type != "object" then error("policy must be a mapping") else .codex end
+        | if . == null then {} else . end
+        | if type != "object" then error("codex must be a mapping") else .bot_login end
+        | if . == null or . == "" then "chatgpt-codex-connector[bot]"
+          elif type == "string" and (test("[[:space:]]") | not) then .
+          else error("bot_login must be a string without whitespace") end
+      ' "$WORK/bot-policy.json") \
+        || infra "PR #$number configured Codex login unreadable"
+      printf '%s\n' "${codex_login:-chatgpt-codex-connector[bot]}" >"$WORK/bot-$base_sha"
+    fi
+    codex_login=$(cat "$WORK/bot-$base_sha")
     fetch_api_array "repos/$REPO/pulls/$number/reviews?per_page=100" "PR #$number reviews" > "$WORK/reviews.json"
     fetch_api_array "repos/$REPO/issues/$number/comments?per_page=100" "PR #$number issue comments" > "$WORK/issue_comments.json"
     fetch_api_array "repos/$REPO/pulls/$number/comments?per_page=100" "PR #$number inline comments" > "$WORK/review_comments.json"
-    fetch_check_runs "$head_sha" "PR #$number head check runs" > "$WORK/check_runs.json"
+    fetch_check_rows "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
+      '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, completed_at}' \
+      "PR #$number head check runs" > "$WORK/check_runs.json"
+    fetch_check_rows "repos/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
+      '.workflow_runs[] | {suite: .check_suite_id, wf: .workflow_id}' \
+      "PR #$number workflow runs" > "$WORK/workflow_runs.json"
     # Push time, server-generated only (see the header). The activity API
     # covers same-repository heads; a fork's push lives in the fork.
     head_pushed_at=""
@@ -279,26 +317,26 @@ else
       head_pushed_at_source="pr-updated-at"
       [ -n "$head_pushed_at" ] || infra "PR #$number has no push activity, no check run and no updated_at"
     fi
-    merge_gate_check=$(jq -r --arg name "$MERGE_GATE_CHECK_NAME" '
-      [.[] | select(.name == $name)] | sort_by(.started_at // "") | last
-      | if . == null then "absent"
-        elif .status != "completed" then "pending"
-        else (.conclusion // "pending") end' "$WORK/check_runs.json")
-    # Required head checks only, newest run per name. A head with no check
+    gate_summary=$(head_check_runs_reduce "$MERGE_GATE_CHECK_NAME" "$WORK/check_runs.json" "$WORK/workflow_runs.json") \
+      || infra "could not reduce the merge gate for PR #$number"
+    merge_gate_check=$(jq -r '.conclusion' <<<"$gate_summary")
+    # Required head checks only, newest completed run per workflow with all
+    # in-flight runs retaining pending precedence. A head with no check
     # runs at all is NONE (a repository without CI); a required check that
     # has not reported yet on a head that has other runs is PENDING.
-    ci_state=$(jq -r --argjson req "$REQUIRED_CHECKS_JSON" '
-      if length == 0 then "NONE"
-      else
-        [ $req[] as $n
-          | ([.[] | select(.name == $n)] | sort_by(.started_at // "") | last) as $run
-          | if $run == null or $run.status != "completed" then "PENDING"
-            elif ($run.conclusion // "") | IN("success", "neutral", "skipped") then "SUCCESS"
-            else "FAILURE" end ]
-        | if index("FAILURE") != null then "FAILURE"
-          elif index("PENDING") != null then "PENDING"
-          else "SUCCESS" end
-      end' "$WORK/check_runs.json") || infra "could not derive the CI state for PR #$number"
+    if jq -e 'length == 0' "$WORK/check_runs.json" >/dev/null; then
+      ci_state=NONE
+    else
+      : > "$WORK/required-summaries.jsonl"
+      while IFS= read -r check_name; do
+        head_check_runs_reduce "$check_name" "$WORK/check_runs.json" "$WORK/workflow_runs.json" >> "$WORK/required-summaries.jsonl" \
+          || infra "could not reduce required check '$check_name' for PR #$number"
+      done < <(jq -r '.[]' <<<"$REQUIRED_CHECKS_JSON")
+      ci_state=$(jq -sr '
+        if any(.state == "failed") then "FAILURE"
+        elif any(.state != "green") then "PENDING" else "SUCCESS" end' "$WORK/required-summaries.jsonl") \
+        || infra "could not derive the CI state for PR #$number"
+    fi
     jq -cn \
       --slurpfile pr "$WORK/pr.json" \
       --slurpfile reviews "$WORK/reviews.json" \
@@ -307,6 +345,7 @@ else
       --arg head_pushed_at "$head_pushed_at" \
       --arg head_pushed_at_source "$head_pushed_at_source" \
       --arg merge_gate_check "$merge_gate_check" \
+      --arg codex_bot_login "$codex_login" \
       --arg ci_state "$ci_state" '
       $pr[0] as $pr
       | {
@@ -323,6 +362,7 @@ else
         head_pushed_at: $head_pushed_at,
         head_pushed_at_source: $head_pushed_at_source,
         merge_gate_check: $merge_gate_check,
+        codex_bot_login: $codex_bot_login,
         ci_state: $ci_state,
         reviews: [$reviews[0][] | {id, state, submitted_at, commit_id, body: (.body // ""),
                                    user: {login: (.user.login // ""), type: (.user.type // "")}}],
@@ -353,7 +393,7 @@ CLASSIFY_JQ='
   def strip_markup: norm | gsub("[`*_~>]"; "");
   def login: (.user.login // "");
   def is_bot: ((.user.type // "") == "Bot") or (login | endswith("[bot]"));
-  def is_codex: login | startswith("chatgpt-codex-connector");
+  def is_codex($bot_login): (.user.type // "") == "Bot" and (login | ascii_downcase) == ($bot_login | ascii_downcase);
   def actor_class($author): if is_bot then "bot" elif login == $author then "author" else "human" end;
   def is_trigger:
     (strip_markup | test("@codex[[:space:]]+review"; "i"))
@@ -381,6 +421,7 @@ CLASSIFY_JQ='
     . as $pr
     | $pr.author as $author
     | $pr.head_sha as $head
+    | ($pr.codex_bot_login // "chatgpt-codex-connector[bot]") as $codex_login
     | ($pr.head_pushed_at | ts) as $head_ts
     # ---- timeline: one event per record that moves the turn ---------------
     | ([ {kind: "push", side: "author", actor: $author, at: $pr.head_pushed_at} ]
@@ -397,14 +438,14 @@ CLASSIFY_JQ='
                {kind: ("review:" + (.state | ascii_downcase)),
                 side: (if $cls == "author" then "author" else "verdict" end),
                 actor: login, at: .submitted_at, state: .state, commit_id: .commit_id,
-                codex: (is_codex and .commit_id == $head)}
+                codex: (is_codex($codex_login) and .commit_id == $head)}
              end ]
        + [ $pr.issue_comments[]
            | (actor_class($author)) as $cls
            | if (.body | is_handoff) and $cls != "bot" then
                {kind: "handoff", side: "handoff", actor: login, at: .created_at}
              elif $cls == "bot" then
-               if is_codex and (.body | is_codex_summary) then
+               if is_codex($codex_login) and (.body | is_codex_summary) then
                  ((.body | summary_status) as $st
                   | (.body | summary_commit) as $sc
                   | if $st == "completed" and $sc != "" and ($head | startswith($sc)) then
@@ -414,7 +455,7 @@ CLASSIFY_JQ='
                     else
                       {kind: "codex-summary-stale", side: "bot-activity", actor: login, at: (.updated_at // .created_at)}
                     end)
-               elif is_codex and (.body | is_codex_verdict) then
+               elif is_codex($codex_login) and (.body | is_codex_verdict) then
                  {kind: "verdict-comment", side: "verdict", actor: login, at: .created_at,
                   names_head: (.body | norm | contains($head)), codex: (.body | norm | contains($head))}
                elif (.body | is_rate_limited) then
@@ -468,16 +509,11 @@ CLASSIFY_JQ='
        and ([ $events[] | select(.side == "verdict" and .actor == $last_rate_limit.actor) | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
        and ([ $events[] | select(.trigger == true and .provider == "codex") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
       ) as $rate_limited
-    | ($pr.ci_state == "PENDING") as $ci_pending
-    | (if $ci_pending then "ci"
-       elif $request_outstanding or $summary_running or $rate_limited then "bot"
-       elif $newest.side == "bot-activity" then "bot"
-       else null end) as $machine_wait
     # ---- head evidence --------------------------------------------------------
-    | ([ $pr.reviews[] | select(is_codex) | select(.commit_id == $head) ] | length > 0
+    | ([ $pr.reviews[] | select(is_codex($codex_login)) | select(.commit_id == $head) ] | length > 0
        or ([ $events[] | select(.kind == "verdict-comment" and .names_head == true) ] | length > 0)
        or ([ $events[] | select(.kind == "codex-summary-completed" or .kind == "codex-summary-running") ] | length > 0)
-       or ([ $pr.review_comments[] | select(is_codex) | select(.in_reply_to_id == null)
+       or ([ $pr.review_comments[] | select(is_codex($codex_login)) | select(.in_reply_to_id == null)
              | select(.commit_id == $head or .original_commit_id == $head) ] | length > 0)
       ) as $codex_signal_on_head
     | ([ $pr.review_comments[] | select((actor_class($author)) != "author") | select(.in_reply_to_id == null)
@@ -498,7 +534,22 @@ CLASSIFY_JQ='
     | ([ $pr.reviews[] | select((actor_class($author)) != "author") | select((.state // "PENDING") != "PENDING")
          | select((actor_class($author)) != "bot" or ((.body | norm | gsub("[[:space:]]"; "")) != ""))
          | select(.commit_id == $head or ((.submitted_at | ts) >= $head_ts)) ]
-       | max_by(.submitted_at | ts) | (.state // null)) as $latest_verdict_state
+       | max_by(.submitted_at | ts)) as $latest_verdict
+    | ($latest_verdict.state // null) as $latest_verdict_state
+    # Reuse the existing actionable finding/change-request criteria. Only
+    # evidence strictly after this push can supersede its CI wait; an older
+    # or same-second verdict cannot establish that ordering.
+    | (any($pr.review_comments[];
+           . as $comment
+           | ($unanswered | any(.id == $comment.id))
+             and (((.updated_at // .created_at) | ts) > $head_ts))
+       or ($latest_verdict_state == "CHANGES_REQUESTED" and $latest_verdict.commit_id == $head
+           and (($latest_verdict.submitted_at | ts) > $head_ts))) as $actionable_after_push
+    | ($pr.ci_state == "PENDING") as $ci_pending
+    | (if $ci_pending and ($actionable_after_push | not) then "ci"
+       elif $request_outstanding or $summary_running or $rate_limited then "bot"
+       elif $newest.side == "bot-activity" then "bot"
+       else null end) as $machine_wait
     # A handoff is in force for as long as ANY comment, review body or inline
     # comment on the PR carries a handoff marker — whoever wrote it, whenever
     # it was posted or edited. No timestamp is compared: there is no later

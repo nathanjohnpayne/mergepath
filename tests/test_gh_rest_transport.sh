@@ -96,6 +96,12 @@ if [ "${1:-}" = auth ] && [ "${2:-}" = token ]; then
   esac
   exit 0
 fi
+# `gh api --help`: STUB_NO_SLURP models a gh older than 2.48.
+if [ "${1:-}" = api ] && [ "${2:-}" = --help ]; then
+  echo "  --paginate   Make additional HTTP requests to fetch all pages of results"
+  [ -n "${STUB_NO_SLURP:-}" ] || echo "  --slurp      Use with \"--paginate\" to return an array of all pages"
+  exit 0
+fi
 if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
   [ -n "$login" ] || exit 4
   echo "$login"
@@ -149,8 +155,8 @@ case "$method $endpoint" in
       --arg body "${STUB_PR_BODY:-old body}" --arg base "${STUB_PR_BASE:-main}" \
       --arg labels "${STUB_PR_LABELS:-}" --arg reviewers "${STUB_PR_REVIEWERS:-}" --arg assignees "${STUB_PR_ASSIGNEES:-}" \
       --arg state "${STUB_PR_STATE:-open}" --arg href "${STUB_PR_HEAD_REF:-feature}" --arg hrepo "${STUB_PR_HEAD_REPO:-$REPO}" \
-      --arg author "${STUB_PR_AUTHOR:-$write_login}" '
-      {number: ($num | tonumber), html_url: $url, state: $state, title: $title, body: $body,
+      --arg author "${STUB_PR_AUTHOR:-$write_login}" --arg merged "${STUB_PR_MERGED:-false}" '
+      {number: ($num | tonumber), html_url: $url, state: $state, merged: ($merged == "true"), title: $title, body: $body,
        user: {login: $author}, base: {ref: $base}, head: {ref: $href, repo: {full_name: $hrepo}},
        labels: ($labels | split(",") | map(select(length > 0)) | map({name: .})),
        requested_reviewers: ($reviewers | split(",") | map(select(length > 0)) | map({login: .})),
@@ -169,6 +175,21 @@ case "$method $endpoint" in
   "POST repos/$REPO/pulls")
     [ -z "${STUB_CREATE_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
     jq -n --arg url "$(url_of 42)" --arg login "$write_login" '{number: 42, html_url: $url, user: {login: $login}}' ;;
+  "POST repos/$REPO/issues")
+    [ -z "${STUB_CREATE_FAIL:-}" ] || { echo 'gh: Validation Failed (HTTP 422)' >&2; exit 1; }
+    jq -n --argjson payload "$input" --arg login "$write_login" --arg repo "$REPO" '
+      $payload + {number:42,html_url:("https://github.com/"+$repo+"/issues/42"),user:{login:$login},
+        labels:($payload.labels|map({name:.})),assignees:($payload.assignees|map({login:.}))}' >"$STATE/created-issue.json"
+    if [ -n "${STUB_ISSUE_BAD_RESPONSE:-}" ]; then printf '{}\n'; else cat "$STATE/created-issue.json"; fi ;;
+  "GET repos/$REPO/issues/42")
+    [ -z "${STUB_ISSUE_READBACK_FAIL:-}" ] || { echo 'gh: HTTP 502' >&2; exit 1; }
+    jq --arg who "${STUB_ISSUE_READBACK_LOGIN:-$write_login}" --arg drop "${STUB_ISSUE_DROP_LABELS:-}" \
+      --arg upper "${STUB_ISSUE_METADATA_UPCASE:-}" --arg assignee "${STUB_ISSUE_READBACK_ASSIGNEE:-}" '
+      .user.login=$who
+      | (if $drop == "" then . else .labels=[] end)
+      | (if $upper == "" then . else .labels |= map(.name |= ascii_upcase)
+         | .assignees |= map(.login |= ascii_upcase) end)
+      | if $assignee == "" then . else .assignees=[{login:$assignee}] end' "$STATE/created-issue.json" ;;
   "POST repos/$REPO/issues/"*"/comments")
     [ -z "${STUB_COMMENT_FAIL:-}" ] || { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; }
     num="$(number_of "$endpoint")"
@@ -930,12 +951,22 @@ else
 fi
 new_case
 set +e
-err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r --comment bye --delete-branch 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already closed' && log_lacks 'PATCH'; then
-  pass "pr close on a closed PR: refused, nothing written"
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'already closed; nothing was written (no comment was posted and no branch was deleted' \
+   && log_lacks 'PATCH' && log_lacks 'issues/42/comments' && log_lacks 'git/refs' && log_lacks 'events?per_page'; then
+  pass "pr close on an already-closed PR: succeeds as gh does, writing nothing (no comment, no branch delete) (#2207)"
 else
-  fail "pr close already closed: rc=$rc err=$err"
+  fail "pr close already closed: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed STUB_PR_MERGED=true as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already merged; nothing was written' && log_lacks 'PATCH'; then
+  pass "pr close on a merged PR: still refused (1), nothing written (#2207)"
+else
+  fail "pr close merged: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
 new_case
@@ -970,6 +1001,55 @@ if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 
   pass "pr close readback: a closed event by another login exits 5"
 else
   fail "pr close actor mutation: rc=$rc err=$err"
+fi
+
+# --- gh without `gh api --slurp` (#2233) -----------------------------------
+# The event reads need gh 2.48 or later. A write whose attribution reads
+# events is refused before anything is written, naming the requirement; a
+# write that reads no events still runs.
+slurp_refused() { # <label> <args...>
+  local label="$1" rc=0 err
+  shift
+  new_case
+  set +e
+  err="$(MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_author -- "$@" 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'install gh 2.48 or later. Nothing was written.' \
+     && log_lacks $'POST\t' && log_lacks $'PATCH\t' && log_lacks $'DELETE\t' && log_lacks 'events?per_page'; then
+    pass "no --slurp: $label is refused before any write"
+  else
+    fail "no --slurp, $label: rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+}
+slurp_refused "an edit" gh pr edit 42 --repo o/r --add-label x
+slurp_refused "a close" gh pr close 42 --repo o/r --comment bye
+slurp_refused "a create with a label" gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls' && log_lacks $'api\t--help'; then
+  pass "no --slurp: a create with no follow-ups reads no events, so it runs without the probe"
+else
+  fail "no --slurp, plain create: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_reviewer -- gh pr comment 1 --repo o/r --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "no --slurp: a comment, attributed from its POST response, still runs"
+else
+  fail "no --slurp, comment: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --add-label x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(grep -c $'api\t--help' "$LOGF")" -eq 1 ]; then
+  pass "with --slurp: the probe runs once per command, however many event reads follow"
+else
+  fail "probe count: rc=$rc count=$(grep -c $'api\t--help' "$LOGF")"; cat "$LOGF" >&2
 fi
 
 # --- partial failures and case ---------------------------------------------
@@ -1632,6 +1712,82 @@ if [ "$rc" -eq 3 ] && log_lacks 'POST' && log_lacks $'pr\tcomment'; then
 else
   fail "placeholder on cloud: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
+
+# #2335: the exact observation-filer command runs as one REST issue create,
+# then verifies the author and requested state through an independent GET.
+ISSUE_BODY="$WORKDIR/observation-body.md"
+printf '%s\n\n' 'Advisory observation: "quoted" text and café.' >"$ISSUE_BODY"
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+  --title '[Post-Review] observation' --body-file "$ISSUE_BODY" \
+  --label post-review --label observation --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ] \
+   && log_has $'POST\trepos/o/r/issues\t--input\t' && log_has $'gh\tapi\trepos/o/r/issues/42' \
+   && log_token_clean ghp_author-token \
+   && jq -e --rawfile body "$ISSUE_BODY" '.body==$body and .title=="[Post-Review] observation"
+      and ([.labels[].name]|sort)==["observation","post-review"]
+      and [.assignees[].login]==["nathanjohnpayne"]' "$STATE/created-issue.json" >/dev/null; then
+  pass "#2335: exact observation-filer issue create uses REST, preserves body bytes and verifies readback"
+else fail "#2335: observation issue create rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+
+# GitHub preserves existing label/login display case. Only metadata names
+# normalize; the author, number, title and exact body still have their fences.
+for metadata_mode in mixed-case wrong-assignee; do
+  new_case
+  set +e
+  out="$(STUB_ISSUE_METADATA_UPCASE=1 \
+    STUB_ISSUE_READBACK_ASSIGNEE="$( [ "$metadata_mode" != wrong-assignee ] || printf 'OtherUser' )" \
+    MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+      --title '[Post-Review] observation' --body-file "$ISSUE_BODY" \
+      --label post-review --label observation --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+  set -e
+  if [ "$(grep -c $'POST\trepos/o/r/issues\t' "$LOGF")" = 1 ] \
+     && log_has $'gh\tapi\trepos/o/r/issues/42' \
+     && { { [ "$metadata_mode" = mixed-case ] && [ "$rc" = 0 ] && [ "$out" = https://github.com/o/r/issues/42 ]; } \
+          || { [ "$metadata_mode" = wrong-assignee ] && [ "$rc" = 5 ]; }; }; then
+    pass "#2335: $metadata_mode metadata readback honors case but retains requested identity"
+  else fail "#2335: $metadata_mode metadata readback rc=$rc out=$out"; cat "$WORKDIR/err" >&2; fi
+done
+
+for mode in wrong-author unreadable changed-metadata bad-response api-failure; do
+  new_case
+  set +e
+  out="$(STUB_ISSUE_READBACK_LOGIN="$( [ "$mode" != wrong-author ] || printf 'claude[bot]' )" \
+    STUB_ISSUE_READBACK_FAIL="$( [ "$mode" != unreadable ] || printf 1 )" \
+    STUB_ISSUE_DROP_LABELS="$( [ "$mode" != changed-metadata ] || printf 1 )" \
+    STUB_ISSUE_BAD_RESPONSE="$( [ "$mode" != bad-response ] || printf 1 )" \
+    STUB_CREATE_FAIL="$( [ "$mode" != api-failure ] || printf 1 )" \
+    MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create --repo o/r \
+      --title observation --body-file "$ISSUE_BODY" --label post-review 2>"$WORKDIR/err")"; rc=$?
+  set -e
+  if [ "$rc" != 0 ] && [ "$(grep -c $'POST\trepos/o/r/issues\t' "$LOGF")" = 1 ]; then
+    case "$mode" in
+      api-failure) [ "$rc" = 1 ] && log_lacks $'gh\tapi\trepos/o/r/issues/42' ;;
+      *) [ "$rc" = 5 ] ;;
+    esac && pass "#2335: $mode refuses without a duplicate create" || fail "#2335: $mode unexpected rc=$rc"
+  else fail "#2335: $mode must refuse after one attempted create (rc=$rc)"; fi
+ done
+
+for variant in no-repo no-title no-body stdin-body extra-flag bad-assignee; do
+  new_case
+  args=(--repo o/r --title observation --body-file "$ISSUE_BODY")
+  case "$variant" in
+    no-repo) args=(--title observation --body-file "$ISSUE_BODY") ;;
+    no-title) args=(--repo o/r --body-file "$ISSUE_BODY") ;;
+    no-body) args=(--repo o/r --title observation) ;;
+    stdin-body) args=(--repo o/r --title observation --body-file -) ;;
+    extra-flag) args+=(--web) ;;
+    bad-assignee) args+=(--assignee @me) ;;
+  esac
+  set +e
+  MERGEPATH_GH_TRANSPORT=rest as_author -- gh issue create "${args[@]}" >"$WORKDIR/out" 2>"$WORKDIR/err"; rc=$?
+  set -e
+  if [ "$rc" != 0 ] && log_lacks $'POST\trepos/o/r/issues\t'; then
+    pass "#2335: $variant grammar refuses before create"
+  else fail "#2335: $variant must refuse before write (rc=$rc)"; fi
+ done
 
 echo ""
 echo "test_gh_rest_transport: $PASS passed, $FAIL failed"

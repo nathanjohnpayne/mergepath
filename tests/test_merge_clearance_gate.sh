@@ -4935,7 +4935,7 @@ else
 fi
 
 WF_2247="$ROOT/.github/workflows/merge-clearance-gate.yml"
-T30="$(mktemp -d "${TMPDIR:-/tmp}/mcg2247.XXXXXX")"
+T30="$(mktemp -d "$WORKDIR/mcg2247.XXXXXX")"
 mkdir -p "$T30/bin" "$T30/wd/scripts"
 # Same extractor as Test 23 (that one is scoped to its own block).
 t30_step_body() {  # <workflow> <step name>

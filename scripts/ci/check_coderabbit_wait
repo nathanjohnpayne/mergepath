@@ -22,7 +22,7 @@ SUITES=(
   "coderabbit-wait codex rate-limit failover tests (#489)" "$REPO_ROOT/tests/test_coderabbit_wait_codex_failover.sh"
   "auto-merge rate-limit gate tests (#489)" "$REPO_ROOT/tests/test_coderabbit_automerge_rate_limit_gate.sh"
   "StatusContext rate-limit false-clear tests (#596)" "$REPO_ROOT/tests/test_coderabbit_wait_statuscontext_ratelimit.sh"
-  "rate-limit remaining-window sleep tests (#727)" "$REPO_ROOT/tests/test_coderabbit_wait_ratelimit_window.sh"
+  "rate-limit immediate rate-limit substitution and window parsing tests (#727)" "$REPO_ROOT/tests/test_coderabbit_wait_ratelimit_window.sh"
   "post-clearance fast-path cap tests (#727)" "$REPO_ROOT/tests/test_coderabbit_wait_post_clearance.sh"
   "Phase 2.5 invocation-decision tests (#1084)" "$REPO_ROOT/tests/test_coderabbit_should_invoke.sh"
 )

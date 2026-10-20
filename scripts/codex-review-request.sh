@@ -140,13 +140,16 @@
 #     "findings": [
 #       { "path": "...", "line": N, "priority": "P0|P1|P2|P3",
 #         "comment_id": N, "body": "<full finding body>",
-#         "blocking": true|false }
+#         "blocking": true|false, "discretionary": true|false }
 #     ],
 #     # `blocking` (#577) is derived from the resolved feedback_policy
 #     # required-tier set (scripts/lib/feedback-policy-helpers.sh
 #     # resolve_required_tiers) — true iff this finding's tier is one the
 #     # codex-p1-gate would block merge on. Absent feedback_policy block ⇒
 #     # only P1 is blocking. An unmarked (P?) finding is never blocking.
+#     # `discretionary` (#1673) independently uses
+#     # resolve_tiers_by_disposition discretionary; absent policy defaults to
+#     # P2/P3/nitpick. An unmarked finding is neither. The new flag is report-only.
 #     "reaction": null | {
 #       "content": "+1",
 #       "created_at": "<iso-8601>",
@@ -407,8 +410,9 @@ fi
 
 # --- config readers ---------------------------------------------------------
 
-# Resolve the policy from the SCRIPT's checkout, not $PWD (Codex P2 on #2175),
-# the way coderabbit-should-invoke.sh and phase-4b-classifier.sh already do.
+# Runtime knobs retain the SCRIPT's checkout, not $PWD (Codex P2 on #2175).
+# The entry decision below materializes REPO's governing base policy for its
+# enabled/request_by_default switches (#2273).
 # A cwd-relative path read no file at all when the script ran from a
 # subdirectory or by absolute path from elsewhere, and every codex: key then
 # took its default -- request_by_default then to true (since #2240 a
@@ -574,14 +578,16 @@ __CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # at the moment the next one is assigned keeps exactly one file live, and the
 # trap removes that one.
 __CRA_BASE_CFG_TMP=""
+__CRA_ENTRY_CFG_TMP=""
 __cra_retire_base_cfg() { # <new-path-or-empty>
   if [ -n "$__CRA_BASE_CFG_TMP" ] && [ "$__CRA_BASE_CFG_TMP" != "${1:-}" ]; then
     rm -f "$__CRA_BASE_CFG_TMP"
   fi
   __CRA_BASE_CFG_TMP="${1:-}"
 }
-trap '__cra_retire_base_cfg ""' EXIT
+trap '__cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
+DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # shellcheck source=lib/feedback-policy-helpers.sh
   . "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh"
@@ -596,6 +602,12 @@ if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # JSON array of required tiers (lowercase p0..p3|nitpick) for jq
   # membership tests. Empty input ⇒ [].
   REQUIRED_TIERS_JSON=$(printf '%s\n' "$__REQUIRED_TIERS" \
+    | jq -R . | jq -s 'map(select(. != ""))')
+  # Disposition defaults differ from the legacy gate set: P0 is not
+  # discretionary merely because an absent policy blocks only P1 (#1673).
+  # Keep this advisory decoration from changing the requester's exits.
+  __DISCRETIONARY_TIERS=$(resolve_tiers_by_disposition discretionary "$CONFIG" || true)
+  DISCRETIONARY_TIERS_JSON=$(printf '%s\n' "$__DISCRETIONARY_TIERS" \
     | jq -R . | jq -s 'map(select(. != ""))')
 fi
 
@@ -636,8 +648,7 @@ fi
 # per-repo docs call this script without the flag, and a Phase 4 PR must not
 # lose its mandatory request because of that. Only a PR the derivation reads
 # as under-threshold is skipped (exit 5, NO_TRIGGER_REQUESTED).
-CODEX_ENABLED=$(codex_field enabled)
-CODEX_ENABLED=${CODEX_ENABLED:-true}
+CODEX_ENABLED=true
 
 # Resolve codex.request_by_default (#2240). Sets REQUEST_BY_DEFAULT to
 # true|false and REQUEST_BY_DEFAULT_SOURCE to explicit|unset|failsafe.
@@ -834,15 +845,28 @@ esac
 # candidate's edit costs a Codex request, never a skipped one.
 #
 # The own copy still runs through run_policy_helper, which starts it with an
-# empty environment plus PATH (to find bash and awk) and LC_ALL=C.UTF-8:
+# empty environment plus PATH (to find bash and awk) and a verified LC_ALL:
 # neither helper reads anything else, and an empty environment keeps a
-# future helper from silently depending on a credential. The locale is
-# UTF-8, not C, because the matcher compiles `?` to `[^/]`; under C a
+# future helper from silently depending on a credential. Probe UTF-8
+# character semantics instead of trusting a locale spelling (#2315): the
+# matcher compiles `?` to `[^/]`; under C a
 # multibyte character in a file name is several characters, so `?` would
 # match LESS than the labeler: the unsafe direction. The EXCLUDE_RE read
 # executes nothing (jq decodes the file and sed extracts one line).
 run_policy_helper() {  # <script> [args...]; stdin passes through
-  env -i PATH="$PATH" LC_ALL=C.UTF-8 bash "$@"
+  local policy_locale
+  for policy_locale in C.UTF-8 en_US.UTF-8; do
+    # The child must evaluate the sample under its own effective locale.
+    # shellcheck disable=SC2016
+    if env -i PATH="$PATH" LC_ALL="$policy_locale" bash -c \
+      'sample=$(printf "\303\251"); [ "${#sample}" -eq 1 ] && [[ $sample =~ ^[^/]$ ]]' \
+      >/dev/null 2>&1; then
+      env -i PATH="$PATH" LC_ALL="$policy_locale" bash "$@"
+      return $?
+    fi
+  done
+  echo "[codex-review-request] no verified UTF-8 locale for policy helpers" >&2
+  return 2
 }
 # Fetch a base helper as data and confirm it is byte-identical to this
 # requester's own copy. Prints nothing; returns 0 when identical, else sets
@@ -1127,6 +1151,20 @@ derive_phase_4a_gate() {
 # or 1 (skip). Kept as a function so the decision is testable in one place
 # and reads as a single boolean expression at the call site.
 should_request_codex() {
+  # Keep the established readers, but scope their CONFIG to the policy of
+  # REPO's base. The script's checkout can belong to another repository.
+  local CONFIG="$CONFIG" entry_cfg
+  entry_cfg=$("$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
+    --repo "$REPO" --pr "$PR_NUMBER" --default-config "$CONFIG" \
+    --materialize-default 2>/dev/null) || entry_cfg=""
+  if [ -z "$entry_cfg" ] || [ ! -r "$entry_cfg" ]; then
+    request_by_default_failsafe "could not resolve the governing policy for $REPO#$PR_NUMBER"
+    return 0
+  fi
+  [ "$entry_cfg" = "$CONFIG" ] || __CRA_ENTRY_CFG_TMP="$entry_cfg"
+  CONFIG="$entry_cfg"
+  CODEX_ENABLED=$(codex_field enabled)
+  CODEX_ENABLED=${CODEX_ENABLED:-true}
   # Codex off ⇒ never trigger (orthogonality rule).
   [ "$CODEX_ENABLED" = "true" ] || return 1
   # A caller-flagged Phase-4a-gated PR is always requested: Phase 4 review is
@@ -1212,18 +1250,38 @@ fi
 REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds)
 REQUEST_MIN_HEAD_AGE_SECONDS=${REQUEST_MIN_HEAD_AGE_SECONDS:-300}
 # REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
-# off (key present and empty). codex_field returns empty for both absent and
-# empty, so the presence test is made separately.
+# off (key present and empty). Resolve value and presence together as YAML
+# inside the write guard, preserving disabled/no-request entry paths.
 REQUEST_WORKFLOW_NAME=repo-lint
 REQUEST_WORKFLOW_PATH=.github/workflows/repo_lint.yml
-REQUEST_REQUIRES_CHECK=$(codex_field request_requires_check)
-if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
-  REQUEST_SIGNAL_MODE=check
-elif [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; then
-  REQUEST_SIGNAL_MODE=off
-else
-  REQUEST_SIGNAL_MODE=workflow
-fi
+REQUEST_REQUIRES_CHECK=""
+REQUEST_SIGNAL_MODE=workflow
+resolve_request_check_signal() {
+  local policy selection
+  # Preserve the bootstrap default when there is no policy file.
+  [ -f "$CONFIG" ] || return 0
+  policy=$(policy_yaml_to_json "$CONFIG") || {
+    echo "ERROR: codex.request_requires_check policy could not be parsed" >&2
+    exit 3
+  }
+  selection=$(printf '%s' "$policy" | jq -ce '
+    if . == null then {} else . end
+    | if type != "object" then error("policy must be a mapping") else . end
+    | (.codex // {})
+    | if type != "object" then error("codex must be a mapping") else . end
+    | if has("request_requires_check") then
+        .request_requires_check
+        | if . == null or . == "" then {mode:"off",name:""}
+          elif type == "string" then {mode:"check",name:.}
+          else error("request_requires_check must be a check name or empty") end
+      else {mode:"workflow",name:""} end
+  ') || {
+    echo "ERROR: codex.request_requires_check must name a check or be empty" >&2
+    exit 3
+  }
+  REQUEST_SIGNAL_MODE=$(printf '%s' "$selection" | jq -r .mode)
+  REQUEST_REQUIRES_CHECK=$(printf '%s' "$selection" | jq -r .name)
+}
 
 POLL_INTERVAL_SECONDS=15
 ACK_POLL_INTERVAL_SECONDS=5
@@ -1330,8 +1388,8 @@ fetch_scan_array() {
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------
-# Evaluate the request decision BEFORE any PR fetch / signal scan / trigger
-# write. When the decision is "skip", emit a minimal JSON object (same field
+# Evaluate the request decision after its governing-policy metadata lookup,
+# before per-head signal scanning or trigger writes. On "skip", emit a minimal JSON object (same field
 # names as the terminal output, all signals null) and exit 5
 # (NO_TRIGGER_REQUESTED) so the caller can distinguish "deliberately did not
 # request" from a timeout (4) or an API error (3).
@@ -1376,6 +1434,32 @@ fi
 
 # --- fetch PR metadata ------------------------------------------------------
 
+request_freshness_snapshot() { # <PR metadata JSON>
+  local tuple policy freshness base_ref base_sha default_branch
+  tuple=$(printf '%s' "$1" | jq -ce '
+    [.base.ref, .base.sha, .base.repo.default_branch]
+    | select(all(.[]; type == "string" and length > 0))') || return 1
+  base_ref=$(printf '%s' "$tuple" | jq -r '.[0]')
+  base_sha=$(printf '%s' "$tuple" | jq -r '.[1]')
+  default_branch=$(printf '%s' "$tuple" | jq -r '.[2]')
+  policy=$(crqe_governing_policy_json "$REPO" "$PR_NUMBER" "$CONFIG" \
+    "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
+    "$base_ref" "$base_sha" "$default_branch") || return 1
+  freshness=$(crqe_policy_reaction_freshness "$policy") || return 1
+  jq -nSc --argjson tuple "$tuple" --argjson freshness "$freshness" \
+    '{tuple:$tuple,freshness:$freshness}'
+}
+
+revalidate_request_freshness() {
+  local metadata snapshot
+  metadata=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
+    || die 3 "cannot revalidate governing request freshness metadata; rerun the requester"
+  snapshot=$(request_freshness_snapshot "$metadata") \
+    || die 3 "cannot revalidate governing request freshness policy; rerun the requester"
+  [ "$snapshot" = "$GOVERNING_FRESHNESS_SNAPSHOT" ] \
+    || die 3 "governing request freshness base/policy changed; rerun the requester"
+}
+
 log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
 
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"
@@ -1392,6 +1476,12 @@ fi
 # Use the committer date for request/provider diagnostics, not the author date.
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
+# Post-write diagnostics use jq's canonical UTC parser. Refuse unsupported
+# metadata before a trigger can be written, rather than failing afterward.
+jq -ne --arg t "$HEAD_COMMITTER_DATE" '
+  $t | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+  and (try ($t | fromdateiso8601 | todateiso8601 == $t) catch false)' >/dev/null \
+  || die 3 "unsupported commit timestamp; expected a valid YYYY-MM-DDTHH:MM:SSZ value"
 
 # Retain the shared timestamp diagnostics used by request evidence and
 # provider-state polling. Clearance below depends on commit anchors; a PR
@@ -1399,9 +1489,9 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
 # #1567: timing is governed by the target base policy, as in Phase 4b. Read
 # freshness before any threshold/reuse decision, without validating request
 # caps on a no-spend path. Each new write still re-reads its governed budgets.
-REACTION_FRESHNESS_SECONDS=$(crqe_governing_freshness "$REPO" "$PR_NUMBER" "$CONFIG" \
-  "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh") \
+GOVERNING_FRESHNESS_SNAPSHOT=$(request_freshness_snapshot "$PR_JSON") \
   || die 3 "cannot read the governing review policy/request freshness"
+REACTION_FRESHNESS_SECONDS=$(printf '%s' "$GOVERNING_FRESHNESS_SNAPSHOT" | jq -r .freshness)
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
 EPOCH_NOW=$(date +%s)
 REACTION_ANCHOR=$(crqe_request_threshold "$HEAD_COMMITTER_DATE" "$TIMELINE_JSON" \
@@ -1427,7 +1517,7 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
-  local reviews comments issue_comments review findings reaction verdict blocked approval_time
+  local reviews comments issue_comments review findings reaction verdict blocked approval_time request summary
 
   # Each read must propagate fetch_api_array's status explicitly (#966):
   # scan_codex_state is invoked from every call site as
@@ -1474,7 +1564,8 @@ scan_codex_state() {
     findings=$(echo "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
       --argjson review_id "$latest_review_id" \
-      --argjson required "$REQUIRED_TIERS_JSON" '
+      --argjson required "$REQUIRED_TIERS_JSON" \
+      --argjson discretionary "$DISCRETIONARY_TIERS_JSON" '
       [ .[]
         | select(.user.login == $bot)
         | select(.pull_request_review_id == $review_id)
@@ -1487,7 +1578,8 @@ scan_codex_state() {
             # normalized tier (p0..p3) against $required (from
             # resolve_required_tiers) so the surfaced flag matches exactly
             # what the codex-p1-gate enforces at merge time.
-            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) )
+            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) ),
+            discretionary: ( $n != null and ( ("p" + $n) as $t | $discretionary | index($t) != null ) )
           }
       ]
     ')
@@ -1575,31 +1667,39 @@ scan_codex_state() {
     blocked='null'
   fi
 
-  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s --arg approval_time "$approval_time" '
-    if length != 5 then error("incomplete Codex scan components") else
-      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4], review_approval_eligible: ($approval_time != "") }
+  request=$(crqe_select_trigger "$issue_comments" "$AUTHOR_IDENTITY" "") || return 3
+  summary=$(crqe_select_codex_review_summary "$issue_comments" "$BOT_LOGIN" "$HEAD_SHA") || return 3
+  blocked=$(crqe_filter_provider_block "$blocked" "$request" "$summary") || return 3
+
+  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" "$request" | jq -s --arg approval_time "$approval_time" '
+    if length != 6 then error("incomplete Codex scan components") else
+      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4], request: .[5], review_approval_eligible: ($approval_time != "") }
     end
   '
 }
 
 # Echo the failure-marker reason (usage_limit|not_connected) carried by a scan
 # that should short-circuit the wait, else empty. When a trigger was posted
-# this run, the marker must be at/after the trigger threshold (a response to
-# THIS trigger, mirroring has_post_trigger_signal); otherwise any marker
-# counts. A usage_limit / not_connected block cannot be cleared by re-polling
+# this run, retain that confirmed request boundary even when the API scan has
+# not observed the new comment yet. Scans already filter against their latest
+# exact author request and active current-head summary. A block is not fixed by re-polling
 # or re-triggering — only a human upgrading/connecting the account resolves
 # it — so treating it as a wait-ending signal is correct (#722).
 current_blocked_reason() {
-  local scan=$1
+  local scan=$1 block request after
+  block=$(printf '%s' "$scan" | jq -c .blocked) || return 3
+  request=$(printf '%s' "$scan" | jq -c '.request // null') || return 3
   if [ "$TRIGGER_POSTED" = "true" ] || [ "${CAP_REUSED_TRIGGER:-false}" = true ] \
      || [ "${RESUMED_TRIGGER:-false}" = true ]; then
-    local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
-    echo "$scan" | jq -r --arg after "$after" '
-      if (.blocked != null and .blocked.created_at >= $after)
-      then .blocked.reason else "" end'
-  else
-    echo "$scan" | jq -r 'if .blocked != null then .blocked.reason else "" end'
+    after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
+    request=${REQUEST_BLOCK_TRIGGER_JSON:-null}
+    if [ "$TRIGGER_POSTED" = true ] || [ "$request" = null ]; then
+      request=$(jq -nc --arg at "$after" --arg id "${TRIGGER_COMMENT_ID:-}" \
+        '{created_at:$at,id:($id | tonumber? // null)}') || return 3
+    fi
   fi
+  block=$(crqe_filter_provider_block "$block" "$request") || return 3
+  printf '%s' "$block" | jq -r 'if . == null then "" else .reason end'
 }
 
 # Returns 0 iff the scan produced a commit-anchored signal (review or
@@ -1695,13 +1795,15 @@ has_post_trigger_signal() {
 # coderabbit-wait.sh fires the failover more than once for the same HEAD (e.g.
 # a re-invocation). Fail-open: on a missing author identity or any read error it
 # returns non-zero so the caller still posts (better to re-request Codex than to
-# silently skip the failover).
+# silently skip the failover). Governing freshness/base uncertainty instead
+# fails closed before this lookup can authorize reuse or a new request.
 existing_codex_trigger_on_head() {
   [ -n "$AUTHOR_IDENTITY" ] || return 1
   local comments
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || return 1
   [ -n "$comments" ] || return 1
+  revalidate_request_freshness
   local trigger
   trigger=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
   [ "$trigger" != null ]
@@ -2189,6 +2291,7 @@ MOVING_HEAD_CHECK_STATUS=""
 MOVING_HEAD_ANCHOR=""
 refuse_moving_head_unless_allowed() {
   local reasons="" pushed_epoch now_epoch age runs status allow=false
+  resolve_request_check_signal
   # A malformed knob is a configuration error on the write path: refuse
   # before the guard's own reads and before any write (#2253; it used to be
   # checked at load time, which also failed the no-write paths).
@@ -2226,12 +2329,12 @@ refuse_moving_head_unless_allowed() {
         status=unreadable
       elif [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ]; then
         status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "unknown"')
-        # The LATEST dispatch on this branch is the current push: a re-run
-        # keeps its run's original created_at (it bumps run_attempt), so it
-        # cannot move this, and an earlier push of the same SHA to this branch
-        # is older by construction (Codex P2 on #2175).
+        # Only PR/push events date this push. Any event proves pickup, but a
+        # later manual or scheduled run must not restart a settled head's age
+        # guard (#2198). A re-run keeps the original created_at.
         dispatched_at=$(printf '%s' "$runs" | jq -r '
-          [.[] | (.created_at // empty)
+          [.[] | select(.event == "pull_request" or .event == "push")
+           | (.created_at // empty)
            | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""')
       else
         # No repo-lint run on this head. Either CI has not picked it up yet,
@@ -2265,7 +2368,11 @@ refuse_moving_head_unless_allowed() {
           -F per_page=100 2>/dev/null) || suites=""
         suites=$(printf '%s' "$suites" | jq -c -s --arg b "$HEAD_REF" '
           if length > 0 and all(.[]; type == "object" and ((.check_suites | type) == "array"))
-          then [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ]
+          then {known: [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ],
+                created: [ .[].check_suites[] | select((.head_branch // "") == $b)
+                           | {id, created_at} ],
+                unknown: [ .[].check_suites[]
+                           | select((.head_branch | type) != "string" or .head_branch == "") | .id ]}
           else "unreadable" end' 2>/dev/null) || suites='"unreadable"'
         [ -n "$suites" ] || suites='"unreadable"'
       fi
@@ -2274,11 +2381,19 @@ refuse_moving_head_unless_allowed() {
       else
         runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_REQUIRES_CHECK" --argjson ids "$suites" '
           if length > 0 and all(.[]; type == "object" and ((.check_runs | type) == "array"))
-          then [ .[].check_runs[] | select((.name // "") == $n)
-                 | select($ids == null or ((.check_suite.id // null) as $s | ($ids | index($s)) != null)) ]
+          then [ .[].check_runs[] | select((.name // "") == $n) ] as $named
+             | [ $named[] | select($ids == null or
+                 ((.check_suite.id // null) as $s | ($ids.known | index($s)) != null)) ] as $known
+             | if ($known | length) > 0 then $known
+               elif $ids != null and any($named[];
+                 (.check_suite.id // null) as $s | ($ids.unknown | index($s)) != null)
+               then "branch-unavailable"
+               else [] end
           else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
         if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
           status=unreadable
+        elif [ "$runs" = '"branch-unavailable"' ]; then
+          status=branch-unavailable
         else
           status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "missing"' 2>/dev/null) || status=unreadable
           [ "$status" != null ] || status=missing
@@ -2286,10 +2401,19 @@ refuse_moving_head_unless_allowed() {
       fi
       # Latest run, as in the workflow path: an earlier run of the same SHA
       # must not date the current push.
-      if [ "$status" != unreadable ] && [ "$status" != missing ]; then
-        dispatched_at=$(printf '%s' "$runs" | jq -r '
-          [.[] | (.started_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
+      if [ "$status" != unreadable ] && [ "$status" != missing ] && [ "$status" != branch-unavailable ]; then
+        dispatched_at=$(printf '%s' "$runs" | jq -r --argjson suites "$suites" '
+          def timestamp: select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"));
+          [.[] | .check_suite.id as $id
+           | [.created_at, .started_at,
+              ($suites.created[]? | select(.id == $id) | .created_at)]
+           | map(timestamp) | first // empty] | max // ""' 2>/dev/null) || dispatched_at=""
+        if [ -z "$dispatched_at" ]; then
+          # Queued checks have no start time. Without any dispatch timestamp,
+          # an old commit date cannot establish when this push was picked up.
+          anchor=""
+          anchor_source="unavailable check dispatch timestamp"
+        fi
       fi
       ;;
     *) status="" ;;
@@ -2300,6 +2424,8 @@ refuse_moving_head_unless_allowed() {
     case "$status" in
       unreadable)
         log "moving-head guard: CI-pickup signal ('$signal_label') for $HEAD_SHA unreadable; not enforced" ;;
+      branch-unavailable)
+        log "moving-head guard: matching '$signal_label' check has unavailable suite branch attribution; CI-pickup signal not enforced" ;;
       no-workflow)
         log "WARNING: moving-head guard: this repository has no '$REQUEST_WORKFLOW_NAME' workflow ($REQUEST_WORKFLOW_PATH), so the CI-pickup signal cannot be observed; not enforced (set codex.request_requires_check to name another check)" ;;
       missing)
@@ -2402,6 +2528,7 @@ post_codex_trigger() {
   # idempotently-reused paths spend no request attempt and retain their
   # established behavior even if a later budget edit is malformed.
   local max_review_rounds request_comments request_count
+  revalidate_request_freshness
   governing_request_attempt_cap
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
@@ -2442,9 +2569,12 @@ post_codex_trigger() {
       || die 3 "cannot select the final Codex request"
     if [ "$TRIGGER_ONLY" != true ] && [ "$pending_trigger" != null ]; then
       CAP_REUSED_TRIGGER=true
+      REQUEST_BLOCK_TRIGGER_JSON=$pending_trigger
       TRIGGER_SIGNAL_THRESHOLD=$(printf '%s' "$pending_trigger" | jq -r '.created_at')
+      local pending_block_reason
+      pending_block_reason=$(current_blocked_reason "$INITIAL_SCAN") || die 3 "cannot order the final-request provider refusal"
       if ! has_post_trigger_signal "$INITIAL_SCAN" \
-         && [ -z "$(current_blocked_reason "$INITIAL_SCAN")" ]; then
+         && [ -z "$pending_block_reason" ]; then
         preserve_final_request_timeout "$request_comments" "$pending_trigger"
         CAP_REQUEST_COUNT=$request_count
         CAP_REQUEST_LIMIT=$max_review_rounds
@@ -2603,8 +2733,10 @@ wait_for_trigger_ack() {
     # too (#722): re-posting `@codex review` cannot help a quota-exhausted or
     # not-connected account, so stop the ack gate (no re-trigger) and let the
     # poll loop short-circuit on the marker FINAL_SCAN already carries.
-    if [ -n "$(current_blocked_reason "$FINAL_SCAN")" ]; then
-      log "Codex reported '$(current_blocked_reason "$FINAL_SCAN")' during eyes-ack wait — no re-trigger (a human must resolve it); handing to the poll loop to short-circuit (#722)"
+    local ack_block_reason
+    ack_block_reason=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the eyes-ack provider refusal"
+    if [ -n "$ack_block_reason" ]; then
+      log "Codex reported '$ack_block_reason' during eyes-ack wait — no re-trigger (a human must resolve it); handing to the poll loop to short-circuit (#722)"
       return 0
     fi
     if has_post_trigger_signal "$FINAL_SCAN"; then
@@ -2797,6 +2929,7 @@ resume_pending_codex_request() {
   local comments="" pending created created_epoch summary status observed now deadline
   read_with_transient_retry "resume-check issue comments read" comments \
     fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)"
+  revalidate_request_freshness
   # The latest exact author request, with no freshness anchor. Neither anchor
   # proves head attribution: the reaction-freshness floor may be shorter than
   # the reply deadline, and HEAD_PUSHED_AT falls back to the author-controlled
@@ -2816,8 +2949,11 @@ resume_pending_codex_request() {
   # a new request, so do not resume.
   TRIGGER_SIGNAL_THRESHOLD=$created
   RESUMED_TRIGGER=true
+  REQUEST_BLOCK_TRIGGER_JSON=$pending
+  local resume_block_reason
+  resume_block_reason=$(current_blocked_reason "$INITIAL_SCAN") || die 3 "cannot order the pending-request provider refusal"
   if has_post_trigger_signal "$INITIAL_SCAN" \
-     || [ -n "$(current_blocked_reason "$INITIAL_SCAN")" ]; then
+     || [ -n "$resume_block_reason" ]; then
     TRIGGER_SIGNAL_THRESHOLD=""
     RESUMED_TRIGGER=false
     return 1
@@ -2878,6 +3014,7 @@ resume_pending_codex_request() {
   RESUMED_TRIGGER=true
   RESUMED_EVER=true
   RESUMED_TRIGGER_ID=$(printf '%s' "$pending" | jq -r .id)
+  REQUEST_BLOCK_TRIGGER_JSON=$pending
   TRIGGER_SIGNAL_THRESHOLD=$created
   START_TS=$created_epoch
   DEADLINE=$deadline
@@ -2912,23 +3049,31 @@ RESUMED_TRIGGER=false
 RESUMED_EVER=false
 [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] || RESUMED_EVER=true
 RESUMED_TRIGGER_ID=""
+REQUEST_BLOCK_TRIGGER_JSON=null
 
-if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
-  post_codex_trigger
-  die 3 "trigger authorization returned without an authorization record"
-fi
-
+NO_WRITE_REASON=""
 if has_cleared_signal "$INITIAL_SCAN"; then
+  NO_WRITE_REASON="already-cleared"
   log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+  NO_WRITE_REASON="existing-trigger"
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
+  NO_WRITE_REASON="content-free-auto-trigger"
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
 elif [ "$TRIGGER_ONLY" != "true" ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
      && resume_pending_codex_request; then
   log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
 else
   post_codex_trigger
+fi
+
+# The wrapper's fresh scan must honor the same no-write decisions as the
+# outer requester. Authorization never spends a request or posts a comment.
+if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+  jq -n --arg reason "${NO_WRITE_REASON:-no-request-authorized}" \
+    '{authorized:false,reason:$reason}'
+  die 3 "trigger not authorized: ${NO_WRITE_REASON:-no-request-authorized}"
 fi
 
 # #489 trigger-only: return immediately after posting (or confirming) the
@@ -2939,13 +3084,25 @@ fi
 # 4a flow and the merge-clearance gate. trigger_posted is false when the
 # idempotency check skipped a duplicate, or when Codex had already cleared.
 if [ "$TRIGGER_ONLY" = "true" ]; then
+  # Preserve a block already known before this trigger. Posting or deduping
+  # a request does not make an unavailable provider usable (#2139).
+  trigger_only_blocked_reason=""
+  if ! has_cleared_signal "$INITIAL_SCAN"; then
+    trigger_only_blocked_reason=$(printf '%s' "$INITIAL_SCAN" | jq -r \
+      --arg after "$REACTION_THRESHOLD" --arg floor "$REACTION_FLOOR_ISO" --argjson now "$EPOCH_NOW" '
+      # A future author-controlled committer date cannot hide a recent block.
+      (if ($after | fromdateiso8601) > $now then $floor else $after end) as $block_after
+      | if .blocked != null and (.blocked.created_at // "") >= $block_after
+      then .blocked.reason else "" end')
+  fi
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
     --arg repo "$REPO" \
     --arg head_sha "$HEAD_SHA" \
     --arg head_committer_date "$HEAD_COMMITTER_DATE" \
     --arg bot_login "$BOT_LOGIN" \
-    --argjson trigger_posted "$TRIGGER_POSTED" '
+    --argjson trigger_posted "$TRIGGER_POSTED" \
+    --arg blocked_reason "$trigger_only_blocked_reason" '
     {
       pr_number: $pr_number,
       repo: $repo,
@@ -2956,7 +3113,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       findings: [],
       reaction: null,
       verdict: null,
-      blocked_reason: null,
+      blocked_reason: (if $blocked_reason == "" then null else $blocked_reason end),
       terminal_determination: null,
       trigger_posted: $trigger_posted,
       trigger_requested: true,
@@ -3002,7 +3159,7 @@ while :; do
   # (FALLBACK_REQUIRED) because no real Codex signal arrived — but now with
   # blocked_reason in the JSON so the caller (and the Phase 4b handoff) can
   # name the real cause instead of a generic timeout.
-  BLOCKED_REASON_NOW=$(current_blocked_reason "$FINAL_SCAN")
+  BLOCKED_REASON_NOW=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the polled provider refusal"
   if [ -n "$BLOCKED_REASON_NOW" ]; then
     log "Codex reported '$BLOCKED_REASON_NOW' after ${ELAPSED}s — short-circuiting the wait; re-polling/re-triggering cannot clear it. The result preserves the invocation's existing routing authority (#722)"
     break
@@ -3040,8 +3197,9 @@ run_review_poll
 # this run's captured HEAD_SHA and its expired deadline into the replacement.
 # Nothing has been written to stdout yet, so the fresh run's JSON is the only
 # result.
+RESUMED_BLOCK_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the resumed provider refusal"
 if [ "$RESUMED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN" \
-   && [ -z "$(current_blocked_reason "$FINAL_SCAN")" ]; then
+   && [ -z "$RESUMED_BLOCK_REASON" ]; then
   log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — re-running as a fresh request with resume disabled (#1550)"
   export MERGEPATH_CODEX_RESUME_EXPIRED=1
   exec bash "$0" ${__CRR_ORIGINAL_ARGS[@]+"${__CRR_ORIGINAL_ARGS[@]}"}
@@ -3063,7 +3221,7 @@ fi
 # Surface the account-/connection-level block (#722) on the final scan, using
 # the same post-trigger anchoring as the poll short-circuit so a stale marker
 # from a prior HEAD does not leak into this run's report. Empty ⇒ null.
-BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN")
+BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the final provider refusal"
 
 # A plain timeout is a terminal Phase 4a determination, not ordinary pending.
 # Persist it before emitting exit 4 so a later Phase 4b process can consume it.

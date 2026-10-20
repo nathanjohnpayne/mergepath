@@ -1455,11 +1455,12 @@ rhc="scripts/required-head-checks.sh"
 if [ -x "$rhc" ] && \
    grep -Fq 'indeterminate, not a 404' "$rhc" && \
    grep -Fq 'yields no check names' "$rhc" && \
-   grep -Fq 'group_by(.wf)' "$rhc" && \
+   grep -Fq 'head_check_runs_reduce' "$rhc" && \
+   grep -Fq 'group_by(.wf)' scripts/lib/head-check-runs.sh && \
    grep -Fq 'actions/runs?head_sha=' "$rhc" && \
    grep -Fq -- '--paginate' "$rhc" && \
    grep -Fq -- '-f check_name=' "$rhc" && \
-   grep -Fq 'if any(.status != "completed") then "pending"' "$rhc" && \
+   grep -Fq 'if any(.status != "completed") then {state:"pending"' scripts/lib/head-check-runs.sh && \
    grep -Fq 'required-head-checks.sh --repo' .github/workflows/agent-review.yml && \
    grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq 'required-head-checks.sh" --repo' scripts/workflow/approval-merge-continuation.sh && \

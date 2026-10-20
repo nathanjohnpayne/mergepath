@@ -57,7 +57,10 @@ rcg_close() { # repo pr head context id conclusion title summary
     title="$context — generation input changed or unreadable"
     summary="Cannot certify PR #$pr at $head: current head, unique PR ownership or trusted default revision changed or could not be read. Re-evaluate from the current trusted revision."
   fi
-  if [ -n "${CR_EVIDENCE_REPORT:-}" ] && [ -s "$CR_EVIDENCE_REPORT" ]; then
+  # A failed final fence must still close this owned generation red. Its
+  # evaluator may have observed the new head; do not attach or validate that
+  # other tuple's report while publishing the already-determined failure.
+  if [ "$failed" -eq 0 ] && [ -n "${CR_EVIDENCE_REPORT:-}" ] && [ -s "$CR_EVIDENCE_REPORT" ]; then
     local evidence
     evidence=$(jq -ce --arg repo "$repo" --argjson pr "$pr" --arg head "$head" \
       'select(.repo == $repo and .pr == $pr and .head == $head)' "$CR_EVIDENCE_REPORT") || return 1
@@ -66,10 +69,8 @@ rcg_close() { # repo pr head context id conclusion title summary
     fi
     # A readable evaluator result ends an episode only after the final
     # publication binding fence succeeds. Infrastructure failures cannot.
-    if [ "$(jq -r .state <<<"$evidence")" != readable ] || [ "$failed" -eq 0 ]; then
-      summary="<!-- mergepath-coderabbit-evidence:v1 $evidence -->
+    summary="<!-- mergepath-coderabbit-evidence:v1 $evidence -->
 $summary"
-    fi
   fi
   # Updating an older owned id cannot change its opening order. In particular,
   # a newer pending/failing generation wins even if it opens after these reads.

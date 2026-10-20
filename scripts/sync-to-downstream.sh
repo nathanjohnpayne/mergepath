@@ -2011,6 +2011,20 @@ requires_closure_gate() {
   return 1
 }
 
+# Shared commit/PR wording binds copy correctness to the selected source,
+# while leaving upstream review and consumer validation outcomes to evidence.
+sync_self_review() {
+  local source_sha=${1:?missing source identifier}
+  cat <<EOF
+## Self-Review
+- Correctness: applies selected canonical changes from mergepath@${source_sha} using the manifest, declared templates and consumer overrides.
+- Regression risk: depends on the selected upstream changes and consumer integration.
+- Style: canonical artifact formatting and per-consumer template rendering.
+- Test coverage: selected changes can add, update or remove canonical tests and fixtures; check consumer CI results for this head.
+- Security: selected artifacts can change workflow, review or credential behavior; inspect the linked source and consumer diff.
+EOF
+}
+
 # Live PR-open. Clones the consumer repo into a tmpdir (writeable
 # workspace, never reuses the cache or sibling worktree), copies canonical
 # files from the Mergepath worktree at $sha, commits with the standard
@@ -2137,6 +2151,7 @@ sync_open_pr() {
   # fail noisily on `git show` and the script would abort the entire
   # consumer rather than mirroring the delete.
   local target
+  local removed_targets=""
   while IFS= read -r target; do
     [ -z "$target" ] && continue
     local consumer_target="$workspace/repo/$target"
@@ -2145,6 +2160,7 @@ sync_open_pr() {
 
     if [ -z "$src_mode" ]; then
       # Path absent at $sha → delete propagation.
+      removed_targets+="${removed_targets:+$'\n'}$target"
       if [ -e "$consumer_target" ]; then
         rm -f "$consumer_target"
       fi
@@ -2249,7 +2265,14 @@ sync_open_pr() {
   fi
   git -C "$workspace/repo" add -A
   local target_lines
-  target_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p"; done <<< "$targets")
+  target_lines=$(while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if printf '%s\n' "$removed_targets" | grep -Fxq -- "$p"; then
+      echo "  - $p (source absent; removal)"
+    else
+      echo "  - $p"
+    fi
+  done <<< "$targets")
   # Append templated dest paths to the commit-body file list. Use the
   # `.dest` value (where the file lands in the consumer), not `.path`
   # (the manifest identifier in mergepath), so a reader sees the same
@@ -2284,12 +2307,7 @@ ${target_lines}
 ${deferred_note}
 Authoring-Agent: ${authoring_agent}
 
-## Self-Review
-- Correctness: mirrors mergepath@${short_sha} verbatim per .mergepath-sync.yml
-- Regression risk: low; same change has been reviewed in the upstream PR
-- Style: N/A (verbatim mirror)
-- Test coverage: relies on the consumer repo CI
-- Security: no new attack surface
+$(sync_self_review "$short_sha")
 
 ${coauthor_trailer}
 EOF
@@ -2395,12 +2413,7 @@ https://github.com/nathanjohnpayne/mergepath/commit/${sha}
 
 Authoring-Agent: ${authoring_agent}
 
-## Self-Review
-- Correctness: mirrors mergepath@${short_sha} verbatim per the upstream manifest. The change has already been reviewed in the upstream Mergepath PR.
-- Regression risk: low. Verbatim mirror of an already-reviewed upstream change.
-- Style: N/A (mirror).
-- Test coverage: relies on the consumer repo CI. No test changes shipped.
-- Security: no new attack surface; the sync script never ran with elevated privileges in this consumer.
+$(sync_self_review "$short_sha")
 EOF
 )" 2>&1) || {
     err "$consumer_name: PR create failed: $pr_url"
@@ -2815,12 +2828,7 @@ ${templated_lines}
 ${override_note}
 Authoring-Agent: ${authoring_agent}
 
-## Self-Review
-- Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per .mergepath-sync.yml; .sync-overrides.yml honored per-consumer
-- Regression risk: low; verbatim mirror, kit paths use allow-extras (consumer-only files kept)
-- Style: N/A (verbatim mirror)
-- Test coverage: relies on the consumer repo CI
-- Security: no new attack surface
+$(sync_self_review "$short_sha")
 
 ${coauthor_trailer}
 EOF
@@ -2902,12 +2910,7 @@ ${templated_lines}
 ${override_note}
 Authoring-Agent: ${authoring_agent}
 
-## Self-Review
-- Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per the manifest. Each path was already reviewed in its upstream PR.
-- Regression risk: low. Verbatim mirror; kit paths use allow-extras semantics so consumer-only files are kept.
-- Style: N/A (mirror).
-- Test coverage: relies on the consumer repo CI. No test changes shipped.
-- Security: no new attack surface; \`.sync-overrides.yml\` was honored per-consumer so documented divergences are untouched.
+$(sync_self_review "$short_sha")
 EOF
 )" 2>&1) || {
     err "$consumer_name: PR create failed: $pr_url"

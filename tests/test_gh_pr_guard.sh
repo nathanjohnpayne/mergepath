@@ -36,6 +36,9 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "pr view")
+    if [ -n "${STUB_INFERRED_HOST:-}" ]; then
+      printf 'pr view repository inferred host: %s\n' "$STUB_INFERRED_HOST" >>"${STUB_API_LOG:-/dev/null}"
+    fi
     # STUB_REQUIRE_TOKEN: a session with no gh keyring, where gh needs GH_TOKEN.
     if [ "${STUB_REQUIRE_TOKEN:-0}" = 1 ]; then
       [ -n "${GH_TOKEN:-}" ] || { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }
@@ -123,6 +126,18 @@ case "${1:-} ${2:-}" in
 esac
 STUB
 chmod +x "$STUB_DIR/gh"
+
+REAL_PYTHON="$(command -v python3)"
+cat >"$STUB_DIR/python3" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == */gh-comment-trigger-guard.py && "${STUB_COMMENT_GUARD_STUB:-0}" = 1 ]]; then
+  printf '%s' "${STUB_COMMENT_GUARD_OUTPUT:-}"
+  exit "${STUB_COMMENT_GUARD_EXIT:-0}"
+fi
+exec "$REAL_PYTHON" "$@"
+STUB
+chmod +x "$STUB_DIR/python3"
+export REAL_PYTHON
 
 run_hook() {
   local cmd="$1"
@@ -501,6 +516,65 @@ assert_rc_contains "review body trigger containment blocks" 2 "Reword the commen
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --comment --body "Do not quote @CoDeX review here."'
 assert_rc_contains "raw REST trigger containment blocks" 2 "Reword the comment" \
   'scripts/gh-as-reviewer.sh -- gh api repos/o/r/issues/123/comments -f "body=Do not quote @codex review here."'
+assert_rc_contains "REST trigger after an earlier read is inspected" 2 "Reword the comment" \
+  'gh repo view && gh api repos/o/r/issues/123/comments -f "body=Do not quote @codex review here."'
+assert_rc_contains "ordinary REST write after an earlier read requires splitting" 2 "compound gh command contains a guarded write" \
+  'gh pr view 123 ; gh api repos/o/r/issues/123/comments -f body=Done'
+assert_rc_contains "wrapped REST write after a read requires splitting" 2 "compound gh command contains a guarded write" \
+  'gh repo view && scripts/gh-as-reviewer.sh -- gh api repos/o/r/issues/123/comments -f body=Done'
+assert_rc_contains "later closing comment is inspected" 2 "Reword the comment" \
+  'gh repo view || gh issue close 123 --comment "Do not quote @codex review here."'
+assert_rc_contains "compound native API reads remain allowed" 0 "" \
+  'gh api repos/o/r && gh api repos/o/r/issues/123/comments --method GET'
+for metadata in '' 'invalid' '{}' 'null' '[]' '{"guarded":"false"}' '{"guarded":null}' '{"guarded":false}{"guarded":false}'; do
+  STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT="$metadata" \
+    assert_rc_contains "invalid guard metadata refuses: $metadata" 2 "invalid guarded metadata" 'gh repo view'
+done
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":false}' STUB_COMMENT_GUARD_EXIT=1 \
+  assert_rc_contains "guard process read failure refuses" 2 "" 'gh repo view'
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":false}' \
+  assert_rc_contains "typed false guard metadata permits a read" 0 "" 'gh repo view'
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":true}' \
+  assert_rc_contains "typed true guard metadata requires the wrapper" 2 "token-verifying wrapper" 'gh api repos/o/r/issues/123/comments -f body=Done'
+
+# A controlled missing-entry copy preserves actual classification and runtime
+# helpers but removes the index assignment. Relocate only its helper root;
+# production receives no fault-injection switch.
+missing_index_hook="$WORKDIR/missing-index.sh"
+python3 - "$HOOK" "$missing_index_hook" "$ROOT/scripts/hooks" <<'PYTHON'
+from pathlib import Path
+import shlex, sys
+source, target, helper_root = sys.argv[1:]
+text = Path(source).read_text()
+root_line = next(line for line in text.splitlines() if line.startswith('HOOK_DIR='))
+text = text.replace(root_line, 'HOOK_DIR=' + shlex.quote(helper_root), 1)
+assignment = '      COMMENT_GUARDED_BY_INDEX[$i]="$comment_guard_boolean"'
+assert text.count(assignment) == 1, 'missing-entry control lost its injection point'
+Path(target).write_text(text.replace(assignment, '      : # controlled missing classification', 1))
+PYTHON
+original_hook="$HOOK"
+for guarded_command in \
+  'gh repo view' \
+  'env FIXTURE=value command gh repo view' \
+  'time -p gh repo view' \
+  'echo ready; gh repo view' \
+  'gh repo view && gh api repos/o/r --method GET' \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'env FIXTURE=value command scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'echo ready; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done'; do
+  HOOK="$original_hook"
+  assert_rc_contains "matching command-position scans permit: $guarded_command" 0 "" "$guarded_command"
+  HOOK="$missing_index_hook"
+  assert_rc_contains "missing classification refuses: $guarded_command" 2 "missing comment-write classification" "$guarded_command"
+done
+for inspected_hook in "$original_hook" "$missing_index_hook"; do
+  HOOK="$inspected_hook"
+  assert_rc_contains 'non-command gh arguments need no classification' 0 "" 'echo gh repo view'
+  assert_rc_contains 'missing-index control cannot authorize reserved trigger prose' 2 'Reword the comment' \
+    'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "Do not quote @codex review here."'
+done
+HOOK="$original_hook"
+
 assert_rc_contains "canonical requester invocation remains allowed" 0 "" \
   'scripts/codex-review-request.sh 123 o/r'
 assert_rc_contains "comment-free issue close retains existing hook scope" 0 "" \
@@ -639,6 +713,54 @@ fi
 # --repo, a GH_HOST elsewhere, or a URL selector on another host keeps gh's
 # own (absent) credentials, so the read fails closed without sending the PAT
 # (Phase 4b on #2178).
+for selector in 123 https://github.com/example/repo/pull/123; do
+  : >"$API_LOG"
+  inferred_host=""
+  [ "$selector" != 123 ] || inferred_host=tenant.ghe.com
+  set +e
+  out=$(unset GH_TOKEN GITHUB_TOKEN GH_REPO GH_HOST; \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat \
+    STUB_REQUIRE_TOKEN=1 STUB_INFERRED_HOST="$inferred_host" STUB_API_LOG="$API_LOG" \
+    run_hook "scripts/gh-as-reviewer.sh -- gh pr review $selector --approve --body lgtm" \
+      "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] \
+      && { [ -z "$inferred_host" ] || grep -q 'repository inferred host: tenant.ghe.com' "$API_LOG"; } \
+      && ! grep -q 'authenticated with the expected token' "$API_LOG"; then
+    pass "self-approve read without explicit canonical repository withholds reviewer PAT ($selector)"
+  else
+    fail "self-approve inferred repository PAT boundary ($selector): rc=$rc out=$out"
+  fi
+done
+: >"$API_LOG"
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN GH_HOST; \
+  GH_REPO=example/repo OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "inherited canonical GH_REPO permits reviewer PAT fallback"
+else
+  fail "inherited canonical GH_REPO PAT boundary: rc=$rc out=$out"
+fi
+: >"$API_LOG"
+set +e
+out=$(unset GITHUB_TOKEN GH_REPO GH_HOST; \
+  GH_TOKEN=fixture-ambient-pat OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-ambient-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "an ambient CLI credential remains available without reviewer PAT fallback"
+else
+  fail "ambient CLI credential changed: rc=$rc out=$out"
+fi
 for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123" \
     "--repo git@tenant.ghe.com:o/r" "--repo=git@tenant.ghe.com:o/r" "--repo=https://tenant.ghe.com/o/r" "GH_REPO=git@tenant.ghe.com:o/r"; do
   : >"$API_LOG"
