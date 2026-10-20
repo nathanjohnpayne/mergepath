@@ -9,18 +9,57 @@
 #   MERGEPATH_PREPUSH_SKIP=1 git push
 #
 # A checkout without the runner (an older branch, or a consumer repository
-# that never received this hub-only tooling) passes without checking.
+# that never received this hub-only tooling) passes without checking, and
+# says so.
+#
+# Every path prints at least one line, starting with the unconditional
+# "hook invoked" line below, so a push log without it means git never ran
+# this hook (#2578). A checkout the hook cannot resolve fails the push
+# instead of passing it: a silent exit 0 is indistinguishable from a clean
+# run.
+
+PREFIX='repo-lint pre-push'
+echo "$PREFIX: hook invoked for remote ${1:-(none)}"
+
+fail_closed() {
+  echo "$PREFIX: FAIL ($1); the push is blocked." >&2
+  shift
+  for line in "$@"; do echo "$PREFIX: $line" >&2; done
+  echo "$PREFIX: bypass only in an emergency: git push --no-verify, or MERGEPATH_PREPUSH_SKIP=1 git push (CI lint still gates the merge)." >&2
+  exit 1
+}
 
 if [ "${MERGEPATH_PREPUSH_SKIP:-0}" = "1" ]; then
-  echo "repo-lint pre-push: skipped (MERGEPATH_PREPUSH_SKIP=1); CI lint remains authoritative"
+  echo "$PREFIX: skipped (MERGEPATH_PREPUSH_SKIP=1); CI lint remains authoritative"
   exit 0
 fi
 
-root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+# A linked worktree reads core.bare from the shared config when
+# extensions.worktreeConfig is on, so one stray `core.bare = true` there
+# (the footprint of a fixture `git init` run under an inherited GIT_DIR)
+# turns every worktree of the clone bare at once (#2578).
+if [ "$(git rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+  origin=$(git config --show-origin --get core.bare 2>/dev/null | cut -f1)
+  origin=${origin#file:}
+  fail_closed "git reports this checkout as a bare repository, so its work tree cannot be checked" \
+    "core.bare = true is set in ${origin:-the repository config}. A pushing checkout is never bare: restore it with" \
+    "  git config --file \"${origin:-<that file>}\" core.bare false" \
+    "(check that file for other unexpected changes too), then push again."
+fi
+root=$(git rev-parse --show-toplevel 2>/dev/null) \
+  || fail_closed "cannot resolve this checkout's top level (git rev-parse --show-toplevel failed)" \
+       "run git rev-parse --show-toplevel here to see git's error, fix the repository state, then push again."
+
 runner="$root/scripts/repo-lint-prepush.sh"
-if [ ! -f "$runner" ]; then
-  echo "repo-lint pre-push: SKIP (scripts/repo-lint-prepush.sh is not in this checkout)"
+if [ ! -e "$runner" ]; then
+  echo "$PREFIX: SKIP (scripts/repo-lint-prepush.sh is not in this checkout)"
   exit 0
 fi
+[ -f "$runner" ] && [ -r "$runner" ] \
+  || fail_closed "$runner exists but is not a readable file"
 
+# With execfail set, a failed exec returns here instead of ending the hook
+# with whatever status the shell picks.
+shopt -s execfail
 exec bash "$runner" --hook "$@"
+fail_closed "could not exec bash $runner"
