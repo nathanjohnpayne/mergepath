@@ -194,6 +194,9 @@ else
   [ -r "$SCRIPT_DIR/lib/feedback-policy-helpers.sh" ] || infra "missing feedback policy reader"
   # shellcheck source=../lib/feedback-policy-helpers.sh
   . "$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
+  [ -r "$SCRIPT_DIR/lib/head-check-runs.sh" ] || infra "missing shared check-run reducer"
+  # shellcheck source=../lib/head-check-runs.sh
+  . "$SCRIPT_DIR/lib/head-check-runs.sh"
   [ -f "$SCRIPT_DIR/workflow/resolve_base_policy.sh" ] || infra "missing governing policy resolver"
   # CI state is judged on the repository's own required head checks (the
   # build/test checks scripts/required-head-checks.sh resolves from the
@@ -227,16 +230,15 @@ else
   # The check-runs endpoint wraps its list in an object, so gh_api_array's
   # array-stream contract does not fit; same failure discipline (a failed
   # read is a status, never an empty list), applied here.
-  fetch_check_runs() {  # <sha> <label>
+  fetch_check_rows() {  # <endpoint> <row selector> <label>
     local raw err rc=0
     err=$(mktemp "${TMPDIR:-/tmp}/stalled-prs-cr.XXXXXX") || infra "mktemp failed"
-    raw=$(gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-            --jq '.check_runs[] | {name, status, conclusion, started_at, completed_at}' 2>"$err") || rc=$?
+    raw=$(gh api --paginate "$1" --jq "$2" 2>"$err") || rc=$?
     if [ "$rc" -ne 0 ]; then
-      infra "failed to fetch $2: $(tr '\n' ' ' < "$err")"
+      infra "failed to fetch $3: $(tr '\n' ' ' < "$err")"
     fi
     rm -f "$err"
-    printf '%s\n' "$raw" | jq -s '.' 2>/dev/null || infra "failed to parse $2"
+    printf '%s\n' "$raw" | jq -s '.' 2>/dev/null || infra "failed to parse $3"
   }
 
   # Large PR histories overflow the exec argument limit when passed as
@@ -285,7 +287,12 @@ else
     fetch_api_array "repos/$REPO/pulls/$number/reviews?per_page=100" "PR #$number reviews" > "$WORK/reviews.json"
     fetch_api_array "repos/$REPO/issues/$number/comments?per_page=100" "PR #$number issue comments" > "$WORK/issue_comments.json"
     fetch_api_array "repos/$REPO/pulls/$number/comments?per_page=100" "PR #$number inline comments" > "$WORK/review_comments.json"
-    fetch_check_runs "$head_sha" "PR #$number head check runs" > "$WORK/check_runs.json"
+    fetch_check_rows "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
+      '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, completed_at}' \
+      "PR #$number head check runs" > "$WORK/check_runs.json"
+    fetch_check_rows "repos/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
+      '.workflow_runs[] | {suite: .check_suite_id, wf: .workflow_id}' \
+      "PR #$number workflow runs" > "$WORK/workflow_runs.json"
     # Push time, server-generated only (see the header). The activity API
     # covers same-repository heads; a fork's push lives in the fork.
     head_pushed_at=""
@@ -310,26 +317,26 @@ else
       head_pushed_at_source="pr-updated-at"
       [ -n "$head_pushed_at" ] || infra "PR #$number has no push activity, no check run and no updated_at"
     fi
-    merge_gate_check=$(jq -r --arg name "$MERGE_GATE_CHECK_NAME" '
-      [.[] | select(.name == $name)] | sort_by(.started_at // "") | last
-      | if . == null then "absent"
-        elif .status != "completed" then "pending"
-        else (.conclusion // "pending") end' "$WORK/check_runs.json")
-    # Required head checks only, newest run per name. A head with no check
+    gate_summary=$(head_check_runs_reduce "$MERGE_GATE_CHECK_NAME" "$WORK/check_runs.json" "$WORK/workflow_runs.json") \
+      || infra "could not reduce the merge gate for PR #$number"
+    merge_gate_check=$(jq -r '.conclusion' <<<"$gate_summary")
+    # Required head checks only, newest completed run per workflow with all
+    # in-flight runs retaining pending precedence. A head with no check
     # runs at all is NONE (a repository without CI); a required check that
     # has not reported yet on a head that has other runs is PENDING.
-    ci_state=$(jq -r --argjson req "$REQUIRED_CHECKS_JSON" '
-      if length == 0 then "NONE"
-      else
-        [ $req[] as $n
-          | ([.[] | select(.name == $n)] | sort_by(.started_at // "") | last) as $run
-          | if $run == null or $run.status != "completed" then "PENDING"
-            elif ($run.conclusion // "") | IN("success", "neutral", "skipped") then "SUCCESS"
-            else "FAILURE" end ]
-        | if index("FAILURE") != null then "FAILURE"
-          elif index("PENDING") != null then "PENDING"
-          else "SUCCESS" end
-      end' "$WORK/check_runs.json") || infra "could not derive the CI state for PR #$number"
+    if jq -e 'length == 0' "$WORK/check_runs.json" >/dev/null; then
+      ci_state=NONE
+    else
+      : > "$WORK/required-summaries.jsonl"
+      while IFS= read -r check_name; do
+        head_check_runs_reduce "$check_name" "$WORK/check_runs.json" "$WORK/workflow_runs.json" >> "$WORK/required-summaries.jsonl" \
+          || infra "could not reduce required check '$check_name' for PR #$number"
+      done < <(jq -r '.[]' <<<"$REQUIRED_CHECKS_JSON")
+      ci_state=$(jq -sr '
+        if any(.state == "failed") then "FAILURE"
+        elif any(.state != "green") then "PENDING" else "SUCCESS" end' "$WORK/required-summaries.jsonl") \
+        || infra "could not derive the CI state for PR #$number"
+    fi
     jq -cn \
       --slurpfile pr "$WORK/pr.json" \
       --slurpfile reviews "$WORK/reviews.json" \

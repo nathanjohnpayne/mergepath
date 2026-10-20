@@ -438,6 +438,10 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  - path: scripts/lib/head-check-runs.sh
+    # Pure workflow-grouped reduction shared by verification and routing.
+    type: canonical
+    consumers: all
   # Dependabot commit provenance: every commit on a Dependabot-opened PR must
   # be Dependabot-authored, GitHub-committed and signature-verified before
   # the Dependabot lane applies. HARD-sourced by merge-clearance-gate.sh and
@@ -898,6 +902,8 @@ paths:
     # and the propagation lane keeps byte-verifying them verbatim.
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/head-check-runs.sh"
   - path: scripts/merge-clearance-gate.sh
     # HEAD-pinned merge-clearance gate (#427/#428). The external-review
     # path delegates to scripts/codex-review-check.sh (with CI checking
@@ -2343,6 +2349,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/head-check-runs.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/resolve_base_policy.sh"
       - "scripts/required-head-checks.sh"        # which checks count as CI (not the review-policy gates)
