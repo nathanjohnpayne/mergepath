@@ -1818,10 +1818,11 @@ p4b_codex_human_stops() {
   case "$ceiling" in ''|*[!0-9]*) jq -nc '{state:"unsafe",reason:"request-ceiling-invalid"}'; return 2 ;; esac
   stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling") \
     || { jq -nc '{state:"unsafe",reason:"ledger-malformed"}'; return 2; }
-  # An owner tiebreak settles a dispute stop for this head (#2511). It is read
-  # only when a dispute stop holds, and a failed read leaves the stop standing:
-  # missing evidence never reads as a decision.
-  if printf '%s' "$stops" | jq -e '(.untested_rebuttals | length) + (.disagreements | length) > 0' >/dev/null 2>&1; then
+  # An owner tiebreak settles a dispute stop (#2511) or a runaway (#2534) for
+  # this head. It is read only when one of those holds, and a failed read
+  # leaves the stop standing: missing evidence never reads as a decision.
+  if printf '%s' "$stops" | jq -e '(.untested_rebuttals | length) + (.disagreements | length) > 0
+       or (.stops | index("runaway")) != null' >/dev/null 2>&1; then
     local tb_comments tb_marks tb_applied
     if tb_comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "owner tiebreak markers" 2>/dev/null) \
        && tb_marks=$(crl_owner_tiebreaks "$tb_comments" "$author" "https://github.com/$repo/pull/$pr" "$head") \

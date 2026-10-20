@@ -2504,9 +2504,9 @@ EOF
       bash "$harness" "$snip" "$trust" "$enabled" "$pause" "$terminal" "$prior" "$state" "$desc" >"$out" 2>"$WORKDIR/timeout-$name.err" || actual=$?
     [ "$actual" = "$rc" ] || fail "940 $name: expected rc $rc, got $actual"
     local n
-    # The failover passes --allow-moving-head (#2166): it must always be able
+    # The failover passes --failover (#2534) and --allow-moving-head (#2166): it must always be able
     # to hand a rate-limited head to Codex, whatever the head's age.
-    n=$(grep -c '^true|--trigger-only --allow-moving-head 999 owner/repo$' "$WORKDIR/timeout-$name.events" || true)
+    n=$(grep -c '^true|--trigger-only --failover --allow-moving-head 999 owner/repo$' "$WORKDIR/timeout-$name.events" || true)
     [ "$n" = "$calls" ] || fail "940 $name: expected $calls gated Codex trigger(s), got $n"
     if [ "$pause" = true ] || [ "$trust" = false ]; then
       ! grep -q '^status-read$' "$WORKDIR/timeout-$name.events" || fail "940 $name: status read ran despite pause or opt-out"

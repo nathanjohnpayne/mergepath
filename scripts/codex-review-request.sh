@@ -7,11 +7,16 @@
 # caller (e.g. an authoring agent) can reason over it.
 #
 # Usage:
-#   scripts/codex-review-request.sh [--trigger-only] [--allow-moving-head] <PR_NUMBER> [REPO]
+#   scripts/codex-review-request.sh [--trigger-only] [--failover] [--allow-moving-head] <PR_NUMBER> [REPO]
 #
 # Flags:
 #   --trigger-only       Post (or confirm) the `@codex review` trigger and
 #                        exit 0 without polling for clearance (#489).
+#   --failover           --trigger-only for the CodeRabbit rate-limit
+#                        failover in scripts/coderabbit-wait.sh only. A
+#                        trigger this run posts is recorded with a failover
+#                        marker comment, and the request ceiling does not
+#                        count it (#2534).
 #   --allow-moving-head  Downgrade the moving-head refusal (exit 8, below) to
 #                        a warning and post anyway. For the exceptional
 #                        callers that must request on a head the agent has
@@ -354,13 +359,16 @@ __CRR_ORIGINAL_ARGS=("$@")
 # helper blocking on Codex's full review. Extract the flag, leave positionals.
 # #2166: --allow-moving-head downgrades the moving-head refusal (exit 8) to a
 # warning. See refuse_moving_head_unless_allowed below.
+# #2534: --failover is --trigger-only plus a failover marker on a posted trigger.
 TRIGGER_ONLY=false
+FAILOVER=false
 AUTHORIZE_TRIGGER_WRITE=false
 ALLOW_MOVING_HEAD=false
 __POSITIONAL=()
 for __arg in "$@"; do
   case "$__arg" in
     --trigger-only) TRIGGER_ONLY=true ;;
+    --failover) FAILOVER=true; TRIGGER_ONLY=true ;;
     --authorize-trigger-write) AUTHORIZE_TRIGGER_WRITE=true; TRIGGER_ONLY=true ;;
     --allow-moving-head) ALLOW_MOVING_HEAD=true ;;
     *) __POSITIONAL+=("$__arg") ;;
@@ -369,8 +377,9 @@ done
 set -- ${__POSITIONAL[@]+"${__POSITIONAL[@]}"}
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 [--trigger-only] [--allow-moving-head] <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--trigger-only] [--failover] [--allow-moving-head] <PR_NUMBER> [REPO]" >&2
   echo "  --trigger-only       post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
+  echo "  --failover           --trigger-only for the CodeRabbit rate-limit failover; marks the trigger it posts" >&2
   echo "  --allow-moving-head  post even when the head is younger than codex.request_min_head_age_seconds" >&2
   echo "                       or CI has not picked it up yet (warns instead of exit 8)" >&2
   echo "  PR_NUMBER       pull request number (integer)" >&2
@@ -2876,6 +2885,40 @@ record_phase4a_timeout_determination() {
   log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
 }
 
+# #2534: record the trigger the CodeRabbit rate-limit failover just posted, so
+# the request ceiling does not count it (crqe_failover_trigger_ids). Runs only
+# for a trigger this run posted with a confirmed id. The marker is best effort:
+# a failed write or readback leaves the trigger counted, which costs a slot
+# and never the ceiling, so it is reported, not fatal. Prints the outcome.
+record_failover_marker() {
+  local body comments
+  if [ "$TRIGGER_POSTED" != true ] || [[ ! "$TERMINAL_TRIGGER_COMMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'not-posted'
+    return 0
+  fi
+  if ! command -v crqe_failover_marker_body crqe_failover_trigger_ids >/dev/null 2>&1 \
+     || ! body=$(crqe_failover_marker_body "$HEAD_SHA" "$TERMINAL_TRIGGER_COMMENT_ID"); then
+    log "failover marker: helper unavailable or invalid input; the trigger counts toward the request ceiling"
+    printf 'failed'
+    return 0
+  fi
+  if ! ( MERGEPATH_CODEX_FAILOVER_MARKER_WRITE=1 post_author_pr_comment "$body" "Codex failover marker" ) >/dev/null; then
+    log "failover marker: write failed; trigger $TERMINAL_TRIGGER_COMMENT_ID counts toward the request ceiling"
+    printf 'failed'
+    return 0
+  fi
+  # Readback through the same parser the ceiling uses.
+  if comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex failover marker readback" 2>/dev/null) \
+     && crqe_failover_trigger_ids "$comments" "$AUTHOR_IDENTITY" 2>/dev/null \
+        | jq -e --argjson id "$TERMINAL_TRIGGER_COMMENT_ID" 'index($id) != null' >/dev/null 2>&1; then
+    log "failover marker: trigger $TERMINAL_TRIGGER_COMMENT_ID is exempt from the request ceiling"
+    printf 'recorded'
+  else
+    log "failover marker: posted, but readback did not validate it; trigger $TERMINAL_TRIGGER_COMMENT_ID counts toward the request ceiling"
+    printf 'failed'
+  fi
+}
+
 # Run a read, retrying transient failures (#1550), and store its output in
 # <out-var> in the caller's shell, so call it directly, never inside $( ).
 # Status 4 from the read means a transient failure; anything else non-zero is
@@ -3089,6 +3132,8 @@ fi
 # 4a flow and the merge-clearance gate. trigger_posted is false when the
 # idempotency check skipped a duplicate, or when Codex had already cleared.
 if [ "$TRIGGER_ONLY" = "true" ]; then
+  failover_marker=null
+  [ "$FAILOVER" != true ] || failover_marker=$(record_failover_marker | jq -Rc .)
   # Preserve a block already known before this trigger. Posting or deduping
   # a request does not make an unavailable provider usable (#2139).
   trigger_only_blocked_reason=""
@@ -3107,6 +3152,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
     --arg head_committer_date "$HEAD_COMMITTER_DATE" \
     --arg bot_login "$BOT_LOGIN" \
     --argjson trigger_posted "$TRIGGER_POSTED" \
+    --argjson failover_marker "$failover_marker" \
     --arg blocked_reason "$trigger_only_blocked_reason" '
     {
       pr_number: $pr_number,
@@ -3123,6 +3169,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       trigger_posted: $trigger_posted,
       trigger_requested: true,
       trigger_only: true,
+      failover_marker: $failover_marker,
       rounds_waited_seconds: 0
     }'
   exit 0

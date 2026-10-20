@@ -10,10 +10,17 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 PHRASE = re.compile(r"@codex\s+review", re.IGNORECASE)
 COMMAND = re.compile(r"\s*@codex\s+review\s*", re.IGNORECASE)
-# A well-formed owner tiebreak marker (#2511). Only the owner may type one, so
-# no agent-authored body may carry it, in prose or in a code fence. Placeholders
-# such as <PR-URL>@<full-head-sha>#<finding-id> do not match.
-TIEBREAK = re.compile(r"TIEBREAK_REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+", re.IGNORECASE)
+# A well-formed owner tiebreak marker, for a dispute (#2511) or a runaway
+# (#2534). Only the owner may type one, so no agent-authored body may carry it,
+# in prose or in a code fence. Placeholders such as
+# <PR-URL>@<full-head-sha>#<finding-id> do not match.
+TIEBREAK = re.compile(r"TIEBREAK_(?:REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+|RUNAWAY_ACCEPTED=\S+@[0-9a-f]{40})", re.IGNORECASE)
+# A well-formed Codex failover marker (#2534) exempts its trigger from the
+# request ceiling, so only codex-review-request.sh --failover may write it: the
+# exact marker as the whole body of an author PR comment, with the write
+# context set. Placeholder forms do not match.
+FAILOVER = re.compile(r"mergepath-codex-failover:v\d+\s+head=[0-9a-f]{40}", re.IGNORECASE)
+FAILOVER_MARKER = re.compile(r"<!-- mergepath-codex-failover:v1 head=(?:[0-9a-f]{40}|[0-9a-f]{64}) trigger_comment_id=[1-9][0-9]* -->")
 GRAPHQL_COMMENTS = frozenset({
     "addComment", "addDiscussionComment", "addPullRequestReview",
     "addPullRequestReviewComment", "addPullRequestReviewThread",
@@ -333,6 +340,11 @@ def inspect(argv, role, state=None):
         raise Refused("Reserved owner tiebreak text is not allowed in an agent-authored comment; the owner posts it.")
     hits = [body for body in bodies if PHRASE.search(body)]
     metadata = {"guarded": True, "trigger": False, "deferred": deferred, "cli_stdin": cli_stdin}
+    if any(FAILOVER.search(body) for body in bodies):
+        if (hits or len(bodies) != 1 or not FAILOVER_MARKER.fullmatch(bodies[0]) or role != "author"
+                or channel != "pr-comment" or os.environ.get("MERGEPATH_CODEX_FAILOVER_MARKER_WRITE") != "1"):
+            raise Refused("Reserved Codex failover marker text is written only by scripts/codex-review-request.sh --failover.")
+        return args, metadata
     if not hits:
         return args, metadata
     if len(bodies) != 1 or not COMMAND.fullmatch(hits[0]):
