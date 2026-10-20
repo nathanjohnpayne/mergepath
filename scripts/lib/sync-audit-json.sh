@@ -183,7 +183,7 @@ audit_json_add_path() {
 }
 
 audit_json_compare_entry() {
-  local path=$1 class=$2 source=$3 dest=$4 name=$5 root=$6 overrides=$7 reason='' target=$1 file leaf listing
+  local path=$1 class=$2 source=$3 dest=$4 name=$5 root=$6 overrides=$7 reason='' target=$1 leaf listing
   [ "$class" != templated ] || target=$dest
   if override_should_skip_path "$overrides" "$target"; then reason=$OVERRIDE_SKIP_REASON; fi
   case "$class" in
@@ -198,7 +198,8 @@ audit_json_compare_entry() {
         err "could not allocate kit listing for $path"
         return 2
       }
-      if ! find "$MERGEPATH_ROOT/${path%/}" -type f -print0 > "$listing"; then
+      # Tracked files only (#2542): ignored and untracked hub files never ship.
+      if ! hub_kit_files "$path" > "$listing"; then
         rm -f "$listing"
         err "could not enumerate hub kit $path"
         return 2
@@ -206,8 +207,7 @@ audit_json_compare_entry() {
       if [ ! -s "$listing" ] && [ ! -d "$root/${path%/}" ]; then
         audit_json_add_path "$path" "$class" "$root" "$reason" missing
       fi
-      while IFS= read -r -d '' file; do
-        leaf="${path%/}/${file#"$MERGEPATH_ROOT/${path%/}/"}"
+      while IFS= read -r -d '' leaf; do
         compare_canonical "$leaf" "$root"
         audit_json_add_path "$leaf" "$class" "$root" "$reason" "$REPLY"
       done < "$listing"
