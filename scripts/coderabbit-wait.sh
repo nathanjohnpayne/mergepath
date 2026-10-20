@@ -1853,6 +1853,11 @@ summary_names_only_other_head() {  # <body> <head_sha>
 # drop everything to EOF — including a real marker. Single definition, used
 # by both probe verdict sites AND the polling summary-marker gate so the
 # heuristic cannot drift between them.
+crw_first_fixed_line() {
+  local body=$1 needle=$2
+  awk -v needle="$needle" 'index($0,needle){print NR; exit}' <<<"$body"
+}
+
 summary_blocking_marker_present() {
   local body=$1 unfenced scan s_line e_line
   # Preserve the structural reader's raw-body fallback (#1178). A failed tier
@@ -1881,8 +1886,8 @@ summary_blocking_marker_present() {
   # from the quote to the real end and delete the finding in between — the same
   # latching failure the gate's summary_strip_pre_merge_block already avoids by
   # selecting from structural lines only.
-  s_line=$(printf '%s\n' "$unfenced" | grep -nF "$CR_PRE_MERGE_BLOCK_START" | head -1 | cut -d: -f1)
-  e_line=$(printf '%s\n' "$unfenced" | grep -nF "$CR_PRE_MERGE_BLOCK_END" | head -1 | cut -d: -f1)
+  s_line=$(crw_first_fixed_line "$unfenced" "$CR_PRE_MERGE_BLOCK_START")
+  e_line=$(crw_first_fixed_line "$unfenced" "$CR_PRE_MERGE_BLOCK_END")
   if [ -n "$s_line" ] && [ -n "$e_line" ] && [ "$s_line" -lt "$e_line" ]; then
     scan=$(printf '%s' "$unfenced" | awk \
       -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
@@ -1953,11 +1958,11 @@ summary_blocking_marker_present() {
 # commits row is never inside a fence"; that is asserted rather than measured.
 # Fail-closed is the right direction to be wrong in, so this ships as-is.
 #
-# Second conjunct dependency: `summary_blocking_marker_present` still locates
-# its delimiters with a `grep -nF | head -1` pipeline under `set -euo pipefail`,
-# which is the #1038 SIGPIPE-141 shape (#520/#947/#1147). Left to that issue
-# rather than widened into here — but the reason this call site is SAFE is not
-# the one it looks like, and getting it wrong is how a later fix inverts it.
+# Second conjunct dependency: `summary_blocking_marker_present` locates each
+# delimiter with the single-process fixed-string helper (#1038), avoiding the
+# early-exit pipeline's SIGPIPE-141 shape (#520/#947/#1147). The reason this
+# call site remains SAFE is still not the one it may first look like, and
+# getting it wrong is how a later edit inverts it.
 #
 # It is NOT "the abort escalates". Calling it as `... || return 1` puts it on
 # the left of a `||`, which suspends errexit for the whole dynamic extent of the
@@ -1970,8 +1975,8 @@ summary_blocking_marker_present() {
 # delimiters therefore WIDENS the scan rather than blinding it — the marker is
 # still found and this guard still escalates.
 #
-# So a #1038 fix must preserve that default, not merely remove the pipe. Three
-# plausible cleanups flip this call site from fail-closed to fail-open:
+# The #1038 fix preserves that default while removing the pipe. Three plausible
+# cleanups would still flip this call site from fail-closed to fail-open:
 # initialising `scan=""`, restructuring so the narrowed block is the default, or
 # adding `|| return 1` to the `s_line=` assignment "for hygiene" — that last one
 # turns a widened scan into "no marker found", i.e. suppress, i.e. a false clear

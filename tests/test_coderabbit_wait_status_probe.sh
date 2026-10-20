@@ -7,6 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WAITER_SOURCE="${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/coderabbit-wait-status-probe.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -30,7 +31,7 @@ make_case() {
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
-  cp "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" "$dir/scripts/coderabbit-wait.sh"
+  cp "$WAITER_SOURCE" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #1008: both fetch wrappers
@@ -3496,11 +3497,11 @@ test_851_summary_helpers_unit() {
   # tests/test_audit_branch_protection.sh.
   local snip="$WORKDIR/summary-helpers.sh" h40 h64 bad=""
   local clean_body chat_body failure_body inside_body outside_body trunc_body
-  local big_pad big_other_head big_this_head
+  local big_pad big_other_head big_this_head repeated_body start_line end_line outside_rc helper_source i old_pipeline_rc old_pipeline_line
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END)=' \
-    "$ROOT/scripts/coderabbit-wait.sh")"
+    "$WAITER_SOURCE")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
-    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+    "$WAITER_SOURCE" >"$snip"
   # The block's one external dependency (#837): the shared classifier the
   # blocking-marker predicate grades each line with. Sourced from the same
   # canonical lib the script hard-requires, so the unit assertions below run
@@ -3605,8 +3606,30 @@ $big_pad"
   # END rendered before START is not a block; stripping to EOF from the
   # latched START would swallow the real marker after it.
   summary_blocking_marker_present "$inverted_body" || bad="$bad inverted-delims"
+  # #1038: retain the first delimiter line when the start marker has thousands
+  # of later matches, and keep hygiene removal plus outside-marker detection.
+  # The source-shape assertion makes restoring the old early-exit pipeline a
+  # deterministic test failure on every platform.
+  repeated_body="$CR_PRE_MERGE_BLOCK_START"
+  for ((i=0; i<2000; i++)); do repeated_body+=$'\n'"$CR_PRE_MERGE_BLOCK_START"; done
+  repeated_body+=$'\n'"$CR_PRE_MERGE_BLOCK_END"$'\n_🟠 Major_ outside the hygiene block'
+  start_line=$(crw_first_fixed_line "$repeated_body" "$CR_PRE_MERGE_BLOCK_START")
+  end_line=$(crw_first_fixed_line "$repeated_body" "$CR_PRE_MERGE_BLOCK_END")
+  [ "$start_line" = 1 ] || bad="$bad repeated-start-first-line"
+  [ "$end_line" = 2002 ] || bad="$bad repeated-end-line"
+  outside_rc=0; summary_blocking_marker_present "$repeated_body" || outside_rc=$?
+  [ "$outside_rc" = 0 ] || bad="$bad repeated-delimiter-marker-status"
+  helper_source=$(awk '/^summary_blocking_marker_present\(\) \{/{f=1} f{print} f && /^}/{exit}' "$WAITER_SOURCE")
+  [ "$(grep -c 'crw_first_fixed_line' <<<"$helper_source")" = 2 ] || bad="$bad locator-not-used-twice"
+  ! grep -Eq 'grep -nF .*\| *head -1' <<<"$helper_source" || bad="$bad early-exit-pipeline-restored"
+  # Deterministically model grep writing its first located line and then
+  # receiving SIGPIPE (141) when head exits. This pins pipefail's old status
+  # propagation without relying on grep/head scheduling timing.
+  old_pipeline_rc=0
+  old_pipeline_line=$(printf '%s\n' "$repeated_body" | bash -c 'printf "1:START\n"; exit 141' | head -1 | cut -d: -f1) || old_pipeline_rc=$?
+  [ "$old_pipeline_line" = 1 ] && [ "$old_pipeline_rc" = 141 ] || bad="$bad old-pipeline-status-control"
   if [ -z "$bad" ]; then
-    pass "#851/#968 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip, other-head demotion"
+    pass "#851/#968/#1038 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip, safe first-delimiter lookup, other-head demotion"
   else
     fail "#851/#968 helpers:$bad"
   fi
@@ -4531,6 +4554,13 @@ PY1673
     fail "#1673 disposition counts:$bad"
   fi
 }
+
+if [ "${CODERABBIT_TEST_ONLY_1038:-0}" = 1 ]; then
+  test_851_summary_helpers_unit
+  echo "Results: $PASS passed, $FAIL failed"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
 
 test_1673_discretionary_counts
 if test_878_nested_tier_errors; then
