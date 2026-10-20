@@ -1023,6 +1023,63 @@ for driver_state in missing nonexec; do
   fi
 done
 
+# The lease title names which question failed (#2536). The check keeps the
+# historical "Codex P1" name, but a feedback-accounting red can be another
+# provider's undispositioned finding, so its title must not send the author
+# looking for a Codex P1 thread. Drive the shipped driver directly.
+for verdict in accounting legacy clear; do
+  dir="$TMP/title-$verdict"
+  mkdir -p "$dir/scripts/workflow" "$dir/bin"
+  cp "${CODEX_P1_SNAPSHOT_DRIVER:-$ROOT/scripts/workflow/codex-p1-snapshot-retry.py}" \
+    "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo fp-stable' \
+    > "$dir/scripts/review-feedback-surface-fingerprint.sh"
+  cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
+#!/usr/bin/env bash
+case "$TITLE_VERDICT" in
+  accounting)
+    echo 'posted=2 accounted=1'
+    echo '[codex-p1-gate] ERROR: review feedback is unaccounted; disposition every finding before merge' >&2
+    exit 1 ;;
+  legacy) echo 'Codex blocking-tier unresolved: 1'; exit 1 ;;
+  *) echo 'Codex blocking-tier unresolved: 0' ;;
+esac
+SH
+  cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${2:-}" = -X ] && [ "${3:-}" = PATCH ]; then
+  previous=""
+  for arg in "$@"; do
+    if [ "$previous" = -f ] && [[ "$arg" == 'output[title]='* ]]; then
+      printf '%s\n' "${arg#*=}" > "$FIXTURE_LOG/title.log"
+    fi
+    previous="$arg"
+  done
+  exit 0
+fi
+echo head-41
+SH
+  chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py" \
+    "$dir/scripts/review-feedback-surface-fingerprint.sh" "$dir/scripts/codex-p1-gate.sh" "$dir/bin/gh"
+  rc=0
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" FIXTURE_LOG="$dir" TITLE_VERDICT="$verdict" \
+      scripts/workflow/codex-p1-snapshot-retry.py 41 owner/repo head-41 lease-41 fingerprint
+  ) >"$dir/out" 2>&1 || rc=$?
+  title=$(cat "$dir/title.log" 2>/dev/null || true)
+  case "$verdict" in
+    accounting) want_rc=1 want='Review feedback unaccounted: run scripts/review-feedback-accounting.sh <PR#>' ;;
+    legacy) want_rc=1 want='Codex blocking-tier review threads unresolved on the current head' ;;
+    clear) want_rc=0 want='Codex feedback gate (leased re-evaluation)' ;;
+  esac
+  if [ "$rc" -ne "$want_rc" ] || [ "$title" != "$want" ]; then
+    fail "driver titles a $verdict verdict by what failed" "rc=$rc title=$title"
+  else
+    pass "driver titles a $verdict verdict by what failed"
+  fi
+done
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

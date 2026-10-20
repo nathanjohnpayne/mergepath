@@ -35,6 +35,24 @@ def transport():
     return subprocess.call([os.environ['SNAPSHOT_REAL_GH'], *sys.argv[1:]])
 
 
+# codex-p1-gate.sh's die() text for a feedback-accounting failure. The check
+# keeps its historical name, so the title must say which question failed: an
+# undispositioned finding in the accounting inventory, whichever provider
+# raised it, or a legacy Codex thread (#2536). The inventory's scope (the
+# recognized providers and non-ignored tiers) is the accounting spec's, so the
+# title does not restate it.
+ACCOUNTING_FAILURE = 'review feedback is unaccounted'
+
+
+def verdict_title(gate_rc, gate_text):
+    if gate_rc == 0:
+        return 'Codex feedback gate (leased re-evaluation)'
+    if ACCOUNTING_FAILURE in gate_text:
+        return ('Review feedback unaccounted: '
+                'run scripts/review-feedback-accounting.sh <PR#>')
+    return 'Codex blocking-tier review threads unresolved on the current head'
+
+
 class Unreadable(Exception):
     pass
 
@@ -106,7 +124,9 @@ def main():
             for attempt in range(1, ATTEMPTS + 1):
                 pinned_head()
                 before = fingerprint()
+                mark = len(messages)
                 gate_rc, output = run(['scripts/codex-p1-gate.sh', pr, repo])
+                gate_text = '\n'.join(messages[mark:] + [output])
                 messages.append(f'Feedback snapshot attempt {attempt}/{ATTEMPTS}:\n{output}')
                 # Configuration/read errors do not become transient just because
                 # a bot also happened to edit a comment during this evaluation.
@@ -129,7 +149,7 @@ def main():
                     time.sleep(2)
                     continue
                 rc = gate_rc
-                title = 'Codex feedback gate (leased re-evaluation)'
+                title = verdict_title(gate_rc, gate_text)
                 break
         except Exhausted as error:
             rc = 3
