@@ -71,14 +71,21 @@ SCRIPT_NAMES = {
 def invocation_signature(text):
     """Recognize literal command positions and the one reviewed helper alias.
 
-    Path mentions in comments, diagnostics and file-existence checks are not
-    executions. New literal parser operands need classification even when the
-    caller uses another JS helper; arbitrary dynamic shell evaluation is out.
+    Standalone comments, quoted shell diagnostics and file tests are data.
+    Parser filenames in standalone echo/console.log quoted literals are data;
+    other parser operands remain conservative, including unsupported dynamic
+    indirection. This is not a general shell/JavaScript parser.
     """
     text = code_lines(text)
     found = []
     for line in text.splitlines():
-        found.extend(['parser'] * line.count('pr-body-contract.mjs'))
+        literal = r'''(?:'[^']*'|"(?:\\.|[^"\\])*")'''
+        shell_diagnostic = re.fullmatch(r'\s*echo\s+' + literal + r'\s*;?\s*(?:#.*)?', line)
+        js_diagnostic = re.fullmatch(r'\s*console\.log\(\s*' + literal + r'\s*\)\s*;?\s*(?://.*)?', line)
+        # A double-quoted shell operand can still execute a substitution.
+        diagnostic = js_diagnostic or (shell_diagnostic and '$(' not in line and '`' not in line)
+        if not diagnostic:
+            found.extend(['parser'] * line.count('pr-body-contract.mjs'))
         # Protect quoted diagnostic operands and trailing comments from the
         # control-prefix admission below. A literal $(...) boundary still
         # starts a command inside double quotes; this is no shell evaluator.
@@ -87,19 +94,25 @@ def invocation_signature(text):
             # A shell command, optionally inside command substitution, after
             # bash, or through the publisher's reviewed gate function.
             path = r'["\']?[^\s"\']*scripts/(?:workflow/)?' + re.escape(name) + r'["\']?'
-            direct = r'(?:^\s*|[|;]\s*|\$\(\s*|\b(?:bash|gate)\s+)' + path + r'(?=\s|$)'
+            direct = (r'(?P<direct_boundary>^\s*|[|;&]\s*|(?<!\\)\$\(\s*(?:(?:bash|gate)\s+)?|\b(?:bash|gate)\s+)'
+                      + r'(?P<direct_path>' + path + r')(?=\s|[;|&)]|$)')
             # The added branch requires a control prefix, preserving the
             # existing direct-call admission rather than widening every word.
             controlled = (r'(?P<boundary>^\s*|[|;&]\s*|\$\(\s*)'
                           r'(?P<control>(?:(?:if|elif|while|until|then|else|do|!)\s+)+)'
-                          + path + r'(?=\s|[;|&)]|$)')
+                          + r'(?P<controlled_path>' + path + r')(?=\s|[;|&)]|$)')
             command = re.compile(direct + '|' + controlled)
             for match in command.finditer(line):
-                if match['control']:
-                    enclosing = next((span for span in inert
-                                      if span.start() <= match.start() < span.end()), None)
-                    if enclosing and not (enclosing[0].startswith('"')
-                                          and match['boundary'].lstrip().startswith('$(')):
+                boundary = 'boundary' if match['control'] else 'direct_boundary'
+                path_group = 'controlled_path' if match['control'] else 'direct_path'
+                enclosing = next((span for span in inert
+                                  if span.start() <= match.start() < span.end()), None)
+                if enclosing:
+                    quoted_executable = match.start(path_group) == enclosing.start()
+                    substitution = (enclosing[0].startswith('"')
+                                    and match[boundary].lstrip().startswith('$(')
+                                    and (match.start() == 0 or line[match.start()-1] != '\\'))
+                    if not (quoted_executable or substitution):
                         continue
                 found.append(key)
     if re.search(r'CLEARANCE_HELPER=.*scripts/codex-review-check\.sh', text):
@@ -371,6 +384,58 @@ class WorkflowBounds(unittest.TestCase):
         for run in references:
             with self.subTest(run=run):
                 self.assertEqual(invocation_signature(run), ())
+
+    def test_boolean_and_and_quoted_command_positions(self):
+        forms = ('true && {call} --check', 'true && "{call}" --check',
+                 'false || {call} --check', "'{call}' --check",
+                 'bash "{call}" --check', 'result=$({call} --check)',
+                 'echo "$({call} --check)"', 'echo "$(bash {call} --check)"')
+        for name, key in SCRIPT_NAMES.items():
+            folder = 'workflow/' if key in ('group', 'continuation') else ''
+            call = 'scripts/' + folder + name
+            flags = {'validate': '--self-review-only', 'continuation': '--retract-unsafe-only',
+                     'group': '--phase post-audit'}.get(key, '--check')
+            for form in forms:
+                run = form.format(call=call).replace('--check', flags)
+                with self.subTest(run=run):
+                    self.assertEqual(invocation_signature(run), (key,))
+                    docs, _ = fixture(step_timeout=1)
+                    file = next(iter(docs))
+                    docs[file]['jobs']['parse']['steps'][0]['run'] = run
+                    with self.assertRaisesRegex(InventoryError, 'unenumerated parser route'):
+                        audit_documents(docs, (), 120)
+                    route = Route(file, 'parse', 'Parse body', 1, signature=(key,))
+                    with self.assertRaisesRegex(InventoryError, 'enclosing.*floor'):
+                        audit_documents(docs, (route,), 120)
+
+    def test_quoted_boolean_separators_remain_data(self):
+        forms = ('echo "true && {call} --check"',
+                 "printf '%s\\n' 'true && {call} --check'",
+                 'echo "bash {call} --check"',
+                 "echo '$({call} --check)'", 'echo "\\$({call} --check)"',
+                 'true # && {call} --check')
+        for name in SCRIPT_NAMES:
+            for form in forms:
+                run = form.format(call='scripts/' + name)
+                with self.subTest(run=run):
+                    self.assertEqual(invocation_signature(run), ())
+
+    def test_standalone_parser_filename_diagnostics_are_data(self):
+        path = 'scripts/lib/pr-body-contract.mjs'
+        diagnostics = (f'echo "{path}"', f"echo '{path}'", f'echo "{path}; literal && data"',
+                       f"console.log('{path}')", f'console.log("{path}");')
+        for run in diagnostics:
+            with self.subTest(run=run):
+                self.assertEqual(invocation_signature(run), ())
+                docs, _ = fixture()
+                docs[next(iter(docs))]['jobs']['parse']['steps'][0]['run'] = run
+                self.assertEqual(audit_documents(docs, (), 120), [])
+        for run in (f"execFileSync('node', ['{path}', '--json']);",
+                    f"console.log(execFileSync('node', ['{path}']));",
+                    f'echo "$(node {path} --json)"',
+                    f"const parser = '{path}'; runParser(parser);"):
+            with self.subTest(run=run):
+                self.assertEqual(invocation_signature(run), ('parser',))
 
     def test_added_sequential_call_requires_reaudit(self):
         docs, routes = fixture()
