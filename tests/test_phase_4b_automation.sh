@@ -3651,7 +3651,7 @@ grep -q "p4b-post-review o/r#134 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa f
 grep -q -- "--title \[Post-Review\]" "$ISSUE_LOG" || grep -q "\[Post-Review\]" "$ISSUE_LOG" \
   && pass "#674: issue title follows the documented Post-Review convention" || fail "#674: Post-Review title prefix missing"
 # #675: the posted APPROVED body's accounting block records the filed advisory
-# with disposition=deferred-to-follow-up + its issue link (not unresolved/null),
+# with disposition=deferred-to-followup + its issue link (not unresolved/null),
 # and totals.advisory_issues_filed derives from it — so the machine-readable
 # record matches the prose "filed as #901" reference instead of contradicting
 # it. Extract the embedded p4b-accounting:v1 record and assert the enrichment.
@@ -3659,9 +3659,9 @@ P4B675_REC="$(awk '/<!-- p4b-accounting:v1/{f=1;next} /^-->/{f=0} f' "$P4B672_BO
 if [ -n "$P4B675_REC" ] && printf '%s' "$P4B675_REC" | jq -e '
     (.totals.advisory_issues_filed == [901])
     and ([ .unique_findings[]
-           | select(.disposition == "deferred-to-follow-up" and .issue == 901) ]
+           | select(.disposition == "deferred-to-followup" and .issue == 901) ]
          | length) == 1' >/dev/null 2>&1; then
-  pass "#675: filed advisory enriches the posted accounting record (deferred-to-follow-up + #901)"
+  pass "#675: filed advisory enriches the posted accounting record (deferred-to-followup + #901)"
 else fail "#675: accounting record not enriched with the filed issue (rec=$P4B675_REC)"; fi
 
 # #674 CodeRabbit: a marker match from a prior partially-failed run is

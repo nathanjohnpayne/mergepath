@@ -381,6 +381,20 @@ p4b_acct_notional_for_loops() {
 # p4b_acct_marker — the embedded-block marker string.
 p4b_acct_marker() { printf 'p4b-accounting:v1'; }
 
+# Normalize only the persisted deferral alias (#1677), in a finding array or
+# an accounting record. Readers accept the old spelling permanently; callers
+# keep stored history intact and use canonical values for new output.
+p4b_acct_normalize_deferrals() {
+  jq -c '
+    def finding:
+      if type == "object" and .disposition == "deferred-to-follow-up"
+      then .disposition = "deferred-to-followup" else . end;
+    if type == "array" then map(finding)
+    elif type == "object" and (.unique_findings | type) == "array"
+    then .unique_findings |= map(finding)
+    else . end'
+}
+
 # p4b_acct_safe_truncate <block> <keep-bytes>
 # Print a byte-prefix of <block> of at most <keep-bytes> that never ends
 # INSIDE the embedded `<!-- p4b-accounting:v1 ... -->` record comment (#615
@@ -470,7 +484,8 @@ p4b_acct_extract_records() {
     # Emit only a conformant compact record; drop anything jq cannot parse or
     # that lacks the v1 schema tag.
     printf '%s' "$block" \
-      | jq -c 'select(type == "object" and .schema == "p4b-accounting/v1")' 2>/dev/null || true
+      | jq -c 'select(type == "object" and .schema == "p4b-accounting/v1")' 2>/dev/null \
+      | p4b_acct_normalize_deferrals 2>/dev/null || true
   done
 }
 
@@ -889,7 +904,7 @@ p4b_acct_finding_details_from_verdict() {
 #      WITHOUT replaying the F-id reduce (#675):
 #      [{severity, path, line, body, issue}, ...]. Each entry is joined on the
 #      SAME collision-proof [severity, path, line, body] | tojson key computed
-#      below and sets disposition "deferred-to-follow-up" + the issue link on
+#      below and sets disposition "deferred-to-followup" + the issue link on
 #      the matching finding.
 # On a per-finding conflict the explicit F-id map (channel 1) wins field by
 # field — its disposition/fix_commit override the filed channel's, and an
@@ -898,10 +913,10 @@ p4b_acct_finding_details_from_verdict() {
 # `{"disposition":"fixed","issue":null}` override keeps issue null instead of
 # reattaching the filed follow-up). Only an ABSENT F-id issue key falls back.
 p4b_acct_unique_findings() {
-  local disp="${1:-}" filed="${2:-}"
+  local disp="${1:-}" filed="${2:-}" out
   [ -n "$disp" ] || disp='{}'
   [ -n "$filed" ] || filed='[]'
-  jq -cs --argjson disp "$disp" --argjson filed "$filed" '
+  out="$(jq -cs --argjson disp "$disp" --argjson filed "$filed" '
     def title_of: (. // "") | split("\n")[0]
       | (if length > 80 then .[0:79] + "…" else . end)
       | (if . == "" then null else . end);
@@ -909,12 +924,12 @@ p4b_acct_unique_findings() {
     # same collision-proof [severity, path, line, body] | tojson tuple the
     # dedupe below computes, normalized with the finding-detail defaults
     # (severity→"unknown", path/line→null, body→"") so a caller need not
-    # reshape its list. Value: the deferred-to-follow-up disposition + issue;
+    # reshape its list. Value: the deferred-to-followup disposition + issue;
     # the explicit F-id map overrides it per field in the final build.
     (reduce ($filed[]?) as $fi ({};
        ( [ ($fi.severity // "unknown"), ($fi.path // null),
            ($fi.line // null), ($fi.body // "") ] | tojson ) as $fk
-       | .[$fk] = {disposition: "deferred-to-follow-up",
+       | .[$fk] = {disposition: "deferred-to-followup",
                    issue: ($fi.issue // null)} )) as $filedmap
     | reduce .[] as $d ( {order: [], map: {}} ;
       # Collision-proof de-dupe key (#615 Codex round 9, finding 3): JSON-encode
@@ -959,7 +974,8 @@ p4b_acct_unique_findings() {
             # `{"disposition":"fixed","issue":null}` override is not silently
             # re-linked to the filed follow-up.
             issue: (if ($o | has("issue")) then $o.issue
-                    else ($fo.issue // null) end) } ]' 2>/dev/null
+                    else ($fo.issue // null) end) } ]' 2>/dev/null)" || return 1
+  printf '%s' "$out" | p4b_acct_normalize_deferrals
 }
 
 # p4b_acct_filed_issues_from_refs <refs-csv> <file-json>
@@ -1020,6 +1036,7 @@ p4b_acct_build_record() {
   local pr="$1" head="$2" verdict="$3" reviewer="$4" direction="$5"
   local astate="$6" wall="$7" loops_json="$8" uf_json="$9"
   local totals_json="${10}" running_json="${11}" gen_at="${12}"
+  uf_json=$(printf '%s' "$uf_json" | p4b_acct_normalize_deferrals) || return 1
 
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
 
@@ -1111,6 +1128,7 @@ p4b_acct_rigor_row() {
 p4b_acct_render_block() {
   local rec="$1"
   [ -n "$rec" ] || return 1
+  rec=$(printf '%s' "$rec" | p4b_acct_normalize_deferrals) || return 1
   printf '%s' "$rec" | jq -e . >/dev/null 2>&1 || return 1
 
   local pr head verdict reviewer direction astate wall loops_json

@@ -82,6 +82,7 @@ extract_tag_class() {
     | grep -oE '\[mergepath-resolve:[[:space:]]*[a-z-]+[[:space:]]*\]' 2>/dev/null \
     | head -n1 \
     | sed -E 's/\[mergepath-resolve:[[:space:]]*([a-z-]+)[[:space:]]*\]/\1/' \
+    | sed 's/^deferred-to-follow-up$/deferred-to-followup/' \
     || true
 }
 
@@ -107,7 +108,7 @@ tag_class_action() {
     # consumer's facts) and confirmed equality (mergepath#572). The
     # thread is evidence-verified handled — skip, don't re-surface.
     addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render|verified-propagation) echo "skip" ;;
-    nitpick-noted|deferred-to-followup) echo "surface" ;;
+    nitpick-noted|deferred-to-followup|deferred-to-follow-up) echo "surface" ;;
     "") echo "" ;;  # no tag → caller falls through to heuristics
     *)  echo "surface" ;;  # unknown → surface
   esac

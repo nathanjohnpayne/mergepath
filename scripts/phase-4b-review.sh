@@ -1620,7 +1620,7 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     # FILE_JSON.findings (reused + created alike, in filing order). Zip them
     # into the tuple-keyed filed-issues channel accounting.sh joins in
     # p4b_acct_unique_findings, flipping each filed finding's record entry from
-    # unresolved/null to disposition "deferred-to-follow-up" + its issue link
+    # unresolved/null to disposition "deferred-to-followup" + its issue link
     # (advisory_issues_filed then derives), so the machine-readable record
     # matches the prose "filed as #N" reference instead of contradicting it.
     # Built via p4b_acct_filed_issues_from_refs (numeric, position-preserving

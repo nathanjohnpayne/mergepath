@@ -335,7 +335,7 @@ resolve_disposition() {
   case "$v" in
     fixed|real|useful|"+1"|thumbsup|thumbs-up|up)
       printf 'fixed\n' ;;
-    deferred|tracked|split|deferred-to-followup)
+    deferred|tracked|split|deferred-to-followup|deferred-to-follow-up)
       printf 'deferred-to-followup\n' ;;
     rebutted|false-positive|false_positive|falsepositive|not-useful|not_useful|notuseful|"-1"|thumbsdown|thumbs-down|down)
       printf 'rebutted\n' ;;
@@ -694,6 +694,7 @@ prior_disposition_of() {
     [ .[] | select(.comment_id == $cid and .repo == $repo) ]
     | last
     | if . == null then "" else (.disposition // "") end
+    | if . == "deferred-to-follow-up" then "deferred-to-followup" else . end
   ' "$LEDGER" 2>/dev/null || true
 }
 

@@ -134,6 +134,7 @@ assert_tag() {
 }
 
 assert_tag '[mergepath-resolve: deferred-to-followup] noted'   "deferred-to-followup" "canonical form"
+assert_tag '[mergepath-resolve: deferred-to-follow-up] noted' "deferred-to-followup" "permanent deferral alias normalizes (#1677)"
 assert_tag '[mergepath-resolve:canonical-coverage] addressed'  "canonical-coverage"   "no space after colon"
 assert_tag '[mergepath-resolve:  addressed-elsewhere ] x'      "addressed-elsewhere"  "extra leading space"
 assert_tag 'no tag here'                                        ""                     "no tag → empty"
@@ -163,6 +164,7 @@ assert_action "templated-render"      "skip"      # #568: routing/skip class
 assert_action "verified-propagation"  "skip"      # #572: byte-verified propagation
 assert_action "nitpick-noted"         "surface"
 assert_action "deferred-to-followup"  "surface"
+assert_action "deferred-to-follow-up" "surface"
 assert_action "future-unknown-class"  "surface"   # spec: err on surface
 assert_action ""                       ""          # caller falls through to heuristics
 
