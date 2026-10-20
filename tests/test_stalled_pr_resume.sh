@@ -296,6 +296,37 @@ expect 136 '.class == "waiting-on-human" and .reason == "handoff posted"'
 expect 137 '.class == "waiting-on-human" and .reason == "handoff posted"'
 expect 135 '.class == "stalled" and .rate_limited == false and .reason == "unanswered-verdict"'
 
+# A pending check must not mask the same head-anchored feedback that already
+# routes to a fix with completed CI. Positive, answered/stale and hold cases
+# reuse the original snapshot records, preserving the main ordering fixture.
+while IFS='~' read -r mode source_number overlay expected_class expected_reason expected_action expected_turn; do
+  jq --argjson n "$source_number" '[.prs[] | select(.number == $n)][0] | .ci_state="PENDING" | '"$overlay" \
+    "$TMP/snapshot.json" | jq -s --arg repo "$REPO" '{schema:"stalled-prs/v1",repo:$repo,prs:.}' > "$TMP/pending-$mode.json"
+  set +e
+  bash "$FINDER" --input "$TMP/pending-$mode.json" --no-gate --json --now "$NOW" \
+    > "$TMP/pending-$mode-report.json" 2> "$TMP/pending-$mode.err"
+  pending_rc=$?
+  set -e
+  if [ "$pending_rc" -le 1 ] && jq -e --arg class "$expected_class" --arg reason "$expected_reason" --arg action "$expected_action" --arg turn "$expected_turn" \
+    '.prs[0] | .class == $class and .reason == $reason and .next_action == $action and .turn == $turn and .next_action != "merge"' \
+    "$TMP/pending-$mode-report.json" >/dev/null; then
+    pass "pending CI verdict precedence: $mode"
+  else fail "pending CI verdict precedence $mode (rc=$pending_rc): $(cat "$TMP/pending-$mode-report.json") $(cat "$TMP/pending-$mode.err")"; fi
+done <<'CASES'
+findings~101~.~stalled~unanswered-verdict~push fix~agent
+fresh-findings~102~.~live~newest event younger than the threshold~push fix~agent
+changes~114~.~stalled~unanswered-verdict~push fix~agent
+edited~130~.~stalled~unanswered-verdict~push fix~agent
+old-changes~119~.~stalled~ci-pending-stale~investigate~machine
+approval~105~.~stalled~ci-pending-stale~investigate~machine
+answered~101~.review_comments += [.review_comments[] | .in_reply_to_id=.id | .id += 100 | .user={login:"nathanpayne-codex",type:"User"} | .created_at="2026-10-13T01:50:00Z" | .updated_at=.created_at]~stalled~ci-pending-stale~investigate~machine
+active-summary~101~.issue_comments += [{id:100,user:{login:"chatgpt-codex-connector[bot]",type:"Bot"},created_at:"2026-10-13T11:45:00Z",updated_at:"2026-10-13T11:45:00Z",body:("<!-- codex-pull-request-review-summary -->\n| | Status | Commit | Trigger |\n|---|---|---|---|\n| 📝 **Code Review** | **Running** | `" + .head_sha + "` | @codex review |")}]~waiting-on-bot~Codex reports the head Running~wait~machine
+before-push~101~.head_pushed_at="2026-10-13T03:00:00Z"~stalled~ci-pending-stale~investigate~machine
+same-second~101~.reviews[].submitted_at=.head_pushed_at | .review_comments[] |= (.created_at="2026-10-13T01:00:00Z" | .updated_at=.created_at)~stalled~ci-pending-stale~investigate~machine
+stale-anchor~101~.reviews[].commit_id="old-head" | .review_comments[] |= (.commit_id="old-head" | .original_commit_id="old-head")~stalled~ci-pending-stale~investigate~machine
+human-hold~101~.labels=["human-hold"]~waiting-on-human~label human-hold~wait~human
+CASES
+
 if jq -e '[.prs[] | .number] == [101, 116, 129, 131, 132, 111, 122, 126, 133, 123, 134, 125, 130, 135, 110, 112, 119, 105, 114, 117, 118, 106, 128, 127, 137, 108, 121, 124, 120, 136, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else

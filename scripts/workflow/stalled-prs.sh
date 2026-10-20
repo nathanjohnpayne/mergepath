@@ -509,11 +509,6 @@ CLASSIFY_JQ='
        and ([ $events[] | select(.side == "verdict" and .actor == $last_rate_limit.actor) | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
        and ([ $events[] | select(.trigger == true and .provider == "codex") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
       ) as $rate_limited
-    | ($pr.ci_state == "PENDING") as $ci_pending
-    | (if $ci_pending then "ci"
-       elif $request_outstanding or $summary_running or $rate_limited then "bot"
-       elif $newest.side == "bot-activity" then "bot"
-       else null end) as $machine_wait
     # ---- head evidence --------------------------------------------------------
     | ([ $pr.reviews[] | select(is_codex($codex_login)) | select(.commit_id == $head) ] | length > 0
        or ([ $events[] | select(.kind == "verdict-comment" and .names_head == true) ] | length > 0)
@@ -539,7 +534,22 @@ CLASSIFY_JQ='
     | ([ $pr.reviews[] | select((actor_class($author)) != "author") | select((.state // "PENDING") != "PENDING")
          | select((actor_class($author)) != "bot" or ((.body | norm | gsub("[[:space:]]"; "")) != ""))
          | select(.commit_id == $head or ((.submitted_at | ts) >= $head_ts)) ]
-       | max_by(.submitted_at | ts) | (.state // null)) as $latest_verdict_state
+       | max_by(.submitted_at | ts)) as $latest_verdict
+    | ($latest_verdict.state // null) as $latest_verdict_state
+    # Reuse the existing actionable finding/change-request criteria. Only
+    # evidence strictly after this push can supersede its CI wait; an older
+    # or same-second verdict cannot establish that ordering.
+    | (any($pr.review_comments[];
+           . as $comment
+           | ($unanswered | any(.id == $comment.id))
+             and (((.updated_at // .created_at) | ts) > $head_ts))
+       or ($latest_verdict_state == "CHANGES_REQUESTED" and $latest_verdict.commit_id == $head
+           and (($latest_verdict.submitted_at | ts) > $head_ts))) as $actionable_after_push
+    | ($pr.ci_state == "PENDING") as $ci_pending
+    | (if $ci_pending and ($actionable_after_push | not) then "ci"
+       elif $request_outstanding or $summary_running or $rate_limited then "bot"
+       elif $newest.side == "bot-activity" then "bot"
+       else null end) as $machine_wait
     # A handoff is in force for as long as ANY comment, review body or inline
     # comment on the PR carries a handoff marker — whoever wrote it, whenever
     # it was posted or edited. No timestamp is compared: there is no later
