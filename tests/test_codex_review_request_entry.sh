@@ -1355,10 +1355,20 @@ STUB
       *) printf '' ;; esac; }
     policy_yaml_to_json() {
       printf '%s\n' "${1:-<none>}" >> "$fake/reader-paths.log"
-      printf '{"author_identity":%s,"available_reviewers":%s}' \
-        "$(printf '%s' "${G1100_AUTHOR-nathanjohnpayne}" | jq -Rs 'rtrimstr("\n")')" \
-        "$(printf '%s' "${G1100_REVIEWERS-nathanpayne-codex nathanpayne-claude}" \
-           | jq -Rc 'rtrimstr("\n") | split(" ") | map(select(length > 0))')"
+      [ -z "${G1100_PARSE_FAIL:-}" ] || return 1
+      if [ -n "${G1100_POLICY_JSON:-}" ]; then
+        printf '%s' "$G1100_POLICY_JSON"
+        return 0
+      fi
+      jq -nc --arg cr "${G1100_CR-coderabbitai[bot]}" \
+        --arg ghas "${G1100_GHAS-github-advanced-security[bot]}" \
+        --arg codex "${G1100_CODEX-chatgpt-codex-connector[bot]}" \
+        --arg author "${G1100_AUTHOR-nathanjohnpayne}" \
+        --arg reviewers "${G1100_REVIEWERS-nathanpayne-codex nathanpayne-claude}" '
+        {author_identity: $author,
+         available_reviewers: ($reviewers | split(" ") | map(select(length > 0))),
+         codex: {bot_login: $codex}, coderabbit: {bot_login: $cr},
+         code_scanning: {bot_login: $ghas}}'
     }
     log() { :; }
     die() { printf 'refuse'; exit 0; }
@@ -1399,14 +1409,38 @@ g1100_case "unaccounted, missing set ABSENT"  '{"status":"unaccounted","posted":
 g1100_case "unaccounted, missing set empty"   '{"status":"unaccounted","missing":[]}' refuse
 g1100_case "missing is not an array"          '{"status":"unaccounted","missing":"three"}' refuse
 
-# Every case above assumes the policy DECLARES the providers that may be
-# skipped. If it does not -- a policy without a coderabbit/code_scanning block,
-# or a read that fails -- the relax set is empty and nothing is skippable, so
-# the gate must refuse exactly as it did before this change. Untested shapes
-# are where the first cut of this fix failed open, so this one is pinned too.
+# #1359: successful absence uses the same provider defaults as accounting.
+# It is different from an unreadable/unparseable policy, which must still
+# leave nothing skippable. The parsed-reader stubs return empty for absence
+# exactly as the shared readers do; the JSON fixture covers omitted blocks.
 G1100_CR='' G1100_GHAS='' \
-  g1100_case "empty relax set (policy declares no skippable provider)" \
+  g1100_case "absent provider logins default CodeRabbit" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+G1100_CR='' G1100_GHAS='' \
+  g1100_case "absent provider logins default code scanning" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+G1100_CR='' G1100_GHAS='' \
+G1100_POLICY_JSON='{"coderabbit":{"enabled":true},"available_reviewers":["nathanpayne-codex"]}' \
+  g1100_case "enabled CodeRabbit without login and absent code-scanning block" \
+    '{"missing":[{"reviewer":"CodeRabbitAI[Bot]"},{"reviewer":"github-advanced-security[bot]"}]}' proceed
+G1100_CR='custom-cr[bot]' G1100_GHAS='custom-ghas[bot]' \
+  g1100_case "explicit provider logins retain their configured names" \
+    '{"missing":[{"reviewer":"custom-cr[bot]"},{"reviewer":"custom-ghas[bot]"}]}' proceed
+G1100_CR='custom-cr[bot]' G1100_GHAS='custom-ghas[bot]' \
+  g1100_case "explicit names do not additionally relax the defaults" \
     '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+G1100_PARSE_FAIL=1 \
+  g1100_case "policy parse failure leaves the relax set empty" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+G1100_POLICY_JSON='not json' \
+  g1100_case "invalid parsed-policy JSON leaves the relax set empty" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+G1100_POLICY_JSON='{"coderabbit":{"bot_login":"coderabbitai[bot]"},"code_scanning":[]}' \
+  g1100_case "failed second provider extraction discards the first login" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+G1100_CR='' G1100_GHAS='' G1100_REVIEWERS='CodeRabbitAI[Bot]' \
+  g1100_case "default provider colliding with a reviewer voids the whole relax set" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
 
 # The relax set NARROWS what gates this request, so it must be resolved from
 # the governing BASE policy -- the same one accounting classifies `.missing`

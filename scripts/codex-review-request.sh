@@ -1947,18 +1947,21 @@ run_feedback_accounting_gate() {
       # untrusted reader is "for an additional login to WIDEN a scan, never to
       # narrow one", and a narrowing caller "must resolve $CONFIG itself".
       #
-      # policy_block_field_parsed reads through the YAML->JSON parse, so a
-      # flow-style `coderabbit: {bot_login: ...}` resolves identically to block
-      # style -- the #1124 defect class.
-      #
-      # Every failure path yields an EMPTY relax set, which refuses: an
-      # unresolvable base policy means we cannot say who may be skipped. The
-      # snapshot is the one resolved above, which accounting also classified
-      # `.missing` with -- not a second resolution that could see a newer base.
-      if [ -n "$__cra_base_cfg" ] && [ -r "$__cra_base_cfg" ]; then
+      # Parse the shared snapshot successfully before defaulting absent fields
+      # (#1359). A failed parse is not absence and must not synthesize a
+      # skippable provider. One structured parse serves both identity sets,
+      # including flow-style YAML (#1124), just as it does in accounting.
+      if [ -n "$__cra_base_cfg" ] && [ -r "$__cra_base_cfg" ] \
+         && __cra_policy_json=$(policy_yaml_to_json "$__cra_base_cfg" 2>/dev/null) \
+         && printf '%s' "$__cra_policy_json" | jq -e 'type == "object"' >/dev/null 2>&1 \
+         && __cra_cr_bot=$(printf '%s' "$__cra_policy_json" | jq -r '.coderabbit.bot_login // empty' 2>/dev/null) \
+         && __cra_ghas_bot=$(printf '%s' "$__cra_policy_json" | jq -r '.code_scanning.bot_login // empty' 2>/dev/null) \
+         && __cra_codex_bot=$(printf '%s' "$__cra_policy_json" | jq -r '.codex.bot_login // empty' 2>/dev/null) \
+         && __cra_author_id=$(printf '%s' "$__cra_policy_json" | jq -r '.author_identity // empty' 2>/dev/null) \
+         && __cra_reviewers=$(printf '%s' "$__cra_policy_json" | jq -r '.available_reviewers[]? // empty' 2>/dev/null); then
         __cra_relax=$(printf '%s\n%s\n' \
-          "$(policy_block_field_parsed coderabbit bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
-          "$(policy_block_field_parsed code_scanning bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
+          "${__cra_cr_bot:-coderabbitai[bot]}" \
+          "${__cra_ghas_bot:-github-advanced-security[bot]}" \
           | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -v '^$' || true)
         # Sourcing the relax set from the BASE policy stops a PR nominating its
         # own skippable providers, but it does not stop a COLLISION.
@@ -1976,17 +1979,12 @@ run_feedback_accounting_gate() {
         # not named either of them, and the safe reading of an ambiguous
         # skippable set is that nothing is skippable.
         #
-        # Defaults are ${x:-...} rather than `|| ...` because
-        # policy_block_field_parsed exits 0 and prints nothing for an absent
-        # field -- the exact shape that leaves the Codex bot out of the gating
-        # set. They match review-feedback-accounting.sh:162-168.
-        __cra_policy_json=$(policy_yaml_to_json "$__cra_base_cfg" 2>/dev/null || true)
-        __cra_codex_bot=$(policy_block_field_parsed codex bot_login "$__cra_base_cfg" 2>/dev/null || true)
-        __cra_author_id=$(printf '%s' "$__cra_policy_json" | jq -r '.author_identity // empty' 2>/dev/null || true)
+        # Empty and absent values share accounting's established defaults;
+        # every parse/extraction failure took the empty-relax branch instead.
         __cra_gating=$(printf '%s\n%s\n%s\n' \
           "${__cra_codex_bot:-chatgpt-codex-connector[bot]}" \
           "${__cra_author_id:-nathanjohnpayne}" \
-          "$(printf '%s' "$__cra_policy_json" | jq -r '.available_reviewers[]? // empty' 2>/dev/null || true)" \
+          "$__cra_reviewers" \
           | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -v '^$' || true)
         if [ -n "$__cra_relax" ] && [ -n "$__cra_gating" ] \
            && printf '%s\n' "$__cra_relax" | grep -xF "$__cra_gating" >/dev/null; then
@@ -1995,7 +1993,7 @@ run_feedback_accounting_gate() {
         fi
       else
         __cra_relax=""
-        log "review feedback accounting: could not resolve the governing base policy; no provider is skippable (#1100)"
+        log "review feedback accounting: could not resolve or parse the governing base policy; no provider is skippable (#1100)"
       fi
       __cra_blocking=$(printf '%s' "$output" | jq -r --arg relax "$__cra_relax" '
         ($relax | split("\n") | map(select(length > 0))) as $ok
