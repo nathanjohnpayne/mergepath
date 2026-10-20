@@ -94,15 +94,16 @@
 #   1   One or more unresolved blocking-tier findings on current HEAD —
 #       gate blocks.
 #   2   Usage / config error. Error message on stderr.
-#   3   REQUIRE_REVIEW_SUMMARY only: a completed CodeRabbit review run is on
-#       the current HEAD and NO acceptor recognised a summary for it, so the
-#       findings on that surface are not knowable. NOT a finding count.
-#       An event-driven caller treats it as non-green; the scheduled /
-#       issue_comment sweep must DECLINE TO PUBLISH rather than post a
-#       success read off the previous publication. Since the primary acceptor
-#       reads the summary out of the run object's OWN body, this no longer
-#       fires merely because the walkthrough comment has not caught up — it
-#       means the run's serialization is one this gate cannot classify.
+#   3   REQUIRE_REVIEW_SUMMARY only: hold when a completed CodeRabbit run on
+#       the current HEAD has no summary recognised by any acceptor, so its
+#       findings cannot be classified; or when an earlier recognised clean
+#       summary is in hand but a later current-HEAD run remains unrecognised.
+#       The second case withholds that stale clean verdict. Neither case is a
+#       known blocking finding or a finding count. An event-driven caller treats
+#       the hold as non-green; the scheduled / issue_comment publisher must
+#       DECLINE TO PUBLISH rather than report success from an earlier result.
+#       The primary acceptor reads the summary from the run object's own body,
+#       so a lagging walkthrough comment alone does not trigger the first case.
 #
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API.
