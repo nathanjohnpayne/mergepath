@@ -1515,6 +1515,62 @@ sync_all_scope_description() {
   printf '%s\n' "$digest ($count requested $noun, before consumer overrides)"
 }
 
+# Describe the requested scope, before consumer overrides change effective
+# delivery. Manifest entries and resolved destination paths are distinct: a
+# template has a source path for coverage but a destination for the branch key.
+# Backticks in printf formats below are literal Markdown.
+# shellcheck disable=SC2016
+sync_all_scope_report() {
+  local consumer_name=$1 manifest=$2 canonical=$3 kit=$4 templated=$5
+  local all_canonical all_kit all_templated all_entries selected_entries
+  local destinations digest count total requested omitted
+  local consumers name repo selected_consumers=0 total_consumers=0
+  local paths_narrowed=no repos_narrowed=no path
+
+  all_canonical=$(FILTER_PATHS='' sync_all_consumer_canonical_targets "$consumer_name" "$manifest") || return 1
+  all_kit=$(FILTER_PATHS='' sync_all_consumer_kit_targets "$consumer_name" "$manifest") || return 1
+  all_templated=$(FILTER_PATHS='' sync_all_consumer_templated_targets "$consumer_name" "$manifest") || return 1
+  all_entries=$(printf '%s\n' "$all_canonical" "$all_kit" "$all_templated" | sed '/^$/d' | LC_ALL=C sort -u) || return 1
+  selected_entries=$(printf '%s\n' "$canonical" "$kit" "$templated" | sed '/^$/d' | LC_ALL=C sort -u) || return 1
+  omitted=$(LC_ALL=C comm -23 <(printf '%s\n' "$all_entries") <(printf '%s\n' "$selected_entries")) || return 1
+  destinations=$(sync_all_normalized_pathset "$manifest" "$canonical" "$kit" "$templated") || return 1
+  digest=$(sync_all_scope_digest "$destinations") || return 1
+  count=$(awk 'NF { n++ } END { print n + 0 }' <<< "$destinations")
+  requested=$(awk 'NF { n++ } END { print n + 0 }' <<< "$selected_entries")
+  total=$(awk 'NF { n++ } END { print n + 0 }' <<< "$all_entries")
+  [ -z "$omitted" ] || paths_narrowed=yes
+
+  consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest") || return 1
+  while IFS=$'\t' read -r name repo; do
+    [ -z "$name" ] && continue
+    total_consumers=$((total_consumers + 1))
+    if in_repo_filter "$name" "$repo"; then
+      selected_consumers=$((selected_consumers + 1))
+    fi
+  done <<< "$consumers"
+  [ "$selected_consumers" -eq "$total_consumers" ] || repos_narrowed=yes
+
+  if [ "$paths_narrowed" = yes ]; then
+    printf '%s\n' 'This requests a **narrowed sync, not a full mirror** of the opted-in manifest paths for this consumer.'
+  else
+    printf '%s\n' 'This requests a full replay of every opted-in canonical, kit and templated manifest entry.'
+  fi
+  printf '\n%s\n\n' '## Requested scope'
+  printf -- '- Resolved scope digest: `%s`; %s requested destination path(s), before consumer overrides.\n' "$digest" "$count"
+  printf -- '- Manifest coverage: %s of %s opted-in manifest entries requested.\n' "$requested" "$total"
+  printf -- '- `--paths` narrowed scope for this consumer: %s.\n' "$paths_narrowed"
+  printf -- '- `--repos` narrowed the consumer set: %s (%s of %s consumers selected).\n' "$repos_narrowed" "$selected_consumers" "$total_consumers"
+  printf '\n%s\n\n' '### Opted-in manifest paths not requested'
+  if [ -n "$omitted" ]; then
+    while IFS= read -r path; do
+      printf -- '- `%s`\n' "$path"
+    done <<< "$omitted"
+  else
+    printf '%s\n' 'None.'
+  fi
+  printf '\n%s\n' 'Consumer overrides are applied separately and listed below; requested scope is not installed acceptance.'
+}
+
 # Idempotency check: does a PR already exist on this consumer's repo from
 # the deterministic sync branch? Echoes one of:
 #   "open:<pr_number>"     PR is open — skip, "already in flight"
@@ -2503,6 +2559,11 @@ sync_all_open_pr() {
   authoring_agent=$(sync_authoring_agent) || return 1
   coauthor_trailer=$(sync_coauthor_trailer "$authoring_agent") || return 1
 
+  local requested_scope templated_targets
+  templated_targets=$(printf '%s\n' "$templated_list" | tr ',' '\n')
+  requested_scope=$(sync_all_scope_report "$consumer_name" "$MERGEPATH_ROOT/$MANIFEST_PATH" \
+    "$canonical_targets" "$kit_targets" "$templated_targets") || return 1
+
   local tmp_root=${TMPDIR:-/tmp}
   local workspace
   workspace=$(mktemp -d "$tmp_root/mergepath-sync-${consumer_name}.XXXXXX") || {
@@ -2897,7 +2958,9 @@ EOF
     --body "$(cat <<EOF
 Bulk sync to [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) — verbatim canonical/kit mirror per \`.mergepath-sync.yml\`.
 
-Opened by \`scripts/sync-to-downstream.sh --sync-all\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)). Unlike a per-commit propagation PR, this replays the **current HEAD state of every canonical + kit path** so a consumer that has fallen behind reaches a clean steady state in one shot.$(sync_coderabbit_ignore_block)
+Opened by \`scripts/sync-to-downstream.sh --sync-all\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)).$(sync_coderabbit_ignore_block)
+
+${requested_scope}
 
 ## Canonical paths synced
 ${canonical_lines}

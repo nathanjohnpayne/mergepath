@@ -1013,6 +1013,66 @@ scope_branch=$(git --git-dir="$scope_remote" for-each-ref --format='%(refname:sh
 [[ "$scope_branch" =~ ^mergepath-sync/sync-all-${meta_sha:0:7}-[0-9a-f]{12}$ ]] \
   || fail "full sync-all did not push a scope-aware branch: $scope_branch"
 
+# #2490: the full request records its branch-bound scope and makes a full
+# replay claim only when every opted-in manifest entry was requested.
+full_scope_body="$META_CAPTURE/pr-body-scope-first.md"
+grep -qF '## Requested scope' "$full_scope_body" || fail 'full sync body omitted requested scope'
+grep -qF "Resolved scope digest: \`${scope_branch##*-}\`; 1 requested destination path(s)" "$full_scope_body" \
+  || fail 'full sync body scope did not match its pushed branch'
+grep -qF 'Manifest coverage: 1 of 1 opted-in manifest entries requested.' "$full_scope_body" \
+  || fail 'full sync body omitted complete manifest coverage'
+grep -qF 'full replay of every opted-in canonical, kit and templated manifest entry' "$full_scope_body" \
+  || fail 'complete request lost its full replay claim'
+grep -qF 'narrowed scope for this consumer: no.' "$full_scope_body" || fail 'full request reported path narrowing'
+grep -qF 'narrowed the consumer set: no (1 of 1 consumers selected).' "$full_scope_body" \
+  || fail 'selecting the only consumer should not claim a narrowed set'
+grep -qFx 'None.' "$full_scope_body" || fail 'full request should have no omitted manifest paths'
+
+# A filtered request reports omitted canonical, kit and templated manifest
+# entries even though only the selected canonical path is materialized.
+narrow_mp="$metadata_workdir/narrow-source"
+git clone -q "$META_MP" "$narrow_mp"
+cat >"$narrow_mp/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+  - {name: beta, repo: example/beta}
+paths:
+  - {path: scripts/the-script.sh, type: canonical, consumers: all}
+  - {path: scripts/omitted.sh, type: canonical, consumers: all}
+  - {path: scripts/omitted-kit/, type: kit, consumers: all}
+  - {path: templates/omitted.in, dest: omitted.config.js, type: templated, consumers: all}
+YAML
+git -C "$narrow_mp" add -A
+git -C "$narrow_mp" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'requested scope fixture'
+narrow_remote="$metadata_workdir/narrow.git"
+setup_metadata_remote "$narrow_remote" "$metadata_workdir/narrow-seed"
+set +e
+narrow_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$narrow_mp" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$narrow_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN=2490 MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha --paths 'scripts/the-script.sh' 2>&1)
+narrow_rc=$?
+set -e
+[ "$narrow_rc" -eq 0 ] || fail "narrowed scope fixture failed: $narrow_out"
+narrow_branch=$(git --git-dir="$narrow_remote" for-each-ref --format='%(refname:short)' 'refs/heads/mergepath-sync/sync-all-*')
+narrow_body="$META_CAPTURE/pr-body-2490.md"
+grep -qF "Resolved scope digest: \`${narrow_branch##*-}\`; 1 requested destination path(s)" "$narrow_body" \
+  || fail 'narrowed body scope did not match its pushed branch'
+grep -qF 'Manifest coverage: 1 of 4 opted-in manifest entries requested.' "$narrow_body" \
+  || fail 'narrowed body omitted partial manifest coverage'
+grep -qF 'narrowed sync, not a full mirror' "$narrow_body" || fail 'partial request claimed a complete mirror'
+if grep -Eq 'full replay|current HEAD state of every canonical' "$narrow_body"; then
+  fail 'narrowed body retained a full-replay claim'
+fi
+grep -qF 'narrowed scope for this consumer: yes.' "$narrow_body" || fail 'narrowed body lost path-filter effect'
+grep -qF 'narrowed the consumer set: yes (1 of 2 consumers selected).' "$narrow_body" \
+  || fail 'narrowed body lost repository-filter effect'
+for omitted_path in scripts/omitted.sh scripts/omitted-kit/ templates/omitted.in; do
+  grep -qFx -- "- \`$omitted_path\`" "$narrow_body" || fail "omitted manifest path absent: $omitted_path"
+done
+echo 'PASS: full and narrowed sync PR bodies retain exact requested scope (#2490)'
+
 set +e
 scope_repeat_out=$(env \
   PATH="$META_FAKE_BIN:$PATH" \
@@ -2952,6 +3012,7 @@ Path(sys.argv[2]).write_text('''set -euo pipefail
 SCRIPT_VERSION=fixture;SYNC_PROGRESS_JSON=1
 consumer_name=alpha;consumer_repo=example/alpha;branch=fixture;sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;short_sha=aaaaaaa
 canonical_lines=README.md;kit_lines=;templated_lines=;override_note=;authoring_agent=codex
+requested_scope='Fixture requested scope.'
 sync_coderabbit_ignore_block(){ :; }
 err(){ printf '%s\\n' "$*" >&2; }
 sync_author_gh(){ /bin/bash "$MERGEPATH_TEST_ACTUAL_WRAPPER" -- gh "$@"; }
