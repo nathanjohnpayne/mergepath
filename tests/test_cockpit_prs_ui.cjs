@@ -156,9 +156,9 @@ test('assets remain fetch-free and scoped; shared motion tokens include normal a
 });
 
 test('a released owner tiebreak renders as released, never as a standing human stop',()=>{
-  const r=row();r.codex.human_stops=[];r.codex.owner_tiebreaks=[{kind:'runaway'},{kind:'untested',finding:100}];
+  const r=row();r.codex.human_stops=[];r.codex.owner_tiebreaks=[{kind:'runaway'},{kind:'untested',finding:'100'},{kind:'disagreement',finding:'9007199254740993'},{kind:'untested',finding:100}];
   assert.equal(Rows.validRow(r),true);const view=new Rows.RowView(r);parent().append(view.node);
-  assert.equal(view.stops.hidden,false);assert.equal(view.stops.textContent,'Owner tiebreak released: runaway, untested #100');assert.equal(view.stops.className,'pr-flag');
+  assert.equal(view.stops.hidden,false);assert.equal(view.stops.textContent,'Owner tiebreak released: runaway, untested #100, disagreement #9007199254740993, untested');assert.equal(view.stops.className,'pr-flag');
   const standing=row();standing.codex.human_stops=['runaway'];standing.codex.owner_tiebreaks=null;view.update(standing,{now:0});
   assert.equal(view.stops.textContent,'Human stop: runaway');assert.equal(view.stops.className,'pr-flag stop');
   const partial=row();partial.codex.human_stops=['untested-rebuttal'];partial.codex.owner_tiebreaks=[{kind:'runaway'}];view.update(partial,{now:0});

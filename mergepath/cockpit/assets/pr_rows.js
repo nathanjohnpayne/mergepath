@@ -136,7 +136,7 @@
       safeLink(this.inflight, row.codex.url);
       this.inflight.className = `pr-flag ${row.codex.in_flight_on_head === true ? "run" : ""}`;
       const standing = row.codex.human_stops === null ? "Human-stop evidence unknown" : row.codex.human_stops.length ? `Human stop: ${row.codex.human_stops.join(", ")}` : "";
-      const released = Array.isArray(row.codex.owner_tiebreaks) && row.codex.owner_tiebreaks.length ? `Owner tiebreak released: ${row.codex.owner_tiebreaks.map(tiebreak => `${tiebreak.kind}${Number.isInteger(tiebreak.finding) ? ` #${tiebreak.finding}` : ""}`).join(", ")}` : "";
+      const released = Array.isArray(row.codex.owner_tiebreaks) && row.codex.owner_tiebreaks.length ? `Owner tiebreak released: ${row.codex.owner_tiebreaks.map(tiebreak => `${tiebreak.kind}${decimal(tiebreak.finding) ? ` #${tiebreak.finding}` : ""}`).join(", ")}` : "";
       this.stops.textContent = [standing, released].filter(Boolean).join(" · "); this.stops.hidden = !this.stops.textContent; this.stops.className = `pr-flag${standing ? " stop" : ""}`;
       this.feedback.textContent = `${row.feedback.accounted ?? "?"} / ${row.feedback.posted ?? "?"}`; this.feedback.classList.toggle("short", row.feedback.accounted !== null && row.feedback.posted !== null && row.feedback.accounted < row.feedback.posted);
       this.feedbackNote.textContent = `accounted / posted${row.feedback.stale ? " · stale" : ""} · ${evidenceAge(row.feedback)}`;

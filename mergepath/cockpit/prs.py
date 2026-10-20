@@ -227,6 +227,10 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
     cr = receipts["coderabbit"]["data"] or {}
     human_stops = ledger.get("human_stops")
     human = any(label in labels for label in ("human-hold", "policy-violation", "needs-human-review")) or bool(human_stops)
+    # Finding ids are opaque GitHub identities: decimal strings before browser publication.
+    tiebreaks = ledger.get("owner_tiebreaks")
+    owner_tiebreaks = ([{**item, "finding": str(item["finding"])} if type(item.get("finding")) is int else item for item in tiebreaks]
+                       if type(tiebreaks) is list and all(type(item) is dict for item in tiebreaks) else None)
     state, label = "idle", "Waiting"
     merge_state = raw.get("mergeStateStatus")
     spent = [item for item in budgets if item["state"] == "boulder"]
@@ -277,7 +281,7 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
            "checks": checks, "checks_known": checks_known, "labels": labels, "budgets": budgets,
            "feedback": {"accounted": integer(feedback.get("accounted")), "posted": integer(feedback.get("posted")), **{k: receipts["feedback"][k] for k in ("observed_at", "stale", "error")}},
            "codex": {"in_flight_on_head": ledger.get("in_flight_on_head"), "outstanding": integer(ledger.get("outstanding")),
-                     "human_stops": human_stops, "owner_tiebreaks": ledger.get("owner_tiebreaks"), "url": ledger.get("url"), **{k: receipts["ledger"][k] for k in ("observed_at", "stale", "error")}},
+                     "human_stops": human_stops, "owner_tiebreaks": owner_tiebreaks, "url": ledger.get("url"), **{k: receipts["ledger"][k] for k in ("observed_at", "stale", "error")}},
            "coderabbit": {"status": cr.get("status", "unknown"), "head": cr.get("head_sha"), "skip_reason": cr.get("skip_reason"),
                           **{k: receipts["coderabbit"][k] for k in ("observed_at", "stale", "error")}},
            "spend": {"totals": (receipts["accounting"]["data"] or {}).get("totals"), "coverage": (receipts["accounting"]["data"] or {}).get("coverage", "unavailable"),
