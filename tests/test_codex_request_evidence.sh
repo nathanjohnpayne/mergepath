@@ -274,11 +274,14 @@ fo_c() { # <id> <login> <created> <body> [updated]
 FO_HA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 FO_HB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 fo_m() { crqe_failover_marker_body "${2:-$FO_HA}" "$1"; }
-fo_case() { # <name> <expected-exempt-json> <expected-count> <comment>...
+# The PR's heads (#2553): a marker must name one of them.
+FO_HEADS=$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" '[$a, $b]')
+fo_case() { # <name> <expected-exempt-json> <expected-count> <comment>...   (FO_CASE_HEADS overrides the heads)
   local name=$1 want=$2 count=$3 c got n
   shift 3
   c=$(printf '%s\n' "$@" | jq -sc .)
-  got=$(crqe_failover_trigger_ids "$c" nathanjohnpayne) && n=$(crqe_count_triggers "$c" nathanjohnpayne) \
+  got=$(crqe_failover_trigger_ids "$c" nathanjohnpayne "${FO_CASE_HEADS:-$FO_HEADS}") \
+    && n=$(crqe_count_triggers "$c" nathanjohnpayne "${FO_CASE_HEADS:-$FO_HEADS}") \
     && [ "$got" = "$want" ] && [ "$n" = "$count" ] \
     || { echo "FAIL: failover: $name (exempt=$got count=${n:-?}, want $want/$count)" >&2; exit 1; }
 }
@@ -304,11 +307,37 @@ fo_case "one exemption per head" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-
   "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20)")"
 fo_case "one exemption on each of two heads" '[10,20]' 0 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
   "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HB")")"
+# #2553: a marker naming a head the PR never had exempts nothing, so one
+# marker per invented head cannot exempt every trigger.
+FO_HX=1111111111111111111111111111111111111111
+FO_HY=2222222222222222222222222222222222222222
+fo_case "a marker naming a foreign head" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 "$FO_HX")")" "$T2"
+fo_case "one marker per invented head" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 "$FO_HX")")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HY")")"
+fo_case "a real head and an invented one" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HY")")"
+FO_CASE_HEADS='[]' fo_case "an empty head set" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" "$T2"
+_fo_c=$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" | jq -sc .)
+[ "$(crqe_failover_trigger_ids "$_fo_c" nathanjohnpayne)" = '[]' ] && [ "$(crqe_count_triggers "$_fo_c" nathanjohnpayne)" = 1 ] \
+  || { echo "FAIL: failover: callers that pass no head set must exempt nothing" >&2; exit 1; }
+crqe_failover_markers_present "$_fo_c" nathanjohnpayne && ! crqe_failover_markers_present "$_fo_c" someone-else \
+  && ! crqe_failover_markers_present "$(printf '%s\n' "$T1" | jq -sc .)" nathanjohnpayne \
+  || { echo "FAIL: failover: marker presence is misread" >&2; exit 1; }
+# The head set: the current head, the commit list, committed events and both
+# sides of a force-push; anything malformed fails so the caller uses [].
+_hs=$(crqe_pr_head_set "$(jq -nc --arg b "$FO_HB" '[{sha: $b}, {sha: "short"}]')" \
+  "$(jq -nc --arg x "$FO_HX" --arg y "$FO_HY" --arg c 3333333333333333333333333333333333333333 \
+     '[{event: "committed", sha: $c}, {event: "head_ref_force_pushed", commit_id: $y, before_commit_id: $x}, {event: "labeled", sha: "4444444444444444444444444444444444444444"}]')" \
+  "$(printf '%s' "$FO_HA" | tr a-f A-F)")
+[ "$_hs" = "$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" --arg x "$FO_HX" --arg y "$FO_HY" '[$a, $b, $x, $y, "3333333333333333333333333333333333333333"] | sort')" ] \
+  || { echo "FAIL: failover: head set was $_hs" >&2; exit 1; }
+! crqe_pr_head_set '{"not":"array"}' '[]' "$FO_HA" >/dev/null && ! crqe_pr_head_set '[]' '[]' abc >/dev/null \
+  || { echo "FAIL: failover: a malformed head-set input was accepted" >&2; exit 1; }
 [ "$(crqe_trigger_generation "$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" | jq -sc .)" nathanjohnpayne)" = '[10]' ] \
   || { echo "FAIL: failover: an exempt trigger left the request generation" >&2; exit 1; }
 ! crqe_failover_marker_body abc 10 >/dev/null && ! crqe_failover_marker_body "$FO_HA" 0 >/dev/null \
   || { echo "FAIL: failover: a marker was built from an abbreviated head or a zero id" >&2; exit 1; }
-echo "PASS: failover markers exempt only the requester's own just-posted trigger (#2534)"
+echo "PASS: failover markers exempt only the requester's own just-posted trigger, on a head the PR had (#2534, #2553)"
 
 # #1598: a Codex request the configured author posts AFTER a Phase 4b
 # substitute approval supersedes it, so gate (c) does not clear on that
