@@ -14,6 +14,7 @@ spec_test_map:
   git_identity_hygiene: tests/test_git_identity_hygiene.sh
   approval_triage:
     - tests/test_self_approval_detector.sh
+  daily_feedback_rollup_workflow: tests/test_465_fail_closed.sh
   yq_bootstrap:
     - tests/test_resolve_pr_threads_verified_propagation.sh
   coderabbit_config:

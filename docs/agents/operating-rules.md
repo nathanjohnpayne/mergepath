@@ -176,6 +176,8 @@ Two complementary automations catch unaddressed review feedback at different tim
 
 **`.github/workflows/daily-feedback-rollup.yml`** runs daily at `55 23 * * *` UTC. It scans yesterday's MERGED PRs and surfaces bot review threads that were RESOLVED **without** an associated fix commit or substantive reply. The output splits into two clearly-labeled tracks (substantive / polish) so the high-severity stream stays high-signal even on days with a lot of nit volume.
 
+Provided `since` and `until` dispatch values must be real `YYYY-MM-DD` Gregorian dates; empty values preserve the rollup script's scheduled defaults. The workflow validates them before invoking the script. A provided non-empty `dry_run` value must be `true` or `false`; an empty value remains valid. See [`specs/daily_feedback_rollup_workflow.md`](../../specs/daily_feedback_rollup_workflow.md) for the dispatch contract and native regression.
+
 This catches the class that motivated #234 / #286 / #287: a CodeRabbit Major or Codex P2 the agent resolved as "non-blocking, will fix in a follow-up" — and then nobody wrote down. Captured while the resolving agent's context is still hot.
 
 See `scripts/daily-feedback-rollup.sh` (workhorse) + `scripts/lib/daily-feedback-rollup-helpers.sh` (classifier helpers) + `scripts/resolve-pr-threads.sh --auto-resolve-bots` (the upstream emit-side that tags each resolve with `[mergepath-resolve:<class>]` so the classifier prefers agent-recorded rationale over heuristics).
