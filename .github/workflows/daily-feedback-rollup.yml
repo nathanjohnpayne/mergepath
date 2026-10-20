@@ -103,9 +103,38 @@ jobs:
           for pair in "since:${INPUT_SINCE:-}" "until:${INPUT_UNTIL:-}"; do
             name=${pair%%:*}
             value=${pair#*:}
-            if [ -n "$value" ] && ! [[ "$value" =~ $date_re ]]; then
-              echo "ERROR: input '$name' must be YYYY-MM-DD; refusing to run." >&2
-              exit 1
+            if [ -n "$value" ]; then
+              if ! [[ "$value" =~ $date_re ]]; then
+                echo "ERROR: input '$name' must be YYYY-MM-DD; refusing to run." >&2
+                exit 1
+              fi
+
+              # Validate calendar semantics without depending on platform-
+              # specific date parsing. The shape check above makes each field
+              # safe for explicit base-10 arithmetic (including leading zeroes).
+              year=$((10#${value%%-*}))
+              date_tail=${value#*-}
+              month=$((10#${date_tail%%-*}))
+              day=$((10#${date_tail#*-}))
+              if (( year == 0 || month < 1 || month > 12 )); then
+                echo "ERROR: input '$name' must be a real calendar date; refusing to run." >&2
+                exit 1
+              fi
+              case "$month" in
+                4|6|9|11) max_day=30 ;;
+                2)
+                  if (( year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) )); then
+                    max_day=29
+                  else
+                    max_day=28
+                  fi
+                  ;;
+                *) max_day=31 ;;
+              esac
+              if (( day < 1 || day > max_day )); then
+                echo "ERROR: input '$name' must be a real calendar date; refusing to run." >&2
+                exit 1
+              fi
             fi
           done
           case "${INPUT_DRY_RUN:-}" in

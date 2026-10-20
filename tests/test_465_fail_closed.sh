@@ -439,6 +439,12 @@ if [ -f "$W/daily-feedback-rollup.yml" ]; then
     else
       fail "D13 runtime: dry_run=false incorrectly changed the arguments"
     fi
+    if run_rollup_step 2000-02-29 2024-02-29 false \
+       && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2000-02-29 --until 2024-02-29 " ]; then
+      pass "D13 runtime: Gregorian leap days are accepted and preserved as quoted arguments"
+    else
+      fail "D13 runtime: valid Gregorian leap days were rejected or changed"
+    fi
     if ! run_rollup_step "2026-09-01\"; touch $D13/pwned; \"" "" "" \
        && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
       pass "D13 runtime: a shell-bearing since input is rejected before anything runs"
@@ -463,6 +469,11 @@ until command substitution||$(touch pwned)|false
 until backticks||`touch pwned`|
 dry_run command substitution|||$(touch pwned)
 invalid date shape|2026-1-1||
+impossible February date|2026-02-30||
+non-leap century February 29|1900-02-29||
+impossible month|2026-13-01||
+zero day|2026-01-00||
+zero year|0000-01-01||
 INPUTS
     if ! run_rollup_step $'2026-09-01\ntouch pwned' "" "" \
        && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
