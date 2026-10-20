@@ -385,6 +385,7 @@ cat >> "$FIX/scripts/ci/check_flag" <<'SH'
 SH
 cat >> "$FIX/scripts/ci/check_env" <<'SH'
 [ -z "${GIT_DIR:-}${GIT_INDEX_FILE:-}${GIT_WORK_TREE:-}" ]
+[ -f required-input.txt ]
 d=$(mktemp -d "${TMPDIR:-/tmp}/probe-git.XXXXXX")
 git init -q "$d"
 [ "$(cd "$d" && pwd -P)" = "$(git -C "$d" rev-parse --show-toplevel)" ]
@@ -405,6 +406,8 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
+      - name: install_python_ci_dependencies
+        run: python3 -m pip install "PyYAML==6.0.3" "markdown-it-py==4.2.0"
       - name: setup prelude
         run: touch "$PROBE_DIR/ran.setup"
       - name: check_ok
@@ -461,6 +464,7 @@ jobs:
         run: ./scripts/ci/check_selftested --self-test
 YAML
 printf 'lib\n' > "$FIX/lib/selftested.sh"
+printf 'committed requirement\n' > "$FIX/required-input.txt"
 git -C "$FIX" init -q -b main
 git -C "$FIX" add -A
 git -C "$FIX" commit -q -m base
@@ -576,22 +580,52 @@ check "failing check: remote not updated" "$(remote_tip feat/fail)" "none"
 case "$out" in *"FAIL  check_flag"*) ok "failing check is named" ;; *) bad "failing check not named: $out" ;; esac
 case "$out" in *"--no-verify"*"MERGEPATH_PREPUSH_SKIP=1"*) ok "bypass is documented in the failure" ;; *) bad "bypass hint missing" ;; esac
 
-# The checkout must be the pushed commit: a dirty tracked file, or a push
-# of a branch other than HEAD, is refused rather than tested.
+# Hook checks use the pushed tip even when the original checkout differs.
 reset_probe
 rm -f "$PROBE_DIR/FLAG"
 git -C "$FIX" checkout -q feat/pass
 printf 'dirty\n' >> "$FIX/README.md"
+printf 'untracked\n' > "$FIX/untracked-local.txt"
 rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/dirty 2>&1) || rc=$?
-check "dirty tracked file: push refused" "$rc" "1"
-case "$out" in *"uncommitted changes"*) ok "dirty refusal says why" ;; *) bad "dirty refusal output: $out" ;; esac
-check "dirty tracked file: remote not updated" "$(remote_tip feat/dirty)" "none"
+check "dirty tracked file: committed tip passes" "$rc" "0"
+check "dirty tracked file: remote receives exact commit" "$(remote_tip feat/dirty)" "$(git -C "$FIX" rev-parse feat/pass)"
+check "dirty checkout bytes retained" "$(tail -n 1 "$FIX/README.md")" "dirty"
+check "untracked checkout bytes retained" "$(cat "$FIX/untracked-local.txt")" "untracked"
 git -C "$FIX" checkout -q -- README.md
+rm "$FIX/untracked-local.txt"
 git -C "$FIX" checkout -q main
 rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/other 2>&1) || rc=$?
-check "push of a non-HEAD tip: refused" "$rc" "1"
-case "$out" in *"the checkout is at"*) ok "non-HEAD refusal says why" ;; *) bad "non-HEAD refusal output: $out" ;; esac
-[ ! -f "$PROBE_DIR/ran.check_ok" ] && ok "refused pushes run no checks" || bad "a refused push ran checks"
+check "push of a non-HEAD tip: checks exact committed tree" "$rc" "0"
+check "non-HEAD remote receives pushed tip" "$(remote_tip feat/other)" "$(git -C "$FIX" rev-parse feat/pass)"
+check "original checkout HEAD retained" "$(git -C "$FIX" symbolic-ref --short HEAD)" "main"
+index_before=$(git hash-object "$FIX/.git/index")
+rc=0; out=$(cd "$FIX" && GIT_DIR="$FIX/.git" GIT_WORK_TREE="$FIX" GIT_INDEX_FILE="$FIX/.git/index" git push origin feat/pass:refs/heads/feat/hook-env 2>&1) || rc=$?
+check "explicit hook-local git environment: exact non-HEAD tip passes" "$rc" "0"
+check "hook-local index remains unchanged" "$(git hash-object "$FIX/.git/index")" "$index_before"
+check "hook-local environment remote receives exact tip" "$(remote_tip feat/hook-env)" "$(git -C "$FIX" rev-parse feat/pass)"
+
+# A deleted tracked requirement, recreated only as an untracked local file,
+# must fail exactly as CI does. The old checkout-based runner passes this.
+reset_probe
+commit_change feat/deleted README.md
+git -C "$FIX" rm -q required-input.txt
+git -C "$FIX" commit -q -m 'delete required input'
+printf 'local recreation\n' > "$FIX/required-input.txt"
+rc=0; out=$(cd "$FIX" && git push origin feat/deleted 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "untracked recreation cannot mask committed deletion"; else bad "untracked recreation masked committed deletion"; fi
+case "$out" in *"FAIL  check_env"*) ok "committed deletion fails its actual check" ;; *) bad "committed deletion diagnostic: $out" ;; esac
+check "committed deletion remote not updated" "$(remote_tip feat/deleted)" "none"
+check "untracked recreation is untouched" "$(cat "$FIX/required-input.txt")" 'local recreation'
+rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/multi-good feat/deleted:refs/heads/feat/multi-bad 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "one failing committed tip blocks a multi-branch push"; else bad "multi-branch push ignored failing tip"; fi
+check "multi-branch good ref not updated on failure" "$(remote_tip feat/multi-good)" "none"
+check "multi-branch bad ref not updated on failure" "$(remote_tip feat/multi-bad)" "none"
+rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/multi-first feat/graphed:refs/heads/feat/multi-second 2>&1) || rc=$?
+check "two passing committed tips allow multi-branch push" "$rc" "0"
+check "first multi-branch tip exact" "$(remote_tip feat/multi-first)" "$(git -C "$FIX" rev-parse feat/pass)"
+check "second multi-branch tip exact" "$(remote_tip feat/multi-second)" "$(git -C "$FIX" rev-parse feat/graphed)"
+rm "$FIX/required-input.txt"
+check "owned snapshots retired" "$(git -C "$FIX" worktree list --porcelain | grep -c '^worktree ')" "1"
 git -C "$FIX" checkout -q feat/fail
 touch "$PROBE_DIR/FLAG"
 
@@ -599,6 +633,29 @@ touch "$PROBE_DIR/FLAG"
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/python-bad" git push origin feat/fail:refs/heads/feat/nopy 2>&1) || rc=$?
 check "missing CI Python packages: push refused" "$rc" "1"
 case "$out" in *"no python3 with the CI packages"*) ok "missing packages are named" ;; *) bad "missing packages output: $out" ;; esac
+
+# Real interpreter metadata must match the committed workflow pins. These
+# local fake distributions need no pip/network; the production probe reads
+# their installed metadata under -I, exactly as it does a normal venv.
+python3 -I -m venv --without-pip "$TMP/pin-venv"
+pin_site=$("$TMP/pin-venv/bin/python3" -I -c 'import site; print(site.getsitepackages()[0])')
+mkdir -p "$pin_site/PyYAML-6.0.3.dist-info" "$pin_site/markdown_it_py-4.2.0.dist-info"
+printf '' > "$pin_site/yaml.py"
+printf '' > "$pin_site/markdown_it.py"
+printf 'Name: PyYAML\nVersion: 6.0.3\n' > "$pin_site/PyYAML-6.0.3.dist-info/METADATA"
+printf 'Name: markdown-it-py\nVersion: 0.0.0\n' > "$pin_site/markdown_it_py-4.2.0.dist-info/METADATA"
+rm -f "$PROBE_DIR/FLAG"
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/wrong-md 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "wrong markdown-it-py version refuses deep run"; else bad "wrong markdown-it-py version passed"; fi
+case "$out" in *"workflow pins"*) ok "version mismatch names pinned environment" ;; *) bad "version mismatch diagnostic: $out" ;; esac
+check "wrong markdown version remote not updated" "$(remote_tip feat/wrong-md)" "none"
+printf 'Name: markdown-it-py\nVersion: 4.2.0\n' > "$pin_site/markdown_it_py-4.2.0.dist-info/METADATA"
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/right-pins 2>&1) || rc=$?
+check "exact pinned metadata allows deep run" "$rc" "0"
+printf 'Name: PyYAML\nVersion: 0.0.0\n' > "$pin_site/PyYAML-6.0.3.dist-info/METADATA"
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" git push origin feat/fail:refs/heads/feat/wrong-yaml 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "wrong PyYAML version refuses fast run"; else bad "wrong PyYAML version passed"; fi
+touch "$PROBE_DIR/FLAG"
 
 # Both bypasses.
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_SKIP=1 git push origin feat/fail 2>&1) || rc=$?
