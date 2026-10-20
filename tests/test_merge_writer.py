@@ -221,10 +221,13 @@ class WriterTests(unittest.TestCase):
         os_bin.mkdir()
         # Model an OS without a system YAML parser, independently of the
         # host's installed Ruby/yq. Keep its other fixed utilities real.
+        # os.path.isfile, unlike Path.is_file before Python 3.12, reports an
+        # unstattable entry (macOS /usr/sbin/weakpass_edit raises EACCES) as
+        # not a file instead of raising.
         for directory in system_paths:
             for executable in Path(directory).iterdir():
                 target = os_bin/executable.name
-                if executable.name not in ('ruby', 'yq', 'python3') and executable.is_file() \
+                if executable.name not in ('ruby', 'yq', 'python3') and os.path.isfile(executable) \
                         and os.access(executable, os.X_OK) and not target.exists():
                     target.symlink_to(executable)
         writer.write_text(source[:start] + 'SYSTEM_PATH = ' + repr((str(os_bin),)) + source[end:])
