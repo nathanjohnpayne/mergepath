@@ -13,7 +13,10 @@ COMMAND = re.compile(r"\s*@codex\s+review\s*", re.IGNORECASE)
 # A well-formed owner tiebreak marker (#2511). Only the owner may type one, so
 # no agent-authored body may carry it, in prose or in a code fence. Placeholders
 # such as <PR-URL>@<full-head-sha>#<finding-id> do not match.
-TIEBREAK = re.compile(r"TIEBREAK_REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+", re.IGNORECASE)
+TIEBREAK = re.compile(
+    r"TIEBREAK_(?:REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+|RUNAWAY_ACCEPTED=\S+@[0-9a-f]{40})",
+    re.IGNORECASE,
+)
 GRAPHQL_COMMENTS = frozenset({
     "addComment", "addDiscussionComment", "addPullRequestReview",
     "addPullRequestReviewComment", "addPullRequestReviewThread",

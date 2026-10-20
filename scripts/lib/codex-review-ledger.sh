@@ -422,7 +422,13 @@ crl_human_stops() {
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
                    (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr >= \$ceiling and \$nw >= \$nr then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
-                   (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
+                   (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )
+    | if (.stops | index(\"runaway\")) != null then
+        .runaway_at = (([ \$reqs[] | select(.counted) | .created_at ]
+          + [ \$rs[] | select($__CRL_COUNTS)
+              | select(.window > 0 and \$reqs[.window - 1].counted == true)
+              | (.last_at // .first_at) ]) | max)
+      else . end" 2>/dev/null
 }
 
 # ---- Owner tiebreak on a dispute stop (#2511) ---------------------------------
@@ -437,6 +443,13 @@ crl_human_stops() {
 # <finding-id> is the `finding` of the stop entry: the inline root comment id
 # of a rebutted thread, or the review id of a body finding. The marker clears
 # only that entry, only on that head, and never `blocking-budget` or `runaway`.
+# The separate #2534 owner line settles only runaway:
+#
+#   TIEBREAK_RUNAWAY_ACCEPTED=<canonical-https-PR-URL>@<full-head-sha>
+#
+# It must postdate runaway_at: the latest counted request and counted-window
+# blocking response signal that created the stop. It does not reset counters
+# or settle a dispute; another contributing signal requires a fresh decision.
 # It approves nothing: the stop's waiver still sends the head to the Phase 4b
 # adapter, and every other gate still applies. A marker counts only if its
 # comment is by the configured author, was never edited, and is newer than the
@@ -448,7 +461,8 @@ crl_human_stops() {
 # owner credential) typed it; the record preserves who posted what and when.
 
 # crl_owner_tiebreaks <issue-comments-json> <author> <pr-url> <head>
-# Prints [{finding, comment_id, at}] for every well-formed marker; fails on
+# Prints [{finding, comment_id, at}] for dispute markers and
+# [{kind:"runaway", comment_id, at}] for runaway markers; fails on
 # input that is not one array of comments.
 crl_owner_tiebreaks() {
   printf '%s\n' "$1" | jq -sec --arg author "$2" --arg url "$3" --arg head "$4" '
@@ -462,9 +476,14 @@ crl_owner_tiebreaks() {
         | . as $c
         | ($c.body | split("\n")[]
            | rtrimstr("\r")
-           | capture("^[ \\t]*TIEBREAK_REBUTTAL_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})#(?<finding>[0-9]+)[ \\t]*$")
+           | capture("^[ \\t]*TIEBREAK_(?<kind>REBUTTAL|RUNAWAY)_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})(?:#(?<finding>[0-9]+))?[ \\t]*$")
            | select((.url | ascii_downcase) == ($url | ascii_downcase) and .head == $head)
-           | {finding: (.finding | tonumber), comment_id: $c.id, at: $c.created_at}) ]' 2>/dev/null
+           | if .kind == "REBUTTAL" and .finding != null then
+               {finding: (.finding | tonumber), comment_id: $c.id, at: $c.created_at}
+             elif .kind == "RUNAWAY" and .finding == null
+                  and ($c.id | type) == "number" and $c.id > 0 and ($c.id | floor) == $c.id then
+               {kind:"runaway", comment_id:$c.id, at:$c.created_at}
+             else empty end) ]' 2>/dev/null
 }
 
 # crl_apply_owner_tiebreaks <stops-json> <ledger-json> <tiebreaks-json>
@@ -473,8 +492,18 @@ crl_owner_tiebreaks() {
 # `owner_tiebreaks`. The input is crl_human_stops' output for the same ledger.
 crl_apply_owner_tiebreaks() {
   jq -nec --argjson stops "$1" --argjson ledger "$2" --argjson tb "$3" '
+    # GitHub owner comments have whole-second timestamps. Round the evidence
+    # down, then require a strictly later second: fractional aliases can never
+    # let a same-second or malformed owner timestamp authorize dispatch.
+    def seconds:
+      if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
+      then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
+      else null end;
+    def newer_runaway($at; $floor):
+      ($at | seconds) as $a | ($floor | seconds) as $f
+      | ($a | type) == "number" and ($f | type) == "number" and $a > $f;
     def settled($e; $floor):
-      any($tb[]; (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
+      any($tb[]; .kind != "runaway" and (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
       ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
     ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
@@ -484,10 +513,15 @@ crl_apply_owner_tiebreaks() {
          | {kind: "untested", finding: $e.finding})) as $a
     | ($stops.disagreements | map(. as $e | select(settled($e; ([$e.at, latest_response($e)] | max)))
          | {kind: "disagreement", finding: $e.finding})) as $b
+    | (if ($stops.stops | index("runaway")) != null and ($stops.runaway_at | type) == "string" then
+         [ $tb[] | select(.kind == "runaway" and newer_runaway(.at; $stops.runaway_at)) ]
+         | sort_by(.at, .comment_id) | last
+       else null end) as $runaway
     | $stops
     | .untested_rebuttals = $untested
     | .disagreements = $disagreements
-    | .owner_tiebreaks = ($a + $b)
+    | .owner_tiebreaks = ($a + $b + (if $runaway == null then [] else [$runaway] end))
     | .stops = [ .stops[] | select((. == "untested-rebuttal" and ($untested | length) == 0) | not)
-                          | select((. == "disagreement" and ($disagreements | length) == 0) | not) ]' 2>/dev/null
+                          | select((. == "disagreement" and ($disagreements | length) == 0) | not)
+                          | select((. == "runaway" and $runaway != null) | not) ]' 2>/dev/null
 }
