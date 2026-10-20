@@ -192,6 +192,10 @@ merge_queue_required_workflow_sha: ""
 # ---------------------------------------------------------------------------
 # Review-feedback disposition policy (#574)
 # ---------------------------------------------------------------------------
+# Deferral writes use deferred-to-followup, matching the existing resolver,
+# rollup and feedback ledger vocabulary (the lower-churn choice, #1677).
+# Readers permanently accept deferred-to-follow-up as an alias; stored
+# tags/accounting records are never rewritten just to change spelling.
 # Controls which review findings require disposition before merge. A
 # disposition is a fix, or an explicit rebuttal explaining why the finding does
 # not apply. The absent-block default is the same as this default block:

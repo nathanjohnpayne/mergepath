@@ -195,7 +195,7 @@
         "disposition": {
           "type": "string",
           "enum": [
-            "fixed", "rebutted", "deferred-to-follow-up",
+            "fixed", "rebutted", "deferred-to-followup", "deferred-to-follow-up",
             "accepted-risk", "false-positive", "unresolved"
           ]
         },

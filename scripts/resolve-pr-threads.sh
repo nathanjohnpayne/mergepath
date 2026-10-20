@@ -610,7 +610,7 @@ if [ -n "$TARGET_THREAD" ]; then
   case "$EXPLICIT_DISPOSITION" in
     fixed|addressed-elsewhere) TARGET_CLASS="addressed-elsewhere" ;;
     rebuttal) TARGET_CLASS="rebuttal-recorded" ;;
-    deferred-to-followup) TARGET_CLASS="deferred-to-followup"
+    deferred-to-followup|deferred-to-follow-up) TARGET_CLASS="deferred-to-followup"
       if [ -z "$TARGET_ISSUE" ]; then
         echo "Error: deferred-to-followup requires --issue <number>" >&2
         exit 1
@@ -2625,6 +2625,8 @@ derive_tag_class() {
       rc_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].body // \"\"")
       rc_tag=$(printf '%s' "$rc_body" \
         | sed -n 's/.*\[mergepath-resolve:[[:space:]]*\([a-z][a-z-]*\)[[:space:]]*\].*/\1/p' | head -1)
+      # Permanent persisted alias; all downstream class branches emit canonical.
+      [ "$rc_tag" != "deferred-to-follow-up" ] || rc_tag="deferred-to-followup"
       if [ -n "$rc_tag" ]; then recorded_class="$rc_tag"; last_marker_idx=$rc_i; fi
     else
       last_nonagent_idx=$rc_i
@@ -3004,6 +3006,8 @@ thread_has_current_deferral() {
       [.[] | select(.repo == $repo)
              | select(.comment_id as $id | ($ids | index($id)) != null)]
       | group_by(.comment_id) | map(last)
+      | map(if .disposition == "deferred-to-follow-up"
+            then .disposition = "deferred-to-followup" else . end)
       | if any(.[];
           ((.recorded_at | type == "string" and length > 0)
            and (.disposition == "deferred-to-followup"

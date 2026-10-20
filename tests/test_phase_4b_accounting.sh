@@ -770,7 +770,7 @@ if printf '%s' "$uf" | jq -e '.[0].title == "first line"' >/dev/null; then
 else fail "multi-line title: $uf"; fi
 uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
   | p4b_acct_unique_findings '{"F1":{"disposition":"deferred-to-follow-up","issue":585}}')"
-if printf '%s' "$uf" | jq -e '.[0].disposition == "deferred-to-follow-up" and .[0].issue == 585' >/dev/null; then
+if printf '%s' "$uf" | jq -e '.[0].disposition == "deferred-to-followup" and .[0].issue == 585' >/dev/null; then
   pass "explicit dispositions map applies (issue link recorded)"
 else fail "dispositions map: $uf"; fi
 uf="$(printf '' | p4b_acct_unique_findings)"
@@ -819,7 +819,7 @@ uf="$(printf '%s\n%s\n' \
   '{"loop":2,"severity":"P3","path":null,"line":null,"body":"solo"}' \
   | p4b_acct_unique_findings '' "$FILED")"
 if printf '%s' "$uf" | jq -e '
-    (.[0].id == "F1" and .[0].disposition == "deferred-to-follow-up" and .[0].issue == 701)
+    (.[0].id == "F1" and .[0].disposition == "deferred-to-followup" and .[0].issue == 701)
     and (.[1].id == "F2" and .[1].disposition == "unresolved" and .[1].issue == null)' >/dev/null; then
   pass "filed-issues tuple join sets deferred-to-follow-up + issue on the matched finding only (#675)"
 else fail "filed-issues tuple join: $uf"; fi
@@ -840,7 +840,7 @@ uf="$(printf '%s\n%s\n' \
   '{"loop":2,"severity":"P2","path":"a|1|b","line":2,"body":"c"}' \
   | p4b_acct_unique_findings '' '[{"severity":"P2","path":"a","line":1,"body":"b|2|c","issue":703}]')"
 if printf '%s' "$uf" | jq -e '
-    (.[0].issue == 703 and .[0].disposition == "deferred-to-follow-up")
+    (.[0].issue == 703 and .[0].disposition == "deferred-to-followup")
     and (.[1].issue == null and .[1].disposition == "unresolved")' >/dev/null; then
   pass "filed join respects the collision-proof tuple key ('|'-bearing content) (#675)"
 else fail "filed join collision: $uf"; fi
@@ -1177,6 +1177,18 @@ p4b_acct_build_record "abc" x APPROVED r d posted "" "[$CLEAN_LOOP]" "[]" "{}" "
 echo "accounting.schema.json — golden sample validates + round-trips"
 # ===========================================================================
 jq -e . "$ACCT_SCHEMA" >/dev/null 2>&1 && pass "accounting.schema.json parses" || fail "schema unparseable"
+CANONICAL_GOLDEN=$(printf '%s' "$GOLDEN" | jq -c '.unique_findings |= map(.disposition = "deferred-to-followup")')
+if printf '%s' "$CANONICAL_GOLDEN" | jq -e --slurpfile s "$ACCT_SCHEMA" '
+  all(.unique_findings[]; .disposition as $d
+    | $s[0]."$defs".unique_finding.properties.disposition.enum | index($d) != null)
+' >/dev/null; then pass "canonical deferral envelope validates against schema enum (#1677)"
+else fail "canonical deferral envelope rejected by schema enum (#1677)"; fi
+# Read the historical bytes directly, independently of the renderer.
+legacy_record=$(printf '<!-- p4b-accounting:v1\n%s\n-->\n' "$GOLDEN" | p4b_acct_extract_records)
+if [ "$(printf '%s' "$legacy_record" | jq -S .)" = "$(printf '%s' "$CANONICAL_GOLDEN" | jq -S .)" ]; then
+  pass "historical accounting extraction normalizes only the deferral alias (#1677)"
+else fail "historical accounting extraction did not normalize deferral alias (#1677)"; fi
+
 if jq -e --slurpfile s "$ACCT_SCHEMA" '
     ($s[0]) as $sch
     | (keys | sort) == ($sch.required | sort)
@@ -1220,7 +1232,7 @@ grep -q  -- 'unavailable (unavailable)' <<<"$BLOCK" \
   && pass "loop with no CLI counts renders explicit unavailable" || fail "missing unavailable cell"
 grep -q  -- '\*\*yes\*\* — approval-carried-findings' <<<"$BLOCK" \
   && pass "fail-closed loop rendered as positive safety evidence" || fail "fail-closed loop row missing"
-grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |' <<<"$BLOCK" \
+grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-followup | #585 |' <<<"$BLOCK" \
   && pass "findings table carries content (path/summary), scope, and the follow-up issue link (#615)" \
   || fail "findings row missing"
 grep -qF  'Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0.' <<<"$BLOCK" \
@@ -1296,8 +1308,8 @@ grep -q '| Local gates green | ✅ | check_phase_4b_automation 67/67 green |' <<
   && pass "captured gate evidence renders the gates row green" || fail "gates evidence row wrong"
 
 RT="$(printf '%s\n' "$BLOCK" | p4b_acct_extract_records)"
-if [ "$(printf '%s' "$RT" | jq -S .)" = "$(printf '%s' "$GOLDEN" | jq -S .)" ]; then
-  pass "embedded record round-trips: render → extract == original"
+if [ "$(printf '%s' "$RT" | jq -S .)" = "$(printf '%s' "$GOLDEN" | jq -S '.unique_findings |= map(.disposition = "deferred-to-followup")')" ]; then
+  pass "embedded historical record round-trips to canonical deferral dispositions"
 else fail "round-trip mismatch"; fi
 RT_N="$(printf 'prose mentions p4b-accounting:v1 in passing\n%s\n' "$BLOCK" | p4b_acct_extract_records | wc -l | tr -d '[:space:]')"
 [ "$RT_N" = "1" ] && pass "extractor keys on the comment-open, not bare marker prose" \
@@ -1321,7 +1333,7 @@ HTERMS="$(printf '%s\n' "$HBLOCK" | sed -n '/<!-- p4b-accounting:v1/,$p' | grep 
   && pass "a hostile title cannot terminate the embedded comment early (exactly one --> after the comment-open)" \
   || fail "embedded comment carries $HTERMS terminator line(s)"
 HRT="$(printf '%s\n' "$HBLOCK" | p4b_acct_extract_records)"
-if [ -n "$HRT" ] && [ "$(printf '%s' "$HRT" | jq -S .)" = "$(printf '%s' "$HOSTILE" | jq -S .)" ]; then
+if [ -n "$HRT" ] && [ "$(printf '%s' "$HRT" | jq -S .)" = "$(printf '%s' "$HOSTILE" | jq -S '.unique_findings |= map(.disposition = "deferred-to-followup")')" ]; then
   pass "hostile-title record round-trips: render → extract == original (#615 round 2)"
 else fail "hostile round-trip mismatch: $HRT"; fi
 BADREC="$(printf '%s' "$GOLDEN" | jq -c '.loops[0].findings.P1 = 3')"
@@ -1476,7 +1488,7 @@ PRIOR_BODY="$WORK/prior-review-body.txt"
 set +e
 out="$(PATH="$BIN:$PATH" P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_fetch_prior_records o/r)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -S .)" = "$(printf '%s' "$GOLDEN" | jq -S .)" ]; then
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -S .)" = "$(printf '%s' "$CANONICAL_GOLDEN" | jq -S .)" ]; then
   pass "fetch pulls prior review bodies via the PATH-shimmed gh and re-emits the embedded record"
 else fail "fetch happy path (rc=$rc, out=$out)"; fi
 set +e
@@ -1588,8 +1600,8 @@ PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_PAGE_DIR="$PAGES_DIR" \
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(grep -c . "$WORK/fetch-pages.jsonl")" = "2" ] \
-   && [ "$(jq -s -S '.[0]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$GOLDEN" | jq -S .)" ] \
-   && [ "$(jq -s -S '.[1]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$REC2" | jq -S .)" ]; then
+   && [ "$(jq -s -S '.[0]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$CANONICAL_GOLDEN" | jq -S .)" ] \
+   && [ "$(jq -s -S '.[1]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$REC2" | jq -S '.unique_findings |= map(.disposition = "deferred-to-followup")')" ]; then
   pass "fetch follows pageInfo.endCursor: trusted records from BOTH pages, in scan order (#615 round 3)"
 else fail "pagination (rc=$rc, out=$(cat "$WORK/fetch-pages.jsonl" 2>/dev/null))"; fi
 [ "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}" = "false" ] && [ "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}" = "3" ] \

@@ -999,6 +999,27 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# #1677: both persisted marker spellings override the nitpick heuristic.
+# This catches alias loss; merely checking the generic surface default cannot.
+for alias in deferred-to-followup deferred-to-follow-up; do
+  alias_threads=$(printf '%s' "$THREADS_T13" | jq -c --arg alias "$alias" '
+    .data.repository.pullRequest.reviewThreads.nodes[0]
+      |= (.commentsFirst.nodes[0].body = "🧹 Nitpick: something deferred earlier"
+          | .allComments.nodes[1].body = ("[mergepath-resolve: " + $alias + "] deferred earlier"))')
+  GH_ARGV_LOG="$SCRATCH/t1677-$alias.log"; : > "$GH_ARGV_LOG"
+  make_gh_stub "$SCRATCH/gh-real" "$alias_threads" '[]' '[]'
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "  PASS: persisted $alias marker is honored and emits canonical deferral"
+  else fail=$((fail + 1)); echo "  FAIL: persisted $alias marker lost explicit deferral (rc=$rc)" >&2; echo "$out" >&2; fi
+done
+
 # ─────────────────────────────────────────────────────────────────────
 # Test 14 (#564, CodeRabbit Major on #565): a STALE actioned marker is NOT
 # honored when the bot posts fresh feedback after it. Thread: finding →
@@ -2189,18 +2210,22 @@ fi
 T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
 T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
 T1010_COMMITS_SAVE="$COMMITS_T990"
-for variant in bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed incomplete incomplete-replied incomplete-restored; do
+for variant in legacy-bare legacy-replied legacy-fixed bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed incomplete incomplete-replied incomplete-restored; do
   COMMITS_T990="$T1010_COMMITS_SAVE"
   cat > "$T1010_LEDGER" <<'JSON'
 {"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
 {"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-04T00:00:00Z"}
 JSON
+  case "$variant" in legacy-*)
+    jq -c 'if .disposition == "deferred-to-followup" then .disposition = "deferred-to-follow-up" else . end' "$T1010_LEDGER" > "$T1010_LEDGER.tmp"
+    mv "$T1010_LEDGER.tmp" "$T1010_LEDGER" ;;
+  esac
   comments="$T990_B_BARE"; expected_rc=3; expected_resolved="PRT_990A "
-  if [ "$variant" = replied ] || [ "$variant" = same-second ]; then comments="$T1010_REPLIED"; fi
+  if [ "$variant" = replied ] || [ "$variant" = same-second ] || [ "$variant" = legacy-replied ]; then comments="$T1010_REPLIED"; fi
   if [ "$variant" = same-second ]; then
     printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
   fi
-  if [ "$variant" = fixed ]; then
+  if [ "$variant" = fixed ] || [ "$variant" = legacy-fixed ]; then
     printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
     expected_rc=0; expected_resolved="PRT_990A PRT_990B "
   fi
@@ -2319,13 +2344,16 @@ TARGET_THREADS=$(jq -c '
        | .commentsFirst.nodes[0].databaseId=2001)]
   | .data.repository.pullRequest.reviewThreads.totalCount=2
 ' <<<"$THREADS_T1")
-for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-stdout-failure tag-stderr-failure tag-warning tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
+for scenario in deferred-touched deferred-alias missing-alias-issue invalid-alias-issue fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-stdout-failure tag-stderr-failure tag-warning tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
   fixture="$TARGET_THREADS"
   args=(--thread 1001 --disposition fixed --commit abc1234567)
   expected_tag=addressed-elsewhere
   expected_rc=0
   case "$scenario" in
     deferred-touched) args=(--thread 1001 --disposition deferred-to-followup --issue 2196); expected_tag=deferred-to-followup ;;
+    deferred-alias) args=(--thread 1001 --disposition deferred-to-follow-up --issue 2196); expected_tag=deferred-to-followup ;;
+    missing-alias-issue) args=(--thread 1001 --disposition deferred-to-follow-up); expected_rc=1 ;;
+    invalid-alias-issue) args=(--thread 1001 --disposition deferred-to-follow-up --issue 0); expected_rc=1 ;;
     fixed-cross-file) args+=(--rationale 'Fixed the shared caller in another file.') ;;
     rebuttal) args=(--thread 1001 --disposition rebuttal --rationale 'The finding assumes an input this interface cannot accept.'); expected_tag=rebuttal-recorded ;;
     node-selector) args=(--thread PRT_1 --disposition addressed-elsewhere) ;;
