@@ -552,9 +552,9 @@ STUB
 fi
 
 # JSON values derived from API arrays must also survive the requester's own
-# scan pipeline under xpg_echo. Exercise the extracted production scan with
-# small deterministic selectors so the review/finding bodies remain visible
-# in the returned JSON rather than merely checking source spelling.
+# scan pipeline under xpg_echo. Exercise the extracted production scan and
+# source its real shared evidence selectors so review/finding bodies and the
+# selected current-head review summary remain visible in returned JSON.
 SCAN_JSON_FN="$(sed -n '/^scan_codex_state() {/,/^}/p' "$SCRIPT")"
 if [ -z "$SCAN_JSON_FN" ]; then
   fail "could not extract scan_codex_state for xpg_echo JSON round-trip"
@@ -575,6 +575,13 @@ else
       "Codex Review: Didnt find any major issues." "$HEAD_SHA" "$body")
     FIXTURE_ISSUE_COMMENTS=$(jq -cn --arg body "$verdict_body" --arg bot "$BOT_LOGIN" \
       "[{id:10,user:{login:\$bot},body:\$body,created_at:\"2026-01-01T00:00:01Z\"}]")
+    summary_body=$(printf "%s\n%s\n%s" \
+      "<!-- codex-pull-request-review-summary -->" \
+      "| 📝 **Code Review** | **Running** | \`$HEAD_SHA\` | @codex review |" \
+      "Review note: line one\\nline two\\\\path")
+    FIXTURE_ISSUE_COMMENTS=$(jq -cn --argjson comments "$FIXTURE_ISSUE_COMMENTS" \
+      --arg body "$summary_body" --arg bot "$BOT_LOGIN" \
+      "\$comments + [{id:11,user:{login:\$bot},body:\$body,created_at:\"2026-01-01T00:00:02Z\",updated_at:\"2026-01-01T00:00:03Z\"}]")
     fetch_scan_array() {
       case "$1" in
         */reviews) printf "[]\\n" ;;
@@ -582,26 +589,34 @@ else
         */issues/*/comments) printf "%s\\n" "$FIXTURE_ISSUE_COMMENTS" ;;
       esac
     }
+    . "$2"
     crqe_resolve_verdict_anchors() { printf "%s" "$1"; }
     crqe_select_head_review() { printf "%s" "$FIXTURE_REVIEW"; }
     crqe_review_approval_time() { printf ""; }
     crqe_select_trigger() { printf "null"; }
-    crqe_select_codex_review_summary() { printf "null"; }
     crqe_filter_provider_block() { printf "%s" "$1"; }
     eval "$1"
     if scan=$(scan_codex_state); then
+      summary=not-selected
       if printf "%s" "$scan" | jq -e --arg body "$body" \
-        ".review.body == \$body and .findings[0].body == \$body and .findings[0].priority == \"P1\" and .verdict.affirmative == true" >/dev/null; then
-        printf "scan JSON preserved\\n"
+        ".review.body == \$body and .findings[0].body == \$body and .findings[0].priority == \"P1\" and .verdict.affirmative == true" >/dev/null \
+        && summary=$(crqe_select_codex_review_summary "$FIXTURE_ISSUE_COMMENTS" "$BOT_LOGIN" "$HEAD_SHA") \
+        && printf "%s" "$summary" | jq -e --arg sha "$HEAD_SHA" \
+          ".status == \"running\" and .commit == \$sha and .observed_at == \"2026-01-01T00:00:03Z\" and .comment_id == 11 and .trigger == \"@codex review\"" >/dev/null; then
+        printf "scan and selected summary JSON preserved\\n"
       else
-        printf "scan JSON mismatch\\n"
+        printf "scan or selected summary JSON mismatch\\n"
+        printf "selected summary: %s\\nscan: %s\\n" "$summary" "$scan"
       fi
     else
       printf "scan execution failed\\n"
     fi
-  ' _ "$SCAN_JSON_FN" 2>/dev/null)"
-  if [ "$scan_xpg_echo_output" = "scan JSON preserved" ]; then
-    pass "scan_codex_state: review and finding JSON strings survive newline/backslash escapes with xpg_echo enabled"
+  ' _ "$SCAN_JSON_FN" "$ROOT/scripts/lib/codex-request-evidence.sh" 2>&1)" || {
+    inner_rc=$?
+    scan_xpg_echo_output="inner exit $inner_rc: $scan_xpg_echo_output"
+  }
+  if [ "$scan_xpg_echo_output" = "scan and selected summary JSON preserved" ]; then
+    pass "scan_codex_state: review/finding JSON and real current-head summary selection survive newline/backslash escapes with xpg_echo enabled"
   else
     fail "scan_codex_state corrupted an API JSON payload with xpg_echo enabled; got: $scan_xpg_echo_output"
   fi
