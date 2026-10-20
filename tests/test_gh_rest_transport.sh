@@ -397,7 +397,7 @@ refused_rest() { # <label> <wrapper fn> <args...>; expects rc 1, the form in the
   set +e
   err="$(MERGEPATH_GH_TRANSPORT=rest "$fn" -- "$@" 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -qE 'the REST transport accepts exactly|comment-trigger-guard:' && log_lacks $'--method\tPOST' && log_lacks $'--method\tPATCH' && log_lacks $'--method\tDELETE'; then
+  if [ "$rc" -eq 1 ] && grep -qE 'the REST transport accepts exactly|comment-trigger-guard:' <<<"$err" && log_lacks $'--method\tPOST' && log_lacks $'--method\tPATCH' && log_lacks $'--method\tDELETE'; then
     pass "refused before any write: $label"
   else
     fail "$label: rc=$rc err=$err"; cat "$LOGF" >&2

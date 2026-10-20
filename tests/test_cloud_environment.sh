@@ -227,7 +227,7 @@ if [ "$(grep -Fxc 'probe_elapsed=$((SECONDS - hook_started))' "$HOOK_VIRTUAL")" 
     : >"$WORKDIR/timeout.log"
     out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" TEST_VIRTUAL_ELAPSED=0 MERGEPATH_CLOUD_PROBE_TIMEOUT="$requested" PATH="$HBIN" bash "$HOOK_VIRTUAL")"; rc=$?
     noticed=no
-    printf '%s' "$out" | grep -q 'MERGEPATH_CLOUD_PROBE_TIMEOUT must be a positive whole number below 120' && noticed=yes
+    grep -q 'MERGEPATH_CLOUD_PROBE_TIMEOUT must be a positive whole number below 120' <<<"$out" && noticed=yes
     if [ "$expected" = deadline ]; then
       bound_ok=no
       if awk -v line="$(tail -1 "$WORKDIR/timeout.log")" 'BEGIN { split(line, a, " "); exit !(a[1] == "timeout" && a[2] > 0 && a[2] <= 115) }'; then

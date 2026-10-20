@@ -99,14 +99,14 @@ rc=$?
 set -e
 body="$(cat "$WORKDIR/body.md" 2>/dev/null || true)"
 if [ "$rc" -eq 0 ] \
-   && printf '%s' "$body" | grep -q "<!-- mergepath-handback: v1 head=$HEAD blocked=graphql -->" \
-   && printf '%s' "$body" | grep -q 'Blocked capability:\*\* `graphql`' \
-   && printf '%s' "$body" | grep -q 'Session tier:\*\* `author-writes,reviewer-writes` (surface: `claude-cloud`)' \
-   && printf '%s' "$body" | grep -q "Review feedback at this head:\*\* 7 posted, 7 accounted" \
-   && printf '%s' "$body" | grep -q "https://claude.ai/code/session_abc123" \
-   && printf '%s' "$body" | grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned" \
-   && printf '%s' "$body" | grep -q "only once the step it stands for has completed: a dispatch that returned is not completion" \
-   && printf '%s' "$body" | grep -qF 'scripts/dispatch-thread-resolution-lane.sh 12` dispatches the lane and waits for its own run'; then
+   && grep -q "<!-- mergepath-handback: v1 head=$HEAD blocked=graphql -->" <<<"$body" \
+   && grep -q 'Blocked capability:\*\* `graphql`' <<<"$body" \
+   && grep -q 'Session tier:\*\* `author-writes,reviewer-writes` (surface: `claude-cloud`)' <<<"$body" \
+   && grep -q "Review feedback at this head:\*\* 7 posted, 7 accounted" <<<"$body" \
+   && grep -q "https://claude.ai/code/session_abc123" <<<"$body" \
+   && grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned" <<<"$body" \
+   && grep -q "only once the step it stands for has completed: a dispatch that returned is not completion" <<<"$body" \
+   && grep -qF 'scripts/dispatch-thread-resolution-lane.sh 12` dispatches the lane and waits for its own run' <<<"$body"; then
   pass "handback comment records capability, tier, head, accounting, session URL and the next command"
 else
   fail "happy path: rc=$rc err=$(cat "$WORKDIR/err") body=$body"
