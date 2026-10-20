@@ -405,6 +405,117 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Post-resolution list faults must keep triage runnable (#1374). Copy the
+# actual loader and scalar helper; replace only its resolver/list subprocesses
+# and jq with narrow shims. Both pipeline stages can fail after partial stdout.
+# Exercise all four faults with resolver-owned and caller-owned policy files.
+# ---------------------------------------------------------------------------
+FAULT_TREE="$WORK/list-fault-tree"
+mkdir -p "$FAULT_TREE/scripts/workflow" "$FAULT_TREE/scripts/lib" "$FAULT_TREE/bin"
+cp "$LOADER" "$FAULT_TREE/scripts/workflow/load_review_config.sh"
+cp "$SCALAR_HELPER" "$FAULT_TREE/scripts/lib/review-policy-scalar.sh"
+export FAULT_REAL_PARSER="$ROOT/scripts/workflow/parse_policy_list.sh"
+export FAULT_REAL_JQ
+FAULT_REAL_JQ=$(command -v jq)
+export FAULT_TREE
+cat > "$FAULT_TREE/scripts/workflow/resolve_base_policy.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$FAULT_CONFIG"
+STUB
+cat > "$FAULT_TREE/scripts/workflow/parse_policy_list.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$2" >> "$FAULT_TREE/parser-calls"
+if [ "$FAULT_STAGE" = parser ] && [ "$2" = "$FAULT_KEY" ]; then
+  printf '%s\n' partial-policy-data
+  echo "injected parser failure: $2" >&2
+  exit 75
+fi
+exec bash "$FAULT_REAL_PARSER" "$@"
+STUB
+cat > "$FAULT_TREE/bin/jq" <<'STUB'
+#!/usr/bin/env bash
+count=$(cat "$FAULT_TREE/jq-count")
+count=$((count + 1))
+printf '%s\n' "$count" > "$FAULT_TREE/jq-count"
+cat > "$FAULT_TREE/jq-input"
+if [ "$FAULT_STAGE" = jq ] && [ "$count" -eq "$FAULT_JQ_CALL" ]; then
+  printf '%s\n' '["partial-policy-data"]'
+  echo "injected jq failure: $FAULT_KEY" >&2
+  exit 76
+fi
+exec "$FAULT_REAL_JQ" "$@" < "$FAULT_TREE/jq-input"
+STUB
+chmod +x "$FAULT_TREE/bin/jq"
+printf 'threshold=0\npaths=[]\nreviewers=[]\nauthor_identity=\n' > "$FAULT_TREE/expected-defaults"
+cp "$DEFAULT_CONFIG" "$FAULT_TREE/default-before.yml"
+export FAULT_CONFIG FAULT_STAGE FAULT_KEY FAULT_JQ_CALL
+for ownership in temporary default; do
+  FAULT_STAGE=none
+  FAULT_KEY=none
+  FAULT_JQ_CALL=0
+  if [ "$ownership" = temporary ]; then
+    FAULT_CONFIG="$FAULT_TREE/resolved-policy.yml"
+    cp "$BASE_POLICY" "$FAULT_CONFIG"
+    printf 'threshold=25\npaths=["release/**"]\nreviewers=["nathanpayne-codex"]\nauthor_identity=release-bot\n' > "$FAULT_TREE/expected-normal"
+  else
+    FAULT_CONFIG="$DEFAULT_CONFIG"
+    printf 'threshold=300\npaths=["src/auth/**",".github/**"]\nreviewers=["nathanpayne-claude","nathanpayne-cursor"]\nauthor_identity=nathanjohnpayne\n' > "$FAULT_TREE/expected-normal"
+  fi
+  printf '0\n' > "$FAULT_TREE/jq-count"
+  : > "$OUT_FILE"
+  LOG=$(PATH="$FAULT_TREE/bin:$PATH" bash "$FAULT_TREE/scripts/workflow/load_review_config.sh" \
+    --repo "$REPO" --base-ref release/1.x --base-sha basesha1 \
+    --default-branch main --default-config "$DEFAULT_CONFIG" --output "$OUT_FILE" \
+    2> "$WORK/err.txt") && RC=0 || RC=$?
+  if [ "$RC" -eq 0 ] && cmp -s "$FAULT_TREE/expected-normal" "$OUT_FILE" \
+     && cmp -s "$FAULT_TREE/default-before.yml" "$DEFAULT_CONFIG" \
+     && { [ "$ownership" = default ] || [ ! -e "$FAULT_CONFIG" ]; }; then
+    pass "fault fixture preserves normal outputs and $ownership policy ownership (#1374 control)"
+  else
+    fail "fault fixture normal $ownership policy (rc=$RC): $(cat "$OUT_FILE") $(cat "$WORK/err.txt")"
+  fi
+done
+
+for ownership in temporary default; do
+  if [ "$ownership" = temporary ]; then
+    FAULT_CONFIG="$FAULT_TREE/resolved-policy.yml"
+  else
+    FAULT_CONFIG="$DEFAULT_CONFIG"
+  fi
+  for FAULT_STAGE in parser jq; do
+    FAULT_JQ_CALL=0
+    for FAULT_KEY in external_review_paths available_reviewers; do
+      FAULT_JQ_CALL=$((FAULT_JQ_CALL + 1))
+      [ "$ownership" = default ] || cp "$BASE_POLICY" "$FAULT_CONFIG"
+      printf '0\n' > "$FAULT_TREE/jq-count"
+      : > "$FAULT_TREE/parser-calls"
+      : > "$OUT_FILE"
+      : > "$CALLS_LOG"
+      LOG=$(PATH="$FAULT_TREE/bin:$PATH" bash "$FAULT_TREE/scripts/workflow/load_review_config.sh" \
+        --repo "$REPO" --base-ref release/1.x --base-sha basesha1 \
+        --default-branch main --default-config "$DEFAULT_CONFIG" --output "$OUT_FILE" \
+        2> "$WORK/err.txt") && RC=0 || RC=$?
+      case_ok=1
+      [ "$RC" -eq 0 ] && cmp -s "$FAULT_TREE/expected-defaults" "$OUT_FILE" || case_ok=0
+      grep -Fq "injected $FAULT_STAGE failure: $FAULT_KEY" "$WORK/err.txt" || case_ok=0
+      grep -Fxq "$FAULT_KEY" "$FAULT_TREE/parser-calls" || case_ok=0
+      grep -q '::warning::' <<< "$LOG" || case_ok=0
+      cmp -s "$FAULT_TREE/default-before.yml" "$DEFAULT_CONFIG" || case_ok=0
+      [ "$ownership" = default ] || [ ! -e "$FAULT_CONFIG" ] || case_ok=0
+      [ ! -s "$CALLS_LOG" ] || case_ok=0
+      if [ "$case_ok" -eq 1 ]; then
+        pass "$FAULT_STAGE/$FAULT_KEY failure emits only four defaults, exits 0 and respects $ownership policy ownership (#1374)"
+      else
+        fail "$FAULT_STAGE/$FAULT_KEY failure with $ownership policy (rc=$RC policy_exists=$([ -e "$FAULT_CONFIG" ] && echo yes || echo no)): $(cat "$OUT_FILE") $(cat "$WORK/err.txt")"
+      fi
+      # Retire the intentionally leaked old-loader fixture after recording its
+      # failure, so each known-bad case starts with the same isolated state.
+      [ "$ownership" = default ] || rm -f "$FAULT_CONFIG"
+    done
+  done
+done
+
+# ---------------------------------------------------------------------------
 # 5. The `load-config` STEP as the runner executes it — bootstrap skew.
 #
 #    The step's `actions/checkout` is pinned to the DEFAULT branch so the

@@ -52,8 +52,8 @@ set -euo pipefail
 #
 # FAILURE HANDLING
 #
-# A resolver failure means the governing policy is UNKNOWN. This script then
-# emits FAIL-CLOSED outputs and exits 0:
+# A resolver or list-extraction failure leaves the governing configuration
+# unproven. This script emits FAIL-CLOSED outputs and exits 0:
 #
 #   reviewers=[]        no account matches the reviewer allow-list, so `assign`
 #                       assigns nobody and the readiness-admission gate refuses
@@ -123,13 +123,17 @@ command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" 
 
 emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
-if [ ! -f "$SCALAR_HELPER" ]; then
-  echo "::warning::$SCALAR_HELPER is not available in this trusted checkout; emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0."
+fail_closed() {
   emit threshold "0"
   emit paths "[]"
   emit reviewers "[]"
   emit author_identity ""
   exit 0
+}
+
+if [ ! -f "$SCALAR_HELPER" ]; then
+  echo "::warning::$SCALAR_HELPER is not available in this trusted checkout; emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0."
+  fail_closed
 fi
 # shellcheck source=../lib/review-policy-scalar.sh
 source "$SCALAR_HELPER"
@@ -184,12 +188,11 @@ set -e
 
 if [ "$resolve_rc" -ne 0 ] || [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
   echo "::warning::Could not resolve the review policy governing base '$BASE_REF' (rc=$resolve_rc); emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0 — rather than exporting identities from a policy that may not govern this PR (#788)."
-  emit threshold "0"
-  emit paths "[]"
-  emit reviewers "[]"
-  emit author_identity ""
-  exit 0
+  fail_closed
 fi
+
+# Only the resolver's non-default materialization belongs to this loader.
+cleanup_config() { [ "$CONFIG" = "$DEFAULT_CONFIG" ] || rm -f "$CONFIG"; }
 
 if [ "$CONFIG" = "$DEFAULT_CONFIG" ]; then
   echo "Governing review policy: $CONFIG (base '$BASE_REF' is the default branch, or predates the policy file)"
@@ -214,10 +217,16 @@ fi
 # nothing, so a policy without the key yields the empty value the callers
 # already handle, without a `|| true` guard against `pipefail` aborting the
 # step (a failed load-config SKIPS triage — see FAILURE HANDLING above).
-PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths \
-  | jq -R -s -c 'split("\n") | map(select(length > 0))')
-REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
-  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+# Guard each complete pipeline: pipefail reports either the list reader or jq
+# failing, including a producer that wrote partial data before its failure.
+if ! PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths \
+  | jq -R -s -c 'split("\n") | map(select(length > 0))') \
+  || ! REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
+  | jq -R -s -c 'split("\n") | map(select(length > 0))'); then
+  cleanup_config
+  echo "::warning::Could not extract the governing review policy lists; emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0 (#1374)."
+  fail_closed
+fi
 THRESHOLD=$(review_policy_scalar "$CONFIG" external_review_threshold)
 AUTHOR=$(review_policy_scalar "$CONFIG" author_identity)
 
@@ -228,7 +237,7 @@ AUTHOR=$(review_policy_scalar "$CONFIG" author_identity)
 # The resolver's contract: a non-default base returns a TEMP file and the
 # caller owns cleanup. The default-config path is the caller's own checkout and
 # must never be deleted.
-[ "$CONFIG" = "$DEFAULT_CONFIG" ] || rm -f "$CONFIG"
+cleanup_config
 
 emit threshold "$THRESHOLD"
 emit paths "$PATHS"

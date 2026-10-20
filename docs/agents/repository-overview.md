@@ -14,6 +14,8 @@ This repository is **Mergepath**, the reference implementation of the AI Agent T
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
 
+The governing-policy loader preserves four fail-closed outputs and exit 0 after either list pipeline fails, so dependent triage stays runnable; resolver-owned cleanup and caller-owned policy preservation are specified in [`specs/load_review_config.md`](../../specs/load_review_config.md) and exercised by `tests/test_load_review_config.sh` (#1374).
+
 Scoped owner admin authorization inventories check runs and commit statuses through exact-head cursor pagination, validates complete counts and compares observations before publication and at the final writer boundary. Its unchanged authorization-record format, safety gates and malformed/drifting-page controls are specified in [`specs/owner_admin_override.md`](../../specs/owner_admin_override.md) and exercised by `tests/test_owner_admin_override.py`.
 
 The read-only credential-isolation audit reports matched authority names from its fixed inventory, without copying secret metadata into diagnostic labels. The output contract and regression coverage are in `specs/credential_isolation.md` and `tests/test_credential_isolation.py`.
