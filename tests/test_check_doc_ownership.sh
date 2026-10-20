@@ -137,7 +137,7 @@ docs/agents/hub.md"
 set +e
 out=$(run_with_fixture "$MANIFEST_OK" "$PATHS_OK"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS (3 docs/agents doc"; then
+if [ "$rc" = "0" ] && grep -q "check_doc_ownership: PASS (3 docs/agents doc" <<<"$out"; then
   pass "Case 1: one doc per class, canonical backed by a paths: entry"
 else
   fail "Case 1 unexpected (rc=$rc): $out"
@@ -157,7 +157,7 @@ docs/agents/orphan.md"
 set +e
 out=$(run_with_fixture "$MANIFEST_ZERO" "$PATHS_ZERO"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/orphan.md' has NO ownership class"; then
+if [ "$rc" = "1" ] && grep -q "'docs/agents/orphan.md' has NO ownership class" <<<"$out"; then
   pass "Case 2: unclassified doc on disk fails closed (zero classes)"
 else
   fail "Case 2 unexpected (rc=$rc): $out"
@@ -176,7 +176,7 @@ PATHS_DUP="docs/agents/local.md"
 set +e
 out=$(run_with_fixture "$MANIFEST_DUP" "$PATHS_DUP"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "is declared more than once in doc_ownership"; then
+if [ "$rc" = "1" ] && grep -q "is declared more than once in doc_ownership" <<<"$out"; then
   pass "Case 3: duplicate declaration fails closed (more than one class)"
 else
   fail "Case 3 unexpected (rc=$rc): $out"
@@ -192,7 +192,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_NESTED_ZERO" "$(printf 'docs/agents/local.md\ndocs/agents/security/rules.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/security/rules.md' has NO ownership class"; then
+if [ "$rc" = "1" ] && grep -q "'docs/agents/security/rules.md' has NO ownership class" <<<"$out"; then
   pass "Case 2b: unclassified nested agent doc fails closed"
 else
   fail "Case 2b unexpected (rc=$rc): $out"
@@ -214,7 +214,7 @@ out=$(MERGEPATH_MANIFEST_PATH="$SYMLINK_FIX/manifest.yml" \
   MERGEPATH_REPO_ROOT="$SYMLINK_FIX" bash "$CHECK" 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/orphan.md' is a symbolic link"; then
+if [ "$rc" = "1" ] && grep -q "'docs/agents/orphan.md' is a symbolic link" <<<"$out"; then
   pass "Case 2c: undeclared symlinked Markdown path is enumerated and rejected"
 else
   fail "Case 2c unexpected (rc=$rc): $out"
@@ -237,7 +237,7 @@ out=$(MERGEPATH_MANIFEST_PATH="$SYMLINK_FIX/manifest.yml" \
   MERGEPATH_REPO_ROOT="$SYMLINK_FIX" bash "$CHECK" 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/linked.md' is a symbolic link"; then
+if [ "$rc" = "1" ] && grep -q "'docs/agents/linked.md' is a symbolic link" <<<"$out"; then
   pass "Case 2c2: declared symlink is rejected instead of accepted by -f"
 else
   fail "Case 2c2 unexpected (rc=$rc): $out"
@@ -256,7 +256,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_DUP_SAME" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "is declared more than once in doc_ownership"; then
+if [ "$rc" = "1" ] && grep -q "is declared more than once in doc_ownership" <<<"$out"; then
   pass "Case 3b: duplicate with an identical class still fails closed"
 else
   fail "Case 3b unexpected (rc=$rc): $out"
@@ -272,7 +272,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_BADCLASS" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has class 'bootstrap-seeded' — must be exactly one of"; then
+if [ "$rc" = "1" ] && grep -q "has class 'bootstrap-seeded' — must be exactly one of" <<<"$out"; then
   pass "Case 4: unknown class ('bootstrap-seeded' is delivery, not ownership) fails closed"
 else
   fail "Case 4 unexpected (rc=$rc): $out"
@@ -288,7 +288,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_STALE" "docs/agents/"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "but that file does not exist in this repo"; then
+if [ "$rc" = "1" ] && grep -q "but that file does not exist in this repo" <<<"$out"; then
   pass "Case 5: stale entry for a deleted doc fails closed"
 else
   fail "Case 5 unexpected (rc=$rc): $out"
@@ -304,7 +304,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_UNBACKED" "docs/agents/shared.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry"; then
+if [ "$rc" = "1" ] && grep -q "has no 'type: canonical' paths entry" <<<"$out"; then
   pass "Case 6: unbacked canonical claim fails closed"
 else
   fail "Case 6 unexpected (rc=$rc): $out"
@@ -328,6 +328,105 @@ else
   fail "Case 7 unexpected (rc=$rc): $out"
 fi
 
+# --- Case 7d: pending debt ends only when qualifying backing lands (#808) ---
+# Exercise the same document through absent, partial and complete backing.
+# Kit containment and templated/source spellings are not canonical backing.
+assert_pending_backing() {
+  local label="$1" backing="$2" expected="$3" fixture out rc
+  fixture="$MIN_HEADER
+paths:
+$backing
+doc_ownership:
+  - path: ./docs/agents/shared.md
+    class: canonical
+    pending_manifest: true
+    note: add fleet-wide canonical propagation in the follow-up
+"
+  set +e
+  out=$(run_with_fixture "$fixture" "$(printf 'docs/agents/shared.md\ntemplates/shared.md')"); rc=$?
+  set -e
+  if [ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || grep -q "redundant pending_manifest: true" <<<"$out"; }; then
+    pass "Case 7d: $label"
+  else
+    fail "Case 7d $label unexpected (rc=$rc): $out"
+  fi
+}
+assert_pending_backing "fleet-wide canonical backing rejects the pending flag" '  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all' 1
+assert_pending_backing "normalized canonical path and same destination reject the pending flag" '  - path: ./docs/agents/shared.md
+    dest: docs/agents/shared.md
+    type: canonical
+    consumers: all' 1
+assert_pending_backing "a full-fleet carrier rejects pending even beside a subset carrier" '  - path: docs/agents/shared.md
+    type: canonical
+    consumers: [example]
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all' 1
+assert_pending_backing "subset-only backing remains transitional" '  - path: docs/agents/shared.md
+    type: canonical
+    consumers: [example]' 0
+assert_pending_backing "a missing consumer scope remains transitional" '  - path: docs/agents/shared.md
+    type: canonical' 0
+assert_pending_backing "templated delivery remains transitional" '  - path: docs/agents/shared.md
+    source: templates/shared.md
+    type: templated
+    consumers: all' 0
+assert_pending_backing "kit containment remains transitional" '  - path: docs/agents/
+    type: kit
+    consumers: all' 0
+assert_pending_backing "an unrelated canonical path cannot supply backing through source" '  - path: templates/shared.md
+    source: docs/agents/shared.md
+    type: canonical
+    consumers: all' 0
+
+# A real destination remap remains invalid for its existing reason, rather
+# than becoming qualifying backing just because pending is present.
+set +e
+out=$(run_with_fixture "$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    dest: templates/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+    pending_manifest: true
+    note: delivery is not yet supported
+" "$(printf 'docs/agents/shared.md\ntemplates/shared.md')"); rc=$?
+set -e
+if [ "$rc" = 1 ] && grep -q 'remove the unsupported dest remap' <<<"$out" \
+   && ! grep -q 'redundant pending_manifest' <<<"$out"; then
+  pass "Case 7d: unsupported remaps fail without claiming qualifying backing"
+else
+  fail "Case 7d remap unexpected (rc=$rc): $out"
+fi
+
+# Removing the transitional flag (or explicitly setting false) completes
+# ownership's transition without removing the debt note or copying a list.
+for pending in '' '    pending_manifest: false'; do
+  set +e
+  out=$(run_with_fixture "$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+$pending
+    note: former transitional debt
+" 'docs/agents/shared.md'); rc=$?
+  set -e
+  if [ "$rc" = 0 ]; then
+    pass "Case 7d: backed canonical doc passes with pending absent or false ($pending)"
+  else
+    fail "Case 7d completed transition unexpected (rc=$rc): $out"
+  fi
+done
+
 # A quoted scalar is truthy-looking to a string comparison but is not the
 # boolean flag the manifest contract defines. It must not waive propagation.
 MANIFEST_PENDING_STRING="$MIN_HEADER
@@ -341,7 +440,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_PENDING_STRING" "docs/agents/shared.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "pending_manifest.*YAML boolean"; then
+if [ "$rc" = "1" ] && grep -q "pending_manifest.*YAML boolean" <<<"$out"; then
   pass "Case 7a: pending_manifest accepts only a YAML boolean"
 else
   fail "Case 7a unexpected (rc=$rc): $out"
@@ -360,7 +459,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_SUBSET_CANONICAL" "docs/agents/shared.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry with 'consumers: all'"; then
+if [ "$rc" = "1" ] && grep -q "has no 'type: canonical' paths entry with 'consumers: all'" <<<"$out"; then
   pass "Case 6b: subset-only path cannot back a fleet-wide canonical doc"
 else
   fail "Case 6b unexpected (rc=$rc): $out"
@@ -380,7 +479,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_CANONICAL_WRONG_DEST" "$(printf 'docs/agents/shared.md\ndocs/shared.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry with 'consumers: all'"; then
+if [ "$rc" = "1" ] && grep -q "has no 'type: canonical' paths entry with 'consumers: all'" <<<"$out"; then
   pass "Case 6c: canonical source remapped elsewhere does not back the owned destination"
 else
   fail "Case 6c unexpected (rc=$rc): $out"
@@ -400,7 +499,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_CANONICAL_DEST_REMAP" "$(printf 'templates/shared.md\ndocs/agents/shared.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "remove the unsupported dest remap"; then
+if [ "$rc" = "1" ] && grep -q "remove the unsupported dest remap" <<<"$out"; then
   pass "Case 6d: canonical destination remap fails closed"
 else
   fail "Case 6d unexpected (rc=$rc): $out"
@@ -438,7 +537,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_PENDING_NONOTE" "docs/agents/shared.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "sets pending_manifest: true without a 'note:'"; then
+if [ "$rc" = "1" ] && grep -q "sets pending_manifest: true without a 'note:'" <<<"$out"; then
   pass "Case 7b: pending_manifest without a note fails closed"
 else
   fail "Case 7b unexpected (rc=$rc): $out"
@@ -456,7 +555,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_PENDING_WRONGCLASS" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "sets pending_manifest: true with class 'per-repo-owned'"; then
+if [ "$rc" = "1" ] && grep -q "sets pending_manifest: true with class 'per-repo-owned'" <<<"$out"; then
   pass "Case 7c: pending_manifest outside class canonical fails closed"
 else
   fail "Case 7c unexpected (rc=$rc): $out"
@@ -476,7 +575,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_CLOBBER" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "VERBATIM-mirrored by a canonical/kit manifest entry (direct)"; then
+if [ "$rc" = "1" ] && grep -q "VERBATIM-mirrored by a canonical/kit manifest entry (direct)" <<<"$out"; then
   pass "Case 8: per-repo-owned doc with a canonical paths: entry fails closed"
 else
   fail "Case 8 unexpected (rc=$rc): $out"
@@ -495,7 +594,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_KIT" "docs/agents/hub.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "kit-contains(docs/agents)"; then
+if [ "$rc" = "1" ] && grep -q "kit-contains(docs/agents)" <<<"$out"; then
   pass "Case 8b: hub-only doc inside a kit directory fails closed"
 else
   fail "Case 8b unexpected (rc=$rc): $out"
@@ -516,7 +615,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_DOTSLASH" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "VERBATIM-mirrored"; then
+if [ "$rc" = "1" ] && grep -q "VERBATIM-mirrored" <<<"$out"; then
   pass "Case 8c: './'-prefixed paths: entry still trips the clobber guard"
 else
   fail "Case 8c unexpected (rc=$rc): $out"
@@ -536,7 +635,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_DEST" "$(printf 'docs/agents/local.md\nexamples/local-template.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "VERBATIM-mirrored"; then
+if [ "$rc" = "1" ] && grep -q "VERBATIM-mirrored" <<<"$out"; then
   pass "Case 8d: canonical entry whose dest: is a per-repo-owned doc fails closed"
 else
   fail "Case 8d unexpected (rc=$rc): $out"
@@ -579,7 +678,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_CANONICAL_TEMPLATED" "$(printf 'docs/agents/shared.md\nexamples/shared-template.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry"; then
+if [ "$rc" = "1" ] && grep -q "has no 'type: canonical' paths entry" <<<"$out"; then
   pass "Case 8f: canonical doc is not backed by a templated paths entry"
 else
   fail "Case 8f unexpected (rc=$rc): $out"
@@ -598,7 +697,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_TEMPLATED_SELF_DEFAULT" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "effective source and destination of a templated manifest entry"; then
+if [ "$rc" = "1" ] && grep -q "effective source and destination of a templated manifest entry" <<<"$out"; then
   pass "Case 8e2: default self-sourced template cannot clobber a per-repo doc"
 else
   fail "Case 8e2 unexpected (rc=$rc): $out"
@@ -619,7 +718,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_TEMPLATED_SELF_EXPLICIT" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "effective source and destination of a templated manifest entry"; then
+if [ "$rc" = "1" ] && grep -q "effective source and destination of a templated manifest entry" <<<"$out"; then
   pass "Case 8e3: normalized explicit self-source cannot clobber a hub-only doc"
 else
   fail "Case 8e3 unexpected (rc=$rc): $out"
@@ -635,7 +734,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_OUTSCOPE" "README.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "outside the inventory's scope"; then
+if [ "$rc" = "1" ] && grep -q "outside the inventory's scope" <<<"$out"; then
   pass "Case 9: a non-docs/agents path in the inventory fails closed"
 else
   fail "Case 9 unexpected (rc=$rc): $out"
@@ -651,7 +750,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_PARENT_TRAVERSAL" "docs/sync-overrides.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "absolute paths and '..' segments are not allowed"; then
+if [ "$rc" = "1" ] && grep -q "absolute paths and '..' segments are not allowed" <<<"$out"; then
   pass "Case 9b: parent traversal in ownership path fails closed"
 else
   fail "Case 9b unexpected (rc=$rc): $out"
@@ -667,7 +766,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_ABSOLUTE" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "absolute paths and '..' segments are not allowed"; then
+if [ "$rc" = "1" ] && grep -q "absolute paths and '..' segments are not allowed" <<<"$out"; then
   pass "Case 9c: absolute ownership path fails closed"
 else
   fail "Case 9c unexpected (rc=$rc): $out"
@@ -686,7 +785,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_EMBEDDED_DOT" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "embedded '.'/empty segments"; then
+if [ "$rc" = "1" ] && grep -q "embedded '.'/empty segments" <<<"$out"; then
   pass "Case 9d: embedded dot segment in a manifest path fails closed"
 else
   fail "Case 9d unexpected (rc=$rc): $out"
@@ -705,7 +804,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_COMMA_PATH" "$(printf 'docs/agents/rules.md,backup.md\ndocs/agents/rules.md')"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "commas are also rejected"; then
+if [ "$rc" = "1" ] && grep -q "commas are also rejected" <<<"$out"; then
   pass "Case 9e: comma-delimited path cannot corrupt ownership membership checks"
 else
   fail "Case 9e unexpected (rc=$rc): $out"
@@ -718,7 +817,7 @@ paths: []
 set +e
 out=$(run_with_fixture "$MANIFEST_NOBLOCK" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'doc_ownership:' block"; then
+if [ "$rc" = "1" ] && grep -q "has no 'doc_ownership:' block" <<<"$out"; then
   pass "Case 10: a manifest with no doc_ownership block fails closed"
 else
   fail "Case 10 unexpected (rc=$rc): $out"
@@ -733,7 +832,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_EMPTY_ENTRY" "docs/agents/"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "doc_ownership entry has an empty 'path'"; then
+if [ "$rc" = "1" ] && grep -q "doc_ownership entry has an empty 'path'" <<<"$out"; then
   pass "Case 10c: empty doc_ownership mapping fails closed"
 else
   fail "Case 10c unexpected (rc=$rc): $out"
@@ -749,7 +848,7 @@ doc_ownership: oops
 set +e
 out=$(run_with_fixture "$MANIFEST_SCALAR" "docs/agents/local.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a list (got YAML tag"; then
+if [ "$rc" = "1" ] && grep -q "must be a list (got YAML tag" <<<"$out"; then
   pass "Case 10b: scalar doc_ownership fails closed instead of iterating garbage"
 else
   fail "Case 10b unexpected (rc=$rc): $out"
@@ -762,7 +861,7 @@ set +e
 out=$(MERGEPATH_MANIFEST_PATH="$WORKDIR/nonexistent-manifest.yml" \
       MERGEPATH_REPO_ROOT="$WORKDIR/nonexistent-root" bash "$CHECK" 2>&1); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: SKIP"; then
+if [ "$rc" = "0" ] && grep -q "check_doc_ownership: SKIP" <<<"$out"; then
   pass "Case 11: consumer checkout (no manifest, no orchestrator marker) SKIPs"
 else
   fail "Case 11 unexpected (rc=$rc): $out"
@@ -775,7 +874,7 @@ mkdir -p "$HUBFIX/scripts"
 set +e
 out=$(MERGEPATH_MANIFEST_PATH="$HUBFIX/gone.yml" MERGEPATH_REPO_ROOT="$HUBFIX" bash "$CHECK" 2>&1); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "must not be deleted/renamed"; then
+if [ "$rc" = "1" ] && grep -q "must not be deleted/renamed" <<<"$out"; then
   pass "Case 11b: hub checkout with a deleted manifest fails closed"
 else
   fail "Case 11b unexpected (rc=$rc): $out"
@@ -799,7 +898,7 @@ out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
   docs/agents/identity.md")
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12: denylisted doc classified canonical fails closed after path normalization (drift guard)"
 else
   fail "Case 12 unexpected (rc=$rc): $out"
@@ -836,7 +935,7 @@ out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
   "docs/agents/identity.md"')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12c: double-quoted denylist entry still fails closed (quote stripping)"
 else
   fail "Case 12c unexpected (rc=$rc): $out"
@@ -852,7 +951,7 @@ out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
   'docs/agents/identity.md'  # per-repo identity doc")
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12d: single-quoted denylist entry with a trailing comment still fails closed"
 else
   fail "Case 12d unexpected (rc=$rc): $out"
@@ -924,7 +1023,7 @@ out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
 IDENTITY_DOCS_DENYLIST=("README.md" "docs/agents/identity.md")')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12g: entries on the declaration line still fail closed"
 else
   fail "Case 12g unexpected (rc=$rc): $out"
@@ -945,7 +1044,7 @@ IDENTITY_DOCS_DENYLIST=(
 )')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12h: a closing paren inside a comment does not truncate the array"
 else
   fail "Case 12h unexpected (rc=$rc): $out"
@@ -964,7 +1063,7 @@ out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
 tity.md"')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12i: a line-continued denylist entry is read as one element"
 else
   fail "Case 12i unexpected (rc=$rc): $out"
@@ -1022,8 +1121,8 @@ IDENTITY_DOCS_DENYLIST=(
 )')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST" \
-   && echo "$out" | grep -q "unexpanded substitution"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out" \
+   && grep -q "unexpanded substitution" <<<"$out"; then
   pass "Case 12k: a command substitution neither ends the array nor passes silently"
 else
   fail "Case 12k unexpected (rc=$rc): $out"
@@ -1046,7 +1145,7 @@ IDENTITY_DOCS_DENYLIST=(
 )')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12l: entries added by a later assignment are enforced"
 else
   fail "Case 12l unexpected (rc=$rc): $out"
@@ -1089,7 +1188,7 @@ if true; then
 fi')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+if [ "$rc" = "1" ] && grep -q "IDENTITY_DOCS_DENYLIST" <<<"$out"; then
   pass "Case 12n: an indented += appends to the denylist"
 else
   fail "Case 12n unexpected (rc=$rc): $out"
@@ -1109,7 +1208,7 @@ IDENTITY_DOCS_DENYLIST=(
   "docs/agents/identity.md"')
 rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "never closes"; then
+if [ "$rc" = "0" ] && grep -q "never closes" <<<"$out"; then
   pass "Case 12o: an unterminated declaration reads as no denylist, with a note"
 else
   fail "Case 12o unexpected (rc=$rc): $out"
@@ -1136,9 +1235,9 @@ docs/agents/`policy`.md' '  "docs/agents/\$policy.md"
   "docs/agents/\`policy\`.md"'); rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "docs/agents/\$policy.md.*IDENTITY_DOCS_DENYLIST" \
-   && echo "$out" | grep -q 'docs/agents/`policy`.md.*IDENTITY_DOCS_DENYLIST' \
-   && ! echo "$out" | grep -q "unexpanded substitution"; then
+   && grep -q "docs/agents/\$policy.md.*IDENTITY_DOCS_DENYLIST" <<<"$out" \
+   && grep -q 'docs/agents/`policy`.md.*IDENTITY_DOCS_DENYLIST' <<<"$out" \
+   && ! grep -q "unexpanded substitution" <<<"$out"; then
   pass "Case 12p: double-quoted dollar/backtick escapes compare as literal denylist paths"
 else
   fail "Case 12p unexpected (rc=$rc): $out"
@@ -1165,7 +1264,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14: canonical doc referencing a hub-only doc fails closed (consumer-truthfulness)"
 else
   fail "Case 14 unexpected (rc=$rc): $out"
@@ -1224,7 +1323,7 @@ for spelling in 'hub.md' './hub.md' '../agents/hub.md'; do
 docs/agents/hub.md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+  if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link" <<<"$out"; then
     pass "Case 14d: sibling-relative link '$spelling' to a hub-only doc fails closed"
   else
     fail "Case 14d ('$spelling') unexpected (rc=$rc): $out"
@@ -1240,7 +1339,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link" <<<"$out"; then
   pass "Case 14e: reference-style link definition to a hub-only doc fails closed"
 else
   fail "Case 14e unexpected (rc=$rc): $out"
@@ -1326,7 +1425,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by repo-relative path"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md' by repo-relative path" <<<"$out"; then
   pass "Case 14i: a bare repo-relative mention beside an absolute URL fails closed"
 else
   fail "Case 14i unexpected (rc=$rc): $out"
@@ -1398,7 +1497,7 @@ do
 docs/agents/hub.md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+  if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link" <<<"$out"; then
     pass "Case 14l: wrapped reference definition to a hub-only doc fails closed"
   else
     fail "Case 14l ('$wrapped') unexpected (rc=$rc): $out"
@@ -1432,7 +1531,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link" <<<"$out"; then
   pass "Case 14n: query-bearing relative link to a hub-only doc fails closed"
 else
   fail "Case 14n unexpected (rc=$rc): $out"
@@ -1468,7 +1567,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14p: repo-relative label with a relative reference destination fails closed"
 else
   fail "Case 14p unexpected (rc=$rc): $out"
@@ -1494,7 +1593,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH_SPACE" \
 docs/agents/hub file.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link" <<<"$out"; then
   pass "Case 14q: angle-bracket link target preserves embedded whitespace"
 else
   fail "Case 14q unexpected (rc=$rc): $out"
@@ -1508,7 +1607,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH_SPACE" \
 docs/agents/hub file.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link" <<<"$out"; then
   pass "Case 14q2: percent-encoded link path is decoded before inventory comparison"
 else
   fail "Case 14q2 unexpected (rc=$rc): $out"
@@ -1554,7 +1653,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14s1: nested-list links remain rendered prose"
 else
   fail "Case 14s1 nested-list unexpected (rc=$rc): $out"
@@ -1566,7 +1665,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14s1: indented paragraph continuations remain rendered prose"
 else
   fail "Case 14s1 paragraph-continuation unexpected (rc=$rc): $out"
@@ -1578,7 +1677,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14s1: lazy blockquote continuations remain rendered prose"
 else
   fail "Case 14s1 blockquote-continuation unexpected (rc=$rc): $out"
@@ -1615,7 +1714,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub.md'" <<<"$out"; then
   pass "Case 14s2: invalid backtick fence opener does not hide a rendered link"
 else
   fail "Case 14s2 unexpected (rc=$rc): $out"
@@ -1644,7 +1743,7 @@ for paren_link in '[the audit](hub(1).md)' '[the audit](<hub(1).md>)'; do
 docs/agents/hub(1).md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link"; then
+  if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link" <<<"$out"; then
     pass "Case 14t: balanced-parenthesis link '$paren_link' fails closed"
   else
     fail "Case 14t ('$paren_link') unexpected (rc=$rc): $out"
@@ -1664,7 +1763,7 @@ do
 docs/agents/hub(1).md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link"; then
+  if [ "$rc" = "1" ] && grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link" <<<"$out"; then
     pass "Case 14u: backslash-escaped reference destination fails closed"
   else
     fail "Case 14u ('$escaped_ref') unexpected (rc=$rc): $out"
@@ -1693,7 +1792,7 @@ out=$(run_with_doc_bodies "$MANIFEST_TRUTH_LITERAL_BACKSLASH" \
 docs/agents/hub\\(1).md|# Hub-only machinery")
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link"; then
+if [ "$rc" = "1" ] && grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" <<<"$out"; then
   pass "Case 14u2: escaped literal-backslash destination fails closed"
 else
   fail "Case 14u2 unexpected (rc=$rc): $out"
@@ -1723,7 +1822,7 @@ set -e
 transport_count=$(wc -l < "$transport_fix/awk-transport.log" | tr -d ' ')
 transport_bad=$(grep -Fvc '@[\\]' "$transport_fix/awk-transport.log" || true)
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" \
+   && grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" <<<"$out" \
    && [ "$transport_count" -gt 0 ] && [ "$transport_bad" = "0" ]; then
   pass "Case 14u3: every ASCII punctuation transport quotes backslash before awk parses it"
 else
@@ -2020,7 +2119,7 @@ out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${C1_CHAR}b.md")" \
 docs/agents/h${C1_CHAR}b.md|# Hub-only machinery")
 rc=$?
 set -e
-if [ "$rc" = "0" ] && ! printf '%s\n' "$out" | grep -q 'references the hub-only doc'; then
+if [ "$rc" = "0" ] && ! grep -q 'references the hub-only doc' <<<"$out"; then
   pass "Case 14v2: a C1 reference does not decode, so no reference to the decoded name is invented"
 else
   fail "Case 14v2 (C1 stays literal) unexpected (rc=$rc): $out"
@@ -2038,7 +2137,7 @@ out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${NBSP}b.md")" \
 docs/agents/h${NBSP}b.md|# Hub-only machinery")
 rc=$?
 set -e
-if [ "$rc" = "1" ] && printf '%s\n' "$out" | grep -qF "references the hub-only doc 'docs/agents/h${NBSP}b.md'"; then
+if [ "$rc" = "1" ] && grep -qF "references the hub-only doc 'docs/agents/h${NBSP}b.md'" <<<"$out"; then
   pass "Case 14v2: U+00A0 is one past the C1 range, so it still decodes"
 else
   fail "Case 14v2 (U+00A0 decodes) unexpected (rc=$rc): $out"
@@ -2064,7 +2163,7 @@ for spelling in "h${OSLASH}b.md" 'h&#248;b.md' 'h%C3%B8b.md'; do
 docs/agents/h${OSLASH}b.md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "1" ] && printf '%s\n' "$out" | grep -qF "references the hub-only doc 'docs/agents/h${OSLASH}b.md'"; then
+  if [ "$rc" = "1" ] && grep -qF "references the hub-only doc 'docs/agents/h${OSLASH}b.md'" <<<"$out"; then
     pass "Case 14v3: '$spelling' resolves to the same hub-only doc"
   else
     fail "Case 14v3 ('$spelling') unexpected (rc=$rc): $out"
@@ -2082,7 +2181,7 @@ out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${DOUBLED}b.md")" \
 docs/agents/h${DOUBLED}b.md|# Hub-only machinery")
 rc=$?
 set -e
-if [ "$rc" = "0" ] && ! printf '%s\n' "$out" | grep -q 'references the hub-only doc'; then
+if [ "$rc" = "0" ] && ! grep -q 'references the hub-only doc' <<<"$out"; then
   pass "Case 14v3: the double-encoded name is not what a percent-escape resolves to"
 else
   fail "Case 14v3 (double-encoded control) unexpected (rc=$rc): $out"
@@ -2260,7 +2359,7 @@ docs/agents/hubfj.md|# Hub-only machinery')
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubfj.md'"; then
+   && grep -q "references the hub-only doc 'docs/agents/hubfj.md'" <<<"$out"; then
   pass "Case 15b: a two-character ASCII named reference resolves to its target"
 else
   fail "Case 15b unexpected (rc=$rc): $out"
@@ -2276,7 +2375,7 @@ docs/agents/hubfj.md|# Hub-only machinery')
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubfj.md'"; then
+   && grep -q "references the hub-only doc 'docs/agents/hubfj.md'" <<<"$out"; then
   pass "Case 15b: the literal spelling of that target reports identically (control)"
 else
   fail "Case 15b control unexpected (rc=$rc): $out"
@@ -2393,7 +2492,7 @@ docs/agents/hubø.md|# Hub-only machinery")
   rc=$?
   set -e
   if [ "$rc" = "1" ] \
-     && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubø.md'"; then
+     && grep -q "references the hub-only doc 'docs/agents/hubø.md'" <<<"$out"; then
     pass "Case 15f: '$ref_spelling' resolves to its non-ASCII target"
   else
     fail "Case 15f ('$ref_spelling') unexpected (rc=$rc): $out"
@@ -2611,7 +2710,7 @@ do
 docs/agents/prefix�hub.md|# Hub-only machinery")
   rc=$?
   set -e
-  if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+  if [ "$rc" = "0" ] && grep -q "check_doc_ownership: PASS" <<<"$out"; then
     pass "Case 15l: '$nl_spelling' does not alias the U+FFFD-named doc"
   else
     fail "Case 15l ('$nl_spelling') unexpected (rc=$rc): $out"
@@ -2625,7 +2724,7 @@ docs/agents/prefix�hub.md|# Hub-only machinery")
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/prefix�hub.md'"; then
+   && grep -q "references the hub-only doc 'docs/agents/prefix�hub.md'" <<<"$out"; then
   pass "Case 15l: the literal U+FFFD spelling still resolves (control)"
 else
   fail "Case 15l (literal U+FFFD control) unexpected (rc=$rc): $out"
@@ -2684,7 +2783,7 @@ docs/agents/?hub.md|# Hub-only machinery")
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/#hub.md'"; then
+   && grep -q "references the hub-only doc 'docs/agents/#hub.md'" <<<"$out"; then
   pass "Case 15n: an encoded '#' is a pathname character, not a fragment"
 else
   fail "Case 15n (%23 path) unexpected (rc=$rc): $out"
@@ -2698,7 +2797,7 @@ docs/agents/?hub.md|# Hub-only machinery")
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
-   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/?hub.md'"; then
+   && grep -q "references the hub-only doc 'docs/agents/?hub.md'" <<<"$out"; then
   pass "Case 15n: an encoded '?' is a pathname character, not a query"
 else
   fail "Case 15n (%3F path) unexpected (rc=$rc): $out"
@@ -2708,7 +2807,7 @@ set +e
 out=$(run_truth_body 'See [the audit](other.md?hub.md) for details.')
 rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_doc_ownership: PASS" <<<"$out"; then
   pass "Case 15n: a real query string is still discarded (control)"
 else
   fail "Case 15n (real query control) unexpected (rc=$rc): $out"
@@ -2718,7 +2817,7 @@ set +e
 out=$(run_truth_body 'See [the audit](other.md#hub.md) for details.')
 rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_doc_ownership: PASS" <<<"$out"; then
   pass "Case 15n: a real fragment is still discarded (control)"
 else
   fail "Case 15n (real fragment control) unexpected (rc=$rc): $out"
@@ -3563,7 +3662,7 @@ if [ -f "$ROOT/.mergepath-sync.yml" ]; then
   out=$(MERGEPATH_MANIFEST_PATH="$ROOT/.mergepath-sync.yml" \
         MERGEPATH_REPO_ROOT="$ROOT" bash "$CHECK" 2>&1); rc=$?
   set -e
-  if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+  if [ "$rc" = "0" ] && grep -q "check_doc_ownership: PASS" <<<"$out"; then
     pass "Case 13: live .mergepath-sync.yml classifies every docs/agents doc"
   else
     fail "Case 13 unexpected (rc=$rc): $out"

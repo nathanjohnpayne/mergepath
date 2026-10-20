@@ -37,8 +37,9 @@
 #      ambiguity waiting to diverge.
 #   5. Every Markdown file under docs/agents/ on disk is declared — the "zero classes"
 #      case, and the one that actually happened.
-#   6. `pending_manifest: true` appears only on a `canonical` entry, and
-#      only alongside a non-empty `note:` naming the follow-up.
+#   6. `pending_manifest: true` appears only on an unbacked `canonical`
+#      entry, alongside a non-empty `note:` naming the follow-up. Once
+#      qualifying backing lands, remove the redundant transitional flag.
 #   7. A `canonical` doc is BACKED: it has a fleet-wide (`consumers: all`)
 #      `paths:` entry in the same manifest, or it declares
 #      `pending_manifest: true`. A canonical class with neither is an
@@ -2338,7 +2339,12 @@ if [ -n "$ownership_rows" ]; then
     # 7 / 8: class ↔ manifest consistency.
     if [ "$doc_class" = "canonical" ]; then
       case "$canonical_exact" in
-        *",$norm_doc,"*) ;;
+        *",$norm_doc,"*)
+          if [ "$doc_pending" = "true" ]; then
+            echo "FAIL: '$norm_doc' has redundant pending_manifest: true — a fleet-wide 'type: canonical' paths entry already backs it. Remove the flag so bootstrap verification requires this canonical document."
+            FAILED=1
+          fi
+          ;;
         *)
           if [ "$doc_pending" != "true" ]; then
             echo "FAIL: '$norm_doc' is classified canonical but has no 'type: canonical' paths entry with 'consumers: all' in the manifest — an unbacked or subset-only canonical claim does not propagate verbatim to the full fleet, so consumers silently do not have it. Add a fleet-wide 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
