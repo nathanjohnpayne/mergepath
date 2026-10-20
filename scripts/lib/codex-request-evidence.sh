@@ -350,7 +350,7 @@ crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
 # codex-review-check.sh (gate diagnostics) and codex-review-request.sh (#1550
 # resume check).
 crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
-  echo "${1:-[]}" | jq -c \
+  printf '%s\n' "${1:-[]}" | jq -c \
     --arg bot "${2:-}" --arg sha "${3:-}" '
     ($sha | ascii_downcase) as $head
     | [ .[]
