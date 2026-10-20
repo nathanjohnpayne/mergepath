@@ -378,7 +378,9 @@ crl_human_stops() {
                               # last_at feeds the runaway marker's floor (#2561): a
                               # non-string sorts below every instant and would drop
                               # the response out of it, so it fails like first_at.
-                              and ((.last_at | type) == \"string\" or .last_at == null))
+                              # Absent is the older-ledger case and falls back to
+                              # first_at; present (null included) must be an instant.
+                              and ((has(\"last_at\") | not) or (.last_at | type) == \"string\"))
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))) | not
     then error(\"ledger\") else . end

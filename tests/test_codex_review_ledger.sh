@@ -692,7 +692,10 @@ stop_check "runaway tiebreak: a malformed candidate below the maximum still leav
 # last_at feeds the floor, so a non-string value fails the ledger rather than
 # dropping that response out of the floor; an absent last_at still falls back
 # to first_at (L_RW's last response: last_at 03:30, first_at 01:10).
-for _bad_last in '.responses[-1].last_at = 5' '.responses[-1].last_at = true' '.responses[-1].last_at = {}'; do
+# An explicit null is present and malformed (CodeRabbit on #2567): falling back
+# to first_at would move the floor earlier, so it fails; only an ABSENT key
+# falls back.
+for _bad_last in '.responses[-1].last_at = 5' '.responses[-1].last_at = true' '.responses[-1].last_at = {}' '.responses[-1].last_at = null'; do
   if crl_human_stops "$(printf '%s' "$L_RW" | jq -c "$_bad_last")" "$HEAD_A" nathanjohnpayne 10 2 >/dev/null; then
     fail "runaway tiebreak: a response with a malformed last_at ($_bad_last) was accepted"
   else
