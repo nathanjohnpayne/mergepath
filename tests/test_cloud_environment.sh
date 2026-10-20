@@ -299,7 +299,10 @@ REALTIMEOUT
 chmod +x "$HBIN_REAL/timeout"
 # A correct deadline may expire before the child gets scheduled. Verify the
 # exact dispatched command rather than requiring the child's first write.
-printf '1\n%s\n--quiet\n' "$HFIX_SLEEP/scripts/agent-capability-probe.sh" >"$WORKDIR/expected-probe-command"
+# The hook derives its root with `cd ... && pwd`, which collapses the double
+# slash a trailing-slash TMPDIR (macOS) puts in WORKDIR; canonicalize the same
+# way so the comparison stays byte-exact on every platform.
+printf '1\n%s\n--quiet\n' "$(cd "$HFIX_SLEEP" && pwd)/scripts/agent-capability-probe.sh" >"$WORKDIR/expected-probe-command"
 for startup_delay in 0 2; do
   rm -f "$WORKDIR/probe-start.log" "$WORKDIR/alarm.log" "$WORKDIR/probe-command.log"
   started="$(date +%s)"
