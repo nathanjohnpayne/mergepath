@@ -63,7 +63,11 @@ case "$*" in
     # association, not just the name — is the one that runs. A pre-filtered
     # name list would make the suite blind to exactly the defects that filter
     # exists for, which is how three findings on this PR got past it.
-    printf '%s\n' "${STUB_CHECK_RUNS_RAW:-${STUB_CHECK_RUNS:?}}"
+    if [ -n "${STUB_CHECK_RUNS_FILE:-}" ]; then
+      cat "$STUB_CHECK_RUNS_FILE"
+    else
+      printf '%s\n' "${STUB_CHECK_RUNS_RAW:-${STUB_CHECK_RUNS:?}}"
+    fi
     case " $* " in
       *" --paginate "*) [ -n "${STUB_CHECK_RUNS_PAGE2:-}" ] && printf '%s\n' "$STUB_CHECK_RUNS_PAGE2" ;;
     esac
@@ -298,6 +302,43 @@ if [ "$RC" = 3 ] && [ "$WROTE" = 0 ] && ! grep -q "conclusion" "$D/gh.log"; then
   pass "a reported-and-failing context is not a recovery case, and no conclusion is consulted"
 else
   fail "expected rc=3, no edit, no conclusion read; rc=$RC wrote=$WROTE log='$(cat "$D/gh.log")'"
+fi
+
+# --- 4b: large listings retain complete context membership (#1259) ---------
+# File-backed API fixtures keep a realistic large listing out of environment
+# and argv limits. Both required contexts precede enough unrelated names to
+# leave printf writing after an early-closing grep finds either match.
+python3 - "$TMP" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+folder = Path(sys.argv[1])
+filler = [f"context-{index:04d}-" + "x" * 150 for index in range(512)]
+for filename, required in [("large-both.json", ["Self-Review Required", "Label Gate"]),
+                           ("large-missing.json", ["Self-Review Required"])]:
+    runs = [{"name": name, "app": {"slug": "github-actions"},
+             "pull_requests": [{"number": 7}], "started_at": "2026-06-01T00:00:00Z"}
+            for name in required + filler]
+    (folder / filename).write_text(json.dumps({"check_runs": runs}))
+PY
+if [ "$(jq '[.check_runs[].name | length + 1] | add' "$TMP/large-both.json")" -gt 80000 ]; then
+  pass "the large-context fixture exceeds 80 KB of decoded check names"
+else
+  fail "the large-context fixture is too small to exercise a complete-input match"
+fi
+run_nudge open sha444b "$VALID_BODY" '' STUB_CHECK_RUNS_FILE="$TMP/large-both.json"
+if [ "$RC" = 3 ] && [ "$WROTE" = 0 ] && [ ! -s "$D/written.txt" ]; then
+  pass "both contexts at the start of a large listing refuse recovery without a body edit"
+else
+  fail "large reported listing must refuse without mutation; rc=$RC wrote=$WROTE out='$OUT' err='$ERR'"
+fi
+run_nudge open sha444c "$VALID_BODY" '' STUB_CHECK_RUNS_FILE="$TMP/large-missing.json"
+MISSING_CONTEXTS=$(sed -n 's/.*; not yet reported: //p' <<<"$OUT")
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && [ "$MISSING_CONTEXTS" = 'Label Gate' ]; then
+  pass "a genuinely missing context in a large listing is nudged and only that context is named"
+else
+  fail "large missing listing must recover only Label Gate; rc=$RC wrote=$WROTE missing='$MISSING_CONTEXTS' err='$ERR'"
 fi
 
 # --- 5: replace, not append ------------------------------------------------

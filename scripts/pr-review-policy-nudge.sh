@@ -171,7 +171,9 @@ NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" 2>/dev/null
       | .name') \
   || die "could not list check runs on $HEAD_SHA" 2
 
-has_context() { printf '%s\n' "$NAMES" | grep -Fxq "$1"; }
+# Consume the complete listing: an early-closing matcher can give a piped
+# producer SIGPIPE under pipefail and misclassify a present context as missing.
+has_context() { grep -Fx -- "$1" <<<"$NAMES" >/dev/null; }
 
 MISSING=()
 has_context "$CONTEXT_SELF_REVIEW" || MISSING+=("$CONTEXT_SELF_REVIEW")
