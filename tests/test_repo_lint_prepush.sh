@@ -801,6 +801,12 @@ case "$out" in *"inherits the relative core.hooksPath=scripts/git-hooks"*) ok "i
 case "$out" in *"this worktree runs $LINKED_P/scripts/git-hooks/pre-push"*) ok "installer --check names the hook git resolves from this worktree" ;; *) bad "resolved hook not named: $out" ;; esac
 rc=0; out=$(cd "$FIX" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
 case "$out" in *"inherits the relative"*) bad "primary checkout warned as a linked worktree: $out" ;; *) ok "the primary checkout gets no linked-worktree warning" ;; esac
+# A relative --git-common-dir resolves against the worktree root, not the
+# directory --check runs from.
+rc=0; out=$(cd "$FIX/scripts" && bash install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check passes from a subdirectory of the primary checkout" "$rc" "0"
+rc=0; out=$(cd "$LINKED/scripts" && bash install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check passes from a subdirectory of a linked worktree" "$rc" "0"
 git -C "$LINKED" config --worktree core.hooksPath "$TMP/no-such-hooks"
 rc=0; out=$(cd "$LINKED" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
 check "installer --check fails when this worktree's effective hooks path has no pre-push" "$rc" "1"
@@ -828,6 +834,11 @@ rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
 check "unreadable runner: push blocked" "$rc" "1"
 case "$out" in *"is not a readable file"*) ok "unreadable runner is named" ;; *) bad "unreadable runner output: $out" ;; esac
 rmdir "$LINKED/scripts/repo-lint-prepush.sh"
+ln -s "$TMP/no-such-runner.sh" "$LINKED/scripts/repo-lint-prepush.sh"
+rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
+check "dangling runner symlink: push blocked, not soft-passed" "$rc" "1"
+case "$out" in *"SKIP (scripts/repo-lint-prepush.sh"*) bad "dangling runner symlink reported as an absent runner: $out" ;; *"is not a readable file"*) ok "dangling runner symlink is named as unusable" ;; *) bad "dangling runner symlink output: $out" ;; esac
+rm "$LINKED/scripts/repo-lint-prepush.sh"
 mv "$TMP/saved-runner" "$LINKED/scripts/repo-lint-prepush.sh"
 # exec failing: a `bash` on PATH whose interpreter does not exist. The wrapper
 # itself runs under the real bash, so only its exec of the runner fails.

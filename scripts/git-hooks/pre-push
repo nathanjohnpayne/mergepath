@@ -51,7 +51,9 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) \
        "run git rev-parse --show-toplevel here to see git's error, fix the repository state, then push again."
 
 runner="$root/scripts/repo-lint-prepush.sh"
-if [ ! -e "$runner" ]; then
+# A dangling symlink is a runner that is present but unusable, not an absent
+# one, so it falls through to the fail-closed check below.
+if [ ! -e "$runner" ] && [ ! -L "$runner" ]; then
   echo "$PREFIX: SKIP (scripts/repo-lint-prepush.sh is not in this checkout)"
   exit 0
 fi

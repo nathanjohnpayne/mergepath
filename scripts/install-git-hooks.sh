@@ -82,7 +82,9 @@ case "$ACTION" in
       fi
       scoped=$(git -C "$root" config --show-scope --get core.hooksPath 2>/dev/null || true)
       git_dir=$(git -C "$root" rev-parse --absolute-git-dir)
-      common_dir=$(cd "$(git -C "$root" rev-parse --git-common-dir)" && pwd -P)
+      # --git-common-dir may be relative (`.git`), and relative to $root,
+      # not to the directory --check was started from.
+      common_dir=$(cd "$root" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
       if [ "$(cd "$git_dir" && pwd -P)" != "$common_dir" ] && [ "${scoped%%$'\t'*}" = local ]; then
         case "${scoped#*$'\t'}" in
           /*) ;;
