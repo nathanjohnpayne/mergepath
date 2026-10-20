@@ -1335,7 +1335,8 @@ The canonical convention is documented in [Reviewer PAT Quick Start](#reviewer-p
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-# Read-only helper:
+# Read-only helper: the Phase 4a step-16a merge gate. On an under-threshold PR,
+# use the threshold-aware scripts/merge-clearance-gate.sh <PR#> instead.
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 
 # coderabbit-wait.sh may POST a retry nudge; it uses the cached PATs
