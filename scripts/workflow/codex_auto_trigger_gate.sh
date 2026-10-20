@@ -5,7 +5,8 @@ set -euo pipefail
 # current PR head (#798).
 #
 # The problem: branch protection on `main` sets `required_status_checks.strict:
-# true`, so every merge forces `gh pr update-branch` on every other open PR.
+# true`, so every merge leaves other open PRs behind, each needing a freshening
+# commit that merges the base into its branch, locally or through `gh pr update-branch`.
 # That produces a NEW HEAD SHA which changes no file in the PR's own diff, and
 # the automatic trigger path (agent-review.yml's auto-merge job →
 # coderabbit-wait.sh's #489 rate-limit failover → codex-review-request.sh
