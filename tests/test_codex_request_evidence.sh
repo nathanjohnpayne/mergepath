@@ -531,6 +531,7 @@ export BOT_LOGIN='chatgpt-codex-connector[bot]'
 export AUTHOR_IDENTITY=nathanjohnpayne
 export HEAD_SHA='abcdef0123456789000000000000000000000000'
 export REPO=owner/repo PR_NUMBER=99 REQUIRED_TIERS_JSON='["p0","p1"]'
+export DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 export CODEX_FAILURE_MARKERS_OK=false
 scan_codex_state >"$DIR/large-scan"
 jq -e '.review.id == 789 and (.review.body | length) == 262144

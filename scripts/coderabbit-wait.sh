@@ -185,6 +185,10 @@
 #     # exit code; the merge-blocking CodeRabbit gate is
 #     # scripts/coderabbit-severity-gate.sh.
 #     "blocking_tier_unresolved": null | N,
+#     # discretionary_tier_unresolved (#1673): same candidate set and null
+#     # conditions, independently selected by resolve_tiers_by_disposition
+#     # discretionary. Report-only; never derived as the blocking complement.
+#     "discretionary_tier_unresolved": null | N,
 #     "rate_limit_retries": N,
 #     "resume_retries": N,
 #     "status_probe": {
@@ -703,9 +707,8 @@ STATUS_SUCCESS_GRACE_SECONDS=120
 # Additive tier-awareness layered ON TOP of the binary blocking-finding
 # detector — it NEVER replaces the exit-code fast-paths below (HEAD-anchoring,
 # rate-limit, auto-pause). When the feedback_policy block is PRESENT, this
-# surfaces a `blocking_tier_unresolved` count (findings on HEAD whose
-# coderabbit_tier_of tier is in the resolved required set) in the emitted JSON.
-# When the block is ABSENT, BLOCKING_TIER_UNRESOLVED stays `null` and the
+# surfaces required and discretionary counts in the emitted JSON, using
+# independently resolved tier sets. When the block is ABSENT, both stay `null` and the
 # exit-code contract is byte-identical to before: surfacing is best-effort, not
 # a gate. The classifier itself is hard-sourced at the top of this script
 # (#837) — the binary count depends on it — so only the CONFIG block presence
@@ -716,6 +719,8 @@ STATUS_SUCCESS_GRACE_SECONDS=120
 # agent can prioritize, mirroring codex-review-request.sh's per-finding
 # `blocking` flag. It does not itself block.
 BLOCKING_TIER_UNRESOLVED="null"
+DISCRETIONARY_TIER_UNRESOLVED="null"
+__CRW_DISCRETIONARY_TIERS_AVAILABLE=false
 FEEDBACK_POLICY_PRESENT=false
 if [ -f "$CONFIG" ] && grep -qE '^feedback_policy:' "$CONFIG"; then
   set +e
@@ -727,16 +732,19 @@ if [ -f "$CONFIG" ] && grep -qE '^feedback_policy:' "$CONFIG"; then
     exit 3
   fi
   FEEDBACK_POLICY_PRESENT=true
+  if __CRW_DISCRETIONARY_TIERS=$(resolve_tiers_by_disposition discretionary "$CONFIG"); then
+    __CRW_DISCRETIONARY_TIERS_AVAILABLE=true
+  fi
 fi
 
-# Return 0 iff $1 (a tier like p0..p3|nitpick) is in the resolved set.
+# Return 0 iff $1 (a tier like p0..p3|nitpick) is in the newline-delimited $2.
 # Only meaningful when FEEDBACK_POLICY_PRESENT=true.
-crw_tier_is_required() {
+crw_tier_in_set() {
   local needle=$1 t
   [ -n "$needle" ] || return 1
   while IFS= read -r t; do
     [ "$t" = "$needle" ] && return 0
-  done <<< "${__CRW_REQUIRED_TIERS:-}"
+  done <<< "$2"
   return 1
 }
 
@@ -2455,39 +2463,46 @@ count_potential_issues() {
   crw_count_blocking_bodies "$bodies"
 }
 
-# Count unaddressed inline findings on HEAD whose coderabbit_tier_of tier is
-# in the resolved required set (#577). Tier-aware sibling of
+# Count unaddressed inline findings on HEAD in each resolved tier set
+# (#577, #1673). Tier-aware sibling of
 # count_potential_issues over the SAME candidate set, differing only in which
 # tiers it keeps. Additive/advisory only: the return value populates the JSON's
-# blocking_tier_unresolved and NEVER feeds an exit code. Guarded by
+# blocking_tier_unresolved/discretionary_tier_unresolved and NEVER feeds an
+# exit code. Guarded by
 # FEEDBACK_POLICY_PRESENT at the single call site, so it never runs when the
 # block is absent.
-count_blocking_tier_issues() {
-  local candidates cand_count blocking body tier i
+count_finding_tiers() {
+  local candidates cand_count blocking discretionary body tier i
   candidates=$(head_review_finding_bodies) || {
-    log "blocking-tier count could not read the HEAD-pinned findings — reporting unknown rather than a count"
+    log "tier counts could not read the HEAD-pinned findings — reporting unknown rather than a count"
     return 3
   }
 
   blocking=0
+  discretionary=0
   # Same fail-closed shape check as crw_count_blocking_bodies. Safe on this
   # advisory path: the single call site already wraps it in `|| true` and
   # validates the result as numeric-or-null, so refusing here surfaces as
-  # `blocking_tier_unresolved: null` (unknown) instead of a false 0.
+  # both tier counts as null (unknown) instead of a false 0.
   cand_count=$(crw_json_array_length "$candidates") || {
-    log "blocking-tier count received input that is not a JSON array — reporting unknown rather than a count"
+    log "tier counts received input that is not a JSON array — reporting unknown rather than a count"
     return 3
   }
   i=0
   while [ "$i" -lt "$cand_count" ]; do
     body=$(printf '%s' "$candidates" | jq -r ".[$i]")
     tier=$(coderabbit_tier_of "$body") || return 3
-    if crw_tier_is_required "$tier"; then
+    if crw_tier_in_set "$tier" "${__CRW_REQUIRED_TIERS:-}"; then
       blocking=$((blocking + 1))
+    fi
+    if crw_tier_in_set "$tier" "${__CRW_DISCRETIONARY_TIERS:-}"; then
+      discretionary=$((discretionary + 1))
     fi
     i=$((i + 1))
   done
-  echo "$blocking"
+  jq -nc --argjson blocking "$blocking" --argjson discretionary "$discretionary" \
+    --argjson available "${__CRW_DISCRETIONARY_TIERS_AVAILABLE:-false}" \
+    '{blocking: $blocking, discretionary: (if $available then $discretionary else null end)}'
 }
 
 # Returns 0 (true) if the latest PR-level CodeRabbit SUMMARY comment body
@@ -3917,39 +3932,41 @@ emit_json_and_exit() {
     skip_reason_json="null"
   fi
 
-  # blocking_tier_unresolved (#577): lazily compute the required-tier finding
-  # count ONLY when the feedback_policy block is present AND this is a
+  # Tier counts (#577, #1673): lazily compute both finding counts
+  # ONLY when the feedback_policy block is present AND this is a
   # findings-relevant terminal (`findings` / `cleared`) — the statuses where
   # inline HEAD findings are meaningful and API access is in play. Every other
   # terminal (timeout / rate_limit_stalled / paused / skip / config error)
   # leaves it null, so no extra API calls are made on those paths and the
-  # historical JSON shape is unchanged except for one additive null field.
+  # JSON counts remain unknown on those paths.
   # This never affects $exit_code — the value is report-only.
   if [ "$FEEDBACK_POLICY_PRESENT" = true ] && [ "$BLOCKING_TIER_UNRESOLVED" = "null" ]; then
     case "$status" in
       findings|cleared)
         # Guard the advisory decoration so it can NEVER flip the terminal exit
         # code or break the JSON emit (nathanpayne-codex P2 on #590). Two
-        # layers: `|| true` stops a nonzero return from count_blocking_tier_issues
+        # layers: `|| true` stops a nonzero return from count_finding_tiers
         # from aborting under set -e, and the numeric-or-null validation forces a
         # value the downstream `jq --argjson` accepts. The earlier `$(...) ||
         # VAR=null` was insufficient: when an internal fetch_api_array read
-        # failed, count_blocking_tier_issues could exit 0 with EMPTY output, so
+        # failed, the counter could exit 0 with EMPTY output, so
         # the `||` never fired and the empty value broke `jq --argjson` — a hard
         # failure on an otherwise-terminal path.
         #
         # KEPT as belt-and-braces, not because that route is still open (#831
-        # acceptance 3). count_blocking_tier_issues propagates its read failure
+        # acceptance 3). The counter propagates its read failure
         # as rc 3 since #837, and every fetch_api_array wrapper in this file
         # propagates since #831, so `|| true` is what converts that honest
         # nonzero into the advisory `null` this decoration wants. The numeric
         # validation still earns its place: it is the only layer that does not
         # depend on any helper's return convention, and this is a report-only
         # field that must never flip a terminal exit code.
-        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null || true)
-        case "$BLOCKING_TIER_UNRESOLVED" in
-          ''|*[!0-9]*) BLOCKING_TIER_UNRESOLVED=null ;;
-        esac
+        local tier_counts
+        tier_counts=$(count_finding_tiers 2>/dev/null || true)
+        BLOCKING_TIER_UNRESOLVED=$(printf '%s' "$tier_counts" | jq -r '.blocking | select(type == "number" and . >= 0 and . == floor)' 2>/dev/null || true)
+        DISCRETIONARY_TIER_UNRESOLVED=$(printf '%s' "$tier_counts" | jq -r '.discretionary | select(type == "number" and . >= 0 and . == floor)' 2>/dev/null || true)
+        case "$BLOCKING_TIER_UNRESOLVED" in ''|*[!0-9]*) BLOCKING_TIER_UNRESOLVED=null ;; esac
+        case "$DISCRETIONARY_TIER_UNRESOLVED" in ''|*[!0-9]*) DISCRETIONARY_TIER_UNRESOLVED=null ;; esac
         ;;
     esac
   fi
@@ -3984,6 +4001,7 @@ emit_json_and_exit() {
     --argjson review "$review_json" \
     --argjson potential_issue_count "$potential_issues" \
     --argjson blocking_tier_unresolved "$BLOCKING_TIER_UNRESOLVED" \
+    --argjson discretionary_tier_unresolved "${DISCRETIONARY_TIER_UNRESOLVED:-null}" \
     --argjson rate_limit_retries "$RATE_LIMIT_RETRIES" \
     --argjson resume_retries "$RESUME_RETRIES" \
     --argjson status_probe "$STATUS_PROBE_JSON" \
@@ -4002,6 +4020,7 @@ emit_json_and_exit() {
       review: $review,
       potential_issue_count: $potential_issue_count,
       blocking_tier_unresolved: $blocking_tier_unresolved,
+      discretionary_tier_unresolved: $discretionary_tier_unresolved,
       rate_limit_retries: $rate_limit_retries,
       resume_retries: $resume_retries,
       status_probe: $status_probe,
