@@ -1268,6 +1268,21 @@ jobs:
         if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
         run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # The oracle's two numeric-kill cells run real Bash in a fresh
+      # user/PID namespace (`unshare --user --map-root-user --pid`). Ubuntu
+      # 24.04 runners deny unprivileged user namespaces through AppArmor, so
+      # the capsule fails closed as unavailable. Lift that restriction on
+      # this ephemeral runner only; kernels without the knob are unchanged.
+      - name: allow_unprivileged_userns_for_token_oracle
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_no_token_in_output'))
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "no AppArmor user-namespace restriction on this kernel"
+          fi
+
       - name: check_no_token_in_output --self-test
         if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_no_token_in_output'))
         run: ./scripts/ci/check_no_token_in_output --self-test || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
