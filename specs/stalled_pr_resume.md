@@ -34,6 +34,10 @@ The script is read-only and performs no GitHub write: it never requests a review
 
 Exit codes: 0 a stalled PR was selected and its work order printed; 1 nothing to resume; 2 usage (including the removed `--execute` flag); 3 the finder could not read the repository.
 
+## Local-agent handback
+
+The shared local-agent handback tooling validates write-boundary inputs before contacting GitHub. `scripts/post-local-agent-handback.sh` refuses a `--next` command containing triple backticks before any read or write, because the command is rendered inside a fixed triple-backtick fence. `scripts/dispatch-thread-resolution-lane.sh` accepts only positive decimal integers of at most seven digits for `--appear-timeout`, `--watch-timeout` and `DISPATCH_LANE_POLL_INTERVAL`; leading zeroes, zero and non-decimal values exit 1 before the repository-dispatch POST. This preserves unambiguous Bash arithmetic and prevents a malformed polling interval from disabling the run watcher.
+
 ## Scheduled routine
 
 The routine itself is configured outside the repository. From a checkout at the default branch, with a read-only token for the finder, it runs `scripts/workflow/resume-stalled-pr.sh --repo <owner/repo>` and an agent session then performs the printed round, writes included, under its own author and reviewer credentials; `docs/agents/operating-rules.md` § Session finalization carries the operator detail.

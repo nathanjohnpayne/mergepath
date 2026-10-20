@@ -80,8 +80,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 printf '%s' "$PR" | grep -Eq '^[0-9]+$' || die 1 "PR number required (got '${PR}')"
-printf '%s' "$APPEAR_TIMEOUT" | grep -Eq '^[0-9]+$' || die 1 "--appear-timeout must be a number of seconds"
-printf '%s' "$WATCH_TIMEOUT" | grep -Eq '^[0-9]+$' || die 1 "--watch-timeout must be a number of seconds"
+printf '%s' "$APPEAR_TIMEOUT" | grep -Eq '^[1-9][0-9]{0,6}$' || die 1 "--appear-timeout must be a positive decimal integer (1-7 digits, no leading zeroes)"
+printf '%s' "$WATCH_TIMEOUT" | grep -Eq '^[1-9][0-9]{0,6}$' || die 1 "--watch-timeout must be a positive decimal integer (1-7 digits, no leading zeroes)"
+printf '%s' "$POLL_INTERVAL" | grep -Eq '^[1-9][0-9]{0,6}$' || die 1 "DISPATCH_LANE_POLL_INTERVAL must be a positive decimal integer (1-7 digits, no leading zeroes)"
 command -v gh >/dev/null 2>&1 || die 1 "gh is required"
 
 if [ -z "$REPO" ]; then

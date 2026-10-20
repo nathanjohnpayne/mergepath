@@ -100,6 +100,7 @@ printf '%s' "$PR" | grep -Eq '^[0-9]+$' || die 1 "PR number required (got '${PR}
 [ -n "$BLOCKED" ] || die 1 "--blocked <capability> is required"
 case " $CAPABILITIES " in *" $BLOCKED "*) ;; *) die 1 "--blocked must be one of: $CAPABILITIES (got '$BLOCKED')" ;; esac
 [ -n "$NEXT" ] || die 1 "--next \"<command>\" is required: the resuming session runs it"
+case "$NEXT" in *'```'*) die 1 "--next must not contain triple backticks" ;; esac
 if [ -n "$NOTE_FILE" ] && [ ! -r "$NOTE_FILE" ]; then die 1 "note file not readable: $NOTE_FILE"; fi
 case "$SESSION_URL" in ''|https://*) ;; *) die 1 "--session-url must be an https:// URL (got '$SESSION_URL')" ;; esac
 case "$SESSION_URL" in *[[:space:]]*) die 1 "--session-url must not contain whitespace" ;; esac
