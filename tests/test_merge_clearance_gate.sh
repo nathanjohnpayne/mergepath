@@ -639,9 +639,12 @@ fi
 echo; echo "--- Test 7: external-review, delegate clears"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture '[]')
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" \
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_REQUIRE_HEAD_PIN=1 \
+      CODEX_STUB_STDOUT='same-agent + Codex HEAD-anchored verdict cleared; no reviewer-identity APPROVED' \
       CODEX_STUB_RC=0 \
       run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
@@ -650,6 +653,20 @@ if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
   pass "external-review + delegate rc=0 → exit 0"
 else
   fail "expected rc=0 PASS; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+# The delegate can legitimately clear without a formal reviewer approval
+# (#923). Assert only on the gate summary: delegate diagnostics may name the
+# absence of APPROVED, and must remain free to explain their own branch.
+SUMMARY_LINE=$(grep '^Merge clearance:' <<<"$OUT" || true)
+if [ "$RC" = 0 ] && [[ "$SUMMARY_LINE" == "Merge clearance: PASS — external review cleared on HEAD $HEAD_SHA (needs-external-review label present"* ]]; then
+  pass "#923: successful external summary retains the head and applicability reason"
+else
+  fail "#923: successful external summary lost head/reason: $SUMMARY_LINE"
+fi
+if [ "$RC" = 0 ] && [ "$(jq 'length' "$FIXTURE_REVIEWS")" = 0 ] && [[ "$SUMMARY_LINE" != *APPROVED* ]]; then
+  pass "#923: successful Codex-only delegation does not claim a formal approval"
+else
+  fail "#923: successful Codex-only summary claims a formal approval: $SUMMARY_LINE"
 fi
 
 # ---------------------------------------------------------------------------
