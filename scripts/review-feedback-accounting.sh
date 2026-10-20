@@ -567,11 +567,17 @@ EOF
 # footer/confirmation run, carriage returns and trailing blank lines removed,
 # for comparing two revisions of one finding on content. The run is removed
 # only when the raw body and its visible text agree on it; otherwise only the
-# carriage returns and trailing blank lines go.
+# carriage returns and trailing blank lines go. For content comparison only,
+# also remove one exact leading vendor header and its immediately adjacent
+# blank line (#2568). Embedded/fenced headers and raw fingerprints stay intact.
 coderabbit_strip_ack_suffix() {
   local body="$1" mode=strip
   coderabbit_ack_run "$body" >/dev/null 2>&1 || mode=trim
-  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK"
+  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK" | awk '
+    NR == 1 && $0 == "<!-- coderabbit-ai-generated:v1 -->" { header = 1; next }
+    NR == 2 && header && /^[ \t]*$/ { next }
+    { print }
+  '
 }
 
 FINDINGS='[]'

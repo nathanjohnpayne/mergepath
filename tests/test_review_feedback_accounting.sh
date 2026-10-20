@@ -968,6 +968,33 @@ archive_of "$PRE_ACK_BODY" 8700
 run_gate
 assert_eq 0 "$RUN_RC" "an archived revision that differs from the live finding only by the footer swap and line is not a second finding (#1167)"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "acknowledgement-only archive demands no inline acknowledgement token"
+
+# #2568: acknowledgement edits can prepend vendor framing as well as change
+# the footer. Compare content symmetrically without changing raw archive IDs.
+for header_side in live archive; do
+  cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+  if [ "$header_side" = live ]; then
+    ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\n" + .' "2026-08-18T21:03:00Z"
+    archive_of "$PRE_ACK_BODY" 8710
+  else
+    printf '<!-- coderabbit-ai-generated:v1 -->\n\n%s\n' "$(cat "$PRE_ACK_BODY")" >"$TMP/header-pre-ack.txt"
+    archive_of "$TMP/header-pre-ack.txt" 8711
+  fi
+  run_gate
+  assert_eq 0 "$RUN_RC" "vendor header on $header_side keeps the existing disposition accounted (#2568)"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "vendor framing adds no archived finding on $header_side"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "vendor framing requires no second disposition on $header_side"
+done
+# shellcheck disable=SC2016 # Markdown fences are literal negative-control data.
+for header_edit in '"<!-- coderabbit-ai-generated:v1 -->\n\n" + sub("Clarify the error"; "Also validate the response")' \
+  '. + "\n\n<!-- coderabbit-ai-generated:v1 -->"' \
+  '"```html\n<!-- coderabbit-ai-generated:v1 -->\n```\n\n" + .'; do
+  cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+  ack_edit "$header_edit" "2026-08-18T21:03:00Z"
+  archive_of "$PRE_ACK_BODY" 8712
+  run_gate
+  assert_eq 1 "$RUN_RC" "real content and embedded or fenced headers still require disposition (#2568)"
+done
 cp "$TMP/fixtures/inline-acked-twice.json" "$TMP/fixtures/inline.json"
 jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.txt"
 archive_of "$TMP/acked-once-body.txt" 8701
