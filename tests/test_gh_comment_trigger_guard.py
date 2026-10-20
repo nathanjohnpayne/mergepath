@@ -264,6 +264,29 @@ class TriggerGuardTests(unittest.TestCase):
         self.assertEqual(raw, Path(args[-1]).read_bytes())
         self.assertFalse(meta["trigger"])
 
+    def test_unreadable_payload_file_names_the_path_not_the_encoding(self):
+        missing = self.root / "never-written.md"
+        directory = self.root / "a-directory"
+        directory.mkdir()
+        for path, reason in ((missing, "No such file or directory"), (directory, "Is a directory")):
+            for args in (["issue", "comment", "518", "--body-file", str(path)],
+                         ["pr", "comment", "123", "-F", str(path)]):
+                with self.subTest(path=path.name, args=args[:2]):
+                    with self.assertRaises(guard.Refused) as caught:
+                        self.check(args)
+                    message = str(caught.exception)
+                    self.assertIn("could not be read", message)
+                    self.assertIn(reason, message)
+                    self.assertIn(str(path), message)
+                    self.assertNotIn("UTF-8", message)
+
+    def test_non_utf8_payload_keeps_the_encoding_message(self):
+        body = self.root / "latin1.md"
+        body.write_bytes("caf\xe9".encode("latin-1"))
+        with self.assertRaises(guard.Refused) as caught:
+            self.check(["issue", "comment", "518", "--body-file", str(body)])
+        self.assertIn("cannot be read as UTF-8", str(caught.exception))
+
     def test_snapshot_preserves_unicode_and_trailing_newlines(self):
         body = self.root / "comment.md"
         raw = "A review with café and 🟡.\n\n".encode()

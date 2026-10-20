@@ -88,8 +88,16 @@ def inspect(argv, role, state=None):
             return None, value
         try:
             raw = sys.stdin.buffer.read() if value == "-" else Path(value).read_bytes()
+        except OSError as exc:
+            # A missing or unreadable path is not an encoding problem;
+            # name the path and the OS reason so the caller fixes the
+            # right thing (#2546).
+            source = "standard input" if value == "-" else value
+            reason = exc.strerror or type(exc).__name__
+            raise Refused(f"Comment payload file could not be read ({reason}): {source}; no write performed.") from exc
+        try:
             text = raw.decode("utf-8")
-        except (OSError, UnicodeError) as exc:
+        except UnicodeError as exc:
             raise Refused("Comment payload cannot be read as UTF-8; no write performed.") from exc
         parsed = json.loads(text) if json_input else text
         replacement = value
