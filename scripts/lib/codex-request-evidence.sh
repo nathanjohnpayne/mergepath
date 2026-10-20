@@ -113,9 +113,11 @@ crqe_failover_markers_present() { # comments-json author
 }
 
 # The heads this PR has had (#2553): <current-head>, every commit in the PR's
-# commit list, and the commits the timeline records (`committed` events and
-# both sides of a `head_ref_force_pushed`). Prints a sorted array of lowercase
-# full SHAs. Fails on input that is not two arrays and a full SHA; callers
+# commit list, and the commits the timeline records (`committed` events and a
+# `head_ref_force_pushed` event's commit_id when REST fills it). REST does not
+# name the head a force-push replaced, so a marker on a head that was later
+# force-pushed away no longer exempts its trigger: it counts, the safe side.
+# Prints a sorted array of lowercase full SHAs. Fails on input that is not two arrays and a full SHA; callers
 # then use [] so that nothing is exempt.
 crqe_pr_head_set() { # commits-json timeline-json current-head
   jq -nce --argjson c "$1" --argjson t "$2" --arg h "$3" '
@@ -126,7 +128,7 @@ crqe_pr_head_set() { # commits-json timeline-json current-head
         ($c[] | objects | .sha | sha),
         ($t[] | objects | select(.event == "committed") | .sha | sha),
         ($t[] | objects | select(.event == "head_ref_force_pushed")
-             | (.commit_id, .before_commit_id, .after_commit_id, .before.sha, .after.sha) | sha) ]
+             | .commit_id | sha) ]
     | unique' 2>/dev/null
 }
 

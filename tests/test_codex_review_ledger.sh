@@ -990,6 +990,24 @@ if [ "$RC" = 0 ] && jq -e '.fixes == []' "$D/out" >/dev/null \
 else
   fail "CLI fixes-p2 case: rc=$RC fixes=$(jq -c .fixes "$D/out" 2>/dev/null) calls=$(grep reactions "$D/calls" | tr '\n' ' ')"
 fi
+# resolve-pr-threads.sh records a fix as addressed-elsewhere: that tag keeps
+# the disposition; another tag beside it still removes it.
+AE='[{"id": 61, "pull_request_review_id": 52, "in_reply_to_id": 60, "path": "x.sh", "user": {"login": "nathanjohnpayne"}, "body": "[mergepath-resolve: addressed-elsewhere] fixed in abc1234", "created_at": "2026-09-25T00:40:00Z"}]'
+D="$WORK/fixes-addressed"; fx_case "$D" "$UP" "$AE"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.fixes == [60]' "$D/out" >/dev/null; then
+  pass "CLI: an addressed-elsewhere tag is the fix class and keeps the disposition"
+else
+  fail "CLI fixes-addressed case: rc=$RC out=$(jq -c '{fixes}' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+fi
+D="$WORK/fixes-addressed-nitpick"
+fx_case "$D" "$UP" "$(printf '%s' "$AE" | jq -c '. + [{id: 62, pull_request_review_id: 53, in_reply_to_id: 60, path: "x.sh", user: {login: "nathanjohnpayne"}, body: "[mergepath-resolve: nitpick-noted] later", created_at: "2026-09-25T00:41:00Z"}]')"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.fixes == []' "$D/out" >/dev/null; then
+  pass "CLI: a nitpick tag beside addressed-elsewhere removes the disposition"
+else
+  fail "CLI fixes-addressed-nitpick case: rc=$RC out=$(jq -c '{fixes}' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+fi
 # A thumbs-down the rollup has not caught up with is not read as a rebuttal,
 # but the fix read still sees it.
 D="$WORK/fixes-stale-down"

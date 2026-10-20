@@ -357,9 +357,10 @@ REBUTTALS=$(jqx "rebuttals" -c --argjson b "$BODY_REBUTTALS" '. + $b' <<<"$REBUT
 # ---- fix dispositions (#2534) ----------------------------------------------------
 # A Codex inline finding has a plain fix disposition when its root carries a
 # thumbs-up from anyone but the bot (codex-record-feedback.sh's fixed verdict),
-# no thumbs-down, no [mergepath-resolve: <class>] reply of any class (a
-# deferral, an addressed-elsewhere or a nitpick note is not a fix), and it is not
-# a rebuttal. It is only one of the three things crl_fixed_rids needs. Only
+# no thumbs-down, no [mergepath-resolve: <class>] reply of any class except
+# addressed-elsewhere (the class resolve-pr-threads.sh records for a fix; a
+# deferral, a rebuttal or a nitpick note is not a fix), and it is not a
+# rebuttal. It is only one of the three things crl_fixed_rids needs. Only
 # blocking-tier roots are read, since no other finding can make a runaway, and
 # a reaction rollup that rules a thumbs-up out skips the read.
 FIXES='[]'
@@ -373,7 +374,9 @@ while IFS= read -r root; do
     | if type != "object" then error("reactions") else (.["+1"] // 1) > 0 end' <<<"$root")
   [ "$rollup_says_up" = true ] || continue
   tagged=$(jqx "thread $rid replies" -r --argjson rid "$rid" '
-    any(.[]; .in_reply_to_id == $rid and ((.body // "") | test("\\[mergepath-resolve:\\s*[a-z][a-z-]*\\s*\\]")))' <<<"$REVIEW_COMMENTS")
+    any(.[]; .in_reply_to_id == $rid
+             and ((.body // "") | [ scan("\\[mergepath-resolve:\\s*([a-z][a-z-]*)\\s*\\]") | .[0] ]
+                                | any(. != "addressed-elsewhere")))' <<<"$REVIEW_COMMENTS")
   [ "$tagged" = false ] || continue
   # Plain jq for the two yes/no reads: a false answer is not malformed
   # evidence, and an unreadable one leaves the finding unfixed.

@@ -338,7 +338,8 @@ __CRL_VALID='type == "object" and (.responses | type) == "array"
 # hold, so no single act by the author can claim it:
 #   disposition  it is in .fixes: a non-bot thumbs-up on its root
 #                (codex-record-feedback.sh's fixed verdict), no thumbs-down, no
-#                [mergepath-resolve: <class>] tag in its thread, not rebutted;
+#                [mergepath-resolve: <class>] tag in its thread other than the
+#                fix class addressed-elsewhere, not rebutted;
 #   a commit     a later head that descends from the reviewed one changed the
 #                finding's file (.head_changes: the compare of the two heads,
 #                status "ahead", lists the path);

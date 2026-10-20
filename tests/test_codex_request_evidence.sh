@@ -327,7 +327,7 @@ crqe_failover_markers_present "$_fo_c" nathanjohnpayne && ! crqe_failover_marker
 # sides of a force-push; anything malformed fails so the caller uses [].
 _hs=$(crqe_pr_head_set "$(jq -nc --arg b "$FO_HB" '[{sha: $b}, {sha: "short"}]')" \
   "$(jq -nc --arg x "$FO_HX" --arg y "$FO_HY" --arg c 3333333333333333333333333333333333333333 \
-     '[{event: "committed", sha: $c}, {event: "head_ref_force_pushed", commit_id: $y, before_commit_id: $x}, {event: "labeled", sha: "4444444444444444444444444444444444444444"}]')" \
+     '[{event: "committed", sha: $c}, {event: "head_ref_force_pushed", commit_id: $y}, {event: "committed", sha: $x}, {event: "labeled", sha: "4444444444444444444444444444444444444444"}]')" \
   "$(printf '%s' "$FO_HA" | tr a-f A-F)")
 [ "$_hs" = "$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" --arg x "$FO_HX" --arg y "$FO_HY" '[$a, $b, $x, $y, "3333333333333333333333333333333333333333"] | sort')" ] \
   || { echo "FAIL: failover: head set was $_hs" >&2; exit 1; }
