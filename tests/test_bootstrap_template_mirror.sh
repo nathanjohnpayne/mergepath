@@ -1285,6 +1285,36 @@ else
   fail "verifier should require a newly backed canonical doc without a copied array update; got: $res"
 fi
 
+# #808: complete the pending-to-backed transition in the source inventory.
+# The same future-rule path was excluded above while pending; no bootstrap
+# array or implementation edit may be needed to make it required afterward.
+future_source='printf "new canonical rule\n" > docs/agents/future-rule.md; git add docs/agents/future-rule.md'
+res=$(verify_case "unbacked-pending-control" ":" "$future_source")
+if [ "${res%%|*}" = 0 ]; then
+  pass "pending canonical doc stays optional before backing lands (#808)"
+else
+  fail "unbacked pending doc should not be required: $res"
+fi
+future_backed="$future_source; "'yq -i '\''.paths = [{"path":"docs/agents/future-rule.md","type":"canonical","consumers":"all"}] | del(.doc_ownership[] | select(.path == "docs/agents/future-rule.md") | .pending_manifest)'\'' .mergepath-sync.yml'
+res=$(verify_case "completed-transition-missing" ":" "$future_backed")
+if [ "${res%%|*}" = 1 ] && grep -q 'canonical agent docs missing.*docs/agents/future-rule.md' <<<"${res#*|}"; then
+  pass "removing the backed doc's pending flag automatically requires it (#808)"
+else
+  fail "completed transition must require the formerly pending doc: $res"
+fi
+res=$(verify_case "completed-transition-stale" 'printf "stale receiver rule\n" > docs/agents/future-rule.md' "$future_backed")
+if [ "${res%%|*}" = 1 ] && grep -q 'canonical agent docs differ.*docs/agents/future-rule.md(content)' <<<"${res#*|}"; then
+  pass "formerly pending canonical doc must match source content (#808)"
+else
+  fail "completed transition must reject a stale receiver doc: $res"
+fi
+res=$(verify_case "completed-transition-intact" 'printf "new canonical rule\n" > docs/agents/future-rule.md' "$future_backed")
+if [ "${res%%|*}" = 0 ]; then
+  pass "completed transition accepts matching formerly pending canonical content (#808)"
+else
+  fail "completed transition should accept matching canonical content: $res"
+fi
+
 res=$(verify_case "missing-doc" 'rm docs/agents/shared-operating-rules.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep "canonical agent docs missing" >/dev/null; then
   pass "verifier fails closed when a canonical agent doc is absent (#780)"

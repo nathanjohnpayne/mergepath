@@ -62,6 +62,8 @@ EOF
 
 # git init each fake worktree — resolve_consumer_worktree() looks for .git/
 git init -q "$MP"
+# Kits are audited from the hub's tracked files (#2542), so stage the fixture.
+git -C "$MP" add -A
 
 SIBLINGS="$WORKDIR/siblings"
 mkdir -p "$SIBLINGS"
@@ -144,6 +146,40 @@ echo "$output" | awk '
   in_block && /^  / { print }
 ' | grep -q '✓\|✗' \
   && fail "missing-everything should report only ⊘; got ✓ or ✗ lines"
+
+# #2542: ignored and untracked hub files inside a kit are never shipped, so
+# the audit must not count them as files the consumer is missing. A local
+# Python run leaves `__pycache__/` (gitignored) in kit dirs; the old
+# filesystem walk reported every consumer as "1 file(s) missing".
+printf '__pycache__/\n' >>"$MP/.git/info/exclude"
+mkdir -p "$MP/scripts/ci/__pycache__"
+echo "bytecode" >"$MP/scripts/ci/__pycache__/check_one.cpython-313.pyc"
+echo "scratch" >"$MP/scripts/ci/check_local_scratch"
+git -C "$MP" status --short --ignored -- scripts/ci | grep -qF '!! scripts/ci/__pycache__/' \
+  || fail "fixture __pycache__ should be gitignored in the hub"
+git -C "$MP" status --short -- scripts/ci | grep -qF '?? scripts/ci/check_local_scratch' \
+  || fail "fixture scratch file should be untracked in the hub"
+set +e
+ignored_kit_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
+ignored_kit_rc=$?
+set -e
+[[ "$ignored_kit_rc" -eq 0 ]] \
+  || fail "ignored/untracked hub kit files reported as drift (exit $ignored_kit_rc): $ignored_kit_out"
+echo "$ignored_kit_out" | grep -qE '✓ scripts/ci/ +in sync' \
+  || fail "kit with ignored/untracked hub files should stay in sync: $ignored_kit_out"
+# A tracked kit file the consumer lacks is still reported as missing.
+echo "kit-file-3" >"$MP/scripts/ci/check_three"
+git -C "$MP" add -- scripts/ci/check_three
+set +e
+tracked_missing_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
+set -e
+echo "$tracked_missing_out" | grep -qE '✗ scripts/ci/ +drift: 0 file\(s\) drifted, 1 file\(s\) missing' \
+  || fail "tracked kit file absent from the consumer should count as missing: $tracked_missing_out"
+git -C "$MP" rm -q --cached -- scripts/ci/check_three
+rm -rf "$MP/scripts/ci/__pycache__" "$MP/scripts/ci/check_local_scratch" "$MP/scripts/ci/check_three"
+echo 'PASS: kit audit ignores untracked and gitignored hub files (#2542)'
 
 # ---------------------------------------------------------------------------
 # Filter test: --paths restriction must shrink the report
@@ -1072,6 +1108,43 @@ for omitted_path in scripts/omitted.sh scripts/omitted-kit/ templates/omitted.in
   grep -qFx -- "- \`$omitted_path\`" "$narrow_body" || fail "omitted manifest path absent: $omitted_path"
 done
 echo 'PASS: full and narrowed sync PR bodies retain exact requested scope (#2490)'
+
+# #2542: --sync-all delivers kit files from the committed tree at the source
+# sha, so an ignored or untracked file in the hub's kit dir never ships.
+kit_hub="$metadata_workdir/kit-tracked-source"
+git clone -q "$META_MP" "$kit_hub"
+cat >"$kit_hub/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+paths:
+  - {path: scripts/kit/, type: kit, consumers: all}
+YAML
+mkdir -p "$kit_hub/scripts/kit"
+echo "kit a" >"$kit_hub/scripts/kit/check_a"
+echo "kit b" >"$kit_hub/scripts/kit/check_b"
+git -C "$kit_hub" add -A
+git -C "$kit_hub" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'kit fixture'
+printf '__pycache__/\n' >>"$kit_hub/.git/info/exclude"
+mkdir -p "$kit_hub/scripts/kit/__pycache__"
+echo "bytecode" >"$kit_hub/scripts/kit/__pycache__/check_a.cpython-313.pyc"
+echo "scratch" >"$kit_hub/scripts/kit/check_local_scratch"
+kit_remote="$metadata_workdir/kit-tracked.git"
+setup_metadata_remote "$kit_remote" "$metadata_workdir/kit-tracked-seed"
+set +e
+kit_sync_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$kit_hub" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$kit_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN=2542 MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha 2>&1)
+kit_sync_rc=$?
+set -e
+[ "$kit_sync_rc" -eq 0 ] || fail "kit sync-all fixture failed: $kit_sync_out"
+kit_branch=$(git --git-dir="$kit_remote" for-each-ref --format='%(refname:short)' 'refs/heads/mergepath-sync/sync-all-*')
+[ -n "$kit_branch" ] || fail "kit sync-all pushed no branch: $kit_sync_out"
+kit_delivered=$(git --git-dir="$kit_remote" ls-tree -r --name-only "refs/heads/$kit_branch" -- scripts/kit)
+[ "$kit_delivered" = $'scripts/kit/check_a\nscripts/kit/check_b' ] \
+  || fail "sync-all kit delivery must be exactly the committed kit files; got: $kit_delivered"
+echo 'PASS: sync-all never delivers untracked or gitignored kit files (#2542)'
 
 set +e
 scope_repeat_out=$(env \

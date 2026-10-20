@@ -63,7 +63,11 @@ case "$*" in
     # association, not just the name — is the one that runs. A pre-filtered
     # name list would make the suite blind to exactly the defects that filter
     # exists for, which is how three findings on this PR got past it.
-    printf '%s\n' "${STUB_CHECK_RUNS_RAW:-${STUB_CHECK_RUNS:?}}"
+    if [ -n "${STUB_CHECK_RUNS_FILE:-}" ]; then
+      cat "$STUB_CHECK_RUNS_FILE"
+    else
+      printf '%s\n' "${STUB_CHECK_RUNS_RAW:-${STUB_CHECK_RUNS:?}}"
+    fi
     case " $* " in
       *" --paginate "*) [ -n "${STUB_CHECK_RUNS_PAGE2:-}" ] && printf '%s\n' "$STUB_CHECK_RUNS_PAGE2" ;;
     esac
@@ -156,6 +160,7 @@ cat > "$TMP/bin/validate-hostile.sh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 body=$(cat)
+[ "${STUB_VALIDATE_SELF_ONLY:-0}" != 1 ] || [ "${1:-}" = --self-review-only ] || exit 0
 case "$body" in
   *mergepath-recovery-nudge:*) echo "hostile validator rejects the marker" >&2; exit 1 ;;
 esac
@@ -300,6 +305,43 @@ else
   fail "expected rc=3, no edit, no conclusion read; rc=$RC wrote=$WROTE log='$(cat "$D/gh.log")'"
 fi
 
+# --- 4b: large listings retain complete context membership (#1259) ---------
+# File-backed API fixtures keep a realistic large listing out of environment
+# and argv limits. Both required contexts precede enough unrelated names to
+# leave printf writing after an early-closing grep finds either match.
+python3 - "$TMP" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+folder = Path(sys.argv[1])
+filler = [f"context-{index:04d}-" + "x" * 150 for index in range(512)]
+for filename, required in [("large-both.json", ["Self-Review Required", "Label Gate"]),
+                           ("large-missing.json", ["Self-Review Required"])]:
+    runs = [{"name": name, "app": {"slug": "github-actions"},
+             "pull_requests": [{"number": 7}], "started_at": "2026-06-01T00:00:00Z"}
+            for name in required + filler]
+    (folder / filename).write_text(json.dumps({"check_runs": runs}))
+PY
+if [ "$(jq '[.check_runs[].name | length + 1] | add' "$TMP/large-both.json")" -gt 80000 ]; then
+  pass "the large-context fixture exceeds 80 KB of decoded check names"
+else
+  fail "the large-context fixture is too small to exercise a complete-input match"
+fi
+run_nudge open sha444b "$VALID_BODY" '' STUB_CHECK_RUNS_FILE="$TMP/large-both.json"
+if [ "$RC" = 3 ] && [ "$WROTE" = 0 ] && [ ! -s "$D/written.txt" ]; then
+  pass "both contexts at the start of a large listing refuse recovery without a body edit"
+else
+  fail "large reported listing must refuse without mutation; rc=$RC wrote=$WROTE out='$OUT' err='$ERR'"
+fi
+run_nudge open sha444c "$VALID_BODY" '' STUB_CHECK_RUNS_FILE="$TMP/large-missing.json"
+MISSING_CONTEXTS=$(sed -n 's/.*; not yet reported: //p' <<<"$OUT")
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && [ "$MISSING_CONTEXTS" = 'Label Gate' ]; then
+  pass "a genuinely missing context in a large listing is nudged and only that context is named"
+else
+  fail "large missing listing must recover only Label Gate; rc=$RC wrote=$WROTE missing='$MISSING_CONTEXTS' err='$ERR'"
+fi
+
 # --- 5: replace, not append ------------------------------------------------
 echo; echo "--- 5: an existing marker is REPLACED, not appended"
 SEEDED="$VALID_BODY"$'\n\n<!-- mergepath-recovery-nudge: 2020-01-01T00:00:00Z -->'
@@ -369,6 +411,15 @@ else
   fail "expected rc=0 with an edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
+echo "--- 7c: a self-review-only regression is refused even if full validation passes"
+run_nudge open sha779 "$VALID_BODY" "$NEITHER" \
+  MERGEPATH_NUDGE_VALIDATE_BIN="$TMP/bin/validate-hostile.sh" STUB_VALIDATE_SELF_ONLY=1
+if [ "$RC" = 4 ] && [ "$WROTE" = 0 ]; then
+  pass "the self-review-only comparison independently preserves non-introduction"
+else
+  fail "expected rc=4 without an edit for a self-review-only regression; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
 # --- 8-11: fail closed on every input it cannot trust ----------------------
 echo; echo "--- 8: a closed PR -> rc 1, no write"
 run_nudge closed sha888 "$VALID_BODY" "$NEITHER"
@@ -405,6 +456,46 @@ if [ "$RC" = 2 ] && [ "$WROTE" = 0 ]; then
 else
   fail "expected rc=2 with no edit; rc=$RC wrote=$WROTE"
 fi
+
+# --- 11a: real validator prerequisites are not invalid-body verdicts (#1257)
+# Copy the actual entrypoint, shell helper and bundled module together, then
+# remove the real dependency path. An exit-127 stub cannot model these rc1s.
+REAL_VALIDATOR_FIXTURE="$TMP/real-validator"
+make_real_validator_fixture() {
+  mkdir -p "$REAL_VALIDATOR_FIXTURE/scripts/lib" "$REAL_VALIDATOR_FIXTURE/.github"
+  cp "$REAL_VALIDATE" "$REAL_VALIDATOR_FIXTURE/scripts/validate-pr-body.sh"
+  cp "$ROOT/scripts/lib/pr-body-contract.sh" "$ROOT/scripts/lib/pr-body-contract.mjs" \
+    "$ROOT/scripts/lib/reviewers-helpers.sh" "$REAL_VALIDATOR_FIXTURE/scripts/lib/"
+  cp "$ROOT/.github/review-policy.yml" "$REAL_VALIDATOR_FIXTURE/.github/"
+}
+for dependency in pr-body-contract.sh pr-body-contract.mjs; do
+  make_real_validator_fixture
+  rm "$REAL_VALIDATOR_FIXTURE/scripts/lib/$dependency"
+  for body_kind in valid invalid; do
+    fixture_body="$VALID_BODY"
+    [ "$body_kind" != invalid ] || fixture_body='no declarations here'
+    run_nudge open shabbb1 "$fixture_body" "$NEITHER" \
+      MERGEPATH_NUDGE_VALIDATE_BIN="$REAL_VALIDATOR_FIXTURE/scripts/validate-pr-body.sh"
+    if [ "$RC" = 2 ] && [ "$WROTE" = 0 ] && [ ! -s "$D/written.txt" ] \
+      && grep -q 'could not run' <<<"$ERR"; then
+      pass "missing real $dependency refuses $body_kind input as infrastructure without editing"
+    else
+      fail "missing real $dependency must refuse $body_kind input; rc=$RC wrote=$WROTE err='$ERR'"
+    fi
+  done
+done
+make_real_validator_fixture
+for body_kind in valid invalid; do
+  fixture_body="$VALID_BODY"
+  [ "$body_kind" != invalid ] || fixture_body='no declarations here'
+  run_nudge open shabbb2 "$fixture_body" "$NEITHER" \
+    MERGEPATH_NUDGE_VALIDATE_BIN="$REAL_VALIDATOR_FIXTURE/scripts/validate-pr-body.sh"
+  if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+    pass "the complete real validator preserves recovery for $body_kind input"
+  else
+    fail "complete real validator must allow $body_kind input; rc=$RC wrote=$WROTE err='$ERR'"
+  fi
+done
 
 echo "--- 12: a failed edit is reported as a failure, not as a nudge"
 run_nudge open shaccc "$VALID_BODY" "$NEITHER" STUB_EDIT_RC=1
@@ -700,6 +791,32 @@ check_wrapper_condition "github.event.action == 'edited'" 0 \
   "the live wrapper preserves an explicitly supported edited condition"
 check_wrapper_condition "always()" 0 \
   "the live wrapper accepts a dependent job that always reports its result"
+
+# Keep the canonical condition first while growing only a copied guard's
+# allowlist data beyond a pipe buffer. The production matcher must consume
+# that literal membership input without a producer SIGPIPE becoming refusal.
+cp "$ROOT/scripts/ci/check_pr_review_policy_nudge" "$WRAPPER_FIXTURE/scripts/ci/"
+python3 - "$WRAPPER_FIXTURE/scripts/ci/check_pr_review_policy_nudge" <<'PY_GUARD'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = "github.event.pull_request.user.login != 'dependabot[bot]'\nalways()\n"
+filler = "".join(f"fixture-condition-{index:05d}\n" for index in range(5000))
+assert len(filler.encode()) > 80_000
+assert text.count(anchor) == 1, "fixture must change only the literal allowlist data"
+path.write_text(text.replace(anchor, anchor.splitlines()[0] + "\n" + filler + "always()\n"))
+PY_GUARD
+rc=0
+env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+  bash "$WRAPPER_FIXTURE/scripts/ci/check_pr_review_policy_nudge" --check \
+  >"$TMP/wrapper.out" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "the literal membership guard accepts a canonical condition before a large allowlist tail"
+else
+  fail "the large allowlist must preserve canonical membership; rc=$rc; $(cat "$TMP/wrapper.out")"
+fi
 
 # A newline in grep's pattern is an alternative, not part of one complete
 # expression (#1258). Exercise the real YAML reader and guard for every job.

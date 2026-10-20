@@ -875,6 +875,25 @@ materialize_templated_targets() {
 # shellcheck disable=SC1091
 source "$MERGEPATH_ROOT/scripts/lib/manifest-fact-helpers.sh"
 
+# Echo the hub files a kit manages, NUL-terminated and relative to
+# MERGEPATH_ROOT. Only tracked files count (#2542): a filesystem walk
+# also picked up gitignored and untracked files such as a local
+# `__pycache__/`, which no sync ever ships, so every consumer looked
+# like it was missing one file per cached kit. Symlinks, gitlinks and
+# tracked files deleted from the working tree are skipped, because the
+# audit compares working-tree content and kits are plain script
+# directories. Returns non-zero when the hub index cannot be read.
+hub_kit_files() {
+  local kit_dir="${1%/}" rel
+  git -C "$MERGEPATH_ROOT" --literal-pathspecs ls-files -z -- "$kit_dir/" \
+    | while IFS= read -r -d '' rel; do
+        if [ -f "$MERGEPATH_ROOT/$rel" ] && [ ! -L "$MERGEPATH_ROOT/$rel" ]; then
+          printf '%s\0' "$rel"
+        fi
+      done
+  [ "${PIPESTATUS[0]}" -eq 0 ]
+}
+
 # Compare a kit directory: every file under Mergepath's path must
 # exist (byte-identical) in the consumer; consumer-only files are
 # allowed and ignored. Outputs a status tag in $REPLY:
@@ -884,34 +903,38 @@ source "$MERGEPATH_ROOT/scripts/lib/manifest-fact-helpers.sh"
 compare_kit() {
   local mp_path=$1
   local consumer_root=$2
-  local mp_full="$MERGEPATH_ROOT/$mp_path"
-  local consumer_full="$consumer_root/$mp_path"
-
-  # Strip trailing slash for find consistency.
-  mp_full="${mp_full%/}"
-  consumer_full="${consumer_full%/}"
+  local consumer_full="$consumer_root/${mp_path%/}"
 
   if [ ! -d "$consumer_full" ]; then
     REPLY="missing"
     return 0
   fi
 
+  local listing
+  listing=$(mktemp "${TMPDIR:-/tmp}/compare-kit.XXXXXX") || {
+    err "compare_kit: mktemp failed"
+    REPLY="drift:0+0"
+    return 0
+  }
+  if ! hub_kit_files "$mp_path" >"$listing"; then
+    rm -f "$listing"
+    err "compare_kit: could not enumerate tracked files for kit $mp_path"
+    REPLY="drift:0+0"
+    return 0
+  fi
+
   local drift_count=0
   local missing_count=0
-  # Walk every file under the Mergepath kit. Ignore symlinks and
-  # special files — kits are plain script directories.
-  while IFS= read -r -d '' f; do
-    # Quote inside the expansion so shell glob metacharacters in the
-    # path (improbable in this repo, but cheap to be correct) are
-    # treated as literals. CodeRabbit nitpick on PR #215.
-    local rel="${f#"$mp_full/"}"
-    local target="$consumer_full/$rel"
+  local rel
+  while IFS= read -r -d '' rel; do
+    local target="$consumer_root/$rel"
     if [ ! -e "$target" ]; then
       missing_count=$((missing_count + 1))
-    elif ! cmp -s "$f" "$target"; then
+    elif ! cmp -s "$MERGEPATH_ROOT/$rel" "$target"; then
       drift_count=$((drift_count + 1))
     fi
-  done < <(find "$mp_full" -type f -print0)
+  done <"$listing"
+  rm -f "$listing"
 
   if [ "$drift_count" -eq 0 ] && [ "$missing_count" -eq 0 ]; then
     REPLY="ok"
