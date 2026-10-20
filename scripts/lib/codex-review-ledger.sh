@@ -148,6 +148,7 @@ crl_ledger() {
               window: $w, unsolicited: ($w == 0),
               anchor: $grp.anchor,
               first_at: ([$grp.sigs[].t] | min),
+              last_at: ([$grp.sigs[].t] | max),
               blocking_paths: ([ $grp.sigs[] | select(.kind == "review") | .blocking_paths[] ] | unique),
               blocking_unlocated: ($c.class == "unknown_tier" or $c.conflicting
                                    or any($grp.sigs[]; .kind == "review" and .blocking_unlocated)),
@@ -457,7 +458,7 @@ crl_apply_owner_tiebreaks() {
     def settled($e; $floor):
       any($tb[]; (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
-      ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | .first_at ] | max) // "";
+      ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
     ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements

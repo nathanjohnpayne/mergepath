@@ -476,6 +476,24 @@ stop_check "tiebreak: a marker older than the re-raise leaves a disagreement sta
 stop_check "tiebreak: a marker newer than the re-raise clears the disagreement" "$(tb_stops "$IN" "$RB" "$C")" \
   '.stops == [] and .disagreements == [] and .owner_tiebreaks == [{kind: "disagreement", finding: 100}]'
 
+# A response group can gain a later signal after its first one; the marker must
+# postdate that last signal too (CodeRabbit on #2515).
+IN_D=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+L_D=$(crl_ledger "$(printf '%s' "$IN_D" | jq -c --argjson rb "$RB" '.rebuttals = $rb')" | jq -c '.max_blocking_reviews = 10')
+if printf '%s' "$L_D" | jq -e 'all(.responses[]; .last_at >= .first_at)' >/dev/null; then
+  pass "tiebreak: every response records last_at, never before first_at"
+else
+  fail "tiebreak: a response is missing last_at or has it before first_at"
+fi
+LATE=$(printf '%s' "$L_D" | jq -c '.responses |= map(if .first_at == "2026-09-25T02:10:00Z" then .last_at = "2026-09-25T03:30:00Z" else . end)')
+ST_D=$(crl_human_stops "$LATE" "$HEAD_A" nathanjohnpayne 10)
+stop_check "tiebreak: a marker older than a response's last signal leaves the disagreement standing" \
+  "$(crl_apply_owner_tiebreaks "$ST_D" "$LATE" "$(crl_owner_tiebreaks "$C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["disagreement"] and (.owner_tiebreaks | length) == 0'
+stop_check "tiebreak: a ledger without last_at falls back to first_at" \
+  "$(crl_apply_owner_tiebreaks "$ST_D" "$(printf '%s' "$LATE" | jq -c 'del(.responses[].last_at)')" "$(crl_owner_tiebreaks "$C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == []'
+
 # Two disputes: settling one leaves the other, and the stop names what remains.
 IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" \
   "$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["x.sh","p1"],["y.sh","p1"]]')" | arr)" '[]' '[]' '[]')
