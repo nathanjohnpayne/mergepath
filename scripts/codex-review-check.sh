@@ -102,8 +102,9 @@
 #       separately and can still refuse. Most often it wants an APPROVED
 #       review OBJECT, and a Codex issue-comment verdict is not a review
 #       object — so a verdict-cleared PR can stay BLOCKED / REVIEW_REQUIRED on
-#       every repo with required_approving_review_count >= 1 (all nine
-#       consumers; the hub is 0). See mergepath#1059.
+#       any repo whose branch protection sets required_approving_review_count
+#       >= 1. That count is per-repo and changes over time, so read the target
+#       repo's protection rather than assuming one (#2552). See mergepath#1059.
 #   1   At least one gate condition fails. A one-line reason is
 #       printed to stderr.
 #   2   Diagnostic or strict substitution probe: Codex cannot report because

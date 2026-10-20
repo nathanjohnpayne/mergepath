@@ -436,11 +436,11 @@ PY_SHIM=''
 PY_OK=0
 # An explicit MERGEPATH_PREPUSH_PYTHON is the only candidate when set.
 if [ -n "${MERGEPATH_PREPUSH_PYTHON:-}" ]; then
-  PY_CANDIDATES="$MERGEPATH_PREPUSH_PYTHON"
+  PY_CANDIDATES=("$MERGEPATH_PREPUSH_PYTHON")
 else
-  PY_CANDIDATES='python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3'
+  PY_CANDIDATES=(python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3)
 fi
-for cand in $PY_CANDIDATES; do
+for cand in "${PY_CANDIDATES[@]}"; do
   if command -v "$cand" >/dev/null 2>&1 && "$cand" -I -c "$PY_PROBE" "$CI_PY_PINS" "$DEEP" >/dev/null 2>&1; then
     PY_SHIM=$(command -v "$cand")
     PY_OK=1
@@ -467,7 +467,13 @@ printf '%s\n' "$ROOT" > "$RUN_DIR/root"
 printf '%s\n' "$NICE" > "$RUN_DIR/nice"
 if [ -n "$PY_SHIM" ]; then
   mkdir -p "$RUN_DIR/bin"
-  ln -s "$PY_SHIM" "$RUN_DIR/bin/python3"
+  # Preserve the selected executable path: invoking a venv Python through an
+  # external symlink can lose pyvenv.cfg and its verified site-packages.
+  # Nested fixtures may deliberately omit bash from PATH. Keep this launcher
+  # self-contained and quote the interpreter for POSIX sh, including apostrophes.
+  PY_SHIM_QUOTED="'${PY_SHIM//\'/\'\\\'\'}'"
+  printf '#!/bin/sh\nexec %s "$@"\n' "$PY_SHIM_QUOTED" > "$RUN_DIR/bin/python3"
+  chmod +x "$RUN_DIR/bin/python3"
   PATH="$RUN_DIR/bin:$PATH"; export PATH
 fi
 
@@ -525,7 +531,7 @@ fi
 if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
   {
     cat "$RUN_DIR"/results/* 2>/dev/null | awk -F'\t' '{ print $3 "\t" $2 }'
-    [ -f "$TIMINGS" ] && cat "$TIMINGS"
+    if [ -f "$TIMINGS" ]; then cat "$TIMINGS"; fi
   } | awk -F'\t' '!seen[$1]++' > "$RUN_DIR/timings.new" && mv "$RUN_DIR/timings.new" "$TIMINGS" || true
 fi
 

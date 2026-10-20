@@ -6,6 +6,7 @@ SCRIPT="$ROOT/scripts/sync-to-downstream.sh"
 for tool in git jq yq; do command -v "$tool" >/dev/null || { echo "SKIP: $tool unavailable"; exit 0; }; done
 yq --version | grep -q mikefarah/yq || { echo 'SKIP: mikefarah/yq unavailable'; exit 0; }
 REAL_FIND=$(command -v find)
+REAL_GIT=$(command -v git)
 REAL_MKTEMP=$(command -v mktemp)
 REAL_CAT=$(command -v cat)
 REAL_RM=$(command -v rm)
@@ -215,6 +216,15 @@ run 0 --audit --json --use-local-tree --no-clone --repos clean
 assert_json '.[0].baseline_info.sha | length == 40'
 run 0 --audit --json --use-local-tree --no-clone --repos overlay
 run 0 --audit --json --use-local-tree --no-clone --repos overlay --paths kit/
+# Ignored and untracked hub files in a kit are never shipped, so they are not
+# consumer drift (#2542).
+printf '__pycache__/\n' >> "$MP/.git/info/exclude"
+mkdir -p "$MP/kit/__pycache__"
+printf 'bytecode\n' > "$MP/kit/__pycache__/one.cpython-313.pyc"
+printf 'scratch\n' > "$MP/kit/local-scratch"
+run 0 --audit --json --use-local-tree --no-clone --repos clean --paths kit/
+assert_json '.[0].status == "in-sync" and .[0].paths == []'
+rm -rf "$MP/kit/__pycache__" "$MP/kit/local-scratch"
 assert_json '.[0].status == "in-sync" and .[0].paths == []'
 run 1 --audit --json --use-local-tree --no-clone --repos drift
 # Dirty consumer, forged sync payload, missing history and both-changed proof refusal.
@@ -286,31 +296,34 @@ assert_json '.[0].status == "drift" and .[0].paths[0].comparison == "missing" an
 mkdir -p "$SIB/clean/empty-kit"
 run 0 --audit --json --use-local-tree --no-clone --repos clean --paths empty-kit/
 assert_json '.[0].status == "in-sync"'
-cat > "$WORK/bin/find" <<'SH'
+# Kit enumeration reads the hub index (#2542), so fault `git ls-files` only.
+export REAL_GIT AUDIT_LS_FILES_CALLS="$WORK/ls-files-calls" AUDIT_LS_FILES_FAIL_AT=1
+: > "$AUDIT_LS_FILES_CALLS"
+cat > "$WORK/bin/git" <<'SH'
 #!/usr/bin/env bash
-exit 1
+set -euo pipefail
+for arg in "$@"; do
+  if [ "$arg" = ls-files ]; then
+    printf 'ls-files\n' >> "$AUDIT_LS_FILES_CALLS"
+    [ "$(wc -l < "$AUDIT_LS_FILES_CALLS" | tr -d ' ')" -lt "$AUDIT_LS_FILES_FAIL_AT" ] || exit 1
+    break
+  fi
+done
+exec "$REAL_GIT" "$@"
 SH
-chmod +x "$WORK/bin/find"
+chmod +x "$WORK/bin/git"
 run 2 --audit --json --use-local-tree --no-clone --repos clean --paths kit/
 [ ! -s "$WORK/out" ] || fail 'failed enumeration emitted a clean record'
 # A later fatal consumer cannot publish an earlier successful record prefix.
 # The real CLI is invoked with two selected consumers in manifest order.
-export REAL_FIND AUDIT_FIND_CALLS="$WORK/find-calls"
-: > "$AUDIT_FIND_CALLS"
-cat > "$WORK/bin/find" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'find\n' >> "$AUDIT_FIND_CALLS"
-[ "$(wc -l < "$AUDIT_FIND_CALLS" | tr -d ' ')" -lt 2 ] || exit 1
-exec "$REAL_FIND" "$@"
-SH
-chmod +x "$WORK/bin/find"
+export AUDIT_LS_FILES_FAIL_AT=2
+: > "$AUDIT_LS_FILES_CALLS"
 : > "$AUDIT_CALLS"
 run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths kit/
-[ "$(wc -l < "$AUDIT_FIND_CALLS" | tr -d ' ')" = 2 ] || fail 'later enumeration failure not exercised'
+[ "$(wc -l < "$AUDIT_LS_FILES_CALLS" | tr -d ' ')" = 2 ] || fail 'later enumeration failure not exercised'
 [ "$(wc -l < "$AUDIT_CALLS" | tr -d ' ')" = 1 ] || fail 'first consumer did not complete before fatal second consumer'
 [ ! -s "$WORK/out" ] || fail 'later fatal consumer published incomplete NDJSON prefix'
-rm "$WORK/bin/find"
+rm "$WORK/bin/git"
 # Isolate JSON-owned temp files so success and every abort prove cleanup.
 AUDIT_TMP="$WORK/audit-tmp"
 mkdir -p "$AUDIT_TMP"

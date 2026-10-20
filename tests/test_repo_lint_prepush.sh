@@ -373,7 +373,9 @@ n=$(ls "$out/running" | wc -l | tr -d ' ')
 echo "$n" >> "$out/concurrency"
 ps -o nice= -p $$ | tr -d ' ' > "$out/nice.$1"
 echo "${REPO_LINT_FULL:-unset} ${REPO_LINT_CHECKS_JSON:-unset} ${REPO_LINT_SHARD:-unset}" > "$out/env.$1"
+printf '%s\n' "$1" >> "$out/start-order"
 touch "$out/ran.$1"
+if [ -f "$out/slow.$1" ]; then sleep 3; fi
 sleep 1
 rm -f "$out/running/$1"
 SH
@@ -465,6 +467,7 @@ jobs:
 YAML
 printf 'lib\n' > "$FIX/lib/selftested.sh"
 printf 'committed requirement\n' > "$FIX/required-input.txt"
+printf '.mergepath/\n' > "$FIX/.gitignore"
 git -C "$FIX" init -q -b main
 git -C "$FIX" add -A
 git -C "$FIX" commit -q -m base
@@ -531,6 +534,7 @@ commit_change() {  # $1 = branch, $2 = path
 
 # A passing run lets the push through; setup and --verify are not run.
 reset_probe
+touch "$PROBE_DIR/slow.check_env"
 commit_change feat/pass README.md
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/pass 2>&1) || rc=$?
 check "passing checks: push succeeds" "$rc" "0"
@@ -556,6 +560,54 @@ PY
 )
 want_nice=$((base_nice + 10)); [ "$want_nice" -le "$nice_ceiling" ] || want_nice=$nice_ceiling
 check "checks run 10 nice levels below the push" "$(cat "$PROBE_DIR/nice.check_ok")" "$want_nice"
+
+# A cold run must bootstrap timing persistence at the original checkout,
+# even though the checks execute in a disposable committed snapshot.
+timings="$FIX/.mergepath/prepush-timings.tsv"
+if [ -f "$timings" ]; then
+  ok "cold timing cache initializes after the first real push"
+  cold_rows=$(wc -l < "$timings" | tr -d ' ')
+  cold_env=$(awk -F'\t' '$1 == "check_env" { print $2 }' "$timings")
+  cold_max=$(awk -F'\t' 'BEGIN{m=0} $2 > m {m=$2} END{print m}' "$timings")
+  check "cold timing cache contains each completed check" "$cold_rows" "3"
+  check "slow fixture supplies the longest measured duration" "$cold_env" "$cold_max"
+else
+  bad "cold timing cache did not initialize"
+fi
+
+# Retain unselected historical rows, discard duplicate old measurements,
+# and use the first run's timings to start its slowest check first.
+if [ -f "$timings" ]; then
+  printf 'old_unselected\t999999\ncheck_env\t999999\n' >> "$timings"
+fi
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m timing-order
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/pass 2>&1) || rc=$?
+check "warm timing cache: next push succeeds" "$rc" "0"
+check "next push starts the previously longest check first" "$(sed -n '1p' "$PROBE_DIR/start-order")" "check_env"
+if [ -f "$timings" ]; then
+  check "warm cache retains unselected historical measurements" "$(awk -F'\t' '$1 == "old_unselected" {print $2}' "$timings")" "999999"
+  check "warm cache has one newest check_env measurement" "$(awk -F'\t' '$1 == "check_env" {n++} END{print n+0}' "$timings")" "1"
+  measured_env=$(awk '$1 == "PASS" && $2 == "check_env" {sub(/s$/, "", $3);print $3}' <<<"$out")
+  check "warm cache uses this run's measured duration" "$(awk -F'\t' '$1 == "check_env" {print $2}' "$timings")" "$measured_env"
+else
+  bad "warm timing cache is missing"
+fi
+
+# Failed persistence stays advisory to the actual selected checks. A file
+# at the cache directory path makes mkdir fail on every supported host.
+if [ -d "$FIX/.mergepath" ]; then mv "$FIX/.mergepath" "$TMP/saved-timing-cache"; fi
+printf 'block cache directory\n' > "$FIX/.mergepath"
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m cache-unavailable
+rc=0; out=$(cd "$FIX" && git push origin HEAD:refs/heads/feat/cache-unavailable-pass 2>&1) || rc=$?
+check "unwritable timing cache does not block passing checks" "$rc" "0"
+touch "$PROBE_DIR/FLAG"
+rc=0; out=$(cd "$FIX" && git push origin HEAD:refs/heads/feat/cache-unavailable-fail 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "unwritable timing cache cannot clear a failed check"; else bad "unwritable timing cache hid a failed check"; fi
+check "failed check with unavailable cache leaves remote unchanged" "$(remote_tip feat/cache-unavailable-fail)" "none"
+rm "$FIX/.mergepath"
+if [ -d "$TMP/saved-timing-cache" ]; then mv "$TMP/saved-timing-cache" "$FIX/.mergepath"; fi
 
 # MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane.
 reset_probe
@@ -637,23 +689,63 @@ case "$out" in *"no python3 with the CI packages"*) ok "missing packages are nam
 # Real interpreter metadata must match the committed workflow pins. These
 # local fake distributions need no pip/network; the production probe reads
 # their installed metadata under -I, exactly as it does a normal venv.
-python3 -I -m venv --without-pip "$TMP/pin-venv"
-pin_site=$("$TMP/pin-venv/bin/python3" -I -c 'import site; print(site.getsitepackages()[0])')
+# Literal spaces, apostrophe and shell metacharacters must survive launcher
+# generation without being evaluated as shell syntax.
+PIN_VENV="$TMP/pin venv's \$(literal) \`literal\`"
+python3 -I -m venv --without-pip "$PIN_VENV"
+pin_site=$("$PIN_VENV/bin/python3" -I -c 'import site; print(site.getsitepackages()[0])')
 mkdir -p "$pin_site/PyYAML-6.0.3.dist-info" "$pin_site/markdown_it_py-4.2.0.dist-info"
 printf '' > "$pin_site/yaml.py"
 printf '' > "$pin_site/markdown_it.py"
 printf 'Name: PyYAML\nVersion: 6.0.3\n' > "$pin_site/PyYAML-6.0.3.dist-info/METADATA"
 printf 'Name: markdown-it-py\nVersion: 0.0.0\n' > "$pin_site/markdown_it_py-4.2.0.dist-info/METADATA"
 rm -f "$PROBE_DIR/FLAG"
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/wrong-md 2>&1) || rc=$?
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$PIN_VENV/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/wrong-md 2>&1) || rc=$?
 if [ "$rc" -ne 0 ]; then ok "wrong markdown-it-py version refuses deep run"; else bad "wrong markdown-it-py version passed"; fi
 case "$out" in *"workflow pins"*) ok "version mismatch names pinned environment" ;; *) bad "version mismatch diagnostic: $out" ;; esac
 check "wrong markdown version remote not updated" "$(remote_tip feat/wrong-md)" "none"
 printf 'Name: markdown-it-py\nVersion: 4.2.0\n' > "$pin_site/markdown_it_py-4.2.0.dist-info/METADATA"
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/right-pins 2>&1) || rc=$?
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$PIN_VENV/bin/python3" MERGEPATH_PREPUSH_DEEP=1 git push origin feat/fail:refs/heads/feat/right-pins 2>&1) || rc=$?
 check "exact pinned metadata allows deep run" "$rc" "0"
+# The environment probe alone is insufficient: checks call python3 again
+# through the installed PATH shim. An external symlink to a venv interpreter
+# can lose its pyvenv.cfg and execute the base Python without these packages.
+# Exercise the actual nested check with a module present only in this venv.
+printf 'MARKER = "venv-runtime-module"\n' > "$pin_site/prepush_venv_only.py"
+git -C "$FIX" checkout -q -B feat/venv-runtime feat/fail
+cat >> "$FIX/scripts/ci/check_env" <<'SH'
+nested_python=$(command -v python3)
+mkdir -p "$PROBE_DIR/bash-free-bin"
+if PATH="$PROBE_DIR/bash-free-bin" command -v bash >/dev/null 2>&1; then exit 1; fi
+PATH="$PROBE_DIR/bash-free-bin" "$nested_python" -I - "$EXPECTED_PYTHON_PREFIX" \
+  '' 'two words' $'quote\' " dollar$() `backtick`' $'line1\nline2' <<'PY' >> "$PROBE_DIR/python-runtime"
+import os, sys, yaml, prepush_venv_only
+assert os.path.samefile(sys.prefix, sys.argv[1])
+assert sys.argv[2:] == ["", "two words", "quote' \" dollar$() `backtick`", "line1\nline2"]
+print(prepush_venv_only.MARKER)
+PY
+SH
+git -C "$FIX" add scripts/ci/check_env
+git -C "$FIX" commit -q -m 'exercise the selected Python in a nested check'
+rc=0; out=$(cd "$FIX" && EXPECTED_PYTHON_PREFIX="$PIN_VENV" \
+  MERGEPATH_PREPUSH_PYTHON="$PIN_VENV/bin/python3" \
+  git push origin feat/venv-runtime 2>&1) || rc=$?
+check "selected venv survives nested check PATH shim" "$rc" "0"
+check "nested Python imports its venv-only module" "$(cat "$PROBE_DIR/python-runtime" 2>/dev/null || true)" "venv-runtime-module"
+if [ "$rc" -ne 0 ]; then printf '%s\n' "$out"; fi
+# Correct package metadata cannot stand in for the actual required import.
+# A real missing PyYAML module must still refuse before any selected check.
+rm "$pin_site/yaml.py"
+rc=0; out=$(cd "$FIX" && EXPECTED_PYTHON_PREFIX="$PIN_VENV" \
+  MERGEPATH_PREPUSH_PYTHON="$PIN_VENV/bin/python3" \
+  git push origin feat/venv-runtime:refs/heads/feat/missing-yaml 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok "missing PyYAML import refuses despite matching metadata"; else bad "matching metadata hid missing PyYAML"; fi
+case "$out" in *"no python3 with the CI packages"*) ok "missing PyYAML import retains environment error" ;; *) bad "missing PyYAML diagnostic: $out" ;; esac
+check "missing PyYAML import leaves remote unchanged" "$(remote_tip feat/missing-yaml)" "none"
+printf '' > "$pin_site/yaml.py"
+git -C "$FIX" checkout -q feat/fail
 printf 'Name: PyYAML\nVersion: 0.0.0\n' > "$pin_site/PyYAML-6.0.3.dist-info/METADATA"
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/pin-venv/bin/python3" git push origin feat/fail:refs/heads/feat/wrong-yaml 2>&1) || rc=$?
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$PIN_VENV/bin/python3" git push origin feat/fail:refs/heads/feat/wrong-yaml 2>&1) || rc=$?
 if [ "$rc" -ne 0 ]; then ok "wrong PyYAML version refuses fast run"; else bad "wrong PyYAML version passed"; fi
 touch "$PROBE_DIR/FLAG"
 

@@ -65,6 +65,7 @@ spec_test_map:
     - tests/test_cockpit.sh
   pr_body_contract:
     - tests/test_pr_body_contract_parity.sh
+    - tests/test_pr_body_workflow_bounds.py
   codex_request_evidence:
     - tests/test_codex_request_evidence.sh
     - tests/test_codex_verdict_anchor_resolution.py
