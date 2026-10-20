@@ -1485,7 +1485,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
     crc=$?
     set -e
     case "$crc" in
-      0) clear_pass "external review cleared on HEAD $HEAD_SHA ($REQUIRES_REASON; reviewer APPROVED + Codex/Phase-4b on HEAD)" ;;
+      0) clear_pass "external review cleared on HEAD $HEAD_SHA ($REQUIRES_REASON)" ;;
       1)
         # The only reason this gate is not green is that clearance has not
         # been reached yet, so it is the pending verdict (#2247)—unless
