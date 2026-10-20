@@ -6,6 +6,8 @@ Targeted review-thread disposition confirms JSON mutation stdout independently o
 
 Automated Phase4b routes deterministic egregious-case alarms to human review before model dispatch. The literal alarms, conservative sensitive-path inventory and accepted hostile-diff residual are specified in `specs/phase_4b_escalation.md`.
 
+Phase 4b's coherent PR policy tuple uses the shared scalar reader's one-request error contract while preserving its four-field validation and fail-closed authority. The reader adds no retries; the contract and bounded native controls are in `specs/codex_request_evidence.md` and `tests/test_phase_4b_automation.sh --policy-tuple-only` (#1523).
+
 Sync commit and PR self-reviews share source-bound operation claims and describe selected test, workflow and credential-tooling effects. Consumer CI and upstream review outcomes remain separate evidence; `specs/pr_body_contract.md` and the production materializer fixtures in `tests/test_sync_to_downstream.sh` own this wording contract (#2473).
 
 Sync-all PR bodies retain the requested destination digest/count, manifest coverage, actual filter narrowing and omitted opted-in paths. Full replay claims require the complete requested manifest scope; consumer overrides and installed acceptance are separate. The contract and native materializer coverage live in `specs/pr_body_contract.md` and `tests/test_sync_to_downstream.sh` (#2490).

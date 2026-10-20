@@ -23,6 +23,89 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# Focused PR-policy tuple reads (#1523): expected under 2s, no adapter,
+# credentials or network. This mode is also run by the ordinary suite.
+if [ "${1:-}" = --policy-tuple-only ]; then
+  command -v jq >/dev/null 2>&1 || { echo 'ERROR: jq required' >&2; exit 1; }
+  LIB="${P4B_TEST_POLICY_TUPLE_LIB:-$LIB}"
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-policy-tuple.XXXXXX")"
+  trap 'rm -rf "$WORK"' EXIT
+  # shellcheck source=../scripts/lib/gh-api-scalar.sh
+  . "$ROOT/scripts/lib/gh-api-scalar.sh"
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$LIB"
+  # Stub only the network edge. Run the real scalar reader, jq projection
+  # and tuple validator; record requests across command substitutions.
+  gh() {
+    [ "$#" -eq 4 ] && [ "$1" = api ] \
+      && [ "$2" = repos/owner/repo/pulls/1523 ] && [ "$3" = --jq ] || return 99
+    local count
+    count=$(cat "$WORK/count")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$WORK/count"
+    if [ "$CASE_MODE" = failure ] || { [ "$CASE_MODE" = transient ] && [ "$count" -eq 1 ]; }; then
+      printf '{"message":"fixture temporary failure"}\n'
+      printf 'gh: fixture temporary failure (HTTP 503)\n' >&2
+      return 1
+    fi
+    case "$CASE_MODE" in
+      malformed) printf '{' ;;
+      blank) : ;;
+      *) jq -c "$4" "$WORK/pr.json" ;;
+    esac
+  }
+  printf '%s\n' '{"head":{"sha":"aaaa"},"base":{"ref":"main","sha":"bbbb","repo":{"default_branch":"main"}}}' >"$WORK/valid.json"
+  cp "$WORK/valid.json" "$WORK/pr.json"
+  expected='{"head_sha":"aaaa","base_ref":"main","base_sha":"bbbb","default_branch":"main"}'
+  CASE_MODE=transient
+  printf '0\n' >"$WORK/count"
+  out='' rc=0
+  out=$(p4b_pr_policy_tuple owner/repo 1523 2>"$WORK/error") || rc=$?
+  [ "$rc" -eq 1 ] && [ -z "$out" ] && [ "$(cat "$WORK/count")" -eq 1 ] \
+    && grep -Fq '[gh-api-scalar] ERROR: could not read PR policy tuple for owner/repo#1523' "$WORK/error" \
+    && grep -Fq 'HTTP 503' "$WORK/error" \
+    || { echo 'FAIL: tuple transport failure was retried, leaked stdout or lost its scalar-reader diagnostic' >&2; exit 1; }
+  out=$(p4b_pr_policy_tuple owner/repo 1523)
+  [ "$out" = "$expected" ] && [ "$(cat "$WORK/count")" -eq 2 ] \
+    || { echo 'FAIL: independent tuple read did not recover' >&2; exit 1; }
+  echo 'PASS: one failed tuple read is empty/nonzero; the next independent invocation succeeds'
+  CASE_MODE=failure
+  for attempt in 1 2; do
+    out='' rc=0
+    out=$(p4b_pr_policy_tuple owner/repo 1523 2>"$WORK/error") || rc=$?
+    [ "$rc" -eq 1 ] && [ -z "$out" ] \
+      || { echo "FAIL: persistent failure $attempt became tuple data" >&2; exit 1; }
+  done
+  [ "$(cat "$WORK/count")" -eq 4 ] || { echo 'FAIL: persistent reads changed request count' >&2; exit 1; }
+  echo 'PASS: persistent tuple failures stay empty/nonzero with one request per invocation'
+  for CASE_MODE in malformed blank; do
+    out='' rc=0
+    out=$(p4b_pr_policy_tuple owner/repo 1523 2>"$WORK/error") || rc=$?
+    [ "$rc" -eq 1 ] && [ -z "$out" ] \
+      || { echo "FAIL: $CASE_MODE tuple accepted" >&2; exit 1; }
+  done
+  CASE_MODE=valid
+  for field in '.head.sha' '.base.ref' '.base.sha' '.base.repo.default_branch'; do
+    for value in null '""' 1 '[]' '{}'; do
+      jq "$field = $value" "$WORK/valid.json" >"$WORK/pr.json"
+      out='' rc=0
+      out=$(p4b_pr_policy_tuple owner/repo 1523 2>"$WORK/error") || rc=$?
+      [ "$rc" -eq 1 ] && [ -z "$out" ] \
+        || { echo "FAIL: tuple field $field accepted $value" >&2; exit 1; }
+    done
+  done
+  echo 'PASS: malformed/blank tuples and all four null, empty or non-string fields refuse'
+  cp "$WORK/valid.json" "$WORK/pr.json"
+  before=$(cat "$WORK/count")
+  out='' rc=0
+  out=$(unset -f gh_api_scalar; p4b_pr_policy_tuple owner/repo 1523 2>"$WORK/error") || rc=$?
+  [ "$rc" -eq 1 ] && [ -z "$out" ] && [ "$(cat "$WORK/count")" -eq "$before" ] \
+    || { echo 'FAIL: missing shared reader allowed a tuple read' >&2; exit 1; }
+  echo 'PASS: unavailable shared reader fails closed before any request'
+  echo 'test_phase_4b_policy_tuple: 4 groups passed (26 reads, including 20 field controls)'
+  exit 0
+fi
+
 # Bounded barrier/probe regressions (#2120): expected about 12s, no
 # orchestrator, adapter CLI, credentials or network. Use an outer 30s timeout.
 if [ "${1:-}" = --rate-limit-only ]; then
@@ -218,6 +301,11 @@ fi
 # This mode never mutation-tests lib.sh or enters the long legacy suite.
 if [ "${1:-}" = --heartbeat-only ]; then
   exec bash "$ROOT/tests/test_phase_4b_heartbeat.sh"
+fi
+
+# Keep the focused real-reader controls in the default CI run too.
+if [ "$#" -eq 0 ]; then
+  bash "$0" --policy-tuple-only
 fi
 
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }

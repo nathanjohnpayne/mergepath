@@ -549,8 +549,8 @@ p4b_codex_timeout_determination() {
 # Read the PR tuple that binds both the reviewed head and the policy source.
 p4b_pr_policy_tuple() { # <repo> <pr>
   local out
-  out=$(gh api "repos/$1/pulls/$2" --jq \
-    '{head_sha:.head.sha,base_ref:.base.ref,base_sha:.base.sha,default_branch:.base.repo.default_branch}' 2>/dev/null) \
+  out=$(gh_api_scalar "PR policy tuple for $1#$2" "repos/$1/pulls/$2" --jq \
+    '{head_sha:.head.sha,base_ref:.base.ref,base_sha:.base.sha,default_branch:.base.repo.default_branch}') \
     || return 1
   printf '%s' "$out" | jq -ce '
     type == "object"
