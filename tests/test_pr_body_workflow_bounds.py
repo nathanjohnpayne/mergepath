@@ -71,7 +71,8 @@ SCRIPT_NAMES = {
 def invocation_signature(text):
     """Recognize literal command positions and the one reviewed helper alias.
 
-    Standalone comments, quoted shell diagnostics and file tests are data.
+    Shell-entrypoint names in standalone comments, quoted diagnostics and
+    file tests are data.
     Parser filenames in standalone echo/console.log quoted literals are data;
     other parser operands remain conservative, including unsupported dynamic
     indirection. This is not a general shell/JavaScript parser.
