@@ -371,7 +371,10 @@ crl_human_stops() {
                              and (.counted | type) == \"boolean\")
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
-                              and (.blocking_unlocated | type) == \"boolean\")
+                              and (.blocking_unlocated | type) == \"boolean\"
+                              # last_at feeds the runaway evidence floor (#2534); a
+                              # non-string must fail, not skew the floor earlier.
+                              and ((.last_at | type) == \"string\" or .last_at == null))
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))) | not
     then error(\"ledger\") else . end

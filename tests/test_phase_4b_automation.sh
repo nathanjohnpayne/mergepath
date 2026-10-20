@@ -5732,6 +5732,31 @@ out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P
     and .human_stops.request_ceiling == 2 and (.reason | contains("runaway"))' >/dev/null 2>&1 \
   || bad="$bad runaway-at-ceiling-waived(rc=$rc,out=$out)"
 
+# #2534: the owner's exact-head runaway marker releases that stop, and only
+# that stop, so the barrier waives the Codex arm and the adapter reviews the
+# head. The marker must postdate the newest counted evidence (the second
+# blocking review, 01:10): an older one is stale and the stop stands. It never
+# releases blocking-budget.
+_cap_runaway_marker="TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/owner/repo/pull/7@$_p4a_head"
+_cap_runaway_ok=$(printf '%s' "$_cap_old" | jq -c --arg b "$_cap_runaway_marker" \
+  '. + [{id:5103,user:{login:"nathanjohnpayne"},body:$b,created_at:"2026-08-01T02:00:00Z",updated_at:"2026-08-01T02:00:00Z"}]')
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_runaway_ok" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling"
+    and .human_stops.state == "clear" and .human_stops.stops == [] and .human_stops.runaway_at == "2026-08-01T01:10:00Z"
+    and .human_stops.owner_tiebreaks == [{kind: "runaway", comment_id: 5103, at: "2026-08-01T02:00:00Z"}]' >/dev/null 2>&1 \
+  || bad="$bad runaway-owner-marker-not-released(rc=$rc,out=$out)"
+_cap_runaway_stale=$(printf '%s' "$_cap_runaway_ok" | jq -c '.[-1].created_at = "2026-08-01T00:30:00Z" | .[-1].updated_at = "2026-08-01T00:30:00Z"')
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_runaway_stale" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .human_stops.stops == ["runaway"]
+    and .human_stops.owner_tiebreaks == []' >/dev/null 2>&1 \
+  || bad="$bad runaway-stale-owner-marker-released(rc=$rc,out=$out)"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=blocking P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_runaway_ok" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.human_stops.stops == ["blocking-budget"]' >/dev/null 2>&1 \
+  || bad="$bad runaway-marker-released-blocking-budget(rc=$rc,out=$out)"
+
 # The governed blocking budget is the base policy's, and an invalid one fails
 # closed rather than reading as room.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"

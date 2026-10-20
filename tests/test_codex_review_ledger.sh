@@ -647,6 +647,41 @@ ST_BUDGET=$(crl_human_stops "$L_BUDGET" "$HEAD_A" nathanjohnpayne 2 2)
 stop_check "runaway tiebreak: blocking-budget remains blocking" \
   "$(crl_apply_owner_tiebreaks "$ST_BUDGET" "$L_BUDGET" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
   '.stops == ["blocking-budget"] and .owner_tiebreaks == []'
+# The floor is the only thing the marker is measured against, so it must be
+# present and well-formed: a stops payload that lost it cannot settle, a
+# response whose last_at is not a string fails the ledger rather than moving
+# the floor earlier, and an absent last_at still falls back to first_at.
+stop_check "runaway tiebreak: a stops payload without runaway_at retains the stop" \
+  "$(crl_apply_owner_tiebreaks "$(printf '%s' "$ST_RUN" | jq -c 'del(.runaway_at)')" "$L_RUN" "$(crl_owner_tiebreaks "$RUN_C" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and .owner_tiebreaks == []'
+for _bad_last in '.responses[-1].last_at = 5' '.responses[-1].last_at = true' '.responses[-1].last_at = {}'; do
+  if crl_human_stops "$(printf '%s' "$L_RUN" | jq -c "$_bad_last")" "$HEAD_A" nathanjohnpayne 10 2 >/dev/null; then
+    fail "runaway tiebreak: a response with a malformed last_at ($_bad_last) was accepted"
+  else
+    pass "runaway tiebreak: a response with a malformed last_at ($_bad_last) fails the ledger"
+  fi
+done
+stop_check "runaway tiebreak: a response without last_at falls back to first_at for the floor" \
+  "$(crl_human_stops "$(printf '%s' "$L_RUN" | jq -c 'del(.responses[].last_at)')" "$HEAD_A" nathanjohnpayne 10 2)" \
+  '.stops == ["runaway"] and .runaway_at == "2026-09-25T02:10:00Z"'
+# Runaway beside an untested rebuttal (finding 110, review 11's root comment,
+# rebutted at 03:00 with no request after it): each marker settles only its
+# own stop, and one comment carrying both lines settles both.
+L_RW_UNT=$(crl_ledger "$(printf '%s' "$IN_RUN" | jq -c --argjson rb "$(rebut 110 x.sh 2026-09-25T03:00:00Z | arr)" '.rebuttals = $rb')" \
+  | jq -c '.max_blocking_reviews = 10')
+ST_RW_UNT=$(crl_human_stops "$L_RW_UNT" "$HEAD_A" nathanjohnpayne 10 2)
+stop_check "runaway tiebreak: runaway and an untested rebuttal hold together" "$ST_RW_UNT" \
+  '.stops == ["runaway", "untested-rebuttal"] and (.untested_rebuttals | map(.finding)) == [110]'
+rw_unt() { crl_apply_owner_tiebreaks "$ST_RW_UNT" "$L_RW_UNT" "$(crl_owner_tiebreaks "$1" nathanjohnpayne "$PR_URL" "$HEAD_A")"; }
+stop_check "runaway tiebreak: the runaway marker leaves the untested rebuttal standing" \
+  "$(rw_unt "$(cm 30 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$RUN_MARK" | arr)")" \
+  '.stops == ["untested-rebuttal"] and (.owner_tiebreaks | map(.kind)) == ["runaway"]'
+stop_check "runaway tiebreak: the dispute marker leaves the runaway standing" \
+  "$(rw_unt "$(cm 30 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$(mark 110)" | arr)")" \
+  '.stops == ["runaway"] and .owner_tiebreaks == [{kind: "untested", finding: 110}]'
+stop_check "runaway tiebreak: one comment carrying both lines settles both stops" \
+  "$(rw_unt "$(cm 30 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$(printf '%s\n%s' "$(mark 110)" "$RUN_MARK")" | arr)")" \
+  '.stops == [] and (.owner_tiebreaks | map(.kind) | sort) == ["runaway", "untested"]'
 
 # The real barrier must read the owner decision for a runaway-only stop, and
 # retain that stop on read failure. Its normal downstream fences remain in use.
