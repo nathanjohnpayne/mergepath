@@ -26,7 +26,7 @@ The ordinary merge writer enrolls safely selected optional Ruby and yq tools bef
 
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
-The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). Native parity audits the enclosing bounds of fourteen reviewed production workflow/template routes, with explicit finite, dynamic-audit and per-item loop treatment; fixture budgets remain separate (#1622). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
+The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). Native parity audits the enclosing bounds of fourteen reviewed production workflow/template routes, with explicit finite, dynamic-audit and per-item loop treatment; fixture budgets remain separate (#1622). Its bounded literal-call inventory also requires classification for conditional, loop and negated shell entrypoints, with native controls separating those calls from quoted and file-test references. The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
 
 Weekly PR audits bound API and verifier work by the remaining audit allowance, report incomplete discovery or coverage, and retain reports in the job summary and encoded logs before attempting issue publication.
 

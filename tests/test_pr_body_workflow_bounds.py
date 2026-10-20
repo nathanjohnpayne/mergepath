@@ -79,13 +79,29 @@ def invocation_signature(text):
     found = []
     for line in text.splitlines():
         found.extend(['parser'] * line.count('pr-body-contract.mjs'))
+        # Protect quoted diagnostic operands and trailing comments from the
+        # control-prefix admission below. A literal $(...) boundary still
+        # starts a command inside double quotes; this is no shell evaluator.
+        inert = tuple(re.finditer(r"""'[^']*'|"(?:\\.|[^"\\])*"|(?<!\S)\#.*""", line))
         for name, key in SCRIPT_NAMES.items():
             # A shell command, optionally inside command substitution, after
             # bash, or through the publisher's reviewed gate function.
-            command = re.compile(r'(?:^\s*|[|;]\s*|\$\(\s*|\b(?:bash|gate)\s+)'
-                                 r'["\']?[^\s"\']*scripts/(?:workflow/)?'
-                                 + re.escape(name) + r'["\']?(?=\s|$)')
-            found.extend([key] * len(command.findall(line)))
+            path = r'["\']?[^\s"\']*scripts/(?:workflow/)?' + re.escape(name) + r'["\']?'
+            direct = r'(?:^\s*|[|;]\s*|\$\(\s*|\b(?:bash|gate)\s+)' + path + r'(?=\s|$)'
+            # The added branch requires a control prefix, preserving the
+            # existing direct-call admission rather than widening every word.
+            controlled = (r'(?P<boundary>^\s*|[|;&]\s*|\$\(\s*)'
+                          r'(?P<control>(?:(?:if|elif|while|until|then|else|do|!)\s+)+)'
+                          + path + r'(?=\s|[;|&)]|$)')
+            command = re.compile(direct + '|' + controlled)
+            for match in command.finditer(line):
+                if match['control']:
+                    enclosing = next((span for span in inert
+                                      if span.start() <= match.start() < span.end()), None)
+                    if enclosing and not (enclosing[0].startswith('"')
+                                          and match['boundary'].lstrip().startswith('$(')):
+                        continue
+                found.append(key)
     if re.search(r'CLEARANCE_HELPER=.*scripts/codex-review-check\.sh', text):
         found.extend(['checker'] * len(re.findall(r'bash\s+"\$CLEARANCE_HELPER"', text)))
     # A wrapper's API/comment writes only source the library. PR-create is the
@@ -309,6 +325,52 @@ class WorkflowBounds(unittest.TestCase):
             {'name': 'New parser', 'run': 'node scripts/lib/pr-body-contract.mjs --author'})
         with self.assertRaisesRegex(InventoryError, 'unenumerated parser route'):
             audit_documents(docs, routes, 120)
+
+    def test_control_keyword_runtime_calls_require_classification(self):
+        forms = (
+            'if {call}; then :; fi',
+            'if false; then :; elif {call}; then :; fi',
+            'while {call}; do break; done',
+            'until {call}; do break; done',
+            'if true; then {call}; fi',
+            'if false; then :; else {call}; fi',
+            'for value in one; do {call}; done',
+            '! {call}',
+            'if ! {call}; then :; fi',
+            'if "{call}"; then :; fi',
+            'true && ! {call}',
+            'false || if {call}; then :; fi',
+            'result="$(if {call}; then :; fi)"',
+        )
+        for name, key in SCRIPT_NAMES.items():
+            folder = 'workflow/' if key in ('group', 'continuation') else ''
+            call = 'scripts/' + folder + name
+            for form in forms:
+                run = form.format(call=call)
+                with self.subTest(run=run):
+                    docs, routes = fixture()
+                    docs[next(iter(docs))]['jobs']['parse']['steps'].append(
+                        {'name': 'New conditional parser', 'run': run})
+                    with self.assertRaisesRegex(InventoryError, 'unenumerated parser route'):
+                        audit_documents(docs, routes, 120)
+                    self.assertEqual(invocation_signature(run), (key,))
+
+    def test_control_keyword_references_are_not_shell_calls(self):
+        references = (
+            '# if scripts/validate-pr-body.sh; then :; fi',
+            ': # if scripts/validate-pr-body.sh; then :; fi',
+            'echo "if scripts/validate-pr-body.sh; then :; fi"',
+            "echo 'while scripts/validate-pr-body.sh; do :; done'",
+            "printf '%s\\n' 'failure; if scripts/validate-pr-body.sh; then :; fi'",
+            'echo "failure; ! scripts/validate-pr-body.sh"',
+            "echo '$(if scripts/validate-pr-body.sh; then :; fi)'",
+            'echo if scripts/validate-pr-body.sh',
+            'test -f scripts/validate-pr-body.sh',
+            'if [ -f scripts/validate-pr-body.sh ]; then :; fi',
+        )
+        for run in references:
+            with self.subTest(run=run):
+                self.assertEqual(invocation_signature(run), ())
 
     def test_added_sequential_call_requires_reaudit(self):
         docs, routes = fixture()
