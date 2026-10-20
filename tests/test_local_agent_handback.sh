@@ -409,6 +409,19 @@ drun() { # <env...> -- <args...>
     DISPATCH_LANE_POLL_INTERVAL=1 ${envs[@]+"${envs[@]}"} \
     "$DFIX/scripts/dispatch-thread-resolution-lane.sh" 12 --repo o/r "$@"
 }
+assert_invalid_dispatch() { # <label> <diagnostic needle> <drun arguments...>
+  local label="$1" needle="$2" rc calls error
+  shift 2
+  drun "$@" >/dev/null 2>"$DFIX/err"; rc=$?
+  calls="$(cat "$DFIX/d.log")"
+  error="$(cat "$DFIX/err")"
+  if [ "$rc" -eq 1 ] && printf '%s' "$error" | grep -q -e "$needle" \
+     && ! printf '%s' "$calls" | grep -q $'\t-X\tPOST'; then
+    pass "$label is rejected as a whole value before dispatch"
+  else
+    fail "$label: rc=$rc err=$error calls=$calls"
+  fi
+}
 set +e
 drun D_APPEAR_AT=3 -- >/dev/null 2>"$DFIX/err"; rc=$?
 set -e
@@ -436,6 +449,12 @@ poll_text_err="$(cat "$DFIX/err")"
 drun D_APPEAR_AT=1 DISPATCH_LANE_POLL_INTERVAL=0 -- --no-wait >/dev/null 2>"$DFIX/err"; r_poll_zero=$?
 poll_zero_calls="$(cat "$DFIX/d.log")"
 poll_zero_err="$(cat "$DFIX/err")"
+assert_invalid_dispatch "--appear-timeout with embedded newline" "--appear-timeout" D_APPEAR_AT=1 -- --appear-timeout $'abc\n5' --no-wait
+assert_invalid_dispatch "--appear-timeout with trailing newline" "--appear-timeout" D_APPEAR_AT=1 -- --appear-timeout $'5\n' --no-wait
+assert_invalid_dispatch "--watch-timeout with embedded newline" "--watch-timeout" D_APPEAR_AT=1 -- --watch-timeout $'abc\n5' --no-wait
+assert_invalid_dispatch "--watch-timeout with trailing newline" "--watch-timeout" D_APPEAR_AT=1 -- --watch-timeout $'5\n' --no-wait
+assert_invalid_dispatch "DISPATCH_LANE_POLL_INTERVAL with embedded newline" "DISPATCH_LANE_POLL_INTERVAL" D_APPEAR_AT=1 $'DISPATCH_LANE_POLL_INTERVAL=abc\n5' -- --no-wait
+assert_invalid_dispatch "DISPATCH_LANE_POLL_INTERVAL with trailing newline" "DISPATCH_LANE_POLL_INTERVAL" D_APPEAR_AT=1 $'DISPATCH_LANE_POLL_INTERVAL=5\n' -- --no-wait
 drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
 drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
 drun D_APPEAR_AT=1 D_RUN_HANGS=1 -- --watch-timeout 2 >/dev/null 2>/dev/null; r_hang=$?
