@@ -2307,7 +2307,7 @@ refuse_moving_head_unless_allowed() {
   # The CI-pickup read comes first: it also supplies the push-time anchor for
   # the age signal below.
   local dispatched_at="" anchor="$HEAD_PUSHED_AT" anchor_source="$ANCHOR_SOURCE" check_reason=""
-  local signal_label="" wf
+  local signal_label="" wf check_dispatch_unavailable=false
   case "$REQUEST_SIGNAL_MODE" in
     workflow)
       signal_label="$REQUEST_WORKFLOW_NAME"
@@ -2410,9 +2410,9 @@ refuse_moving_head_unless_allowed() {
            | map(timestamp) | first // empty] | max // ""' 2>/dev/null) || dispatched_at=""
         if [ -z "$dispatched_at" ]; then
           # Queued checks have no start time. Without any dispatch timestamp,
-          # an old commit date cannot establish when this push was picked up.
-          anchor=""
-          anchor_source="unavailable check dispatch timestamp"
+          # an old commit date cannot establish pickup age. Keep the anchor
+          # until its age is checked so an independently young head still holds.
+          check_dispatch_unavailable=true
         fi
       fi
       ;;
@@ -2442,8 +2442,8 @@ refuse_moving_head_unless_allowed() {
         # of a commit created long before reads as an old head the moment it
         # lands. The latest run of the signal for this head on the PR branch
         # was created when GitHub dispatched the current push, which is the
-        # push time this signal means. Use whichever is later. A missing or unparseable timestamp
-        # keeps the commit-based anchor.
+        # push time this signal means. Use whichever is later. Missing check
+        # dispatch metadata retains only an independently young age signal.
         if [ -n "$dispatched_at" ] && [[ "$dispatched_at" > "$anchor" ]]; then
           anchor="$dispatched_at"
           anchor_source="latest '$signal_label' dispatch for HEAD on the PR branch (push dispatch)"
@@ -2458,6 +2458,13 @@ refuse_moving_head_unless_allowed() {
     if [[ "$pushed_epoch" =~ ^[0-9]+$ ]]; then
       age=$((now_epoch - pushed_epoch))
       [ "$age" -ge 0 ] || age=0
+      if [ "$check_dispatch_unavailable" = true ] && [ "$age" -ge "$REQUEST_MIN_HEAD_AGE_SECONDS" ]; then
+        anchor=""
+        anchor_source="unavailable check dispatch timestamp"
+        pushed_epoch=""
+      fi
+    fi
+    if [[ "$pushed_epoch" =~ ^[0-9]+$ ]]; then
       MOVING_HEAD_AGE_SECONDS=$age
       if [ "$age" -lt "$REQUEST_MIN_HEAD_AGE_SECONDS" ]; then
         reasons="head-age"

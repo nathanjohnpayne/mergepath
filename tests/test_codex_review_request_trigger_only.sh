@@ -1714,39 +1714,40 @@ test_guard_runs_after_the_cap_branch() {
 }
 
 
-# #2274: queued checks need creation metadata; a missing dispatch timestamp
-# makes age unavailable rather than laundering an old committer date.
+# #2274/#2510: queued checks need creation metadata; missing dispatch timestamps
+# cannot establish old-head age or discard an independently young head.
 test_guard_dates_queued_checks() {
   refresh_head_dates
-  local variant dir rc created started suite expected before=$FAIL
-  for variant in run-created suite-created started unavailable settled invalid-run; do
+  local variant dir rc created started suite head expected before=$FAIL
+  for variant in run-created suite-created started unavailable unavailable-young settled invalid-run; do
     dir=$(make_case "queued-dating-$variant")
     printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
-    created=""; started=""; suite=""; expected=8
+    created=""; started=""; suite=""; head=$OLD_HEAD; expected=8
     case "$variant" in
       run-created) created=$YOUNG_HEAD; suite=$OLD_HEAD ;;
       suite-created) suite=$YOUNG_HEAD ;;
       started) started=$YOUNG_HEAD; suite=$OLD_HEAD ;;
       unavailable) expected=0 ;;
+      unavailable-young) head=$YOUNG_HEAD ;;
       settled) created=$OLD_HEAD; suite=$OLD_HEAD; expected=0 ;;
       invalid-run) created=unreadable; suite=$YOUNG_HEAD ;;
     esac
     rc=$(CODEX_TEST_RUN_CREATED="$created" CODEX_TEST_RUN_STARTED="$started" \
       CODEX_TEST_SUITE_CREATED="$suite" CODEX_TEST_CHECK_RUNS=dated \
-      run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+      run_guard "$dir" fresh "$head" completed "" --trigger-only)
     [ "$rc" = "$expected" ] || fail "#2274: $variant expected exit $expected, got $rc ($(cat "$dir/err.log"))"
     if [ "$expected" = 8 ]; then
       [ "$(trig_count "$dir")" = 0 ] \
         && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
         && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
-        || fail "#2274: $variant must refuse from fresh dispatch metadata before POST"
+        || fail "#2274/#2510: $variant must retain young-head refusal before POST"
     else
       [ "$(trig_count "$dir")" = 1 ] || fail "#2274: $variant must retain a settled/unavailable write"
       [ "$variant" != unavailable ] || grep -q 'head-age signal unavailable, not enforced' "$dir/err.log" \
         || fail "#2274: missing dispatch timestamps must report unavailable age"
     fi
   done
-  [ "$FAIL" -ne "$before" ] || pass "#2274: queued check creation and suite times date pickup; absent metadata makes age unavailable"
+  [ "$FAIL" -ne "$before" ] || pass "#2274/#2510: queued check metadata dates pickup; missing metadata preserves young-head refusal"
 }
 
 # #2200: fork check suites may not identify their branch. Unknown attribution
