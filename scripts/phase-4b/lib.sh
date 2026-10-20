@@ -1766,7 +1766,8 @@ p4b_barrier_maybe_resume() {
 # The human-stop conditions a spent request ceiling must clear before it may
 # dispatch the automated adapter (#1560 slice 3, S3-4): the blocking-review
 # budget, a runaway, an untested rebuttal, and a disagreement, as crl_human_stops defines
-# them over the Codex review ledger. Prints {state: "clear"|"stop", stops,
+# them over the Codex review ledger, with the owner's tiebreak markers applied
+# through crl_resolved_human_stops (#2558). Prints {state: "clear"|"stop", stops,
 # blocking_reviews, max_blocking_reviews, untested_rebuttals, disagreements,
 # governing_tuple} and returns 0, or {state: "unsafe", reason} and returns 2
 # when any input is missing, unreadable, malformed, or moved during the read.
@@ -1775,7 +1776,8 @@ p4b_codex_human_stops() {
   local repo="$1" pr="$2" head="$3" config author resolver tuple final_tuple budget max
   local ledger_cmd ledger stops base_ref base_sha default_branch fp ceiling
   if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] || [ "$P4B_CODEX_LEDGER_OK" != true ] \
-     || ! command -v crqe_governing_budget crl_human_stops crl_owner_tiebreaks crl_apply_owner_tiebreaks >/dev/null 2>&1; then
+     || ! command -v crqe_governing_budget crl_human_stops crl_owner_tiebreaks crl_apply_owner_tiebreaks \
+                     crl_resolved_human_stops >/dev/null 2>&1; then
     jq -nc '{state:"unsafe",reason:"human-stop-helper-unavailable"}'
     return 2
   fi
@@ -1816,20 +1818,13 @@ p4b_codex_human_stops() {
   # still reads a ceiling of blocking reviews as a runaway (#1560 canary).
   ceiling=$(printf '%s' "$budget" | jq -r '.max_request_attempts // empty')
   case "$ceiling" in ''|*[!0-9]*) jq -nc '{state:"unsafe",reason:"request-ceiling-invalid"}'; return 2 ;; esac
-  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling") \
-    || { jq -nc '{state:"unsafe",reason:"ledger-malformed"}'; return 2; }
-  # An owner tiebreak settles a dispute stop (#2511) or a runaway (#2534) for
-  # this head. It is read only when one of those holds, and a failed read
+  # The one consumer-facing stop calculation, shared with Cockpit (#2558): an
+  # owner tiebreak settles a dispute stop (#2511) or a runaway (#2534) for this
+  # head. The markers are read only when one of those holds, and a failed read
   # leaves the stop standing: missing evidence never reads as a decision.
-  if printf '%s' "$stops" | jq -e '(.untested_rebuttals | length) + (.disagreements | length) > 0
-       or (.stops | index("runaway")) != null' >/dev/null 2>&1; then
-    local tb_comments tb_marks tb_applied
-    if tb_comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "owner tiebreak markers" 2>/dev/null) \
-       && tb_marks=$(crl_owner_tiebreaks "$tb_comments" "$author" "https://github.com/$repo/pull/$pr" "$head") \
-       && tb_applied=$(crl_apply_owner_tiebreaks "$stops" "$(printf '%s' "$ledger" | jq -sc '.[0]')" "$tb_marks"); then
-      stops="$tb_applied"
-    fi
-  fi
+  stops=$(crl_resolved_human_stops "$ledger" "$head" "$author" "$max" "$ceiling" \
+      "https://github.com/$repo/pull/$pr" gh_api_array "repos/$repo/issues/$pr/comments" "owner tiebreak markers") \
+    || { jq -nc '{state:"unsafe",reason:"ledger-malformed"}'; return 2; }
   final_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") \
     || { jq -nc '{state:"unsafe",reason:"pr-policy-tuple-reread-failed"}'; return 2; }
   if [ "$final_tuple" != "$tuple" ]; then

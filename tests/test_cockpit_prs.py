@@ -488,6 +488,44 @@ class PRTests(unittest.TestCase):
         self.assertIsNotNone(data['coderabbit']['data'],data)
         self.assertIsNone(data['commits']['data']);self.assertIsNone(data['accounting']['data'])
 
+    def test_actual_read_helpers_apply_owner_tiebreak_to_runaway_stop(self):
+        # #2558: a request ceiling of 2 with two author requests, each drawing a blocking
+        # Codex review, is a runaway. The owner's marker, newer than every request and
+        # response, releases it: the row is not a human stop and the receipt names the tiebreak.
+        policy=(ROOT/'.github/review-policy.yml').read_text().replace('max_review_rounds: 20','max_review_rounds: 2',1)
+        bot='chatgpt-codex-connector[bot]'
+        marker={'id':103,'user':{'login':'nathanjohnpayne'},'body':f'TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/{REPO}/pull/1@{HEAD}','created_at':'2026-10-01T05:00:00Z','updated_at':'2026-10-01T05:00:00Z'}
+        def badge(text):return '**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** '+text
+        class Reads:
+            def __init__(self,released):
+                self.paths=[]
+                self.lists={f'/repos/{REPO}/issues/1/comments':[{'id':101,'user':{'login':'nathanjohnpayne'},'body':'@codex review','created_at':'2026-10-01T00:00:00Z','updated_at':'2026-10-01T00:00:00Z'},
+                                                               {'id':102,'user':{'login':'nathanjohnpayne'},'body':'@codex review','created_at':'2026-10-01T02:00:00Z','updated_at':'2026-10-01T02:00:00Z'}]+([marker] if released else []),
+                            f'/repos/{REPO}/pulls/1/reviews':[{'id':50,'user':{'login':bot},'submitted_at':'2026-10-01T00:10:00Z','commit_id':HEAD,'body':''},
+                                                              {'id':51,'user':{'login':bot},'submitted_at':'2026-10-01T02:10:00Z','commit_id':HEAD,'body':''}],
+                            f'/repos/{REPO}/pulls/1/comments':[{'id':60,'pull_request_review_id':50,'in_reply_to_id':None,'path':'a.sh','user':{'login':bot},'body':badge('first'),'created_at':'2026-10-01T00:10:00Z','reactions':{'-1':0}},
+                                                               {'id':61,'pull_request_review_id':51,'in_reply_to_id':None,'path':'b.sh','user':{'login':bot},'body':badge('second'),'created_at':'2026-10-01T02:10:00Z','reactions':{'-1':0}}]}
+            def get(self,path,*,deadline):
+                self.paths.append(path)
+                if 'contents/' in path:return {'encoding':'base64','content':base64.b64encode(policy.encode()).decode()}
+                if '/pulls/' in path:return {'number':1,'head':{'sha':HEAD,'repo':{'id':1}},'base':{'sha':'b'*40,'ref':'main','repo':{'id':1,'default_branch':'main'}},'draft':False}
+                if '/commits/' in path:return {'sha':HEAD,'commit':{'committer':{'date':'2026-10-03T00:00:00Z'}}}
+                return {}
+            def pages(self,path,*,deadline):
+                self.paths.append(path);return copy.deepcopy(self.lists.get(path,[]))
+        standing=Reads(False);data=HelperReader(standing,ROOT).read(REPO,'1',HEAD,time.monotonic()+15)
+        self.assertEqual(data['ledger']['data']['human_stops'],['runaway'],data['ledger'])
+        self.assertEqual(data['ledger']['data']['owner_tiebreaks'],[])
+        row=build_row(REPO,raw(),receipts(ledger=data['ledger']['data']))
+        self.assertEqual((row['state'],row['label']),('boulder','Human stop'));self.assertIn('runaway',row['hazards'][0]['detail'])
+        released=Reads(True);data=HelperReader(released,ROOT).read(REPO,'1',HEAD,time.monotonic()+15)
+        self.assertEqual(data['ledger']['data']['human_stops'],[],data['ledger'])
+        self.assertEqual(data['ledger']['data']['owner_tiebreaks'],[{'kind':'runaway'}])
+        self.assertEqual(standing.paths.count(f'/repos/{REPO}/issues/1/comments'),released.paths.count(f'/repos/{REPO}/issues/1/comments'))
+        row=build_row(REPO,raw(),receipts(ledger=data['ledger']['data']))
+        self.assertNotEqual(row['label'],'Human stop');self.assertEqual(row['codex']['human_stops'],[]);self.assertEqual(row['codex']['owner_tiebreaks'],[{'kind':'runaway'}])
+        self.assertFalse([hazard for hazard in row['hazards'] if 'Human stop' in hazard['title']])
+
     def test_actual_accounting_helpers_trusted_records_local_loops_and_exact_tokens(self):
         loop={'run_id':'fixture-unique','verdict':'CHANGES_REQUESTED','reviewer':'nathanpayne-codex',
               'tokens':{'total':9007199254740993,'input':None,'output':None,'cost_usd':1.25},'fail_closed':{'happened':False}}

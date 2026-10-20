@@ -518,3 +518,37 @@ crl_apply_owner_tiebreaks() {
                           | select((. == "disagreement" and ($disagreements | length) == 0) | not)
                           | select((. == "runaway" and $runaway) | not) ]' 2>/dev/null
 }
+
+# crl_resolved_human_stops <ledger-json> <head> <author> <max-blocking-reviews>
+#                          <request-ceiling> <pr-url> [comments-reader [args...]]
+#
+# The one consumer-facing stop calculation (#2558): crl_human_stops with the
+# owner's tiebreak markers applied. The Phase 4b barrier (p4b_codex_human_stops)
+# and Cockpit's PR read both call it, so the two cannot disagree about whether
+# an owner tiebreak released a stop. Prints crl_human_stops' output for the
+# ledger, head, author, budget and ceiling. When a dispute stop (an untested
+# rebuttal or a disagreement, #2511) or a runaway stop (#2534) holds, it runs
+# the reader to obtain the PR's issue comments as one JSON array, parses the
+# markers with crl_owner_tiebreaks against <pr-url> and <head>, and applies them
+# with crl_apply_owner_tiebreaks, so the output carries `owner_tiebreaks` (empty
+# when no marker settled anything). A reader that fails or prints anything but
+# one array, or no reader at all, leaves the stops as crl_human_stops computed
+# them, without `owner_tiebreaks`: missing evidence never reads as a decision.
+# With no such stop the reader never runs, so a PR with nothing to release costs
+# no read; `blocking-budget` alone is not releasable. Returns nonzero, printing
+# nothing, when crl_human_stops does.
+crl_resolved_human_stops() {
+  local ledger="$1" head="$2" author="$3" max="$4" ceiling="$5" url="$6"
+  local stops comments marks applied
+  shift 6
+  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling") || return 1
+  if [ $# -gt 0 ] && printf '%s' "$stops" | jq -e '(.untested_rebuttals | length) + (.disagreements | length) > 0
+       or (.stops | index("runaway")) != null' >/dev/null 2>&1; then
+    if comments=$("$@" 2>/dev/null) \
+       && marks=$(crl_owner_tiebreaks "$comments" "$author" "$url" "$head") \
+       && applied=$(crl_apply_owner_tiebreaks "$stops" "$(printf '%s' "$ledger" | jq -sc '.[0]')" "$marks"); then
+      stops="$applied"
+    fi
+  fi
+  printf '%s\n' "$stops"
+}

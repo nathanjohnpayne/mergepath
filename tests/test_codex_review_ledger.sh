@@ -703,6 +703,63 @@ stop_check "barrier: an owner runaway marker on the PR clears it, and the result
 stop_check "barrier: unreadable comments leave the runaway standing" "$(barrier_stops FAIL)" \
   '.state == "stop" and .stops == ["runaway"]'
 
+# ---- Resolved stops: the one consumer-facing calculation (#2558) -------------
+# crl_resolved_human_stops is what the Phase 4b barrier and Cockpit both call:
+# crl_human_stops with the owner's markers applied. It reads the comments
+# through the command it is given, only when a dispute or runaway stop holds,
+# and a failed read leaves the stop standing.
+rs_read() { printf 'read\n' >>"$TB_DIR/rs-reads"; printf '%s' "$1"; }
+rs_fail() { printf 'read\n' >>"$TB_DIR/rs-reads"; return 1; }
+rs_reads() { if [ -f "$TB_DIR/rs-reads" ]; then wc -l <"$TB_DIR/rs-reads" | tr -d ' '; else printf 0; fi; }
+RS_RW=$(crl_ledger "$(printf '%s' "$IN2" | jq -c '.rebuttals = []')" | jq -c '.max_blocking_reviews = 10')
+stop_check "resolved: an owner runaway marker releases the runaway, and the result records it" \
+  "$(crl_resolved_human_stops "$RS_RW" "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL" rs_read "$RWC")" \
+  '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}] and .blocking_windows == 2'
+stop_check "resolved: no marker leaves the runaway standing, with an empty tiebreak record" \
+  "$(crl_resolved_human_stops "$RS_RW" "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL" rs_read '[]')" \
+  '.stops == ["runaway"] and .owner_tiebreaks == []'
+stop_check "resolved: unreadable comments leave the runaway standing, with no tiebreak record" \
+  "$(crl_resolved_human_stops "$RS_RW" "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL" rs_fail)" \
+  '.stops == ["runaway"] and (has("owner_tiebreaks") | not)'
+stop_check "resolved: a comments payload that is not one array leaves the runaway standing" \
+  "$(crl_resolved_human_stops "$RS_RW" "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL" rs_read '{"not":"an array"}')" \
+  '.stops == ["runaway"] and (has("owner_tiebreaks") | not)'
+stop_check "resolved: no reader at all leaves the runaway standing" \
+  "$(crl_resolved_human_stops "$RS_RW" "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL")" \
+  '.stops == ["runaway"] and (has("owner_tiebreaks") | not)'
+RS_D=$(crl_ledger "$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]' \
+  | jq -c --argjson rb "$RB" '.rebuttals = $rb')" | jq -c '.max_blocking_reviews = 10')
+stop_check "resolved: an owner rebuttal marker releases an untested rebuttal" \
+  "$(crl_resolved_human_stops "$RS_D" "$HEAD_A" nathanjohnpayne 10 "" "$PR_URL" rs_read "$C")" \
+  '.stops == [] and .untested_rebuttals == [] and .owner_tiebreaks == [{kind: "untested", finding: 100}]'
+stop_check "resolved: a runaway marker releases no dispute" \
+  "$(crl_resolved_human_stops "$RS_D" "$HEAD_A" nathanjohnpayne 10 "" "$PR_URL" rs_read "$RWC")" \
+  '.stops == ["untested-rebuttal"] and .owner_tiebreaks == []'
+# With no releasable stop the reader never runs and the output is crl_human_stops' own.
+RS_CLEAN=$(crl_ledger "$(inputs "$R4" "$CCBB" '[]' '[]' '[]' | jq -c '.rebuttals = []')" | jq -c '.max_blocking_reviews = 10')
+RS_BUDGET=$(printf '%s' "$RS_CLEAN" | jq -c '.max_blocking_reviews = 2')
+reads_before=$(rs_reads)
+OUT=$(crl_resolved_human_stops "$RS_CLEAN" "$HEAD_A" nathanjohnpayne 10 20 "$PR_URL" rs_fail)
+if [ "$OUT" = "$(crl_human_stops "$RS_CLEAN" "$HEAD_A" nathanjohnpayne 10 20)" ] \
+   && printf '%s' "$OUT" | jq -e '.stops == [] and (has("owner_tiebreaks") | not)' >/dev/null; then
+  pass "resolved: with no stop the output is crl_human_stops' own"
+else
+  fail "resolved: the no-stop output differs from crl_human_stops: $OUT"
+fi
+stop_check "resolved: a spent blocking budget alone is not releasable" \
+  "$(crl_resolved_human_stops "$RS_BUDGET" "$HEAD_A" nathanjohnpayne 2 20 "$PR_URL" rs_fail)" \
+  '.stops == ["blocking-budget"] and (has("owner_tiebreaks") | not)'
+if OUT=$(crl_resolved_human_stops '{"not":"a ledger"}' "$HEAD_A" nathanjohnpayne 10 2 "$PR_URL" rs_read "$RWC") || [ -n "$OUT" ]; then
+  fail "resolved: a malformed ledger was accepted: $OUT"
+else
+  pass "resolved: a malformed ledger fails, printing nothing"
+fi
+if [ "$(rs_reads)" = "$reads_before" ]; then
+  pass "resolved: with no dispute or runaway stop, or no ledger, the comments are never read"
+else
+  fail "resolved: the comments were read with nothing to release ($reads_before -> $(rs_reads))"
+fi
+
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
 make_cli_case() {
