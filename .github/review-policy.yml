@@ -220,8 +220,9 @@ feedback_policy:
 # not override GitHub's required-conversation-resolution branch protection:
 # unresolved review conversations still block merge until cleared under
 # REVIEW_POLICY.md's pre-merge review conversation gate. The agent is required
-# to read and address substantive CodeRabbit findings before proceeding past
-# Phase 2.5.
+# to read and address substantive CodeRabbit findings as they arrive, and no
+# later than the pre-merge gates. Phase 2.5 does not hold Phase 3 unless the
+# configured wait_for_review requires that wait.
 #
 # Phase 2.5 runs only when scripts/coderabbit-should-invoke.sh <PR#> exits 0
 # (#1084). `coderabbit.enabled: true` is necessary but NOT sufficient: the

@@ -2317,12 +2317,12 @@ refuse_moving_head_unless_allowed() {
         status=unreadable
       elif [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ]; then
         status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "unknown"')
-        # The LATEST dispatch on this branch is the current push: a re-run
-        # keeps its run's original created_at (it bumps run_attempt), so it
-        # cannot move this, and an earlier push of the same SHA to this branch
-        # is older by construction (Codex P2 on #2175).
+        # Only PR/push events date this push. Any event proves pickup, but a
+        # later manual or scheduled run must not restart a settled head's age
+        # guard (#2198). A re-run keeps the original created_at.
         dispatched_at=$(printf '%s' "$runs" | jq -r '
-          [.[] | (.created_at // empty)
+          [.[] | select(.event == "pull_request" or .event == "push")
+           | (.created_at // empty)
            | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""')
       else
         # No repo-lint run on this head. Either CI has not picked it up yet,

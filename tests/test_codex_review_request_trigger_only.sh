@@ -172,10 +172,11 @@ case "$endpoint" in
       # LATEST dispatch on the PR branch.
       dispatched) jq -cn --arg o "${CODEX_TEST_CHECK_OTHER:-$(jq -rn 'now - 10800 | floor | todate')}" \
                     --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
+                    --arg first_event "${CODEX_TEST_CHECK_EVENT-pull_request}" --arg last_event "${CODEX_TEST_CHECK_RERUN_EVENT-push}" \
                     '{total_count:3,workflow_runs:[
-                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",status:"completed",created_at:$o},
-                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$a},
-                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$b}]}' ;;
+                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",event:"push",status:"completed",created_at:$o},
+                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",event:$first_event,status:"completed",created_at:$a},
+                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",event:$last_event,status:"completed",created_at:$b}]}' ;;
       *)          jq -cn --arg st "${CODEX_TEST_LINT_RUNS:-completed}" '{total_count:1,workflow_runs:[{id:2,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:$st}]}' ;;
     esac ;;
   repos/owner/repo/actions/workflows)
@@ -1579,6 +1580,35 @@ test_guard_anchors_on_push_dispatch() {
   [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the latest repo-lint dispatch for the head on the PR branch, not only the commit date"
 }
 
+# #2198: every workflow event proves pickup, but only PR/push dispatches
+# date the age guard. A later manual/scheduled run cannot reset a settled head.
+test_guard_workflow_event_anchors() {
+  refresh_head_dates
+  local dir rc event shape first expected before
+  for event in workflow_dispatch schedule '' pull_request push; do
+    for shape in mixed event-only; do
+      before=$FAIL
+      dir=$(make_case "guard-event-${event:-missing}-$shape")
+      first=pull_request; [ "$shape" != event-only ] || first=$event
+      rc=$(CODEX_TEST_CHECK_EVENT="$first" CODEX_TEST_CHECK_RERUN_EVENT="$event" \
+        CODEX_TEST_CHECK_STARTED="$OLD_HEAD" CODEX_TEST_CHECK_RERUN="$YOUNG_HEAD" \
+        run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+      case "$event" in
+        pull_request|push)
+          [ "$rc" = 8 ] && [ "$(trig_count "$dir")" = 0 ] \
+            && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+            && jq -e '.moving_head.reasons == ["head-age"]' "$dir/out.json" >/dev/null \
+            || fail "#2198: fresh $event dispatch must retain age refusal ($shape, rc=$rc)" ;;
+        *)
+          [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] \
+            && grep -q "'repo-lint' is completed on HEAD" "$dir/err.log" \
+            || fail "#2198: ${event:-missing} event must prove pickup without resetting push age ($shape, rc=$rc)" ;;
+      esac
+      [ "$FAIL" -ne "$before" ] || pass "#2198: ${event:-missing} workflow age anchor ($shape)"
+    done
+  done
+}
+
 # MH12 (#2175, #2273): the target policy governs from a subdirectory or a
 # foreign cwd, even when the script checkout requests by default.
 test_policy_resolved_from_script_checkout() {
@@ -1852,6 +1882,7 @@ test_guard_exempts_automatic_caller
 test_guard_does_not_run_on_no_write_paths
 test_guard_applies_in_polling_mode
 test_guard_anchors_on_push_dispatch
+test_guard_workflow_event_anchors
 test_policy_resolved_from_script_checkout
 test_guard_workflow_signal_shapes
 test_guard_override_paginates_and_scopes
