@@ -263,6 +263,53 @@ if crqe_trigger_generation '[{"id":"bad","user":{"login":"nathanjohnpayne"},"bod
 fi
 echo "PASS: shared exact-request generation selector"
 
+# #2534: a CodeRabbit rate-limit failover request does not spend the request
+# ceiling. Only a marker posted by the requester itself, right after its own
+# trigger, exempts that trigger; every forgery or stretch below leaves it
+# counted, and the trigger always stays in the generation.
+fo_c() { # <id> <login> <created> <body> [updated]
+  jq -nc --argjson id "$1" --arg u "$2" --arg c "$3" --arg b "$4" --arg up "${5:-$3}" \
+    '{id: $id, user: {login: $u}, created_at: $c, updated_at: $up, body: $b}'
+}
+FO_HA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+FO_HB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fo_m() { crqe_failover_marker_body "${2:-$FO_HA}" "$1"; }
+fo_case() { # <name> <expected-exempt-json> <expected-count> <comment>...
+  local name=$1 want=$2 count=$3 c got n
+  shift 3
+  c=$(printf '%s\n' "$@" | jq -sc .)
+  got=$(crqe_failover_trigger_ids "$c" nathanjohnpayne) && n=$(crqe_count_triggers "$c" nathanjohnpayne) \
+    && [ "$got" = "$want" ] && [ "$n" = "$count" ] \
+    || { echo "FAIL: failover: $name (exempt=$got count=${n:-?}, want $want/$count)" >&2; exit 1; }
+}
+T1=$(fo_c 10 nathanjohnpayne 2026-10-01T00:00:00Z '@codex review')
+T2=$(fo_c 20 nathanjohnpayne 2026-10-01T01:00:00Z '@codex review')
+fo_case "no marker counts every request" '[]' 2 "$T1" "$T2"
+fo_case "a marker right after its trigger exempts it" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" "$T2"
+fo_case "a marker 300 s after is still in the window" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:05:00Z "$(fo_m 10)")" "$T2"
+fo_case "a marker added later cannot exempt an old request" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:05:01Z "$(fo_m 10)")" "$T2"
+fo_case "a marker by another login" '[]' 2 "$T1" "$(fo_c 11 nathanpayne-claude 2026-10-01T00:00:05Z "$(fo_m 10)")" "$T2"
+fo_case "an edited marker" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)" 2026-10-01T00:00:09Z)" "$T2"
+fo_case "a marker naming a comment that is not a request" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 9)")" "$T2"
+fo_case "a marker naming a foreign request" '[]' 2 "$T1" "$(fo_c 9 someone-else 2026-10-01T00:00:01Z '@codex review')" \
+  "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 9)")" "$T2"
+fo_case "a marker with another request between it and its trigger" '[]' 3 "$T1" \
+  "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:02Z '@codex review')" "$(fo_c 12 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" "$T2"
+fo_case "a marker that is not the whole body" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "> $(fo_m 10)")" \
+  "$(fo_c 12 nathanjohnpayne 2026-10-01T00:00:06Z "$(fo_m 10) extra")" "$T2"
+fo_case "an unknown marker version" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 | sed 's/:v1 /:v2 /')")" "$T2"
+fo_case "a marker older than its trigger" '[]' 2 "$(fo_c 11 nathanjohnpayne 2026-09-30T23:59:59Z "$(fo_m 12)")" \
+  "$(fo_c 12 nathanjohnpayne 2026-10-01T00:00:00Z '@codex review')" "$T2"
+fo_case "one exemption per head" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20)")"
+fo_case "one exemption on each of two heads" '[10,20]' 0 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HB")")"
+[ "$(crqe_trigger_generation "$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" | jq -sc .)" nathanjohnpayne)" = '[10]' ] \
+  || { echo "FAIL: failover: an exempt trigger left the request generation" >&2; exit 1; }
+! crqe_failover_marker_body abc 10 >/dev/null && ! crqe_failover_marker_body "$FO_HA" 0 >/dev/null \
+  || { echo "FAIL: failover: a marker was built from an abbreviated head or a zero id" >&2; exit 1; }
+echo "PASS: failover markers exempt only the requester's own just-posted trigger (#2534)"
+
 # #1598: a Codex request the configured author posts AFTER a Phase 4b
 # substitute approval supersedes it, so gate (c) does not clear on that
 # approval until Codex answers. An older request, a newer request from another

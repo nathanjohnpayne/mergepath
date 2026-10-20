@@ -210,6 +210,7 @@ test_failover_fires() {
   [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "A: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
   [ "$(stub_calls "$dir")" = "1" ] || fail "A: Codex helper invoked $(stub_calls "$dir") time(s), expected 1"
   grep -q -- '--trigger-only' "$dir/state/codex-stub.log" || fail "A: Codex helper not called with --trigger-only; log=$(cat "$dir/state/codex-stub.log")"
+  grep -q -- '--failover' "$dir/state/codex-stub.log" || fail "A: Codex helper not called with --failover (#2534); log=$(cat "$dir/state/codex-stub.log")"
   grep -q 'phase4a=true' "$dir/state/codex-stub.log" || fail "A: MERGEPATH_PHASE_4A_GATED not set true; log=$(cat "$dir/state/codex-stub.log")"
   # #2166: the requester refuses a head that does not look final (exit 8)
   # unless the caller allows a moving head. The failover must always be able

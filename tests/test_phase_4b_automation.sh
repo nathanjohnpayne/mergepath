@@ -5732,6 +5732,46 @@ out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P
     and .human_stops.request_ceiling == 2 and (.reason | contains("runaway"))' >/dev/null 2>&1 \
   || bad="$bad runaway-at-ceiling-waived(rc=$rc,out=$out)"
 
+# The owner's runaway tiebreak (#2534): a well-formed marker newer than the last
+# response clears the runaway, so the ceiling waives the Codex arm and the head
+# goes to the adapter. It approves nothing itself. A marker older than the
+# runaway's last response leaves exit 8.
+_rw_marker() { # <created_at> -> comments JSON with _cap_old's requests and one owner marker
+  printf '%s' "$_cap_old" | jq -c --arg at "$1" --arg b "TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/owner/repo/pull/7@$_p4a_head" \
+    '. + [{id: 5150, user: {login: "nathanjohnpayne"}, body: $b, created_at: $at, updated_at: $at}]'
+}
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$(_rw_marker 2026-08-03T00:00:00Z)" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling"
+    and .human_stops.state == "clear" and .human_stops.stops == [] and .human_stops.owner_tiebreaks == [{kind: "runaway"}]' >/dev/null 2>&1 \
+  || bad="$bad runaway-owner-marker-not-waived(rc=$rc,out=$out)"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$(_rw_marker 2026-08-01T01:05:00Z)" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .human_stops.stops == ["runaway"]
+    and (.human_stops.owner_tiebreaks | length) == 0' >/dev/null 2>&1 \
+  || bad="$bad runaway-stale-owner-marker-waived(rc=$rc,out=$out)"
+
+# A CodeRabbit failover request spends no ceiling slot (#2534): with the second
+# of _cap_old's two requests marked as the failover, the budget of 2 has room,
+# so the barrier's budget read reports room instead of a spent ceiling.
+_cap_failover=$(printf '%s' "$_cap_old" | jq -c '. + [{id: 5103, user: {login: "nathanjohnpayne"}, created_at: "2026-08-02T00:00:05Z", updated_at: "2026-08-02T00:00:05Z",
+  body: "<!-- mergepath-codex-failover:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=5102 -->"}]')
+for _fo in "$_cap_old:exhausted:2" "$_cap_failover:available:1"; do
+  _fo_comments=${_fo%:*:*}; _fo_rest=${_fo#"$_fo_comments":}
+  out="$(
+    export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-candidate.yml"
+    export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+    export P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml"
+    export P4B_TEST_COMMENTS_JSON="$_fo_comments" P4B_TEST_LIVE_HEAD="$_p4a_head"
+    export P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' P4B_TEST_TIMELINE_JSON='[]'
+    export PATH="$WORK/barrier-bin:$PATH"
+    p4b_codex_request_budget_state owner/repo 7 "$_p4a_head"
+  )" && rc=0 || rc=$?
+  [ "$rc" = 0 ] && printf '%s' "$out" | jq -e --arg st "${_fo_rest%:*}" --argjson n "${_fo_rest#*:}" \
+      '.state == $st and .request_attempts == $n and .max_request_attempts == 2' >/dev/null 2>&1 \
+    || bad="$bad failover-ceiling-read(${_fo_rest},rc=$rc,out=$out)"
+done
+
 # The governed blocking budget is the base policy's, and an invalid one fails
 # closed rather than reading as room.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"

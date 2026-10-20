@@ -80,10 +80,56 @@ crqe_latest_trigger_time() { # comments-json author
   '
 }
 
+# The CodeRabbit rate-limit failover (#489) asks Codex to stand in for the
+# CodeRabbit review the PR lost; it is not a deliberate Codex round, so it does
+# not spend the request ceiling (#2534). `codex-review-request.sh --failover`
+# records the trigger it just posted with one author-owned comment:
+#
+#   <!-- mergepath-codex-failover:v1 head=<full-sha> trigger_comment_id=<id> -->
+#
+# A trigger is exempt only when that marker is the whole body of an unedited
+# configured-author comment that names an exact configured-author trigger,
+# follows it within CRQE_FAILOVER_MARKER_WINDOW_SECONDS by GitHub's own
+# timestamps, and has no other author trigger between the two. So a marker
+# cannot be added to an old request later, and at most one trigger per named
+# head is exempt. Anything else, malformed or unreadable, leaves the trigger
+# counted: a missing exemption costs a request slot, never the ceiling. The
+# trigger stays in the request generation; only the ceiling skips it.
+CRQE_FAILOVER_MARKER_WINDOW_SECONDS=300
+
+crqe_failover_marker_body() { # full-head-sha trigger-comment-id
+  [[ "${1-}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ && "${2-}" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '<!-- mergepath-codex-failover:v1 head=%s trigger_comment_id=%s -->' "$1" "$2"
+}
+
+# Prints the sorted ids of the exempt failover triggers.
+crqe_failover_trigger_ids() { # comments-json author
+  printf '%s\n' "$1" | jq -cer --arg author "$2" --argjson window "$CRQE_FAILOVER_MARKER_WINDOW_SECONDS" '
+    def epoch: try fromdateiso8601 catch null;
+    [ .[] | select(type == "object" and (.user.login // "") == $author) ] as $mine
+    | [ $mine[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] as $triggers
+    | [ $mine[]
+        | select((.body | type) == "string" and (.id | type) == "number"
+                 and (.created_at | type) == "string" and .updated_at == .created_at)
+        | . as $m
+        | ($m.body | capture("\\A<!-- mergepath-codex-failover:v1 head=(?<head>[0-9a-f]{40}|[0-9a-f]{64}) trigger_comment_id=(?<trigger>[1-9][0-9]*) -->\\z"))
+        | .head as $head
+        | (.trigger | tonumber) as $tid
+        | ([ $triggers[] | select(.id == $tid) ] | first) as $t
+        | select($t != null and ($t.created_at | type) == "string")
+        | ($m.created_at | epoch) as $ma | ($t.created_at | epoch) as $ta
+        | select($ma != null and $ta != null and $m.id > $tid and $ma >= $ta and $ma - $ta <= $window)
+        | select([ $triggers[] | select(.id > $tid and .id < $m.id) ] | length == 0)
+        | {head: $head, id: $tid} ]
+    | group_by(.head) | map(min_by(.id).id) | unique'
+}
+
+# The requests that spend the ceiling: the generation less exempt failovers.
 crqe_count_triggers() { # comments-json author
-  local generation
+  local generation exempt
   generation=$(crqe_trigger_generation "$1" "$2") || return 1
-  printf '%s\n' "$generation" | jq -er 'length'
+  exempt=$(crqe_failover_trigger_ids "$1" "$2") || return 1
+  jq -ner --argjson g "$generation" --argjson x "$exempt" '[ $g[] | select(. as $i | $x | index($i) | not) ] | length'
 }
 
 # Latest trusted PR force-push transition, not an author-controlled commit date.

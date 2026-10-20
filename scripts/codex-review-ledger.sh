@@ -187,9 +187,14 @@ printf '%s\n' "$REVIEWS" >"$LEDGER_TMP/reviews.json"
 # so they open windows and are attribution candidates, but are not counted.
 REQUEST_IDS=$(crqe_trigger_generation "$ISSUE_COMMENTS" "$AUTHOR") \
   || die "a configured-author Codex request comment lacks a positive integer id"
-REQUESTS=$(jqx "issue comments" -c --argjson ids "$REQUEST_IDS" '
+# A CodeRabbit rate-limit failover request is the configured author's too, but
+# the request ceiling does not count it (#2534), so a runaway must not either.
+FAILOVER_IDS=$(crqe_failover_trigger_ids "$ISSUE_COMMENTS" "$AUTHOR") \
+  || die "cannot read Codex failover markers"
+REQUESTS=$(jqx "issue comments" -c --argjson ids "$REQUEST_IDS" --argjson fo "$FAILOVER_IDS" '
   [ .[] | select(.id as $i | $ids | index($i))
-    | {id, created_at, counted: true, source: "issue_comment", author: .user.login} ]
+    | {id, created_at, counted: true, ceiling_exempt: (.id as $i | $fo | index($i) != null),
+       source: "issue_comment", author: .user.login} ]
   | unique_by(.id)' <<<"$ISSUE_COMMENTS")
 FOREIGN=$(jqx "request mentions" -nc --slurpfile ic "$LEDGER_TMP/issue_comments.json" \
   --slurpfile rc "$LEDGER_TMP/review_comments.json" --slurpfile rv "$LEDGER_TMP/reviews.json" \

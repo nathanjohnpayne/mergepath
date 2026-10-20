@@ -38,7 +38,8 @@
 #   {
 #     pr, repo, head_sha, author, bot, required_tiers: ["p1", ...],
 #     requests:  [{id, created_at, counted: true|false, source, author,
-#                  eyes_at: iso|null}],
+#                  eyes_at: iso|null, ceiling_exempt: true|false (optional;
+#                  a counted CodeRabbit failover request, #2534)}],
 #     reviews:   [{id, submitted_at, commit_id|null, body_tiers: [...],
 #                  root_findings: [{comment_id, tier, path}], reply_comments: N,
 #                  reply_markers: [...]}],
@@ -246,7 +247,7 @@ crl_ledger() {
           | .k as $k | ($k | tostring) as $ks
           | (if $k < $n then $reqs[$k] else null end) as $next
           | ( [ $responses[] | select(.window == $k) ] | length ) as $own
-          | { id, created_at, counted, source, author, eyes_at,
+          | { id, created_at, counted, ceiling_exempt: (.ceiling_exempt == true), source, author, eyes_at,
               outcome: ( if $sweep.att[$ks] then "attributed"
                          elif $sweep.amb[$ks] then "ambiguous"
                          elif $k == $n then "no_response_yet"
@@ -368,7 +369,9 @@ crl_human_stops() {
                              and (.responses | type) == \"array\"
                              # counted decides which windows a runaway counts;
                              # absent or malformed must fail, not read as foreign.
-                             and (.counted | type) == \"boolean\")
+                             and (.counted | type) == \"boolean\"
+                             # absent reads as counted (older ledgers); malformed fails.
+                             and (.ceiling_exempt == null or (.ceiling_exempt | type) == \"boolean\"))
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
                               and (.blocking_unlocated | type) == \"boolean\")
@@ -382,12 +385,14 @@ crl_human_stops() {
     # response, not with responses: a window can hold several (#1584).
     # Only windows opened by COUNTED (configured-author) requests, which is
     # what the ceiling counts; a foreign mention opens a window too (#1584).
+    # A failover request is the author's but spends no ceiling (#2534).
     | ([ \$rs[] | select($__CRL_COUNTS) | .window
-         | select(. > 0 and (\$reqs[. - 1].counted == true)) ] | unique | length) as \$nw
+         | select(. > 0 and (\$reqs[. - 1].counted == true) and (\$reqs[. - 1].ceiling_exempt != true)) ]
+       | unique | length) as \$nw
     # A runaway needs EVERY counted request to have drawn a blocking review,
     # not just as many windows as the current ceiling: a lowered ceiling or
     # concurrent near-cap callers can leave more requests than it (#1584).
-    | ([ \$reqs[] | select(.counted == true) ] | length) as \$nr
+    | ([ \$reqs[] | select(.counted == true and .ceiling_exempt != true) ] | length) as \$nr
     | [ .rebuttals[] | . as \$r
         # Only a response to a request posted AFTER the rebuttal can have read
         # it: a request already in flight may be answered later without
@@ -446,10 +451,22 @@ crl_human_stops() {
 # well-formed marker text in any agent-authored body. As with the scoped admin
 # override, GitHub cannot show the owner (rather than an operator holding the
 # owner credential) typed it; the record preserves who posted what and when.
+#
+# A runaway stop has its own line, with no finding id because it names no
+# dispute (#2534):
+#
+#   TIEBREAK_RUNAWAY_ACCEPTED=<canonical-https-PR-URL>@<full-head-sha>
+#
+# It follows the same rules and clears only `runaway`, only on that head. It
+# must be newer than every request and every response in the ledger, so it
+# cannot be recorded before the round that completed the runaway. It never
+# clears `blocking-budget`: that budget is the owner's cap on Codex spend, and
+# the waiver's next step is another review.
 
 # crl_owner_tiebreaks <issue-comments-json> <author> <pr-url> <head>
-# Prints [{finding, comment_id, at}] for every well-formed marker; fails on
-# input that is not one array of comments.
+# Prints [{kind: "rebuttal", finding, comment_id, at} | {kind: "runaway",
+# comment_id, at}] for every well-formed marker; fails on input that is not
+# one array of comments.
 crl_owner_tiebreaks() {
   printf '%s\n' "$1" | jq -sec --arg author "$2" --arg url "$3" --arg head "$4" '
     if length != 1 or (.[0] | type) != "array" then error("comments") else .[0] end
@@ -462,22 +479,31 @@ crl_owner_tiebreaks() {
         | . as $c
         | ($c.body | split("\n")[]
            | rtrimstr("\r")
-           | capture("^[ \\t]*TIEBREAK_REBUTTAL_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})#(?<finding>[0-9]+)[ \\t]*$")
-           | select((.url | ascii_downcase) == ($url | ascii_downcase) and .head == $head)
-           | {finding: (.finding | tonumber), comment_id: $c.id, at: $c.created_at}) ]' 2>/dev/null
+           | (capture("^[ \\t]*TIEBREAK_REBUTTAL_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})#(?<finding>[0-9]+)[ \\t]*$")
+              | select((.url | ascii_downcase) == ($url | ascii_downcase) and .head == $head)
+              | {kind: "rebuttal", finding: (.finding | tonumber), comment_id: $c.id, at: $c.created_at}),
+             (capture("^[ \\t]*TIEBREAK_RUNAWAY_ACCEPTED=(?<url>[^@#\\s]+)@(?<head>[0-9a-f]{40})[ \\t]*$")
+              | select((.url | ascii_downcase) == ($url | ascii_downcase) and .head == $head)
+              | {kind: "runaway", comment_id: $c.id, at: $c.created_at})) ]' 2>/dev/null
 }
 
 # crl_apply_owner_tiebreaks <stops-json> <ledger-json> <tiebreaks-json>
 # Drops each untested-rebuttal / disagreement entry that a newer owner marker
-# settles, recomputes `stops`, and records what it applied in
-# `owner_tiebreaks`. The input is crl_human_stops' output for the same ledger.
+# settles, and the runaway stop when a newer runaway marker settles it,
+# recomputes `stops`, and records what it applied in `owner_tiebreaks`. The
+# input is crl_human_stops' output for the same ledger.
 crl_apply_owner_tiebreaks() {
   jq -nec --argjson stops "$1" --argjson ledger "$2" --argjson tb "$3" '
     def settled($e; $floor):
-      any($tb[]; (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
+      any($tb[]; .kind == "rebuttal" and (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
       ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
-    ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
+    # The runaway formed with the latest request or response, so the marker
+    # must postdate every one of them.
+    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ] | max // "") as $runaway_floor
+    | (($stops.stops | index("runaway")) != null
+       and any($tb[]; .kind == "runaway" and .at > $runaway_floor)) as $runaway
+    | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements
     | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at))
@@ -487,7 +513,8 @@ crl_apply_owner_tiebreaks() {
     | $stops
     | .untested_rebuttals = $untested
     | .disagreements = $disagreements
-    | .owner_tiebreaks = ($a + $b)
+    | .owner_tiebreaks = ($a + $b + (if $runaway then [{kind: "runaway"}] else [] end))
     | .stops = [ .stops[] | select((. == "untested-rebuttal" and ($untested | length) == 0) | not)
-                          | select((. == "disagreement" and ($disagreements | length) == 0) | not) ]' 2>/dev/null
+                          | select((. == "disagreement" and ($disagreements | length) == 0) | not)
+                          | select((. == "runaway" and $runaway) | not) ]' 2>/dev/null
 }

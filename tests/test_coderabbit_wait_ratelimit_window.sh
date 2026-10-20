@@ -367,7 +367,7 @@ EOF
     || fail "$name: failover result misreported"
   if [ "$enabled" = "true" ]; then
     [ "$(wc -l <"$dir/state/codex-requests.log" | tr -d ' ')" = "1" ] \
-      && grep -Fxq 'true|--trigger-only --allow-moving-head 999 owner/repo' "$dir/state/codex-requests.log" \
+      && grep -Fxq 'true|--trigger-only --failover --allow-moving-head 999 owner/repo' "$dir/state/codex-requests.log" \
       || fail "$name: expected one correctly gated trigger-only request"
   else
     [ ! -e "$dir/state/codex-requests.log" ] || fail "$name: opt-out invoked Codex"

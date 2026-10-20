@@ -3650,11 +3650,13 @@ request_codex_rate_limit_failover() {
     # a head CodeRabbit refused to Codex so the PR is not stranded, and it
     # fires on the provider's refusal, not on a push the agent is amending.
     # The requester still warns, and its dedup/idempotency is untouched.
+    # --failover (#2534) marks a trigger it posts, so this stand-in for the
+    # lost CodeRabbit review does not spend the Codex request ceiling.
     local request_json
     # This substitution requires Codex on this exact head, so automatic
     # content-free carry-forward suppression cannot satisfy the request.
     if request_json=$(MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_AUTO_TRIGGER=false \
-        "$CODEX_REQUEST_CMD" --trigger-only --allow-moving-head "$PR_NUMBER" "$REPO"); then
+        "$CODEX_REQUEST_CMD" --trigger-only --failover --allow-moving-head "$PR_NUMBER" "$REPO"); then
       printf '%s\n' "$request_json" >&2
       if ! printf '%s' "$request_json" | jq -e '.trigger_requested == true and (.blocked_reason // null) == null' >/dev/null 2>&1; then
         log "codex failover: unusable request or known provider block — human attention required"

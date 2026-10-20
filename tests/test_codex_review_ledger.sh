@@ -338,6 +338,33 @@ IN2=$(inputs "$R2B" "$BB" '[]' '[]' '[]')
 stop_check "stops: two blocking reviews at a request ceiling of 2 under a budget of 10 are a runaway" \
   "$(stops "$IN2" '[]' 10 2)" '.stops == ["runaway"] and .request_ceiling == 2'
 stop_check "stops: the same two at a ceiling of 3 are no runaway" "$(stops "$IN2" '[]' 10 3)" '.stops == []'
+# A CodeRabbit failover request spends no ceiling (#2534), so it is no runaway
+# window either: matchline#581's two blocking rounds, one of them the failover,
+# are one deliberate request of two. A third, deliberate, blocking request then
+# completes the runaway.
+R2F=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z | jq -c '.ceiling_exempt = true')" "$(req 2 2026-09-25T01:00:00Z)" | arr)
+stop_check "stops: a failover request is not a runaway window" "$(stops "$(inputs "$R2F" "$BB" '[]' '[]' '[]')" '[]' 10 2)" \
+  '.stops == [] and .counted_requests == 1 and .blocking_windows == 1'
+R3F=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z | jq -c '.ceiling_exempt = true')" "$(req 2 2026-09-25T01:00:00Z)" "$(req 3 2026-09-25T02:00:00Z)" | arr)
+BBB_F=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["a.sh","p1"]]')" "$(preview 11 2026-09-25T01:10:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" \
+  "$(preview 12 2026-09-25T02:10:00Z '[["c.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+stop_check "stops: two deliberate blocking requests after a failover are a runaway" "$(stops "$(inputs "$R3F" "$BBB_F" '[]' '[]' '[]')" '[]' 10 2)" \
+  '.stops == ["runaway"] and .counted_requests == 2 and .blocking_windows == 2'
+stop_check "stops: the failover response still counts toward the blocking budget" "$(stops "$(inputs "$R3F" "$BBB_F" '[]' '[]' '[]')" '[]' 3 2)" \
+  '.stops == ["blocking-budget"] and .blocking_reviews == 3'
+L_F=$(crl_ledger "$(inputs "$R2F" "$BB" '[]' '[]' '[]' | jq -c '.rebuttals = []')" | jq -c '.max_blocking_reviews = 10')
+if printf '%s' "$L_F" | jq -e '[.requests[].ceiling_exempt] == [true, false]' >/dev/null; then
+  pass "stops: the ledger carries ceiling_exempt through"
+else
+  fail "stops: the ledger dropped ceiling_exempt: $(printf '%s' "$L_F" | jq -c '[.requests[] | {id, ceiling_exempt}]')"
+fi
+if crl_human_stops "$(printf '%s' "$L_F" | jq -c '.requests[0].ceiling_exempt = "yes"')" "$HEAD_A" nathanjohnpayne 10 2 >/dev/null; then
+  fail "stops: a malformed ceiling_exempt was read"
+else
+  pass "stops: a malformed ceiling_exempt fails closed"
+fi
+stop_check "stops: a ledger without ceiling_exempt counts every author request" \
+  "$(crl_human_stops "$(printf '%s' "$L_F" | jq -c 'del(.requests[].ceiling_exempt)')" "$HEAD_A" nathanjohnpayne 10 2)" '.stops == ["runaway"]'
 stop_check "stops: a spent blocking budget names blocking-budget, not runaway" "$(stops "$IN2" '[]' 2 2)" '.stops == ["blocking-budget"]'
 # Runaway counts request windows, not responses (#1584): two blocking reviews
 # both answering the FIRST request, with a second request that drew nothing,
@@ -565,6 +592,79 @@ stop_check "tiebreak: settling one of two rebuttals leaves the stop standing" "$
 stop_check "tiebreak: a marker line per finding settles both" \
   "$(tb_stops "$IN" "$RB2" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(printf '%s\n%s' "$M100" "$(mark 101)")")" | arr)")" '.stops == []'
 
+# ---- Owner tiebreak on a runaway (#2534) --------------------------------------
+
+# matchline#581's shape: a request ceiling of 2, and each request drew a
+# blocking review. The last signal is the second response, at 01:10.
+rmark() { printf 'TIEBREAK_RUNAWAY_ACCEPTED=%s@%s' "${1:-$PR_URL}" "${2:-$HEAD_A}"; }
+# rw_stops <ledger-inputs> <comments-json> [rebuttals] [max] -> applied stops
+rw_stops() {
+  local l st marks
+  l=$(crl_ledger "$(printf '%s' "$1" | jq -c --argjson rb "${3:-[]}" '.rebuttals = $rb')" \
+    | jq -c --argjson m "${4:-10}" '.max_blocking_reviews = $m') || return 1
+  st=$(crl_human_stops "$l" "$HEAD_A" nathanjohnpayne "${4:-10}" 2) || return 1
+  marks=$(crl_owner_tiebreaks "$2" nathanjohnpayne "$PR_URL" "$HEAD_A") || return 1
+  crl_apply_owner_tiebreaks "$st" "$l" "$marks"
+}
+RM=$(rmark)
+RWC=$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$RM")" | arr)
+stop_check "runaway tiebreak: without a marker the runaway stands" "$(rw_stops "$IN2" '[]')" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+stop_check "runaway tiebreak: an owner runaway marker clears the runaway" "$(rw_stops "$IN2" "$RWC")" \
+  '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+stop_check "runaway tiebreak: a marker on a multi-line comment, with CRLF and indentation, is read" \
+  "$(rw_stops "$IN2" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(printf 'Both rounds found real bugs.\r\n  %s\r\n' "$RM")")" | arr)")" '.stops == []'
+stop_check "runaway tiebreak: the PR URL compares case-insensitively" \
+  "$(rw_stops "$IN2" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(rmark HTTPS://GITHUB.COM/O/R/pull/1)")" | arr)")" '.stops == []'
+
+rw_no_clear() { # <name> <comments-json>
+  stop_check "runaway tiebreak: $1 does not clear the runaway" "$(rw_stops "$IN2" "$2")" \
+    '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+}
+rw_no_clear "a marker by another account" "$(printf '%s\n' "$(cm 1 nathanpayne-claude 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$RM")" | arr)"
+rw_no_clear "an edited marker comment" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:05:00Z "$RM")" | arr)"
+rw_no_clear "a marker posted before the last request" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T00:30:00Z 2026-09-25T00:30:00Z "$RM")" | arr)"
+rw_no_clear "a marker posted after the last request but before its response" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T01:05:00Z 2026-09-25T01:05:00Z "$RM")" | arr)"
+rw_no_clear "a marker in the same second as the last response" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T01:10:00Z 2026-09-25T01:10:00Z "$RM")" | arr)"
+rw_no_clear "a marker for another head" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(rmark "$PR_URL" "$HEAD_B")")" | arr)"
+rw_no_clear "a marker for another PR" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(rmark https://github.com/o/r/pull/2)")" | arr)"
+rw_no_clear "a marker with a finding suffix" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$RM#100")" | arr)"
+rw_no_clear "a rebuttal marker" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(mark 100)")" | arr)"
+rw_no_clear "a marker quoted, in prose, or as a placeholder" "$(printf '%s\n' \
+  "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "> $RM")" \
+  "$(cm 2 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "see $RM for the rule")" \
+  "$(cm 3 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "TIEBREAK_RUNAWAY_ACCEPTED=<PR-URL>@<full-head-sha>")" | arr)"
+rw_no_clear "no comments" '[]'
+
+# A response group that gains a later signal moves the floor with it.
+L_RW=$(crl_ledger "$(printf '%s' "$IN2" | jq -c '.rebuttals = []')" | jq -c '.max_blocking_reviews = 10 | .responses[-1].last_at = "2026-09-25T03:30:00Z"')
+stop_check "runaway tiebreak: a marker older than a response's last signal leaves the runaway standing" \
+  "$(crl_apply_owner_tiebreaks "$(crl_human_stops "$L_RW" "$HEAD_A" nathanjohnpayne 10 2)" "$L_RW" "$(crl_owner_tiebreaks "$RWC" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+
+# A request posted after the runaway's last response moves the floor too.
+IN2_LATE=$(inputs "$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 2 2026-09-25T01:00:00Z)" "$(req 3 2026-09-25T02:00:00Z null false)" | arr)" "$BB" '[]' '[]' '[]')
+stop_check "runaway tiebreak: a marker older than a later request leaves the runaway standing" \
+  "$(rw_stops "$IN2_LATE" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T01:30:00Z 2026-09-25T01:30:00Z "$RM")" | arr)")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+stop_check "runaway tiebreak: a marker newer than that request clears the runaway" "$(rw_stops "$IN2_LATE" "$RWC")" \
+  '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+
+# The runaway marker settles nothing else: a dispute or a spent blocking
+# budget on the same head still stands.
+stop_check "runaway tiebreak: a runaway marker leaves an untested rebuttal standing" \
+  "$(tb_stops "$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]')" "$RB" "$RWC")" \
+  '.stops == ["untested-rebuttal"] and (.owner_tiebreaks | length) == 0'
+RB_RW=$(rebut 110 b.sh 2026-09-25T01:30:00Z | arr)
+stop_check "runaway tiebreak: with a runaway and an untested rebuttal, the marker clears only the runaway" \
+  "$(rw_stops "$IN2" "$RWC" "$RB_RW")" \
+  '.stops == ["untested-rebuttal"] and .owner_tiebreaks == [{kind: "runaway"}] and (.untested_rebuttals | map(.finding)) == [110]'
+stop_check "runaway tiebreak: a rebuttal marker and a runaway marker together clear both" \
+  "$(rw_stops "$IN2" "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:00Z 2026-09-25T03:00:00Z "$(printf '%s\n%s' "$RM" "$(mark 110)")")" | arr)" "$RB_RW")" \
+  '.stops == [] and (.owner_tiebreaks | map(.kind) | sort) == ["runaway", "untested"]'
+stop_check "runaway tiebreak: a runaway marker leaves blocking-budget standing" \
+  "$(rw_stops "$IN2" "$RWC" '[]' 2)" '.stops == ["blocking-budget"] and (.owner_tiebreaks | length) == 0'
+
 # The barrier's own reader (p4b_codex_human_stops) applies markers it reads from
 # the PR's comments, and leaves the stop standing when it cannot read them.
 TB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ledger-tiebreak.XXXXXX")
@@ -592,6 +692,16 @@ stop_check "barrier: an owner marker on the PR clears it, and the result records
   '.state == "clear" and .stops == [] and .owner_tiebreaks == [{kind: "untested", finding: 100}]'
 stop_check "barrier: unreadable comments leave the stop standing" "$(barrier_stops FAIL)" \
   '.state == "stop" and .stops == ["untested-rebuttal"]'
+# The barrier reads markers when a runaway is the only stop, too (#2534): the
+# stub budget's ceiling is 2, as on matchline.
+crl_ledger "$(printf '%s' "$IN2" | jq -c '.rebuttals = []')" \
+  | jq -c '.max_blocking_reviews = 10 | .policy_fingerprint = "1-2"' >"$TB_DIR/ledger.json"
+stop_check "barrier: no marker leaves the runaway standing" "$(barrier_stops '[]')" \
+  '.state == "stop" and .stops == ["runaway"]'
+stop_check "barrier: an owner runaway marker on the PR clears it, and the result records the tiebreak" "$(barrier_stops "$RWC")" \
+  '.state == "clear" and .stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+stop_check "barrier: unreadable comments leave the runaway standing" "$(barrier_stops FAIL)" \
+  '.state == "stop" and .stops == ["runaway"]'
 
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
@@ -688,6 +798,20 @@ if ! grep -q '^repos/o/r/issues/7/reactions$' "$D/calls" && ! grep -qvE '^repos/
   pass "CLI: reads only the PR's own records"
 else
   fail "CLI read an unexpected endpoint: $(cat "$D/calls")"
+fi
+
+# A CodeRabbit failover request is marked ceiling_exempt from its marker (#2534).
+D="$WORK/failover"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
+        {id: 102, user: {login: "nathanjohnpayne"}, created_at: "2026-09-25T00:00:04Z", updated_at: "2026-09-25T00:00:04Z",
+         body: "<!-- mergepath-codex-failover:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=101 -->"},
+        {id: 103, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T01:00:00Z"}]' >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '[.requests[] | select(.counted) | {id, ceiling_exempt}]
+     == [{id: 101, ceiling_exempt: true}, {id: 103, ceiling_exempt: false}]' "$D/out" >/dev/null; then
+  pass "CLI: a failover-marked request is ceiling_exempt, a deliberate one is not"
+else
+  fail "CLI failover case: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
 
 # --expect-head (#1560 slice 3): the requester's blocking-review count must be
