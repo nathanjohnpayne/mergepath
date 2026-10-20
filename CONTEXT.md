@@ -160,7 +160,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Verdict (per-finding)**: The ledger-recorded judgment on a single finding — fixed, or false-positive with a reason. _Avoid_: confusing with Codex's verdict comment (previous cluster).
 
-**Resolve class**: The disposition of record stamped on a review thread at resolve time and read by the rollup and sweep — `addressed-elsewhere`, `rebuttal-recorded`, `deferred-to-followup`, `verified-propagation`, `nitpick-noted`, plus the routing-only `canonical-coverage` and `templated-render`. The tag must state the truth: deferring a finding you actually fixed mis-records it.
+**Resolve class**: The disposition of record stamped on a review thread at resolve time and read by the rollup and sweep — `addressed-elsewhere`, `rebuttal-recorded`, `deferred-to-followup`, `verified-propagation`, `nitpick-noted`, plus the routing-only `canonical-coverage` and `templated-render`. `deferred-to-followup` is canonical because the resolver, rollup and feedback ledger already use it; `deferred-to-follow-up` remains a permanent read/input alias for historical tags and accounting records (#1677). New writes use the canonical spelling without rewriting history. The tag must state the truth: deferring a finding you actually fixed mis-records it.
 
 **Routing class**: A resolve class that says where a durable fix belongs (the canonical source, or the template) rather than that one happened; never counted as actioned on its own.
 

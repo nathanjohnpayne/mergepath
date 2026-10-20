@@ -474,7 +474,7 @@ test_marker_absence_preserves_supplied_tier() {
 
 test_deferred_aliases_and_superseding_rows() {
   local alias dir rc rc2 rc3 rc4
-  for alias in deferred tracked split deferred-to-followup; do
+  for alias in deferred tracked split deferred-to-followup deferred-to-follow-up; do
     dir=$(make_case "deferred-$alias")
     jq -n --arg b "$MINOR_BODY" '[{path:"x",line:1,comment_id:9801,body:$b}]' > "$dir/findings.json"
     make_threads_fixture '[{isResolved: true, comment_ids: [9801]}]' > "$dir/threads.json"
@@ -500,6 +500,31 @@ test_deferred_aliases_and_superseding_rows() {
   done
 }
 
+# #1677: a persisted legacy spelling is already the same disposition. Both
+# input spellings are no-ops; a later fixed verdict appends, never rewrites.
+test_persisted_deferral_alias_idempotence() {
+  local dir rc before alias
+  dir=$(make_case "persisted-deferral-alias")
+  jq -n --arg b "$MINOR_BODY" '[{path:"x",line:1,comment_id:9802,body:$b}]' > "$dir/findings.json"
+  mkdir -p "$(dirname "$(ledger_file "$dir")")"
+  printf '%s\n' '{"repo":"owner/repo","comment_id":9802,"verdict":"deferred","disposition":"deferred-to-follow-up","recorded_at":"2026-01-01T00:00:00Z"}' > "$(ledger_file "$dir")"
+  before=$(cat "$(ledger_file "$dir")")
+  for alias in deferred-to-followup deferred-to-follow-up; do
+    rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict "9802=$alias")
+    if [ "$rc" = 0 ] && [ "$(cat "$(ledger_file "$dir")")" = "$before" ] \
+      && jq -e '.skipped[0].why == "already-recorded"' "$dir/out.json" >/dev/null; then
+      pass "persisted deferral alias + $alias is an unchanged no-op"
+    else fail "persisted deferral alias + $alias rewrote or appended history (rc=$rc)"; fi
+  done
+  rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 9802=fixed)
+  if [ "$rc" = 0 ] && [ "$(ledger_lines "$dir")" = 2 ] \
+    && [ "$(head -1 "$(ledger_file "$dir")")" = "$before" ] \
+    && jq -se '.[1].disposition == "fixed" and .[1].superseded_prior' "$(ledger_file "$dir")" >/dev/null; then
+    pass "a later fix supersedes the alias without rewriting its persisted row"
+  else fail "later fix did not supersede persisted alias (rc=$rc)"; fi
+}
+
+test_persisted_deferral_alias_idempotence
 test_deferred_aliases_and_superseding_rows
 test_tier_extraction_error_refuses_supplied_fallback
 test_marker_absence_preserves_supplied_tier

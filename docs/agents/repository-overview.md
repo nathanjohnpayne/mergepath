@@ -44,7 +44,7 @@ The requester reads its moving-head check override as YAML, preserving absent, e
 
 Provider-block diagnostics use the latest exact author request and same-second comment ordering rather than reusing an earlier account refusal. Requester and checker share that filter and retain newer Running/unknown holds; the contract and native cases are in `specs/codex_request_evidence.md` (#2337).
 
-Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`. Targeted bot-thread resolution accepts an explicit disposition and requires its marker before resolving exactly the selected thread (#2196).
+Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. Accounting, recorder, resolver and rollup readers permanently normalize the historical `deferred-to-follow-up` alias in memory; new disposition writes use `deferred-to-followup`, preserving historical data and deferral evidence (#1677). The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`. Targeted bot-thread resolution accepts an explicit disposition and requires its marker before resolving exactly the selected thread (#2196).
 
 CodeRabbit's exact outside-diff section headings do not contribute finding severity; nested findings keep their own badges and configured policy. The bounded shared-classifier contract and regression coverage are documented in `specs/coderabbit_review_sensing.md` and `specs/review_feedback_accounting.md` (#1407).
 
