@@ -251,6 +251,19 @@ else
   fail "--print: rc=$rc"
 fi
 
+# A command containing the renderer's fence delimiter is refused before any
+# GitHub read or write, keeping the handback body structurally valid.
+: >"$WORKDIR/gh.log"
+set +e
+run -- --blocked graphql --next 'echo ```' >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q -- '--next must not contain triple backticks' "$WORKDIR/err" \
+   && [ ! -s "$WORKDIR/gh.log" ]; then
+  pass "--next containing triple backticks is refused before posting or reading GitHub state"
+else
+  fail "--next fence refusal: rc=$rc err=$(cat "$WORKDIR/err") calls=$(cat "$WORKDIR/gh.log")"
+fi
+
 # --- the CI lane that resumes a graphql handback (#1057 G) ---------------------
 LANE="$ROOT/.github/workflows/thread-resolution-lane.yml"
 # The lane is read with mikefarah/yq v4 syntax. Another program named yq (the
@@ -396,6 +409,19 @@ drun() { # <env...> -- <args...>
     DISPATCH_LANE_POLL_INTERVAL=1 ${envs[@]+"${envs[@]}"} \
     "$DFIX/scripts/dispatch-thread-resolution-lane.sh" 12 --repo o/r "$@"
 }
+assert_invalid_dispatch() { # <label> <diagnostic needle> <drun arguments...>
+  local label="$1" needle="$2" rc calls error
+  shift 2
+  drun "$@" >/dev/null 2>"$DFIX/err"; rc=$?
+  calls="$(cat "$DFIX/d.log")"
+  error="$(cat "$DFIX/err")"
+  if [ "$rc" -eq 1 ] && printf '%s' "$error" | grep -q -e "$needle" \
+     && ! printf '%s' "$calls" | grep -q $'\t-X\tPOST'; then
+    pass "$label is rejected as a whole value before dispatch"
+  else
+    fail "$label: rc=$rc err=$error calls=$calls"
+  fi
+}
 set +e
 drun D_APPEAR_AT=3 -- >/dev/null 2>"$DFIX/err"; rc=$?
 set -e
@@ -411,6 +437,24 @@ else
 fi
 set +e
 drun -- --appear-timeout 2 >/dev/null 2>"$DFIX/err"; r_none=$?
+drun -- --appear-timeout 08 >/dev/null 2>"$DFIX/err"; r_appear_zero=$?
+appear_calls="$(cat "$DFIX/d.log")"
+appear_err="$(cat "$DFIX/err")"
+drun D_APPEAR_AT=1 -- --watch-timeout 010 >/dev/null 2>"$DFIX/err"; r_watch_zero=$?
+watch_calls="$(cat "$DFIX/d.log")"
+watch_err="$(cat "$DFIX/err")"
+drun D_APPEAR_AT=1 DISPATCH_LANE_POLL_INTERVAL=abc -- --no-wait >/dev/null 2>"$DFIX/err"; r_poll_text=$?
+poll_text_calls="$(cat "$DFIX/d.log")"
+poll_text_err="$(cat "$DFIX/err")"
+drun D_APPEAR_AT=1 DISPATCH_LANE_POLL_INTERVAL=0 -- --no-wait >/dev/null 2>"$DFIX/err"; r_poll_zero=$?
+poll_zero_calls="$(cat "$DFIX/d.log")"
+poll_zero_err="$(cat "$DFIX/err")"
+assert_invalid_dispatch "--appear-timeout with embedded newline" "--appear-timeout" D_APPEAR_AT=1 -- --appear-timeout $'abc\n5' --no-wait
+assert_invalid_dispatch "--appear-timeout with trailing newline" "--appear-timeout" D_APPEAR_AT=1 -- --appear-timeout $'5\n' --no-wait
+assert_invalid_dispatch "--watch-timeout with embedded newline" "--watch-timeout" D_APPEAR_AT=1 -- --watch-timeout $'abc\n5' --no-wait
+assert_invalid_dispatch "--watch-timeout with trailing newline" "--watch-timeout" D_APPEAR_AT=1 -- --watch-timeout $'5\n' --no-wait
+assert_invalid_dispatch "DISPATCH_LANE_POLL_INTERVAL with embedded newline" "DISPATCH_LANE_POLL_INTERVAL" D_APPEAR_AT=1 $'DISPATCH_LANE_POLL_INTERVAL=abc\n5' -- --no-wait
+assert_invalid_dispatch "DISPATCH_LANE_POLL_INTERVAL with trailing newline" "DISPATCH_LANE_POLL_INTERVAL" D_APPEAR_AT=1 $'DISPATCH_LANE_POLL_INTERVAL=5\n' -- --no-wait
 drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
 drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
 drun D_APPEAR_AT=1 D_RUN_HANGS=1 -- --watch-timeout 2 >/dev/null 2>/dev/null; r_hang=$?
@@ -422,10 +466,14 @@ t_slow=$(( SECONDS - t0 ))
 out="$(drun D_APPEAR_AT=1 -- --no-wait 2>/dev/null)"; r_nowait=$?
 set -e
 if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] && [ "$r_slow" -eq 9 ] && [ "$t_slow" -le 6 ] \
+   && [ "$r_appear_zero" -eq 1 ] && printf '%s' "$appear_err" | grep -q -e '--appear-timeout' && ! printf '%s' "$appear_calls" | grep -q $'\t-X\tPOST' \
+   && [ "$r_watch_zero" -eq 1 ] && printf '%s' "$watch_err" | grep -q -e '--watch-timeout' && ! printf '%s' "$watch_calls" | grep -q $'\t-X\tPOST' \
+   && [ "$r_poll_text" -eq 1 ] && printf '%s' "$poll_text_err" | grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' && ! printf '%s' "$poll_text_calls" | grep -q $'\t-X\tPOST' \
+   && [ "$r_poll_zero" -eq 1 ] && printf '%s' "$poll_zero_err" | grep -q -e 'DISPATCH_LANE_POLL_INTERVAL' && ! printf '%s' "$poll_zero_calls" | grep -q $'\t-X\tPOST' \
    && [ "$r_fail" -eq 8 ] && [ "$r_refused" -eq 4 ] && [ "$r_nowait" -eq 0 ] && [ "$out" = "222" ]; then
-  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; never completes -> 9 (a wall-clock deadline that counts request time); dispatch refused -> 4; --no-wait prints the run id"
+  pass "dispatch validates positive decimal timeouts and poll intervals before dispatch; own run never listed -> 6; run failed -> 8; never completes -> 9; dispatch refused -> 4; --no-wait prints the run id"
 else
-  fail "dispatch exits: none=$r_none hang=$r_hang slow=$r_slow/${t_slow}s fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
+  fail "dispatch exits: invalid appear=$r_appear_zero watch=$r_watch_zero poll_text=$r_poll_text poll_zero=$r_poll_zero; none=$r_none hang=$r_hang slow=$r_slow/${t_slow}s fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
 fi
 
 # Nothing sent is not GitHub refusing: a missing author token is named as
