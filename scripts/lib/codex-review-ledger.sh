@@ -374,7 +374,11 @@ crl_human_stops() {
                              and (.ceiling_exempt == null or (.ceiling_exempt | type) == \"boolean\"))
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
-                              and (.blocking_unlocated | type) == \"boolean\")
+                              and (.blocking_unlocated | type) == \"boolean\"
+                              # last_at feeds the runaway marker's floor (#2561): a
+                              # non-string sorts below every instant and would drop
+                              # the response out of it, so it fails like first_at.
+                              and ((.last_at | type) == \"string\" or .last_at == null))
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))) | not
     then error(\"ledger\") else . end
@@ -498,11 +502,24 @@ crl_apply_owner_tiebreaks() {
       any($tb[]; .kind == "rebuttal" and (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
       ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
+    # Instants compare as whole seconds, never as text (#2561): ISO strings
+    # collate "...00Z" after "...00.5Z", and any non-instant string sorts
+    # above every real one, so a lexicographic test let a same-second,
+    # fractional or malformed timestamp release the stop. GitHub comment
+    # timestamps carry no fraction, so "strictly later second" is the finest
+    # order the evidence supports; a malformed instant on either side holds.
+    def seconds:
+      if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
+      then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
+      else null end;
+    def later_second($at; $floor):
+      ($at | seconds) as $a | ($floor | seconds) as $f
+      | ($a | type) == "number" and ($f | type) == "number" and $a > $f;
     # The runaway formed with the latest request or response, so the marker
     # must postdate every one of them.
     ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ] | max // "") as $runaway_floor
     | (($stops.stops | index("runaway")) != null
-       and any($tb[]; .kind == "runaway" and .at > $runaway_floor)) as $runaway
+       and any($tb[]; .kind == "runaway" and later_second(.at; $runaway_floor))) as $runaway
     | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements

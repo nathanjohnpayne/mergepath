@@ -665,6 +665,39 @@ stop_check "runaway tiebreak: a rebuttal marker and a runaway marker together cl
 stop_check "runaway tiebreak: a runaway marker leaves blocking-budget standing" \
   "$(rw_stops "$IN2" "$RWC" '[]' 2)" '.stops == ["blocking-budget"] and (.owner_tiebreaks | length) == 0'
 
+# Instants compare as whole seconds, never as text (#2561). ISO strings
+# collate "...00Z" after "...00.5Z", and a non-instant string sorts above
+# every real one, so a lexicographic test would release the stop on a
+# same-second, fractional or malformed timestamp. The ledger grammar accepts
+# a seconds fraction (#2528), so the floor can carry one.
+L_RW_FRAC=$(printf '%s' "$L_RW" | jq -c '.responses[-1].last_at = "2026-09-25T03:00:00.5Z"')
+ST_RW_FRAC=$(crl_human_stops "$L_RW_FRAC" "$HEAD_A" nathanjohnpayne 10 2)
+rw_frac() { crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$L_RW_FRAC" "$(crl_owner_tiebreaks "$1" nathanjohnpayne "$PR_URL" "$HEAD_A")"; }
+stop_check "runaway tiebreak: a same-second marker does not outrank a fractional-second floor" "$(rw_frac "$RWC")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+stop_check "runaway tiebreak: a next-second marker postdates a fractional-second floor" \
+  "$(rw_frac "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T03:00:01Z 2026-09-25T03:00:01Z "$RM")" | arr)")" \
+  '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+rw_no_clear "a marker whose comment timestamp is not an instant" "$(printf '%s\n' "$(cm 1 nathanjohnpayne not-a-time not-a-time "$RM")" | arr)"
+rw_no_clear "a marker whose comment timestamp sorts above every instant" "$(printf '%s\n' "$(cm 1 nathanjohnpayne zzzz-99-99T99:99:99Z zzzz-99-99T99:99:99Z "$RM")" | arr)"
+stop_check "runaway tiebreak: a floor that is not an instant leaves the runaway standing" \
+  "$(crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$(printf '%s' "$L_RW_FRAC" | jq -c '.responses[-1].last_at = "later"')" "$(crl_owner_tiebreaks "$RWC" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+# last_at feeds the floor, so a non-string value fails the ledger rather than
+# dropping that response out of the floor; an absent last_at still falls back
+# to first_at (L_RW's last response: last_at 03:30, first_at 01:10).
+for _bad_last in '.responses[-1].last_at = 5' '.responses[-1].last_at = true' '.responses[-1].last_at = {}'; do
+  if crl_human_stops "$(printf '%s' "$L_RW" | jq -c "$_bad_last")" "$HEAD_A" nathanjohnpayne 10 2 >/dev/null; then
+    fail "runaway tiebreak: a response with a malformed last_at ($_bad_last) was accepted"
+  else
+    pass "runaway tiebreak: a response with a malformed last_at ($_bad_last) fails the ledger"
+  fi
+done
+L_RW_NOLAST=$(printf '%s' "$L_RW" | jq -c 'del(.responses[].last_at)')
+stop_check "runaway tiebreak: a response without last_at falls back to first_at for the floor" \
+  "$(crl_apply_owner_tiebreaks "$(crl_human_stops "$L_RW_NOLAST" "$HEAD_A" nathanjohnpayne 10 2)" "$L_RW_NOLAST" "$(crl_owner_tiebreaks "$RWC" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+
 # The barrier's own reader (p4b_codex_human_stops) applies markers it reads from
 # the PR's comments, and leaves the stop standing when it cannot read them.
 TB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ledger-tiebreak.XXXXXX")
