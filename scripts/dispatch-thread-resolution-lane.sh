@@ -58,6 +58,12 @@ WAIT=true
 
 die() { echo "dispatch-thread-resolution-lane: $2" >&2; exit "$1"; }
 
+is_positive_decimal() { # <value>: whole string, 1-7 digits, no leading zero
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 7 ] || return 1
+  case "$1" in [1-9]*) return 0 ;; *) return 1 ;; esac
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo|--appear-timeout|--watch-timeout)
@@ -80,8 +86,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 printf '%s' "$PR" | grep -Eq '^[0-9]+$' || die 1 "PR number required (got '${PR}')"
-printf '%s' "$APPEAR_TIMEOUT" | grep -Eq '^[0-9]+$' || die 1 "--appear-timeout must be a number of seconds"
-printf '%s' "$WATCH_TIMEOUT" | grep -Eq '^[0-9]+$' || die 1 "--watch-timeout must be a number of seconds"
+is_positive_decimal "$APPEAR_TIMEOUT" || die 1 "--appear-timeout must be a positive decimal integer (1-7 digits, no leading zeroes)"
+is_positive_decimal "$WATCH_TIMEOUT" || die 1 "--watch-timeout must be a positive decimal integer (1-7 digits, no leading zeroes)"
+is_positive_decimal "$POLL_INTERVAL" || die 1 "DISPATCH_LANE_POLL_INTERVAL must be a positive decimal integer (1-7 digits, no leading zeroes)"
 command -v gh >/dev/null 2>&1 || die 1 "gh is required"
 
 if [ -z "$REPO" ]; then

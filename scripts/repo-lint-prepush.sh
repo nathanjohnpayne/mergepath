@@ -40,7 +40,8 @@
 #                and residue legs of `deep_safety`, and the complete consumer
 #                replay. Only with MERGEPATH_PREPUSH_DEEP=1 (or --deep);
 #                otherwise the selection is printed and CI runs them.
-# Deliberately not run locally: the workflow's setup prelude (checkout,
+# Deliberately not run locally: non-check setup steps, including the
+# workflow's ref-fetch setup and its prelude (checkout,
 # chmod, pip and yq provisioning; this script finds python3/yq itself), the
 # `check_git_identity_hygiene --snapshot` / `--verify` per-runner bookends,
 # and the deep jobs' closing `check_git_identity_hygiene` (the plain call
@@ -382,7 +383,7 @@ PLAN_JSON=$(jq -c \
   | need("deep_safety") as $safety
   | need("deep_consumer_replay") as $rep
   | need("deep_self_tests") as $st
-  | [ ($fast.steps[] | select(.if != null)
+  | [ ($fast.steps[] | select(.if != null and (.name | startswith("check_")))
         | if (.if | test("^matrix\\.shard == [0-9]+$")) then
             wrapper as $w
             | {lane: (if $w == null or ($graph | index($w)) == null then "live"

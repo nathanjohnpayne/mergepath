@@ -140,13 +140,16 @@
 #     "findings": [
 #       { "path": "...", "line": N, "priority": "P0|P1|P2|P3",
 #         "comment_id": N, "body": "<full finding body>",
-#         "blocking": true|false }
+#         "blocking": true|false, "discretionary": true|false }
 #     ],
 #     # `blocking` (#577) is derived from the resolved feedback_policy
 #     # required-tier set (scripts/lib/feedback-policy-helpers.sh
 #     # resolve_required_tiers) — true iff this finding's tier is one the
 #     # codex-p1-gate would block merge on. Absent feedback_policy block ⇒
 #     # only P1 is blocking. An unmarked (P?) finding is never blocking.
+#     # `discretionary` (#1673) independently uses
+#     # resolve_tiers_by_disposition discretionary; absent policy defaults to
+#     # P2/P3/nitpick. An unmarked finding is neither. The new flag is report-only.
 #     "reaction": null | {
 #       "content": "+1",
 #       "created_at": "<iso-8601>",
@@ -584,6 +587,7 @@ __cra_retire_base_cfg() { # <new-path-or-empty>
 }
 trap '__cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
+DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # shellcheck source=lib/feedback-policy-helpers.sh
   . "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh"
@@ -598,6 +602,12 @@ if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # JSON array of required tiers (lowercase p0..p3|nitpick) for jq
   # membership tests. Empty input ⇒ [].
   REQUIRED_TIERS_JSON=$(printf '%s\n' "$__REQUIRED_TIERS" \
+    | jq -R . | jq -s 'map(select(. != ""))')
+  # Disposition defaults differ from the legacy gate set: P0 is not
+  # discretionary merely because an absent policy blocks only P1 (#1673).
+  # Keep this advisory decoration from changing the requester's exits.
+  __DISCRETIONARY_TIERS=$(resolve_tiers_by_disposition discretionary "$CONFIG" || true)
+  DISCRETIONARY_TIERS_JSON=$(printf '%s\n' "$__DISCRETIONARY_TIERS" \
     | jq -R . | jq -s 'map(select(. != ""))')
 fi
 
@@ -1554,7 +1564,8 @@ scan_codex_state() {
     findings=$(echo "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
       --argjson review_id "$latest_review_id" \
-      --argjson required "$REQUIRED_TIERS_JSON" '
+      --argjson required "$REQUIRED_TIERS_JSON" \
+      --argjson discretionary "$DISCRETIONARY_TIERS_JSON" '
       [ .[]
         | select(.user.login == $bot)
         | select(.pull_request_review_id == $review_id)
@@ -1567,7 +1578,8 @@ scan_codex_state() {
             # normalized tier (p0..p3) against $required (from
             # resolve_required_tiers) so the surfaced flag matches exactly
             # what the codex-p1-gate enforces at merge time.
-            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) )
+            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) ),
+            discretionary: ( $n != null and ( ("p" + $n) as $t | $discretionary | index($t) != null ) )
           }
       ]
     ')

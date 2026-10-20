@@ -703,8 +703,9 @@ jobs:
       - name: check_no_token_in_output
         if: matrix.shard == 4
         # Canonical rule, oracle, safety and exemption contracts live in
-        # scripts/ci/token_output_gate.py. This wire runs that file's self-test
-        # and repository scan; ubuntu-latest supplies its Python and bash.
+        # scripts/ci/token_output_gate.py. This fast-lane wire always runs the
+        # repository scan (--scan); deep safety runs the oracle self-test
+        # (--self-test) on full scope or when this wrapper is selected.
         #
         # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
         # soft-pass when the check script is absent in this tree (a checkout
@@ -756,6 +757,70 @@ jobs:
       # must share one Dependabot group, listed before any group that would split
       # them, or their coupled majors open as separate PRs that each fail npm ci.
       # Needs the PyYAML provisioned by install_python_ci_dependencies above.
+      - name: fetch_dependabot_target_refs
+        if: matrix.shard == 1
+        timeout-minutes: 3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, pathlib, runpy, subprocess, sys, time
+
+          checker = pathlib.Path('scripts/ci/dependabot_coupled_groups.py')
+          if not checker.is_file():
+              if pathlib.Path('scripts/sync-to-downstream.sh').is_file():
+                  sys.exit('missing Dependabot coupled-family checker on the hub')
+              print('Dependabot target refs: skipped (consumer kit absent)')
+              sys.exit(0)
+          config_path = pathlib.Path('.github/dependabot.yml')
+          if not config_path.is_file():
+              print('Dependabot target refs: no configuration')
+              sys.exit(0)
+          deadline = time.monotonic() + 120
+          def git(*args, env=None):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  raise TimeoutError('target-ref allowance exhausted')
+              return subprocess.run(['git', *args], check=True, capture_output=True,
+                                    text=True, timeout=remaining, env=env)
+          try:
+              config, error = runpy.run_path(str(checker))['load_yaml'](str(config_path))
+              if error or not isinstance(config, dict):
+                  raise ValueError(error or 'configuration must be a mapping')
+              current = {os.environ.get('GITHUB_BASE_REF'), os.environ.get('GITHUB_REF_NAME')}
+              branches = sorted({entry['target-branch'] for entry in config.get('updates', [])
+                  if isinstance(entry, dict) and entry.get('package-ecosystem') == 'npm'
+                  and entry.get('open-pull-requests-limit') != 0
+                  and isinstance(entry.get('target-branch'), str) and entry['target-branch']
+                  and entry['target-branch'] not in current})
+              for branch in branches:
+                  git('check-ref-format', '--branch', branch)
+              if branches:
+                  token = os.environ.get('GITHUB_TOKEN', '')
+                  server = os.environ['GITHUB_SERVER_URL'].rstrip('/')
+                  repository = os.environ['GITHUB_REPOSITORY']
+                  if not token or not server.startswith('https://'):
+                      raise ValueError('read token or HTTPS GitHub server unavailable')
+                  env = {k: v for k, v in os.environ.items()
+                         if not k.startswith('GIT_TRACE') and k != 'GIT_CURL_VERBOSE'}
+                  auth = base64.b64encode(('x-access-token:' + token).encode()).decode()
+                  env.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_COUNT='3',
+                      GIT_CONFIG_KEY_0='credential.helper', GIT_CONFIG_VALUE_0='',
+                      GIT_CONFIG_KEY_1=f'http.{server}/.extraheader', GIT_CONFIG_VALUE_1='',
+                      GIT_CONFIG_KEY_2=f'http.{server}/.extraheader',
+                      GIT_CONFIG_VALUE_2='AUTHORIZATION: basic ' + auth)
+                  for branch in branches:
+                      print(f'Dependabot target refs: fetching refs/heads/{branch}', flush=True)
+                      git('fetch', '--no-tags', '--depth=1', '--', f'{server}/{repository}.git',
+                          f'+refs/heads/{branch}:refs/remotes/origin/{branch}', env=env)
+              print(f'Dependabot target refs: {len(branches)} alternate branch(es) ready')
+          except Exception as exc:
+              # Errors can carry transport credentials; report the failure
+              # class and the preceding ref diagnostic without raw stderr.
+              print(f'Dependabot target refs: failed ({type(exc).__name__}); no clearance', file=sys.stderr)
+              sys.exit(2)
+          PY
+
       - name: check_dependabot_coupled_groups
         if: matrix.shard == 1
         run: ./scripts/ci/check_dependabot_coupled_groups --check || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }

@@ -1,5 +1,7 @@
 # Repo-lint execution model
 
+The depth-one lint-fast checkout fetches only active npm Dependabot entries’ declared alternate target branches before the coupled-family check. It reuses the checker’s YAML loader, skips the current/base branch and disabled version updates, validates complete branch refs, and fetches each distinct target at depth one without tags into `refs/remotes/origin/`. All Git subprocesses share a 120-second allowance within the three-minute setup step; failed, invalid or unavailable targets fail the lane. Fetch authentication uses only the job’s read-scoped token in subprocess configuration, leaves `.git/config` unchanged and retains checkout `persist-credentials: false`. A full-history checkout would also supply refs but fetch unrelated history; targeted reads keep the required input and cost bounded. Native fixtures execute the workflow step against depth-one local remotes with default, alternate and unavailable target configurations (#2464).
+
 ## Purpose
 
 The `repo-lint` workflow preserves one stable required context named `lint` while avoiding duplicate work and keeping exhaustive regression nets off unrelated pull requests' critical path.

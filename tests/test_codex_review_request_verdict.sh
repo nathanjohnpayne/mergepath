@@ -298,6 +298,59 @@ else
   fi
 fi
 
+# #1673: execute the production policy setup and finding-filter shell block,
+# preserving its JSON shape while exercising independent dispositions.
+test_discretionary_finding_flags() (
+  local setup filter fixture got policy bad="" dir findings=""
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/codex-finding-tiers.XXXXXX")
+  trap 'rm -rf "$dir"' EXIT
+  setup=$(sed -n '/^REQUIRED_TIERS_JSON=/,/^# --- Phase 4a entry decision/{ /^# --- Phase 4a entry decision/d; p; }' "$SCRIPT")
+  filter=$(python3 - "$SCRIPT" <<'PY1673'
+from pathlib import Path
+import sys
+s = Path(sys.argv[1]).read_text()
+start = s.index('  if [ -n "$latest_review_id" ]')
+print(s[start:s.index('\n  # #1751:', start)])
+PY1673
+)
+  fixture=$(jq -nc --arg bot "$BOT" '
+    ["![P1 Badge] required", "**P2 discretionary", "![P2 Badge] also discretionary",
+     "![P0 Badge] urgent", "unmarked"] | to_entries
+    | map({id: (.key + 1), user: {login: $bot}, pull_request_review_id: 1,
+           path: "fixture.sh", line: (.key + 1), body: .value})')
+  __CODEX_REQ_LIBDIR="$ROOT/scripts"
+  # shellcheck disable=SC2034 # Inputs consumed by the extracted production block through eval.
+  BOT_LOGIN=$BOT latest_review_id=1 comments=$fixture
+  for policy in hub absent ignore all; do
+    CONFIG="$dir/policy.yml"
+    case "$policy" in
+      hub) printf 'feedback_policy:\n  mode: by-priority\n  priorities:\n    p0: required\n    p1: required\n    p2: discretionary\n    p3: discretionary\n    nitpick: discretionary\n' >"$CONFIG" ;;
+      absent) printf 'codex:\n  enabled: true\n' >"$CONFIG" ;;
+      ignore) printf 'feedback_policy:\n  mode: by-priority\n  priorities:\n    p1: required\n    p2: ignore\n' >"$CONFIG" ;;
+      all) printf 'feedback_policy:\n  mode: address-all\n' >"$CONFIG" ;;
+    esac
+    eval "$setup"
+    eval "$filter"
+    got=$(printf '%s' "$findings" | jq -c 'map([.blocking,.discretionary])')
+    case "$policy" in
+      hub) [ "$got" = '[[true,false],[false,true],[false,true],[true,false],[false,false]]' ] || bad="$bad hub=$got" ;;
+      absent) [ "$got" = '[[true,false],[false,true],[false,true],[false,false],[false,false]]' ] || bad="$bad absent=$got" ;;
+      ignore) [ "$got" = '[[true,false],[false,false],[false,false],[false,true],[false,false]]' ] || bad="$bad ignore=$got" ;;
+      all) [ "$got" = '[[true,false],[true,false],[true,false],[true,false],[false,false]]' ] || bad="$bad all=$got" ;;
+    esac
+    # Existing fields preserve their values and findings remain in order.
+    printf '%s' "$findings" | jq -e --argjson fixture "$fixture" '
+      map(del(.blocking,.discretionary,.priority) | .id = .comment_id | del(.comment_id))
+      == ($fixture | map(del(.user,.pull_request_review_id)))' >/dev/null || bad="$bad $policy-shape"
+  done
+  [ -z "$bad" ] || { printf '%s\n' "$bad" >&2; exit 1; }
+)
+if test_discretionary_finding_flags; then
+  pass "#1673: production finding flags use independent hub/default/ignore/address-all tier sets"
+else
+  fail "#1673: discretionary finding flags"
+fi
+
 # ── 10. Behavioral: fetch_api_array must not let `gh api`'s STDERR reach
 #       the `jq -s` slurp. `gh api` prints diagnostics on calls that
 #       succeed (deprecation notices, retry chatter), and the old

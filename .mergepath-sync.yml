@@ -1321,6 +1321,9 @@ paths:
   - path: tests/test_dependabot_coupled_groups.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/ci/"
+      - ".github/workflows/repo_lint.yml"
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
   # against a repo-local git identity override silently reattributing and
   # unsigning every commit made from the checkout (and from every worktree
@@ -1571,6 +1574,7 @@ paths:
     requires:
       - "scripts/codex-review-request.sh"   # #1550, asserts fetch_scan_array and scan_codex_state statuses
       - "scripts/lib/gh-retry-helpers.sh"   # #1550, sourced for the transient-read classifier cases
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1673, production disposition setup in finding fixtures
   # Write-token / keyring-fallback regression (#737): the `@codex review`
   # trigger must resolve a token from the gh keyring when the op-preflight
   # cache has lapsed, and fail loud (never silently no-op) when it cannot.
