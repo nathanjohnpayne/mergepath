@@ -412,6 +412,19 @@ if [ "${1:-}" = "pr" ] && { [ "${2:-}" = "create" ] || [ "${2:-}" = "new" ]; }; 
   exit "${GH_CREATE_PR_RC:-0}"
 fi
 
+# The duplicate-link check (#2562) lists open PRs: `gh pr list` without a
+# repository, `gh api --paginate --slurp repos/<repo>/pulls` with one.
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
+  [ -z "${GH_PR_LIST_RC:-}" ] || exit "$GH_PR_LIST_RC"
+  printf '%s\n' "${GH_PR_LIST_JSON:-[]}"
+  exit 0
+fi
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "--paginate" ]; then
+  [ -z "${GH_API_PULLS_RC:-}" ] || exit "$GH_API_PULLS_RC"
+  printf '%s\n' "${GH_API_PULLS_JSON:-[]}"
+  exit 0
+fi
+
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
   rc="${GH_VIEW_RC:-0}"
   if [ "$rc" -ne 0 ]; then exit "$rc"; fi
@@ -501,6 +514,66 @@ elif grep -q $'gh\tpr\tnew' "$WORKDIR/calls.log"; then
 else
   pass "pr new alias contract: invalid body blocked before write"
 fi
+
+# A second pull request linking an issue another open one already links is
+# refused before the write (#2562), unless GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK
+# names that pull request. Links are the shared rule's own-line keyword
+# forms; a prose mention, a different number and a cross-repository link are
+# not links here. An unreadable open-PR list refuses; an unlinked body never
+# reads it.
+DUP_BODY=$'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.\n\nCloses #12\n'
+# dup_case <name> <expected rc> <create must run: yes|no> <body> [--repo R] -- env assignments via caller
+dup_case() {
+  local name="$1" want_rc="$2" want_create="$3" body="$4"; shift 4
+  local rc=0 err
+  reset_log
+  set +e
+  err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_VIEW_AUTHOR="nathanjohnpayne" \
+    run_wrapper -- gh pr create --title "t" --body "$body" "$@" 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  DUP_ERR="$err"
+  if [ "$rc" -ne "$want_rc" ]; then
+    fail "duplicate link: $name: rc=$rc expected $want_rc ($err)"
+  elif [ "$want_create" = yes ] && ! grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+    fail "duplicate link: $name: create did not run"
+  elif [ "$want_create" = no ] && grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+    fail "duplicate link: $name: create ran"
+  else
+    pass "duplicate link: $name"
+  fi
+}
+GH_PR_LIST_JSON='[{"number":40,"body":"Authoring-Agent: claude\n\nCloses #12\n"},{"number":41,"body":"Refs #120"}]' \
+  dup_case "an open PR closing the same issue refuses the create" 7 no "$DUP_BODY"
+echo "$DUP_ERR" | grep -q '#40 links #12' || fail "duplicate link: refusal does not name the other PR and the issue: $DUP_ERR"
+GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+  dup_case "naming that PR in the override lets the create run" 0 yes "$DUP_BODY"
+GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=41 \
+  dup_case "an override naming another PR still refuses" 7 no "$DUP_BODY"
+GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"},{"number":43,"body":"Refs #12"}]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40,43 \
+  dup_case "an override naming every linking PR lets the create run" 0 yes "$DUP_BODY"
+GH_PR_LIST_JSON='[{"number":40,"body":"Part one.\r\n  refs #12\r\n"}]' \
+  dup_case "a Refs link on the other PR counts, case and CRLF included" 7 no "$DUP_BODY"
+GH_PR_LIST_JSON='[{"number":40,"body":"see #12 for context; fixes #120 too"}]' \
+  dup_case "a prose mention or another number is not a link" 0 yes "$DUP_BODY"
+GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' \
+  dup_case "a cross-repository link in the new body is not checked" 0 yes \
+  $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n\nCloses other/repo#12\n'
+GH_PR_LIST_JSON='[{"number":40,"body":"Closes #12"}]' \
+  dup_case "a Refs link in the new body is checked like Closes" 7 no \
+  $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n\nRefs #12\n'
+GH_PR_LIST_RC=1 dup_case "an unreadable open-PR list refuses rather than passes" 1 no "$DUP_BODY"
+echo "$DUP_ERR" | grep -q 'could not list open pull requests' || fail "duplicate link: unreadable-list refusal lacks its diagnostic: $DUP_ERR"
+GH_PR_LIST_RC=1 dup_case "a body with no link never reads the list" 0 yes \
+  $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n'
+grep -q $'gh\tpr\tlist' "$WORKDIR/calls.log" && fail "duplicate link: an unlinked body listed open PRs"
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
+  dup_case "with --repo the check reads the REST pulls list" 7 no "$DUP_BODY" --repo example/repo
+grep -q $'gh\tapi\t--paginate\t--slurp\trepos/example/repo/pulls?state=open&per_page=100' "$WORKDIR/calls.log" \
+  || fail "duplicate link: --repo form did not read repos/example/repo/pulls: $(cat "$WORKDIR/calls.log")"
+GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+  dup_case "with --repo=OWNER/REPO the override is honored" 0 yes "$DUP_BODY" --repo=example/repo
+GH_API_PULLS_RC=1 dup_case "with --repo an unreadable REST list refuses" 1 no "$DUP_BODY" --repo example/repo
 
 # Every prefix shape the pre-write guard delegates to this wrapper must still
 # enter the create-only validation path. Otherwise an invalid body reaches the
