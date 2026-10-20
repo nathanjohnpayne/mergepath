@@ -118,6 +118,14 @@ fi
 [ -r "$VALIDATE" ] || die "PR-body validator not found at $VALIDATE; refusing to edit a body it cannot check" 2
 [ -x "$GH_AS_AUTHOR" ] || die "author wrapper not executable at $GH_AS_AUTHOR" 2
 
+# Missing real parser dependencies can return the same rc1 as an invalid body.
+# First require a known-valid, policy-independent heading to pass the selected
+# validator, before the PR snapshot and the four non-introduction comparisons.
+VALIDATOR_PREREQUISITE_RC=0
+printf '## Self-Review\n' | bash "$VALIDATE" --self-review-only >/dev/null 2>&1 || VALIDATOR_PREREQUISITE_RC=$?
+[ "$VALIDATOR_PREREQUISITE_RC" -eq 0 ] \
+  || die "PR-body validation prerequisites could not run (validator exited $VALIDATOR_PREREQUISITE_RC); refusing to edit a body it cannot check" 2
+
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
   || die "could not read $REPO#$PR_NUMBER" 2
 

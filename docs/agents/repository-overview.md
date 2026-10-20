@@ -28,6 +28,8 @@ The publisher structural fence prevents workflow and job concurrency for all thr
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
 
+The recovery nudge checks its selected validator with a known-valid Self-Review heading before comparing body results. Missing real parser dependencies are infrastructure refusals without an edit; legitimately invalid bodies retain the existing recovery behavior (#1257). The contract and native missing-dependency controls are in `specs/pr_body_contract.md` and `tests/test_pr_review_policy_nudge.sh`.
+
 Weekly PR audits bound API and verifier work by the remaining audit allowance, report incomplete discovery or coverage, and retain reports in the job summary and encoded logs before attempting issue publication.
 
 Relay provenance API reads recompute their remaining allowance after GitHub CLI capability probing and refuse an exhausted read before launching its subprocess. The existing timeout cap and cache behavior remain; the contract and fake-clock production controls live in `specs/review_feedback_accounting.md` and `tests/test_marker_provenance.py` (#2309). Capability detection retries one failed help probe within that same allowance; only successful help caches modern or legacy support. Two failed probes refuse the text read (#2310).
@@ -90,7 +92,7 @@ The Cockpit header shows nathanjohnpayne’s author GraphQL allowance first, obt
 
 The propagated publisher structural fence also prevents scheduled and manually dispatched runs of the native body/label gate. Its parsed-YAML contract is in `specs/required_check_publisher.md` and its mutation cases are in `tests/test_merge_clearance_gate.sh`.
 
-The required lint lane checks blocking-label parity between Label Gate and the shared shell predicate. The nudge's recovery guard also requires each producer's complete decoded condition to match its verified allowlist and refuses embedded newlines before matching; supported YAML scalar representations retain their decoded-expression behavior (#1258). The literal-source and recovery contracts, label mutations and condition regressions are documented in `specs/repo_lint_execution.md` and `tests/test_pr_review_policy_nudge.sh`.
+The required lint lane checks blocking-label parity between Label Gate and the shared shell predicate. The nudge's recovery guard also requires each producer's complete decoded condition to match its verified allowlist and refuses embedded newlines before matching; supported YAML scalar representations retain their decoded-expression behavior (#1258). Literal allowlist membership uses complete input without a producer pipeline, preserving recognized canonical conditions even with a large allowlist tail (#1257). The literal-source and recovery contracts, label mutations and condition regressions are documented in `specs/repo_lint_execution.md` and `tests/test_pr_review_policy_nudge.sh`.
 
 The recovery nudge checks context presence over the complete filtered name listing, preserving its no-edit refusal when both required contexts already reported even on large listings (#1259). Its runtime contract and large present/missing controls are in `specs/repo_lint_execution.md` and `tests/test_pr_review_policy_nudge.sh`.
 
