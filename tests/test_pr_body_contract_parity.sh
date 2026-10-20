@@ -1491,7 +1491,10 @@ async function audit(prs, options = {}) {
         if (expireAfterFirst && parsed.length === 1) now += 25 * 60 * 1000;
         if (opts.input.startsWith('timeout')) {
           now += opts.timeout;
-          throw Object.assign(new Error('parser timed out'), {code: 'ETIMEDOUT'});
+          // Exercise Node's actual emitted error code, not an assumed shape.
+          // Shorten only this child wait after checking the production options.
+          return require('node:child_process').execFileSync(process.execPath,
+            ['-e', 'setInterval(() => {}, 1000)'], {...opts, timeout: 100});
         }
         if (opts.input === 'ordinary') throw new Error('ordinary parser failure');
         return JSON.stringify({author: 'codex', authorCount: 1, hasSelfReview: true});
