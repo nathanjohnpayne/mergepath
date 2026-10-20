@@ -29,6 +29,16 @@ All agents author and push code under a single shared author identity:
 
 When GitHub creates a commit during a squash merge, `update-branch`, or a web-UI merge, its committer may be GitHub's `GitHub <noreply@github.com>` / `web-flow` identity. That server-side identity is not selectable by the agent and is not an agent identity; the author identity, reviewer identities, signing requirements, and merge rules above and below remain unchanged.
 
+To freshen a `BEHIND` PR under `required_status_checks.strict: true`, merge the base locally from the PR's worktree using the existing `nathanjohnpayne` identity and signing configuration:
+
+```bash
+git -C <pr-worktree> fetch origin
+git -C <pr-worktree> merge --no-edit origin/main
+git -C <pr-worktree> push origin HEAD
+```
+
+For routine freshening, do not use `gh pr update-branch` or `PUT .../pulls/<n>/update-branch`: those create a commit with GitHub's `web-flow` committer, inviting identity findings that cost a review round ([mergepath#1288](https://github.com/nathanjohnpayne/mergepath/issues/1288)). A local merge keeps both author and committer on `nathanjohnpayne` and signs the commit under the local signing configuration. When no local checkout is possible, `update-branch` remains allowed as an exception; the identity and merge rules remain unchanged.
+
 ### Reviewer Identities
 
 Each agent has a dedicated reviewer identity used exclusively for code review:
