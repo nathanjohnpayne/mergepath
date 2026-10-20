@@ -61,7 +61,7 @@ git -C "$FIX" config user.email "t@t"
 git -C "$FIX" config user.name "t"
 git -C "$FIX" config commit.gpgsign false
 '
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "PASS"; then
+if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
   pass "scoped -C writes: clean"
 else
   fail "scoped -C writes: rc=$RC out=$OUT"
@@ -73,8 +73,8 @@ cd "$FIX"
 git config user.email "test@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "unscoped git identity write" \
-  && printf '%s' "$OUT" | grep -q "tests/leaky.sh:3"; then
+  && grep -q "unscoped git identity write" <<<"$OUT" \
+  && grep -q "tests/leaky.sh:3" <<<"$OUT"; then
   pass "unscoped user.email in a shell script: caught, with path and line"
 else
   fail "unscoped user.email in a shell script: rc=$RC out=$OUT"
@@ -91,8 +91,8 @@ git config user.email "nathan@nathanjohnpayne.example"
 ```
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "REVIEW_POLICY.md:4" \
-  && printf '%s' "$OUT" | grep -q "REVIEW_POLICY.md:5"; then
+  && grep -q "REVIEW_POLICY.md:4" <<<"$OUT" \
+  && grep -q "REVIEW_POLICY.md:5" <<<"$OUT"; then
   pass "unscoped identity write in Markdown: caught (the real #777 writer)"
 else
   fail "unscoped identity write in Markdown: rc=$RC out=$OUT"
@@ -179,9 +179,9 @@ git config tag.gpgsign false
 git config user.signingkey ABC123
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/signing.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/signing.sh:3" \
-  && printf '%s' "$OUT" | grep -q "tests/signing.sh:4"; then
+  && grep -q "tests/signing.sh:2" <<<"$OUT" \
+  && grep -q "tests/signing.sh:3" <<<"$OUT" \
+  && grep -q "tests/signing.sh:4" <<<"$OUT"; then
   pass "unscoped gpgsign / signingkey writes: caught"
 else
   fail "unscoped gpgsign / signingkey writes: rc=$RC out=$OUT"
@@ -240,10 +240,10 @@ OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/leaky.sh:2" \
-  && printf '%s' "$OUT" | grep -q "REVIEW_POLICY.md:2" \
-  && ! printf '%s' "$OUT" | grep -q "test_git_identity_hygiene.sh:" \
-  && ! printf '%s' "$OUT" | grep -q "docs/projects/app/prds/app.md:"; then
+  && grep -q "tests/leaky.sh:2" <<<"$OUT" \
+  && grep -q "REVIEW_POLICY.md:2" <<<"$OUT" \
+  && ! grep -q "test_git_identity_hygiene.sh:" <<<"$OUT" \
+  && ! grep -q "docs/projects/app/prds/app.md:" <<<"$OUT"; then
   pass "markerless consumer: tracked script and policy writes caught; fixture and generated paths excluded"
 else
   fail "consumer tracked scan: rc=$RC out=$OUT"
@@ -261,8 +261,8 @@ OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "regression test suite skipped (consumer checkout" \
-  && ! printf '%s' "$OUT" | grep -q "Part C skipped"; then
+  && grep -q "regression test suite skipped (consumer checkout" <<<"$OUT" \
+  && ! grep -q "Part C skipped" <<<"$OUT"; then
   pass "markerless consumer: targeted fixture writes and explicit exemptions pass; hub suite remains skipped"
 else
   fail "clean consumer with frozen hub-suite fixture: rc=$RC out=$OUT"
@@ -277,7 +277,7 @@ set +e
 OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "regression test suite failed"; then
+if [ "$RC" = "1" ] && grep -q "regression test suite failed" <<<"$OUT"; then
   pass "hub marker: paired regression suite runs and failure is retained"
 else
   fail "hub suite gate: rc=$RC out=$OUT"
@@ -358,8 +358,8 @@ for STATE in absent clean writer; do
   set +e
   OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
   set -e
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/regular.md:1:' \
-    && ! printf '%s' "$OUT" | grep -q 'linked.*:2:'; then
+  if [ "$RC" = "1" ] && grep -q 'docs/regular.md:1:' <<<"$OUT" \
+    && ! grep -q 'linked.*:2:' <<<"$OUT"; then
     pass "regular tracked companion still scanned with $STATE symlink target"
   else
     fail "regular source beside $STATE symlink: rc=$RC out=$OUT"
@@ -500,8 +500,8 @@ git \
 config user.email "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "unscoped git identity write" \
-  && printf '%s' "$OUT" | grep -q "tests/split-verb.sh:2"; then
+  && grep -q "unscoped git identity write" <<<"$OUT" \
+  && grep -q "tests/split-verb.sh:2" <<<"$OUT"; then
   pass "continuation between git and config: caught"
 else
   fail "continuation between git and config: rc=$RC out=$OUT"
@@ -514,7 +514,7 @@ git config user.email \
   "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/split-value.sh:2"; then
+  && grep -q "tests/split-value.sh:2" <<<"$OUT"; then
   pass "continuation between key and value: caught"
 else
   fail "continuation between key and value: rc=$RC out=$OUT"
@@ -529,7 +529,7 @@ t con\
 fig user.email "joined@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/split-words.sh:2"; then
+  && grep -q "tests/split-words.sh:2" <<<"$OUT"; then
   pass "continuation inside command words: adjacency is preserved and write is caught"
 else
   fail "intra-word continuation hid identity write: rc=$RC out=$OUT"
@@ -572,8 +572,8 @@ git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container onl
 git config user.email "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/bleed-first.sh:3" \
-  && ! printf '%s' "$OUT" | grep -q "tests/bleed-first.sh:2"; then
+  && grep -q "tests/bleed-first.sh:3" <<<"$OUT" \
+  && ! grep -q "tests/bleed-first.sh:2" <<<"$OUT"; then
   pass "exempt line joined to an unscoped write: only the write is caught"
 else
   fail "marker bleeding forward across a join: rc=$RC out=$OUT"
@@ -586,8 +586,8 @@ git config user.email "leak@example.com" \
 git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/bleed-second.sh:2" \
-  && ! printf '%s' "$OUT" | grep -q "tests/bleed-second.sh:3"; then
+  && grep -q "tests/bleed-second.sh:2" <<<"$OUT" \
+  && ! grep -q "tests/bleed-second.sh:3" <<<"$OUT"; then
   pass "unscoped write joined to an exempt line: still caught"
 else
   fail "marker bleeding backward across a join: rc=$RC out=$OUT"
@@ -602,7 +602,7 @@ run_on_fixture "docs/bleed.md" '# Doc
     git config user.email "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "docs/bleed.md:4"; then
+  && grep -q "docs/bleed.md:4" <<<"$OUT"; then
   pass "Markdown hard break after an exempt example: next write still caught"
 else
   fail "marker bleeding across a Markdown hard break: rc=$RC out=$OUT"
@@ -616,8 +616,8 @@ git config user.email "leak1@example.com" \
 git config user.name "leak2"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/two-hits.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/two-hits.sh:3"; then
+  && grep -q "tests/two-hits.sh:2" <<<"$OUT" \
+  && grep -q "tests/two-hits.sh:3" <<<"$OUT"; then
   pass "two offending lines in one joined group: both reported"
 else
   fail "joined group reporting only its first offender: rc=$RC out=$OUT"
@@ -634,8 +634,8 @@ who=$(git config --get user.email); git config user.name "leak2"
 echo "$who"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/multi-command.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/multi-command.sh:3"; then
+  && grep -q "tests/multi-command.sh:2" <<<"$OUT" \
+  && grep -q "tests/multi-command.sh:3" <<<"$OUT"; then
   pass "suppressor on an earlier command in the line: write still caught"
 else
   fail "earlier-command suppressor masking a later write: rc=$RC out=$OUT"
@@ -667,9 +667,9 @@ git config user.signingkey /tmp/key.pub
 git config user.signingkey ./key.pub
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:3" \
-  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:4"; then
+  && grep -q "tests/path-value.sh:2" <<<"$OUT" \
+  && grep -q "tests/path-value.sh:3" <<<"$OUT" \
+  && grep -q "tests/path-value.sh:4" <<<"$OUT"; then
   pass "path-valued signingkey writes: caught"
 else
   fail "path-valued signingkey writes: rc=$RC out=$OUT"
@@ -742,7 +742,7 @@ run_on_fixture "docs/prose.md" '# Identity
 Use `git config --global user.email you@example.com`, never `git config user.email you@example.com`.
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "docs/prose.md:3"; then
+  && grep -q "docs/prose.md:3" <<<"$OUT"; then
   pass "sanctioned example beside a forbidden one in prose: still caught"
 else
   fail "prose --global example suppressing the write beside it: rc=$RC out=$OUT"
@@ -772,7 +772,7 @@ run_on_fixture "docs/describes-marker.md" '# Identity
 A deliberate exception carries `GIT_IDENTITY_SCOPE_EXEMPT: <reason>`, as in `git config user.email you@example.com`.
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "docs/describes-marker.md:3"; then
+  && grep -q "docs/describes-marker.md:3" <<<"$OUT"; then
   pass "marker cited inside a code span: does not exempt the line"
 else
   fail "prose mention of the marker exempting a live write: rc=$RC out=$OUT"
@@ -876,10 +876,10 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "repo-local git identity override" \
-  && printf '%s' "$OUT" | grep -q "local: user.name = nathanjohnpayne" \
-  && printf '%s' "$OUT" | grep -q "local: user.email = nathan@nathanjohnpayne.example" \
-  && printf '%s' "$OUT" | grep -q "local: commit.gpgsign = false"; then
+  && grep -q "repo-local git identity override" <<<"$OUT" \
+  && grep -q "local: user.name = nathanjohnpayne" <<<"$OUT" \
+  && grep -q "local: user.email = nathan@nathanjohnpayne.example" <<<"$OUT" \
+  && grep -q "local: commit.gpgsign = false" <<<"$OUT"; then
   pass "repo-local identity override: caught, naming every key"
 else
   fail "repo-local identity override: rc=$RC out=$OUT"
@@ -909,9 +909,9 @@ RC=$?
 set -e
 REMEDY_COUNT="$(printf '%s\n' "$OUT" | grep -cE '^[[:space:]]+git -C ' || true)"
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all user.signingkey" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all tag.gpgsign" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --worktree --unset-all user.email" \
+  && grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all user.signingkey" <<<"$OUT" \
+  && grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all tag.gpgsign" <<<"$OUT" \
+  && grep -qF -- "git -C \"$SIGREPO_REAL\" config --worktree --unset-all user.email" <<<"$OUT" \
   && [ "$REMEDY_COUNT" = "3" ]; then
   pass "remediation: one unset command per offender, in its own scope"
 else
@@ -952,7 +952,7 @@ OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$DORMANT_WT_REPO" bash "$CHECK" 2>&1)"
 RC_AFTER=$?
 set -e
 if [ -z "$DORMANT_EFFECTIVE" ] && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "dormant worktree" \
+  && grep -q "dormant worktree" <<<"$OUT" \
   && [ -n "$REMEDY" ] && [ "$RC_AFTER" = "0" ]; then
   pass "disabled worktreeConfig: dormant config.worktree identity is caught and removable"
 else
@@ -1007,8 +1007,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$EMPTYREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = (set to the empty string)" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$EMPTYREPO_REAL\" config --local --unset-all user.email"; then
+  && grep -q "local: user.email = (set to the empty string)" <<<"$OUT" \
+  && grep -qF -- "git -C \"$EMPTYREPO_REAL\" config --local --unset-all user.email" <<<"$OUT"; then
   pass "empty-string local identity value: caught as an override"
 else
   fail "empty-string local identity value: rc=$RC out=$OUT"
@@ -1032,8 +1032,8 @@ RC=$?
 set -e
 if [ "$EFFECTIVE" = "included@example.com" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = included@example.com" \
-  && printf '%s' "$OUT" | grep -q "via include:"; then
+  && grep -q "local: user.email = included@example.com" <<<"$OUT" \
+  && grep -q "via include:" <<<"$OUT"; then
   pass "identity supplied by an include.path: caught, with its origin named"
 else
   fail "include.path identity: effective='$EFFECTIVE' rc=$RC out=$OUT"
@@ -1077,8 +1077,8 @@ RC=$?
 set -e
 if [ -z "$ACTIVE" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = release@example.com" \
-  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  && grep -q "local: user.email = release@example.com" <<<"$OUT" \
+  && grep -q "via inactive include:" <<<"$OUT"; then
   pass "identity behind an inactive includeIf: caught while its condition is off"
 else
   fail "inactive includeIf identity: active='$ACTIVE' rc=$RC out=$OUT"
@@ -1111,8 +1111,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NESTREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = nested@example.com" \
-  && printf '%s' "$OUT" | grep -q "nested-identity"; then
+  && grep -q "local: user.email = nested@example.com" <<<"$OUT" \
+  && grep -q "nested-identity" <<<"$OUT"; then
   pass "identity two hops behind an inactive includeIf: caught"
 else
   fail "nested inactive include: rc=$RC out=$OUT"
@@ -1136,7 +1136,7 @@ N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true
 if [ "$RC" = "1" ] \
   && [ "$N_ENTRIES" -eq 1 ] \
   && [ "$N_REMEDIES" -eq 1 ] \
-  && ! printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  && ! grep -q "via inactive include:" <<<"$OUT"; then
   pass "active includeIf: reported once, as an active include"
 else
   fail "active includeIf double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
@@ -1178,7 +1178,7 @@ set +e
 OUT="$(MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "Part A skipped"; then
+if [ "$RC" = "0" ] && grep -q "Part A skipped" <<<"$OUT"; then
   pass "MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1: opts out"
 else
   fail "MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1: rc=$RC out=$OUT"
@@ -1209,7 +1209,7 @@ set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" --snapshot 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "snapshot recorded"; then
+if [ "$RC" = "0" ] && grep -q "snapshot recorded" <<<"$OUT"; then
   pass "--snapshot: baseline recorded"
 else
   fail "--snapshot: rc=$RC out=$OUT"
@@ -1219,7 +1219,7 @@ set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "unchanged since snapshot"; then
+if [ "$RC" = "0" ] && grep -q "unchanged since snapshot" <<<"$OUT"; then
   pass "unmodified .git/config: byte-identical to the baseline"
 else
   fail "unmodified .git/config: rc=$RC out=$OUT"
@@ -1238,8 +1238,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$BASELINE_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "snapshot baseline is missing" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "snapshot baseline is missing" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "deleted snapshot baseline: fails closed instead of forgetting the comparison"
 else
   fail "deleted snapshot baseline forgotten: rc=$RC out=$OUT"
@@ -1253,8 +1253,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
-  && printf '%s' "$OUT" | grep -q "bigFileThreshold"; then
+  && grep -q "changed since the snapshot" <<<"$OUT" \
+  && grep -q "bigFileThreshold" <<<"$OUT"; then
   pass "mutated .git/config: caught, with the diff"
 else
   fail "mutated .git/config: rc=$RC out=$OUT"
@@ -1286,9 +1286,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" MERGEPATH_GIT_IDENTITY_SUITE="
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS (--verify" \
-  && ! printf '%s' "$OUT" | grep -q "verify-offender" \
+  && grep -q "unchanged since snapshot" <<<"$OUT" \
+  && grep -q "check_git_identity_hygiene: PASS (--verify" <<<"$OUT" \
+  && ! grep -q "verify-offender" <<<"$OUT" \
   && [ ! -e "$VERIFY_SENTINEL" ]; then
   pass "--verify: Parts A and B pass against the snapshot; no tree scan, no suite"
 else
@@ -1298,7 +1298,7 @@ set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" MERGEPATH_GIT_IDENTITY_SUITE="$VERIFY_SUITE" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "verify-offender"; then
+if [ "$RC" = "1" ] && grep -q "verify-offender" <<<"$OUT"; then
   pass "--verify contrast: the plain call on the same tree still fails the Part C offender"
 else
   fail "--verify contrast fixture is vacuous: the plain call did not fail on the offender (rc=$RC out=$OUT)"
@@ -1312,9 +1312,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" bash "$CHECK" --verify 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
-  && printf '%s' "$OUT" | grep -q "bigFileThreshold" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "changed since the snapshot" <<<"$OUT" \
+  && grep -q "bigFileThreshold" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "--verify: a config write since the snapshot fails, with the diff"
 else
   fail "--verify missed a config write: rc=$RC out=$OUT"
@@ -1331,9 +1331,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_IDREPO" bash "$CHECK" --verify 2>&1)
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "user.email = verify-local@example.com" \
-  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "user.email = verify-local@example.com" <<<"$OUT" \
+  && grep -q "unchanged since snapshot" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "--verify: a repo-local identity override still fails Part A"
 else
   fail "--verify skipped Part A: rc=$RC out=$OUT"
@@ -1349,8 +1349,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_NOSNAP" bash "$CHECK" --verify 2>&1)
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "no snapshot was recorded for this checkout" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "no snapshot was recorded for this checkout" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "--verify: no recorded snapshot fails closed"
 else
   fail "--verify passed with nothing to compare against: rc=$RC out=$OUT"
@@ -1367,8 +1367,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_GONE" bash "$CHECK" --verify 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "snapshot baseline is missing" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "snapshot baseline is missing" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "--verify: a deleted baseline fails closed"
 else
   fail "--verify forgot a requested comparison: rc=$RC out=$OUT"
@@ -1393,8 +1393,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$MULTI_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
-  && printf '%s' "$OUT" | grep -q "pager"; then
+  && grep -q "changed since the snapshot" <<<"$OUT" \
+  && grep -q "pager" <<<"$OUT"; then
   pass "linked worktrees keep independent snapshot baselines"
 else
   fail "linked worktree snapshot overwrote another baseline: rc=$RC out=$OUT"
@@ -1427,9 +1427,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$PAGERREPO" MERGEPATH_GIT_IDENTITY_SUITE="$S
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
-  && printf '%s' "$OUT" | grep -q "pager" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "changed since the snapshot" <<<"$OUT" \
+  && grep -q "pager" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "suite that writes .git/config: caught after it runs, not reported PASS"
 else
   fail "post-suite baseline comparison: rc=$RC out=$OUT"
@@ -1450,9 +1450,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$LEAKREPO" MERGEPATH_GIT_IDENTITY_SUITE="$ID
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = nathan@nathanjohnpayne.example" \
-  && printf '%s' "$OUT" | grep -q "the suite" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "local: user.email = nathan@nathanjohnpayne.example" <<<"$OUT" \
+  && grep -q "the suite" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "suite that writes an identity key: caught after it runs"
 else
   fail "post-suite identity assertion: rc=$RC out=$OUT"
@@ -1469,8 +1469,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CLEANREPO" MERGEPATH_GIT_IDENTITY_SUITE="$C
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "unchanged by the regression suite" \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "unchanged by the regression suite" <<<"$OUT" \
+  && grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "clean suite: post-suite re-assertion passes"
 else
   fail "clean suite post-suite re-assertion: rc=$RC out=$OUT"
@@ -1502,9 +1502,9 @@ git config Commit.GpgSign false
 '
 if [ "$CASE_READBACK" = "Upper@example.com" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:3" \
-  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:4"; then
+  && grep -q "tests/mixed-case.sh:2" <<<"$OUT" \
+  && grep -q "tests/mixed-case.sh:3" <<<"$OUT" \
+  && grep -q "tests/mixed-case.sh:4" <<<"$OUT"; then
   pass "identity keys in git-accepted casing: caught"
 else
   fail "mixed-case identity keys: readback='$CASE_READBACK' rc=$RC out=$OUT"
@@ -1526,8 +1526,8 @@ git config user.name no--list-here
 '
 if [ "$GETVAL_READBACK" = "author--get@example.com" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/flagish-value.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/flagish-value.sh:3"; then
+  && grep -q "tests/flagish-value.sh:2" <<<"$OUT" \
+  && grep -q "tests/flagish-value.sh:3" <<<"$OUT"; then
   pass "read flag embedded in the value: no longer suppresses the write"
 else
   fail "flag-shaped value suppressing a write: readback='$GETVAL_READBACK' rc=$RC out=$OUT"
@@ -1552,9 +1552,9 @@ if [ "$LEADING_HYPHEN" = "-leak@example.com" ] \
   && [ "$LEADING_SLASH" = '\leak@example.com' ] \
   && [ "$LEADING_OPTION" = "--show-origin" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:3" \
-  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:4"; then
+  && grep -q "tests/leading-value.sh:2" <<<"$OUT" \
+  && grep -q "tests/leading-value.sh:3" <<<"$OUT" \
+  && grep -q "tests/leading-value.sh:4" <<<"$OUT"; then
   pass "hyphen-, backslash-, and option-shaped identity values: caught by position"
 else
   fail "leading identity values skipped: hyphen='$LEADING_HYPHEN' slash='$LEADING_SLASH' option='$LEADING_OPTION' rc=$RC out=$OUT"
@@ -1582,7 +1582,7 @@ git config user.email trailing@example.com --global
 if [ "$TRAIL_LOCAL" = "trailing@example.com" ] \
   && [ "$TRAIL_GLOBAL_LEFT" = "0" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/trailing-global.sh:2"; then
+  && grep -q "tests/trailing-global.sh:2" <<<"$OUT"; then
   pass "scope flag after the key: does not suppress the local write it is not scoping"
 else
   fail "trailing --global suppressing a local write: local='$TRAIL_LOCAL' globalLines='$TRAIL_GLOBAL_LEFT' rc=$RC out=$OUT"
@@ -1620,7 +1620,7 @@ run_on_fixture "tests/flagish-option-arg.sh" '#!/usr/bin/env bash
 git --exec-path=/opt/git--get/libexec config user.email leak@example.com
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/flagish-option-arg.sh:2"; then
+  && grep -q "tests/flagish-option-arg.sh:2" <<<"$OUT"; then
   pass "flag spelling inside another option argument: does not suppress"
 else
   fail "flag-shaped option argument suppressing a write: rc=$RC out=$OUT"
@@ -1637,9 +1637,9 @@ run_on_fixture "tests/qualified-git.sh" '#!/usr/bin/env bash
 ./git config user.signingkey ABC123
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:2" \
-  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:3" \
-  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:4"; then
+  && grep -q "tests/qualified-git.sh:2" <<<"$OUT" \
+  && grep -q "tests/qualified-git.sh:3" <<<"$OUT" \
+  && grep -q "tests/qualified-git.sh:4" <<<"$OUT"; then
   pass "path-qualified git executables: caught"
 else
   fail "path-qualified git executables: rc=$RC out=$OUT"
@@ -1657,9 +1657,9 @@ run_on_fixture "tests/quoted-git-path.sh" "#!/usr/bin/env bash
 '/usr/bin/git' config user.name quoted
 "
 if [ "$quoted_path_rc" = "1" ] \
-  && printf '%s' "$quoted_path_out" | grep -q "tests/quoted-git.sh:2" \
+  && grep -q "tests/quoted-git.sh:2" <<<"$quoted_path_out" \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/quoted-git-path.sh:2"; then
+  && grep -q "tests/quoted-git-path.sh:2" <<<"$OUT"; then
   pass "quoted Git executable words: caught in PATH and path-qualified forms"
 else
   fail "quoted Git executable escaped scan: path_rc=$quoted_path_rc path_out=$quoted_path_out rc=$RC out=$OUT"
@@ -1693,7 +1693,7 @@ run_on_fixture "docs/prose.markdown" '# Identity
 Use `git config --global user.email you@example.com`, never `git config user.email you@example.com`.
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "docs/prose.markdown:3"; then
+  && grep -q "docs/prose.markdown:3" <<<"$OUT"; then
   pass ".markdown doc: scanned, and cut on backticks like any Markdown"
 else
   fail ".markdown doc: rc=$RC out=$OUT"
@@ -1703,7 +1703,7 @@ run_on_fixture "docs/UPPER.MD" '# Identity
 
 Never run `git config user.email leak@example.com`.
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/UPPER.MD:3"; then
+if [ "$RC" = "1" ] && grep -q "docs/UPPER.MD:3" <<<"$OUT"; then
   pass "uppercase .MD doc: scanned"
 else
   fail "uppercase .MD doc: rc=$RC out=$OUT"
@@ -1718,7 +1718,7 @@ for SHEBANG in '#!/usr/bin/env zsh' '#!/bin/dash' '#!/usr/bin/env sh' '#!/bin/ks
   run_on_fixture "tools/hook" "$SHEBANG
 git config user.email leak@example.com
 "
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "tools/hook:2"; then
+  if [ "$RC" = "1" ] && grep -q "tools/hook:2" <<<"$OUT"; then
     pass "extensionless script with shebang '$SHEBANG': scanned"
   else
     fail "extensionless script with shebang '$SHEBANG': rc=$RC out=$OUT"
@@ -1745,7 +1745,7 @@ run_on_fixture "tests/printed-marker.sh" '#!/usr/bin/env bash
 echo "GIT_IDENTITY_SCOPE_EXEMPT: merely-printed"; git config user.email leak@example.com
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/printed-marker.sh:2"; then
+  && grep -q "tests/printed-marker.sh:2" <<<"$OUT"; then
   pass "marker printed as string data: does not exempt the write beside it"
 else
   fail "printed marker exempting a live write: rc=$RC out=$OUT"
@@ -1760,7 +1760,7 @@ run_on_fixture "docs/prose-marker.md" '# Identity
 A deliberate exception is marked GIT_IDENTITY_SCOPE_EXEMPT: with a reason, as in `git config user.email you@example.com`.
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "docs/prose-marker.md:3"; then
+  && grep -q "docs/prose-marker.md:3" <<<"$OUT"; then
   pass "marker named in Markdown prose: does not exempt the write beside it"
 else
   fail "prose marker exempting a live write: rc=$RC out=$OUT"
@@ -1787,7 +1787,7 @@ fi
 while IFS= read -r LINE; do
   run_on_fixture "tests/quoted-marker.sh" "$LINE
 "
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "tests/quoted-marker.sh:1"; then
+  if [ "$RC" = "1" ] && grep -q "tests/quoted-marker.sh:1" <<<"$OUT"; then
     pass "quoted/escaped comment-shaped marker does not exempt: $LINE"
   else
     fail "quoted/escaped marker exemption: rc=$RC out=$OUT"
@@ -1839,7 +1839,7 @@ EOF
 while IFS= read -r LINE; do
   run_on_fixture "tests/operator-data.sh" "$LINE
 "
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/operator-data.sh:1'; then
+  if [ "$RC" = "1" ] && grep -q 'tests/operator-data.sh:1' <<<"$OUT"; then
     pass "quoted/escaped control operator cannot forge exemption: $LINE"
   else
     fail "control-operator data exempted writer: rc=$RC out=$OUT"
@@ -1854,7 +1854,7 @@ EOF
 while IFS= read -r LINE; do
   run_on_fixture "docs/broken-marker.md" "$LINE
 "
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/broken-marker.md:1"; then
+  if [ "$RC" = "1" ] && grep -q "docs/broken-marker.md:1" <<<"$OUT"; then
     pass "invalid Markdown comment does not exempt: $LINE"
   else
     fail "invalid Markdown comment exemption: rc=$RC out=$OUT"
@@ -1881,7 +1881,7 @@ for FENCE in '```' '~~~' '````' '~~~~'; do
 '"$MISMATCH"'
 git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/fenced-html.md:4"; then
+  if [ "$RC" = "1" ] && grep -q "docs/fenced-html.md:4" <<<"$OUT"; then
     pass "HTML marker inside $FENCE fence: cannot exempt a write"
   else
     fail "HTML marker inside $FENCE fence: rc=$RC out=$OUT"
@@ -1902,7 +1902,7 @@ git config user.email \
 fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
    ~~~~~
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/continued-fenced-html.md:2"; then
+if [ "$RC" = "1" ] && grep -q "docs/continued-fenced-html.md:2" <<<"$OUT"; then
   pass "continued command inside indented Markdown fence: HTML marker cannot exempt"
 else
   fail "continued fenced HTML marker: rc=$RC out=$OUT"
@@ -1940,8 +1940,8 @@ git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: fenced da
 ${FENCE}
 "'`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: real outside comment -->
 '
-    if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/control-fence.md:3:' \
-      && ! printf '%s' "$OUT" | grep -q 'docs/control-fence.md:5:'; then
+    if [ "$RC" = "1" ] && grep -q 'docs/control-fence.md:3:' <<<"$OUT" \
+      && ! grep -q 'docs/control-fence.md:5:' <<<"$OUT"; then
       pass "control byte cannot close $FENCE fence; real closer restores HTML comments"
     else
       fail "control-byte $FENCE fence boundary: rc=$RC out=$OUT"
@@ -2025,7 +2025,7 @@ for PREFIX in '> ' '> > ' '- ' '1. ' '> - '; do
 '"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'```
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-html.md:2"; then
+  if [ "$RC" = "1" ] && grep -q "docs/container-html.md:2" <<<"$OUT"; then
     pass "HTML marker in $PREFIX container fence: cannot exempt"
   else
     fail "HTML marker in $PREFIX container fence: rc=$RC out=$OUT"
@@ -2047,7 +2047,7 @@ git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture o
 '"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'```
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-continued.md:2"; then
+  if [ "$RC" = "1" ] && grep -q "docs/container-continued.md:2" <<<"$OUT"; then
     pass "continued write inside $PREFIX container fence: HTML cannot exempt"
   else
     fail "continued write inside $PREFIX container fence: rc=$RC out=$OUT"
@@ -2071,7 +2071,7 @@ run_on_fixture "docs/list-continuation-html.md" '- Example:
   git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
   ```
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/list-continuation-html.md:3"; then
+if [ "$RC" = "1" ] && grep -q "docs/list-continuation-html.md:3" <<<"$OUT"; then
   pass "fence opened on a list continuation: HTML cannot exempt"
 else
   fail "list continuation fence: rc=$RC out=$OUT"
@@ -2088,7 +2088,7 @@ for PREFIX in '- - ' '1. - ' '> - - '; do
 '"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'```
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-html.md:2'; then
+  if [ "$RC" = "1" ] && grep -q 'docs/nested-list-html.md:2' <<<"$OUT"; then
     pass "same-line nested list $PREFIX fence: HTML cannot exempt"
   else
     fail "nested list $PREFIX fence: rc=$RC out=$OUT"
@@ -2109,7 +2109,7 @@ for PREFIX in '- - ' '1. - ' '> - - '; do
 '"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'```
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-continued.md:2'; then
+  if [ "$RC" = "1" ] && grep -q 'docs/nested-list-continued.md:2' <<<"$OUT"; then
     pass "same-line nested list $PREFIX continued command: HTML cannot exempt"
   else
     fail "nested list $PREFIX continued command: rc=$RC out=$OUT"
@@ -2122,7 +2122,7 @@ run_on_fixture "docs/tab-list-html.md" $'- Example:
 \tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 \t```
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-html.md:3'; then
+if [ "$RC" = "1" ] && grep -q 'docs/tab-list-html.md:3' <<<"$OUT"; then
   pass "tab-indented list fence: HTML cannot exempt"
 else
   fail "tab-indented list fence: rc=$RC out=$OUT"
@@ -2131,7 +2131,7 @@ run_on_fixture "docs/tab-nested-list-html.md" $'-\t-\t~~~bash
 \t\tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 \t\t~~~
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-nested-list-html.md:2'; then
+if [ "$RC" = "1" ] && grep -q 'docs/tab-nested-list-html.md:2' <<<"$OUT"; then
   pass "tab-separated nested list markers preserve column indentation"
 else
   fail "tab-separated nested list fence: rc=$RC out=$OUT"
@@ -2164,7 +2164,7 @@ run_on_fixture "docs/tab-list-continued.md" $'- Example:
 \tgit config user.email \\\n\tleak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 \t```
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-continued.md:3'; then
+if [ "$RC" = "1" ] && grep -q 'docs/tab-list-continued.md:3' <<<"$OUT"; then
   pass "tab-indented continued command: HTML cannot exempt"
 else
   fail "tab-indented continued command: rc=$RC out=$OUT"
@@ -2183,7 +2183,7 @@ for PREFIX in '- > ' '> - > ' '- > - '; do
 '"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'```
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-html.md:2'; then
+  if [ "$RC" = "1" ] && grep -q 'docs/mixed-container-html.md:2' <<<"$OUT"; then
     pass "mixed container $PREFIX fence: HTML cannot exempt"
   else
     fail "mixed container $PREFIX HTML exemption: rc=$RC out=$OUT"
@@ -2193,7 +2193,7 @@ for PREFIX in '- > ' '> - > ' '- > - '; do
 '"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 '"$CONTINUATION"'~~~
 '
-  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-continued.md:2'; then
+  if [ "$RC" = "1" ] && grep -q 'docs/mixed-container-continued.md:2' <<<"$OUT"; then
     pass "mixed container $PREFIX continued command: HTML cannot exempt"
   else
     fail "mixed container $PREFIX continued HTML exemption: rc=$RC out=$OUT"
@@ -2249,8 +2249,8 @@ OUT="$(HOME="$FAKEHOME" MERGEPATH_GIT_IDENTITY_ROOT="$HOMEREPO" bash "$CHECK" 2>
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = tildehome@example.com" \
-  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  && grep -q "local: user.email = tildehome@example.com" <<<"$OUT" \
+  && grep -q "via inactive include:" <<<"$OUT"; then
   pass "identity behind a ~/ include path: expanded and caught"
 else
   fail "tilde-home include path: rc=$RC out=$OUT"
@@ -2281,8 +2281,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$TILDEREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "local: user.email = tildeuser@example.com" \
-  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  && grep -q "local: user.email = tildeuser@example.com" <<<"$OUT" \
+  && grep -q "via inactive include:" <<<"$OUT"; then
   pass "identity behind a ~user/ include path: expanded and caught"
 else
   fail "~user/ include path: user='$TILDEUSER' rc=$RC out=$OUT"
@@ -2302,8 +2302,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NOUSERREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "unresolvable include path" \
-  && printf '%s' "$OUT" | grep -q "mergepath-no-such-user-777"; then
+  && grep -q "unresolvable include path" <<<"$OUT" \
+  && grep -q "mergepath-no-such-user-777" <<<"$OUT"; then
   pass "include path this machine cannot expand: fails closed"
 else
   fail "unresolvable include path skipped: rc=$RC out=$OUT"
@@ -2355,8 +2355,8 @@ OUT="$(cd "$WORKDIR" && MERGEPATH_GIT_IDENTITY_ROOT=relative-root-repo bash "$CH
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "dormant-relative@example.com" \
-  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  && grep -q "dormant-relative@example.com" <<<"$OUT" \
+  && grep -q "inactive include" <<<"$OUT"; then
   pass "relative fixture root: inactive include identity is still detected"
 else
   fail "relative fixture root hid include identity: rc=$RC out=$OUT"
@@ -2376,8 +2376,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$PREFIX_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "runtime-prefix@example.com" \
-  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  && grep -q "runtime-prefix@example.com" <<<"$OUT" \
+  && grep -q "inactive include" <<<"$OUT"; then
   pass "identity behind a %(prefix)/ include path: expanded with Git and caught"
 else
   fail "runtime-prefix include path hid identity: rc=$RC out=$OUT"
@@ -2408,11 +2408,11 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NUKEREPO" MERGEPATH_GIT_IDENTITY_SUITE="$NU
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "removed repository metadata" \
-  && printf '%s' "$OUT" | grep -q "the repository itself" \
-  && printf '%s' "$OUT" | grep -q ".git/config" \
-  && printf '%s' "$OUT" | grep -q "baseline recorded before the suite ran" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "removed repository metadata" <<<"$OUT" \
+  && grep -q "the repository itself" <<<"$OUT" \
+  && grep -q ".git/config" <<<"$OUT" \
+  && grep -q "baseline recorded before the suite ran" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "suite that deletes the repository: caught, not reported PASS"
 else
   fail "post-suite metadata assertion: rc=$RC out=$OUT"
@@ -2443,9 +2443,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$BASEKILLREPO" MERGEPATH_GIT_IDENTITY_SUITE=
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "baseline recorded before the suite ran" \
-  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
-  && printf '%s' "$OUT" | grep -q "pager"; then
+  && grep -q "baseline recorded before the suite ran" <<<"$OUT" \
+  && grep -q "changed since the snapshot" <<<"$OUT" \
+  && grep -q "pager" <<<"$OUT"; then
   pass "suite that deletes the baseline: the config diff is still reported"
 else
   fail "preserved baseline not used for the post-suite comparison: rc=$RC out=$OUT"
@@ -2463,8 +2463,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NOREPO" MERGEPATH_GIT_IDENTITY_SUITE="$CLEA
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
-  && ! printf '%s' "$OUT" | grep -q "removed repository metadata"; then
+  && grep -q "check_git_identity_hygiene: PASS" <<<"$OUT" \
+  && ! grep -q "removed repository metadata" <<<"$OUT"; then
   pass "non-repository fixture tree: metadata assertion stays quiet"
 else
   fail "metadata assertion firing on a non-repository: rc=$RC out=$OUT"
@@ -2521,8 +2521,8 @@ set -e
 if [ "$RC" = "1" ] \
   && [ "$MARKER_UNDER_GIT" = "0" ] \
   && [ "$MARKER_KEPT" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "snapshotted repository is missing" \
-  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  && grep -q "snapshotted repository is missing" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
   pass "snapshot then deleted .git: the request survives outside metadata and fails closed"
 else
   fail "deleted checkout blessed after --snapshot: under_git=$MARKER_UNDER_GIT kept=$MARKER_KEPT rc=$RC out=$OUT"
@@ -2539,9 +2539,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
-  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  && grep -q "unchanged since snapshot" <<<"$OUT" \
+  && grep -q "check_git_identity_hygiene: PASS" <<<"$OUT" \
+  && ! grep -q "snapshotted repository is missing" <<<"$OUT"; then
   pass "intact checkout with a recorded snapshot: still passes"
 else
   fail "intact snapshotted checkout: rc=$RC out=$OUT"
@@ -2571,10 +2571,10 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPCOPY_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
-  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
-  && ! printf '%s' "$OUT" | grep -q "baseline is missing" \
-  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  && grep -q "check_git_identity_hygiene: PASS" <<<"$OUT" \
+  && grep -q "recorded for another checkout" <<<"$OUT" \
+  && ! grep -q "baseline is missing" <<<"$OUT" \
+  && ! grep -q "snapshotted repository is missing" <<<"$OUT"; then
   pass "a working-tree copy inherits the request but not the baseline: not this checkout's snapshot"
 else
   fail "copied snapshot request failed a checkout nobody snapshotted: rc=$RC out=$OUT"
@@ -2593,8 +2593,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
-  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  && grep -q "the requested snapshot baseline is missing" <<<"$OUT" \
+  && ! grep -q "recorded for another checkout" <<<"$OUT"; then
   pass "own snapshot with the baseline deleted: still fails closed"
 else
   fail "own request with a deleted baseline was waved through: rc=$RC out=$OUT"
@@ -2615,8 +2615,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
-  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  && grep -q "the requested snapshot baseline is missing" <<<"$OUT" \
+  && ! grep -q "recorded for another checkout" <<<"$OUT"; then
   pass "newline in the checkout path: the marker still names this checkout"
 else
   fail "newline-path marker read as a foreign request: rc=$RC out=$OUT"
@@ -2642,9 +2642,9 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_COPY" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
-  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
-  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  && grep -q "check_git_identity_hygiene: PASS" <<<"$OUT" \
+  && grep -q "recorded for another checkout" <<<"$OUT" \
+  && ! grep -q "snapshotted repository is missing" <<<"$OUT"; then
   pass "non-repository tree copy inheriting the request: not this checkout's snapshot"
 else
   fail "inherited request failed a non-repository fixture: rc=$RC out=$OUT"
@@ -2665,7 +2665,7 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPLINK_REPO" bash "$CHECK" --snapshot 2>&
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "snapshot state path is a symlink" \
+  && grep -q "snapshot state path is a symlink" <<<"$OUT" \
   && [ ! -e "$SNAPLINK_TARGET/gitconfig-baseline.requested" ]; then
   pass "symlinked snapshot state dir: refused, nothing written through the link"
 else
@@ -2681,7 +2681,7 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPPLAIN_REPO" bash "$CHECK" --snapshot 2>
 RC=$?
 set -e
 if [ "$RC" = "0" ] \
-  && printf '%s' "$OUT" | grep -q "snapshot recorded" \
+  && grep -q "snapshot recorded" <<<"$OUT" \
   && [ -f "$SNAPPLAIN_REPO/.mergepath/gitconfig-baseline.requested" ]; then
   pass "ordinary state dir: snapshot still recorded"
 else
@@ -2712,8 +2712,8 @@ OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLREPO" bash "$CHECK" 2>&1)"
 RC_AFTER=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "newline-include@example.com" \
-  && printf '%s' "$OUT" | grep -q "inactive include" \
+  && grep -q "newline-include@example.com" <<<"$OUT" \
+  && grep -q "inactive include" <<<"$OUT" \
   && [ -n "$REMEDY" ] && [ -z "$NL_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
   pass "include target whose filename contains a newline: inspected, and its remediation lands on that file"
 else
@@ -2736,8 +2736,8 @@ OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLTREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "newline-tail-include@example.com" \
-  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  && grep -q "newline-tail-include@example.com" <<<"$OUT" \
+  && grep -q "inactive include" <<<"$OUT"; then
   pass "include target whose filename ENDS in a newline: inspected"
 else
   fail "trailing-newline include target escaped the walk: rc=$RC out=$OUT"
@@ -2818,7 +2818,7 @@ git config retag.gpgsign false
 N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-mixed\.sh:' || true)"
 if [ "$RC" = "1" ] \
   && [ "$N_HITS" -eq 1 ] \
-  && printf '%s' "$OUT" | grep -q "tests/suffix-mixed.sh:3:"; then
+  && grep -q "tests/suffix-mixed.sh:3:" <<<"$OUT"; then
   pass "suffix keys around a real write: only the exact protected key is reported"
 else
   fail "mixed suffix/protected keys: hits=$N_HITS rc=$RC out=$OUT"
@@ -2836,7 +2836,7 @@ git config precommit.gpgsign false && git config notuser.email "not-protected@ex
 N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-same-line\.sh:' || true)"
 if [ "$RC" = "1" ] \
   && [ "$N_HITS" -eq 1 ] \
-  && printf '%s' "$OUT" | grep -q "tests/suffix-same-line.sh:2:"; then
+  && grep -q "tests/suffix-same-line.sh:2:" <<<"$OUT"; then
   pass "suffix and protected keys in one command: only the protected write is reported"
 else
   fail "same-line suffix/protected mix: hits=$N_HITS rc=$RC out=$OUT"
@@ -2871,7 +2871,7 @@ git config a.b:commit.gpgsign true
 N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/subsection-mixed\.sh:' || true)"
 if [ "$RC" = "1" ] \
   && [ "$N_HITS" -eq 1 ] \
-  && printf '%s' "$OUT" | grep -q "tests/subsection-mixed.sh:3:"; then
+  && grep -q "tests/subsection-mixed.sh:3:" <<<"$OUT"; then
   pass "subsection keys around a real write: only the exact protected key is reported"
 else
   fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
@@ -2944,7 +2944,7 @@ run_on_fixture "tests/escaped-key.sh" '#!/usr/bin/env bash
 git config \user.email "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/escaped-key.sh:2:"; then
+  && grep -q "tests/escaped-key.sh:2:" <<<"$OUT"; then
   pass "shell-escaped protected key: still reported"
 else
   fail "escaped protected key missed: rc=$RC out=$OUT"
@@ -2959,7 +2959,7 @@ run_on_fixture "tests/internally-escaped-key.sh" '#!/usr/bin/env bash
 git config us\er.email "leak@example.com"
 '
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "tests/internally-escaped-key.sh:2:"; then
+  && grep -q "tests/internally-escaped-key.sh:2:" <<<"$OUT"; then
   pass "internally-escaped protected key: reported"
 else
   fail "internally-escaped protected key missed: rc=$RC out=$OUT"
@@ -2981,7 +2981,7 @@ git config "user".email "leak3@example.com"
 N_UNMATCHED_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/unmatched-quote-key\.sh:' || true)"
 if [ "$RC" = "1" ] \
   && [ "$N_UNMATCHED_HITS" -eq 1 ] \
-  && printf '%s' "$OUT" | grep -q "tests/unmatched-quote-key.sh:4:"; then
+  && grep -q "tests/unmatched-quote-key.sh:4:" <<<"$OUT"; then
   pass "unmatched quote: not reported; paired quote on the same fixture still is"
 else
   fail "unmatched-quote dequoting wrong: hits=$N_UNMATCHED_HITS rc=$RC out=$OUT"
@@ -3042,7 +3042,7 @@ fi
 run_on_fixture "tests/quoted-continued.sh" "git -c foo.bar='a;b' \\
 config user.email leak@example.invalid
 "
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/quoted-continued.sh:1:'; then
+if [ "$RC" = "1" ] && grep -q 'tests/quoted-continued.sh:1:' <<<"$OUT"; then
   pass "quoted option separator preserves continued-command finding"
 else
   fail "continued quoted-option writer missed: rc=$RC out=$OUT"
@@ -3185,7 +3185,7 @@ done
 run_on_fixture "docs/prose-continued.md" "If you can't, run git \\
 config user.email leak@example.invalid
 "
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/prose-continued.md:1:'; then
+if [ "$RC" = "1" ] && grep -q 'docs/prose-continued.md:1:' <<<"$OUT"; then
   pass "prose quote handling preserves continued-command finding"
 else
   fail "continued prose command missed: rc=$RC out=$OUT"
@@ -3521,7 +3521,7 @@ for PREFIX in "printf '%s' '\$(printf a'" 'printf "%s" \$(printf a' '# $(printf 
 git config --global user.email fixture@example.invalid
 git config user.email leak@example.invalid
 "
-  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'literal-dollar-lines.sh:3'; then
+  if [ "$RC" = 1 ] && grep -q 'literal-dollar-lines.sh:3' <<<"$OUT"; then
     pass "quoted/escaped/comment dollar does not absorb following physical writer"
   else
     fail "literal dollar joined unrelated commands: prefix='$PREFIX' rc=$RC out=$OUT"
@@ -3584,7 +3584,7 @@ if [ "$RC" = 0 ]; then pass "actual marker on body writer physical line retains 
   fail "body physical-line marker rejected: rc=$RC out=$OUT"
 fi
 run_on_fixture tests/substitution-body-neighbour-marker.sh $'value=$(git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture\ngit config user.name leak\n)\n'
-if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'substitution-body-neighbour-marker.sh:2'; then
+if [ "$RC" = 1 ] && grep -q 'substitution-body-neighbour-marker.sh:2' <<<"$OUT"; then
   pass "body physical-line marker cannot exempt a second independent body writer"
 else
   fail "body marker widened to later writer: rc=$RC out=$OUT"
@@ -3687,7 +3687,7 @@ ENV_SPLIT_CASES
 # Case 65z: owner-ratified Bats admission is bounded to .bats/env-bats.
 for REL in tests/setup.bats tests/setup.BATS tests/setup; do
   run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
-  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q "$REL:3"; then pass "Bats extension/shebang admits literal fixture setup"; else
+  if [ "$RC" = 1 ] && grep -q "$REL:3" <<<"$OUT"; then pass "Bats extension/shebang admits literal fixture setup"; else
     fail "Bats source skipped: rel=$REL rc=$RC out=$OUT"
   fi
   run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git -C "$FIX" config user.email fixture@example.invalid\n  git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: intentional isolated fixture\n}\n'
@@ -4558,7 +4558,7 @@ done
 run_on_fixture "docs/indented-continued.md" '    git \
     config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
 '
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/indented-continued.md:1:'; then
+if [ "$RC" = "1" ] && grep -q 'docs/indented-continued.md:1:' <<<"$OUT"; then
   pass "continued command in indented code cannot use literal HTML exemption"
 else
   fail "continued indented writer missed: rc=$RC out=$OUT"
@@ -4569,7 +4569,7 @@ printf '    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_E
 set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$WORKDIR/fixture-$FIXTURE_SEQ" bash "$CHECK" 2>&1)"; RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/b-code.md:1:'; then
+if [ "$RC" = "1" ] && grep -q 'docs/b-code.md:1:' <<<"$OUT"; then
   pass "paragraph context resets between Markdown files"
 else
   fail "paragraph state leaked between files: rc=$RC out=$OUT"
@@ -4610,8 +4610,8 @@ RC_AFTER=$?
 set -e
 if [ -z "$LW_OWN_SCOPE" ] && [ -z "$LW_LOCAL" ] \
   && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "linked-worktree@example.com" \
-  && printf '%s' "$OUT" | grep -q "worktrees/linked-identity-sibling/config.worktree" \
+  && grep -q "linked-worktree@example.com" <<<"$OUT" \
+  && grep -q "worktrees/linked-identity-sibling/config.worktree" <<<"$OUT" \
   && [ -n "$REMEDY" ] && [ -z "$LW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
   pass "identity in a sibling linked worktree: caught from the main worktree and cleared by the printed command"
 else
@@ -4651,8 +4651,8 @@ OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$DLWMAIN" bash "$CHECK" 2>&1)"
 RC_AFTER=$?
 set -e
 if [ "$DLW_PRESENT" = "1" ] && [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -q "dormant linked worktree" \
-  && printf '%s' "$OUT" | grep -q "DORMANTKEY" \
+  && grep -q "dormant linked worktree" <<<"$OUT" \
+  && grep -q "DORMANTKEY" <<<"$OUT" \
   && [ -n "$REMEDY" ] && [ -z "$DLW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
   pass "dormant sibling config.worktree: inspected and cleared like an active one"
 else
@@ -4674,7 +4674,7 @@ set -e
 N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = self-worktree@example.com" || true)"
 N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
 if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ] \
-  && ! printf '%s' "$OUT" | grep -q "linked worktree"; then
+  && ! grep -q "linked worktree" <<<"$OUT"; then
   pass "the invoking worktree's own config.worktree: reported once, not also as a sibling"
 else
   fail "own config.worktree double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
