@@ -525,7 +525,7 @@ fi
 if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
   {
     cat "$RUN_DIR"/results/* 2>/dev/null | awk -F'\t' '{ print $3 "\t" $2 }'
-    [ -f "$TIMINGS" ] && cat "$TIMINGS"
+    if [ -f "$TIMINGS" ]; then cat "$TIMINGS"; fi
   } | awk -F'\t' '!seen[$1]++' > "$RUN_DIR/timings.new" && mv "$RUN_DIR/timings.new" "$TIMINGS" || true
 fi
 
