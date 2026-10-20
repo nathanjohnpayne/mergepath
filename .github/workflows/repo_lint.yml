@@ -703,8 +703,9 @@ jobs:
       - name: check_no_token_in_output
         if: matrix.shard == 4
         # Canonical rule, oracle, safety and exemption contracts live in
-        # scripts/ci/token_output_gate.py. This wire runs that file's self-test
-        # and repository scan; ubuntu-latest supplies its Python and bash.
+        # scripts/ci/token_output_gate.py. This fast-lane wire always runs the
+        # repository scan (--scan); deep safety runs the oracle self-test
+        # (--self-test) on full scope or when this wrapper is selected.
         #
         # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
         # soft-pass when the check script is absent in this tree (a checkout
