@@ -549,8 +549,8 @@ p4b_codex_timeout_determination() {
 # Read the PR tuple that binds both the reviewed head and the policy source.
 p4b_pr_policy_tuple() { # <repo> <pr>
   local out
-  out=$(gh api "repos/$1/pulls/$2" --jq \
-    '{head_sha:.head.sha,base_ref:.base.ref,base_sha:.base.sha,default_branch:.base.repo.default_branch}' 2>/dev/null) \
+  out=$(gh_api_scalar "PR policy tuple for $1#$2" "repos/$1/pulls/$2" --jq \
+    '{head_sha:.head.sha,base_ref:.base.ref,base_sha:.base.sha,default_branch:.base.repo.default_branch}') \
     || return 1
   printf '%s' "$out" | jq -ce '
     type == "object"
@@ -567,7 +567,7 @@ p4b_pr_policy_tuple() { # <repo> <pr>
 # request freshness anchor. `final-request-pending` preserves the last
 # request's legitimate wait; it never manufactures a timeout determination.
 p4b_codex_request_budget_state() {
-  local repo="$1" pr="$2" head="$3" config author resolver budget comments generation count cap
+  local repo="$1" pr="$2" head="$3" config author resolver budget comments generation count cap heads
   local initial_tuple final_tuple base_ref base_sha default_branch committed timeline threshold seconds epoch anchor selected select_rc=0
   if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] \
      || ! command -v crqe_governing_budget crqe_trigger_generation crqe_count_triggers crqe_select_trigger >/dev/null 2>&1 \
@@ -596,7 +596,19 @@ p4b_codex_request_budget_state() {
     || { jq -nc '{state:"unreadable",reason:"comments-read-failed"}'; return 2; }
   generation=$(crqe_trigger_generation "$comments" "$author") \
     || { jq -nc '{state:"unreadable",reason:"request-generation-invalid"}'; return 2; }
-  count=$(crqe_count_triggers "$comments" "$author") \
+  # A CodeRabbit failover marker exempts its trigger only when it names a head
+  # this PR had (#2553); the head set is read only when a marker is present,
+  # and an unreadable one exempts nothing.
+  heads='[]'
+  if command -v crqe_failover_markers_present crqe_pr_head_set >/dev/null 2>&1 \
+     && crqe_failover_markers_present "$comments" "$author"; then
+    local fo_commits fo_timeline
+    if fo_commits=$(gh_api_array "repos/$repo/pulls/$pr/commits" "PR commits for failover markers" 2>/dev/null) \
+       && fo_timeline=$(gh_api_array "repos/$repo/issues/$pr/timeline" "PR timeline for failover markers" 2>/dev/null); then
+      heads=$(crqe_pr_head_set "$fo_commits" "$fo_timeline" "$head") || heads='[]'
+    fi
+  fi
+  count=$(crqe_count_triggers "$comments" "$author" "$heads") \
     || { jq -nc '{state:"unreadable",reason:"request-count-invalid"}'; return 2; }
   cap=$(printf '%s' "$budget" | jq -r '.max_request_attempts')
   final_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") \

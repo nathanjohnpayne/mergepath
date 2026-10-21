@@ -36,7 +36,7 @@ shift
 [ "${1:-}" != --paginate ] || shift
 printf '%s\n' "$1" >>"$CALLS"
 case "$1" in
-  repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789000000000000000000000000"},user:{login:$author},body:$body,labels:[]}' ;;
+  repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789000000000000000000000000"},base:{ref:"main"},user:{login:$author},body:$body,labels:[]}' ;;
   repos/owner/repo/commits/*) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '2026-09-14T00:00:00Z' ;;
   repos/owner/repo/issues/99/comments)
     if [ -n "${COMMENTS_FAIL_FROM:-}" ] \
@@ -44,13 +44,22 @@ case "$1" in
       exit 1
     fi
     cat "$FIXTURES/comments" ;;
-  repos/owner/repo/pulls/99/reviews) cat "$FIXTURES/reviews" ;;
+  repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }; cat "$FIXTURES/reviews" ;;
+  repos/owner/repo/pulls/99/files) printf '%s\n' '[]' ;;
+  repos/owner/repo/rulesets*) printf '%s\n' '[]' ;;
+  repos/owner/repo/rules/branches/main) printf '%s\n' '[]' ;;
+  repos/owner/repo/contents/.github/workflows/repo_lint_local.yml*) echo 'HTTP 404: fixture annex absent' >&2; exit 1 ;;
   repos/owner/repo/issues/comments/123/reactions) [ "$ACK_READ" != error ] || exit 1; cat "$FIXTURES/ack" ;;
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
   repos/owner/repo/issues/99/reactions) printf '%s\n' "$ISSUE_REACTIONS" ;;
   repos/owner/repo/issues/99/timeline) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
   repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; printf '%s\n' "${INLINE_COMMENTS_JSON:-[]}" ;;
-  graphql) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  graphql)
+    case "$*" in
+      *requiredStatusCheckContexts*) printf '%s\n' '{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["Build"]}}}}}' ;;
+      *statusCheckRollup*) printf '%s\n' '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext","context":"Build","state":"FAILURE","createdAt":"2026-09-14T00:03:00Z","isRequired":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}]}}}}}' ;;
+      *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+    esac ;;
   *) echo "unexpected $*" >&2; exit 99 ;;
 esac
 GH
@@ -274,11 +283,14 @@ fo_c() { # <id> <login> <created> <body> [updated]
 FO_HA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 FO_HB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 fo_m() { crqe_failover_marker_body "${2:-$FO_HA}" "$1"; }
-fo_case() { # <name> <expected-exempt-json> <expected-count> <comment>...
+# The PR's heads (#2553): a marker must name one of them.
+FO_HEADS=$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" '[$a, $b]')
+fo_case() { # <name> <expected-exempt-json> <expected-count> <comment>...   (FO_CASE_HEADS overrides the heads)
   local name=$1 want=$2 count=$3 c got n
   shift 3
   c=$(printf '%s\n' "$@" | jq -sc .)
-  got=$(crqe_failover_trigger_ids "$c" nathanjohnpayne) && n=$(crqe_count_triggers "$c" nathanjohnpayne) \
+  got=$(crqe_failover_trigger_ids "$c" nathanjohnpayne "${FO_CASE_HEADS:-$FO_HEADS}") \
+    && n=$(crqe_count_triggers "$c" nathanjohnpayne "${FO_CASE_HEADS:-$FO_HEADS}") \
     && [ "$got" = "$want" ] && [ "$n" = "$count" ] \
     || { echo "FAIL: failover: $name (exempt=$got count=${n:-?}, want $want/$count)" >&2; exit 1; }
 }
@@ -304,11 +316,37 @@ fo_case "one exemption per head" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-
   "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20)")"
 fo_case "one exemption on each of two heads" '[10,20]' 0 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
   "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HB")")"
+# #2553: a marker naming a head the PR never had exempts nothing, so one
+# marker per invented head cannot exempt every trigger.
+FO_HX=1111111111111111111111111111111111111111
+FO_HY=2222222222222222222222222222222222222222
+fo_case "a marker naming a foreign head" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 "$FO_HX")")" "$T2"
+fo_case "one marker per invented head" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 "$FO_HX")")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HY")")"
+fo_case "a real head and an invented one" '[10]' 1 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" \
+  "$T2" "$(fo_c 21 nathanjohnpayne 2026-10-01T01:00:05Z "$(fo_m 20 "$FO_HY")")"
+FO_CASE_HEADS='[]' fo_case "an empty head set" '[]' 2 "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" "$T2"
+_fo_c=$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" | jq -sc .)
+[ "$(crqe_failover_trigger_ids "$_fo_c" nathanjohnpayne)" = '[]' ] && [ "$(crqe_count_triggers "$_fo_c" nathanjohnpayne)" = 1 ] \
+  || { echo "FAIL: failover: callers that pass no head set must exempt nothing" >&2; exit 1; }
+crqe_failover_markers_present "$_fo_c" nathanjohnpayne && ! crqe_failover_markers_present "$_fo_c" someone-else \
+  && ! crqe_failover_markers_present "$(printf '%s\n' "$T1" | jq -sc .)" nathanjohnpayne \
+  || { echo "FAIL: failover: marker presence is misread" >&2; exit 1; }
+# The head set: the current head, the commit list, committed events and both
+# sides of a force-push; anything malformed fails so the caller uses [].
+_hs=$(crqe_pr_head_set "$(jq -nc --arg b "$FO_HB" '[{sha: $b}, {sha: "short"}]')" \
+  "$(jq -nc --arg x "$FO_HX" --arg y "$FO_HY" --arg c 3333333333333333333333333333333333333333 \
+     '[{event: "committed", sha: $c}, {event: "head_ref_force_pushed", commit_id: $y}, {event: "committed", sha: $x}, {event: "labeled", sha: "4444444444444444444444444444444444444444"}]')" \
+  "$(printf '%s' "$FO_HA" | tr a-f A-F)")
+[ "$_hs" = "$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" --arg x "$FO_HX" --arg y "$FO_HY" '[$a, $b, $x, $y, "3333333333333333333333333333333333333333"] | sort')" ] \
+  || { echo "FAIL: failover: head set was $_hs" >&2; exit 1; }
+! crqe_pr_head_set '{"not":"array"}' '[]' "$FO_HA" >/dev/null && ! crqe_pr_head_set '[]' '[]' abc >/dev/null \
+  || { echo "FAIL: failover: a malformed head-set input was accepted" >&2; exit 1; }
 [ "$(crqe_trigger_generation "$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10)")" | jq -sc .)" nathanjohnpayne)" = '[10]' ] \
   || { echo "FAIL: failover: an exempt trigger left the request generation" >&2; exit 1; }
 ! crqe_failover_marker_body abc 10 >/dev/null && ! crqe_failover_marker_body "$FO_HA" 0 >/dev/null \
   || { echo "FAIL: failover: a marker was built from an abbreviated head or a zero id" >&2; exit 1; }
-echo "PASS: failover markers exempt only the requester's own just-posted trigger (#2534)"
+echo "PASS: failover markers exempt only the requester's own just-posted trigger, on a head the PR had (#2534, #2553)"
 
 # #1598: a Codex request the configured author posts AFTER a Phase 4b
 # substitute approval supersedes it, so gate (c) does not clear on that
@@ -781,5 +819,102 @@ RESOLVER
   echo 'PASS: unreadable policy/history and malformed request evidence fail closed'
 )
 PASS=$((PASS + 18))
+
+# #1512: exercise the real checker's per-invocation flag contracts. The fake
+# GitHub API exposes one red required context; approval and Codex evidence
+# then distinguish an ordinary clearance failure from gate-(a)'s CI result.
+sed 's/require_ci_green: false/require_ci_green: true/' "$DIR/default-policy.yml" >"$DIR/flag-policy.yml"
+FLAG_HEAD=abcdef0123456789000000000000000000000000
+FLAG_OLD_HEAD=1111111111111111111111111111111111111111
+FLAG_CODEX_COMMENT=$(jq -cn --arg head "$FLAG_HEAD" \
+  '{id:990,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-09-14T00:05:00Z",body:("Codex Review: Didnt find any major issues.\nReviewed commit: " + $head)}')
+flag_reviews() {
+  # Three opinionated states for one registered, non-author reviewer.
+  jq -cn --arg head "$1" --arg old "$FLAG_OLD_HEAD" '
+    [
+      {user:{login:"nathanpayne-claude"},state:"APPROVED",commit_id:$head,submitted_at:"2026-09-14T00:02:00Z"},
+      {user:{login:"nathanpayne-claude"},state:"APPROVED",commit_id:$old,submitted_at:"2026-09-14T00:03:00Z"}
+    ]'
+}
+FLAG_OLD_LATEST=$(flag_reviews "$FLAG_HEAD")
+FLAG_HEAD_LATEST=$(printf '%s' "$FLAG_OLD_LATEST" | jq -c --arg head "$FLAG_HEAD" \
+  '. + [{user:{login:"nathanpayne-claude"},state:"APPROVED",commit_id:$head,submitted_at:"2026-09-14T00:04:00Z"}]')
+run_flag_checker() { # name reviews comments skip-ci require-head [reviews-fail]
+  local name=$1 reviews=$2 comments=$3 skip_ci=$4 require_head=$5 reviews_fail=${6:-0} rc=0
+  printf '%s\n' "$reviews" >"$DIR/reviews"
+  printf '%s\n' "$comments" >"$DIR/comments"
+  printf '[]\n' >"$DIR/ack"
+  : >"$DIR/calls"
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=flag-contract \
+    PR_BODY='' PR_AUTHOR=contributor ISSUE_REACTIONS='[]' REVIEWS_FAIL="$reviews_fail" BR_RETRY_SLEEP=0 \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/flag-policy.yml" \
+    CODEX_REVIEW_CHECK_SKIP_CI="$skip_ci" CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD="$require_head" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/flag-out" 2>&1 || rc=$?
+  printf '%s\n' "$rc" >"$DIR/flag-rc"
+}
+
+# The CI skip only skips gate (a): without either the reviewer approval or a
+# Codex signal, the real checker still returns its normal gate-failure exit 1.
+run_flag_checker skip-still-gates '[]' '[]' 1 ''
+if [ "$(cat "$DIR/flag-rc")" = 1 ] \
+   && grep -q 'gate (a): SKIPPED (codex.require_ci_green=false)' "$DIR/flag-out" \
+   && grep -q 'FAIL: no reviewer identity in available_reviewers' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 SKIP_CI skips red CI but reviewer and Codex clearance gates still block'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 SKIP_CI cleared a non-CI gate or did not skip gate (a)'; exit 1
+fi
+
+# With a current-head reviewer approval and anchored Codex verdict, the same
+# red CI blocks without SKIP_CI and clears with it.
+FLAG_HEAD_APPROVAL=$(jq -cn --arg head "$FLAG_HEAD" \
+  '[{user:{login:"nathanpayne-claude"},state:"APPROVED",commit_id:$head,submitted_at:"2026-09-14T00:04:00Z"}]')
+run_flag_checker red-ci-blocks "$FLAG_HEAD_APPROVAL" "[$FLAG_CODEX_COMMENT]" '' ''
+if [ "$(cat "$DIR/flag-rc")" = 1 ] && grep -q 'FAIL: CI not green: 1 non-passing check(s): Build (commit status)=FAILURE' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 red required CI blocks an otherwise-cleared review when SKIP_CI is absent'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 red required CI did not block without SKIP_CI'; exit 1
+fi
+run_flag_checker skip-red-ci-clears "$FLAG_HEAD_APPROVAL" "[$FLAG_CODEX_COMMENT]" 1 ''
+if [ "$(cat "$DIR/flag-rc")" = 0 ] \
+   && grep -q 'gate (a): SKIPPED (codex.require_ci_green=false)' "$DIR/flag-out" \
+   && grep -q 'gate (b): latest-state APPROVED by nathanpayne-claude' "$DIR/flag-out" \
+   && grep -q 'gate (c): cleared' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 SKIP_CI permits the other independently-cleared gates to decide'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 SKIP_CI did not preserve independent clearance gates'; exit 1
+fi
+
+# Without the head pin, the latest approval on an old head preserves legacy
+# behavior. With it, the latest opinionated state must itself name HEAD: an
+# earlier HEAD approval cannot survive a newer approval of an older commit.
+run_flag_checker old-approval-default "$FLAG_OLD_LATEST" "[$FLAG_CODEX_COMMENT]" 1 ''
+if [ "$(cat "$DIR/flag-rc")" = 0 ]; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 REQUIRE_APPROVAL_ON_HEAD unset preserves the existing any-head approval behavior'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 default approval behavior changed'; exit 1
+fi
+run_flag_checker latest-old-head-strict "$FLAG_OLD_LATEST" "[$FLAG_CODEX_COMMENT]" 1 1
+if [ "$(cat "$DIR/flag-rc")" = 1 ] \
+   && grep -q 'FAIL: no reviewer identity in available_reviewers has a latest-state APPROVED review' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 strict head pin rejects a newer old-head opinionated approval despite an earlier HEAD approval'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 strict head pin accepted an old-head latest approval'; exit 1
+fi
+run_flag_checker latest-head-strict "$FLAG_HEAD_LATEST" "[$FLAG_CODEX_COMMENT]" 1 1
+if [ "$(cat "$DIR/flag-rc")" = 0 ] \
+   && grep -q 'gate (b): latest-state APPROVED by nathanpayne-claude' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 strict head pin accepts the latest opinionated approval when it names exact HEAD'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 strict head pin rejected the latest exact-head approval'; exit 1
+fi
+
+# A real API-read failure remains infrastructure exit 3, distinct from the
+# normal not-cleared exit 1 above.
+run_flag_checker review-read-infra "$FLAG_HEAD_APPROVAL" "[$FLAG_CODEX_COMMENT]" 1 1 1
+if [ "$(cat "$DIR/flag-rc")" = 3 ] && grep -q 'failed to fetch reviews' "$DIR/flag-out"; then
+  PASS=$((PASS + 1)); echo 'PASS: #1512 an unreadable reviews API remains infrastructure exit 3'
+else
+  cat "$DIR/flag-out"; echo 'FAIL: #1512 reviews API failure did not remain infrastructure exit 3'; exit 1
+fi
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
