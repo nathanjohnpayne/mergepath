@@ -255,15 +255,17 @@ else
     fi
   fi
 
-  # #2580: every top-level scripts/*.sh that a suite a declared wrapper runs
-  # names is a declared dependency of that wrapper. An undeclared script
+  # #2580: every top-level scripts/*.sh that a declared wrapper names, in its
+  # own text or in a suite it runs, is a declared dependency of that wrapper. An undeclared script
   # costs both lanes: CI fails closed to the complete surface for it, and
   # the pre-push hook runs only the live assertions for it, so a change to
   # the script never runs the suite that exercises it before the push. A
   # script declared under one wrapper but named by another wrapper's suite is
   # worse: CI selects the first wrapper alone and skips the second suite
   # (#1839). Suites are read from the RAW wrapper text and scripts from the
-  # RAW suite text, comments included, for the reason given above (#2227):
+  # RAW wrapper and suite text, comments included, for the reason given
+  # above (#2227); a wrapper can inspect a script itself, as
+  # check_workflow_parsers does scripts/required-head-checks.sh:
   # a reference reader can only over-ask, and an over-ask is loud. A script
   # the lane's own definition covers (full_triggers) already selects
   # everything. Hub-only: the wrappers and suites are read from the tree.
@@ -275,15 +277,19 @@ else
     script_gaps=""
     script_edges=0
     gh_as_author_witness=0
+    wrapper_direct_witness=0
     while IFS= read -r wrapper; do
       [ -n "$wrapper" ] || continue
       [ -f "$ROOT/scripts/ci/$wrapper" ] || continue
       wrapper_patterns=$(jq -r --arg w "$wrapper" '.wrappers[$w][]' "$DEPENDENCIES")
       suites=$(grep -o 'tests/test_[A-Za-z0-9_]*\.\(sh\|py\|cjs\)' "$ROOT/scripts/ci/$wrapper" | LC_ALL=C sort -u || true)
-      named=$(while IFS= read -r suite; do
-          [ -n "$suite" ] && [ -f "$ROOT/$suite" ] || continue
-          grep -o 'scripts/[A-Za-z0-9_.-]*\.sh' "$ROOT/$suite" || true
-        done <<<"$suites" | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(printf '%s\n' "$top_scripts"))
+      named=$({
+          grep -o 'scripts/[A-Za-z0-9_.-]*\.sh' "$ROOT/scripts/ci/$wrapper" || true
+          while IFS= read -r suite; do
+            [ -n "$suite" ] && [ -f "$ROOT/$suite" ] || continue
+            grep -o 'scripts/[A-Za-z0-9_.-]*\.sh' "$ROOT/$suite" || true
+          done <<<"$suites"
+        } | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(printf '%s\n' "$top_scripts"))
       while IFS= read -r script; do
         [ -n "$script" ] || continue
         if matches_any_glob "$script" "$full_trigger_patterns"; then
@@ -293,13 +299,18 @@ else
         if [ "$wrapper" = check_gh_as_author ] && [ "$script" = scripts/gh-as-author.sh ]; then
           gh_as_author_witness=1
         fi
+        # Named only by the wrapper itself, so it is visible exactly when the
+        # wrapper's own text is read.
+        if [ "$wrapper" = check_workflow_parsers ] && [ "$script" = scripts/required-head-checks.sh ]; then
+          wrapper_direct_witness=1
+        fi
         matches_any_glob "$script" "$wrapper_patterns" || script_gaps="$script_gaps $wrapper:$script"
       done <<<"$named"
     done < <(jq -r '.wrappers | keys[]' "$DEPENDENCIES")
-    if [ -z "$script_gaps" ] && [ "$script_edges" -gt 0 ] && [ "$gh_as_author_witness" -eq 1 ]; then
-      pass "every top-level script a declared wrapper's suite names is declared under that wrapper ($script_edges edges)"
+    if [ -z "$script_gaps" ] && [ "$script_edges" -gt 0 ] && [ "$gh_as_author_witness" -eq 1 ] && [ "$wrapper_direct_witness" -eq 1 ]; then
+      pass "every top-level script a declared wrapper or its suites name is declared under that wrapper ($script_edges edges)"
     else
-      fail "scripts named by a wrapper's suites but not declared under that wrapper in repo-lint-dependencies.json (declare each under the wrapper that runs the suite; #2580; edges=$script_edges, gh-as-author witness=$gh_as_author_witness):$script_gaps"
+      fail "scripts named by a wrapper or its suites but not declared under that wrapper in repo-lint-dependencies.json (declare each under that wrapper; #2580; edges=$script_edges, gh-as-author witness=$gh_as_author_witness, wrapper-direct witness=$wrapper_direct_witness):$script_gaps"
     fi
   fi
 

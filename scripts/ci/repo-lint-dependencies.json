@@ -78,7 +78,8 @@
       "tests/test_merge_clearance_gate.sh",
       "scripts/workflow/installation-budget.sh",
       "scripts/gate-api-lineage-blocking.sh",
-      "scripts/merge-clearance-gate.sh"
+      "scripts/merge-clearance-gate.sh",
+      "scripts/codex-review-check.sh"
     ],
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh",
@@ -163,7 +164,8 @@
     ],
     "check_coderabbit_record_feedback": [
       "tests/test_coderabbit_record_feedback.sh",
-      "scripts/coderabbit-record-feedback.sh"
+      "scripts/coderabbit-record-feedback.sh",
+      "scripts/codex-record-feedback.sh"
     ],
     "check_coderabbit_severity_gate": [
       "tests/test_coderabbit_severity_gate.sh",
@@ -200,7 +202,8 @@
       "scripts/workflow/installation-budget.sh",
       "scripts/codex-p1-gate.sh",
       "scripts/codex-review-check.sh",
-      "scripts/review-feedback-accounting.sh"
+      "scripts/review-feedback-accounting.sh",
+      "scripts/gate-api-lineage-blocking.sh"
     ],
     "check_codex_scripts": [
       "scripts/lib/codex-request-evidence.sh",
@@ -250,7 +253,8 @@
     "check_disagreement_detector": [
       "tests/test_disagreement_detector.sh",
       "scripts/ci/fixtures/disagreement-detector/*",
-      "scripts/disagreement-detector.cjs"
+      "scripts/disagreement-detector.cjs",
+      "scripts/codex-review-check.sh"
     ],
     "check_doc_ownership": [
       "scripts/lib/ci-check-modes.sh",
@@ -318,7 +322,8 @@
     ],
     "check_gh_projects_move_item": [
       "scripts/gh-projects/move-item.sh",
-      "scripts/lib/ci-check-modes.sh"
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/identity-check.sh"
     ],
     "check_git_identity_hygiene": [
       "tests/test_git_identity_hygiene.sh"
@@ -340,7 +345,9 @@
       "scripts/daily-feedback-rollup.sh"
     ],
     "check_merge_group_required_checks": [
-      "tests/test_merge_group_required_checks.sh"
+      "tests/test_merge_group_required_checks.sh",
+      "scripts/gh-as-author.sh",
+      "scripts/identity-check.sh"
     ],
     "check_mktemp_portability": [
       "tests/test_check_mktemp_portability.sh"
@@ -424,7 +431,8 @@
       "scripts/phase-4b-classifier.sh"
     ],
     "check_pr_audit_codex_clearance": [
-      "scripts/ci/fixtures/pr-audit-codex-clearance/*"
+      "scripts/ci/fixtures/pr-audit-codex-clearance/*",
+      "scripts/codex-review-check.sh"
     ],
     "check_pr_review_policy_nudge": [
       "scripts/pr-review-policy-nudge.sh",
@@ -576,7 +584,9 @@
       "scripts/ci/fixtures/workflow-parsers/*",
       "scripts/lib/head-check-runs.sh",
       "scripts/codex-review-check.sh",
-      "scripts/merge-clearance-gate.sh"
+      "scripts/merge-clearance-gate.sh",
+      "scripts/op-preflight.sh",
+      "scripts/required-head-checks.sh"
     ],
     "check_workflow_verify_propagation_templated": [
       "tests/test_verify_propagation_pr_templated.sh"
