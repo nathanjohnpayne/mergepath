@@ -524,9 +524,20 @@ else
 fi
 undeclared_notice() {
   [ -n "$UNDECLARED" ] || return 0
-  local list
+  local list ran
   list=$(printf '%s' "$UNDECLARED" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g')
-  echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; this hook runs only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps not run here; MERGEPATH_PREPUSH_LIVE=all runs the wrappers, and with MERGEPATH_PREPUSH_DEEP=1 as well the deep steps)."
+  # Say what this invocation does with the expansion: --plan runs nothing,
+  # LIVE=all runs the fallback wrappers (and with DEEP=1 the deep steps).
+  if [ "$PLAN" -eq 1 ]; then
+    ran="a hook run executes only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps are not run by default)"
+  elif [ "$ALL_LIVE" -eq 1 ] && [ "$DEEP" -eq 1 ]; then
+    ran="MERGEPATH_PREPUSH_LIVE=all and MERGEPATH_PREPUSH_DEEP=1 run it here too ($FB_N fallback wrappers and $DEEPFB_N deep steps)"
+  elif [ "$ALL_LIVE" -eq 1 ]; then
+    ran="MERGEPATH_PREPUSH_LIVE=all runs its $FB_N fallback wrappers here; its $DEEPFB_N deep steps also need MERGEPATH_PREPUSH_DEEP=1"
+  else
+    ran="this hook runs only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps not run here; MERGEPATH_PREPUSH_LIVE=all runs the wrappers, and with MERGEPATH_PREPUSH_DEEP=1 as well the deep steps)"
+  fi
+  echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; $ran."
 }
 
 if [ "$PLAN" -eq 1 ]; then

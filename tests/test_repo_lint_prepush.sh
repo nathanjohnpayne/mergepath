@@ -745,6 +745,12 @@ rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LIVE=all git push origin feat/undecla
 check "undeclared path, MERGEPATH_PREPUSH_LIVE=all: push succeeds" "$rc" "0"
 if [ -f "$PROBE_DIR/ran.check_graphed" ]; then ok "MERGEPATH_PREPUSH_LIVE=all runs the fallback wrapper"; else bad "fallback wrapper not run under LIVE=all"; fi
 case "$out" in *"1 fallback wrappers"*) ok "MERGEPATH_PREPUSH_LIVE=all counts the fallback wrappers it runs" ;; *) bad "LIVE=all running line: $out" ;; esac
+# The notice describes this run, not the default one.
+case "$out" in
+  *"this hook runs only the live assertions"*) bad "LIVE=all notice still claims only the live assertions ran: $out" ;;
+  *"MERGEPATH_PREPUSH_LIVE=all runs its 1 fallback wrappers here; its 3 deep steps also need MERGEPATH_PREPUSH_DEEP=1"*) ok "MERGEPATH_PREPUSH_LIVE=all: the notice says the fallback wrappers ran and the deep steps need DEEP=1" ;;
+  *) bad "LIVE=all notice: $out" ;;
+esac
 
 # A failing selected check blocks the push and names the check.
 reset_probe
