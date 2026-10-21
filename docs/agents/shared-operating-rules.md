@@ -177,6 +177,8 @@ The link is what moves the issue on the repository's Project board. The board's 
 
 Use `Refs #N` instead when the pull request is only part of the work, so the merge does not close an issue that still has work left; move that issue between lanes by hand. What each lane means, and which moves are manual: `scripts/gh-projects/README.md` § Status lanes.
 
+One issue, one open pull request. `scripts/gh-as-author.sh -- gh pr create` refuses to open a pull request whose body links an issue that another open pull request in the same repository already links with any of those keywords, and names that pull request (exit `7`). Two sessions implementing one issue, discovered only by a merge conflict, is the failure it catches (nathanjohnpayne/mergepath#2562). When the second pull request is a deliberate split or a stacked tranche, name the first in `GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=<number>` and say so in the body; an open-PR list the wrapper cannot read refuses rather than passes. The check sees only open pull requests, so before starting on an issue read its newest comments and any open linked pull request, and leave a one-line claim through the reviewer wrapper, `<!-- mergepath-claim: <agent> <YYYY-MM-DD> -->` on its own line, so a session arriving in the window before your pull request exists sees who holds it; do not start on an issue whose newest claim is another identity's while that identity's pull request is still open or its claim is less than a day old.
+
 ## PR and issue titles/descriptions: describe the work, not the session
 
 Titles and descriptions — for both pull requests and issues — must describe the final state of the change (what it does and why) for a reader who arrives with no knowledge of the session that produced it.

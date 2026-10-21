@@ -985,6 +985,25 @@ jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.
 archive_of "$TMP/acked-once-body.txt" 8701
 run_gate
 assert_eq 0 "$RUN_RC" "an archived first-acknowledgement revision collapses with the twice-acknowledged live finding"
+
+# #2568: CodeRabbit's acknowledgement edit can also prepend the invisible
+# `<!-- coderabbit-ai-generated:v1 -->` header to a finding created without
+# it (observed on nathanpaynedotcom#1445). That header is framing, not
+# content: the reply before the edit still accounts for the live finding, and
+# the archived pre-edit revision demands no acknowledgement token.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "an acknowledgement edit that also prepends the generated header keeps the finding accounted (#2568)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "the header-only difference demands no inline acknowledgement token (#2568)"
+# Negative control: the header is stripped only as the first line, so a real
+# content change that comes with it is still an ordinary edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\nAlso rename the flag.\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8703
+run_gate
+assert_eq 1 "$RUN_RC" "a content change delivered with the generated header still raises the floor (#2568)"
 cp "$TMP/fixtures/inline-acked-crlf.json" "$TMP/fixtures/inline.json"
 jq -r '.[0].body' "$TMP/fixtures/inline-before-ack-crlf.json" >"$TMP/pre-ack-body-crlf.txt"
 archive_of "$TMP/pre-ack-body-crlf.txt" 8702

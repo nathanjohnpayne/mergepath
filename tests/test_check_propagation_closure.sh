@@ -131,7 +131,7 @@ tests/test_widget.sh"
 set +e
 out=$(run_raw "$MANIFEST_A" "$PATHS_A" "$CHECK_BODY_REFS_TEST"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references 'tests/test_widget.sh' but that path is NOT covered"; then
+if [ "$rc" = "1" ] && grep -q "references 'tests/test_widget.sh' but that path is NOT covered" <<<"$out"; then
   pass "Case (a): undeclared on-disk propagated ref fails closed naming the missing ref"
 else
   fail "Case (a) unexpected (rc=$rc): $out"
@@ -157,7 +157,7 @@ tests/test_widget.sh"
 set +e
 out=$(run_raw "$MANIFEST_B" "$PATHS_B" "$CHECK_BODY_REFS_TEST"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: PASS" <<<"$out"; then
   pass "Case (b): declaring the ref in requires: makes the check pass"
 else
   fail "Case (b) unexpected (rc=$rc): $out"
@@ -175,7 +175,7 @@ scripts/bootstrap/foo.sh"
 set +e
 out=$(run_raw "$MANIFEST_C" "$PATHS_C" "$CHECK_BODY_BOOTSTRAP"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: PASS" <<<"$out"; then
   pass "Case (c): allow-listed orchestrator ref (scripts/bootstrap/foo.sh) is exempt and passes"
 else
   fail "Case (c) unexpected (rc=$rc): $out"
@@ -185,7 +185,7 @@ fi
 set +e
 out=$(run_with_fixture "" "" "no-marker"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: SKIP"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: SKIP" <<<"$out"; then
   pass "Case (d): consumer checkout (no manifest, no marker) SKIPs with exit 0"
 else
   fail "Case (d) unexpected (rc=$rc): $out"
@@ -197,7 +197,7 @@ fi
 set +e
 out=$(run_with_fixture "" "" "marker"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "manifest must not be deleted/renamed"; then
+if [ "$rc" = "1" ] && grep -q "manifest must not be deleted/renamed" <<<"$out"; then
   pass "Case (e): manifest-absent + marker-present (mergepath) fails closed"
 else
   fail "Case (e) unexpected (rc=$rc): $out"
@@ -217,7 +217,7 @@ PATHS_F="scripts/ci/"
 set +e
 out=$(run_raw "$MANIFEST_F" "$PATHS_F" "$CHECK_BODY_GHOST"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: PASS" <<<"$out"; then
   pass "Case (f): undeclared ref that does not exist on disk is not flagged (exists-on-disk filter)"
 else
   fail "Case (f) unexpected (rc=$rc): $out"
@@ -244,7 +244,7 @@ PATHS_G="scripts/ci/"
 set +e
 out=$(run_raw "$MANIFEST_G" "$PATHS_G" "$CHECK_BODY_SELF" "scripts/ci/check_selfref.sh"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: PASS" <<<"$out"; then
   pass "Case (g): a propagated check naming its own .sh path is self-ref-skipped (no false positive)"
 else
   fail "Case (g) unexpected (rc=$rc): $out"
@@ -269,7 +269,7 @@ tests/test_widget.sh"
 set +e
 out=$(run_raw "$MANIFEST_H" "$PATHS_H" "$CHECK_BODY_REFS_TEST"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_propagation_closure: PASS" <<<"$out"; then
   pass "Case (h): a non-propagated check_* is not scanned (no false positive on its refs)"
 else
   fail "Case (h) unexpected (rc=$rc): $out"
@@ -301,7 +301,7 @@ scripts/helper.sh"
 set +e
 out=$(run_raw "$MANIFEST_I" "$PATHS_I" "$WORKFLOW_BODY" ".github/workflows/fixture.yml"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references 'scripts/helper.sh' but that path is NOT covered"; then
+if [ "$rc" = "1" ] && grep -q "references 'scripts/helper.sh' but that path is NOT covered" <<<"$out"; then
   pass "Case (i): exact-manifest workflow with undeclared on-disk script ref fails closed"
 else
   fail "Case (i) unexpected (rc=$rc): $out"
@@ -335,7 +335,7 @@ scripts/workflow/parse_policy_list.sh"
 set +e
 out=$(run_raw "$MANIFEST_J" "$PATHS_J" "$WORKFLOW_BODY_J" ".github/workflows/pr-review-policy.yml"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "references 'scripts/workflow/parse_policy_list.sh' but that path is NOT covered"; then
+if [ "$rc" = "1" ] && grep -q "references 'scripts/workflow/parse_policy_list.sh' but that path is NOT covered" <<<"$out"; then
   pass "Case (j): undeclared scripts/workflow/ helper ref in a propagated workflow fails closed (#543)"
 else
   fail "Case (j) unexpected (rc=$rc): $out"
