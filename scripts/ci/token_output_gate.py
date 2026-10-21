@@ -1598,6 +1598,7 @@ class Lexer:
             body, hd.owner, start_line, cur_ll, in_heredoc_body=True,
             source_offset=source_offset,
         )
+        masked = _mask_continued_pid_parameters(masked)
         for offset, raw in enumerate(masked.split("\n")):
             for name, in_ew in _iter_refs_ew(raw):
                 r = Ref(name, start_line + offset, hd.owner)
@@ -1849,11 +1850,14 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
-                if nxt == "$":
+                pid_end = _pid_parameter_end(text, i)
+                if pid_end is not None:
                     # PID special parameter: the second dollar cannot start a
-                    # named reference. Preserve raw spelling for word readers.
+                    # reference, even across an active continuation. Keep
+                    # logical word spelling and physical source line counts.
                     cur_level()["word"].append("$$")
-                    i += 2
+                    line += text[i:pid_end].count("\n")
+                    i = pid_end
                     continue
                 if nxt == "[":
                     # A raw legacy arithmetic bound withholds new ANSI proof
@@ -2704,6 +2708,34 @@ def _skip_balanced_parens_legacy(text, start):
     return n
 
 
+def _pid_parameter_end(text, start):
+    """Consume two expansion dollars across only active backslash-LF spans."""
+    if text[start:start + 1] != "$":
+        return None
+    end = start + 1
+    while text.startswith("\\\n", end):
+        end += 2
+    return end + 1 if text[end:end + 1] == "$" else None
+
+
+def _mask_continued_pid_parameters(text):
+    """Keep physical here-doc lines while consuming a cross-line PID pair."""
+    chars = list(text)
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        end = _pid_parameter_end(text, i)
+        if end is not None:
+            if end > i + 2:
+                chars[i] = chars[end - 1] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(chars)
+
+
 def ident_at(text, pos):
     """Match a shell identifier at `pos`, transparently across `\\<newline>`.
 
@@ -2885,8 +2917,9 @@ def _iter_refs_at(s):
             i += 2
             continue
         if ch == "$":
-            if s.startswith("$$", i):
-                i += 2
+            pid_end = _pid_parameter_end(s, i)
+            if pid_end is not None:
+                i = pid_end
                 continue
             if i + 1 < n and s[i + 1] == "{":
                 name = braced_ref_at(s, i)
@@ -4358,8 +4391,9 @@ def _heredoc_data_has_positional(body):
         if body[i] == "\\" and body[i + 1:i + 2] in ("$", "`", "\\", "\n"):
             i += 2
             continue
-        if body.startswith("$$", i):
-            i += 2
+        pid_end = _pid_parameter_end(body, i)
+        if pid_end is not None:
+            i = pid_end
             continue
         if body.startswith("${", i):
             try:
@@ -4435,8 +4469,9 @@ def _word_has_verbatim_positional_exact(w):
         if in_double and c == "$" and w[i + 1 : i + 2] == "{":
             _simple_parameter_end(w, i)  # raises on a word it cannot read
         if c == "$":
-            if w.startswith("$$", i):
-                i += 2
+            pid_end = _pid_parameter_end(w, i)
+            if pid_end is not None:
+                i = pid_end
                 continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
@@ -4478,8 +4513,9 @@ def _word_has_verbatim_positional_legacy(w):
             i = n if j == -1 else j + 1
             continue
         if c == "$":
-            if w.startswith("$$", i):
-                i += 2
+            pid_end = _pid_parameter_end(w, i)
+            if pid_end is not None:
+                i = pid_end
                 continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
@@ -15727,6 +15763,43 @@ KNOWN_BROADER.update({cid: (
     "option state are reconstructed (#1465 extglob review repair)."
 ) for cid in ('eval-extglob-extglob-not', 'eval-extglob-safe-matched-plus', 'eval-extglob-safe-unmatched-at', 'eval-extglob-opener-not-space')})
 
+def _pid_continuation_cases():
+    """Preserve logical dollar pairs and physical reference positions."""
+    failures = []
+    for reader in (_word_has_verbatim_positional_exact,
+                   _word_has_verbatim_positional_legacy,
+                   _heredoc_data_has_positional):
+        for word, expected in (
+            ("$\\\n$$1", True),
+            ("$\\\n$1", False),
+            ("$\\\n$${1}", True),
+            ("$\\\n${1}", False),
+            ("$\\\n$\\\n$1", True),
+            ("$\\\\\n$$1", False),
+        ):
+            if reader(word) != expected:
+                failures.append("PID continuation %s: %r expected %s" %
+                                (reader.__name__, word, expected))
+    raw = "$\\\n$$GH_TOKEN"
+    clean = "$\\\n$GH_TOKEN"
+    if _iter_refs_at(raw) != [("GH_TOKEN", raw.rfind("$GH_TOKEN"))]:
+        failures.append("PID continuation raw reader: real dollar offset lost")
+    if _iter_refs_at(clean):
+        failures.append("PID continuation raw reader: literal PID suffix flagged")
+    for source, expected_lines in (
+        ("echo \"$\\\n$$GH_TOKEN\"\necho \"$GH_TOKEN\"\n", [2,3]),
+        ("echo \"$\\\n\\\n$$GH_TOKEN\"\n", [3]),
+        ("cat <<EOF\n$\\\n$$GH_TOKEN\nEOF\n", [3]),
+        ("cat <<EOF\n$\\\n$GH_TOKEN\nEOF\n", []),
+        ("echo \"$\\\n$GH_TOKEN\"\necho \"$GH_TOKEN\"\n", [3]),
+    ):
+        findings, errors = scan_text(source)
+        if errors or [f.line for f in findings] != expected_lines:
+            failures.append("PID continuation source lines: %r expected %s, got %s/%s" %
+                            (source, expected_lines, [f.line for f in findings], errors))
+    return failures
+
+
 def _pid_special_parameter_cases():
     """Pin independent readers and later real-reference source coordinates."""
     failures = []
@@ -16418,6 +16491,29 @@ CORPUS += [
     ("pid-helper-escaped-first-real", MUST_FLAG, r'show() { echo "\$$1"; }; show "$GH_TOKEN"' + '\n'),
     ("pid-helper-heredoc", MUST_NOT_FLAG, 'show() { cat <<EOF\n$$1\nEOF\n}; show "$GH_TOKEN"\n'),
     ("pid-helper-heredoc-real", MUST_FLAG, 'show() { cat <<EOF\n$1\nEOF\n}; show "$GH_TOKEN"\n'),
+]
+
+
+# #1456 continuation repair: only active backslash-LF between PID dollars.
+CORPUS += [
+    ("pid-continuation-named-quoted", MUST_FLAG, "echo \"$\\\n$$GH_TOKEN\"\n"),
+    ("pid-continuation-named-unquoted", MUST_FLAG, "echo $\\\n$$GH_TOKEN\n"),
+    ("pid-continuation-named-braced", MUST_FLAG, "echo \"$\\\n$${GH_TOKEN}\"\n"),
+    ("pid-continuation-named-both-splits", MUST_FLAG, "echo \"$\\\n$\\\n$GH_TOKEN\"\n"),
+    ("pid-continuation-named-repeated-split", MUST_FLAG, "echo \"$\\\n\\\n$$GH_TOKEN\"\n"),
+    ("pid-continuation-named-pid-literal", MUST_NOT_FLAG, "echo \"$\\\n$GH_TOKEN\"\n"),
+    ("pid-continuation-named-braced-literal", MUST_NOT_FLAG, "echo \"$\\\n${GH_TOKEN}\"\n"),
+    ("pid-continuation-named-inactive-backslash", MUST_NOT_FLAG, "echo \"$\\\\\n$$GH_TOKEN\"\n"),
+    ("pid-continuation-named-escaped-first", MUST_NOT_FLAG, "echo \"\\$\\\n$$GH_TOKEN\"\n"),
+    ("pid-continuation-named-later-real", MUST_FLAG, "echo \"$\\\n$GH_TOKEN\"\necho \"$GH_TOKEN\"\n"),
+    ("pid-continuation-heredoc-real", MUST_FLAG, "cat <<EOF\n$\\\n$$GH_TOKEN\nEOF\n"),
+    ("pid-continuation-heredoc-literal", MUST_NOT_FLAG, "cat <<EOF\n$\\\n$GH_TOKEN\nEOF\n"),
+    ("pid-continuation-heredoc-braced-real", MUST_FLAG, "cat <<EOF\n$\\\n$${GH_TOKEN}\nEOF\n"),
+    ("pid-continuation-helper-real", MUST_FLAG, "show(){ echo \"$\\\n$$1\"; }; show \"$GH_TOKEN\"\n"),
+    ("pid-continuation-helper-literal", MUST_NOT_FLAG, "show(){ echo \"$\\\n$1\"; }; show \"$GH_TOKEN\"\n"),
+    ("pid-continuation-helper-braced-real", MUST_FLAG, "show(){ echo \"$\\\n$${1}\"; }; show \"$GH_TOKEN\"\n"),
+    ("pid-continuation-helper-heredoc-real", MUST_FLAG, "show(){ cat <<EOF\n$\\\n$$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
+    ("pid-continuation-helper-heredoc-literal", MUST_NOT_FLAG, "show(){ cat <<EOF\n$\\\n$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
 ]
 
 
@@ -17694,6 +17790,7 @@ def self_test():
 
     failures.extend(_corpus_id_cases())
     failures.extend(_pid_special_parameter_cases())
+    failures.extend(_pid_continuation_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
