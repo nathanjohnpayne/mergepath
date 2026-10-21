@@ -111,10 +111,7 @@
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
 #      `max_ack_retries` if no acknowledgment appears. The eyes
-#      acknowledgment is never treated as clearance. A retry that is not
-#      written (the request cap, the wrapper's authorization, or a failed
-#      write) leaves the run polling the request it already confirmed
-#      (#2582).
+#      acknowledgment is never treated as clearance.
 #   5. Polls every 15 seconds for up to `review_timeout_seconds`
 #      measured from the latest trigger comment, while accepting a
 #      terminal response to any trigger posted in this run, for any of
@@ -2025,8 +2022,8 @@ run_feedback_accounting_gate() {
   esac
 }
 
-post_author_pr_comment() { # <body> <purpose> [body-file|inline] [fatal|soft]
-  local body="$1" purpose="$2" mode="${3:-body-file}" on_failure="${4:-fatal}" AS_AUTHOR bridge_author_pat=""
+post_author_pr_comment() { # <body> <purpose> [body-file|inline]
+  local body="$1" purpose="$2" mode="${3:-body-file}" AS_AUTHOR bridge_author_pat=""
   local body_file="" output="" rc=0 identity_checker
   local -a body_args
   AS_AUTHOR="$__CODEX_REQUEST_DIR/gh-as-author.sh"
@@ -2091,13 +2088,27 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline] [fatal|soft]
       || rc=$?
   fi
   [ -z "$body_file" ] || rm -f "$body_file"
-  AUTHOR_COMMENT_OUTPUT="$output"
-  if [ "$rc" -ne 0 ]; then
-    # A soft caller reports the failed write itself; the output is the same
-    # wrapper diagnostic the fatal path prints.
-    [ "$on_failure" = soft ] || die 3 "failed to post $purpose: $output"
-    return 1
+  if [ "$rc" -ne 0 ] && [ "$TRIGGER_POSTED" = true ] \
+     && [ "$mode" = inline ] && [ "$body" = '@codex review' ] \
+     && grep -Fqx '[codex-review-request] ERROR: trigger not authorized: existing-trigger' <<< "$output"; then
+    # The real wrapper's canonical authorizer may refuse an ack retry as a
+    # duplicate. Preserve this run's confirmed request and its original poll
+    # clock, but only while fresh evidence still names that exact request.
+    local ack_comments ack_trigger
+    revalidate_request_freshness
+    ack_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "ack retry duplicate evidence") \
+      || die 3 "cannot confirm the refused acknowledgement retry's existing trigger"
+    ack_trigger=$(crqe_select_trigger "$ack_comments" "$AUTHOR_IDENTITY" "") \
+      || die 3 "cannot select the refused acknowledgement retry's existing trigger"
+    if printf '%s' "$ack_trigger" | jq -e --arg id "$TRIGGER_COMMENT_ID" --arg created "$TRIGGER_POST_TIME" \
+         '(.id | tostring) == $id and .created_at == $created' >/dev/null 2>&1; then
+      ACK_RETRY_REFUSED_BY_EXISTING=true
+      log "existing trigger $TRIGGER_COMMENT_ID refused the acknowledgement retry — continuing normal review poll"
+      return 1
+    fi
   fi
+  [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
+  AUTHOR_COMMENT_OUTPUT="$output"
 }
 
 # The request-attempt cap is an intentional review-loop stop, not an API
@@ -2555,7 +2566,7 @@ post_codex_trigger() {
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
     || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
-  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
+  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY" "$(failover_head_set "$request_comments")") \
     || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
   # Below the ceiling, a new request is about to be written: the blocking
   # budget gates it. At the ceiling, the check runs only where a stop is about
@@ -2641,23 +2652,16 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
-  # An acknowledgement retry re-asks for a request this run already confirmed
-  # on the timeline (#2582). If the retry is not written, whether the
-  # canonical authorization refused it or the write failed, that confirmed
-  # request still gets its ordinary bounded poll, as when the request cap
-  # suppresses the retry. An initial request has nothing to poll and still
-  # fails closed.
-  local write_failure=fatal
-  [ "$TRIGGER_POSTED" != true ] || write_failure=soft
+  # A new request names this run's mode for the wrapper's authorization
+  # (#2582). An eyes-ack retry names none: the authorization then refuses it
+  # as the existing trigger, and this run keeps polling the request it
+  # confirmed without spending another (#2631).
+  local caller_mode="$REQUEST_MODE"
+  [ "$TRIGGER_POSTED" != true ] || caller_mode=""
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
-  if ! MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
-    MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$REQUEST_MODE" \
-    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline "$write_failure"; then
-    ACK_RETRY_NOT_POSTED=true
-    log "acknowledgement retry was not posted: $AUTHOR_COMMENT_OUTPUT"
-    log "continuing normal review poll on confirmed trigger comment ${TRIGGER_COMMENT_ID:-unknown}"
-    return 1
-  fi
+  MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
+    MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
+    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
 
@@ -2818,7 +2822,7 @@ run_trigger_ack_gate() {
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
     if ! post_codex_trigger; then
-      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ] || [ "$ACK_RETRY_NOT_POSTED" = true ]; then
+      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ] || [ "$ACK_RETRY_REFUSED_BY_EXISTING" = true ]; then
         return 0
       fi
       die 3 "acknowledgement retry did not post a Codex trigger"
@@ -2907,6 +2911,22 @@ record_phase4a_timeout_determination() {
   log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
 }
 
+# #2553: the heads a failover marker may name, read only when one is present.
+# An unreadable read prints [], so every trigger counts. The force-push heads
+# come from GraphQL (#2591); if that read fails, only they are left out.
+failover_head_set() { # <comments-json>
+  local commits timeline forced
+  if ! crqe_failover_markers_present "$1" "$AUTHOR_IDENTITY"; then printf '[]'; return 0; fi
+  forced=$(crqe_force_push_heads "$REPO" "$PR_NUMBER" 2>/dev/null) || forced='[]'
+  if commits=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/commits" "PR commits for failover markers" 2>/dev/null) \
+     && timeline=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline for failover markers" 2>/dev/null) \
+     && crqe_pr_head_set "$commits" "$timeline" "$HEAD_SHA" "$forced"; then
+    return 0
+  fi
+  log "failover markers: the PR's head set is unreadable; every trigger counts toward the request ceiling"
+  printf '[]'
+}
+
 # #2534: record the trigger the CodeRabbit rate-limit failover just posted, so
 # the request ceiling does not count it (crqe_failover_trigger_ids). Runs only
 # for a trigger this run posted with a confirmed id. The marker is best effort:
@@ -2918,7 +2938,7 @@ record_failover_marker() {
     printf 'not-posted'
     return 0
   fi
-  if ! command -v crqe_failover_marker_body crqe_failover_trigger_ids >/dev/null 2>&1 \
+  if ! command -v crqe_failover_marker_body crqe_failover_trigger_ids crqe_pr_head_set >/dev/null 2>&1 \
      || ! body=$(crqe_failover_marker_body "$HEAD_SHA" "$TERMINAL_TRIGGER_COMMENT_ID"); then
     log "failover marker: helper unavailable or invalid input; the trigger counts toward the request ceiling"
     printf 'failed'
@@ -2931,7 +2951,7 @@ record_failover_marker() {
   fi
   # Readback through the same parser the ceiling uses.
   if comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex failover marker readback" 2>/dev/null) \
-     && crqe_failover_trigger_ids "$comments" "$AUTHOR_IDENTITY" 2>/dev/null \
+     && crqe_failover_trigger_ids "$comments" "$AUTHOR_IDENTITY" "$(failover_head_set "$comments")" 2>/dev/null \
         | jq -e --argjson id "$TERMINAL_TRIGGER_COMMENT_ID" 'index($id) != null' >/dev/null 2>&1; then
     log "failover marker: trigger $TERMINAL_TRIGGER_COMMENT_ID is exempt from the request ceiling"
     printf 'recorded'
@@ -3107,7 +3127,7 @@ TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 ACK_RETRY_REFUSED_BY_CAP=false
-ACK_RETRY_NOT_POSTED=false
+ACK_RETRY_REFUSED_BY_EXISTING=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
@@ -3122,14 +3142,15 @@ RESUMED_EVER=false
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
-# #2582: the no-write decisions below belong to a request mode. A requester
-# applies its own. The wrapper's authorization pass runs as --trigger-only, so
-# it applies the mode of the canonical requester that is about to write, which
-# names it in MERGEPATH_CODEX_TRIGGER_CALLER_MODE. Polling mode posts by design
-# while a trigger is already on HEAD (the eyes-ack retry, a pending request
-# with no provider evidence, a resumed request that expired), so authorizing
-# that write must not refuse it as a #489 duplicate. Without the variable the
-# stricter trigger-only decisions apply.
+# The no-write decisions below belong to a request mode. A requester applies
+# its own. The wrapper's authorization pass runs as --trigger-only, so it
+# applies the mode the canonical requester names in
+# MERGEPATH_CODEX_TRIGGER_CALLER_MODE (#2582). Polling mode posts a new request
+# while an earlier trigger is on HEAD by design (a pending request with no
+# provider evidence, the replacement for a resumed request that expired), so
+# authorizing that write must not refuse it as a #489 duplicate. Without the
+# variable, the stricter trigger-only decisions apply; the eyes-ack retry
+# relies on that refusal to keep polling without spending a request.
 REQUEST_MODE=poll
 [ "$TRIGGER_ONLY" != true ] || REQUEST_MODE="trigger-only"
 if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then

@@ -542,34 +542,43 @@ assert_grep "D11: propagation lane extracts only the source SHA (#1150)" \
 
 # Execute the workflow's parser itself so these case-boundary vectors cannot
 # pass by merely duplicating the intended regex in this test.
-sync_key_parser="$(awk '
-  /^            if \[\[ "\$SYNC_KEY" =~ \^sync-all-/ { capture=1 }
-  capture {
-    is_end=($0 == "            fi")
-    sub(/^            /, "")
-    print
-    if (is_end) exit
-  }
-' "$W/pr-review-policy.yml")"
-parse_sync_key() {
-  local SYNC_KEY="$1" SYNC_SHA=""
-  eval "$sync_key_parser"
-  printf '%s\n' "$SYNC_SHA"
-}
-scoped_lower="$(parse_sync_key 'sync-all-abcdef1-0123456789ab')"
-scoped_upper="$(parse_sync_key 'sync-all-ABCDEF1-0123456789ab')"
-legacy_upper="$(parse_sync_key 'sync-all-ABCDEF1')"
-[ "$scoped_lower" = "abcdef1" ] \
-  && pass "D11 runtime: lowercase scoped sync-all key extracts its source SHA" \
-  || fail "D11 runtime: lowercase scoped sync-all key was rejected"
-if [[ "$scoped_upper" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-  fail "D11 runtime: uppercase scoped sync-all key widened the new grammar"
+if [ -f "$W/pr-review-policy.yml" ]; then
+  if ! sync_key_parser="$(awk '
+    /^            if \[\[ "\$SYNC_KEY" =~ \^sync-all-/ { capture=1 }
+    capture {
+      is_end=($0 == "            fi")
+      sub(/^            /, "")
+      print
+      if (is_end) exit
+    }
+  ' "$W/pr-review-policy.yml")"; then
+    fail "D11 runtime: workflow parser extraction failed"
+  elif [ -z "$sync_key_parser" ]; then
+    fail "D11 runtime: workflow parser extraction is empty"
+  else
+    parse_sync_key() {
+      local SYNC_KEY="$1" SYNC_SHA=""
+      eval "$sync_key_parser"
+      printf '%s\n' "$SYNC_SHA"
+    }
+    scoped_lower="$(parse_sync_key 'sync-all-abcdef1-0123456789ab')"
+    scoped_upper="$(parse_sync_key 'sync-all-ABCDEF1-0123456789ab')"
+    legacy_upper="$(parse_sync_key 'sync-all-ABCDEF1')"
+    [ "$scoped_lower" = "abcdef1" ] \
+      && pass "D11 runtime: lowercase scoped sync-all key extracts its source SHA" \
+      || fail "D11 runtime: lowercase scoped sync-all key was rejected"
+    if [[ "$scoped_upper" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+      fail "D11 runtime: uppercase scoped sync-all key widened the new grammar"
+    else
+      pass "D11 runtime: uppercase scoped sync-all key is rejected"
+    fi
+    [ "$legacy_upper" = "ABCDEF1" ] \
+      && pass "D11 runtime: legacy uppercase sync-all SHA remains accepted" \
+      || fail "D11 runtime: legacy uppercase sync-all SHA compatibility changed"
+  fi
 else
-  pass "D11 runtime: uppercase scoped sync-all key is rejected"
+  echo "SKIP: D11 runtime: pr-review-policy.yml absent"; SKIP=$((SKIP + 1))
 fi
-[ "$legacy_upper" = "ABCDEF1" ] \
-  && pass "D11 runtime: legacy uppercase sync-all SHA remains accepted" \
-  || fail "D11 runtime: legacy uppercase sync-all SHA compatibility changed"
 
 # Source-commit provenance: the branch-name SHA may name ANY commit in the
 # public mergepath repo, so the lane resolves it to ONE full commit and

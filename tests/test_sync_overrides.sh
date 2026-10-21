@@ -314,7 +314,7 @@ cat >"$scalar_subs" <<'YAML'
 substitutions: "this is a scalar, not a map"
 YAML
 out=$("$VALIDATOR" "$scalar_subs" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "must be a map"; then
+if grep -q "must be a map" <<<"$out"; then
   pass "scalar substitutions → clean diagnostic, not a crash"
 else
   fail "scalar substitutions did not produce expected diagnostic; got: $out"
@@ -326,7 +326,7 @@ cat >"$scalar_skip" <<'YAML'
 skip_paths: "scalar instead of sequence"
 YAML
 out=$("$VALIDATOR" "$scalar_skip" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "must be a sequence"; then
+if grep -q "must be a sequence" <<<"$out"; then
   pass "scalar skip_paths → clean diagnostic, not a crash"
 else
   fail "scalar skip_paths did not produce expected diagnostic; got: $out"
@@ -341,7 +341,7 @@ cat >"$scalar_root" <<'YAML'
 "not-a-map"
 YAML
 out=$("$VALIDATOR" "$scalar_root" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "document root must be a map"; then
+if grep -q "document root must be a map" <<<"$out"; then
   pass "scalar root → clean diagnostic, not a silent pass"
 else
   fail "scalar root did not produce expected diagnostic; got: $out"
@@ -354,7 +354,7 @@ cat >"$seq_root" <<'YAML'
 - entry-two
 YAML
 out=$("$VALIDATOR" "$seq_root" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "document root must be a map"; then
+if grep -q "document root must be a map" <<<"$out"; then
   pass "sequence root → clean diagnostic"
 else
   fail "sequence root did not produce expected diagnostic; got: $out"
@@ -396,7 +396,7 @@ substitutions:
   phase_4b_default: fallback-only
 YAML
 out=$("$VALIDATOR" "$bare_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "must be a map with 'value' and 'reason'"; then
+if grep -q "must be a map with 'value' and 'reason'" <<<"$out"; then
   pass "bare-scalar substitution → rejected with clear diagnostic"
 else
   fail "bare-scalar substitution should be rejected; got: $out"
@@ -410,7 +410,7 @@ substitutions:
     value: fallback-only
 YAML
 out=$("$VALIDATOR" "$no_reason_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing or empty 'reason' field"; then
+if grep -q "missing or empty 'reason' field" <<<"$out"; then
   pass "substitution without reason → rejected"
 else
   fail "substitution without reason should be rejected; got: $out"
@@ -425,7 +425,7 @@ substitutions:
     reason: "   "
 YAML
 out=$("$VALIDATOR" "$ws_reason_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing or empty 'reason' field"; then
+if grep -q "missing or empty 'reason' field" <<<"$out"; then
   pass "substitution with whitespace-only reason → rejected"
 else
   fail "substitution with whitespace reason should be rejected; got: $out"
@@ -439,7 +439,7 @@ substitutions:
     reason: forgot the value field
 YAML
 out=$("$VALIDATOR" "$no_value_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing 'value' field"; then
+if grep -q "missing 'value' field" <<<"$out"; then
   pass "substitution without value → rejected"
 else
   fail "substitution without value should be rejected; got: $out"
@@ -458,7 +458,7 @@ substitutions:
     reason: oops, forgot the actual value
 YAML
 out=$("$VALIDATOR" "$null_value_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing or empty 'value' field"; then
+if grep -q "missing or empty 'value' field" <<<"$out"; then
   pass "substitution with value: null → rejected"
 else
   fail "substitution with null value should be rejected; got: $out"
@@ -474,7 +474,7 @@ substitutions:
     reason: ditto, but with explicit empty string
 YAML
 out=$("$VALIDATOR" "$empty_value_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing or empty 'value' field"; then
+if grep -q "missing or empty 'value' field" <<<"$out"; then
   pass "substitution with value: \"\" → rejected"
 else
   fail "substitution with empty value should be rejected; got: $out"
@@ -490,7 +490,7 @@ substitutions:
     reason: whitespace value
 YAML
 out=$("$VALIDATOR" "$ws_value_sub" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing or empty 'value' field"; then
+if grep -q "missing or empty 'value' field" <<<"$out"; then
   pass "substitution with whitespace-only value → rejected"
 else
   fail "substitution with whitespace value should be rejected; got: $out"
@@ -504,7 +504,7 @@ cat >"$no_version" <<'YAML'
 skip_paths: []
 YAML
 out=$("$VALIDATOR" "$no_version" "$MANIFEST" 2>&1 || true)
-if echo "$out" | grep -q "missing required top-level key: version"; then
+if grep -q "missing required top-level key: version" <<<"$out"; then
   pass "non-empty file without version → rejected"
 else
   fail "missing version should be rejected; got: $out"
@@ -558,8 +558,8 @@ skip_paths:
     reason: exercise manifest parsing
 YAML
 out=$("$VALIDATOR" "$manifest_parse_override" "$malformed_manifest" 2>&1 || true)
-if echo "$out" | grep -q "failed to parse manifest" \
-   && ! echo "$out" | grep -q "has no paths declared"; then
+if grep -q "failed to parse manifest" <<<"$out" \
+   && ! grep -q "has no paths declared" <<<"$out"; then
   pass "malformed manifest → parse failure is preserved"
 else
   fail "malformed manifest should preserve its parse failure; got: $out"
@@ -571,8 +571,8 @@ version: 1
 paths: []
 YAML
 out=$("$VALIDATOR" "$manifest_parse_override" "$empty_paths_manifest" 2>&1 || true)
-if echo "$out" | grep -q "has no paths declared" \
-   && ! echo "$out" | grep -q "failed to parse manifest"; then
+if grep -q "has no paths declared" <<<"$out" \
+   && ! grep -q "failed to parse manifest" <<<"$out"; then
   pass "valid empty manifest paths → distinct no-paths failure is preserved"
 else
   fail "valid empty manifest paths should retain the no-paths diagnostic; got: $out"

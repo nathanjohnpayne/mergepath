@@ -135,7 +135,9 @@
       this.inflight.title = `${evidenceAge(row.codex)}${row.codex.stale ? " · stale" : ""}`;
       safeLink(this.inflight, row.codex.url);
       this.inflight.className = `pr-flag ${row.codex.in_flight_on_head === true ? "run" : ""}`;
-      this.stops.textContent = row.codex.human_stops === null ? "Human-stop evidence unknown" : row.codex.human_stops.length ? `Human stop: ${row.codex.human_stops.join(", ")}` : ""; this.stops.hidden = !this.stops.textContent;
+      const standing = row.codex.human_stops === null ? "Human-stop evidence unknown" : row.codex.human_stops.length ? `Human stop: ${row.codex.human_stops.join(", ")}` : "";
+      const released = Array.isArray(row.codex.owner_tiebreaks) && row.codex.owner_tiebreaks.length ? `Owner tiebreak released: ${row.codex.owner_tiebreaks.map(tiebreak => `${tiebreak.kind}${decimal(tiebreak.finding) ? ` #${tiebreak.finding}` : ""}`).join(", ")}` : "";
+      this.stops.textContent = [standing, released].filter(Boolean).join(" · "); this.stops.hidden = !this.stops.textContent; this.stops.className = `pr-flag${standing ? " stop" : ""}`;
       this.feedback.textContent = `${row.feedback.accounted ?? "?"} / ${row.feedback.posted ?? "?"}`; this.feedback.classList.toggle("short", row.feedback.accounted !== null && row.feedback.posted !== null && row.feedback.accounted < row.feedback.posted);
       this.feedbackNote.textContent = `accounted / posted${row.feedback.stale ? " · stale" : ""} · ${evidenceAge(row.feedback)}`;
       const crLabel = row.coderabbit.status === "reported" && row.coderabbit.head === row.head ? "Reviewed on HEAD" : row.coderabbit.status === "paused" || row.coderabbit.skip_reason === "paused" ? "Paused" : row.coderabbit.status === "rate_limit_stalled" ? "Rate-limited" : row.coderabbit.status === "findings" ? "Findings on HEAD" : row.coderabbit.status === "skipped" ? "Skipped" : row.coderabbit.status === "no_review_yet" ? "No review on HEAD" : row.coderabbit.status === "unknown" ? "Unknown" : "Review pending";

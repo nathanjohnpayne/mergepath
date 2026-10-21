@@ -432,8 +432,9 @@ agent_reply_after_finding() {
 #   3. reply marker, confirmation line, `auto-generated comment` footer;
 #   4. confirmation line, then either footer (the original #1000 form);
 #   5. the footer rewritten to the reply marker with NO confirmation line,
-#      after a reply CodeRabbit does not confirm (handled below the FINDINGS
-#      loop from the relay's record, since it carries no marker of its own);
+#      after a reply CodeRabbit does not confirm (decided below the FINDINGS
+#      loop from the relay's record, or from GitHub's own edit history when
+#      no record applies (#2598), since it carries no marker of its own);
 # and any of them stacked when CodeRabbit acknowledges again. The wording of
 # the confirmation line varies (`✅ Confirmed as addressed by @<login>`,
 # `✅ Addressed in commit <sha>`, plurals), so recognition is anchored on the
@@ -567,11 +568,86 @@ EOF
 # footer/confirmation run, carriage returns and trailing blank lines removed,
 # for comparing two revisions of one finding on content. The run is removed
 # only when the raw body and its visible text agree on it; otherwise only the
-# carriage returns and trailing blank lines go.
+# carriage returns and trailing blank lines go. A leading
+# `<!-- coderabbit-ai-generated:v1 -->` line and the blank lines after it go
+# too: CodeRabbit's acknowledgement edit prepends that invisible header to a
+# finding created without it, which is vendor framing, not content (#2568).
 coderabbit_strip_ack_suffix() {
   local body="$1" mode=strip
   coderabbit_ack_run "$body" >/dev/null 2>&1 || mode=trim
-  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK"
+  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK" | awk '
+    NR == 1 && /^<!-- coderabbit-ai-generated:v1 -->[ \t\r]*$/ { header = 1; next }
+    header && /^[ \t\r]*$/ { next }
+    { header = 0; print }
+  '
+}
+
+# coderabbit_footer_only_run <body> — exit 0 when the body ends in a trusted
+# run that holds the reply marker and no confirmation line: shape 5, the
+# footer CodeRabbit rewrites after a reply it does not confirm. An
+# acknowledging run, a run without the reply marker (an unedited finding
+# ends in its comment footer), no run, or an untrusted run exits 1.
+coderabbit_footer_only_run() {
+  local body="$1" run
+  run=$(coderabbit_ack_run "$body") || return 1
+  [ -n "$run" ] || return 1
+  if printf '%s\n' "$run" | awk -v mode=suffix "$CODERABBIT_ACK_PAIR_AWK" >/dev/null; then
+    return 1
+  fi
+  grep -qxF -- '<!-- This is an auto-generated reply by CodeRabbit -->' <<<"$run"
+}
+
+# coderabbit_edit_history <node id> — GitHub's own record of an inline
+# comment's revisions (#2598), newest first, as a JSON array of
+# {edited_at, readable, body}: `body` is the revision's full text, and
+# `readable` is false when GitHub withholds it or the revision was deleted.
+# GitHub lists the creation as the oldest revision when it holds the
+# original text, so a history identical throughout reaches the finding's
+# creation. Exit 1 with nothing on stdout when the read fails or the comment
+# no longer resolves; the caller then has no record and fails closed.
+coderabbit_edit_history() {
+  local node_id="$1" pages
+  pages=$(gh api graphql --paginate --slurp -F id="$node_id" -f query='
+query($id: ID!, $endCursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewComment {
+      userContentEdits(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { editedAt deletedAt diff }
+      }
+    }
+  }
+}' 2>/dev/null) || return 1
+  printf '%s' "$pages" | jq -ce '
+    map(.data.node.userContentEdits // error("no edit history"))
+    | map(.nodes // []) | add // []
+    | map({edited_at: (.editedAt // ""),
+           readable: (.deletedAt == null and (.diff | type) == "string"),
+           body: .diff})
+    | sort_by(.edited_at) | reverse' 2>/dev/null
+}
+
+# coderabbit_history_floor <history> <live stripped content> — the time of
+# the newest revision that changed the finding's content, read off GitHub's
+# record: from the newest revision back, every readable revision whose
+# content (footer run removed, as coderabbit_strip_ack_suffix compares) is
+# the live content extends the run of content-free edits, and the oldest of
+# them is the floor. A revision that differs or cannot be read ends the walk
+# at the newer edit. Empty when the newest revision is not the live content
+# (an edit raced the read) or cannot be read; the caller then keeps the
+# marker-based floor.
+coderabbit_history_floor() {
+  local history="$1" live_stripped="$2" floor="" revision body
+  while IFS= read -r revision; do
+    [ -n "$revision" ] || continue
+    [ "$(printf '%s' "$revision" | jq -r '.readable')" = true ] || break
+    body=$(printf '%s' "$revision" | jq -r '.body')
+    [ "$(coderabbit_strip_ack_suffix "$body")" = "$live_stripped" ] || break
+    floor=$(printf '%s' "$revision" | jq -r '.edited_at')
+  done <<EOF
+$(printf '%s' "$history" | jq -c '.[]')
+EOF
+  printf '%s' "$floor"
 }
 
 FINDINGS='[]'
@@ -861,35 +937,43 @@ ARCHIVE_ENTRIES=$(printf '%s' "$VALIDATED_ARCHIVE_ENTRIES" | jq -c '
 # the finding's creation. An edit that changed content raises the floor to
 # that edit even when an acknowledgement came with it, so a reply to the old
 # text cannot stand for the new. Every CodeRabbit inline finding with a
-# record is revisited; without a record the marker-based decision stands.
-# On a fork pull request the record is fork-supplied (#1210), so no finding
-# is revisited: the marker-based decision stands and every archived
-# revision stays inventoried.
+# record is revisited. Without a record the marker-based decision stands
+# for every shape but one: the footer rewritten to the reply marker with no
+# confirmation line, which the marker rule can only read as an ordinary
+# edit. That shape is decided from GitHub's own record of the comment's
+# revisions instead (#2598), so an edit that left the content byte-identical
+# keeps the floor at the newest revision that did change content, or the
+# finding's creation. On a fork pull request the relay's record is
+# fork-supplied (#1210), so no record applies there either: every archived
+# revision stays inventoried, and the footer-only shape is decided from
+# GitHub's record, which a fork cannot write.
 REFINED_FINDINGS='[]'
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
-  if [ "$PR_HEAD_IS_FORK" = true ] \
-    || [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
+  if [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
     REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
     continue
   fi
   finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
   root_id=$(printf '%s' "$finding" | jq -r '.root_id')
   confirmed_login=$(printf '%s' "$finding" | jq -r '.confirmed_login // ""')
-  live_stripped=$(coderabbit_strip_ack_suffix "$(printf '%s' "$finding" | jq -r '.body // ""')")
+  finding_created_at=$(printf '%s' "$finding" | jq -r '.created_at')
+  live_body=$(printf '%s' "$finding" | jq -r '.body // ""')
+  live_stripped=$(coderabbit_strip_ack_suffix "$live_body")
   content_floor=""
   content_matched=false
   archives_seen=false
-  while IFS= read -r entry; do
-    [ -n "$entry" ] || continue
-    archives_seen=true
-    archived_at=$(printf '%s' "$entry" | jq -r '.archived_at')
-    if [ "$(coderabbit_strip_ack_suffix "$(printf '%s' "$entry" | jq -r '.payload.body')")" = "$live_stripped" ]; then
-      content_matched=true
-    elif [ -z "$content_floor" ] || [ "$archived_at" \> "$content_floor" ]; then
-      content_floor="$archived_at"
-    fi
-  done <<EOF
+  if [ "$PR_HEAD_IS_FORK" != true ]; then
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      archives_seen=true
+      archived_at=$(printf '%s' "$entry" | jq -r '.archived_at')
+      if [ "$(coderabbit_strip_ack_suffix "$(printf '%s' "$entry" | jq -r '.payload.body')")" = "$live_stripped" ]; then
+        content_matched=true
+      elif [ -z "$content_floor" ] || [ "$archived_at" \> "$content_floor" ]; then
+        content_floor="$archived_at"
+      fi
+    done <<EOF
 $(printf '%s' "$ARCHIVE_ENTRIES" | jq -c --argjson id "$finding_id" --arg login "$CODERABBIT_BOT" '
   .[] | select((.payload.source_kind // "issue-comment") == "inline"
     and .payload.source_comment_id == $id
@@ -902,13 +986,16 @@ $(printf '%s' "$ARCHIVE_ENTRIES" | jq -c --argjson id "$finding_id" --arg login 
       printf '%s\n' "$entry"
     done)
 EOF
+  fi
   # With a record, the record decides: the latest edit was content-free only
   # when some archived revision has the live content, and then the floor is
   # the newest content change; otherwise the latest edit changed content and
   # the floor is that edit, whatever acknowledgement it was delivered with.
-  # Without a record the marker-based decision above stands.
+  # Without a record the marker-based decision above stands, except for a
+  # footer-only rewrite it left unaccounted: GitHub's record decides that
+  # one, and when that record cannot be read the ordinary-edit floor stands
+  # with the cause named, so a blocked finding is never silent about why.
   if [ "$archives_seen" = true ]; then
-    finding_created_at=$(printf '%s' "$finding" | jq -r '.created_at')
     if [ "$content_matched" = true ]; then
       [ -n "$content_floor" ] || content_floor="$finding_created_at"
     else
@@ -923,6 +1010,25 @@ EOF
       finding=$(printf '%s' "$finding" | jq -c '.accounted = true | .evidence = "thread-reply"')
     else
       finding=$(printf '%s' "$finding" | jq -c '.accounted = false | .evidence = null')
+    fi
+  elif [ "$(printf '%s' "$finding" | jq -r '.accounted')" != true ] \
+    && coderabbit_footer_only_run "$live_body"; then
+    node_id=$(printf '%s' "$INLINE_COMMENTS" | jq -r --argjson id "$finding_id" \
+      '[.[] | select(.id == $id)][0].node_id // ""')
+    history_floor=""
+    if [ -z "$node_id" ]; then
+      echo "[review-feedback-accounting] WARNING: inline finding $finding_id carries no node id, so GitHub's edit history cannot be read; its footer-only rewrite stays an ordinary edit" >&2
+    elif history=$(coderabbit_edit_history "$node_id"); then
+      history_floor=$(coderabbit_history_floor "$history" "$live_stripped")
+      [ -n "$history_floor" ] || echo "[review-feedback-accounting] WARNING: GitHub's edit history for inline finding $finding_id does not show the live body as a readable newest revision; its footer-only rewrite stays an ordinary edit" >&2
+    else
+      echo "[review-feedback-accounting] WARNING: could not read GitHub's edit history for inline finding $finding_id; its footer-only rewrite stays an ordinary edit" >&2
+    fi
+    # No confirmation line, so no identity is named and no same-second
+    # allowance applies: the reply must follow the newest content change.
+    if [ -n "$history_floor" ] \
+      && agent_reply_after_finding "$root_id" "$history_floor" "$finding_id" ""; then
+      finding=$(printf '%s' "$finding" | jq -c '.accounted = true | .evidence = "thread-reply"')
     fi
   fi
   REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')

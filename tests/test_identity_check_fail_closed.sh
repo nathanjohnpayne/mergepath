@@ -159,12 +159,12 @@ fi
 #      '@codex review'` through the wrapper and never reaches a bare gh.
 
 # Part 1: the call site inside post_codex_trigger (the only trigger writer;
-# the eyes-ack retry re-enters it, passing its soft failure mode, #2582).
+# the eyes-ack retry re-enters it).
 crr_trigger_fn=$(awk '/^post_codex_trigger\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CRR")
 if [ -z "$crr_trigger_fn" ]; then
   fail "codex-review-request: post_codex_trigger() not found — cannot locate the '@codex review' trigger write"
 elif printf '%s\n' "$crr_trigger_fn" \
-     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline( "\$write_failure"; then)?[[:space:]]*$'; then
+     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline([[:space:]]+\|\|[[:space:]]+return[[:space:]]+1)?[[:space:]]*$'; then
   pass "codex-review-request: post_codex_trigger posts '@codex review' via post_author_pr_comment (inline --body mode)"
 else
   fail "codex-review-request: post_codex_trigger does not post '@codex review' via post_author_pr_comment ... inline"
@@ -307,9 +307,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "stage 1 (helper missing): exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -q "identity-check helper missing or non-executable"; then
+elif ! grep -q "identity-check helper missing or non-executable" <<<"$out"; then
   fail "stage 1: missing 'helper missing or non-executable' diagnostic; output: $out"
-elif echo "$out" | grep -q "REACHED_POST_GATE"; then
+elif grep -q "REACHED_POST_GATE" <<<"$out"; then
   fail "stage 1: post-gate marker leaked through (fail-OPEN); output: $out"
 else
   pass "stage 1: helper missing → exit 2 + diagnostic, post-gate NOT reached"
@@ -329,9 +329,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "stage 2 (helper non-executable): exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -q "identity-check helper missing or non-executable"; then
+elif ! grep -q "identity-check helper missing or non-executable" <<<"$out"; then
   fail "stage 2: missing diagnostic; output: $out"
-elif echo "$out" | grep -q "REACHED_POST_GATE"; then
+elif grep -q "REACHED_POST_GATE" <<<"$out"; then
   fail "stage 2: post-gate marker leaked through (fail-OPEN); output: $out"
 else
   pass "stage 2: helper present but non-executable → exit 2 + diagnostic, post-gate NOT reached"
@@ -346,7 +346,7 @@ set +e
 out=$("$HARNESS_DIR/harness.sh" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && echo "$out" | grep -q "REACHED_POST_GATE"; then
+if [ "$rc" -eq 0 ] && grep -q "REACHED_POST_GATE" <<<"$out"; then
   pass "stage 3: helper present + executable → post-gate reached, exit 0"
 else
   fail "stage 3 (happy path): exit $rc, output: $out"
@@ -362,7 +362,7 @@ set +e
 out=$(HARNESS_SKIP_IDENTITY_CHECK=1 "$HARNESS_DIR/harness.sh" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && echo "$out" | grep -q "REACHED_POST_GATE"; then
+if [ "$rc" -eq 0 ] && grep -q "REACHED_POST_GATE" <<<"$out"; then
   pass "stage 4: opt-out set + helper missing → gate skipped (dev only path works)"
 else
   fail "stage 4 (opt-out): exit $rc, output: $out"

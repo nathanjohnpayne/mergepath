@@ -364,7 +364,7 @@ test_reviewer_write_pinned_to_github_com() {
   dir=$(make_case "pinned-host")
   rc=$(run_case "$dir" nathanpayne-codex nathanpayne-codex)
   host=$(state_file "$dir" post-host)
-  if [ -n "$host" ] && ! printf '%s\n' "$host" | grep -vqx 'github.com'; then
+  if [ -n "$host" ] && ! grep -vqx 'github.com' <<<"$host"; then
     pass "reviewer write runs with GH_HOST=github.com (rc=$rc)"
   else
     fail "reviewer write host: '${host:-none posted}'; stderr=$(cat "$dir/err.log")"

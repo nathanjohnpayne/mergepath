@@ -91,8 +91,6 @@ make_case() {
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
-  # #2582: CODEX_TEST_REAL_AUTHORIZE runs the production write authorization.
-  cp "$ROOT/scripts/lib/gh-comment-trigger-guard.sh" "$dir/scripts/lib/gh-comment-trigger-guard.sh"
 
   # request_min_head_age_seconds: 0 -- these cases model acknowledgement,
   # resume and expiry mechanics under a FAKE clock that places "now" seconds
@@ -138,35 +136,6 @@ case "$body" in
   '<!-- mergepath-phase-4a-terminal:'*) kind=terminal ;;
   *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
 esac
-
-# #2582: a failed author write, for the initial request or only its retry.
-if [ "$kind" = trigger ]; then
-  case "${CODEX_TEST_SCENARIO:-}" in
-    initial_write_fails) echo "simulated author write failure" >&2; exit 1 ;;
-    retry_write_fails)
-      [ ! -f "$state_dir/trigger-count" ] || { echo "simulated author write failure" >&2; exit 1; } ;;
-  esac
-fi
-
-# #2582 (#2323): run the real wrapper's write authorization, which re-runs this
-# fixture's requester with --authorize-trigger-write against the same stubs,
-# before recording the trigger. Without it the stub authorizes every write.
-if [ "$kind" = trigger ] && [ "${CODEX_TEST_REAL_AUTHORIZE:-0}" = 1 ]; then
-  ROOT=$(cd "$(dirname "$0")/.." && pwd)
-  AUTHOR=${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}
-  TOKEN=test-token
-  GH_COMMENT_GUARD_STATE=$(mktemp -d "$state_dir/guard.XXXXXX")
-  jq -n --arg head "${MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD:-}" \
-    '{trigger:true,repo:"owner/repo",pr:999,head:$head}' >"$GH_COMMENT_GUARD_STATE/metadata.json"
-  # shellcheck source=/dev/null
-  . "$ROOT/scripts/lib/gh-comment-trigger-guard.sh"
-  if ! gh_comment_guard_authorize 2>>"$state_dir/authorize.log"; then
-    printf 'refused\n' >>"$state_dir/authorize-verdicts"
-    tail -n 1 "$state_dir/authorize.log" >&2
-    exit 1
-  fi
-  printf 'authorized\n' >>"$state_dir/authorize-verdicts"
-fi
 
 count=0
 if [ -f "$state_dir/$kind-count" ]; then
@@ -308,6 +277,8 @@ case "$endpoint" in
       exit 1
     elif [ "$scenario" = "poll-502-once" ] && [ "$reads" -gt 2 ]; then
       printf '[{"id":95,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response after a transient read failure"}]\n' "$bot"
+    elif [ "$scenario" = "wrapper-slow-ack" ] && [ -f "$state_dir/authorization-refused" ]; then
+      printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"delayed response to original request"}]\n' "$bot"
     elif [ "$scenario" = "review_after_retry" ]; then
       count=0
       if [ -f "$state_dir/trigger-count" ]; then
@@ -1199,20 +1170,20 @@ test_secret_descriptor_never_reveals_the_value() {
   i=0
   while [ $((i + 4)) -le ${#secret_tail} ]; do
     chunk=${secret_tail:$i:4}
-    if printf '%s' "$rendered" | grep -qF "$chunk"; then
+    if grep -qF "$chunk" <<<"$rendered"; then
       window=$chunk
       break
     fi
     i=$((i + 1))
   done
 
-  if printf '%s' "$rendered" | grep -qF "$CREDENTIAL_SENTINEL"; then
+  if grep -qF "$CREDENTIAL_SENTINEL" <<<"$rendered"; then
     fail "secret descriptor: the rendering still contains the whole value"
   elif [ -n "$window" ]; then
     fail "secret descriptor: the rendering leaks a 4-char run of the value's entropy (found '$window' in '$rendered')"
   elif [ "$rendered" = "$empty_rendered" ]; then
     fail "secret descriptor: set and unset render identically ('$rendered'), so no message can tell them apart"
-  elif ! printf '%s' "$rendered" | grep -qF "${#CREDENTIAL_SENTINEL} chars"; then
+  elif ! grep -qF "${#CREDENTIAL_SENTINEL} chars" <<<"$rendered"; then
     fail "secret descriptor: the rendering omits the length that makes it debuggable (got '$rendered')"
   else
     pass "describe_secret reports class and length only, never the value ($rendered)"
@@ -1484,83 +1455,6 @@ test_resumed_request_expiry_posts_new_request() {
   [ "$FAIL" -ne "$before" ] || pass "#1550: a resumed request that expires unanswered is replaced, and only the replacement records a timeout"
 }
 
-# --- #2582: eyes-ack retries and re-posts through the real authorization ---
-
-authorize_verdicts() { # <fixture-dir>
-  if [ -f "$1/state/authorize-verdicts" ]; then tr '\n' ' ' <"$1/state/authorize-verdicts" | sed 's/ $//'; fi
-}
-
-# The retry re-asks for a request already on HEAD. The wrapper's authorization
-# must apply polling mode, not refuse the retry as a #489 duplicate.
-test_real_authorization_permits_ack_retry() {
-  local dir rc count before=$FAIL
-  dir=$(make_case "real-auth-ack-retry" 0 1)
-  rc=$(CODEX_TEST_REAL_AUTHORIZE=1 run_case "$dir" absent)
-  count=$(trigger_count "$dir")
-  [ "$rc" = 4 ] || fail "#2582 real-auth retry: exit $rc, expected 4 after the retried request timed out; stderr=$(cat "$dir/err.log")"
-  [ "$count" = 2 ] || fail "#2582 real-auth retry: $count trigger(s), expected the request and its retry"
-  [ "$(authorize_verdicts "$dir")" = "authorized authorized" ] \
-    || fail "#2582 real-auth retry: authorization verdicts '$(authorize_verdicts "$dir")'; log=$(cat "$dir/state/authorize.log" 2>/dev/null)"
-  ! grep -q 'trigger not authorized' "$dir/err.log" "$dir/state/authorize.log" 2>/dev/null \
-    || fail "#2582 real-auth retry: an authorization pass refused a polling-mode write"
-  [ "$FAIL" -ne "$before" ] || pass "#2582: the real write authorization permits the eyes-ack retry of a request on HEAD"
-}
-
-# A rerun with an unanswered pending request and no provider evidence posts a
-# new request (#1550). The real authorization must permit that write.
-test_real_authorization_permits_unproven_repost() {
-  local dir rc count before=$FAIL
-  dir=$(make_case "real-auth-unproven" 0 0 60)
-  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
-  set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_REAL_AUTHORIZE=1 run_case "$dir" absent 1)
-  count=$(trigger_count "$dir")
-  grep -q 'pending request 900 has no Codex Running summary' "$dir/err.log" \
-    || fail "#2582 real-auth re-post: the pending request was not considered for resume"
-  [ "$count" = 1 ] || fail "#2582 real-auth re-post: $count trigger(s), expected one new request; stderr=$(cat "$dir/err.log")"
-  [ "$(authorize_verdicts "$dir")" = authorized ] \
-    || fail "#2582 real-auth re-post: authorization verdicts '$(authorize_verdicts "$dir")'; log=$(cat "$dir/state/authorize.log" 2>/dev/null)"
-  [ "$rc" = 4 ] || fail "#2582 real-auth re-post: exit $rc, expected 4 after the new request timed out; stderr=$(cat "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2582: the real write authorization permits re-posting a pending request with no provider evidence"
-}
-
-# Codex reports HEAD Running since the request but never added eyes. The
-# authorization refuses the retry, and the run polls the confirmed request.
-test_refused_ack_retry_polls_confirmed_request() {
-  local dir rc count before=$FAIL
-  dir=$(make_case "real-auth-running" 0 1 60)
-  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
-  set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_REAL_AUTHORIZE=1 run_case "$dir" absent 1)
-  count=$(trigger_count "$dir")
-  [ "$count" = 1 ] || fail "#2582 refused retry: $count trigger(s), expected only the confirmed request; stderr=$(cat "$dir/err.log")"
-  [ "$(authorize_verdicts "$dir")" = "authorized refused" ] \
-    || fail "#2582 refused retry: authorization verdicts '$(authorize_verdicts "$dir")'"
-  grep -q 'trigger not authorized: pending-request-running' "$dir/state/authorize.log" \
-    || fail "#2582 refused retry: the refusal did not name the Running request; log=$(cat "$dir/state/authorize.log" 2>/dev/null)"
-  grep -q 'continuing normal review poll on confirmed trigger comment 1001' "$dir/err.log" \
-    || fail "#2582 refused retry: the run did not continue polling the confirmed request"
-  [ "$rc" = 4 ] && [ "$(jq -r '.terminal_determination.outcome // "none"' "$dir/out.json")" = timeout ] \
-    || fail "#2582 refused retry: exit $rc, expected the confirmed request's recorded timeout; stderr=$(cat "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2582: a refused eyes-ack retry leaves the run polling the request it confirmed"
-}
-
-# Any unwritten retry falls back to the confirmed request's poll; an unwritten
-# initial request has nothing to poll and still exits 3.
-test_failed_retry_write_polls_but_initial_failure_exits_3() {
-  local dir rc count before=$FAIL
-  dir=$(make_case "retry-write-fails" 0 1)
-  rc=$(run_case "$dir" retry_write_fails)
-  count=$(trigger_count "$dir")
-  [ "$rc" = 4 ] && [ "$count" = 1 ] && grep -q 'acknowledgement retry was not posted' "$dir/err.log" \
-    || fail "#2582 failed retry write: exit $rc with $count trigger(s), expected 4 polling the first request; stderr=$(cat "$dir/err.log")"
-  dir=$(make_case "initial-write-fails" 0 1)
-  rc=$(run_case "$dir" initial_write_fails)
-  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 0 ] && grep -q "failed to post '@codex review' trigger comment" "$dir/err.log" \
-    || fail "#2582 failed initial write: exit $rc, expected 3; stderr=$(cat "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2582: a failed retry write polls the confirmed request; a failed initial write still exits 3"
-}
-
 # --- #1550: transient poll-read failures are retried ----------------------
 
 test_transient_poll_failure_is_retried() {
@@ -1620,6 +1514,113 @@ test_default_reply_deadline_is_1800() {
 }
 
 test_prior_reaction_cannot_clear_backdated_ordinary_push
+# Drive the shipped author wrapper and its canonical trigger authorization.
+# The existing transport fake remains only the final GH write sink.
+make_real_wrapper_case() {
+  local dir=$1 name
+  mv "$dir/scripts/gh-as-author.sh" "$dir/scripts/fixture-author-transport.sh"
+  cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author-real.sh"
+  for name in gh-token-resolver.sh gh-command-classifier.sh pr-body-contract.sh reviewers-helpers.sh credential-class.sh gh-comment-trigger-guard.sh gh-rest-transport.sh; do
+    cp "$ROOT/scripts/lib/$name" "$dir/scripts/lib/$name"
+  done
+  for name in gh-comment-trigger-guard.py owner-admin-override.py merge-writer.py; do
+    cp "$ROOT/scripts/workflow/$name" "$dir/scripts/workflow/$name"
+  done
+  printf '#!/bin/sh\nexit 0\n' > "$dir/scripts/identity-check.sh"
+  chmod +x "$dir/scripts/identity-check.sh"
+  mv "$dir/bin/gh" "$dir/bin/fixture-read-gh"
+  cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
+  exec "$here/../scripts/fixture-author-transport.sh" -- gh "$@"
+fi
+exec "$here/fixture-read-gh" "$@"
+SH
+  cat > "$dir/scripts/gh-as-author.sh" <<'SH'
+#!/usr/bin/env bash
+rc=0
+if [ "${CODEX_TEST_SCENARIO:-}" = wrapper-other-failure ] && [ -f "$CODEX_TEST_STATE_DIR/trigger-count" ]; then
+  echo 'unrelated wrapper transport failure' >&2
+  exit 42
+fi
+output=$("$(dirname "$0")/gh-as-author-real.sh" "$@" 2>&1) || rc=$?
+printf '%s\n' "$output"
+if [ "$rc" -ne 0 ] && grep -Fqx '[codex-review-request] ERROR: trigger not authorized: existing-trigger' <<< "$output"; then
+  touch "$CODEX_TEST_STATE_DIR/authorization-refused"
+  if [ "${CODEX_TEST_SCENARIO:-}" = wrapper-superseded ]; then
+    jq -cn '{id:9001,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:00:10Z"}' \
+      >> "$CODEX_TEST_STATE_DIR/comments.jsonl"
+  fi
+fi
+exit "$rc"
+SH
+  chmod +x "$dir/bin/gh" "$dir/scripts/gh-as-author.sh"
+}
+
+test_real_wrapper_duplicate_ack_retry_keeps_polling() {
+  local scenario dir rc expected before count
+  for scenario in wrapper-slow-ack wrapper-no-response wrapper-other-failure wrapper-superseded; do
+    before=$FAIL
+    dir=$(make_case "$scenario" 0 1)
+    make_real_wrapper_case "$dir"
+    rc=$(MERGEPATH_GH_TRANSPORT=gh run_case "$dir" "$scenario" 0 ghp_fixture_author)
+    count=$(trigger_count "$dir")
+    case "$scenario" in wrapper-slow-ack) expected=0 ;; wrapper-no-response) expected=4 ;; *) expected=3 ;; esac
+    [ "$rc" = "$expected" ] || fail "#2582 $scenario: exit $rc, expected $expected; stderr=$(cat "$dir/err.log")"
+    [ "$count" = 1 ] || fail "#2582 $scenario: expected only the confirmed original trigger, got $count"
+    if [ "$scenario" = wrapper-slow-ack ] || [ "$scenario" = wrapper-no-response ]; then
+      [ -f "$dir/state/authorization-refused" ] || fail "#2582 $scenario: real wrapper did not exercise canonical duplicate refusal"
+      grep -q 'existing trigger.*continuing normal review poll' "$dir/err.log" \
+        || fail "#2582 $scenario: missing bounded-poll recovery diagnostic"
+    elif [ "$scenario" = wrapper-other-failure ]; then
+      grep -q 'unrelated wrapper transport failure' "$dir/err.log" || fail '#2582 unrelated error was hidden'
+    else
+      [ -f "$dir/state/authorization-refused" ] || fail '#2582 superseded: canonical refusal was not exercised'
+      if grep -q 'existing trigger.*continuing normal review poll' "$dir/err.log"; then
+        fail '#2582 superseded: a newer request inherited the original poll recovery'
+      fi
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2582 real wrapper: $scenario keeps its intended poll/error disposition"
+  done
+}
+
+test_real_wrapper_duplicate_ack_retry_keeps_polling
+
+# #2582: polling mode posts a new request while an earlier trigger is on HEAD
+# by design. The real wrapper's authorization must apply that mode, not refuse
+# the write as a #489 duplicate: a pending request with no provider evidence,
+# and the replacement for a resumed request that expired.
+test_real_wrapper_authorizes_polling_mode_new_requests() {
+  local scenario dir rc count before
+  for scenario in unproven-pending resumed-expiry; do
+    before=$FAIL
+    dir=$(make_case "wrapper-$scenario" 0 0 60)
+    make_real_wrapper_case "$dir"
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    [ "$scenario" != resumed-expiry ] || seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 30
+    rc=$(MERGEPATH_GH_TRANSPORT=gh run_case "$dir" absent 1 ghp_fixture_author)
+    count=$(trigger_count "$dir")
+    case "$scenario" in
+      unproven-pending)
+        grep -q 'pending request 900 has no Codex Running summary' "$dir/err.log" \
+          || fail "#2582 $scenario: the pending request was not considered for resume" ;;
+      resumed-expiry)
+        grep -q 'resumed request 900 drew no Codex response.*re-running as a fresh request' "$dir/err.log" \
+          || fail "#2582 $scenario: the resumed request did not expire into a fresh run" ;;
+    esac
+    [ ! -f "$dir/state/authorization-refused" ] && ! grep -q 'trigger not authorized' "$dir/err.log" \
+      || fail "#2582 $scenario: the real authorization refused a polling-mode new request; stderr=$(cat "$dir/err.log")"
+    [ "$count" = 1 ] || fail "#2582 $scenario: $count trigger(s), expected exactly one new request"
+    [ "$rc" = 4 ] && [ "$(jq -r '.terminal_determination.outcome // "none"' "$dir/out.json")" = timeout ] \
+      || fail "#2582 $scenario: exit $rc, expected 4 with the new request's recorded timeout; stderr=$(cat "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "#2582 real wrapper: $scenario posts its new request through the canonical authorization"
+  done
+}
+
+test_real_wrapper_authorizes_polling_mode_new_requests
+
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_ack_retry_ignores_blocking_budget_value
@@ -1664,10 +1665,6 @@ test_marker_for_older_request_does_not_block_resume
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request
-test_real_authorization_permits_ack_retry
-test_real_authorization_permits_unproven_repost
-test_refused_ack_retry_polls_confirmed_request
-test_failed_retry_write_polls_but_initial_failure_exits_3
 test_transient_poll_failure_is_retried
 test_persistent_transient_failure_fails_closed
 test_permanent_poll_failure_is_not_retried

@@ -996,7 +996,9 @@ JSON
         #
         # `ref` non-null carrying `refUpdateRule: null` is the honest shape
         # for this fixture repo: the ref was OBSERVED (so the surface really
-        # was read) and carries no classic protection rule. A null `ref`
+        # was read) and carries no classic protection rule. The response also
+        # proves a personal-repository WRITE reader, so the projection is
+        # complete without administrative bypass ambiguity (#2571). A null `ref`
         # would mean nothing was learned, which br_required_checks correctly
         # records as an UNREAD surface — and an unread surface resolves to
         # `unknown`, which makes gate (a) fail closed on an unresolved
@@ -1004,7 +1006,7 @@ JSON
         for gql_arg in "$@"; do
           case "$gql_arg" in
             *qualifiedName*)
-              printf '{"data":{"repository":{"ref":{"refUpdateRule":null}}}}\n'
+              printf '{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}\n'
               exit 0
               ;;
           esac

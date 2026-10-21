@@ -75,11 +75,15 @@ feedback_policy_field() (
 # back to the default login. Two readers of the same file is the bug; this is
 # the shared one.
 policy_yaml_to_json() {
-  local cfg="${1:-}"
+  local cfg="${1:-}" docs json
   [ -r "$cfg" ] || return 1
   if command -v yq >/dev/null 2>&1 \
      && yq --version 2>/dev/null | grep -qi 'mikefarah'; then
-    yq eval -o=json '.' "$cfg" 2>/dev/null || return 1
+    # shellcheck disable=SC2016 # $d belongs to yq, not the shell.
+    docs=$(yq eval-all -o=json '[.] as $d ireduce ([]; . + $d) | length' "$cfg" 2>/dev/null) || return 1
+    [ "$docs" = 1 ] || return 1
+    json=$(yq eval -o=json '.' "$cfg" 2>/dev/null) || return 1
+    printf '%s\n' "$json"
   elif command -v python3 >/dev/null 2>&1 \
        && python3 -c 'import yaml' >/dev/null 2>&1; then
     python3 -c '

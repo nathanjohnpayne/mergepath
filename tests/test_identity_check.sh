@@ -57,13 +57,22 @@ case "$1 $2" in
       *" --hostname github.com "*) ;;
       *) if [ -n "${STUB_SOLE_GHES_LOGIN:-}" ]; then echo "$STUB_SOLE_GHES_LOGIN"; exit 0; fi ;;
     esac
-    echo "${STUB_TOKEN_LOGIN:-}"
+    if [ "${GH_TOKEN:-}" = gho_diagnostic_fallback ]; then
+      echo "${STUB_FALLBACK_LOGIN:-}"
+    else
+      echo "${STUB_TOKEN_LOGIN:-}"
+    fi
+    exit 0
+    ;;
+  "auth token")
+    printf '%s\n' gho_diagnostic_fallback
     exit 0
     ;;
   "api -i")
     # `gh api -i user`: the headers --expect-write-identity reads for a
     # legacy unprefixed token (#1057).
     [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
+    [ "${STUB_HEADERS_EMPTY:-0}" != 1 ] || exit "${STUB_HEADERS_RC:-0}"
     printf 'HTTP/2.0 200 OK\r\n'
     [ -n "${STUB_SCOPES:-}" ] && printf 'X-Oauth-Scopes: %s\r\n' "$STUB_SCOPES"
     printf '\r\n{"login":"%s"}\n' "${STUB_TOKEN_LOGIN:-}"
@@ -103,9 +112,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-author mismatch: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "expected 'nathanjohnpayne'"; then
+elif ! grep -qi "expected 'nathanjohnpayne'" <<<"$out"; then
   fail "--expect-author mismatch: missing 'expected nathanjohnpayne' in output: $out"
-elif ! echo "$out" | grep -qi "use the token wrapper for guarded writes"; then
+elif ! grep -qi "use the token wrapper for guarded writes" <<<"$out"; then
   fail "--expect-author mismatch: missing remediation hint; output: $out"
 else
   pass "--expect-author mismatch: exit 2 with remediation"
@@ -150,7 +159,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-reviewer (cursor expected, claude active): exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "expected 'nathanpayne-cursor'"; then
+elif ! grep -qi "expected 'nathanpayne-cursor'" <<<"$out"; then
   fail "--expect-reviewer (cursor expected, claude active): missing expected identity; output: $out"
 else
   pass "--expect-reviewer cross-agent mismatch: exit 2"
@@ -174,7 +183,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "--expect-reviewer missing MERGEPATH_AGENT: exit $rc, expected 0 (fallback to claude); output: $out"
-elif ! echo "$out" | grep -qi "MERGEPATH_AGENT is unset"; then
+elif ! grep -qi "MERGEPATH_AGENT is unset" <<<"$out"; then
   fail "--expect-reviewer missing MERGEPATH_AGENT: missing warning; output: $out"
 else
   pass "--expect-reviewer missing MERGEPATH_AGENT: warns + falls back to claude"
@@ -204,7 +213,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-external codex (active=claude): exit $rc, expected 2"
-elif ! echo "$out" | grep -qi "expected 'nathanpayne-codex'"; then
+elif ! grep -qi "expected 'nathanpayne-codex'" <<<"$out"; then
   fail "--expect-external codex (active=claude): missing expected identity; output: $out"
 else
   pass "--expect-external codex mismatch: exit 2"
@@ -247,9 +256,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-token-identity mismatch: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "GH_TOKEN resolves to identity 'nathanjohnpayne'"; then
+elif ! grep -qi "GH_TOKEN resolves to identity 'nathanjohnpayne'" <<<"$out"; then
   fail "--expect-token-identity mismatch: missing actual identity; output: $out"
-elif ! echo "$out" | grep -qi "graphql write — PAT-attributed"; then
+elif ! grep -qi "graphql write — PAT-attributed" <<<"$out"; then
   fail "--expect-token-identity mismatch: missing matrix pointer; output: $out"
 else
   pass "--expect-token-identity mismatch: exit 2 with matrix pointer"
@@ -266,7 +275,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "--expect-token-identity no GH_TOKEN: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "GH_TOKEN is empty"; then
+elif ! grep -qi "GH_TOKEN is empty" <<<"$out"; then
   fail "--expect-token-identity no GH_TOKEN: missing diagnostic; output: $out"
 else
   pass "--expect-token-identity no GH_TOKEN: exit 3 (fail closed)"
@@ -282,7 +291,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "--expect-token-identity api failure: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "gh api user.*failed"; then
+elif ! grep -qi "gh api user.*failed" <<<"$out"; then
   fail "--expect-token-identity api failure: missing diagnostic; output: $out"
 else
   pass "--expect-token-identity api failure: exit 3 (fail closed)"
@@ -297,7 +306,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "keyring read failure: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "returned empty"; then
+elif ! grep -qi "returned empty" <<<"$out"; then
   fail "keyring read failure: missing diagnostic; output: $out"
 else
   pass "keyring read failure: exit 3 (fail closed)"
@@ -310,7 +319,7 @@ set +e
 out=$(run_check 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "no mode specified"; then
+if [ "$rc" -eq 1 ] && grep -qi "no mode specified" <<<"$out"; then
   pass "no mode: exit 1"
 else
   fail "no mode: exit $rc, output: $out"
@@ -323,7 +332,7 @@ set +e
 out=$(run_check --expect-author --expect-reviewer 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "conflicting modes"; then
+if [ "$rc" -eq 1 ] && grep -qi "conflicting modes" <<<"$out"; then
   pass "conflicting modes: exit 1"
 else
   fail "conflicting modes: exit $rc, output: $out"
@@ -360,7 +369,7 @@ write_case "user-held PAT reading as another login" 2 ghp_x STUB_TOKEN_LOGIN=nat
 write_case "cloud placeholder that reads as the login" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne
 if [ -s "$WORKDIR/api.log" ]; then
   fail "--expect-write-identity placeholder: GET /user was called before the class refused it"
-elif ! printf '%s' "$WRITE_OUT" | grep -q "credential class is 'brokered'"; then
+elif ! grep -q "credential class is 'brokered'" <<<"$WRITE_OUT"; then
   fail "--expect-write-identity placeholder: diagnostic does not name the class; output: $WRITE_OUT"
 else
   pass "--expect-write-identity placeholder: refused on class, before any API call"
@@ -407,7 +416,7 @@ else
 fi
 write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
 write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
-if printf '%s' "$WRITE_OUT" | grep -q "WARNING"; then
+if grep -q "WARNING" <<<"$WRITE_OUT"; then
   pass "--expect-write-identity opt-in: accepted with a stderr warning"
 else
   fail "--expect-write-identity opt-in: no warning; output: $WRITE_OUT"
@@ -440,6 +449,71 @@ if [ "$rc" -eq 0 ]; then
 else
   fail "--expect-token-identity placeholder read: exit $rc; output: $out"
 fi
+
+# #1544: run the actual shared resolver and identity checker together. The
+# successful ambient path must replay warnings without stdout/token material;
+# rejected candidates keep their checker diagnostics private during fallback.
+for expected in nathanjohnpayne nathanpayne-claude; do
+  for scenario in recognised opt-in rejected mismatch empty-headers; do
+    fixture_token=opaque-diagnostic-fixture; selected_token="$fixture_token"
+    login="$expected"; opt_in=1; empty_headers=0
+    case "$scenario" in
+      recognised) fixture_token=ghp_diagnostic_fixture; selected_token="$fixture_token" ;;
+      rejected) opt_in=0; selected_token=gho_diagnostic_fallback ;;
+      mismatch) login=someone-else; selected_token=gho_diagnostic_fallback ;;
+      empty-headers) fixture_token="$HEX40"; selected_token="$fixture_token"; empty_headers=1 ;;
+    esac
+    rc=0
+    # Positional parameters expand in the child Bash after sourcing the helper.
+    # shellcheck disable=SC2016
+    env GH_TOKEN="$fixture_token" STUB_TOKEN_LOGIN="$login" STUB_FALLBACK_LOGIN="$expected" \
+      MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN="$opt_in" STUB_HEADERS_EMPTY="$empty_headers" \
+      PATH="$STUB_DIR:$PATH" bash -c '
+        . "$1"
+        gh_resolve_token_for_identity "$2" "" diagnostic-fixture || exit $?
+        [ "$GH_RESOLVED_TOKEN" = "$3" ]
+      ' _ "$ROOT/scripts/lib/gh-token-resolver.sh" "$expected" "$selected_token" \
+      >"$WORKDIR/resolver.out" 2>"$WORKDIR/resolver.err" || rc=$?
+    diagnostic_ok=0
+    case "$scenario" in
+      recognised) [ ! -s "$WORKDIR/resolver.err" ] && diagnostic_ok=1 ;;
+      opt-in) grep -Fq 'WARNING GH_TOKEN is not a recognised user-held credential form' "$WORKDIR/resolver.err" && diagnostic_ok=1 ;;
+      rejected|mismatch)
+        if grep -Fq 'ambient GH_TOKEN did not verify' "$WORKDIR/resolver.err" \
+           && ! grep -Eq 'identity-check: (WARNING|BLOCKED)' "$WORKDIR/resolver.err"; then diagnostic_ok=1; fi ;;
+      empty-headers)
+        if grep -Fq 'legacy token response headers are empty' "$WORKDIR/resolver.err" \
+           && grep -Fq 'WARNING GH_TOKEN is not a recognised user-held credential form' "$WORKDIR/resolver.err"; then diagnostic_ok=1; fi ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "$diagnostic_ok" -eq 1 ] && [ ! -s "$WORKDIR/resolver.out" ] \
+       && ! grep -Fq -- "$fixture_token" "$WORKDIR/resolver.err" \
+       && ! grep -Fq -- "$selected_token" "$WORKDIR/resolver.err"; then
+      pass "#1544 $expected $scenario preserves resolver diagnostics, selection and stdout"
+    else
+      fail "#1544 $expected $scenario: rc=$rc or diagnostic/selection/output mismatch"
+    fi
+  done
+done
+
+# Empty 40-hex header capture is observable for both successful-empty and
+# failed probes. Classification and the explicit override decision stay intact.
+for header_rc in 0 1; do
+  for opt_in in 0 1; do
+    wanted=3; [ "$opt_in" != 1 ] || wanted=0
+    rc=0
+    env GH_TOKEN="$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne STUB_HEADERS_EMPTY=1 \
+      STUB_HEADERS_RC="$header_rc" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN="$opt_in" \
+      PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne \
+      >"$WORKDIR/header.out" 2>"$WORKDIR/header.err" || rc=$?
+    if [ "$rc" -eq "$wanted" ] && [ ! -s "$WORKDIR/header.out" ] \
+       && grep -Fq 'legacy token response headers are empty' "$WORKDIR/header.err" \
+       && ! grep -Fq -- "$HEX40" "$WORKDIR/header.err"; then
+      pass "#1544 empty headers rc=$header_rc opt-in=$opt_in note preserves existing decision"
+    else
+      fail "#1544 empty headers rc=$header_rc opt-in=$opt_in lost note or changed decision/stdout"
+    fi
+  done
+done
 
 # -----------------------------------------------------------------------
 # Summary

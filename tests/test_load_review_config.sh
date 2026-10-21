@@ -390,7 +390,7 @@ else
   fail "fail-closed path (rc=$RC threshold=$(out_value threshold) reviewers=$(out_value reviewers) author=$(out_value author_identity))"
 fi
 
-if printf '%s' "$LOG" | grep -q '::warning::'; then
+if grep -q '::warning::' <<<"$LOG"; then
   pass "the fail-closed path annotates the run rather than failing silently"
 else
   fail "fail-closed path emitted no ::warning:: annotation: $LOG"
@@ -694,9 +694,9 @@ AUTH_STEP_PRIVILEGE_SURFACE=$(printf '%s\n' "$AUTH_STEP_ENV" | awk '
 ')
 if printf '%s\n' "$AUTH_STEP_ENV" \
    | grep -Fq 'EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}' \
-   && printf '%s\n' "$AUTH_STEP_ENV" | grep -Fq 'GH_TOKEN: ${{ github.token }}' \
-   && ! printf '%s\n' "$AUTH_STEP_PRIVILEGE_SURFACE" | grep -Eiq 'secrets[[:space:]]*\.|secrets[[:space:]]*\[|AUTHOR_MERGE_TOKEN|MERGE_QUEUE_(POLICY|SOURCE)_TOKEN' \
-   && ! printf '%s\n' "$AUTH_STEP_PRIVILEGE_SURFACE" | grep -Eiq 'gh[[:space:]]+api[[:space:]]+user|gh[[:space:]]+pr[[:space:]]+merge|approval-merge-continuation\.sh'; then
+   && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$AUTH_STEP_ENV" \
+   && ! grep -Eiq 'secrets[[:space:]]*\.|secrets[[:space:]]*\[|AUTHOR_MERGE_TOKEN|MERGE_QUEUE_(POLICY|SOURCE)_TOKEN' <<<"$AUTH_STEP_PRIVILEGE_SURFACE" \
+   && ! grep -Eiq 'gh[[:space:]]+api[[:space:]]+user|gh[[:space:]]+pr[[:space:]]+merge|approval-merge-continuation\.sh' <<<"$AUTH_STEP_PRIVILEGE_SURFACE"; then
   pass "the readiness step binds the base-resolved author to github.token without privileged credentials or mutation (#788/#1058)"
 else
   fail "the readiness step must bind the base-resolved author to github.token and remain credential-free and read-only"
@@ -722,7 +722,7 @@ run_readiness_step() {
 run_readiness_step "release-bot"
 if [ "$ASRC" -eq 0 ] \
    && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ] \
-   && printf '%s' "$ASTEP_LOG" | grep -Fq 'governing author: release-bot' \
+   && grep -Fq 'governing author: release-bot' <<<"$ASTEP_LOG" \
    && ! grep -q . "$CALLS_LOG"; then
   pass "read-only readiness consumes the BASE policy's author_identity without re-parsing the checkout or probing a credential (#788/#1058)"
 else

@@ -1915,11 +1915,11 @@ STUB
   [ "$out" = "strict=3 best=1 v=[] w=[]" ] \
     || fail "27a: expected strict rc 3 / best-effort rc 1 with empty stdout on both; got: $out"
   err=$(cat "$dir/err.log")
-  printf '%s' "$err" | grep -q 'ERROR: failed to fetch reviews' \
+  grep -q 'ERROR: failed to fetch reviews' <<<"$err" \
     || fail "27a: the strict wrapper did not name the failed fetch; err=$err"
-  printf '%s' "$err" | grep -q 'HTTP 500 upstream boom' \
+  grep -q 'HTTP 500 upstream boom' <<<"$err" \
     || fail "27a: the gh stderr diagnostic was lost; err=$err"
-  printf '%s' "$err" | grep -q 'best-effort fetch failed for reviews' \
+  grep -q 'best-effort fetch failed for reviews' <<<"$err" \
     || fail "27a: the best-effort wrapper lost its own fetch wording; err=$err"
 
   # (b) parse failure — gh SUCCEEDS with a body that is not JSON, so the
@@ -1944,9 +1944,9 @@ STUB
   [ "$out" = "strict=3 best=1 v=[] w=[]" ] \
     || fail "27b: expected strict rc 3 / best-effort rc 1 with empty stdout on both; got: $out"
   err=$(cat "$dir/err2.log")
-  printf '%s' "$err" | grep -q 'ERROR: failed to flatten reviews pagination output' \
+  grep -q 'ERROR: failed to flatten reviews pagination output' <<<"$err" \
     || fail "27b: the strict wrapper did not name the failed flatten; err=$err"
-  printf '%s' "$err" | grep -q 'best-effort fetch failed to flatten reviews pagination output' \
+  grep -q 'best-effort fetch failed to flatten reviews pagination output' <<<"$err" \
     || fail "27b: the best-effort wrapper collapsed its flatten wording into the fetch one; err=$err"
 
   # (c) the success escape: a genuinely empty page is a READ, not a failure,
@@ -1983,10 +1983,10 @@ STUB
   [ "$out" = "strict=0 best=0 v=[[]] w=[[]]" ] \
     || fail "27c: an empty page with benign gh stderr must still read as [] with status 0 on both wrappers; got: $out"
   err=$(cat "$dir/err3.log")
-  if printf '%s' "$err" | grep -q 'failed to fetch reviews'; then
+  if grep -q 'failed to fetch reviews' <<<"$err"; then
     fail "27c: benign stderr on a SUCCESSFUL read was graded as a fetch failure; err=$err"
   fi
-  if printf '%s' "$err" | grep -q 'failed to flatten reviews'; then
+  if grep -q 'failed to flatten reviews' <<<"$err"; then
     fail "27c: benign stderr on a SUCCESSFUL read reached the jq slurp; err=$err"
   fi
 

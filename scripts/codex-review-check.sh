@@ -2046,10 +2046,35 @@ if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
   # freely-editable display name, so match on the known, fixed annex
   # filename instead. A StatusContext (no checkSuite at all) safely
   # resolves workflowPath to "" and can never collide with this literal.
-  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow_path "repo_lint_local.yml" '
+  #
+  # #2563: match the annex's JOBS, not everything GitHub filed under its suite.
+  # A check run POSTed through the Checks API with the Actions token coalesces
+  # into whichever Actions suite was created first on the head (the #1215
+  # projection comment above), so the Codex P1 gate's lease runs ("Codex P1
+  # unresolved threads", still in progress) can carry this workflowPath on a
+  # head where the annex itself is green. Read as annex results, an in-flight
+  # lease is a non-passing entry, and the FAIL line names the wrong workflow
+  # (nathanjohnpayne/fiveacross#1953, head ab17bfa2). The annex's own jobs are
+  # job-native runs, which Actions stamps with an externalId; the projection
+  # already classifies the API-POSTed ones as lineage "api". Drop those here
+  # and leave them to the required-check path, which judges them under their
+  # own context. `!= "api"` rather than `== "native"` so an entry the
+  # projection could not classify stays in the scan: the degraded shape is the
+  # pre-#2563 false red, not a blind scan.
+  ANNEX_WORKFLOW_SUITE_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow_path "repo_lint_local.yml" '
     [.statusCheckRollup[] | select((.workflowPath // "") == $workflow_path)]
   ')
+  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_WORKFLOW_SUITE_MATCHES" | jq '
+    [.[] | select((.lineage // "") != "api")]
+  ')
   ANNEX_WORKFLOW_MATCH_COUNT=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq 'length')
+  ANNEX_WORKFLOW_FOREIGN=$(echo "$ANNEX_WORKFLOW_SUITE_MATCHES" | jq -c '
+    [.[] | select((.lineage // "") == "api") | "\(.name // .context // "?")=\(.conclusion // .state // "")"] | unique
+  ')
+  ANNEX_WORKFLOW_FOREIGN_COUNT=$(echo "$ANNEX_WORKFLOW_FOREIGN" | jq 'length')
+  if [ "$ANNEX_WORKFLOW_FOREIGN_COUNT" -gt 0 ]; then
+    log "gate (a): $ANNEX_WORKFLOW_FOREIGN_COUNT Checks-API check run(s) filed under the repo_lint_local.yml annex workflow's suite were not produced by an annex job (no externalId) and are left to the required-check path rather than read as annex results (#2563): $(echo "$ANNEX_WORKFLOW_FOREIGN" | jq -r 'join(", ")')"
+  fi
   if [ "$ANNEX_WORKFLOW_MATCH_COUNT" -eq 0 ] && [ "$ANNEX_UNFILTERED" = "true" ]; then
     log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has an unfiltered pull_request trigger but has not reported anything yet for $HEAD_SHA_FOR_ANNEX (#655 round 8) — treating as not-yet-clean rather than silently passing, since it is guaranteed to eventually run."
     BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '(. + [{label: "(not yet reported)", workflow: $workflow, result: "PENDING"}]) | unique')
@@ -2159,21 +2184,28 @@ else
     fi
   fi
 fi
-BAD_COUNT=$(echo "$BAD_CHECKS" | jq 'length')
+# #2563: count the lines the FAIL message prints, not the entries behind them.
+# BAD_CHECKS keeps one winner per surface and, for the guarded contexts, per
+# lineage (#1193, #1215), so one red required context can stand there twice, a
+# job-native FAILURE and a Checks-API FAILURE of the same name, and the two
+# render as one identical line that `unique` below then collapses. Taking the
+# count from BAD_CHECKS announced "3 non-passing check(s)" over a list of two.
+BAD_SUMMARY_LINES=$(echo "$BAD_CHECKS" | jq -c '
+  # Name the surface for a legacy commit status (#1193). Splitting the two
+  # surfaces creates a blocking cause an operator has no other way to see: a
+  # red commit status under a required name whose same-named check run is
+  # green. Unannotated, that reads as the gate contradicting a check run
+  # everyone can see is passing. CheckRun stays unannotated because it is
+  # what every pre-existing entry in this summary already was.
+  [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end)
+       + (if (.kind // "") == "StatusContext" then " (commit status)" else "" end)
+       + "=" + .result]
+  | unique
+')
+BAD_COUNT=$(echo "$BAD_SUMMARY_LINES" | jq 'length')
 
 if [ "$BAD_COUNT" -gt 0 ]; then
-  SUMMARY=$(echo "$BAD_CHECKS" | jq -r '
-    # Name the surface for a legacy commit status (#1193). Splitting the two
-    # surfaces creates a blocking cause an operator has no other way to see: a
-    # red commit status under a required name whose same-named check run is
-    # green. Unannotated, that reads as the gate contradicting a check run
-    # everyone can see is passing. CheckRun stays unannotated because it is
-    # what every pre-existing entry in this summary already was.
-    [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end)
-         + (if (.kind // "") == "StatusContext" then " (commit status)" else "" end)
-         + "=" + .result]
-    | unique | join(", ")
-  ')
+  SUMMARY=$(echo "$BAD_SUMMARY_LINES" | jq -r 'join(", ")')
   fail_gate "CI not green: $BAD_COUNT non-passing check(s): $SUMMARY"
 fi
 
@@ -2453,12 +2485,10 @@ crc_render_request_evidence() {
   [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ] || return 1
   # shellcheck source=lib/codex-request-evidence.sh
   . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" || return 1
-  local trigger id posted age reactions ack=unknown review budget ack_budget summary_advice diagnostic_comments
-  # The request helper writes exactly this literal. Prefilter only diagnostic
-  # candidates, then leave author/freshness/order semantics with the shared
-  # selector that requester deduplication also uses.
-  diagnostic_comments=$(printf '%s\n' "$ISSUE_COMMENTS_JSON" | jq -c '[.[] | select((.body // "") == "@codex review")]') || return 1
-  trigger=$(crqe_select_trigger "$diagnostic_comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  local trigger id posted age reactions ack=unknown review budget ack_budget summary_advice
+  # Share the case-insensitive complete-command, author, freshness and ordering
+  # contract with requester deduplication, without narrowing its input first.
+  trigger=$(crqe_select_trigger "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
   review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") || return 1
   log "request evidence (informational; BLOCKED unchanged):"
   # Independent observations: an older terminal artifact must not hide a newer run.
@@ -2640,6 +2670,28 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review on current HEAD $HEAD_SHA"
     fi
     crc_request_evidence
+    # #2550: say so when an approval exists but was discounted as
+    # same-agent. That approval is the intended clearance on a PR outside
+    # Phase 4, which this gate does not judge; point at the gate that does.
+    # Message only: the decision and exit code are unchanged.
+    DISCOUNTED_SAME_AGENT_APPROVAL=""
+    if [ -n "$GATE_B_SAME_AGENT_REVIEWER" ]; then
+      DISCOUNTED_SAME_AGENT_APPROVAL=$(echo "$REVIEWS_JSON" | jq -r \
+        --arg reviewer "$GATE_B_SAME_AGENT_REVIEWER" \
+        --arg sha "$HEAD_SHA" \
+        --arg require_head "$REQUIRE_APPROVAL_ON_HEAD" '
+          [ .[]
+            | select(.user.login == $reviewer)
+            | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          ]
+          | max_by(.submitted_at)
+          | if . != null and .state == "APPROVED" and ($require_head != "1" or .commit_id == $sha)
+            then $reviewer else empty end
+      ' 2>/dev/null || true)
+    fi
+    if [ -n "$DISCOUNTED_SAME_AGENT_APPROVAL" ]; then
+      fail_gate "no qualifying reviewer approval cleared gate (b): the latest-state APPROVED review from the authoring agent's own reviewer identity ($DISCOUNTED_SAME_AGENT_APPROVAL) is discounted by this Phase 4 gate under the no-self-approve rule, and the same-agent anchored Codex review/verdict fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; threshold: $REACTION_THRESHOLD). On a PR under external_review_threshold with no external_review_paths match and no needs-external-review label, that approval is the intended clearance and this gate does not apply: run scripts/merge-clearance-gate.sh <PR#> for the threshold-aware decision, and when CodeRabbit was rate-limited also require exact-head Codex clearance with scripts/codex-review-check.sh --require-codex-on-head <PR#> before approving"
+    fi
     fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + anchored Codex review/verdict fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
   fi
 else

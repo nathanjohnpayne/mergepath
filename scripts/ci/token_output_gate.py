@@ -1470,6 +1470,7 @@ class Lexer:
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
         self.quoted_data_offsets = set()  # Read-only function-header context.
+        self.parameter_data_offsets = set()  # WORD data cannot define functions.
         self.unterminated_ansi_c_quotes = []  # Original source offsets.
         self.unsupported_ansi_aliases = []  # Executable-context failure offsets.
         self.unsupported_ansi_sources = []  # Non-alias source-proof failures.
@@ -1490,6 +1491,9 @@ class Lexer:
             body_offset + i for i in sub.quoted_data_offsets
         )
         self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
+        self.parameter_data_offsets.update(
+            body_offset + i for i in sub.parameter_data_offsets
+        )
         self.xtrace_context_events.extend(
             (body_offset + pos, seg, word, eligible)
             for pos, seg, word, eligible in sub.xtrace_context_events
@@ -1617,6 +1621,7 @@ class Lexer:
         n = len(text)
         i = 0
         line = 1
+        parameter_backtick_end = -1
 
         cur_ll = LogicalLine(1)
         self.logical.append(cur_ll)
@@ -1750,6 +1755,15 @@ class Lexer:
             c = text[i]
             if "'" in quotes or '"' in quotes:
                 self.quoted_data_offsets.add(i)
+            if any(q.startswith("${") for q in quotes):
+                self.parameter_data_offsets.add(i)
+                # Retain executable backtick child context without changing
+                # the existing token/reference walk of the parameter WORD.
+                if c == "`" and "'" not in quotes and i >= parameter_backtick_end:
+                    end = _skip_backtick(text, i)
+                    if end > i + 1 and text[end - 1] == "`":
+                        self.function_source_children.append((i + 1, Lexer(text[i + 1:end - 1])))
+                        parameter_backtick_end = end
 
             # ---- inside a here-doc body ----
             if in_heredoc is not None:
@@ -1835,6 +1849,12 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
+                if nxt == "$":
+                    # PID special parameter: the second dollar cannot start a
+                    # named reference. Preserve raw spelling for word readers.
+                    cur_level()["word"].append("$$")
+                    i += 2
+                    continue
                 if nxt == "[":
                     # A raw legacy arithmetic bound withholds new ANSI proof
                     # without changing this loop's existing token semantics.
@@ -2865,6 +2885,9 @@ def _iter_refs_at(s):
             i += 2
             continue
         if ch == "$":
+            if s.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and s[i + 1] == "{":
                 name = braced_ref_at(s, i)
                 if name:
@@ -3835,6 +3858,15 @@ def _mask_heredoc_body_lines(text, lx=None):
     return "".join(masked)
 
 
+def _function_header_is_data(lx, offset):
+    # Child source owns its own context, even when the containing WORD is data.
+    for start, child in lx.function_source_children:
+        if start <= offset < start + len(child.text):
+            return _function_header_is_data(child, offset - start)
+    return (offset in lx.quoted_data_offsets or offset in lx.comment_offsets
+            or offset in lx.parameter_data_offsets)
+
+
 def _iter_function_definitions(text):
     """Yield each recognized function definition as (match, name, body).
 
@@ -3856,10 +3888,7 @@ def _iter_function_definitions(text):
     lx = Lexer(text)
     structural = _mask_heredoc_body_lines(text, lx)
     for m in _FUNC_DEF_RE.finditer(structural):
-        if (
-            m.start("name") in lx.quoted_data_offsets
-            or m.start("name") in lx.comment_offsets
-        ):
+        if _function_header_is_data(lx, m.start("name")):
             continue
         name = m.group("name")
         if name in RESERVED_WORDS:
@@ -4329,6 +4358,9 @@ def _heredoc_data_has_positional(body):
         if body[i] == "\\" and body[i + 1:i + 2] in ("$", "`", "\\", "\n"):
             i += 2
             continue
+        if body.startswith("$$", i):
+            i += 2
+            continue
         if body.startswith("${", i):
             try:
                 end = _simple_parameter_end(body, i)
@@ -4403,6 +4435,9 @@ def _word_has_verbatim_positional_exact(w):
         if in_double and c == "$" and w[i + 1 : i + 2] == "{":
             _simple_parameter_end(w, i)  # raises on a word it cannot read
         if c == "$":
+            if w.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
                 if j < n and w[j] in "#!":
@@ -4443,6 +4478,9 @@ def _word_has_verbatim_positional_legacy(w):
             i = n if j == -1 else j + 1
             continue
         if c == "$":
+            if w.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
                 if j < n and w[j] in "#!":
@@ -9035,6 +9073,47 @@ CORPUS = [
         'helper-backtick-next-line-code',
         MUST_FLAG,
         'out=`\nfunction log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2`\n',
+    ),
+    # Non-executable parameter WORD data and contained code (#2087).
+    (
+        'helper-parameter-word-header-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-\ntrue()\n(\n echo "$1"\n)\n}\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-quoted-header-data',
+        MUST_NOT_FLAG,
+        'data="${UNSET:-\ntrue()\n(\n echo "$1"\n)\n}"\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-actual-function',
+        MUST_FLAG,
+        'true()\n(\n echo "$1"\n)\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-substitution-emits',
+        MUST_FLAG,
+        'data=${UNSET:-$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-captured',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN")}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-nonemitter',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(function log\n{ : "$1"; }\nlog "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-quoted-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(value=\'\ntrue()\n{ echo "$1"; }\n\'\ntrue "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-nested-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-${OTHER:-\ntrue()\n(\n echo "$1"\n)\n}}\ntrue "$GH_TOKEN"\n',
     ),
     (
         'helper-comment-header-data',
@@ -15648,6 +15727,28 @@ KNOWN_BROADER.update({cid: (
     "option state are reconstructed (#1465 extglob review repair)."
 ) for cid in ('eval-extglob-extglob-not', 'eval-extglob-safe-matched-plus', 'eval-extglob-safe-unmatched-at', 'eval-extglob-opener-not-space')})
 
+def _pid_special_parameter_cases():
+    """Pin independent readers and later real-reference source coordinates."""
+    failures = []
+    for reader in (_word_has_verbatim_positional_exact,
+                   _word_has_verbatim_positional_legacy,
+                   _heredoc_data_has_positional):
+        for word, expected in (("$$1", False), ("$${1}", False),
+                               ("$$$1", True), ("$1", True),
+                               (r"\$\$1", False), (r"\$$1", True)):
+            if reader(word) != expected:
+                failures.append("PID %s: %r expected %s" %
+                                (reader.__name__, word, expected))
+    raw = '$$GH_TOKEN $${GH_TOKEN} $$$GH_TOKEN'
+    expected = [("GH_TOKEN", raw.rfind("$GH_TOKEN"))]
+    if _iter_refs_at(raw) != expected:
+        failures.append("PID raw references: expected only the adjacent real reference")
+    findings, errors = scan_text('echo "$$GH_TOKEN"\necho "$GH_TOKEN"\n')
+    if errors or len(findings) != 1 or findings[0].line != 2:
+        failures.append("PID later real reference: expected only physical line 2")
+    return failures
+
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -15804,6 +15905,39 @@ def _function_definition_cases():
         findings, errors = scan_text(PROLOGUE + text)
         if list(_iter_function_definitions(text)) or findings or errors:
             failures.append("quoted data acquired an emitting helper: %r" % text)
+    parameter_definitions = {'helper-parameter-word-header-data': [], 'helper-parameter-word-quoted-header-data': [], 'helper-parameter-word-actual-function': ['true'], 'helper-parameter-word-substitution-emits': ['log'], 'helper-parameter-word-substitution-captured': ['log'], 'helper-parameter-word-substitution-nonemitter': ['log'], 'helper-parameter-word-substitution-quoted-data': [], 'helper-parameter-word-nested-data': []}
+    # Backtick children keep their own executable/quoted/parameter context.
+    for text, expected in (
+        ('value=${U:-`\nfunction log\n{ : "$1"; }\n`}\n', ["log"]),
+        ('value="${U:-`\nfunction log\n{ : "$1"; }\n`}"\n', ["log"]),
+        ("value=${U:-`data='\ntrue()\n{ echo \"$1\"; }\n'\n`}\n", []),
+        ('value=${U:-`data=${V:-\ntrue()\n( echo "$1"; )\n}\n`}\n', []),
+    ):
+        definitions = list(_iter_function_definitions(text))
+        if [name for _match, name, _body in definitions] != expected:
+            failures.append("parameter WORD backtick source context: " + repr(text))
+        if len(_function_body_line_spans(text)) != len(expected):
+            failures.append("parameter WORD backtick source spans: " + repr(text))
+    parameter_corpus = {name: body for name, _rule, body in CORPUS}
+    for cid, expected in parameter_definitions.items():
+        text = parameter_corpus[cid]
+        definitions = list(_iter_function_definitions(text))
+        if [name for _match, name, _body in definitions] != expected:
+            failures.append("parameter WORD function discovery: " + cid)
+        spans, offsets = _function_body_line_spans(text, with_offsets=True)
+        expected_spans = [(text.count("\n", 0, match.end()) + 1,
+                           text.count("\n", 0, match.end()) + 1 + body.count("\n"))
+                          for match, _name, body in definitions]
+        expected_offsets = [(match.end() - 1, match.end() + len(body))
+                            for match, _name, body in definitions]
+        if spans != expected_spans or offsets != expected_offsets:
+            failures.append("parameter WORD function spans: " + cid)
+        for match, _name, body in definitions if expected else []:
+            opener = text.index("(\n") if cid.endswith("actual-function") else text.index("{ ")
+            if match.end() - 1 != opener or body != text[opener + 1:opener + 1 + len(body)]:
+                failures.append("parameter WORD actual body offset: " + cid)
+        if not expected and (spans or offsets or "true" in discover_emitter_helpers(text)):
+            failures.append("parameter WORD data acquired a helper or body span: " + cid)
     executed = ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n'
     findings, errors = scan_text(PROLOGUE + executed)
     if "log" not in discover_emitter_helpers(executed) or not findings or errors:
@@ -16258,6 +16392,33 @@ KNOWN_BROADER.update({cid: "A literal extglob operand makes pre-eval input uncer
 # #2228: paired quote, escape, non-prefix and redaction controls.
 CORPUS += [('eval-assignment-tilde-control-single-quoted', 'clean', 'HOME=\'; echo\'\neval X=\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-double-quoted', 'clean', 'HOME=\'; echo\'\neval X="~" \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-escaped', 'clean', 'HOME=\'; echo\'\neval X=\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-whole-quoted', 'clean', 'HOME=\'; echo\'\neval \'X=~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-quoted', 'clean', 'HOME=\'; echo\'\neval X=prefix:\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-escaped', 'clean', 'HOME=\'; echo\'\neval X=prefix:\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-name-quoted', 'clean', 'HOME=\'; echo\'\neval "X"=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-equal-escaped', 'clean', 'HOME=\'; echo\'\neval X\\=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-not-prefix', 'clean', 'HOME=\'; echo\'\neval X=prefix~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-safe-home', 'flag', 'HOME=safe\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-length', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${#GH_TOKEN}"\'\n'), ('eval-assignment-tilde-constant', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${GH_TOKEN:+set}"\'\n')]
 KNOWN_BROADER["eval-assignment-tilde-safe-home"] = "A written assignment-tilde operand retains source-only eval uncertainty even when this oracle supplies a safe HOME value; no runtime value propagation is modeled (#2228)."
+
+
+# #1456: PID text is literal until another real expansion begins.
+CORPUS += [
+    ("pid-named-double-quoted", MUST_NOT_FLAG, 'echo "$$GH_TOKEN"\n'),
+    ("pid-named-unquoted", MUST_NOT_FLAG, 'echo $$GH_TOKEN\n'),
+    ("pid-named-braced-literal", MUST_NOT_FLAG, 'echo "$${GH_TOKEN}"\n'),
+    ("pid-named-single-quoted", MUST_NOT_FLAG, "echo '$$GH_TOKEN'\n"),
+    ("pid-named-later-real", MUST_FLAG, 'echo "$$GH_TOKEN"; echo "$GH_TOKEN"\n'),
+    ("pid-named-adjacent-real", MUST_FLAG, 'echo "$$$GH_TOKEN"\n'),
+    ("pid-named-adjacent-braced-real", MUST_FLAG, 'echo "$$${GH_TOKEN}"\n'),
+    ("pid-named-escaped-pair", MUST_NOT_FLAG, r'echo "\$\$GH_TOKEN"' + '\n'),
+    ("pid-named-escaped-first-real", MUST_FLAG, r'echo "\$$GH_TOKEN"' + '\n'),
+    ("pid-heredoc-named", MUST_NOT_FLAG, 'cat <<EOF\n$$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-braced-literal", MUST_NOT_FLAG, 'cat <<EOF\n$${GH_TOKEN}\nEOF\n'),
+    ("pid-heredoc-adjacent-real", MUST_FLAG, 'cat <<EOF\n$$$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-escaped-pair", MUST_NOT_FLAG, 'cat <<EOF\n\\$\\$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-escaped-first-real", MUST_FLAG, 'cat <<EOF\n\\$$GH_TOKEN\nEOF\n'),
+    ("pid-helper-positional", MUST_NOT_FLAG, 'show() { echo "$$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-braced-literal", MUST_NOT_FLAG, 'show() { echo "$${1}"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-real-positional", MUST_FLAG, 'show() { echo "$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-adjacent-real", MUST_FLAG, 'show() { echo "$$$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-escaped-pair", MUST_NOT_FLAG, r'show() { echo "\$\$1"; }; show "$GH_TOKEN"' + '\n'),
+    ("pid-helper-escaped-first-real", MUST_FLAG, r'show() { echo "\$$1"; }; show "$GH_TOKEN"' + '\n'),
+    ("pid-helper-heredoc", MUST_NOT_FLAG, 'show() { cat <<EOF\n$$1\nEOF\n}; show "$GH_TOKEN"\n'),
+    ("pid-helper-heredoc-real", MUST_FLAG, 'show() { cat <<EOF\n$1\nEOF\n}; show "$GH_TOKEN"\n'),
+]
 
 
 # Exact shape scopes are populated only from inspected measurements. Existing
@@ -17498,6 +17659,14 @@ def self_test():
     import hashlib
     import json
 
+    # The parent owns the end-to-end probes; only its guarded child runs the
+    # corpus. Delegating before any oracle work avoids measuring it twice.
+    residue_failures = _residue_and_quoted_tmpdir_case()
+    if residue_failures is not None:
+        for failure in residue_failures:
+            print("check_no_token_in_output: FAIL: %s" % failure, file=sys.stderr)
+        return int(bool(residue_failures))
+
     failures = []
     # Evidence is additive to the existing outcomes; no cell is run twice.
     tilde_evidence_seen = set()
@@ -17524,6 +17693,7 @@ def self_test():
         return 1
 
     failures.extend(_corpus_id_cases())
+    failures.extend(_pid_special_parameter_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
@@ -17537,6 +17707,9 @@ def self_test():
     failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
+        # Report the actual allocation, not merely the requested environment.
+        print("check_no_token_in_output: oracle TMPDIR: "
+              + json.dumps(os.path.dirname(tmp)))
 
         def _one(cell):
             entry, sample = cell
@@ -17705,8 +17878,6 @@ def self_test():
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_shell_file_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
-
-    failures.extend(_residue_and_quoted_tmpdir_case())
 
     failures.extend(_sentinel_window_cases())
 
@@ -18845,7 +19016,10 @@ def _path_independence_case(tmp):
 
 
 def _residue_and_quoted_tmpdir_case():
-    """Two successive runs leave nothing behind, and a quoted TMPDIR is inert.
+    """Run the corpus once under a quoted TMPDIR and check all temp cleanup.
+
+    Return None only in the child, suppressing recursive residue setup while
+    leaving the complete corpus and its auxiliary axes enabled.
 
     #1012 installed two `trap ... RETURN` handlers where the second replaced
     the first, so one temp file survived every `--scan`, and a `'` in TMPDIR
@@ -18853,9 +19027,11 @@ def _residue_and_quoted_tmpdir_case():
     scan path at all and drives its fixtures from a Python context manager, so
     the property is asserted directly rather than argued.
     """
-    failures = []
+    import json
+
     if os.environ.get("_TOKEN_OUTPUT_SELFTEST_INNER") == "1":
-        return failures
+        return None
+    failures = []
 
     # The #1012 reproduction, asserted END TO END on the process exit code:
     # a tree whose ONLY file is an extensionless `#!/usr/bin/env -S bash -e`
@@ -18912,6 +19088,23 @@ def _residue_and_quoted_tmpdir_case():
             env=env,
             capture_output=True,
         )
+        # Keep the child's full oracle diagnostics visible and count a
+        # completed corpus independently of its PASS/FAIL verdict.
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        summaries = [line for line in stdout.splitlines()
+                     if line.startswith("check_no_token_in_output: oracle samples: ")]
+        root_prefix = "check_no_token_in_output: oracle TMPDIR: "
+        roots = [line[len(root_prefix):] for line in stdout.splitlines()
+                 if line.startswith(root_prefix)]
+        if len(summaries) != 1:
+            failures.append("residue: expected exactly one full oracle corpus, observed %d"
+                            % len(summaries))
+        if roots != [json.dumps(quoted)]:
+            failures.append("residue: full oracle corpus did not allocate exactly once "
+                            "under the quoted TMPDIR: %r" % roots)
         if proc.returncode != 0:
             failures.append(
                 "residue: --self-test under a quoted TMPDIR exited %d: %s"
@@ -18920,9 +19113,12 @@ def _residue_and_quoted_tmpdir_case():
         leftover = sorted(os.listdir(quoted))
         if leftover:
             failures.append(
-                "residue: %d file(s) left under TMPDIR after two runs: %s"
+                "residue: %d file(s) left under TMPDIR after two scans and the self-test: %s"
                 % (len(leftover), leftover)
             )
+        if not failures:
+            print("check_no_token_in_output: PASS (one full oracle corpus under "
+                  "quoted TMPDIR; two scans and self-test left no residue)")
     return failures
 
 

@@ -82,10 +82,11 @@ set -euo pipefail
 # thing. `size:XL` is deliberately absent: it existed in
 # nathanpaynedotcom and was never applied to a single issue.
 #
-# `status:blocked` is fleet-shared too: blocked is a label, not a board
-# lane, on every repository's board (scripts/gh-projects/README.md §
-# Status lanes), so every repo needs the same label. Byte-identical to
-# mergepath's, like the rest.
+# `status:blocked` is fleet-shared too: it marks a blocker that no issue
+# can point at (a vendor, an outside event) under the same lane rule on
+# every repository's board (scripts/gh-projects/README.md § Status lanes),
+# so every repo needs the same label. Byte-identical to mergepath's, like
+# the rest.
 #
 # Deliberately NOT seeded: `area:*`, the other `status:*` values and
 # the repo-local `type:*` values. Those are per-repo vocabulary;

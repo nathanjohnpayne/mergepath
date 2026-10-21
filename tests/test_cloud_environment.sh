@@ -58,13 +58,13 @@ else
 fi
 
 out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
-   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling: hand this step to a local session or CI)' \
-   && printf '%s' "$out" | grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential, tools or setup, then re-run' \
-   && printf '%s' "$out" | grep -q -- '- graphql: no, viewer query returned 500 (fix the credential, tools or setup' \
-   && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (fix the credential, tools or setup' \
-   && printf '%s' "$out" | grep -q -- '- author-writes: yes, a$' \
-   && ! printf '%s' "$out" | grep -q -- 'may be transient' \
+if [ "$rc" -eq 0 ] && grep -q 'capability tier `author-writes`' <<<"$out" \
+   && grep -q -- '- push-multi-branch: no, documented (proxy ceiling: hand this step to a local session or CI)' <<<"$out" \
+   && grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential, tools or setup, then re-run' <<<"$out" \
+   && grep -q -- '- graphql: no, viewer query returned 500 (fix the credential, tools or setup' <<<"$out" \
+   && grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (fix the credential, tools or setup' <<<"$out" \
+   && grep -q -- '- author-writes: yes, a$' <<<"$out" \
+   && ! grep -q -- 'may be transient' <<<"$out" \
    && grep -q -- '--quiet' "$WORKDIR/probe.log"; then
   pass "hook, cloud session: classifies each no from the probe's basis and reason (a documented denial is a ceiling; a GraphQL 500 or a bare cross-repo 403 is fix-first)"
 else
@@ -74,10 +74,10 @@ fi
 # A run with a transient failure (a rate-limited 403 among them) re-probes its
 # measured "no" answers before calling them a setup problem or a ceiling.
 out="$(CLAUDE_CODE_REMOTE=true PROBE_TRANSIENT=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (may be transient: re-run' \
-   && printf '%s' "$out" | grep -q -- '- graphql: no, viewer query returned 500 (may be transient' \
-   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling' \
-   && ! printf '%s' "$out" | grep -q -- 'fix the credential, tools or setup, then'; then
+if [ "$rc" -eq 0 ] && grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (may be transient: re-run' <<<"$out" \
+   && grep -q -- '- graphql: no, viewer query returned 500 (may be transient' <<<"$out" \
+   && grep -q -- '- push-multi-branch: no, documented (proxy ceiling' <<<"$out" \
+   && ! grep -q -- 'fix the credential, tools or setup, then' <<<"$out"; then
   pass "hook, transient run: a measured no is marked may-be-transient, a documented ceiling stays a ceiling"
 else
   fail "hook transient: rc=$rc out=$out"
@@ -87,16 +87,16 @@ fi
 # and the wrappers accept it, so it is not sent round the fix-and-re-probe
 # loop (Codex on #1552).
 out="$(CLAUDE_CODE_REMOTE=true PROBE_RW_BASIS=unverifiable PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- "- reviewer-writes: no, no-verified-token (not provable: GitHub does not expose this token type's permissions; the wrappers still verify" \
-   && ! printf '%s' "$out" | grep -q -- '- reviewer-writes: .*fix the credential' \
-   && ! printf '%s' "$out" | grep -qi -- 'any other no'; then
+if [ "$rc" -eq 0 ] && grep -q -- "- reviewer-writes: no, no-verified-token (not provable: GitHub does not expose this token type's permissions; the wrappers still verify" <<<"$out" \
+   && ! grep -q -- '- reviewer-writes: .*fix the credential' <<<"$out" \
+   && ! grep -qi -- 'any other no' <<<"$out"; then
   pass "hook, unverifiable token: reported as not provable, not as a setup problem to fix and re-probe"
 else
   fail "hook unverifiable: rc=$rc out=$out"
 fi
 
 out="$(CLAUDE_CODE_REMOTE=true PROBE_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "capabilities unknown"; then
+if [ "$rc" -eq 0 ] && grep -q "capabilities unknown" <<<"$out"; then
   pass "hook, probe failure: still exits 0 and says the capabilities are unknown"
 else
   fail "hook probe failure: rc=$rc out=$out"
@@ -145,7 +145,7 @@ chmod +x "$HBIN_GT/gtimeout"
 : >"$WORKDIR/timeout.log"
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.53.6 (scripts/cloud-setup.sh).' \
-   && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
+   && grep -q 'capability tier `author-writes`' <<<"$out" \
    && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log" \
    && [ "$(head -1 "$WORKDIR/timeout.log")" = "timeout 60" ] \
    && [ "$(tail -1 "$WORKDIR/timeout.log")" = "timeout 90" ]; then
@@ -161,7 +161,7 @@ for case_spec in "30:30:no" "500:60:yes" "0:60:yes" "abc:60:yes" "060:60:yes"; d
   : >"$WORKDIR/probe.log"; : >"$WORKDIR/timeout.log"
   out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" MERGEPATH_CLOUD_SETUP_TIMEOUT="$requested" PATH="$HBIN" bash "$HOOK")"; rc=$?
   noticed=no
-  printf '%s' "$out" | grep -q 'MERGEPATH_CLOUD_SETUP_TIMEOUT must be a whole number of seconds from 1 to 60' && noticed=yes
+  grep -q 'MERGEPATH_CLOUD_SETUP_TIMEOUT must be a whole number of seconds from 1 to 60' <<<"$out" && noticed=yes
   if [ "$rc" -eq 0 ] && [ "$(head -1 "$WORKDIR/timeout.log")" = "timeout $expected" ] \
      && [ "$(wc -l <"$WORKDIR/timeout.log" | tr -d ' ')" = "2" ] \
      && [ "$noticed" = "$notice" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
@@ -215,7 +215,7 @@ if [ "$(grep -Fxc 'probe_elapsed=$((SECONDS - hook_started))' "$HOOK_VIRTUAL")" 
   : >"$WORKDIR/probe.log"
   : >"$WORKDIR/timeout.log"
   out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" TEST_VIRTUAL_ELAPSED=120 PATH="$HBIN" bash "$HOOK_VIRTUAL")"; rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capabilities unknown' \
+  if [ "$rc" -eq 0 ] && grep -q 'capabilities unknown' <<<"$out" \
      && [ "$(cat "$WORKDIR/timeout.log")" = "timeout 60" ] && ! grep -q '^probe ' "$WORKDIR/probe.log"; then
     pass "hook, exhausted budget: skips the probe and prints the existing unknown summary"
   else
@@ -320,14 +320,14 @@ for startup_delay in 0 2; do
 done
 fi
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' \
-   && printf '%s' "$out" | grep -q 'capability tier `author-writes`'; then
+if [ "$rc" -eq 0 ] && grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' <<<"$out" \
+   && grep -q 'capability tier `author-writes`' <<<"$out"; then
   pass "hook, setup failure: reported in the summary, the probe still runs, the hook still exits 0"
 else
   fail "hook setup failure: rc=$rc out=$out"
 fi
 out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'cloud-setup\|tool setup'; then
+if [ "$rc" -eq 0 ] && ! grep -q 'cloud-setup\|tool setup' <<<"$out"; then
   pass "hook, setup with nothing to install: adds nothing to the summary"
 else
   fail "hook setup noop: rc=$rc out=$out"
@@ -336,7 +336,7 @@ rm -f "$HFIX/scripts/cloud-setup.sh"
 
 rm -f "$HFIX/scripts/agent-capability-probe.sh"
 out="$(CLAUDE_CODE_REMOTE=true bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "probe missing"; then
+if [ "$rc" -eq 0 ] && grep -q "probe missing" <<<"$out"; then
   pass "hook, probe absent: exits 0 and says so"
 else
   fail "hook probe absent: rc=$rc out=$out"
