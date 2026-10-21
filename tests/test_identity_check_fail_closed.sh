@@ -164,7 +164,7 @@ crr_trigger_fn=$(awk '/^post_codex_trigger\(\) \{/{f=1} f{print} f&&/^\}/{exit}'
 if [ -z "$crr_trigger_fn" ]; then
   fail "codex-review-request: post_codex_trigger() not found — cannot locate the '@codex review' trigger write"
 elif printf '%s\n' "$crr_trigger_fn" \
-     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline[[:space:]]*$'; then
+     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline([[:space:]]+\|\|[[:space:]]+return[[:space:]]+1)?[[:space:]]*$'; then
   pass "codex-review-request: post_codex_trigger posts '@codex review' via post_author_pr_comment (inline --body mode)"
 else
   fail "codex-review-request: post_codex_trigger does not post '@codex review' via post_author_pr_comment ... inline"
