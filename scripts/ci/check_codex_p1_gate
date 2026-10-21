@@ -29,12 +29,13 @@ RELAY_SOURCE="scripts/workflow/feedback-archive-relay-source.sh"
 TEST="tests/test_codex_p1_gate.sh"
 RELAY_TEST="tests/test_feedback_archive_relay_source.sh"
 WORKFLOW_RUNTIME_TEST="tests/test_codex_p1_workflow_runtime.sh"
+PENDING_TEST="tests/test_codex_p1_pending.sh"
 SNAPSHOT_DRIVER="scripts/workflow/codex-p1-snapshot-retry.py"
 
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST" "$SNAPSHOT_DRIVER"; do
+for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST" "$PENDING_TEST" "$SNAPSHOT_DRIVER"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -299,7 +300,7 @@ if gate.is_a?(Hash)
       close_env.fetch("FINGERPRINT_AVAILABLE", "").to_s.include?("steps.gate.outputs.fingerprint_available") &&
       close_run.include?('scripts/workflow/codex-p1-snapshot-retry.py') &&
       close_run.include?('"$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode"') &&
-      close_run.include?('if scripts/workflow/codex-p1-snapshot-retry.py') &&
+      close_run.include?('if CODEX_P1_PENDING_VERDICT_FILE="$verdict_file" scripts/workflow/codex-p1-snapshot-retry.py') &&
       close_run.include?('driver_status=("${PIPESTATUS[@]}")') &&
       close_run.include?('[ "${driver_status[1]}" -ne 0 ]') &&
       close_run.include?('exit "${driver_status[1]}"') &&
@@ -320,7 +321,7 @@ if gate.is_a?(Hash)
   require_shape.call(
     [budget_lineage, budget_check, budget_close, driver_call].all? &&
       budget_check < budget_close && budget_close < driver_call &&
-      close_run.scan('exit 0').length == 1 &&
+      close_run.scan('exit 0').length == 2 &&
       (native_body = close_run[/budget_native_exit\(\) \{\n(.*?)\n\s*\}\n/m, 1]) &&
       native_body.index("gate-api-lineage-blocking.sh") &&
       native_body.index("gate-api-lineage-blocking.sh") < native_body.index("exit 0") &&
@@ -330,6 +331,31 @@ if gate.is_a?(Hash)
       %w[BUDGET_PER_EVAL_REQUESTS BUDGET_RESERVE_REQUESTS BUDGET_PER_EVAL_GRAPHQL_POINTS
          BUDGET_GRAPHQL_RESERVE_POINTS].all? { |k| close_env.fetch(k, "").to_s.match?(/\A[0-9]+\z/) },
     "codex-p1-gate's budget guard (#2286) can conclude a run that did not evaluate without confirming the Checks-API lineage blocks"
+  )
+  # #2618: the pending arm. The native run may conclude non-failing on an
+  # evaluated head only through pending_native_exit, which requires the
+  # lineage helper; it is reached only for driver rc 1 with the step's own
+  # verdict file (removed before the driver runs) reading exactly `pending`,
+  # after the budget arm, and before the driver's exit code is returned.
+  verdict_rm = close_run.index('rm -f "$verdict_file"')
+  verdict_set = close_run.index('verdict_file="$RUNNER_TEMP/codex-p1-verdict"')
+  pending_call = close_run.index(/^\s+pending_native_exit$/)
+  pending_cond = close_run.index('if [ "$driver_rc" -eq 1 ] && [ -f "$verdict_file" ]')
+  budget_after_driver = close_run.rindex(/^\s+budget_native_exit$/)
+  final_exit = close_run.rindex('exit "$driver_rc"')
+  require_shape.call(
+    [verdict_rm, verdict_set, pending_call, pending_cond, budget_after_driver, final_exit].all? &&
+      verdict_set < verdict_rm && verdict_rm < driver_call &&
+      budget_after_driver < pending_cond && pending_cond < pending_call && pending_call < final_exit &&
+      close_run.include?('[ "$(cat "$verdict_file" 2>/dev/null)" = pending ]; then') &&
+      close_run.scan("pending_native_exit").length == 2 &&
+      (pending_body = close_run[/pending_native_exit\(\) \{\n(.*?)\n\s*\}\n/m, 1]) &&
+      pending_body.index('scripts/gate-api-lineage-blocking.sh "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"') &&
+      pending_body.index("gate-api-lineage-blocking.sh") < pending_body.index("exit 0") &&
+      pending_body.index("exit 0") < pending_body.index("exit 1") &&
+      pending_body.scan("exit 0").length == 1 &&
+      !pending_body.include?("success"),
+    "codex-p1-gate's pending arm (#2618) can conclude the native run non-failing without the driver's explicit pending verdict and a confirmed blocking Checks-API lineage"
   )
 
 end
@@ -684,6 +710,10 @@ if ! bash "$RELAY_TEST"; then
 fi
 if ! bash "$WORKFLOW_RUNTIME_TEST"; then
   echo "check_codex_p1_gate: FAIL (workflow runtime suite)"
+  exit 1
+fi
+if ! bash "$PENDING_TEST"; then
+  echo "check_codex_p1_gate: FAIL (pending verdict suite, #2618)"
   exit 1
 fi
 

@@ -1351,6 +1351,172 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 24 (#2618): the explicit pending verdict. With MERGEPATH_GATE_VERDICT_FILE
+# set, an accounting failure whose undispositioned findings are ALL
+# non-blocking does not stop the gate: it still runs the head-drift fence and
+# the legacy blocking-tier scan, and writes exactly `pending` only when both
+# found nothing. Every blocking, unknown, malformed or error state leaves the
+# file absent; without the variable the output is byte-identical to before.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 24 (#2618): pending verdict for non-blocking findings awaiting disposition"
+ACCOUNTING_STUB="$WORKDIR/feedback-accounting-json.sh"
+cat >"$ACCOUNTING_STUB" <<'EOF'
+#!/bin/sh
+cat "$ACCOUNTING_JSON"
+exit "${ACCOUNTING_RC:-1}"
+EOF
+chmod +x "$ACCOUNTING_STUB"
+# accounting_answer <missing JSON array> [feedback_policy JSON] -> file path
+accounting_answer() {
+  local file="$WORKDIR/accounting.$$.$RANDOM.json"
+  jq -nc --argjson missing "$1" --argjson policy "${2:-{\}}" '{
+    status: "unaccounted", repo: "owner/repo", pr_number: 99,
+    feedback_policy: $policy, posted: ($missing | length), accounted: 0,
+    missing_count: ($missing | length), findings: $missing, missing: $missing
+  }' >"$file"
+  echo "$file"
+}
+P2_INLINE='[{"kind":"inline","reviewer":"chatgpt-codex-connector[bot]","tier":"p2","finding_id":7,"path":"a.sh","line":3,"accounted":false}]'
+MINOR_CR='[{"kind":"inline","reviewer":"coderabbitai[bot]","tier":"p2","finding_id":8,"path":"b.sh","line":4,"accounted":false},{"kind":"issue-comment","reviewer":"coderabbitai[bot]","tier":"nitpick","comment_id":9,"accounted":false}]'
+P1_AND_P2='[{"kind":"inline","reviewer":"chatgpt-codex-connector[bot]","tier":"p2","finding_id":7,"accounted":false},{"kind":"review-body","reviewer":"chatgpt-codex-connector[bot]","tier":"p1","review_id":10,"accounted":false}]'
+MERGEPATH_POLICY='{"mode":"by-priority","priorities":{"p0":"required","p1":"required","p2":"discretionary","p3":"discretionary","nitpick":"discretionary"}}'
+CLEAR_THREADS=$(make_threads_fixture '[{isResolved: true, comment_ids: [1001]}]')
+OPEN_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+P1_ON_HEAD=$(make_single_comment_fixture "$HEAD_SHA" "![P1 Badge](url) Real blocker.")
+NO_COMMENTS=$(make_comments_fixture '[]')
+PR_ON_HEAD=$(make_pr_fixture "$HEAD_SHA")
+
+# pending_case <label> <expect: pending|none> <expected rc> <answer file>
+#   [scratch-kind] [comments fixture] [threads fixture] [extra VAR=value ...]
+# Runs the gate twice: once with the verdict file (the event job's ask) and
+# once without it, and asserts the verdict-free run kept today's exact output.
+pending_case() {
+  local label=$1 expect=$2 want_rc=$3 answer=$4 scratch_kind=${5:-enabled}
+  local comments=${6:-$NO_COMMENTS} threads=${7:-$CLEAR_THREADS}
+  shift 7 2>/dev/null || shift $#
+  local scratch vfile out rc out_plain rc_plain content
+  case "$scratch_kind" in
+    disabled) scratch=$(make_scratch_with_config false) ;;
+    p2-required) scratch=$(make_scratch_with_policy "$(printf 'feedback_policy:\n  mode: by-priority\n  priorities:\n    p1: required\n    p2: required\n')") ;;
+    *) scratch=$(make_scratch_with_config true) ;;
+  esac
+  vfile="$WORKDIR/verdict.$RANDOM"
+  rm -f "$vfile"
+  set +e
+  out=$(
+    export ACCOUNTING_JSON="$answer" MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$ACCOUNTING_STUB" \
+      FIXTURE_PR="$PR_ON_HEAD" FIXTURE_COMMENTS="$comments" FIXTURE_THREADS="$threads" \
+      CODEX_P1_EXPECTED_HEAD_SHA="$HEAD_SHA" MERGEPATH_GATE_VERDICT_FILE="$vfile"
+    for kv in "$@"; do export "${kv?}"; done
+    run_gate "$scratch" 99 owner/repo 2>/dev/null
+  )
+  rc=$?
+  out_plain=$(
+    export ACCOUNTING_JSON="$answer" MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$ACCOUNTING_STUB" \
+      FIXTURE_PR="$PR_ON_HEAD" FIXTURE_COMMENTS="$comments" FIXTURE_THREADS="$threads" \
+      CODEX_P1_EXPECTED_HEAD_SHA="$HEAD_SHA"
+    for kv in "$@"; do export "${kv?}"; done
+    run_gate "$scratch" 99 owner/repo 2>/dev/null
+  )
+  rc_plain=$?
+  set -e
+  content=$(cat "$vfile" 2>/dev/null || echo "<absent>")
+  # Verdict-free: stdout is the accounting answer alone (today's stop at the
+  # accounting failure), or nothing on an accounting error.
+  if [ "$out_plain" != "$(cat "$answer")" ] && [ "$rc_plain" != 2 ]; then
+    fail "#2618: $label changed the verdict-free stdout (rc=$rc_plain out=$out_plain)"
+    return 0
+  fi
+  if [ "$expect" = pending ]; then
+    if [ "$rc" = 1 ] && [ "$content" = pending ] && [ "$rc_plain" = 1 ] \
+        && grep -q '"status":"unaccounted"' <<<"$out"; then
+      pass "#2618: $label → rc 1, verdict file reads pending, accounting answer still reported"
+    else
+      fail "#2618: $label expected pending (rc=$rc file=$content plain_rc=$rc_plain out=$out)"
+    fi
+  else
+    if [ "$rc" = "$want_rc" ] && [ "$content" = "<absent>" ] && [ "$rc_plain" != 0 ]; then
+      pass "#2618: $label → rc $want_rc, no pending verdict"
+    else
+      fail "#2618: $label expected rc $want_rc and no verdict (rc=$rc file=$content plain_rc=$rc_plain out=$out)"
+    fi
+  fi
+}
+
+# (a) only non-blocking findings await disposition.
+pending_case "Codex P2 awaiting disposition, no blocking-tier thread" pending 1 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")"
+pending_case "CodeRabbit Minor + nitpick awaiting disposition" pending 1 \
+  "$(accounting_answer "$MINOR_CR" "$MERGEPATH_POLICY")"
+pending_case "absent governing policy, P2 awaiting disposition" pending 1 \
+  "$(accounting_answer "$P2_INLINE")"
+pending_case "legacy scan disabled, P2 awaiting disposition" pending 1 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" disabled
+pending_case "resolved P1 thread on HEAD, P2 awaiting disposition" pending 1 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" enabled "$P1_ON_HEAD" "$CLEAR_THREADS"
+
+# (c) a real blocker anywhere keeps the failure.
+pending_case "P1 awaiting disposition beside a P2" none 1 \
+  "$(accounting_answer "$P1_AND_P2" "$MERGEPATH_POLICY")"
+pending_case "P0 awaiting disposition" none 1 \
+  "$(accounting_answer '[{"kind":"inline","tier":"p0","accounted":false}]' "$MERGEPATH_POLICY")"
+pending_case "P2 awaiting disposition + UNRESOLVED P1 thread on HEAD" none 1 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" enabled "$P1_ON_HEAD" "$OPEN_THREADS"
+pending_case "governing policy requires p2" none 1 \
+  "$(accounting_answer "$P2_INLINE" '{"mode":"by-priority","priorities":{"p2":"required"}}')"
+pending_case "governing policy is address-all" none 1 \
+  "$(accounting_answer "$P2_INLINE" '{"mode":"address-all"}')"
+pending_case "trusted gate config makes p2 blocking-tier" none 1 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" p2-required
+
+# (d) unknown tiers, malformed answers and every error stay failing.
+pending_case "unknown tier" none 1 \
+  "$(accounting_answer '[{"kind":"inline","tier":"p9","accounted":false}]' "$MERGEPATH_POLICY")"
+pending_case "missing tier" none 1 \
+  "$(accounting_answer '[{"kind":"inline","accounted":false}]' "$MERGEPATH_POLICY")"
+pending_case "null tier" none 1 \
+  "$(accounting_answer '[{"kind":"inline","tier":null,"accounted":false}]' "$MERGEPATH_POLICY")"
+pending_case "unknown finding kind" none 1 \
+  "$(accounting_answer '[{"kind":"telepathy","tier":"p2","accounted":false}]' "$MERGEPATH_POLICY")"
+pending_case "unknown policy mode" none 1 \
+  "$(accounting_answer "$P2_INLINE" '{"mode":"vibes"}')"
+BAD_COUNT="$WORKDIR/accounting-bad-count.json"
+jq -c '.missing_count = 0' "$(accounting_answer "$P2_INLINE")" >"$BAD_COUNT"
+pending_case "missing_count disagrees with the list" none 1 "$BAD_COUNT"
+EMPTY_MISSING="$WORKDIR/accounting-empty.json"
+accounting_answer '[]' >/dev/null
+jq -n '{status:"unaccounted",missing:[],missing_count:0}' >"$EMPTY_MISSING"
+pending_case "unaccounted with an empty missing list" none 1 "$EMPTY_MISSING"
+NOT_JSON="$WORKDIR/accounting-not-json.txt"
+printf 'not json at all\n' >"$NOT_JSON"
+pending_case "accounting answer is not JSON" none 1 "$NOT_JSON"
+pending_case "accounting read/API error (rc 2)" none 2 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" enabled "$NO_COMMENTS" "$CLEAR_THREADS" ACCOUNTING_RC=2
+pending_case "reviewThreads API error after a non-blocking accounting failure" none 2 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" enabled "$P1_ON_HEAD" /dev/null
+pending_case "PR head drifted after a non-blocking accounting failure" none 2 \
+  "$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" enabled "$NO_COMMENTS" "$CLEAR_THREADS" \
+  CODEX_P1_EXPECTED_HEAD_SHA=feedface
+
+# Without the variable the gate is exactly what it was: it stops at the
+# accounting failure, before any legacy read, with the same stdout.
+SCRATCH=$(make_scratch_with_config true)
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(ACCOUNTING_JSON="$(accounting_answer "$P2_INLINE" "$MERGEPATH_POLICY")" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$ACCOUNTING_STUB" \
+  FIXTURE_PR="$PR_ON_HEAD" run_gate "$SCRATCH" 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && [ "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" = 1 ] \
+    && grep -q '"status":"unaccounted"' <<<"$OUT" && ! grep -q '^gh' "$WORKDIR/gh-calls.log"; then
+  pass "#2618: without MERGEPATH_GATE_VERDICT_FILE a non-blocking miss stops before legacy reads, stdout unchanged"
+else
+  fail "#2618: verdict-free behaviour changed (rc=$RC, out=$OUT)"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_codex_p1_gate.sh: $PASS passed, $FAIL failed"

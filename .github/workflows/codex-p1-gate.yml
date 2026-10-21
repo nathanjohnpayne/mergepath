@@ -670,6 +670,28 @@ jobs:
             echo "::error::$CHECK_NAME was not evaluated on $HEAD_SHA (installation API budget, #2286), and the Checks-API lineage could not be confirmed to block, so the job-native run fails."
             exit 1
           }
+          # #2618 (the #2247 treatment, extended by owner decision): when the
+          # only blocker on the head is a non-blocking finding (for example a
+          # Codex P2 or a CodeRabbit Minor) awaiting its disposition, the
+          # driver records an explicit `pending` verdict, after the gate
+          # script has ruled out every blocking-tier finding and the driver
+          # has closed this run's lease red. A failed native run would then
+          # stay on the head after the disposition clears the gate, and only
+          # a manual rerun retires it. So the native run concludes non-failing
+          # ONLY when scripts/gate-api-lineage-blocking.sh confirms the
+          # Checks-API lineage blocks the head outside this run's suite; that
+          # lineage keeps the PR blocked until a later evaluation publishes
+          # green after the disposition. Blocking-tier findings, unknown tiers
+          # and every read, API or config error never reach this function.
+          pending_native_exit() {
+            if [ -x scripts/gate-api-lineage-blocking.sh ] \
+               && scripts/gate-api-lineage-blocking.sh "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"; then
+              echo "::notice::$CHECK_NAME on $HEAD_SHA is PENDING: only non-blocking findings await disposition, and no blocking-tier finding is open (#2618). This job-native run concludes non-failing by design; the Checks-API run of the same name carries the block until a disposition clears the gate."
+              exit 0
+            fi
+            echo "::error::$CHECK_NAME on $HEAD_SHA awaits non-blocking dispositions, and the Checks-API lineage could not be confirmed to block, so the job-native run fails (#2618)."
+            exit 1
+          }
           if [ "$ARCHIVE_RESULT" != failure ] && [ "$ARCHIVE_RESULT" != cancelled ] \
             && [ "$GATE_READY" = true ]; then
             mode=fingerprint
@@ -707,7 +729,12 @@ jobs:
             fi
             if [ -x scripts/workflow/codex-p1-snapshot-retry.py ]; then
               driver_out=$(mktemp)
-              if scripts/workflow/codex-p1-snapshot-retry.py \
+              # #2618: the driver's explicit pending verdict travels in a file
+              # this step owns, removed first so a stale file cannot speak. A
+              # driver that predates the contract never writes it.
+              verdict_file="$RUNNER_TEMP/codex-p1-verdict"
+              rm -f "$verdict_file"
+              if CODEX_P1_PENDING_VERDICT_FILE="$verdict_file" scripts/workflow/codex-p1-snapshot-retry.py \
                 "$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode" 2>&1 | tee "$driver_out"; then
                 driver_rc=0
               else
@@ -738,6 +765,14 @@ jobs:
                     || echo "::warning::Could not stamp the back-off title on lease $CHECK_ID; the driver's red stands."
                 fi
                 budget_native_exit
+              fi
+              # Pending is a positive verdict, never an inference (#2618):
+              # driver rc 1 and the file reading exactly `pending`. Anything
+              # else (rc 0, 2 or 3, an absent, empty or different file) keeps
+              # the driver's exit code.
+              if [ "$driver_rc" -eq 1 ] && [ -f "$verdict_file" ] \
+                 && [ "$(cat "$verdict_file" 2>/dev/null)" = pending ]; then
+                pending_native_exit
               fi
               exit "$driver_rc"
             elif [ "$LEGACY_BOOTSTRAP" = true ]; then
