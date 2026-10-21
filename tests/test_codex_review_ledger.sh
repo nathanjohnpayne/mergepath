@@ -800,6 +800,12 @@ L_RW_NOLAST=$(printf '%s' "$L_RW" | jq -c 'del(.responses[].last_at)')
 stop_check "runaway tiebreak: a response without last_at falls back to first_at for the floor" \
   "$(crl_apply_owner_tiebreaks "$(crl_human_stops "$L_RW_NOLAST" "$HEAD_A" nathanjohnpayne 10 2)" "$L_RW_NOLAST" "$(crl_owner_tiebreaks "$RWC" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
   '.stops == [] and .owner_tiebreaks == [{kind: "runaway"}]'
+# The fallback floor is the response's first_at (01:10), later than the last
+# request (01:00): a marker between the two must hold, or the fallback has
+# dropped the response and only the requests set the floor (CodeRabbit on #2567).
+stop_check "runaway tiebreak: under the absent-last_at fallback a marker after the last request but before first_at holds" \
+  "$(crl_apply_owner_tiebreaks "$(crl_human_stops "$L_RW_NOLAST" "$HEAD_A" nathanjohnpayne 10 2)" "$L_RW_NOLAST" "$(crl_owner_tiebreaks "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T01:05:00Z 2026-09-25T01:05:00Z "$RM")" | arr)" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
 
 # The barrier's own reader (p4b_codex_human_stops) applies markers it reads from
 # the PR's comments, and leaves the stop standing when it cannot read them.
