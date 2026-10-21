@@ -76,7 +76,7 @@ else
 fi
 
 # ── 5. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with the
-#      `verdict=$(echo "$issue_comments" | jq -c ...)` filter in
+#      `verdict=$(printf '%s\n' "$issue_comments" | jq -c ...)` filter in
 #      scan_codex_state. Selects the LATEST HEAD-anchored verdict comment
 #      (any disposition) and reports whether it is affirmative.
 BOT="chatgpt-codex-connector[bot]"
@@ -85,7 +85,7 @@ VERDICT_FILTER=$(python3 - "$SCRIPT" <<'SELECTOR'
 from pathlib import Path
 import sys
 source = Path(sys.argv[1]).read_text()
-start = source.index('  verdict=$(echo ')
+start = source.index('  verdict=$(printf \'%s\\n\' "$issue_comments" | jq -c ')
 marker = '--arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" ' + chr(39)
 start = source.index(marker, start) + len(marker)
 end = source.index("\n  ')", start)
@@ -400,6 +400,30 @@ STUB
     fail "fetch_api_array mishandled stderr on a successful fetch; got: $fetch_ok_output"
   fi
 
+  # JSON payloads contain escape sequences that xpg_echo would interpret.
+  # Set the option inside this wrapper (not via inherited BASHOPTS): macOS
+  # Bash 3.2 ignores an inherited BASHOPTS setting.
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' '[{"body":"line one\nline two\\path"}]'
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+  fetch_xpg_echo_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    shopt -s xpg_echo
+    set -eo pipefail
+    log() { :; }
+    . "$2"
+    eval "$1"
+    out=$(fetch_api_array "repos/o/r/x" "widgets")
+    printf "%s" "$out" | jq -e ".[0].body == \"line one\\nline two\\\\path\"" >/dev/null
+    printf "escape-bearing JSON preserved\n"
+  ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
+  if [ "$fetch_xpg_echo_output" = "escape-bearing JSON preserved" ]; then
+    pass "fetch_api_array: literal JSON emission preserves newline and backslash escapes with xpg_echo enabled"
+  else
+    fail "fetch_api_array corrupted escape-bearing JSON with xpg_echo enabled; got: $fetch_xpg_echo_output"
+  fi
+
   # #1008: `--paginate` emits one JSON document per page, and the flatten is
   # what turns them into ONE array. A reader that kept only the first page
   # would under-report every surface it scans, which on this poller is a
@@ -525,6 +549,77 @@ STUB
   fi
 
   rm -rf "$fetch_stub_dir"
+fi
+
+# JSON values derived from API arrays must also survive the requester's own
+# scan pipeline under xpg_echo. Exercise the extracted production scan and
+# source its real shared evidence selectors so review/finding bodies and the
+# selected current-head review summary remain visible in returned JSON.
+SCAN_JSON_FN="$(sed -n '/^scan_codex_state() {/,/^}/p' "$SCRIPT")"
+if [ -z "$SCAN_JSON_FN" ]; then
+  fail "could not extract scan_codex_state for xpg_echo JSON round-trip"
+else
+  scan_xpg_echo_output="$(bash -c '
+    shopt -s xpg_echo
+    set -eo pipefail
+    REPO=owner/repo PR_NUMBER=1 HEAD_SHA=0123456789012345678901234567890123456789
+    BOT_LOGIN=codex[bot] AUTHOR_IDENTITY=author
+    REQUIRED_TIERS_JSON=$(jq -nc --arg tier p1 "[\$tier]")
+    DISCRETIONARY_TIERS_JSON='[]' CODEX_FAILURE_MARKERS_OK=false
+    body=$'"'"'**P1** first line\nsecond line\\n literal and \\\\path'"'"'
+    FIXTURE_REVIEW=$(jq -cn --arg body "$body" --arg sha "$HEAD_SHA" \
+      "{id:7,state:\"COMMENTED\",submitted_at:\"2026-01-01T00:00:00Z\",commit_id:\$sha,body:\$body}")
+    FIXTURE_COMMENTS=$(jq -cn --arg body "$body" --arg bot "$BOT_LOGIN" \
+      "[{id:9,user:{login:\$bot},pull_request_review_id:7,body:\$body,path:\"sample.sh\",line:1}]")
+    verdict_body=$(printf "%s\nReviewed commit: %s\n%s" \
+      "Codex Review: Didnt find any major issues." "$HEAD_SHA" "$body")
+    FIXTURE_ISSUE_COMMENTS=$(jq -cn --arg body "$verdict_body" --arg bot "$BOT_LOGIN" \
+      "[{id:10,user:{login:\$bot},body:\$body,created_at:\"2026-01-01T00:00:01Z\"}]")
+    summary_body=$(printf "%s\n%s\n%s" \
+      "<!-- codex-pull-request-review-summary -->" \
+      "| 📝 **Code Review** | **Running** | \`$HEAD_SHA\` | @codex review |" \
+      "Review note: line one\\nline two\\\\path")
+    FIXTURE_ISSUE_COMMENTS=$(jq -cn --argjson comments "$FIXTURE_ISSUE_COMMENTS" \
+      --arg body "$summary_body" --arg bot "$BOT_LOGIN" \
+      "\$comments + [{id:11,user:{login:\$bot},body:\$body,created_at:\"2026-01-01T00:00:02Z\",updated_at:\"2026-01-01T00:00:03Z\"}]")
+    fetch_scan_array() {
+      case "$1" in
+        */reviews) printf "[]\\n" ;;
+        */pulls/*/comments) printf "%s\\n" "$FIXTURE_COMMENTS" ;;
+        */issues/*/comments) printf "%s\\n" "$FIXTURE_ISSUE_COMMENTS" ;;
+      esac
+    }
+    . "$2"
+    crqe_resolve_verdict_anchors() { printf "%s" "$1"; }
+    crqe_select_head_review() { printf "%s" "$FIXTURE_REVIEW"; }
+    crqe_review_approval_time() { printf ""; }
+    crqe_select_trigger() { printf "null"; }
+    crqe_filter_provider_block() { printf "%s" "$1"; }
+    eval "$1"
+    if scan=$(scan_codex_state); then
+      summary=not-selected
+      if printf "%s" "$scan" | jq -e --arg body "$body" \
+        ".review.body == \$body and .findings[0].body == \$body and .findings[0].priority == \"P1\" and .verdict.affirmative == true" >/dev/null \
+        && summary=$(crqe_select_codex_review_summary "$FIXTURE_ISSUE_COMMENTS" "$BOT_LOGIN" "$HEAD_SHA") \
+        && printf "%s" "$summary" | jq -e --arg sha "$HEAD_SHA" \
+          ".status == \"running\" and .commit == \$sha and .observed_at == \"2026-01-01T00:00:03Z\" and .comment_id == 11 and .trigger == \"@codex review\"" >/dev/null; then
+        printf "scan and selected summary JSON preserved\\n"
+      else
+        printf "scan or selected summary JSON mismatch\\n"
+        printf "selected summary: %s\\nscan: %s\\n" "$summary" "$scan"
+      fi
+    else
+      printf "scan execution failed\\n"
+    fi
+  ' _ "$SCAN_JSON_FN" "$ROOT/scripts/lib/codex-request-evidence.sh" 2>&1)" || {
+    inner_rc=$?
+    scan_xpg_echo_output="inner exit $inner_rc: $scan_xpg_echo_output"
+  }
+  if [ "$scan_xpg_echo_output" = "scan and selected summary JSON preserved" ]; then
+    pass "scan_codex_state: review/finding JSON and real current-head summary selection survive newline/backslash escapes with xpg_echo enabled"
+  else
+    fail "scan_codex_state corrupted an API JSON payload with xpg_echo enabled; got: $scan_xpg_echo_output"
+  fi
 fi
 
 # ── 11. Behavioral (#1550): fetch_scan_array classifies a failed read with the

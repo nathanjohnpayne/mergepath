@@ -1412,6 +1412,15 @@ while IFS= read -r wf; do
   fi
 done <<< "$wf_sites"
 
+# Parsed YAML also checks the enclosing step/job allowances, including inert
+# required-workflow templates on the hub. Generic negative fixtures run on
+# consumers; their live inventory is repo-owned and remains hub-only (#1622).
+if python3 "$ROOT/tests/test_pr_body_workflow_bounds.py"; then
+  ok "#1622: reviewed workflow routes retain their enclosing parser allowances"
+else
+  bad "#1622: workflow parser inventory or enclosing timeout floor changed"
+fi
+
 # Execute the actual weekly-audit script with fake GitHub and parser boundaries.
 # Parser infrastructure failures must survive Dependabot exemptions, later PRs
 # must still be audited, and a spent budget must report the unaudited remainder.

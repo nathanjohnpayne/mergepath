@@ -14,7 +14,7 @@ Feature: honest consumer identity in bootstrapped repos. Stage B of `scripts/boo
 
 ### Canonical agent docs delivered and ordered (#780)
 
-- After the identity scaffold finishes, Stage B derives the complete required agent-doc set from the source `.mergepath-sync.yml`: every `doc_ownership` entry with `class: canonical` whose `pending_manifest` flag is not true. The required set is not duplicated in bootstrap code, so backing a pending canonical doc makes it required on the next bootstrap run automatically.
+- After the identity scaffold finishes, Stage B derives the complete required agent-doc set from the source `.mergepath-sync.yml`: every `doc_ownership` entry with `class: canonical` whose `pending_manifest` flag is not true. The required set is not duplicated in bootstrap code. Ownership validation rejects `pending_manifest: true` once a qualifying all-consumer canonical backing path exists, so the same change must remove the flag; that transition makes the document required on the next bootstrap run automatically. Unbacked transitional entries still require their follow-up note and remain outside the required set.
 - Every derived canonical agent doc must exist in the mirrored target. This is a positive post-rsync assertion that a future exclude pattern cannot silently strip a fleet-wide rulebook.
 - The target `AGENTS.md` must reference `docs/agents/shared-operating-rules.md` before `docs/agents/operating-rules.md`. Ordering compares both line and column, so two links on one physical line cannot bypass the shared-before-local invariant.
 

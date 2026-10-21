@@ -62,6 +62,8 @@ EOF
 
 # git init each fake worktree — resolve_consumer_worktree() looks for .git/
 git init -q "$MP"
+# Kits are audited from the hub's tracked files (#2542), so stage the fixture.
+git -C "$MP" add -A
 
 SIBLINGS="$WORKDIR/siblings"
 mkdir -p "$SIBLINGS"
@@ -115,11 +117,11 @@ fail() { echo "FAIL: $*" >&2; echo "---output---" >&2; echo "$output" >&2; exit 
 # grep finds nothing, and the test silently passes — drift goes
 # undetected. These three explicit header presence assertions turn that
 # silent-pass into a loud failure.
-echo "$output" | grep -q "^clean-consumer" \
+grep -q "^clean-consumer" <<<"$output" \
   || fail "clean-consumer block missing from --audit output"
-echo "$output" | grep -q "^drifted" \
+grep -q "^drifted" <<<"$output" \
   || fail "drifted block missing from --audit output"
-echo "$output" | grep -q "^missing-everything" \
+grep -q "^missing-everything" <<<"$output" \
   || fail "missing-everything block missing from --audit output"
 
 # Clean consumer: every line should be ✓ in sync (the consumer-only extra
@@ -132,9 +134,9 @@ echo "$output" | awk '
   && fail "clean-consumer should report no drift; got non-✓ lines"
 
 # Drifted consumer: must show drift for keep-in-sync.sh and for the kit dir
-echo "$output" | grep -q "✗ scripts/keep-in-sync.sh" \
+grep -q "✗ scripts/keep-in-sync.sh" <<<"$output" \
   || fail "expected drift line for scripts/keep-in-sync.sh on drifted consumer"
-echo "$output" | grep -q "✗ scripts/ci/" \
+grep -q "✗ scripts/ci/" <<<"$output" \
   || fail "expected drift line for scripts/ci/ kit on drifted consumer"
 
 # Missing-everything: every path must be ⊘
@@ -145,12 +147,46 @@ echo "$output" | awk '
 ' | grep -q '✓\|✗' \
   && fail "missing-everything should report only ⊘; got ✓ or ✗ lines"
 
+# #2542: ignored and untracked hub files inside a kit are never shipped, so
+# the audit must not count them as files the consumer is missing. A local
+# Python run leaves `__pycache__/` (gitignored) in kit dirs; the old
+# filesystem walk reported every consumer as "1 file(s) missing".
+printf '__pycache__/\n' >>"$MP/.git/info/exclude"
+mkdir -p "$MP/scripts/ci/__pycache__"
+echo "bytecode" >"$MP/scripts/ci/__pycache__/check_one.cpython-313.pyc"
+echo "scratch" >"$MP/scripts/ci/check_local_scratch"
+git -C "$MP" status --short --ignored -- scripts/ci | grep -qF '!! scripts/ci/__pycache__/' \
+  || fail "fixture __pycache__ should be gitignored in the hub"
+git -C "$MP" status --short -- scripts/ci | grep -qF '?? scripts/ci/check_local_scratch' \
+  || fail "fixture scratch file should be untracked in the hub"
+set +e
+ignored_kit_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
+ignored_kit_rc=$?
+set -e
+[[ "$ignored_kit_rc" -eq 0 ]] \
+  || fail "ignored/untracked hub kit files reported as drift (exit $ignored_kit_rc): $ignored_kit_out"
+grep -qE '✓ scripts/ci/ +in sync' <<<"$ignored_kit_out" \
+  || fail "kit with ignored/untracked hub files should stay in sync: $ignored_kit_out"
+# A tracked kit file the consumer lacks is still reported as missing.
+echo "kit-file-3" >"$MP/scripts/ci/check_three"
+git -C "$MP" add -- scripts/ci/check_three
+set +e
+tracked_missing_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
+set -e
+grep -qE '✗ scripts/ci/ +drift: 0 file\(s\) drifted, 1 file\(s\) missing' <<<"$tracked_missing_out" \
+  || fail "tracked kit file absent from the consumer should count as missing: $tracked_missing_out"
+git -C "$MP" rm -q --cached -- scripts/ci/check_three
+rm -rf "$MP/scripts/ci/__pycache__" "$MP/scripts/ci/check_local_scratch" "$MP/scripts/ci/check_three"
+echo 'PASS: kit audit ignores untracked and gitignored hub files (#2542)'
+
 # ---------------------------------------------------------------------------
 # Filter test: --paths restriction must shrink the report
 # ---------------------------------------------------------------------------
 filtered=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
   "$SCRIPT" --audit --use-local-tree --no-clone --paths "scripts/hooks/the-hook.sh" 2>&1 || true)
-echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
+grep -q "scripts/keep-in-sync.sh" <<<"$filtered" \
   && fail "--paths filter should have excluded scripts/keep-in-sync.sh"
 
 # Explicit selectors must be valid. A short consumer name and its owner/name
@@ -159,9 +195,9 @@ echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
 # for every selected consumer rather than silently reporting an empty audit.
 owner_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
   "$SCRIPT" --audit --use-local-tree --no-clone --repos x/clean-consumer 2>&1)
-echo "$owner_selector_out" | grep -q '^clean-consumer (x/clean-consumer)' \
+grep -q '^clean-consumer (x/clean-consumer)' <<<"$owner_selector_out" \
   || fail "owner/name --repos selector did not select clean-consumer: $owner_selector_out"
-echo "$owner_selector_out" | grep -q '^drifted' \
+grep -q '^drifted' <<<"$owner_selector_out" \
   && fail "owner/name --repos selector leaked a non-selected consumer: $owner_selector_out"
 
 set +e
@@ -174,13 +210,13 @@ empty_path_ec=$?
 set -e
 [[ "$unknown_repos_ec" -eq 2 ]] \
   || fail "unknown audit --repos selector should exit 2; got $unknown_repos_ec ($unknown_repos_out)"
-echo "$unknown_repos_out" | grep -q 'not-a-consumer' \
+grep -q 'not-a-consumer' <<<"$unknown_repos_out" \
   || fail "unknown audit --repos diagnostic omitted unmatched selector: $unknown_repos_out"
-echo "$unknown_repos_out" | grep -q 'clean-consumer (x/clean-consumer)' \
+grep -q 'clean-consumer (x/clean-consumer)' <<<"$unknown_repos_out" \
   || fail "unknown audit --repos diagnostic omitted valid consumers: $unknown_repos_out"
 [[ "$empty_path_ec" -eq 2 ]] \
   || fail "empty audit --paths selection should exit 2; got $empty_path_ec ($empty_path_out)"
-echo "$empty_path_out" | grep -q 'selects no managed path for clean-consumer' \
+grep -q 'selects no managed path for clean-consumer' <<<"$empty_path_out" \
   || fail "empty audit --paths diagnostic was unclear: $empty_path_out"
 
 # read -a would silently discard an empty trailing field and everything after a
@@ -198,9 +234,9 @@ for selector_ec in "$trailing_selector_ec" "$multiline_selector_ec"; do
     || fail "malformed --repos list should exit 2; got $selector_ec"
 done
 for selector_out in "$trailing_selector_out" "$multiline_selector_out"; do
-  echo "$selector_out" | grep -q 'invalid --repos list' \
+  grep -q 'invalid --repos list' <<<"$selector_out" \
     || fail "malformed --repos diagnostic was unclear: $selector_out"
-  echo "$selector_out" | grep -q '^clean-consumer (' \
+  grep -q '^clean-consumer (' <<<"$selector_out" \
     && fail "audit driver started after malformed --repos input: $selector_out"
 done
 
@@ -230,9 +266,9 @@ validation_yq_ec=$?
 set -e
 [[ "$validation_yq_ec" -eq 2 ]] \
   || fail "failed validation consumer read should exit 2; got $validation_yq_ec ($validation_yq_out)"
-echo "$validation_yq_out" | grep -q 'could not read manifest consumers while validating filters' \
+grep -q 'could not read manifest consumers while validating filters' <<<"$validation_yq_out" \
   || fail "failed validation consumer read lacked a clear diagnostic: $validation_yq_out"
-echo "$validation_yq_out" | grep -q '^clean-consumer (' \
+grep -q '^clean-consumer (' <<<"$validation_yq_out" \
   && fail "audit driver started after validation consumer read failed: $validation_yq_out"
 
 # Audit honors .sync-overrides.yml on templated dest paths (#336).
@@ -274,7 +310,7 @@ audit_override_rc=$?
 set -e
 [ "$audit_override_rc" -eq 1 ] \
   || fail "audit override fixture should still exit 1 because beta drifts; got $audit_override_rc ($audit_override_out)"
-echo "$audit_override_out" | grep -q "↷ eslint.config.js.*skipped per .sync-overrides.yml" \
+grep -q "↷ eslint.config.js.*skipped per .sync-overrides.yml" <<<"$audit_override_out" \
   || fail "audit should report alpha templated dest as override-skipped; output: $audit_override_out"
 [ "$(echo "$audit_override_out" | grep -c "✗ eslint.config.js")" -eq 1 ] \
   || fail "audit should flag only beta's un-overridden templated drift; output: $audit_override_out"
@@ -318,7 +354,7 @@ worktree_exit=$?
 set -e
 [[ "$worktree_exit" -eq 0 ]] \
   || fail "worktree (.git as file) should be accepted as a sibling; got exit $worktree_exit, output: $output"
-echo "$output" | grep -q "no local worktree" \
+grep -q "no local worktree" <<<"$output" \
   && fail "worktree (.git as file) misclassified as missing"
 
 # ---------------------------------------------------------------------------
@@ -375,9 +411,9 @@ live_exit=$?
 set -e
 [[ "$live_exit" -eq 0 ]] \
   || fail "default audit should read the clean cache clone (exit 0) and ignore the stale sibling; got exit $live_exit, output: $live_output"
-echo "$live_output" | grep -q "baseline: .*cache clone, refreshed" \
+grep -q "baseline: .*cache clone, refreshed" <<<"$live_output" \
   || fail "default audit should print the cache-clone baseline header; got: $live_output"
-echo "$live_output" | grep -q "LOCAL SIBLING TREE" \
+grep -q "LOCAL SIBLING TREE" <<<"$live_output" \
   && fail "default audit must not read the sibling tree; got: $live_output"
 
 # --use-local-tree: the stale sibling IS the baseline; drift is reported
@@ -391,11 +427,11 @@ stale_exit=$?
 set -e
 [[ "$stale_exit" -eq 1 ]] \
   || fail "--use-local-tree audit should report the stale sibling's drift (exit 1); got exit $stale_exit, output: $stale_output"
-echo "$stale_output" | grep -q "baseline: feature/stale-work@.*LOCAL SIBLING TREE" \
+grep -q "baseline: feature/stale-work@.*LOCAL SIBLING TREE" <<<"$stale_output" \
   || fail "--use-local-tree audit should print the sibling baseline ref@sha; got: $stale_output"
-echo "$stale_output" | grep -q "⚠ sibling tree is on 'feature/stale-work', not the default branch 'main'" \
+grep -q "⚠ sibling tree is on 'feature/stale-work', not the default branch 'main'" <<<"$stale_output" \
   || fail "--use-local-tree audit should warn about the non-default branch; got: $stale_output"
-echo "$stale_output" | grep -q "⚠ sibling tree HEAD .* != last-fetched origin/main" \
+grep -q "⚠ sibling tree HEAD .* != last-fetched origin/main" <<<"$stale_output" \
   || fail "--use-local-tree audit should warn that HEAD differs from origin/main; got: $stale_output"
 
 # Default mode + --no-clone with NO cache clone present: fail closed with
@@ -409,9 +445,9 @@ noclone_exit=$?
 set -e
 [[ "$noclone_exit" -eq 3 ]] \
   || fail "default audit --no-clone with no cache should exit 3; got $noclone_exit, output: $noclone_output"
-echo "$noclone_output" | grep -q "no cached clone for clean-consumer" \
+grep -q "no cached clone for clean-consumer" <<<"$noclone_output" \
   || fail "default audit --no-clone should explain the missing cache clone; got: $noclone_output"
-echo "$noclone_output" | grep -q -- "--use-local-tree" \
+grep -q -- "--use-local-tree" <<<"$noclone_output" \
   || fail "default audit --no-clone should point at --use-local-tree; got: $noclone_output"
 
 # --use-local-tree is audit-mode-only.
@@ -443,7 +479,7 @@ rename_exit=$?
 set -e
 [[ "$rename_exit" -eq 1 ]] \
   || fail "default audit should follow a renamed default branch and report its drift (exit 1); got exit $rename_exit, output: $rename_output"
-echo "$rename_output" | grep -q "baseline: trunk@" \
+grep -q "baseline: trunk@" <<<"$rename_output" \
   || fail "default audit baseline should show the renamed default branch 'trunk'; got: $rename_output"
 
 # ---------------------------------------------------------------------------
@@ -473,7 +509,7 @@ hostile_exit=$?
 set -e
 [[ "$hostile_exit" -eq 3 ]] \
   || fail "expected exit 3 (fetch error from refusing symlinked cache), got $hostile_exit"
-echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEPATH_SYNC_CACHE" \
+grep -qE "it is a symbolic link|resolves outside MERGEPATH_SYNC_CACHE" <<<"$hostile_output" \
   || fail "expected symlink-guard error message; got: $hostile_output"
 # The user's working tree must NOT have been touched — this is the
 # load-bearing assertion. The exit code and error message are
@@ -539,31 +575,31 @@ sha_C=$(git -C "$SYNC_MP" rev-parse HEAD)
 # 1) Multi-type touch: canonical lands, kit + templated are deferred with
 #    a per-consumer note. All 3 consumers get a planned PR.
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run 2>&1)
-echo "$sync_out" | grep -q "would open PR on branch mergepath-sync/${sha_A:0:7}" \
+grep -q "would open PR on branch mergepath-sync/${sha_A:0:7}" <<<"$sync_out" \
   || fail "multi-type sync did not produce planned PRs; output: $sync_out"
 [[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 3 ]] \
   || fail "expected 3 planned PRs (one per consumer); got: $sync_out"
-echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+grep -q "+ scripts/hooks/the-hook.sh" <<<"$sync_out" \
   || fail "canonical target scripts/hooks/the-hook.sh missing from plan"
-echo "$sync_out" | grep -q "deferred this slice: kit=scripts/ci/" \
+grep -q "deferred this slice: kit=scripts/ci/" <<<"$sync_out" \
   || fail "kit deferred-note missing from plan"
-echo "$sync_out" | grep -q "templated=AGENTS.md" \
+grep -q "templated=AGENTS.md" <<<"$sync_out" \
   || fail "templated deferred-note missing from plan"
 
 # 2) --repos filter restricts consumer set.
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_B" --dry-run --repos beta 2>&1)
 [[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 1 ]] \
   || fail "--repos filter did not restrict to one consumer; got: $sync_out"
-echo "$sync_out" | grep -q "beta — would open PR" \
+grep -q "beta — would open PR" <<<"$sync_out" \
   || fail "expected beta in --repos filter output; got: $sync_out"
-echo "$sync_out" | grep -q "alpha\|gamma" \
+grep -q "alpha\|gamma" <<<"$sync_out" \
   && fail "non-filtered consumer leaked into output: $sync_out"
 
 # 3) --paths filter restricts target set within the planned PR.
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --paths "scripts/hooks/the-hook.sh" 2>&1)
-echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+grep -q "+ scripts/hooks/the-hook.sh" <<<"$sync_out" \
   || fail "--paths filter excluded the requested path"
-echo "$sync_out" | grep -q "+ scripts/coderabbit-wait.sh" \
+grep -q "+ scripts/coderabbit-wait.sh" <<<"$sync_out" \
   && fail "--paths filter did not exclude scripts/coderabbit-wait.sh"
 
 # Commit and sync-all modes use the same preflight: both reject invalid
@@ -587,13 +623,13 @@ for filter_ec in "$sync_unknown_repos_ec" "$sync_empty_path_ec" \
   [[ "$filter_ec" -eq 2 ]] \
     || fail "invalid delivery filter should exit 2; got $filter_ec"
 done
-echo "$sync_unknown_repos_out" | grep -q 'no-such-consumer' \
+grep -q 'no-such-consumer' <<<"$sync_unknown_repos_out" \
   || fail "commit sync invalid --repos diagnostic omitted selector: $sync_unknown_repos_out"
-echo "$syncall_unknown_repos_out" | grep -q 'valid consumers:' \
+grep -q 'valid consumers:' <<<"$syncall_unknown_repos_out" \
   || fail "sync-all invalid --repos diagnostic omitted valid consumers: $syncall_unknown_repos_out"
-echo "$sync_empty_path_out" | grep -q 'selects no managed path for beta' \
+grep -q 'selects no managed path for beta' <<<"$sync_empty_path_out" \
   || fail "commit sync empty --paths diagnostic was unclear: $sync_empty_path_out"
-echo "$syncall_empty_path_out" | grep -q 'selects no managed path for beta' \
+grep -q 'selects no managed path for beta' <<<"$syncall_empty_path_out" \
   || fail "sync-all empty --paths diagnostic was unclear: $syncall_empty_path_out"
 
 # 4) Commit that only touches kit + templated → no canonical targets,
@@ -607,14 +643,14 @@ git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commi
 sha_D=$(git -C "$SYNC_MP" rev-parse HEAD)
 
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_D" --dry-run 2>&1)
-echo "$sync_out" | grep -q "no canonical targets" \
+grep -q "no canonical targets" <<<"$sync_out" \
   || fail "kit-only commit should report 'no canonical targets' per consumer; got: $sync_out"
-echo "$sync_out" | grep -q "would open PR" \
+grep -q "would open PR" <<<"$sync_out" \
   && fail "kit-only commit should not plan any PRs (canonical-only slice)"
 
 # 5) Commit that touches no manifest path at all → "no manifest paths touched".
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_C" --dry-run 2>&1)
-echo "$sync_out" | grep -q "no manifest paths touched" \
+grep -q "no manifest paths touched" <<<"$sync_out" \
   || fail "unrelated-only commit should report 'no manifest paths touched'; got: $sync_out"
 
 # 6) Resolution of an unknown commit-ish exits 2 cleanly.
@@ -694,9 +730,9 @@ set +e
 guard_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
 guard_exit=$?
 set -e
-echo "$guard_out" | grep -q "refusing to run live sync" \
+grep -q "refusing to run live sync" <<<"$guard_out" \
   || fail "author-token guard did not fire; got: $guard_out"
-echo "$guard_out" | grep -q "definitely-not-a-real-user-9999" \
+grep -q "definitely-not-a-real-user-9999" <<<"$guard_out" \
   || fail "author-token guard did not name the expected actor"
 [[ "$guard_exit" -ne 0 ]] \
   || fail "author-token guard should exit non-zero; got $guard_exit"
@@ -709,7 +745,7 @@ dr_exit=$?
 set -e
 [[ "$dr_exit" -eq 0 ]] \
   || fail "dry-run should not be blocked by author-token guard; got exit $dr_exit, output: $dr_out"
-echo "$dr_out" | grep -q "would open PR" \
+grep -q "would open PR" <<<"$dr_out" \
   || fail "dry-run should still plan a PR; got: $dr_out"
 
 # Live --no-pr performs git clone/push work but does not create,
@@ -724,9 +760,9 @@ nopr_out=$(PATH="$GUARD_FAKE_BIN:$PATH" \
   "$SCRIPT" "$guard_sha" --repos alpha --no-pr 2>&1)
 nopr_exit=$?
 set -e
-echo "$nopr_out" | grep -q "refusing to run live sync" \
+grep -q "refusing to run live sync" <<<"$nopr_out" \
   && fail "--no-pr should skip the author-token guard; got: $nopr_out"
-echo "$nopr_out" | grep -q "fake gh repo clone reached" \
+grep -q "fake gh repo clone reached" <<<"$nopr_out" \
   || fail "--no-pr should reach clone after skipping author-token guard; got: $nopr_out"
 [[ "$nopr_exit" -ne 0 ]] \
   || fail "--no-pr fixture should exit non-zero after fake clone failure; got $nopr_exit"
@@ -739,7 +775,7 @@ override_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
   MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
   "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
 set -e
-echo "$override_out" | grep -q "refusing to run live sync" \
+grep -q "refusing to run live sync" <<<"$override_out" \
   && fail "test bypass should skip the author-token guard; got: $override_out"
 
 # Agent-aware sync metadata (#392). Exercise the live path with a local
@@ -858,11 +894,11 @@ metadata_run_and_assert() {
   local commit_body pr_body
   commit_body=$(git --git-dir="$remote" log -1 --format=%B "refs/heads/$meta_branch")
   pr_body=$(cat "$META_CAPTURE/pr-body-${run_id}.md")
-  echo "$commit_body" | grep -q "Authoring-Agent: ${expected_agent}" \
+  grep -q "Authoring-Agent: ${expected_agent}" <<<"$commit_body" \
     || fail "metadata sync $run_id commit body missing Authoring-Agent: ${expected_agent}; body: $commit_body"
-  echo "$pr_body" | grep -q "Authoring-Agent: ${expected_agent}" \
+  grep -q "Authoring-Agent: ${expected_agent}" <<<"$pr_body" \
     || fail "metadata sync $run_id PR body missing Authoring-Agent: ${expected_agent}; body: $pr_body"
-  echo "$commit_body" | grep -qF "$expected_trailer" \
+  grep -qF "$expected_trailer" <<<"$commit_body" \
     || fail "metadata sync $run_id commit body missing trailer '$expected_trailer'; body: $commit_body"
 }
 
@@ -1006,7 +1042,7 @@ scope_first_rc=$?
 set -e
 [ "$scope_first_rc" -eq 0 ] \
   || fail "full sync-all after legacy partial branch failed: $scope_first_out"
-echo "$scope_first_out" | grep -q 'opened https://github.com/example/alpha/pull/scope-first' \
+grep -q 'opened https://github.com/example/alpha/pull/scope-first' <<<"$scope_first_out" \
   || fail "legacy SHA-only completed PR suppressed a new scope-aware full sync: $scope_first_out"
 scope_branch=$(git --git-dir="$scope_remote" for-each-ref --format='%(refname:short)' \
   'refs/heads/mergepath-sync/sync-all-*' | head -1)
@@ -1073,6 +1109,43 @@ for omitted_path in scripts/omitted.sh scripts/omitted-kit/ templates/omitted.in
 done
 echo 'PASS: full and narrowed sync PR bodies retain exact requested scope (#2490)'
 
+# #2542: --sync-all delivers kit files from the committed tree at the source
+# sha, so an ignored or untracked file in the hub's kit dir never ships.
+kit_hub="$metadata_workdir/kit-tracked-source"
+git clone -q "$META_MP" "$kit_hub"
+cat >"$kit_hub/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+paths:
+  - {path: scripts/kit/, type: kit, consumers: all}
+YAML
+mkdir -p "$kit_hub/scripts/kit"
+echo "kit a" >"$kit_hub/scripts/kit/check_a"
+echo "kit b" >"$kit_hub/scripts/kit/check_b"
+git -C "$kit_hub" add -A
+git -C "$kit_hub" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'kit fixture'
+printf '__pycache__/\n' >>"$kit_hub/.git/info/exclude"
+mkdir -p "$kit_hub/scripts/kit/__pycache__"
+echo "bytecode" >"$kit_hub/scripts/kit/__pycache__/check_a.cpython-313.pyc"
+echo "scratch" >"$kit_hub/scripts/kit/check_local_scratch"
+kit_remote="$metadata_workdir/kit-tracked.git"
+setup_metadata_remote "$kit_remote" "$metadata_workdir/kit-tracked-seed"
+set +e
+kit_sync_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$kit_hub" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$kit_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN=2542 MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha 2>&1)
+kit_sync_rc=$?
+set -e
+[ "$kit_sync_rc" -eq 0 ] || fail "kit sync-all fixture failed: $kit_sync_out"
+kit_branch=$(git --git-dir="$kit_remote" for-each-ref --format='%(refname:short)' 'refs/heads/mergepath-sync/sync-all-*')
+[ -n "$kit_branch" ] || fail "kit sync-all pushed no branch: $kit_sync_out"
+kit_delivered=$(git --git-dir="$kit_remote" ls-tree -r --name-only "refs/heads/$kit_branch" -- scripts/kit)
+[ "$kit_delivered" = $'scripts/kit/check_a\nscripts/kit/check_b' ] \
+  || fail "sync-all kit delivery must be exactly the committed kit files; got: $kit_delivered"
+echo 'PASS: sync-all never delivers untracked or gitignored kit files (#2542)'
+
 set +e
 scope_repeat_out=$(env \
   PATH="$META_FAKE_BIN:$PATH" \
@@ -1087,7 +1160,7 @@ scope_repeat_rc=$?
 set -e
 [ "$scope_repeat_rc" -eq 0 ] \
   || fail "exact completed scope repeat failed: $scope_repeat_out"
-echo "$scope_repeat_out" | grep -q "already done (sync-all PR #413 closed/merged on branch $scope_branch; requested scope:" \
+grep -q "already done (sync-all PR #413 closed/merged on branch $scope_branch; requested scope:" <<<"$scope_repeat_out" \
   || fail "exact completed scope did not remain idempotent or omitted its scope diagnostic: $scope_repeat_out"
 [ ! -f "$META_CAPTURE/pr-body-scope-repeat.md" ] \
   || fail "exact completed scope repeat opened a duplicate PR"
@@ -1106,7 +1179,7 @@ metadata_unknown_rc=$?
 set -e
 [ "$metadata_unknown_rc" -ne 0 ] \
   || fail "unknown authoring agent without MERGEPATH_SYNC_COAUTHOR_TRAILER should fail closed"
-echo "$metadata_unknown_out" | grep -q "no built-in coauthor trailer" \
+grep -q "no built-in coauthor trailer" <<<"$metadata_unknown_out" \
   || fail "unknown authoring agent should explain missing trailer; got: $metadata_unknown_out"
 
 # ---------------------------------------------------------------------------
@@ -1181,7 +1254,7 @@ files_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --fi
 paths_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --paths "scripts/hooks/the-hook.sh" 2>&1)
 [ "$files_out" = "$paths_out" ] \
   || fail "--files and --paths should produce identical output"
-echo "$files_out" | grep -q "scripts/hooks/the-hook.sh" \
+grep -q "scripts/hooks/the-hook.sh" <<<"$files_out" \
   || fail "--files did not honor the path filter"
 
 # ---------------------------------------------------------------------------
@@ -1194,7 +1267,7 @@ for flag in --no-pr --recreate-existing --verbose; do
   ec=$?
   set -e
   [ "$ec" -eq 2 ] || fail "expected exit 2 when $flag combined with --audit; got $ec ($out)"
-  echo "$out" | grep -q "sync-mode-only" \
+  grep -q "sync-mode-only" <<<"$out" \
     || fail "expected 'sync-mode-only' diagnostic for $flag; got: $out"
 done
 
@@ -1206,7 +1279,7 @@ mutex_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --no-pr --recr
 mutex_ec=$?
 set -e
 [ "$mutex_ec" -eq 2 ] || fail "expected exit 2 for --no-pr + --recreate-existing; got $mutex_ec"
-echo "$mutex_out" | grep -q "incompatible" \
+grep -q "incompatible" <<<"$mutex_out" \
   || fail "expected 'incompatible' diagnostic; got: $mutex_out"
 
 # ---------------------------------------------------------------------------
@@ -1219,7 +1292,7 @@ skip_mutex_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --skip-ex
 skip_mutex_ec=$?
 set -e
 [ "$skip_mutex_ec" -eq 2 ] || fail "expected exit 2 for --skip-existing + --recreate-existing; got $skip_mutex_ec"
-echo "$skip_mutex_out" | grep -q "incompatible" \
+grep -q "incompatible" <<<"$skip_mutex_out" \
   || fail "expected 'incompatible' diagnostic for --skip-existing + --recreate-existing; got: $skip_mutex_out"
 
 # ---------------------------------------------------------------------------
@@ -1231,25 +1304,25 @@ skip_audit_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS
 skip_audit_ec=$?
 set -e
 [ "$skip_audit_ec" -eq 2 ] || fail "expected exit 2 when --skip-existing combined with --audit; got $skip_audit_ec"
-echo "$skip_audit_out" | grep -q "sync-mode-only" \
+grep -q "sync-mode-only" <<<"$skip_audit_out" \
   || fail "expected 'sync-mode-only' diagnostic for --skip-existing; got: $skip_audit_out"
 
 # ---------------------------------------------------------------------------
 # --verbose dry-run: emits per-file diff hunks for affected targets.
 # ---------------------------------------------------------------------------
 verbose_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --verbose 2>&1)
-echo "$verbose_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+grep -q "+ scripts/hooks/the-hook.sh" <<<"$verbose_out" \
   || fail "--verbose dry-run should still emit + path lines"
 # A real diff hunk includes `@@` for context — that's the cheapest signal
 # the verbose diff actually rendered. We don't pin to exact diff content
 # (commit subjects/hashes vary) but the hunk header is deterministic.
-echo "$verbose_out" | grep -qE "^\s+@@" \
+grep -qE "^\s+@@" <<<"$verbose_out" \
   || fail "--verbose dry-run should include diff hunk headers; got: $verbose_out"
 
 # Without --verbose the same dry-run should NOT include the diff hunks
 # (just the summary path lines).
 plain_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run 2>&1)
-echo "$plain_out" | grep -qE "^\s+@@" \
+grep -qE "^\s+@@" <<<"$plain_out" \
   && fail "non-verbose dry-run should NOT include diff hunks"
 
 # ---------------------------------------------------------------------------
@@ -1257,7 +1330,7 @@ echo "$plain_out" | grep -qE "^\s+@@" \
 # means we never actually reach the push-or-create code).
 # ---------------------------------------------------------------------------
 nopr_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --no-pr 2>&1)
-echo "$nopr_out" | grep -q "would open PR" \
+grep -q "would open PR" <<<"$nopr_out" \
   || fail "--no-pr in dry-run should still produce a plan; got: $nopr_out"
 
 # ---------------------------------------------------------------------------
@@ -1454,9 +1527,9 @@ sa_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" 
   "$SCRIPT" --sync-all --dry-run 2>&1)
 [[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 4 ]] \
   || fail "--sync-all --dry-run should plan one PR per non-zero-target consumer (4); got: $sa_out"
-echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (canonical)" \
+grep -q "scripts/hooks/the-hook.sh (canonical)" <<<"$sa_out" \
   || fail "--sync-all plan missing canonical path scripts/hooks/the-hook.sh"
-echo "$sa_out" | grep -q "scripts/coderabbit-wait.sh (canonical)" \
+grep -q "scripts/coderabbit-wait.sh (canonical)" <<<"$sa_out" \
   || fail "--sync-all plan missing canonical path scripts/coderabbit-wait.sh"
 grep -q "scripts/ci/ (kit, allow-extras)" <<<"$sa_out" \
   || fail "--sync-all plan missing kit path scripts/ci/"
@@ -1474,9 +1547,9 @@ gamma_block=$(echo "$sa_out" | awk '
   /^[a-z].* \(/ && in_block { exit }
   in_block { print }
 ')
-echo "$gamma_block" | grep -q "scripts/coderabbit-wait.sh (SKIPPED per .sync-overrides.yml" \
+grep -q "scripts/coderabbit-wait.sh (SKIPPED per .sync-overrides.yml" <<<"$gamma_block" \
   || fail "--sync-all did not honor gamma's .sync-overrides.yml skip; gamma block: $gamma_block"
-echo "$gamma_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
+grep -q "+ scripts/coderabbit-wait.sh (canonical)" <<<"$gamma_block" \
   && fail "--sync-all listed an override-skipped path as a sync target for gamma; gamma block: $gamma_block"
 # alpha has no overrides — the same path MUST still be a target for it.
 alpha_block=$(echo "$sa_out" | awk '
@@ -1484,9 +1557,9 @@ alpha_block=$(echo "$sa_out" | awk '
   /^[a-z].* \(/ && in_block { exit }
   in_block { print }
 ')
-echo "$alpha_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
+grep -q "+ scripts/coderabbit-wait.sh (canonical)" <<<"$alpha_block" \
   || fail "--sync-all should still sync scripts/coderabbit-wait.sh to alpha (no overrides); alpha block: $alpha_block"
-echo "$alpha_block" | grep -q "SKIPPED per .sync-overrides.yml" \
+grep -q "SKIPPED per .sync-overrides.yml" <<<"$alpha_block" \
   && fail "--sync-all marked a path skipped for alpha, which has no overrides; alpha block: $alpha_block"
 
 # 2b) Zero-target guard: delta overrides EVERY canonical + kit path and
@@ -1495,12 +1568,12 @@ echo "$alpha_block" | grep -q "SKIPPED per .sync-overrides.yml" \
 #     planned PR. A "would open PR" line for delta would overstate the
 #     planned PR count vs. live behavior (sync_all_open_pr skips a
 #     fully-overridden consumer without opening a PR).
-echo "$sa_out" | grep -q "⊘ delta — all effective sync targets skipped per .sync-overrides.yml" \
+grep -q "⊘ delta — all effective sync targets skipped per .sync-overrides.yml" <<<"$sa_out" \
   || fail "--sync-all dry-run should report fully-overridden delta as skipped; got: $sa_out"
-echo "$sa_out" | grep -qE "⤷ delta — would open PR" \
+grep -qE "⤷ delta — would open PR" <<<"$sa_out" \
   && fail "--sync-all dry-run planned a PR for fully-overridden delta; should be skipped; got: $sa_out"
 # delta's overridden paths must still be surfaced as SKIPPED lines.
-echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
+grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" <<<"$sa_out" \
   || fail "--sync-all dry-run should surface delta's override-skipped paths; got: $sa_out"
 # The "would open PR" count is still 4 — delta is skipped, not planned.
 [[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 4 ]] \
@@ -1514,13 +1587,13 @@ epsilon_block=$(echo "$sa_out" | awk '
   /^[a-z].* \(/ && in_block { exit }
   in_block { print }
 ')
-echo "$epsilon_block" | grep -q "would open PR" \
+grep -q "would open PR" <<<"$epsilon_block" \
   || fail "--sync-all dry-run should plan a PR for templated-only epsilon; epsilon block: $epsilon_block"
-echo "$epsilon_block" | grep -q "0 canonical + 0 kit path(s)" \
+grep -q "0 canonical + 0 kit path(s)" <<<"$epsilon_block" \
   || fail "--sync-all dry-run should show epsilon as templated-only; epsilon block: $epsilon_block"
-echo "$epsilon_block" | grep -q "templated, rendered per consumer facts: AGENTS.md" \
+grep -q "templated, rendered per consumer facts: AGENTS.md" <<<"$epsilon_block" \
   || fail "--sync-all dry-run should list epsilon's templated render; epsilon block: $epsilon_block"
-echo "$epsilon_block" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
+grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" <<<"$epsilon_block" \
   || fail "--sync-all dry-run should still surface epsilon override-skipped paths; epsilon block: $epsilon_block"
 
 # 2d) Templated override guard: zeta's templated dest is also skipped,
@@ -1530,11 +1603,11 @@ zeta_block=$(echo "$sa_out" | awk '
   /^[a-z].* \(/ && in_block { exit }
   in_block { print }
 ')
-echo "$zeta_block" | grep -q "all effective sync targets skipped per .sync-overrides.yml" \
+grep -q "all effective sync targets skipped per .sync-overrides.yml" <<<"$zeta_block" \
   || fail "--sync-all dry-run should skip zeta when templated dest is overridden; zeta block: $zeta_block"
-echo "$zeta_block" | grep -q "AGENTS.md (templated, SKIPPED per .sync-overrides.yml" \
+grep -q "AGENTS.md (templated, SKIPPED per .sync-overrides.yml" <<<"$zeta_block" \
   || fail "--sync-all dry-run should surface zeta's templated override; zeta block: $zeta_block"
-echo "$zeta_block" | grep -q "would open PR" \
+grep -q "would open PR" <<<"$zeta_block" \
   && fail "--sync-all dry-run planned a PR for zeta despite all targets being overridden; zeta block: $zeta_block"
 
 # 3) --sync-all + --audit → exit 2 (mutex).
@@ -1543,7 +1616,7 @@ sa_audit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --sync-all --audit 2>&
 sa_audit_ec=$?
 set -e
 [[ "$sa_audit_ec" -eq 2 ]] || fail "--sync-all + --audit should exit 2; got $sa_audit_ec"
-echo "$sa_audit_out" | grep -q "mutually exclusive" \
+grep -q "mutually exclusive" <<<"$sa_audit_out" \
   || fail "--sync-all + --audit should emit a 'mutually exclusive' diagnostic; got: $sa_audit_out"
 # Order independence: --audit first should also be rejected.
 set +e
@@ -1558,7 +1631,7 @@ sa_commit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --sync-all "$sa_head"
 sa_commit_ec=$?
 set -e
 [[ "$sa_commit_ec" -eq 2 ]] || fail "--sync-all + positional commit-ish should exit 2; got $sa_commit_ec"
-echo "$sa_commit_out" | grep -q "mutually exclusive" \
+grep -q "mutually exclusive" <<<"$sa_commit_out" \
   || fail "--sync-all + commit-ish should emit a 'mutually exclusive' diagnostic; got: $sa_commit_out"
 # Order independence: commit-ish first then --sync-all.
 set +e
@@ -1577,7 +1650,7 @@ sa_audit_commit_ec=$?
 set -e
 [[ "$sa_audit_commit_ec" -eq 2 ]] \
   || fail "--audit + positional commit-ish should exit 2; got $sa_audit_commit_ec"
-echo "$sa_audit_commit_out" | grep -q "takes no positional" \
+grep -q "takes no positional" <<<"$sa_audit_commit_out" \
   || fail "--audit + commit-ish should emit a 'takes no positional' diagnostic; got: $sa_audit_commit_out"
 set +e
 MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" "$sa_head" --audit 2>/dev/null
@@ -1591,16 +1664,16 @@ sa_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBL
   "$SCRIPT" --sync-all --dry-run --repos beta 2>&1)
 [[ "$(echo "$sa_repos_out" | grep -c 'would open PR')" -eq 1 ]] \
   || fail "--sync-all --repos beta should plan exactly one PR; got: $sa_repos_out"
-echo "$sa_repos_out" | grep -q "^beta (" \
+grep -q "^beta (" <<<"$sa_repos_out" \
   || fail "--sync-all --repos beta should include beta; got: $sa_repos_out"
-echo "$sa_repos_out" | grep -qE "^(alpha|gamma|delta) \(" \
+grep -qE "^(alpha|gamma|delta) \(" <<<"$sa_repos_out" \
   && fail "--sync-all --repos beta leaked a non-filtered consumer; got: $sa_repos_out"
 
 # 6) Branch-name scheme for --sync-all is distinct from per-commit and every
 #    scope, including the full manifest, carries a resolved path-set digest.
-echo "$sa_out" | grep -qE "mergepath-sync/sync-all-${sa_short}-[0-9a-f]{12}" \
+grep -qE "mergepath-sync/sync-all-${sa_short}-[0-9a-f]{12}" <<<"$sa_out" \
   || fail "--sync-all branch name missing the 'sync-all-' prefix scheme; got: $sa_out"
-echo "$sa_out" | grep -qE "branch mergepath-sync/${sa_short} " \
+grep -qE "branch mergepath-sync/${sa_short} " <<<"$sa_out" \
   && fail "--sync-all used the bare per-commit branch scheme (mergepath-sync/<sha>); must use sync-all- infix"
 
 # 6b) A filtered delivery keys idempotency on the concrete resolved path set,
@@ -1622,7 +1695,7 @@ sa_wait_branch=$(sed -n 's/.*would open PR on branch \([^ ]*\).*/\1/p' <<<"$sa_w
   || fail "selectors resolving to the same delivered path set produced different keys: exact=$sa_hook_exact_branch glob=$sa_hook_glob_branch"
 [ "$sa_hook_exact_branch" != "$sa_wait_branch" ] \
   || fail "different delivered path sets at the same SHA reused one key: $sa_hook_exact_branch"
-echo "$sa_hook_exact_out" | grep -q "requested scope: ${sa_hook_exact_branch##*-} (1 requested path, before consumer overrides)" \
+grep -q "requested scope: ${sa_hook_exact_branch##*-} (1 requested path, before consumer overrides)" <<<"$sa_hook_exact_out" \
   || fail "filtered --sync-all diagnostic does not name its requested scope: $sa_hook_exact_out"
 
 # Fingerprint failures are infrastructure errors, never an empty path set that
@@ -1647,9 +1720,9 @@ sa_hash_fail_rc=$?
 set -e
 [ "$sa_hash_fail_rc" -ne 0 ] \
   || fail "sync-all accepted a failed path-set fingerprint: $sa_hash_fail_out"
-echo "$sa_hash_fail_out" | grep -q 'could not fingerprint requested sync-all destination paths' \
+grep -q 'could not fingerprint requested sync-all destination paths' <<<"$sa_hash_fail_out" \
   || fail "sync-all fingerprint failure lacked a precise diagnostic: $sa_hash_fail_out"
-echo "$sa_hash_fail_out" | grep -q 'would open PR on branch' \
+grep -q 'would open PR on branch' <<<"$sa_hash_fail_out" \
   && fail "sync-all fingerprint failure produced a valid-looking branch: $sa_hash_fail_out"
 
 # Every templated destination lookup contributes to the requested-scope key.
@@ -1681,9 +1754,9 @@ sa_yq_fail_rc=$?
 set -e
 [ "$sa_yq_fail_rc" -ne 0 ] \
   || fail "sync-all hid an earlier templated destination lookup failure: $sa_yq_fail_out"
-echo "$sa_yq_fail_out" | grep -q 'could not resolve requested sync-all destination paths' \
+grep -q 'could not resolve requested sync-all destination paths' <<<"$sa_yq_fail_out" \
   || fail "templated destination lookup failure lacked a precise diagnostic: $sa_yq_fail_out"
-echo "$sa_yq_fail_out" | grep -q 'would open PR on branch' \
+grep -q 'would open PR on branch' <<<"$sa_yq_fail_out" \
   && fail "templated destination lookup failure produced a valid-looking branch: $sa_yq_fail_out"
 
 # Manifest order and duplicate entries are not semantic path-set changes. Keep
@@ -1928,11 +2001,11 @@ req_push_seed "$remote1" "$seed1"
 set +e
 output=$(req_run reqgate1 "$remote1")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "requires gate did not fire for the kit-less consumer: $output"
-echo "$output" | grep -q "scripts/ci/check_a" \
+grep -q "scripts/ci/check_a" <<<"$output" \
   || fail "gate message does not name a missing kit file: $output"
-echo "$output" | grep -q -- "--sync-all" \
+grep -q -- "--sync-all" <<<"$output" \
   || fail "gate message does not point at the sync-all remedy: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate1.txt" ] \
   || fail "PR was opened despite the missing required kit"
@@ -1951,7 +2024,7 @@ req_push_seed "$remote2" "$seed2"
 set +e
 output=$(req_run reqgate2 "$remote2")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   && fail "requires gate fired on a kit-current consumer: $output"
 [ -f "$REQ_CAPTURE/pr-title-reqgate2.txt" ] \
   || fail "kit-current consumer did not get a PR: $output"
@@ -1976,9 +2049,9 @@ req_push_seed "$remote3" "$seed3"
 set +e
 output=$(req_run reqgate3 "$remote3")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "override-skipped required kit bypassed closure: $output"
-echo "$output" | grep -q 'scripts/ci/check_a (required by .github/workflows/repo_lint.yml)' \
+grep -q 'scripts/ci/check_a (required by .github/workflows/repo_lint.yml)' <<<"$output" \
   || fail "contradiction did not name both paths: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate3.txt" ] \
   || fail "contradictory override opened a PR: $output"
@@ -1994,7 +2067,7 @@ for run_id in reqgate3filtered reqgate3full; do
     output=$(req_run_full_sync_all "$run_id" "$remote3")
   fi
   set -e
-  echo "$output" | grep -q 'requires-closure gate' || fail "sync-all bypassed required skip: $output"
+  grep -q 'requires-closure gate' <<<"$output" || fail "sync-all bypassed required skip: $output"
   [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail 'contradictory sync-all opened PR'
 done
 
@@ -2009,9 +2082,9 @@ req_push_seed "$remote4" "$seed4"
 set +e
 output=$(req_run_sync_all reqgate4 "$remote4")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "filtered sync-all did not reject a missing required kit: $output"
-echo "$output" | grep -q "scripts/ci/check_a" \
+grep -q "scripts/ci/check_a" <<<"$output" \
   || fail "filtered sync-all diagnostic did not name a missing required file: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate4.txt" ] \
   || fail "filtered sync-all opened a PR despite the missing required kit"
@@ -2031,9 +2104,9 @@ req_push_seed "$remote5" "$seed5"
 set +e
 output=$(req_run_sync_all reqgate5 "$remote5")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "filtered sync-all accepted a required file with stale executable mode: $output"
-echo "$output" | grep -q "scripts/ci/check_a" \
+grep -q "scripts/ci/check_a" <<<"$output" \
   || fail "mode-mismatch diagnostic did not name the required file: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate5.txt" ] \
   || fail "filtered sync-all opened a PR with a stale required-file mode"
@@ -2051,7 +2124,7 @@ output=$(req_run_full_sync_all reqgate6 "$remote6")
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "unfiltered sync-all closure remedy failed: $output"
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   && fail "requires gate rejected a slice that carried its own complete kit: $output"
 [ -f "$REQ_CAPTURE/pr-title-reqgate6.txt" ] \
   || fail "unfiltered sync-all did not open a PR after carrying the complete kit: $output"
@@ -2066,9 +2139,9 @@ req_push_seed "$remote7" "$seed7"
 set +e
 output=$(req_run_sync_all reqgate7 "$remote7" ".github/workflows/templated_runtime.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "templated requirement did not reject a missing rendered destination: $output"
-echo "$output" | grep -q "scripts/runtime/helper.sh" \
+grep -q "scripts/runtime/helper.sh" <<<"$output" \
   || fail "templated requirement diagnostic did not name its rendered destination: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate7.txt" ] \
   || fail "filtered sync-all opened a PR without its required templated destination"
@@ -2088,7 +2161,7 @@ output=$(req_run_sync_all reqgate8 "$remote8" ".github/workflows/templated_runti
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "current templated requirement blocked its filtered sync: $output"
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   && fail "requires gate compared a templated source instead of its current rendered destination: $output"
 [ -f "$REQ_CAPTURE/pr-title-reqgate8.txt" ] \
   || fail "filtered sync-all did not open a PR with its templated runtime already current: $output"
@@ -2106,9 +2179,9 @@ req_push_seed "$remote9" "$seed9"
 set +e
 output=$(req_run_sync_all reqgate9 "$remote9" ".github/workflows/templated_runtime.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "templated requirement accepted a rendered destination with stale executable mode: $output"
-echo "$output" | grep -q "scripts/runtime/helper.sh" \
+grep -q "scripts/runtime/helper.sh" <<<"$output" \
   || fail "templated mode-mismatch diagnostic did not name its destination: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate9.txt" ] \
   || fail "filtered sync-all opened a PR with a mode-stale templated runtime"
@@ -2142,7 +2215,7 @@ output=$(req_run_sync_all reqgate10 "$remote10" "examples/runtime-helper.in")
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "override-skipped templated target failed its no-op sync: $output"
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   && fail "closure gate checked requirements for an override-skipped templated target: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate10.txt" ] \
   || fail "override-skipped templated no-op unexpectedly opened a PR"
@@ -2171,7 +2244,7 @@ req_push_seed "$remote11" "$seed11"
 set +e
 output=$(req_run_sync_all reqgate11 "$remote11" ".github/workflows/templated_runtime.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "templated comparison did not fail closed when fact export failed: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate11.txt" ] \
   || fail "fact-less rendered dependency was accepted and a PR opened"
@@ -2190,7 +2263,7 @@ set +e
 output=$(req_run_sync_all reqgate12 "$remote12" "examples/runtime-helper.in")
 set -e
 mv "$req_workdir/manifest-fact-helpers.backup" "$REQ_MP/scripts/lib/manifest-fact-helpers.sh"
-echo "$output" | grep -q "render failed for templated" \
+grep -q "render failed for templated" <<<"$output" \
   || fail "templated materialization did not fail closed when fact export failed: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate12.txt" ] \
   || fail "materializer opened a PR after consumer fact export failed"
@@ -2212,7 +2285,7 @@ output=$(req_run_sync_all reqgate13 "$remote13" ".github/workflows/slashless_kit
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "slashless exact kit blocked a current consumer: $output"
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   && fail "requires gate treated a slashless kit as a single file: $output"
 [ -f "$REQ_CAPTURE/pr-title-reqgate13.txt" ] \
   || fail "current slashless-kit consumer did not get the selected workflow PR: $output"
@@ -2232,7 +2305,7 @@ set +e
 output=$(MERGEPATH_TEST_GIT_FAILURE=kit-ls-tree \
   req_run_sync_all reqgate14 "$remote14" ".github/workflows/slashless_kit.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "kit enumeration failure did not fail the closure gate: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate14.txt" ] \
   || fail "kit enumeration failure was accepted and a PR opened"
@@ -2252,7 +2325,7 @@ set +e
 output=$(MERGEPATH_TEST_GIT_FAILURE=source-blob \
   req_run_sync_all reqgate15 "$remote15" ".github/workflows/slashless_kit.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "required blob read failure did not fail the closure gate: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate15.txt" ] \
   || fail "required blob read failure was accepted and a PR opened"
@@ -2272,7 +2345,7 @@ set +e
 output=$(MERGEPATH_TEST_GIT_FAILURE=templated-consumer-blob \
   req_run_sync_all reqgate16 "$remote16" ".github/workflows/templated_runtime.yml")
 set -e
-echo "$output" | grep -q "requires-closure gate" \
+grep -q "requires-closure gate" <<<"$output" \
   || fail "templated consumer blob read failure did not fail the closure gate: $output"
 [ ! -f "$REQ_CAPTURE/pr-title-reqgate16.txt" ] \
   || fail "templated consumer blob read failure was accepted and a PR opened"
@@ -2327,8 +2400,8 @@ for state in missing stale current; do
       echo "PASS: relay-test sync accepts current runtime dependencies"
       break
     fi
-    echo "$output" | grep -q 'requires-closure gate' || fail "relay-test sync accepted $state dependency $dep: $output"
-    echo "$output" | grep -Fq "$dep" || fail "relay-test sync did not name $state dependency $dep: $output"
+    grep -q 'requires-closure gate' <<<"$output" || fail "relay-test sync accepted $state dependency $dep: $output"
+    grep -Fq "$dep" <<<"$output" || fail "relay-test sync did not name $state dependency $dep: $output"
     [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail "relay-test sync opened a PR with $state dependency $dep"
     echo "PASS: relay-test sync blocks $state dependency $dep"
   done
@@ -2400,8 +2473,8 @@ for state in current missing stale; do
   if [ "$state" = current ]; then
     [ -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail "all-current CI-kit closure did not permit sync: $output"
     echo "PASS: CI-kit sync accepts the complete current direct closure"
-  elif echo "$output" | grep -q 'requires-closure gate' \
-    && echo "$output" | grep -Fq "$ci_archive_lib" \
+  elif grep -q 'requires-closure gate' <<<"$output" \
+    && grep -Fq "$ci_archive_lib" <<<"$output" \
     && [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ]; then
     echo "PASS: CI-kit sync blocks $state archive identity library with current archive test"
   else
@@ -2630,11 +2703,11 @@ FAILW="$WFDIR/failed-write"; mkdir -p "$FAILW"; : > "$FAILW/gh-calls.log"
 wf_make_audit_output "$FAILW/audit-output.txt" 3
 GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="1" wf_run_steps "$FAILW"
 [ "$WF_RC" -ne 0 ] || wf_fail "a failed issue write must fail the step"
-echo "$WF_TEXT" | grep -q '::error::' \
+grep -q '::error::' <<<"$WF_TEXT" \
   || wf_fail "a failed issue write must emit an ::error:: annotation: $WF_TEXT"
-echo "$WF_TEXT" | grep -q 'Drift WAS detected' \
+grep -q 'Drift WAS detected' <<<"$WF_TEXT" \
   || wf_fail "a failed issue write must say drift was detected but unfiled: $WF_TEXT"
-echo "$WF_TEXT" | grep -q 'actions/runs/1' \
+grep -q 'actions/runs/1' <<<"$WF_TEXT" \
   || wf_fail "a failed issue write must point at the run holding the findings: $WF_TEXT"
 echo "PASS: a tracking-issue write failure reports that drift was detected and unfiled (#988)"
 
@@ -2760,7 +2833,7 @@ fresh_branch=$(git --git-dir="$fresh_remote" for-each-ref --format='%(refname:sh
 [[ "$fresh_branch" =~ ^mergepath-sync/sync-all-${meta_sha:0:7}-[0-9a-f]{12}-${fresh_nonce}$ ]] || fail "fresh branch nonce missing: $fresh_branch"
 stages=$(printf '%s\n' "$fresh_out" | sed -n 's/^@@cockpit-sync.*"kind":"stage".*"value":"\([^"]*\)".*/\1/p' | paste -sd, -)
 [ "$stages" = fetch,diff,branch,commit,PR ] || fail "engine operation events wrong: $stages"
-printf '%s\n' "$fresh_out" | grep -q '"kind":"result".*https://github.com/example/alpha/pull/129' || fail "actual PR result absent"
+grep -q '"kind":"result".*https://github.com/example/alpha/pull/129' <<<"$fresh_out" || fail "actual PR result absent"
 echo "PASS: opt-in fresh branch leaves old open PR/branch intact and emits actual stages/results"
 
 for fence in hub consumer; do
@@ -2823,14 +2896,14 @@ for status_at in 2 3; do
   status_rc=$?
   set -e
   [ "$status_rc" -ne 0 ] || fail "failed hub status authorized actual engine at fence $status_at: $status_out"
-  printf '%s\n' "$status_out" | grep -q 'confirmed hub status unavailable' || fail "hub status failure reason missing at fence $status_at: $status_out"
+  grep -q 'confirmed hub status unavailable' <<<"$status_out" || fail "hub status failure reason missing at fence $status_at: $status_out"
   [ "$(cat "$status_count")" -eq "$status_at" ] || fail "status failure did not reach expected actual fence $status_at"
   [ ! -s "$status_pushes" ] || fail "failed status reached git push at fence $status_at"
   [ ! -f "$META_CAPTURE/pr-body-status-$status_at.md" ] || fail "failed status reached PR creation at fence $status_at"
   if [ "$status_at" -eq 2 ]; then
-    ! printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"diff"' || fail "failed pre-copy status reached diff"
+    ! grep -q '"kind":"stage".*"value":"diff"' <<<"$status_out" || fail "failed pre-copy status reached diff"
   else
-    printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"commit"' || fail "pre-push status fixture did not reach commit"
+    grep -q '"kind":"stage".*"value":"commit"' <<<"$status_out" || fail "pre-push status fixture did not reach commit"
   fi
 done
 echo "PASS: actual engine fails closed on unavailable pre-copy and pre-push hub status"
@@ -3031,12 +3104,12 @@ for telemetry_mode in verified wrong duplicate mixed malformed missing failed; d
   set -e
   if [ "$telemetry_mode" = verified ]; then
     [ "$telemetry_rc" -eq 0 ] || fail "actual author wrapper rejected synthetic success: $telemetry_out"
-    printf '%s\n' "$telemetry_out" | grep -Fq 'gh-as-author: verified PR #99 author=nathanjohnpayne' || fail 'actual wrapper verification diagnostic absent'
+    grep -Fq 'gh-as-author: verified PR #99 author=nathanjohnpayne' <<<"$telemetry_out" || fail 'actual wrapper verification diagnostic absent'
     [ "$(printf '%s\n' "$telemetry_out" | grep -c '^@@cockpit-sync')" -eq 1 ] || fail 'expected one verified result event'
-    printf '%s\n' "$telemetry_out" | grep -Fq '"kind":"result","repo":"example/alpha","value":"https://github.com/example/alpha/pull/99"' || fail 'verified wrapper URL was not emitted exactly'
-    printf '%s\n' "$telemetry_out" | grep -Fq 'opened https://github.com/example/alpha/pull/99' || fail 'legacy human output changed'
+    grep -Fq '"kind":"result","repo":"example/alpha","value":"https://github.com/example/alpha/pull/99"' <<<"$telemetry_out" || fail 'verified wrapper URL was not emitted exactly'
+    grep -Fq 'opened https://github.com/example/alpha/pull/99' <<<"$telemetry_out" || fail 'legacy human output changed'
   else
-    ! printf '%s\n' "$telemetry_out" | grep -q '^@@cockpit-sync' || fail "unverified/ambiguous URL emitted telemetry: $telemetry_mode"
+    ! grep -q '^@@cockpit-sync' <<<"$telemetry_out" || fail "unverified/ambiguous URL emitted telemetry: $telemetry_mode"
     case "$telemetry_mode" in missing|failed)
       [ "$telemetry_rc" -ne 0 ] || fail "actual wrapper failure lost its return status: $telemetry_mode";;
     esac

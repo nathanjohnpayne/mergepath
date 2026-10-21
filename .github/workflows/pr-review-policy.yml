@@ -1023,7 +1023,14 @@ jobs:
           }
 
           MARKER="<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
-          ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
+          # Read every page before matching: a partial response is not proof
+          # of absence, and piping directly to grep can hide a later failure.
+          if ! MARKER_COMMENTS=$(gh api --paginate \
+            "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --jq '.[].body'); then
+            echo "::error::Could not read complete propagation-lane marker history; refusing writes." >&2
+            exit 1
+          fi
+          ALREADY=$(grep -F "$MARKER" <<<"$MARKER_COMMENTS" || true)
           if [ -z "$ALREADY" ]; then
             # Fence the complete event pair before publishing its diagnostic
             # marker. Receivers independently verify the live pair.

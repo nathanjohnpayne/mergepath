@@ -11,6 +11,13 @@
 # Usage:
 #   scripts/install-git-hooks.sh             install (no-op if already installed)
 #   scripts/install-git-hooks.sh --check     exit 0 if installed, 1 if not
+#
+# --check also proves the hook is reachable from the worktree it runs in:
+# `git rev-parse --git-path hooks` must resolve to an executable pre-push,
+# and git must not see the checkout as bare (a shared `core.bare = true`
+# makes the hook exit before it can check anything, #2578). It warns when a
+# linked worktree inherits the relative value from the shared config, which
+# resolves against that worktree's own checkout.
 #   scripts/install-git-hooks.sh --uninstall remove the key if it is ours
 #   scripts/install-git-hooks.sh --force     replace a different core.hooksPath
 #
@@ -33,6 +40,16 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# A shared `core.bare = true` (with extensions.worktreeConfig it reaches
+# every linked worktree) leaves no top level to resolve; name the setting
+# instead of reporting "not inside a git work tree" (#2578).
+if [ "$(git rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+  origin=$(git config --show-origin --get core.bare 2>/dev/null | cut -f1)
+  origin=${origin#file:}
+  echo "install-git-hooks: git reports this checkout as bare (core.bare = true in ${origin:-the repository config}), so the pre-push hook cannot check anything here; restore it with: git config --file \"${origin:-<that file>}\" core.bare false" >&2
+  [ "$ACTION" = check ] && exit 1
+  exit 2
+fi
 root=$(git rev-parse --show-toplevel 2>/dev/null) || {
   echo "install-git-hooks: not inside a git work tree" >&2
   exit 2
@@ -54,7 +71,27 @@ hook_executable=0
 case "$ACTION" in
   check)
     if [ "$current" = "$HOOKS_PATH" ] && [ "$hook_executable" -eq 1 ]; then
-      echo "install-git-hooks: installed (core.hooksPath=$HOOKS_PATH)"
+      # The key being ours is not proof that git finds the hook from here: a
+      # per-worktree value (config.worktree) overrides it, and a relative
+      # value resolves against this worktree's checkout.
+      effective=$(git -C "$root" rev-parse --git-path hooks)
+      case "$effective" in /*) ;; *) effective="$root/$effective" ;; esac
+      if [ ! -f "$effective/pre-push" ] || [ ! -x "$effective/pre-push" ]; then
+        echo "install-git-hooks: core.hooksPath resolves to $effective from this worktree, and there is no executable pre-push there, so git runs no hook for a push from here"
+        exit 1
+      fi
+      scoped=$(git -C "$root" config --show-scope --get core.hooksPath 2>/dev/null || true)
+      git_dir=$(git -C "$root" rev-parse --absolute-git-dir)
+      # --git-common-dir may be relative (`.git`), and relative to $root,
+      # not to the directory --check was started from.
+      common_dir=$(cd "$root" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
+      if [ "$(cd "$git_dir" && pwd -P)" != "$common_dir" ] && [ "${scoped%%$'\t'*}" = local ]; then
+        case "${scoped#*$'\t'}" in
+          /*) ;;
+          *) echo "install-git-hooks: warning: this linked worktree inherits the relative core.hooksPath=${scoped#*$'\t'} from the shared config ($common_dir/config); git resolves it against this worktree's own checkout, so a branch here without that directory's pre-push pushes with no hook and no output. To pin one hook directory for this worktree: git config --worktree core.hooksPath <absolute path> (needs extensions.worktreeConfig)" >&2 ;;
+        esac
+      fi
+      echo "install-git-hooks: installed (core.hooksPath=$HOOKS_PATH; this worktree runs $effective/pre-push)"
       exit 0
     fi
     if [ "$current" = "$HOOKS_PATH" ]; then

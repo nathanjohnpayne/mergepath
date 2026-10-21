@@ -59,11 +59,12 @@ cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 # Minimal gh shim for post-phase-4b-handoff tests.
 FIXTURE_DIR="${FIXTURE_DIR:?FIXTURE_DIR must be set}"
+[ -z "${HANDOFF_GH_LOG:-}" ] || printf '%s\n' "$*" >>"$HANDOFF_GH_LOG"
 
 if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
   # `gh repo view --json owner,name --jq '.owner.login + "/" + .name'`
-  printf '%s' "${CURRENT_REPO_OVERRIDE:-nathanjohnpayne/mergepath}"
-  exit 0
+  printf '%s' "${CURRENT_REPO_OVERRIDE-nathanjohnpayne/mergepath}"
+  exit "${CURRENT_REPO_RC:-0}"
 fi
 
 if [ "$1" = "api" ]; then
@@ -157,6 +158,7 @@ export PATH="$STUB_DIR:$PATH"
 export FIXTURE_DIR
 cat >"$WORKDIR/accounting.sh" <<'STUB'
 #!/bin/sh
+[ -z "${HANDOFF_ACCOUNTING_LOG:-}" ] || printf '%s\t%s\n' "$1" "$2" >>"$HANDOFF_ACCOUNTING_LOG"
 jq -nc --arg repo "$2" --argjson pr "$1" '{status:"clear",repo:$repo,pr_number:$pr,posted:2,accounted:2,missing_count:0}'
 STUB
 chmod +x "$WORKDIR/accounting.sh"
@@ -408,6 +410,55 @@ if [ "$rc" -eq 2 ]; then
 else
   fail "invalid ref returned rc=$rc (expected 2)"
 fi
+
+# ---------------------------------------------------------------------------
+# Case 6b: malformed successful resolution must not produce an empty artifact.
+# Empty is distinct from an unset fixture override; account every valid ref
+# only after the complete parsed input has passed validation (#1441).
+# ---------------------------------------------------------------------------
+for scenario in empty failed empty-pr empty-row later-empty-pr mixed-empty; do
+  resolved_repo=''; resolver_rc=0; diagnostic='empty repository'
+  refs=(281)
+  case "$scenario" in
+    failed) resolver_rc=1; diagnostic='not a gh-resolvable repo' ;;
+    empty-pr) resolved_repo=$'\t'; diagnostic='invalid parsed pr-ref' ;;
+    empty-row) resolved_repo=$'\nnathanjohnpayne/mergepath'; diagnostic='invalid parsed pr-ref' ;;
+    later-empty-pr) resolved_repo=$'nathanjohnpayne/mergepath\t281\n\t'; diagnostic='invalid parsed pr-ref' ;;
+    mixed-empty) refs=(nathanjohnpayne/mergepath#281 281) ;;
+  esac
+  : >"$WORKDIR/ref-accounting.log"
+  rc=0
+  OUT=$(CURRENT_REPO_OVERRIDE="$resolved_repo" CURRENT_REPO_RC="$resolver_rc" \
+    HANDOFF_ACCOUNTING_LOG="$WORKDIR/ref-accounting.log" \
+    "$SCRIPT" "${refs[@]}" 2>"$WORKDIR/ref-error") || rc=$?
+  if [ "$rc" -eq 3 ] && [ -z "$OUT" ] && [ ! -s "$WORKDIR/ref-accounting.log" ] \
+     && grep -Fq "$diagnostic" "$WORKDIR/ref-error"; then
+    pass "#1441 $scenario resolution refuses before accounting or rendering"
+  else
+    fail "#1441 $scenario returned rc=$rc, accounting=$(cat "$WORKDIR/ref-accounting.log"), stdout=$OUT"
+    cat "$WORKDIR/ref-error" >&2
+  fi
+done
+
+for form in bare explicit; do
+  refs=(281)
+  resolver_rc=0
+  [ "$form" != explicit ] || { refs=(nathanjohnpayne/mergepath#281); resolver_rc=1; }
+  : >"$WORKDIR/ref-accounting.log"
+  : >"$WORKDIR/ref-gh.log"
+  rc=0
+  OUT=$(CURRENT_REPO_OVERRIDE=$'nathanjohnpayne/mergepath\n' CURRENT_REPO_RC="$resolver_rc" \
+    HANDOFF_ACCOUNTING_LOG="$WORKDIR/ref-accounting.log" HANDOFF_GH_LOG="$WORKDIR/ref-gh.log" \
+    "$SCRIPT" "${refs[@]}" 2>"$WORKDIR/ref-error") || rc=$?
+  if [ "$rc" -eq 0 ] && grep -Fq 'PR ready for external review' <<<"$OUT" \
+     && [ "$(cat "$WORKDIR/ref-accounting.log")" = $'281\tnathanjohnpayne/mergepath' ] \
+     && { [ "$form" != explicit ] || ! grep -q '^repo view ' "$WORKDIR/ref-gh.log"; }; then
+    pass "#1441 $form ref preserves accounting and ready artifact with structural newlines"
+  else
+    fail "#1441 $form ref returned rc=$rc or lost its valid artifact/accounting"
+    cat "$WORKDIR/ref-error" >&2
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # Case 7: The manual handoff path is a reviewer dispatch too. It must stop on

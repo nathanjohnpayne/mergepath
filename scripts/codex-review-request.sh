@@ -1473,11 +1473,11 @@ log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
 
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"
 
-HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+HEAD_SHA=$(printf '%s\n' "$PR_JSON" | jq -r '.head.sha')
 # The PR's head branch scopes the moving-head guard's push-dispatch anchor to
 # runs dispatched for THIS branch (Codex P2 on #2175). Empty when unreadable;
 # the guard then falls back to every run for the SHA.
-HEAD_REF=$(echo "$PR_JSON" | jq -r '.head.ref // empty' 2>/dev/null) || HEAD_REF=""
+HEAD_REF=$(printf '%s\n' "$PR_JSON" | jq -r '.head.ref // empty' 2>/dev/null) || HEAD_REF=""
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
@@ -1559,7 +1559,7 @@ scan_codex_state() {
   # comments from earlier reviews on the same HEAD forever — same
   # bug class as PR #65 round 1's gate (c) findings filter on
   # codex-review-check.sh.
-  latest_review_id=$(echo "$review" | jq -r 'if . == null then "" else .id end')
+  latest_review_id=$(printf '%s\n' "$review" | jq -r 'if . == null then "" else .id end')
 
   # Inline findings from the bot on the current HEAD commit, scoped
   # to the LATEST review round (via pull_request_review_id), with
@@ -1570,7 +1570,7 @@ scan_codex_state() {
   # alternation's leftmost match wins, matching codex_tier_of's first-marker
   # rule. If there's no current review, findings is empty.
   if [ -n "$latest_review_id" ] && [ "$latest_review_id" != "null" ]; then
-    findings=$(echo "$comments" | jq \
+    findings=$(printf '%s\n' "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
       --argjson review_id "$latest_review_id" \
       --argjson required "$REQUIRED_TIERS_JSON" \
@@ -1611,7 +1611,7 @@ scan_codex_state() {
   # newer non-affirmative verdict on the same HEAD supersedes an older clean
   # one and fails closed (same #608 P1 shape as the merge gate). KEEP THIS
   # FILTER IN SYNC with CODEX_VERDICT_JSON in scripts/codex-review-check.sh.
-  verdict=$(echo "$issue_comments" | jq -c \
+  verdict=$(printf '%s\n' "$issue_comments" | jq -c \
     --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     ($sha | ascii_downcase) as $head
     | [ .[]
@@ -1657,7 +1657,7 @@ scan_codex_state() {
   # happens to mention e.g. "rate limit" is not misread as a quota block.
   # usage_limit wins over not_connected on a comment matching both.
   if [ "$CODEX_FAILURE_MARKERS_OK" = "true" ]; then
-    blocked=$(echo "$issue_comments" | jq -c \
+    blocked=$(printf '%s\n' "$issue_comments" | jq -c \
       --arg bot "$BOT_LOGIN" \
       --arg usage_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
       --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
@@ -1719,7 +1719,7 @@ current_blocked_reason() {
 # response must end the poll instead of running to timeout).
 has_signal() {
   local scan=$1
-  [ "$(echo "$scan" | jq -r '.review != null or .verdict != null')" = "true" ]
+  [ "$(printf '%s\n' "$scan" | jq -r '.review != null or .verdict != null')" = "true" ]
 }
 
 # Returns 0 iff the scan produced a signal that should be treated as
@@ -1746,7 +1746,7 @@ has_cleared_signal() {
   # Latest-signal-wins between commit-anchored reviews and verdicts.
   # An older clean review cannot mask a newer negative verdict; verdicts
   # win timestamp ties. Unanchored reactions have no authority (#1751).
-  [ "$(echo "$scan" | jq -r '
+  [ "$(printf '%s\n' "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
     def verdict_time: if .verdict == null then "" else .verdict.created_at end;
     # P0 ALWAYS blocks clearance (the absent-policy disposition default is
@@ -1784,7 +1784,7 @@ has_cleared_signal() {
 has_post_trigger_signal() {
   local scan=$1
   local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
-  [ "$(echo "$scan" | jq -r --arg after "$after" '
+  [ "$(printf '%s\n' "$scan" | jq -r --arg after "$after" '
     ((.review != null and .review.submitted_at >= $after)
      or (.verdict != null and .verdict.created_at >= $after))
   ')" = "true" ]
@@ -2547,7 +2547,7 @@ post_codex_trigger() {
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
     || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
-  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
+  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY" "$(failover_head_set "$request_comments")") \
     || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
   # Below the ceiling, a new request is about to be written: the blocking
   # budget gates it. At the ceiling, the check runs only where a stop is about
@@ -2656,7 +2656,7 @@ post_codex_trigger() {
   # clock minus a 60-second buffer if the comment ID can't be
   # extracted (e.g., gh output format change). Codex caught the
   # wall-clock issue on nathanpaynedotcom propagation PR #180 round 4.
-  TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
+  TRIGGER_COMMENT_ID=$(printf '%s\n' "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
     # Keep the newest CONFIRMED trigger separately from the current ack target.
     # A retry whose wrapper output unexpectedly omits the id must not erase an
@@ -2885,6 +2885,20 @@ record_phase4a_timeout_determination() {
   log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
 }
 
+# #2553: the heads a failover marker may name, read only when one is present.
+# An unreadable read prints [], so every trigger counts.
+failover_head_set() { # <comments-json>
+  local commits timeline
+  if ! crqe_failover_markers_present "$1" "$AUTHOR_IDENTITY"; then printf '[]'; return 0; fi
+  if commits=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/commits" "PR commits for failover markers" 2>/dev/null) \
+     && timeline=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline for failover markers" 2>/dev/null) \
+     && crqe_pr_head_set "$commits" "$timeline" "$HEAD_SHA"; then
+    return 0
+  fi
+  log "failover markers: the PR's head set is unreadable; every trigger counts toward the request ceiling"
+  printf '[]'
+}
+
 # #2534: record the trigger the CodeRabbit rate-limit failover just posted, so
 # the request ceiling does not count it (crqe_failover_trigger_ids). Runs only
 # for a trigger this run posted with a confirmed id. The marker is best effort:
@@ -2896,7 +2910,7 @@ record_failover_marker() {
     printf 'not-posted'
     return 0
   fi
-  if ! command -v crqe_failover_marker_body crqe_failover_trigger_ids >/dev/null 2>&1 \
+  if ! command -v crqe_failover_marker_body crqe_failover_trigger_ids crqe_pr_head_set >/dev/null 2>&1 \
      || ! body=$(crqe_failover_marker_body "$HEAD_SHA" "$TERMINAL_TRIGGER_COMMENT_ID"); then
     log "failover marker: helper unavailable or invalid input; the trigger counts toward the request ceiling"
     printf 'failed'
@@ -2909,7 +2923,7 @@ record_failover_marker() {
   fi
   # Readback through the same parser the ceiling uses.
   if comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex failover marker readback" 2>/dev/null) \
-     && crqe_failover_trigger_ids "$comments" "$AUTHOR_IDENTITY" 2>/dev/null \
+     && crqe_failover_trigger_ids "$comments" "$AUTHOR_IDENTITY" "$(failover_head_set "$comments")" 2>/dev/null \
         | jq -e --argjson id "$TERMINAL_TRIGGER_COMMENT_ID" 'index($id) != null' >/dev/null 2>&1; then
     log "failover marker: trigger $TERMINAL_TRIGGER_COMMENT_ID is exempt from the request ceiling"
     printf 'recorded'
