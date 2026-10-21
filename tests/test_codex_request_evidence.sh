@@ -346,7 +346,42 @@ _hs=$(crqe_pr_head_set "$(jq -nc --arg b "$FO_HB" '[{sha: $b}, {sha: "short"}]')
   || { echo "FAIL: failover: an exempt trigger left the request generation" >&2; exit 1; }
 ! crqe_failover_marker_body abc 10 >/dev/null && ! crqe_failover_marker_body "$FO_HA" 0 >/dev/null \
   || { echo "FAIL: failover: a marker was built from an abbreviated head or a zero id" >&2; exit 1; }
-echo "PASS: failover markers exempt only the requester's own just-posted trigger, on a head the PR had (#2534, #2553)"
+# #2591: a force-push's before and after commits come from GraphQL, because the
+# REST event names neither; they join the head set as a fourth input.
+FO_HZ=5555555555555555555555555555555555555555
+[ "$(crqe_pr_head_set '[]' '[]' "$FO_HA" "$(jq -nc --arg z "$FO_HZ" '[$z, "short", null]')")" = "$(jq -nc --arg a "$FO_HA" --arg z "$FO_HZ" '[$a, $z] | sort')" ] \
+  || { echo "FAIL: failover: force-push heads were not added to the head set" >&2; exit 1; }
+! crqe_pr_head_set '[]' '[]' "$FO_HA" '{"not":"array"}' >/dev/null \
+  || { echo "FAIL: failover: a malformed force-push head list was accepted" >&2; exit 1; }
+_fo_mark_z=$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z "$(fo_m 10 "$FO_HZ")")" | jq -sc .)
+[ "$(crqe_failover_trigger_ids "$_fo_mark_z" nathanjohnpayne "$(crqe_pr_head_set '[]' '[]' "$FO_HA" "[\"$FO_HZ\"]")")" = '[10]' ] \
+  && [ "$(crqe_failover_trigger_ids "$_fo_mark_z" nathanjohnpayne "$(crqe_pr_head_set '[]' '[]' "$FO_HA")")" = '[]' ] \
+  || { echo "FAIL: failover: a marker on a force-pushed-away head must count only with the GraphQL heads" >&2; exit 1; }
+# crqe_force_push_heads reads every page through gh's GraphQL pagination,
+# which needs the $endCursor variable, and fails on a failed or shapeless read.
+FP_DIR=$(mktemp -d)
+cat >"$FP_DIR/gh" <<'GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$FP_LOG"
+[ "${FP_MODE:-ok}" != fail ] || exit 1
+if [ "${FP_MODE:-ok}" = shapeless ]; then printf '{"data":{"repository":null}}\n'; exit 0; fi
+printf '%s\n' '{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":true,"endCursor":"c1"},"nodes":[{"beforeCommit":{"oid":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"afterCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}}}}}'
+printf '%s\n' '{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":false,"endCursor":"c2"},"nodes":[{"beforeCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"afterCommit":null},{}]}}}}}'
+GH
+chmod +x "$FP_DIR/gh"
+_fp=$(PATH="$FP_DIR:$PATH" FP_LOG="$FP_DIR/log" crqe_force_push_heads owner/repo 7)
+[ "$_fp" = '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccccccccccc"]' ] \
+  || { echo "FAIL: failover: force-push heads across pages were $_fp" >&2; exit 1; }
+grep -q -- '--paginate' "$FP_DIR/log" && grep -q 'endCursor' "$FP_DIR/log" && grep -q 'owner=owner' "$FP_DIR/log" \
+  && grep -q 'name=repo' "$FP_DIR/log" && grep -q 'number=7' "$FP_DIR/log" \
+  || { echo "FAIL: failover: the force-push read is not a paginated query for owner/repo#7: $(cat "$FP_DIR/log")" >&2; exit 1; }
+for _m in fail shapeless; do
+  if PATH="$FP_DIR:$PATH" FP_LOG="$FP_DIR/log" FP_MODE=$_m crqe_force_push_heads owner/repo 7 >/dev/null; then
+    echo "FAIL: failover: a $_m force-push read was accepted" >&2; exit 1
+  fi
+done
+rm -rf "$FP_DIR"
+echo "PASS: failover markers exempt only the requester's own just-posted trigger, on a head the PR had, force-pushed heads included (#2534, #2553, #2591)"
 
 # #1598: a Codex request the configured author posts AFTER a Phase 4b
 # substitute approval supersedes it, so gate (c) does not clear on that

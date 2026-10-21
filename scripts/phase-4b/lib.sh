@@ -602,10 +602,13 @@ p4b_codex_request_budget_state() {
   heads='[]'
   if command -v crqe_failover_markers_present crqe_pr_head_set >/dev/null 2>&1 \
      && crqe_failover_markers_present "$comments" "$author"; then
-    local fo_commits fo_timeline
+    local fo_commits fo_timeline fo_forced
+    # Force-push heads come from GraphQL (#2591); a failed read leaves only
+    # them out.
+    fo_forced=$(crqe_force_push_heads "$repo" "$pr" 2>/dev/null) || fo_forced='[]'
     if fo_commits=$(gh_api_array "repos/$repo/pulls/$pr/commits" "PR commits for failover markers" 2>/dev/null) \
        && fo_timeline=$(gh_api_array "repos/$repo/issues/$pr/timeline" "PR timeline for failover markers" 2>/dev/null); then
-      heads=$(crqe_pr_head_set "$fo_commits" "$fo_timeline" "$head") || heads='[]'
+      heads=$(crqe_pr_head_set "$fo_commits" "$fo_timeline" "$head" "$fo_forced") || heads='[]'
     fi
   fi
   count=$(crqe_count_triggers "$comments" "$author" "$heads") \

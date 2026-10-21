@@ -963,6 +963,9 @@ case "$1" in
   repos/o/r/pulls/7/commits)
     if [ -f "$LEDGER_TEST_DIR/commits.json" ]; then cat "$LEDGER_TEST_DIR/commits.json"; else echo "no commits fixture" >&2; exit 1; fi ;;
   repos/o/r/issues/7/timeline) printf '[]\n' ;;
+  # #2591: the GraphQL force-push timeline.
+  graphql)
+    if [ -f "$LEDGER_TEST_DIR/graphql.json" ]; then cat "$LEDGER_TEST_DIR/graphql.json"; else echo "no graphql fixture" >&2; exit 1; fi ;;
   # #2534: a head-to-head compare, filtered by the caller's --jq like gh does.
   repos/o/r/compare/*)
     [ -f "$LEDGER_TEST_DIR/compare.json" ] || { echo "no compare fixture" >&2; exit 1; }
@@ -1039,6 +1042,22 @@ if [ "$RC" = 0 ] && jq -e '[.requests[] | select(.counted) | .ceiling_exempt] ==
   pass "CLI: a failover marker naming an earlier PR commit exempts its trigger"
 else
   fail "CLI failover earlier-head case: rc=$RC out=$(jq -c '[.requests[] | {id, ceiling_exempt}]' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+fi
+# #2591: a head a force-push replaced is only in the GraphQL timeline.
+printf '[]\n' >"$D/commits.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '[.requests[] | select(.counted) | .ceiling_exempt] == [false, false]' "$D/out" >/dev/null; then
+  pass "CLI: without the GraphQL timeline, a force-pushed-away head exempts nothing"
+else
+  fail "CLI failover no-graphql case: rc=$RC err=$(cat "$D/err")"
+fi
+jq -n '{data: {repository: {pullRequest: {timelineItems: {pageInfo: {hasNextPage: false, endCursor: null},
+  nodes: [{beforeCommit: {oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, afterCommit: {oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}}}}' >"$D/graphql.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '[.requests[] | select(.counted) | .ceiling_exempt] == [true, false]' "$D/out" >/dev/null; then
+  pass "CLI: a failover marker on a head a force-push replaced exempts its trigger"
+else
+  fail "CLI failover force-pushed case: rc=$RC out=$(jq -c '[.requests[] | {id, ceiling_exempt}]' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
 fi
 rm -f "$D/commits.json"
 RC=$(run_cli "$D")
