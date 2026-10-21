@@ -5221,13 +5221,22 @@ case "$mode" in
                      --argjson b "$(resp 1 blocking false x.sh 2026-08-01T02:00:00Z 2)" '$a + $b')
                 reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"],"counted":true},{"id":2,"created_at":"2026-08-01T01:30:00Z","outcome":"attributed","responses":["w0"],"counted":true}]'
                 rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["thumbs-down"]}]' ;;
+  # #2534 option B: two_fixed is two's shape with the first round's finding
+  # fixed on a later head that Codex re-read without re-raising it.
+  two-fixed)
+    r='[{"rid":"r1","window":1,"class":"blocking","unsolicited":false,"conflicting":false,"first_at":"2026-08-01T00:10:00Z","last_at":"2026-08-01T00:10:00Z","anchor":"1111111111111111111111111111111111111111","blocking_paths":["x.sh"],"blocking_unlocated":false,"blocking_findings":[{"id":900,"path":"x.sh"}]},
+        {"rid":"r2","window":2,"class":"blocking","unsolicited":false,"conflicting":false,"first_at":"2026-08-01T01:10:00Z","last_at":"2026-08-01T01:10:00Z","anchor":"2222222222222222222222222222222222222222","blocking_paths":["y.sh"],"blocking_unlocated":false,"blocking_findings":[{"id":901,"path":"y.sh"}]}]'
+    reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["r1"],"counted":true},{"id":2,"created_at":"2026-08-01T01:00:00Z","outcome":"attributed","responses":["r2"],"counted":true}]'
+    rb='[]'; fx='[900]'
+    hc='[{"base":"1111111111111111111111111111111111111111","head":"2222222222222222222222222222222222222222","status":"ahead","files":["x.sh"]}]' ;;
   fail) exit 3 ;;
   garbage) printf 'not a ledger\n'; exit 0 ;;
   other-head) head=0000000000000000000000000000000000000000; r='[]'; rb='[]' ;;
 esac
 jq -nc --arg h "$head" --argjson r "$r" --argjson rb "$rb" --argjson m "${P4B_TEST_LEDGER_MAX:-10}" --arg fp "${fp:-}" \
-  --argjson q "$reqs" \
-  '{head_sha: $h, author: "nathanjohnpayne", max_blocking_reviews: $m, policy_fingerprint: $fp, requests: $q, responses: $r, rebuttals: $rb}'
+  --argjson q "$reqs" --argjson fx "${fx:-[]}" --argjson hc "${hc:-[]}" \
+  '{head_sha: $h, author: "nathanjohnpayne", max_blocking_reviews: $m, policy_fingerprint: $fp, requests: $q, responses: $r, rebuttals: $rb,
+    fixes: $fx, head_changes: $hc}'
 EOF
 chmod +x "$WORK/stub-ledger.sh"
 export P4B_CODEX_LEDGER="$WORK/stub-ledger.sh"
@@ -5820,6 +5829,15 @@ out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P
     and .human_stops.request_ceiling == 2 and (.reason | contains("runaway"))' >/dev/null 2>&1 \
   || bad="$bad runaway-at-ceiling-waived(rc=$rc,out=$out)"
 
+# A runaway whose first round was fixed (#2534, option B): that round is no
+# runaway window, so the spent ceiling waives the Codex arm and the head goes
+# to the adapter with no owner marker.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two-fixed P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling"
+    and .human_stops.stops == [] and .human_stops.fixed_responses == ["r1"] and .human_stops.blocking_windows == 1' >/dev/null 2>&1 \
+  || bad="$bad runaway-with-fixed-round-not-waived(rc=$rc,out=$out)"
+
 # The owner's runaway tiebreak (#2534): a well-formed marker newer than the last
 # response clears the runaway, so the ceiling waives the Codex arm and the head
 # goes to the adapter. It approves nothing itself. A marker older than the
@@ -5844,7 +5862,9 @@ out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P
 # so the barrier's budget read reports room instead of a spent ceiling.
 _cap_failover=$(printf '%s' "$_cap_old" | jq -c '. + [{id: 5103, user: {login: "nathanjohnpayne"}, created_at: "2026-08-02T00:00:05Z", updated_at: "2026-08-02T00:00:05Z",
   body: "<!-- mergepath-codex-failover:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=5102 -->"}]')
-for _fo in "$_cap_old:exhausted:2" "$_cap_failover:available:1"; do
+# A marker naming a head this PR never had exempts nothing (#2553).
+_cap_failover_foreign=$(printf '%s' "$_cap_failover" | jq -c 'map(if .id == 5103 then .body |= sub("head=a{40}"; "head=" + ("1" * 40)) else . end)')
+for _fo in "$_cap_old:exhausted:2" "$_cap_failover:available:1" "$_cap_failover_foreign:exhausted:2"; do
   _fo_comments=${_fo%:*:*}; _fo_rest=${_fo#"$_fo_comments":}
   out="$(
     export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-candidate.yml"
