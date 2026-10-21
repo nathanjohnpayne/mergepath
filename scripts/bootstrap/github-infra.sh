@@ -14,11 +14,12 @@
 #      both run under the SAME verified author credential, the create
 #      via bootstrap::run_author_gh and the push via
 #      bootstrap::run_author_git.
-#   2. Seed the 21 canonical labels (needs-external-review,
+#   2. Seed the 15 active canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
-#      needs-local-agent, human-action, decision-needed, agent-action,
-#      phase-0..4, size:S/M/L, priority:critical/high/normal/low,
-#      status:blocked).
+#      needs-local-agent, human-action, agent-action, size:S/M/L,
+#      priority:critical/high/normal/low, status:blocked). The deprecated
+#      phase-0..4 and decision-needed stay canonical but are not seeded;
+#      scripts/sync-labels.sh keeps the fleet in step.
 #      Eliminates the first-PR "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
 #      codex per BOOTSTRAP_INPUT_REVIEWERS). Each invite is async;
@@ -99,13 +100,13 @@ BOOTSTRAP_LABELS=(
   "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
   "needs-local-agent|fbca04|A cloud/limited session parked this step; a session with the named capability resumes it"
   "human-action|0e8a16|Requires human attention"
-  "decision-needed|e99695|Needs a human decision before work proceeds (issue triage, not a PR merge gate)"
+  "decision-needed|e99695|Superseded by status:blocked + type:decision. Kept: seeded by bootstrap/github-infra.sh."
   "agent-action|1d76db|Agent task — not blocked on human"
   "phase-0|c5def5|Phase 0: foundations"
   "phase-1|bfd4f2|Phase 1: core"
   "phase-2|bfd4f2|Phase 2"
   "phase-3|bfd4f2|Phase 3"
-  "phase-4|bfd4f2|Phase 4"
+  "phase-4|bfd4f2|Superseded by area:phase-4b. Kept for history and the bootstrap label seed."
   "size:S|c2e0c6|Small: one or a few files, straightforward verification. Calibrated to nathanpaynedotcom#942/#849."
   "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
   "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
@@ -115,6 +116,22 @@ BOOTSTRAP_LABELS=(
   "priority:low|D4D8DD|Would not be missed. A candidate for closure at the next audit if still untouched."
   "status:blocked|6E7781|Cannot proceed until something outside this issue happens. Name what, in the issue."
 )
+
+# Deprecated canonical labels: still canonical (scripts/sync-labels.sh keeps
+# their colour and description in step wherever a repository already has
+# them, so their history stays legible) but never created. A new repository
+# is not seeded with them, and the fleet sync does not add them to one that
+# lacks them: their replacements (area:phase-4b, status:blocked,
+# type:decision) are hub taxonomy, so their descriptions would point at
+# labels most consumers do not have. Owner decision, 2026-10-21.
+BOOTSTRAP_DEPRECATED_LABELS=(phase-0 phase-1 phase-2 phase-3 phase-4 decision-needed)
+
+# bootstrap::label_is_deprecated <name> -> 0 when <name> is deprecated.
+bootstrap::label_is_deprecated() {
+  local d
+  for d in "${BOOTSTRAP_DEPRECATED_LABELS[@]}"; do [ "$d" = "$1" ] && return 0; done
+  return 1
+}
 
 # 1Password reference for the REVIEWER_ASSIGNMENT_TOKEN PAT (the
 # nathanpayne-claude reviewer PAT). MUST be an item-UUID path, never a
@@ -482,6 +499,11 @@ bootstrap::_seed_labels() {
     local rest=${spec#*|}
     color=${rest%%|*}
     desc=${rest#*|}
+
+    # A deprecated label is kept in step where it exists but never seeded.
+    if bootstrap::label_is_deprecated "$name"; then
+      continue
+    fi
 
     # Reject a malformed entry rather than creating a mis-parsed label.
     # A separator typo used to be silently survivable: the old ':'

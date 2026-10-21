@@ -620,6 +620,12 @@
       "tests/test_match_protected_paths.sh",
       "tests/test_verify_propagation_pr.sh"
     ],
+    "check_sync_labels": [
+      "tests/test_sync_labels.sh",
+      "scripts/sync-labels.sh",
+      "scripts/bootstrap/github-infra.sh",
+      ".mergepath-sync.yml"
+    ],
     "check_wave_audit": [
       "tests/test_wave_audit.sh",
       "scripts/wave-audit.sh"
