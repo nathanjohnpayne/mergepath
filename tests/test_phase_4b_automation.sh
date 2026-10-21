@@ -1098,7 +1098,7 @@ for override_case in reviewer policy; do
   set -e
   if [ "$rc" = 0 ] && [ -e "$WORK/integrity-adapter-ran" ] && [ -s "$P4B_TEST_POSTED_REVIEW" ] \
     && jq -e --arg want "$want" '.body | contains("Admin override (#2633)") and contains("Owner: run it") and contains($want)' "$P4B_TEST_POSTED_REVIEW" >/dev/null \
-    && printf '%s' "$out" | jq -e --arg want "$want" '.review_posted and ([.admin_overridden[].tripwires[]?] | index($want) != null)' >/dev/null; then
+    && printf '%s' "$out" | jq -e --arg want "$want" '.review_posted and .admin_override_quote == "Owner: run it" and ([.admin_overridden[].tripwires[]?] | index($want) != null)' >/dev/null; then
     pass "admin override runs the adapter past the $override_case tripwire and records it in the posted review"
   else
     fail "admin override past $override_case (rc=$rc): $(tail -n 3 "$WORK/override-$override_case.stderr")"
@@ -1118,7 +1118,7 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
 set -e
 if [ "$rc" = 0 ] && [ -s "$P4B_TEST_POSTED_REVIEW" ] \
   && ! jq -e '.body | contains("Admin override")' "$P4B_TEST_POSTED_REVIEW" >/dev/null \
-  && printf '%s' "$out" | jq -e '.admin_overridden == []' >/dev/null; then
+  && printf '%s' "$out" | jq -e '.admin_overridden == [] and .admin_override_quote == "Owner: run it"' >/dev/null; then
   pass "admin override with no human stop posts an ordinary review"
 else
   fail "admin override with no human stop (rc=$rc): $(tail -n 3 "$WORK/override-clean.stderr")"

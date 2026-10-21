@@ -48,9 +48,8 @@
 #                    admin automated 4b override (#2633). A deterministic
 #                    tripwire is recorded and the run continues to the real
 #                    adapter, whose verdict posts under the reviewer identity
-#                    as usual; a curated wave capture also skips the wave
-#                    byte-budget refusal. Barrier and Codex human stops are
-#                    not overridden here: they keep the owner tiebreak (#2544). The quote must be one non-empty line of at most
+#                    as usual. Barrier and Codex human stops are not
+#                    overridden here: they keep the owner tiebreak (#2544). The quote must be one non-empty line of at most
 #                    500 characters; it and every overridden stop are written
 #                    into the posted review body and the emitted JSON
 #                    (`admin_overridden`). Correctness stops are never
@@ -300,15 +299,6 @@ if [ "$ADMIN_OVERRIDE_SET" = true ]; then
     *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
   esac
   [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
-fi
-
-# The trusted wave capture re-runs wave-audit.sh as a child that inherits
-# this environment; it skips the byte-budget refusal only under the owner's
-# override (capture itself has no publishing authority).
-if [ "$ADMIN_OVERRIDE_SET" = true ]; then
-  export P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1
-else
-  unset P4B_WAVE_CAPTURE_ADMIN_OVERRIDE
 fi
 
 if [ "$RETAIN_EVIDENCE" = true ]; then
@@ -2207,6 +2197,7 @@ jq -n \
   --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" \
   --argjson admin_overridden "$ADMIN_OVERRIDDEN" \
+  --arg admin_quote "$ADMIN_OVERRIDE_QUOTE" --argjson admin_set "$ADMIN_OVERRIDE_SET" \
   --arg enabled_via "$ENABLED_VIA" '
   {
     pr_number: $pr,
@@ -2226,6 +2217,7 @@ jq -n \
     usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,
     admin_overridden: $admin_overridden,
+    admin_override_quote: (if $admin_set then $admin_quote else null end),
     automation_enabled: true,
     enabled_via: $enabled_via
   }

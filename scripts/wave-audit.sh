@@ -52,7 +52,8 @@
 #           Codex-cap human stop). No reviewer authority
 #           or tag follows. Never fan out on either shape. A byte-verified
 #           canary does not trip the deterministic tripwires (#2633), and
-#           --admin-override runs the adapter past a tripwire or the budget;
+#           --admin-override runs the adapter past a tripwire. The budget
+#           refusal is never overridden (use the historical-prefix path), and
 #           a Codex-cap human stop keeps its owner tiebreak (#2544).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
@@ -82,13 +83,11 @@
 # are ~70 KB and fit trivially.
 #
 # --admin-override (#2633): the owner's authorization, quoted, for this run to
-# dispatch the real Phase 4b adapter past the over-budget refusal and the
-# orchestrator's deterministic tripwires, and to post its verdict. The
-# orchestrator's trusted capture child inherits the budget bypass through
-# P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1, which only the orchestrator sets. It is passed through to
+# dispatch the real Phase 4b adapter past the orchestrator's deterministic
+# tripwires, and to post its verdict. It is passed through to
 # phase-4b-review.sh, recorded in the posted review body, and marked
-# `admin-override=true` on the watermark annotation. It never skips the canary
-# byte verification, drift checks or feedback accounting.
+# `admin-override=true` on the watermark annotation. It never skips the byte
+# budget, the canary byte verification, drift checks or feedback accounting.
 #
 # Env (tests / manual runs):
 #   WAVE_AUDIT_REPO_DIR       canonical repo to diff/tag (default: this repo)
@@ -771,13 +770,7 @@ fi
 # The complete curated payload is already known. Refuse deterministic
 # overage before the orchestrator waits on providers or accounts feedback;
 # its transient-unavailability exit would only chain a larger range (#1186).
-if [ "$BYTES" -gt "$DIFF_MAX" ] && { { [ "$ADMIN_OVERRIDE_SET" = true ] && [ -z "$CAPTURE_INPUT_DIR" ]; } \
-     || { [ -n "$CAPTURE_INPUT_DIR" ] && [ "${P4B_WAVE_CAPTURE_ADMIN_OVERRIDE:-}" = 1 ]; }; }; then
-  # #2633: the owner's override runs the real adapter anyway. The adapter's own
-  # budget still applies: it omits only allowlisted sections and fails closed
-  # to the manual handoff when unreviewable code would be left out.
-  log "admin override (#2633): audit scope exceeds the ${DIFF_MAX}-byte budget (${BYTES} bytes); dispatching the adapter under its own omission rules"
-elif [ "$BYTES" -gt "$DIFF_MAX" ]; then
+if [ "$BYTES" -gt "$DIFF_MAX" ]; then
   emit_json null false '"over-budget"'
   log "audit scope exceeds the ${DIFF_MAX}-byte budget (${BYTES} bytes) — no reviewer dispatched and no watermark; do NOT fan out, this range needs bounded review before retrying"
   exit 8
@@ -787,12 +780,21 @@ fi
 # a watermark. The trusted orchestrator independently invokes this mode.
 if [ -n "$CAPTURE_INPUT_DIR" ]; then
   cp "$DIFF_FILE" "$CAPTURE_INPUT_DIR/review.diff"
+  # #2633: a base on the audited head's first-parent history is a merged hub
+  # state, so the curated diff carries no never-merged intermediate bytes.
+  # Only then may escalation treat the verified canary as reviewed content.
+  base_on_first_parent=false
+  if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fxq -- "$BASE_FULL"; then
+    base_on_first_parent=true
+  fi
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --argjson first_parent "$base_on_first_parent" \
     --arg end "${HISTORICAL_END:+$RANGE_HEAD}" --argjson final "$FINALIZE_HISTORICAL" \
     --arg manifest "$MANIFEST_BLOB" --arg fingerprint "$SCOPE_FINGERPRINT" \
     '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,
       historical_end_sha:$end,finalize_historical:$final,
-      manifest_blob:$manifest,scope_fingerprint:$fingerprint}' > "$CAPTURE_INPUT_DIR/scope.json"
+      manifest_blob:$manifest,scope_fingerprint:$fingerprint,
+      base_on_first_parent:$first_parent}' > "$CAPTURE_INPUT_DIR/scope.json"
   chmod 400 "$CAPTURE_INPUT_DIR/review.diff" "$CAPTURE_INPUT_DIR/scope.json"
   exit 0
 fi

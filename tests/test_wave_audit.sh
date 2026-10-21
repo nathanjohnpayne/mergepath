@@ -594,12 +594,18 @@ for mode in operational dry-run; do
   remote_has_tag "$LARGE_HEAD" && fail "$mode over-budget pushed watermark" || pass "$mode over-budget leaves remote watermark untouched"
 done
 
-# #2633: the owner's admin override dispatches past the budget refusal, passes
-# the quote to the orchestrator, and marks the watermark it advances.
+# #2633: the admin override never overrides the byte budget: an oversized
+# range keeps its deterministic exit 8 and dispatches nothing.
 rc=0
 run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+  --admin-override 'Owner: run it' >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 8 ] && [ ! -e "$CAPTURE/args" ] \
+  && pass "admin override does not bypass the byte budget" || fail "admin override over-budget returned $rc or dispatched"
+# Within budget it forwards the quote and marks the watermark it advances.
+rc=0
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
   --admin-override 'Owner: run it' > "$WORK/override.json" 2> "$WORK/override.err" || rc=$?
-[ "$rc" -eq 0 ] && pass "admin override dispatches an over-budget range" || fail "admin override over-budget returned $rc: $(tail -n 2 "$WORK/override.err")"
+[ "$rc" -eq 0 ] && pass "admin override dispatches a within-budget range" || fail "admin override returned $rc: $(tail -n 2 "$WORK/override.err")"
 grep -A1 -Fx -- '--admin-override' "$CAPTURE/args" 2>/dev/null | tail -n 1 | grep -Fxq 'Owner: run it' \
   && pass "admin override quote is forwarded to the orchestrator" || fail "admin override quote not forwarded"
 git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-pass/$LARGE_HEAD:refs/tags/wave-audit-pass/$LARGE_HEAD" 2>/dev/null || true
@@ -607,24 +613,6 @@ git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | gr
   && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
 git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
-# The orchestrator's trusted capture child skips the budget only when the
-# orchestrator signals the override; capture alone still refuses.
-for capture_override in unset set; do
-  rm -rf "$WORK/capture-budget"; mkdir -p "$WORK/capture-budget"
-  rc=0
-  if [ "$capture_override" = set ]; then
-    P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1 run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-      --capture-input-dir "$WORK/capture-budget" >/dev/null 2>&1 || rc=$?
-  else
-    run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-      --capture-input-dir "$WORK/capture-budget" >/dev/null 2>&1 || rc=$?
-  fi
-  case "$capture_override:$rc" in
-    set:0) [ -s "$WORK/capture-budget/review.diff" ] && pass "override-signalled capture regenerates an over-budget range" || fail "override capture wrote no diff" ;;
-    unset:8) [ ! -e "$WORK/capture-budget/review.diff" ] && pass "capture without the override still refuses an over-budget range" || fail "refused capture still wrote a diff" ;;
-    *) fail "capture budget ($capture_override) returned $rc" ;;
-  esac
-done
 rc=0
 run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
   --admin-override '  ' >/dev/null 2>&1 || rc=$?
@@ -1153,10 +1141,20 @@ run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$C
   --capture-input-dir "$WORK/capture-normal" >/dev/null 2>"$WORK/capture-normal.err"
 if [ ! -e "$CAPTURE/args" ] && grep -q '^diff --git a/scripts/a.sh' "$WORK/capture-normal/review.diff" \
    && jq -e --arg base "$C1" --arg head "$C2" \
-     '.canonical_base_sha == $base and .canonical_head_sha == $head and .historical_end_sha == "" and .finalize_historical == false' \
+     '.canonical_base_sha == $base and .canonical_head_sha == $head and .historical_end_sha == "" and .finalize_historical == false and .base_on_first_parent == true' \
      "$WORK/capture-normal/scope.json" >/dev/null; then
   pass "normal capture regenerates curated bytes and complete scope without dispatch"
 else fail "normal capture"; fi
+# #2633: a base reached only through a merge's second parent is not a merged
+# hub state; capture records that so escalation keeps the tripwires.
+SIDE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'side branch, never merged on its own')"
+MERGED="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C2" -p "$SIDE" -m 'merge side')"
+mkdir "$WORK/capture-second-parent"
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$SIDE" --head-sha "$MERGED" \
+  --capture-input-dir "$WORK/capture-second-parent" >/dev/null 2>"$WORK/capture-second-parent.err" || true
+if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.json" >/dev/null 2>&1; then
+  pass "capture records a second-parent base as off the first-parent history"
+else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
 run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$CHURN_BASE" --head-sha "$EMPTY_HIST_HEAD" \
   --historical-end "$CHURN_MIDDLE" --capture-input-dir "$WORK/capture-chunk" >/dev/null 2>"$WORK/capture-chunk.err"
 if [ ! -e "$CAPTURE/args" ] && grep -q '^-old' "$WORK/capture-chunk/review.diff" \
