@@ -2038,7 +2038,7 @@ CODEX_REQUEST_CHECKPOINT_AFTER=5
 CODEX_REQUEST_CHECKPOINT_MARKER='<!-- mergepath-codex-request-checkpoint:v1'
 REQUEST_CHECKPOINT_JSON=null
 record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
-  local comments="$1" counted="$2" ceiling="$3" existing body_file
+  local comments="$1" counted="$2" ceiling="$3" existing body body_file
   [ "$counted" -ge "$CODEX_REQUEST_CHECKPOINT_AFTER" ] || return 0
   existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" --arg marker "$CODEX_REQUEST_CHECKPOINT_MARKER" \
     '[.[] | select((.user.login // "" | ascii_downcase) == ($who | ascii_downcase))
@@ -2048,13 +2048,24 @@ record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
       '{after:5,counted_requests:$n,recorded:"existing",comment_id:($id|tonumber? // null)}')
     return 0
   fi
-  body_file=$(mktemp "${TMPDIR:-/tmp}/codex-request-checkpoint.XXXXXX") || { log "WARN: request checkpoint body could not be staged; continuing"; return 0; }
-  {
+  # Every staging failure is nonblocking too: under `set -e` an unguarded
+  # write error would end the request before it posts.
+  # The comment is posted to whichever repository runs this propagated
+  # script, so the hub issue is fully qualified. The body is one simple
+  # command's write: a redirect failure on a `{ }` group is not reliably seen.
+  body=$(
     printf '%s counted=%s head=%s -->\n' "$CODEX_REQUEST_CHECKPOINT_MARKER" "$counted" "$HEAD_SHA"
-    printf '**Codex request checkpoint (#2657).** This PR already counts %s Codex requests (request ceiling %s, blocking-review budget %s).\n\n' \
+    printf '**Codex request checkpoint (nathanjohnpayne/mergepath#2657).** This PR already counts %s Codex requests (request ceiling %s, blocking-review budget %s).\n\n' \
       "$counted" "$ceiling" "${GOVERNING_BLOCKING_REVIEW_BUDGET:-default}"
-    printf 'Before the next round: reassess the scope and any recurring findings, batch the remaining fixes into one push, and strengthen the tests or shared fixtures that let those findings through. This note is informational. It blocks nothing and changes no budget.\n'
-  } >"$body_file"
+    printf 'Before the next round: reassess the scope and any recurring findings, batch the remaining fixes into one push, and strengthen the tests or shared fixtures that let those findings through. This note is informational. It blocks nothing and changes no budget.'
+  )
+  body_file=$(mktemp "${TMPDIR:-/tmp}/codex-request-checkpoint.XXXXXX") || body_file=""
+  if [ -z "$body_file" ] || ! printf '%s\n' "$body" 2>/dev/null >"$body_file"; then
+    log "WARN: request checkpoint (#2657) body could not be staged; continuing (the checkpoint is informational)"
+    REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"failed",comment_id:null}')
+    [ -z "$body_file" ] || rm -rf "$body_file" 2>/dev/null || :
+    return 0
+  fi
   # A subshell contains post_author_pr_comment's `die`: the checkpoint must
   # never abort the request it precedes.
   if ( post_author_pr_comment "$(cat "$body_file")" "Codex request checkpoint" body-file ) >/dev/null 2>&1; then
@@ -2064,7 +2075,7 @@ record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
     log "WARN: request checkpoint (#2657) comment could not be posted; continuing (the checkpoint is informational)"
     REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"failed",comment_id:null}')
   fi
-  rm -f "$body_file"
+  rm -f "$body_file" 2>/dev/null || :
   return 0
 }
 

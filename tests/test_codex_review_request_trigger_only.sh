@@ -524,6 +524,7 @@ test_request_checkpoint() {
       || fail "#2657 $scenario: request_checkpoint.recorded=$(jqf "$dir" '.request_checkpoint.recorded // "null"'), expected $want_rec"
     if [ "$want_cp" = 1 ]; then
       grep -Fq 'counted=' "$dir/state/checkpoint-1.md" && grep -Fq 'reassess the scope' "$dir/state/checkpoint-1.md" \
+        && grep -Fq 'nathanjohnpayne/mergepath#2657' "$dir/state/checkpoint-1.md" \
         || fail "#2657 $scenario: checkpoint body lacks its count or guidance"
     fi
     [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: $scenario posts $want_cp checkpoint(s), recorded=$want_rec, request still posts"
@@ -534,6 +535,23 @@ test_request_checkpoint() {
   [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(jqf "$dir" '.request_checkpoint.recorded')" = failed ] \
     || fail "#2657: a failed checkpoint write blocked or hid the request (rc=$rc posts=$(trig_count "$dir"))"
   [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a failed checkpoint write never blocks the request"
+  # Staging: the body file is created but cannot be written (a full disk or
+  # quota); here the "file" is a directory, so the write fails.
+  before=$FAIL
+  dir=$(make_case "checkpoint-staging-fails")
+  cat >"$dir/bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *codex-request-checkpoint*) path=$(/usr/bin/mktemp -d "$1") && printf '%s\n' "$path" ;;
+  *) exec /usr/bin/mktemp "$@" ;;
+esac
+EOF
+  chmod +x "$dir/bin/mktemp"
+  rc=$(run_trigger_only "$dir" cp_five)
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(cp_count "$dir")" = 0 ] \
+    && [ "$(jqf "$dir" '.request_checkpoint.recorded')" = failed ] \
+    || fail "#2657: a checkpoint staging failure blocked or hid the request (rc=$rc posts=$(trig_count "$dir")); $(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a staging failure never blocks the request"
 }
 
 test_nondefault_request_attempt_cap() {
