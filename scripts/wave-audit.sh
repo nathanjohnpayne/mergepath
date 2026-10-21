@@ -783,8 +783,10 @@ if [ -n "$CAPTURE_INPUT_DIR" ]; then
   # #2633: a base on the audited head's first-parent history is a merged hub
   # state, so the curated diff carries no never-merged intermediate bytes.
   # Only then may escalation treat the verified canary as reviewed content.
+  # grep must drain rev-list: with pipefail, an early `grep -q` exit SIGPIPEs
+  # the producer and reads a long, valid history as "not found".
   base_on_first_parent=false
-  if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fxq -- "$BASE_FULL"; then
+  if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fx -- "$BASE_FULL" >/dev/null; then
     base_on_first_parent=true
   fi
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \

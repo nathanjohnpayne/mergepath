@@ -1155,6 +1155,24 @@ run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$SIDE" --head-sha "
 if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.json" >/dev/null 2>&1; then
   pass "capture records a second-parent base as off the first-parent history"
 else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
+# A recent base with more than a pipe buffer of older history behind it
+# (2,500 commits of 41 bytes is ~100 KiB) is the real watermark shape. rev-list
+# prints newest first, so an early `grep -q` exit on the base SIGPIPEs it
+# under pipefail and reads the valid base as off the history.
+LONG_TIP="$C2"
+for _ in $(seq 1 2500); do
+  LONG_TIP="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$LONG_TIP" -m 'long first-parent history')"
+done
+RECENT_BASE="$LONG_TIP"
+for _ in 1 2 3; do
+  LONG_TIP="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$LONG_TIP" -m 'recent wave')"
+done
+mkdir "$WORK/capture-long-history"
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$RECENT_BASE" --head-sha "$LONG_TIP" \
+  --capture-input-dir "$WORK/capture-long-history" >/dev/null 2>"$WORK/capture-long-history.err" || true
+if jq -e '.base_on_first_parent == true' "$WORK/capture-long-history/scope.json" >/dev/null 2>&1; then
+  pass "capture finds a recent first-parent base with a full pipe buffer of history behind it"
+else fail "long-history base provenance: $(tail -n 2 "$WORK/capture-long-history.err")"; fi
 run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$CHURN_BASE" --head-sha "$EMPTY_HIST_HEAD" \
   --historical-end "$CHURN_MIDDLE" --capture-input-dir "$WORK/capture-chunk" >/dev/null 2>"$WORK/capture-chunk.err"
 if [ ! -e "$CAPTURE/args" ] && grep -q '^-old' "$WORK/capture-chunk/review.diff" \
