@@ -1028,7 +1028,7 @@ class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
-        "_function_binding", "eval_pattern_uncertain",
+        "_function_binding", "eval_pattern_uncertain", "tee_output_processes",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -1062,6 +1062,9 @@ class Segment:
         self._cmd_literal = None
         self._function_binding = None
         self.eval_pattern_uncertain = False
+        # Standalone output-process operands retain their already-lexed child
+        # commands for the finite mid-pipeline tee side-write check (#1497).
+        self.tee_output_processes = []
 
 
 class Ref:
@@ -2195,6 +2198,17 @@ class Lexer:
                 # process substitution: a NON-capturing level, so the emitter
                 # inside is judged on its own merits
                 parent_seg = cur_level()["seg"]
+                previous = parent_seg.words[-1] if parent_seg.words else ""
+                redirection = _REDIR_RE.match(previous)
+                probe = Segment(-1, None, False, line)
+                probe.words = list(parent_seg.words)
+                tee_operand = (
+                    c == ">" and not cur_level()["word"]
+                    and text[i - 1:i] in (" ", "\t", "\n")
+                    and resolve_command(probe)[0] == "tee"
+                    and previous != "<<" and not _HERESTRING_RE.fullmatch(previous)
+                    and not (redirection and redirection.end() == len(previous))
+                )
                 if (parent_seg.words and _HERESTRING_RE.fullmatch(parent_seg.words[-1])
                         and not cur_level()["word"]):
                     # This child still occupies the here-string operand word.
@@ -2207,6 +2221,8 @@ class Lexer:
                         "seg": seg,
                         "capture": False,
                         "kind": "procsub",
+                        "tee_output_owner": parent_seg if tee_operand else None,
+                        "tee_output_start": len(cur_ll.segments) - 1,
                         "word": [],
                         "saved_quotes": quotes,
                     }
@@ -2378,6 +2394,18 @@ class Lexer:
                 if len(levels) > 1:
                     finish_word()
                     kind = levels[-1]["kind"]
+                    owner = levels[-1].get("tee_output_owner")
+                    if (owner is not None
+                            and text[i + 1:i + 3] not in ("<(", ">(")
+                            and (i + 1 == n or text[i + 1] in " \t\n;&|()<>")):
+                        # Concatenated pathname words and redirection targets
+                        # are not standalone tee operands. Keep only direct
+                        # children; nested substitutions retain their own role.
+                        owner.tee_output_processes.append([
+                            child for child in cur_ll.segments[
+                                levels[-1]["tee_output_start"]:
+                            ] if child.parent is owner and child.words
+                        ])
                     quotes = levels[-1]["saved_quotes"]
                     levels.pop()
                     if kind == "cmdsub":
@@ -3330,6 +3358,21 @@ def tee_file_operands(seg):
     return files
 
 
+def _tee_process_substitution_sidewrite(seg):
+    """The measured single-cat stderr operand, not general stdin dataflow."""
+    if resolve_command(seg)[0] != "tee":
+        return False
+    for children in seg.tee_output_processes:
+        if len(children) != 1:
+            continue  # No command-list or process-substitution pipeline model.
+        child = children[0]
+        if (resolve_command(child)[0] == "cat" and child._cmd_index == 0
+                and child.pipe_to is None
+                and child.words[1:] in ([">&2"], ["1>&2"])):
+            return True
+    return False
+
+
 def _printf_literal(raw, literal):
     """Only already literal, non-expanding shell words enter the allowlist."""
     if (literal is None or "$'" in raw
@@ -3713,6 +3756,10 @@ def reaches_output(ref, emitter_helpers, helper_routing=None):
                     % (cmd or emitter or "output command"),
                 )
             tee_files = tee_file_operands(seg)
+            if _tee_process_substitution_sidewrite(seg):
+                return True, _why(
+                    note, "tee, whose output process substitution writes to stderr"
+                )
             if tee_files:
                 # `tee FILE` is a fork, not a hop: the pipe carries the value
                 # onward AND the file receives it.  Following only the pipe
@@ -15826,6 +15873,47 @@ def _pid_continuation_cases():
     return failures
 
 
+def _tee_process_substitution_cases():
+    """Retain a standalone measured tee operand without inventing a path."""
+    failures = []
+    for consumer, expected in [
+        ("cat >&2", True), ("cat 1>&2", True),
+        ("cat >/dev/null", False), ("cat 1>/dev/null", False),
+        ("cat >&2; :", False), ("cat >&2 | cat", False),
+    ]:
+        text = 'printf %%s "$GH_TOKEN" | tee >(%s) | grep -qF zz\n' % consumer
+        lx = Lexer(text)
+        tee = next(seg for ll in lx.logical for seg in ll.segments
+                   if seg.parent is None and resolve_command(seg)[0] == "tee")
+        if len(tee.tee_output_processes) != 1:
+            failures.append("tee process operand: missing child link for " + consumer)
+        if _tee_process_substitution_sidewrite(tee) != expected:
+            failures.append("tee process sidewrite: wrong consumer boundary for " + consumer)
+        findings, errors = scan_text(text)
+        if bool(findings) != expected or errors:
+            failures.append("tee process sidewrite: wrong finding/error for " + consumer)
+    for text in [
+        'tee <(cat >&2)\n', 'tee prefix>(cat >&2)\n',
+        'tee >(cat >&2)suffix\n', 'tee > >(cat >&2)\n',
+        'tee >(cat >&2)>(cat >/dev/null)\n',
+        'tee >(cat >/dev/null)>(cat >&2)\n',
+        'tee <<< >(cat >&2)\n', '>(cat >&2) tee\n',
+        'cat >(cat >&2)\n',
+    ]:
+        lx = Lexer(text)
+        if any(seg.tee_output_processes for ll in lx.logical for seg in ll.segments):
+            failures.append("tee process operand: admitted a non-operand " + repr(text))
+    text = ('printf %s "$GH_TOKEN" | tee >(cat >/dev/null) '
+            '>(cat >&2) | grep -qF zz\n')
+    findings, errors = scan_text(text)
+    if not findings or errors:
+        failures.append("tee process sidewrite: later output operand lost")
+    findings, errors = scan_text(text.replace('"$GH_TOKEN"', 'safe'))
+    if findings or errors:
+        failures.append("tee process sidewrite: invented a credential reference")
+    return failures
+
+
 def _line_ending_normalization_cases(tmp, observe=None):
     """Raw reads and each lexer entry retain the lone CR before CRLF."""
     global Lexer
@@ -16835,6 +16923,23 @@ CORPUS += [
     ("line-ending-lone-cr-xtrace", MUST_FLAG, 'set -x\n: # \rset +x\n: "$GH_TOKEN"\n'),
     ("line-ending-lf-xtrace", MUST_NOT_FLAG, 'set -x\n: # \nset +x\n: "$GH_TOKEN"\n'),
     ("line-ending-crlf-xtrace", MUST_NOT_FLAG, 'set -x\n: # \r\nset +x\n: "$GH_TOKEN"\n'),
+]
+
+
+# #1497: a measured tee output-process operand forks before the quiet consumer.
+CORPUS += [
+    ("tee-process-stderr", MUST_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat >&2) | grep -qF zz\n'),
+    ("tee-process-null", MUST_NOT_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat >/dev/null) | grep -qF zz\n'),
+    ("tee-process-fd1-stderr", MUST_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat 1>&2) | grep -qF zz\n'),
+    ("tee-process-fd1-null", MUST_NOT_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat 1>/dev/null) | grep -qF zz\n'),
+    ("tee-process-concatenated-stderr-first", MUST_NOT_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat >&2)>(cat >/dev/null) | grep -qF zz\n'),
+    ("tee-process-concatenated-stderr-last", MUST_NOT_FLAG,
+     'printf \'%s\' "$GH_TOKEN" | tee >(cat >/dev/null)>(cat >&2) | grep -qF zz\n'),
 ]
 
 
@@ -18113,6 +18218,7 @@ def self_test():
     failures.extend(_pid_special_parameter_cases())
     failures.extend(_pid_continuation_cases())
     failures.extend(_leading_herestring_cases())
+    failures.extend(_tee_process_substitution_cases())
     failures.extend(_herestring_operand_cases())
     failures.extend(_herestring_descriptor_cases())
     failures.extend(_oracle_sample_cases())
