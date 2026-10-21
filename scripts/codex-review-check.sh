@@ -2046,10 +2046,35 @@ if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
   # freely-editable display name, so match on the known, fixed annex
   # filename instead. A StatusContext (no checkSuite at all) safely
   # resolves workflowPath to "" and can never collide with this literal.
-  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow_path "repo_lint_local.yml" '
+  #
+  # #2563: match the annex's JOBS, not everything GitHub filed under its suite.
+  # A check run POSTed through the Checks API with the Actions token coalesces
+  # into whichever Actions suite was created first on the head (the #1215
+  # projection comment above), so the Codex P1 gate's lease runs ("Codex P1
+  # unresolved threads", still in progress) can carry this workflowPath on a
+  # head where the annex itself is green. Read as annex results, an in-flight
+  # lease is a non-passing entry, and the FAIL line names the wrong workflow
+  # (nathanjohnpayne/fiveacross#1953, head ab17bfa2). The annex's own jobs are
+  # job-native runs, which Actions stamps with an externalId; the projection
+  # already classifies the API-POSTed ones as lineage "api". Drop those here
+  # and leave them to the required-check path, which judges them under their
+  # own context. `!= "api"` rather than `== "native"` so an entry the
+  # projection could not classify stays in the scan: the degraded shape is the
+  # pre-#2563 false red, not a blind scan.
+  ANNEX_WORKFLOW_SUITE_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow_path "repo_lint_local.yml" '
     [.statusCheckRollup[] | select((.workflowPath // "") == $workflow_path)]
   ')
+  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_WORKFLOW_SUITE_MATCHES" | jq '
+    [.[] | select((.lineage // "") != "api")]
+  ')
   ANNEX_WORKFLOW_MATCH_COUNT=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq 'length')
+  ANNEX_WORKFLOW_FOREIGN=$(echo "$ANNEX_WORKFLOW_SUITE_MATCHES" | jq -c '
+    [.[] | select((.lineage // "") == "api") | "\(.name // .context // "?")=\(.conclusion // .state // "")"] | unique
+  ')
+  ANNEX_WORKFLOW_FOREIGN_COUNT=$(echo "$ANNEX_WORKFLOW_FOREIGN" | jq 'length')
+  if [ "$ANNEX_WORKFLOW_FOREIGN_COUNT" -gt 0 ]; then
+    log "gate (a): $ANNEX_WORKFLOW_FOREIGN_COUNT Checks-API check run(s) filed under the repo_lint_local.yml annex workflow's suite were not produced by an annex job (no externalId) and are left to the required-check path rather than read as annex results (#2563): $(echo "$ANNEX_WORKFLOW_FOREIGN" | jq -r 'join(", ")')"
+  fi
   if [ "$ANNEX_WORKFLOW_MATCH_COUNT" -eq 0 ] && [ "$ANNEX_UNFILTERED" = "true" ]; then
     log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has an unfiltered pull_request trigger but has not reported anything yet for $HEAD_SHA_FOR_ANNEX (#655 round 8) — treating as not-yet-clean rather than silently passing, since it is guaranteed to eventually run."
     BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '(. + [{label: "(not yet reported)", workflow: $workflow, result: "PENDING"}]) | unique')
@@ -2159,21 +2184,28 @@ else
     fi
   fi
 fi
-BAD_COUNT=$(echo "$BAD_CHECKS" | jq 'length')
+# #2563: count the lines the FAIL message prints, not the entries behind them.
+# BAD_CHECKS keeps one winner per surface and, for the guarded contexts, per
+# lineage (#1193, #1215), so one red required context can stand there twice, a
+# job-native FAILURE and a Checks-API FAILURE of the same name, and the two
+# render as one identical line that `unique` below then collapses. Taking the
+# count from BAD_CHECKS announced "3 non-passing check(s)" over a list of two.
+BAD_SUMMARY_LINES=$(echo "$BAD_CHECKS" | jq -c '
+  # Name the surface for a legacy commit status (#1193). Splitting the two
+  # surfaces creates a blocking cause an operator has no other way to see: a
+  # red commit status under a required name whose same-named check run is
+  # green. Unannotated, that reads as the gate contradicting a check run
+  # everyone can see is passing. CheckRun stays unannotated because it is
+  # what every pre-existing entry in this summary already was.
+  [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end)
+       + (if (.kind // "") == "StatusContext" then " (commit status)" else "" end)
+       + "=" + .result]
+  | unique
+')
+BAD_COUNT=$(echo "$BAD_SUMMARY_LINES" | jq 'length')
 
 if [ "$BAD_COUNT" -gt 0 ]; then
-  SUMMARY=$(echo "$BAD_CHECKS" | jq -r '
-    # Name the surface for a legacy commit status (#1193). Splitting the two
-    # surfaces creates a blocking cause an operator has no other way to see: a
-    # red commit status under a required name whose same-named check run is
-    # green. Unannotated, that reads as the gate contradicting a check run
-    # everyone can see is passing. CheckRun stays unannotated because it is
-    # what every pre-existing entry in this summary already was.
-    [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end)
-         + (if (.kind // "") == "StatusContext" then " (commit status)" else "" end)
-         + "=" + .result]
-    | unique | join(", ")
-  ')
+  SUMMARY=$(echo "$BAD_SUMMARY_LINES" | jq -r 'join(", ")')
   fail_gate "CI not green: $BAD_COUNT non-passing check(s): $SUMMARY"
 fi
 
