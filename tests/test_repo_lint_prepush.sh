@@ -246,7 +246,6 @@ unknowntrigger|feat/unknown-trigger|scripts/brand-new-tool.sh;scripts/ci/repo-li
 prose|feat/prose|scripts/ci/README.md;tests/README.md|
 sync|mergepath-sync/wave-1|README.md;scripts/brand-new-tool.sh|
 mixed|feat/mixed|scripts/ci/check_doc_ownership;scripts/merge-clearance-gate.sh;BRAND.md|
-hot|feat/hot|scripts/gh-as-author.sh;scripts/codex-review-check.sh|
 self|feat/self|scripts/repo-lint-prepush.sh;scripts/git-hooks/pre-push;tests/test_repo_lint_prepush.sh|'
 
 lanes_only() { awk -F'\t' '$1 ~ /^(live|selected|fallback|unselected|deep|deep_fallback)$/'; }
@@ -387,8 +386,10 @@ check "script case selects exactly its self-tests" \
   "$(awk -F'\t' '$2 == "deep_self_tests" { print $3 }' "$TMP/plan.script" | LC_ALL=C sort | tr '\n' ' ')" "check_coderabbit_wait --self-test check_phase_4b_automation --self-test "
 check "full case selects the consumer replay" "$(grep -c 'deep_consumer_replay' "$TMP/plan.full" || true)" "1"
 # #2580: an undeclared path runs no graph wrapper and no deep step here, a
-# full trigger or a propagation head beside one still selects everything,
-# and the hot review scripts select by path rather than by fallback.
+# full trigger or a propagation head beside one still selects everything.
+# tests/test_repo_lint_optimization.sh asserts the hot review scripts
+# select by path; naming them here would make this suite one of their
+# readers and its wrapper a dependent (#2580's drift rule).
 check "unknown case runs no graph wrapper locally" "$(grep -c '^selected' "$TMP/plan.unknown" || true)" "0"
 check "unknown case runs no deep step locally" "$(grep -c '^deep	' "$TMP/plan.unknown" || true)" "0"
 if [ "$(grep -c '^fallback' "$TMP/plan.unknown" || true)" -gt 0 ]; then ok "unknown case keeps CI's expansion in the fallback lane"; else bad "unknown case lost CI's expansion"; fi
@@ -399,11 +400,6 @@ check "unknownmixed case still runs the declared path's wrapper" \
 check "a full trigger beside an undeclared path keeps the complete surface" "$(grep -c '^fallback' "$TMP/plan.unknowntrigger" || true)" "0"
 case "$(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" in *"complete-surface rule (a full trigger"*) ok "the full-trigger reason is printed" ;; *) bad "full-trigger reason: $(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" ;; esac
 check "a propagation head beside an undeclared path keeps the complete surface" "$(grep -c '^fallback' "$TMP/plan.sync" || true)" "0"
-check "the hot review scripts fall back to nothing" "$(grep -c '^fallback' "$TMP/plan.hot" || true)" "0"
-case " $(hook_wrappers "$TMP/plan.hot" selected | tr '\n' ' ') " in
-  *" check_codex_scripts "*" check_gh_as_author "*) ok "the hot review scripts select the wrappers that exercise them" ;;
-  *) bad "hot selection: $(hook_wrappers "$TMP/plan.hot" selected | tr '\n' ' ')" ;;
-esac
 
 # A push to the default branch is a `push` event in CI: the complete surface.
 git -C "$HUB" checkout -q main
