@@ -227,6 +227,10 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
     cr = receipts["coderabbit"]["data"] or {}
     human_stops = ledger.get("human_stops")
     human = any(label in labels for label in ("human-hold", "policy-violation", "needs-human-review")) or bool(human_stops)
+    # Finding ids are opaque GitHub identities: decimal strings before browser publication.
+    tiebreaks = ledger.get("owner_tiebreaks")
+    owner_tiebreaks = ([{**item, "finding": str(item["finding"])} if type(item.get("finding")) is int else item for item in tiebreaks]
+                       if type(tiebreaks) is list and all(type(item) is dict for item in tiebreaks) else None)
     state, label = "idle", "Waiting"
     merge_state = raw.get("mergeStateStatus")
     spent = [item for item in budgets if item["state"] == "boulder"]
@@ -277,7 +281,7 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
            "checks": checks, "checks_known": checks_known, "labels": labels, "budgets": budgets,
            "feedback": {"accounted": integer(feedback.get("accounted")), "posted": integer(feedback.get("posted")), **{k: receipts["feedback"][k] for k in ("observed_at", "stale", "error")}},
            "codex": {"in_flight_on_head": ledger.get("in_flight_on_head"), "outstanding": integer(ledger.get("outstanding")),
-                     "human_stops": human_stops, "url": ledger.get("url"), **{k: receipts["ledger"][k] for k in ("observed_at", "stale", "error")}},
+                     "human_stops": human_stops, "owner_tiebreaks": owner_tiebreaks, "url": ledger.get("url"), **{k: receipts["ledger"][k] for k in ("observed_at", "stale", "error")}},
            "coderabbit": {"status": cr.get("status", "unknown"), "head": cr.get("head_sha"), "skip_reason": cr.get("skip_reason"),
                           **{k: receipts["coderabbit"][k] for k in ("observed_at", "stale", "error")}},
            "spend": {"totals": (receipts["accounting"]["data"] or {}).get("totals"), "coverage": (receipts["accounting"]["data"] or {}).get("coverage", "unavailable"),
@@ -442,10 +446,13 @@ ledger=$("$s/codex-review-ledger.sh" --repo "$repo" --expect-head "$head" --expe
 max=$(printf '%s' "$ledger" | jq -r '.max_blocking_reviews')
 ceiling=$(printf '%s' "$policy" | jq -er '.codex.max_review_rounds // 20')
 author=$(printf '%s' "$ledger" | jq -r '.author')
-stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling")
+# The shared resolved-stop calculation (#2558): the owner's tiebreak markers are
+# read through the bridge only when a dispute or runaway stop holds, and a
+# failed read leaves the stop standing, exactly as the Phase 4b barrier reads it.
+stops=$(crl_resolved_human_stops "$ledger" "$head" "$author" "$max" "$ceiling" "https://github.com/$repo/pull/$pr" gh api --paginate "repos/$repo/issues/$pr/comments")
 metadata=$(gh api "repos/$repo/pulls/$pr")
 [ "$(printf '%s' "$metadata" | jq -ce '{head:.head.sha,base:.base.sha,ref:.base.ref,repository:.base.repo.id}')" = "$tuple" ]
-printf '%s' "$ledger" | jq --argjson policy "$policy" --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,commit_context:{reviewers:($policy.available_reviewers // []),bot_login:($policy.coderabbit.bot_login // "coderabbitai[bot]")},base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
+printf '%s' "$ledger" | jq --argjson policy "$policy" --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,commit_context:{reviewers:($policy.available_reviewers // []),bot_login:($policy.coderabbit.bot_login // "coderabbitai[bot]")},base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,owner_tiebreaks:($stops.owner_tiebreaks // null),outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
 '''
         result = {}
         target_policy = None

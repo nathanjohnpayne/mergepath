@@ -40,6 +40,11 @@
 #   GH_AS_AUTHOR_TRACE_MARKER  optional path, created after every check
 #                           passed and immediately before the gh write runs
 #                           (never inherited by it); gh payloads only.
+#   GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK  comma-separated pull request numbers
+#                           that may already link an issue this `gh pr create`
+#                           body links (a deliberate split or stacked PR);
+#                           any other open PR linking it refuses the create
+#                           (#2562).
 #
 # Exit codes:
 #   0    success
@@ -50,6 +55,8 @@
 #        the git push destination or repo config was refused, or (REST
 #        transport) a write's byline could not be read back as the author
 #   6    REST transport: `gh pr merge` is not run on a cloud surface
+#   7    another open pull request already links an issue this PR body links
+#        and GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK does not name it (#2562)
 #   70   GH_AS_AUTHOR_TRACE_MARKER could not be written; nothing ran
 #   *    propagated from the wrapped command otherwise
 #
@@ -188,10 +195,24 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
     PR_BODY="${PR_BODY%x}"
   }
 
+  PR_CREATE_REPO=""
+  PRE_VERB_REPO_PENDING=0
   while [ "$#" -gt 0 ]; do
     argument="$1"
     shift
     if [ "$COMMAND_INDEX" -le "$PR_CREATE_VERB_INDEX" ]; then
+      # gh accepts the repository flag before the verb too (`gh --repo o/r pr
+      # create`); the duplicate-link check must see it wherever it sits.
+      if [ "$PRE_VERB_REPO_PENDING" -eq 1 ]; then
+        PR_CREATE_REPO="$argument"
+        PRE_VERB_REPO_PENDING=0
+      else
+        case "$argument" in
+          -R|--repo) PRE_VERB_REPO_PENDING=1 ;;
+          --repo=*) PR_CREATE_REPO="${argument#--repo=}" ;;
+          -R?*) PR_CREATE_REPO="${argument#-R}"; PR_CREATE_REPO="${PR_CREATE_REPO#=}" ;;
+        esac
+      fi
       NORMALIZED_COMMAND+=("$argument")
       COMMAND_INDEX=$((COMMAND_INDEX + 1))
       continue
@@ -237,8 +258,18 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
           echo "gh-as-author: PR creation flag '$argument' is missing its value." >&2
           exit 1
         fi
+        case "$argument" in -R|--repo) PR_CREATE_REPO="$1" ;; esac
         NORMALIZED_COMMAND+=("$argument" "$1")
         shift
+        ;;
+      --repo=*)
+        PR_CREATE_REPO="${argument#--repo=}"
+        NORMALIZED_COMMAND+=("$argument")
+        ;;
+      -R?*)
+        PR_CREATE_REPO="${argument#-R}"
+        PR_CREATE_REPO="${PR_CREATE_REPO#=}"
+        NORMALIZED_COMMAND+=("$argument")
         ;;
       # ATTACHED value for another value-taking short option. `-tbug` is
       # `-t bug`, not a clustered `-b`; the catch-all below would otherwise
@@ -259,6 +290,79 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   if ! pr_body_validate "$PR_BODY" "$ROOT/.github/review-policy.yml"; then
     echo "gh-as-author: refusing to create a PR that Phase 4b cannot attribute." >&2
     exit 1
+  fi
+
+  # A pull request that links an issue another open pull request already
+  # links is almost always a second implementation of the same ticket: two
+  # sessions did that on mergepath#2534 and only a merge conflict told them
+  # (#2562). Refuse it before the write, naming the other pull request, unless
+  # GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK names that number (a deliberate split
+  # or a stacked PR). Links are the shared rule's own-line keyword forms, in
+  # this repository only: `Closes OWNER/REPO#N` links an issue elsewhere and
+  # is not checked. An open-PR list that cannot be read refuses, never passes.
+  pr_body_issue_links() {
+    printf '%s\n' "$1" \
+      | grep -iE '^[[:space:]]*(closes?|closed|fix(es|ed)?|resolves?|resolved|refs?)[[:space:]]+#[0-9]+[[:space:]]*\.?[[:space:]]*$' \
+      | sed -E 's/^.*#([0-9]+)[^0-9]*$/\1/' | sort -u || true
+  }
+  # pr_create_duplicate_links <body> <repo-or-empty>: prints one
+  # "#<other> links #<n>" line per open pull request that links an issue the
+  # body links; prints nothing when none does; returns 2 when the list is
+  # unreadable. The read uses the verified author token through one fully
+  # paginated REST path: the repository the command names, or, when it names
+  # none, the one `gh repo view` resolves for the checkout (the cloud surface
+  # requires the flag, so it never reaches the resolution). A capped list such
+  # as `gh pr list --limit N` would hide every pull request past the cap.
+  pr_create_duplicate_links() {
+    local links open n repo
+    links="$(pr_body_issue_links "$1")"
+    [ -n "$links" ] || return 0
+    repo="$2"
+    if [ -z "$repo" ]; then
+      repo="$(GH_TOKEN="$TOKEN" gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || return 2
+      case "$repo" in */*) ;; *) return 2 ;; esac
+    fi
+    open="$(GH_TOKEN="$TOKEN" gh api --paginate --slurp "repos/$repo/pulls?state=open&per_page=100" 2>/dev/null)" || return 2
+    open="$(printf '%s' "$open" | jq -c 'add // [] | map({number, body})' 2>/dev/null)" || return 2
+    printf '%s' "$open" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+    while read -r n; do
+      [ -n "$n" ] || continue
+      printf '%s' "$open" | jq -r --arg n "$n" '
+        .[] | select(type == "object" and (.number | type) == "number")
+        | select(any((.body // "") | split("\n")[] | rtrimstr("\r");
+                     test("^[ \\t]*(closes?|closed|fix(es|ed)?|resolves?|resolved|refs?)[ \\t]+#" + $n + "[ \\t]*\\.?[ \\t]*$"; "i")))
+        | "#\(.number) links #\($n)"' 2>/dev/null || return 2
+    done <<LINKS
+$links
+LINKS
+  }
+  set +e
+  DUPLICATE_LINKS="$(pr_create_duplicate_links "$PR_BODY" "${PR_CREATE_REPO:-}")"
+  DUPLICATE_RC=$?
+  set -e
+  if [ "$DUPLICATE_RC" -ne 0 ]; then
+    echo "gh-as-author: could not list open pull requests to check whether another one already links this issue; retry, or name that pull request in GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK (#2562)." >&2
+    exit 1
+  fi
+  if [ -n "$DUPLICATE_LINKS" ]; then
+    UNNAMED_DUPLICATES=""
+    while read -r duplicate_line; do
+      [ -n "$duplicate_line" ] || continue
+      other_number="${duplicate_line#\#}"
+      other_number="${other_number%% *}"
+      case ",${GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK:-}," in
+        *",$other_number,"*) ;;
+        *) UNNAMED_DUPLICATES="$UNNAMED_DUPLICATES
+  $duplicate_line" ;;
+      esac
+    done <<DUPLICATES
+$DUPLICATE_LINKS
+DUPLICATES
+    if [ -n "$UNNAMED_DUPLICATES" ]; then
+      echo "gh-as-author: another open pull request already links an issue this body links:$UNNAMED_DUPLICATES" >&2
+      echo "  Refusing to open a second one (#2562). Read that pull request first; if this one is a deliberate split or a stacked tranche, name it in GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=<number>[,<number>] and say so in the body." >&2
+      exit 7
+    fi
   fi
 
   # The validated snapshot is the only body value passed to gh. This prevents
