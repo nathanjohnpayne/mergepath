@@ -7,6 +7,8 @@ WORKFLOW="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-$ROOT/.github/workflows/required-
 command -v ruby >/dev/null 2>&1 || { echo "ERROR: Ruby is required" >&2; exit 1; }
 ruby -e 'require "yaml"' >/dev/null 2>&1 \
   || { echo "ERROR: Ruby YAML support is required" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 \
+  || { echo "ERROR: Python 3 (python3) is required" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
