@@ -2670,6 +2670,28 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review on current HEAD $HEAD_SHA"
     fi
     crc_request_evidence
+    # #2550: say so when an approval exists but was discounted as
+    # same-agent. That approval is the intended clearance on a PR outside
+    # Phase 4, which this gate does not judge; point at the gate that does.
+    # Message only: the decision and exit code are unchanged.
+    DISCOUNTED_SAME_AGENT_APPROVAL=""
+    if [ -n "$GATE_B_SAME_AGENT_REVIEWER" ]; then
+      DISCOUNTED_SAME_AGENT_APPROVAL=$(echo "$REVIEWS_JSON" | jq -r \
+        --arg reviewer "$GATE_B_SAME_AGENT_REVIEWER" \
+        --arg sha "$HEAD_SHA" \
+        --arg require_head "$REQUIRE_APPROVAL_ON_HEAD" '
+          [ .[]
+            | select(.user.login == $reviewer)
+            | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          ]
+          | max_by(.submitted_at)
+          | if . != null and .state == "APPROVED" and ($require_head != "1" or .commit_id == $sha)
+            then $reviewer else empty end
+      ' 2>/dev/null || true)
+    fi
+    if [ -n "$DISCOUNTED_SAME_AGENT_APPROVAL" ]; then
+      fail_gate "no qualifying reviewer approval cleared gate (b): the latest-state APPROVED review from the authoring agent's own reviewer identity ($DISCOUNTED_SAME_AGENT_APPROVAL) is discounted by this Phase 4 gate under the no-self-approve rule, and the same-agent anchored Codex review/verdict fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; threshold: $REACTION_THRESHOLD). On a PR under external_review_threshold with no external_review_paths match and no needs-external-review label, that approval is the intended clearance and this gate does not apply: run scripts/merge-clearance-gate.sh <PR#> for the threshold-aware decision, and when CodeRabbit was rate-limited also require exact-head Codex clearance with scripts/codex-review-check.sh --require-codex-on-head <PR#> before approving"
+    fi
     fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + anchored Codex review/verdict fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
   fi
 else

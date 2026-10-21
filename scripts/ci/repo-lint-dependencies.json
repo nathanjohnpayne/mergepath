@@ -222,6 +222,7 @@
       "tests/test_codex_review_ledger.sh",
       "scripts/phase-4b/lib.sh",
       "scripts/workflow/gh-comment-trigger-guard.py",
+      "scripts/merge-clearance-gate.sh",
       "tests/test_465_fail_closed.sh",
       "tests/test_655_repo_lint_local_observed.sh",
       "tests/test_branch_requirements.sh",

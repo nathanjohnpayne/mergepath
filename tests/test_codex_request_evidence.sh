@@ -163,6 +163,12 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
   if [ "$name" = thumbs-unapproved ]; then
     pr_body=''; pr_author=contributor; issue_reactions="${EYES/eyes/+1}"
   fi
+  case "$name" in
+    # #2550: the authoring agent's own approval is discounted, and the
+    # message names it and the threshold-aware gate rather than claiming
+    # that no approval exists.
+    same-agent-*) pr_body='Authoring-Agent: claude' ;;
+  esac
   rc=0
   PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$name" \
     PR_BODY="$pr_body" PR_AUTHOR="$pr_author" ISSUE_REACTIONS="$issue_reactions" \
@@ -247,6 +253,8 @@ completed-gate-c|completed|none|approved||1|1|completed summary observed.*inspec
 thumbs-unapproved|none|none|[]||1|1|no freshness-qualified author trigger|0
 gate-c|trigger|eyes|approved||1|1|linked eyes acknowledgement=true|1
 not-opted|trigger|eyes|[]||0|1|no reviewer identity|0
+same-agent-approved|none|none|approved||0|1|no qualifying reviewer approval cleared gate (b): the latest-state APPROVED review from the authoring agent.s own reviewer identity (nathanpayne-claude) is discounted.*run scripts/merge-clearance-gate.sh.*--require-codex-on-head|0
+same-agent-unapproved|none|none|[]||0|1|no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent|0
 readiness|trigger|eyes|[]|--approval-readiness-only|1|1|no reviewer identity|0
 diagnostic|trigger|eyes|[]|--diagnostic-signal-only|1|1|Codex has not produced|0
 renewed-provider-block|old-block|none|[]|--require-codex-on-head|0|1|no reviewer identity|0
