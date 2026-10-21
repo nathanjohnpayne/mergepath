@@ -607,6 +607,24 @@ git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | gr
   && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
 git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+# The orchestrator's trusted capture child skips the budget only when the
+# orchestrator signals the override; capture alone still refuses.
+for capture_override in unset set; do
+  rm -rf "$WORK/capture-budget"; mkdir -p "$WORK/capture-budget"
+  rc=0
+  if [ "$capture_override" = set ]; then
+    P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1 run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+      --capture-input-dir "$WORK/capture-budget" >/dev/null 2>&1 || rc=$?
+  else
+    run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+      --capture-input-dir "$WORK/capture-budget" >/dev/null 2>&1 || rc=$?
+  fi
+  case "$capture_override:$rc" in
+    set:0) [ -s "$WORK/capture-budget/review.diff" ] && pass "override-signalled capture regenerates an over-budget range" || fail "override capture wrote no diff" ;;
+    unset:8) [ ! -e "$WORK/capture-budget/review.diff" ] && pass "capture without the override still refuses an over-budget range" || fail "refused capture still wrote a diff" ;;
+    *) fail "capture budget ($capture_override) returned $rc" ;;
+  esac
+done
 rc=0
 run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
   --admin-override '  ' >/dev/null 2>&1 || rc=$?

@@ -45,17 +45,18 @@
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
 #   --admin-override "<owner authorization quote>"
-#                    admin automated 4b override (#2633). Each stop that would
-#                    wait for a human (a deterministic tripwire, a barrier
-#                    human tiebreaker, a Codex human stop at a spent request
-#                    ceiling) is recorded and the run continues to the real
+#                    admin automated 4b override (#2633). A deterministic
+#                    tripwire is recorded and the run continues to the real
 #                    adapter, whose verdict posts under the reviewer identity
-#                    as usual. The quote must be one non-empty line of at most
+#                    as usual; a curated wave capture also skips the wave
+#                    byte-budget refusal. Barrier and Codex human stops are
+#                    not overridden here: they keep the owner tiebreak (#2544). The quote must be one non-empty line of at most
 #                    500 characters; it and every overridden stop are written
 #                    into the posted review body and the emitted JSON
 #                    (`admin_overridden`). Correctness stops are never
 #                    overridden: holds (6), feedback accounting (7), input
-#                    integrity and drift (3), request-budget evidence (10).
+#                    integrity and drift (3), request-budget evidence (10),
+#                    and every provider-barrier result.
 #   --force-enabled  run this one invocation even when
 #                    phase_4b_automation.enabled is false/absent in
 #                    .github/review-policy.yml (#1046). Overrides ONLY
@@ -299,6 +300,15 @@ if [ "$ADMIN_OVERRIDE_SET" = true ]; then
     *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
   esac
   [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
+fi
+
+# The trusted wave capture re-runs wave-audit.sh as a child that inherits
+# this environment; it skips the byte-budget refusal only under the owner's
+# override (capture itself has no publishing authority).
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  export P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1
+else
+  unset P4B_WAVE_CAPTURE_ADMIN_OVERRIDE
 fi
 
 if [ "$RETAIN_EVIDENCE" = true ]; then
@@ -828,10 +838,13 @@ hold_for_external_review() {
   exit 6
 }
 
-# #2633: under --admin-override, a stop that would wait for a human (a
-# deterministic tripwire or a Codex human stop) is recorded and the run
-# continues to the real adapter, whose verdict posts as usual. Correctness
-# stops (holds, integrity, drift, accounting) never come through here.
+# #2633: under --admin-override, a deterministic tripwire is recorded and the
+# run continues to the real adapter, whose verdict posts as usual. Only the
+# tripwire site calls this: it runs after every provider barrier and before
+# the body renders, so no provider hold, request-budget snapshot or writer-
+# boundary recheck is skipped. Barrier and Codex human stops keep their own
+# owner exits (#2544) because absorbing them would skip the barrier's
+# CodeRabbit arm and its budget evidence.
 admin_override_absorbs() {
   [ "$ADMIN_OVERRIDE_SET" = true ] || return 1
   local payload="$1" entry
@@ -924,8 +937,7 @@ run_same_head_barrier() {
       return 0
       ;;
     1) hold_for_external_review "$out" ;;
-    3) admin_override_absorbs "$out" && return 0
-       stop_for_human_tiebreaker "$out" ;;
+    3) stop_for_human_tiebreaker "$out" ;;
     4) stop_for_barrier_error "$out" ;;
     *)
       # A spent-ceiling waiver that escalated still carries its authority
@@ -1068,8 +1080,6 @@ revalidate_request_ceiling_authority() {
     0:clear) return 0 ;;
     0:stop)
       reason="A human stop appeared during external review at the spent Codex request ceiling ($(printf '%s' "$stops_json" | jq -r '.stops | join(", ")')); human tiebreaker required"
-      admin_override_absorbs "$(jq -nc --arg r "$reason" '{decision:"human-tiebreaker",reason:$r,codex_evidence:"request-ceiling-human-stop"}')" \
-        && return 0
       [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
         "Codex human stop" "the spent Codex request ceiling for ${REPO}#${PR}"
       payload="$(jq -nc --arg r "$reason" --argjson b "$budget_json" --argjson hs "$stops_json" \

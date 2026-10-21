@@ -6693,6 +6693,25 @@ if [ "$rc" = 8 ] \
 else
   fail "#1305: orchestrator cap stop wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
 fi
+# #2633: the admin override never absorbs a barrier human stop. The barrier
+# skips its CodeRabbit arm and carries budget evidence once this stop holds.
+: >"$HANDOFF_LOG"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" \
+    --admin-override 'Owner: run it' 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] && [ "$(printf '%s' "$out" | jq -r '.human_tiebreaker_required')" = true ] \
+   && [ ! -s "$HANDOFF_LOG" ]; then
+  pass "#2633: admin override leaves a barrier cap human stop in force"
+else
+  fail "#2633: admin override absorbed a barrier human stop (rc=$rc): $out"
+fi
 
 cat >"$WORK/policy-cap-final-wait.yml" <<'EOF'
 available_reviewers:

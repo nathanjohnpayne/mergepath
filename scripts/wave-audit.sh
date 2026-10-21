@@ -52,7 +52,8 @@
 #           Codex-cap human stop). No reviewer authority
 #           or tag follows. Never fan out on either shape. A byte-verified
 #           canary does not trip the deterministic tripwires (#2633), and
-#           --admin-override runs the adapter past every remaining shape.
+#           --admin-override runs the adapter past a tripwire or the budget;
+#           a Codex-cap human stop keeps its owner tiebreak (#2544).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
@@ -82,7 +83,9 @@
 #
 # --admin-override (#2633): the owner's authorization, quoted, for this run to
 # dispatch the real Phase 4b adapter past the over-budget refusal and the
-# orchestrator's human stops, and to post its verdict. It is passed through to
+# orchestrator's deterministic tripwires, and to post its verdict. The
+# orchestrator's trusted capture child inherits the budget bypass through
+# P4B_WAVE_CAPTURE_ADMIN_OVERRIDE=1, which only the orchestrator sets. It is passed through to
 # phase-4b-review.sh, recorded in the posted review body, and marked
 # `admin-override=true` on the watermark annotation. It never skips the canary
 # byte verification, drift checks or feedback accounting.
@@ -768,7 +771,8 @@ fi
 # The complete curated payload is already known. Refuse deterministic
 # overage before the orchestrator waits on providers or accounts feedback;
 # its transient-unavailability exit would only chain a larger range (#1186).
-if [ "$BYTES" -gt "$DIFF_MAX" ] && [ "$ADMIN_OVERRIDE_SET" = true ] && [ -z "$CAPTURE_INPUT_DIR" ]; then
+if [ "$BYTES" -gt "$DIFF_MAX" ] && { { [ "$ADMIN_OVERRIDE_SET" = true ] && [ -z "$CAPTURE_INPUT_DIR" ]; } \
+     || { [ -n "$CAPTURE_INPUT_DIR" ] && [ "${P4B_WAVE_CAPTURE_ADMIN_OVERRIDE:-}" = 1 ]; }; }; then
   # #2633: the owner's override runs the real adapter anyway. The adapter's own
   # budget still applies: it omits only allowlisted sections and fails closed
   # to the manual handoff when unreviewable code would be left out.
