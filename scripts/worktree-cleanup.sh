@@ -1282,23 +1282,42 @@ print_record() {
 }
 
 # True when --min-age is set and something under the worktree, or under its
-# git admin directory, changed within that window. find(1) -mmin works on BSD
-# and GNU find alike and needs no reference file.
+# git admin directory, changed within that window — or when that cannot be
+# measured. find(1) -mmin works on BSD and GNU find alike and needs no
+# reference file. A scan that fails (an unreadable subtree, say) counts as
+# active: an unmeasured age guard must keep the candidate, not wave it
+# through. A path that no longer exists has nothing to measure or lose.
+# ACTIVITY_REASON says which, for the caller's message.
 recently_active() {
-  local path="$1" admin
+  local path="$1" admin found
   [ "$MIN_AGE_MINUTES" -gt 0 ] || return 1
+  [ -e "$path" ] || return 1
   admin=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) || admin=""
   # Regular files only: the status probe's index.lock bumps the admin
   # directory's own mtime, and it may rewrite the admin index itself.
-  [ -n "$(find "$path" ${admin:+"$admin"} -maxdepth 3 -type f -mmin "-$MIN_AGE_MINUTES" \
-    ! -path "${admin:-/nonexistent}/index" -print -quit 2>/dev/null)" ]
+  if ! found=$(find "$path" ${admin:+"$admin"} -maxdepth 3 -type f -mmin "-$MIN_AGE_MINUTES" \
+      ! -path "${admin:-/nonexistent}/index" -print -quit 2>/dev/null); then
+    ACTIVITY_REASON="activity could not be measured for --min-age $MIN_AGE"
+    return 0
+  fi
+  ACTIVITY_REASON="activity within --min-age $MIN_AGE"
+  [ -n "$found" ]
+}
+
+# The reason line for a worktree kept by worktree_content_state().
+print_unclean_reason() {
+  if [ "$1" = "ignored" ]; then
+    echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+  else
+    echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+  fi
 }
 
 try_remove() {
   local path="$1" locked="$2"
   if recently_active "$path"; then
-    echo "    -> kept instead: activity within --min-age $MIN_AGE"
-    SUMMARY_SKIPPED+=("$path (active within --min-age $MIN_AGE)")
+    echo "    -> kept instead: $ACTIVITY_REASON"
+    SUMMARY_SKIPPED+=("$path ($ACTIVITY_REASON)")
     return 0
   fi
   # Locked worktrees need `git worktree remove -f -f` (double force) per
@@ -1373,6 +1392,17 @@ while IFS= read -r -d '' WT_PATH \
       pr_state=$(gh_pr_state "$pr_num")
       case "$pr_state" in
         CLOSED|MERGED)
+          # The same content gate as every other removal path, BEFORE the
+          # locked check: git's own refusal does not protect gitignored files,
+          # and the forced locked path protects nothing.
+          wt_state=$(worktree_content_state "$WT_PATH") || true
+          if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
+            print_record "[detached PR #${pr_num} (${pr_state}) but the working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
+              "$WT_PATH" "" "$WT_HEAD" "[detached]" "$pr_state" "$WT_LOCK_REASON"
+            print_unclean_reason "$wt_state"
+            SUMMARY_UNCLEAN_KEPT+=("$WT_PATH (detached, PR #${pr_num} ${pr_state}, ${wt_state})")
+            continue
+          fi
           if [ "$WT_LOCKED" = "1" ]; then
             print_record "[LOCKED detached PR #${pr_num} (${pr_state})]" "$C_YELLOW" \
               "$WT_PATH" "" "$WT_HEAD" "[detached]" "$pr_state" "$WT_LOCK_REASON"
@@ -1445,11 +1475,7 @@ while IFS= read -r -d '' WT_PATH \
     if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
       print_record "[${pr_num:+PR #${pr_num} }gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
         "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
-      if [ "$wt_state" = "ignored" ]; then
-        echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
-      else
-        echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
-      fi
+      print_unclean_reason "$wt_state"
       SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
       continue
     fi
@@ -1848,8 +1874,8 @@ if [ -d "$ORPHAN_ROOT" ]; then
         "$abs" "" "" "[orphan]" "" ""
       SUMMARY_ORPHAN+=("$abs")
       if [ "$MODE" = "apply" ] && [ "$ORPHAN_CLEAN" = "1" ] && recently_active "$abs"; then
-        echo "    -> skipped (orphan with activity within --min-age $MIN_AGE)"
-        SUMMARY_SKIPPED+=("$abs (orphan, active within --min-age $MIN_AGE)")
+        echo "    -> skipped (orphan; $ACTIVITY_REASON)"
+        SUMMARY_SKIPPED+=("$abs (orphan, $ACTIVITY_REASON)")
       elif [ "$MODE" = "apply" ] && [ "$ORPHAN_CLEAN" = "1" ]; then
         echo "    -> rm -rf"
         if rm -rf "$abs"; then

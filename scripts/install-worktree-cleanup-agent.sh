@@ -105,6 +105,11 @@ PLIST
 
 loaded() { "$LAUNCHCTL" print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
 
+# The job runs whatever branch the main checkout has, which may predate (or,
+# after a switch, fall back behind) --min-age.
+supports_min_age() { grep -Fq -- '--min-age)' "$main/scripts/worktree-cleanup.sh"; }
+MIN_AGE_MISSING="$main/scripts/worktree-cleanup.sh has no --min-age, so the daily run would fail; update the main checkout first (git -C \"$main\" switch main && git -C \"$main\" pull)"
+
 case "$ACTION" in
   print)
     render
@@ -121,6 +126,10 @@ case "$ACTION" in
     fi
     if ! loaded; then
       echo "install-worktree-cleanup-agent: $PLIST exists but launchd has not loaded $LABEL; rerun the installer"
+      exit 1
+    fi
+    if ! supports_min_age; then
+      echo "install-worktree-cleanup-agent: installed, but $MIN_AGE_MISSING"
       exit 1
     fi
     echo "install-worktree-cleanup-agent: installed and loaded (daily at $(printf '%02d:%02d' "$HOUR" "$MINUTE"), --min-age $MIN_AGE, log $LOG_DIR/worktree-cleanup.log)"
@@ -149,9 +158,8 @@ case "$ACTION" in
     ;;
 esac
 
-# The job runs whatever branch the main checkout has, which may predate --min-age.
-if ! grep -Fq -- '--min-age)' "$main/scripts/worktree-cleanup.sh"; then
-  echo "install-worktree-cleanup-agent: $main/scripts/worktree-cleanup.sh has no --min-age, so the daily run would fail; update the main checkout first (git -C \"$main\" switch main && git -C \"$main\" pull)" >&2
+if ! supports_min_age; then
+  echo "install-worktree-cleanup-agent: $MIN_AGE_MISSING" >&2
   exit 1
 fi
 mkdir -p "$AGENTS_DIR" "$LOG_DIR"
@@ -159,7 +167,8 @@ tmp=$(mktemp "$AGENTS_DIR/.$LABEL.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
 render >"$tmp"
 if command -v plutil >/dev/null 2>&1; then
-  plutil -lint -s "$tmp" || { echo "install-worktree-cleanup-agent: rendered plist failed plutil -lint" >&2; exit 1; }
+  # No -s: Swift's Linux plutil scopes it to conversion and rejects it here.
+  plutil -lint "$tmp" >/dev/null || { echo "install-worktree-cleanup-agent: rendered plist failed plutil -lint" >&2; exit 1; }
 fi
 # Unload the old definition first: bootstrap refuses a label that is already loaded.
 if loaded; then

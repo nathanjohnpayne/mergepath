@@ -72,7 +72,7 @@ else
   fail "unexpected job arguments: '$args'"
 fi
 if command -v plutil >/dev/null 2>&1; then
-  if plutil -lint -s "$PLIST"; then pass "plutil accepts the plist"; else fail "plutil rejected the plist"; fi
+  if plutil -lint "$PLIST" >/dev/null; then pass "plutil accepts the plist"; else fail "plutil rejected the plist"; fi
 fi
 
 OUT=$(run --check)
@@ -88,6 +88,14 @@ fi
 
 OUT=$(run --run-now)
 if grep -Fq "kickstart gui/$(id -u)/com.nathanjohnpayne.mergepath.worktree-cleanup" "$CALLS"; then pass "--run-now kickstarts the job"; else fail "--run-now: $OUT"; fi
+
+cp "$MAIN/scripts/worktree-cleanup.sh" "$WORKDIR/cleanup-current"
+printf '#!/usr/bin/env bash\n' >"$MAIN/scripts/worktree-cleanup.sh"
+set +e
+OUT=$(run --check); RC=$?
+set -e
+if [ "$RC" -eq 1 ] && grep -Fq "installed, but" <<<"$OUT" && grep -Fq "has no --min-age" <<<"$OUT"; then pass "--check notices the main checkout fell back behind --min-age"; else fail "--check after a cleanup-script downgrade: rc=$RC $OUT"; fi
+cp "$WORKDIR/cleanup-current" "$MAIN/scripts/worktree-cleanup.sh"
 
 echo "<!-- edited -->" >>"$PLIST"
 set +e

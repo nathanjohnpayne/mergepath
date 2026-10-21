@@ -54,13 +54,13 @@ The wall-clock ceiling applies only where a `timeout` implementation exists. `ti
 
 ## Unattended runs (#2668)
 
-`--min-age <N>m|<N>h|<N>d` makes `--apply` keep any candidate, worktree or orphan, that has a regular file modified within the window, at most three levels into the worktree or its git admin directory. Directories and the admin `index` are not evidence, because the audit's own status probe creates `index.lock` in the admin directory and may rewrite the index, which would make every audited worktree look active. A malformed value exits `1` before any removal. A kept candidate prints `-> kept instead: activity within --min-age <value>` and counts under `skipped`.
+`--min-age <N>m|<N>h|<N>d` makes `--apply` keep any candidate, worktree or orphan, that has a regular file modified within the window, at most three levels into the worktree or its git admin directory. Directories and the admin `index` are not evidence, because the audit's own status probe creates `index.lock` in the admin directory and may rewrite the index, which would make every audited worktree look active. A scan that fails, for example on an unreadable subtree, keeps the candidate (`-> kept instead: activity could not be measured …`): an unmeasured age guard must not read as an idle tree. A path that no longer exists has nothing to measure. A malformed value exits `1` before any removal. A kept candidate prints `-> kept instead: activity within --min-age <value>` and counts under `skipped`.
 
-Every gone-upstream worktree clears `worktree_content_state()` before removal. The gate used to cover PR-slug paths only, leaving other worktrees to git's own refusal, which protects modified and untracked files but deletes gitignored ones.
+Every removal path clears `worktree_content_state()` first: every gone-upstream worktree, and every detached closed/merged-PR worktree before its locked check. The gate used to cover branch-attached and gone-upstream PR-slug paths only, leaving the rest to git's own refusal, which protects modified and untracked files but deletes gitignored ones (and, under `--force-locked`, protects nothing).
 
 A removal git refuses prints `-> FAILED: <git's first line>` and is listed under `failed:`. The run continues to the remaining candidates and the final prune, then exits `1`.
 
-`scripts/install-worktree-cleanup-agent.sh` installs the daily launchd agent that runs `--apply --min-age 24h --no-color` on the main checkout. Its regression suite is `tests/test_install_worktree_cleanup_agent.sh`, which uses a fixture clone and a stub `launchctl` and never touches the real LaunchAgents directory.
+`scripts/install-worktree-cleanup-agent.sh` installs the daily launchd agent that runs `--apply --min-age 24h --no-color` on the main checkout. The installer, and `--check` afterwards, refuse a main checkout whose script lacks `--min-age`, since the agent runs whatever branch that checkout has. Its regression suite is `tests/test_install_worktree_cleanup_agent.sh`, which uses a fixture clone and a stub `launchctl` and never touches the real LaunchAgents directory.
 
 ## Non-goals
 

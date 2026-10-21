@@ -4024,6 +4024,78 @@ for bad in "" 24 1w -1h; do
   fi
 done
 
+# ── Case 48: no removal path skips the content gate ───────────────────────
+# A detached worktree for a closed PR reached try_remove() without
+# worktree_content_state(), so a gitignored `.env` in it was deleted. And under
+# --min-age, a scan that cannot read part of a candidate must keep it rather
+# than read as "no recent activity". Own fixture and stub: the stub answers
+# CLOSED for one PR number.
+GATE_ROOT="$WORKDIR/gate"
+GATE_MAIN="$GATE_ROOT/main"
+GATE_PR_NUM=77777
+mkdir -p "$GATE_ROOT/.mergepath-worktrees" "$GATE_ROOT/stub"
+git init --bare -q "$GATE_ROOT/remote.git"
+git init -q -b main "$GATE_MAIN"
+git -C "$GATE_MAIN" config user.email "test@example.com"
+git -C "$GATE_MAIN" config user.name "Test"
+git -C "$GATE_MAIN" config commit.gpgsign false
+git -C "$GATE_MAIN" config tag.gpgsign false
+git -C "$GATE_MAIN" remote add origin "$GATE_ROOT/remote.git"
+echo ".env" > "$GATE_MAIN/.gitignore"
+git -C "$GATE_MAIN" add .gitignore
+git -C "$GATE_MAIN" commit -q -m "initial"
+git -C "$GATE_MAIN" push -q -u origin main
+DETACHED_WT="$GATE_ROOT/.mergepath-worktrees/pr-${GATE_PR_NUM}-detached"
+git -C "$GATE_MAIN" worktree add -q --detach "$DETACHED_WT"
+echo "SECRET=1" > "$DETACHED_WT/.env"
+git -C "$GATE_MAIN" branch unreadable-gone
+git -C "$GATE_MAIN" push -q -u origin unreadable-gone
+UNREADABLE_WT="$GATE_ROOT/unreadable-gone"
+git -C "$GATE_MAIN" worktree add -q "$UNREADABLE_WT" unreadable-gone
+git -C "$GATE_MAIN" push -q origin --delete unreadable-gone
+git -C "$GATE_MAIN" fetch -q --prune
+UNREADABLE_ADMIN=$(git -C "$UNREADABLE_WT" rev-parse --absolute-git-dir)
+find "$UNREADABLE_WT" "$UNREADABLE_ADMIN" -exec touch -t 202001010000 {} +
+cat >"$GATE_ROOT/stub/gh" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "pr" ] && [ "\$2" = "view" ] && [ "\$3" = "$GATE_PR_NUM" ]; then echo CLOSED; exit 0; fi
+exit 1
+STUB
+chmod +x "$GATE_ROOT/stub/gh"
+
+if [ "$(id -u)" -eq 0 ]; then
+  pass "an unmeasurable --min-age scan keeps the candidate (skipped: root reads every directory)"
+else
+  # Two levels down, so the gone-upstream gate's own status walk still sees a
+  # clean tree while find(1) at -maxdepth 3 hits the unreadable directory.
+  mkdir -p "$UNREADABLE_WT/a/sealed"
+  touch -t 202001010000 "$UNREADABLE_WT/a" "$UNREADABLE_WT"
+  chmod 000 "$UNREADABLE_WT/a/sealed"
+  set +e
+  OUT_UNREAD=$( cd "$GATE_MAIN" && PATH="$GATE_ROOT/stub:$PATH" bash "$HELPER" --no-color --apply --min-age 1h 2>&1 )
+  set -e
+  # Absent when a regression removed the candidate; the assertion below reports it.
+  chmod 755 "$UNREADABLE_WT/a/sealed" 2>/dev/null || true
+  if [ -d "$UNREADABLE_WT" ] && grep -Fq -- "-> kept instead: activity could not be measured for --min-age 1h" <<<"$OUT_UNREAD"; then
+    pass "an unmeasurable --min-age scan keeps the candidate"
+  else
+    fail "an unreadable subtree let --min-age remove the candidate"
+    echo "$OUT_UNREAD" >&2
+  fi
+fi
+
+set +e
+OUT_GATE=$( cd "$GATE_MAIN" && PATH="$GATE_ROOT/stub:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+set -e
+if [ -f "$DETACHED_WT/.env" ] \
+   && grep -Fq -- "detached PR #${GATE_PR_NUM} (CLOSED) but the working tree is ignored — review manually, keeping" <<<"$OUT_GATE"; then
+  pass "a detached closed-PR worktree with only gitignored content is kept"
+else
+  fail "the gitignored .env in a detached closed-PR worktree was not kept"
+  echo "$OUT_GATE" >&2
+fi
+
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
