@@ -137,6 +137,35 @@ assert_allowed_source "a pre-verb long label value that spells merge" \
   'gh pr --label merge list'
 assert_prohibited_source "a short label value cannot hide a later merge verb" \
   'gh pr -l merge merge 7'
+
+# #1342: search queries may precede or follow the list verb. Their literal
+# value must never become a native verb, while real writes with the same
+# option placements and executable substitutions remain inspectable.
+for search_flag in --search -S; do
+  assert_allowed_source "$search_flag query before the list verb" \
+    "gh pr $search_flag merge list"
+  assert_allowed_source "$search_flag query after the list verb" \
+    "gh pr list $search_flag merge"
+  assert_allowed_source "$search_flag quoted query before the list verb" \
+    "gh pr $search_flag 'merge' list"
+  assert_allowed_source "$search_flag attached query before the list verb" \
+    "gh pr $search_flag=merge list"
+  assert_allowed_source "$search_flag attached query after the list verb" \
+    "gh pr list $search_flag=merge"
+  assert_prohibited_source "$search_flag query cannot hide a later merge verb" \
+    "gh pr $search_flag merge merge 7"
+  assert_prohibited_source "$search_flag ordinary query cannot hide a later merge verb" \
+    "gh pr $search_flag topic merge 7"
+  assert_prohibited_source "$search_flag query after a real merge verb" \
+    "gh pr merge 7 $search_flag merge"
+  assert_prohibited_source "$search_flag pre-verb query substitution still exposes a merge" \
+    "gh pr $search_flag \"\$(gh pr merge 7)\" list"
+  assert_prohibited_source "$search_flag post-verb query substitution still exposes a merge" \
+    "gh pr list $search_flag \"\$(gh pr merge 7)\""
+  assert_prohibited_source "$search_flag read cannot hide a separate native merge" \
+    "gh pr $search_flag merge list; gh pr merge 7"
+done
+
 # The method flag is a gh option and is legal on either side of `api`; gh sends
 # the fields as a query string, so this is an explicit read.
 assert_allowed_source "an explicit GET pinned before the api command" \
