@@ -48,6 +48,36 @@ NEW_RATE_LIMIT_BODY='<!-- This is an auto-generated comment: rate limited by cod
 
 <!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
 
+# #2657: the spending-cap body CodeRabbit posted on mergepath#2644
+# (2026-10-21), verbatim apart from the org id: a review-stack preface, the
+# rate-limited marker, the "Review limit reached" header, and a new
+# "Next included review available in" window line.
+SPENDING_CAP_BODY='<!-- coderabbit-ai-generated:v1 -->
+
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+<!-- review_stack_entry_start -->
+
+<a href="https://app.coderabbit.ai/change-stack/owner/repo/pull/999">Review in Change Stack</a>
+
+<!-- review_stack_entry_end -->
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+>
+> Your organization has reached its usage spending cap. Adjust your spending cap in the [billing tab](https://app.coderabbit.ai/settings/billing?tab=usage&orgId=org).
+>
+> **Next included review available in 7 minutes.**
+
+<!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
+
+# Unknown warning prose with no rate-limit marker or recognized header. It
+# must never be read as a confirmed rate limit.
+UNKNOWN_WARNING_BODY='> [!WARNING]
+> ## Something unexpected happened
+>
+> We could not process this pull request right now. Please try again later.'
+
 # make_case <name> <max_wait> <max_retries> <failover> [rate_limit_body]
 #   rate_limit_body defaults to the OLD format; pass NEW_RATE_LIMIT_BODY to
 #   exercise the adaptive-limit variant.
@@ -292,6 +322,33 @@ test_newformat_window_parsed() {
   [ "$FAIL" -ne "$before" ] || pass "F: published 13-minute window never delays Codex substitution"
 }
 
+
+# --- Test G: the spending-cap variant is a confirmed rate limit (#2657) -----
+test_spending_cap_fires() {
+  local dir rc before=$FAIL
+  dir=$(make_case "spending-cap" 1800 1 true "$SPENDING_CAP_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "5" ] || fail "G: expected exit 5 on the spending-cap body, got $rc; err=$(tail -3 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "G: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "G: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
+  [ "$(stub_calls "$dir")" = "1" ] || fail "G: Codex helper invoked $(stub_calls "$dir") time(s), expected 1"
+  grep -q -- '--failover' "$dir/state/codex-stub.log" 2>/dev/null || fail "G: failover trigger lacks --failover"
+  [ ! -s "$dir/state/sleeps.log" ] || fail "G: the spending cap slept instead of handing off to Codex"
+  [ ! -s "$dir/state/posts.log" ] || fail "G: the spending cap posted a CodeRabbit retry"
+  [ "$(jqf "$dir" '.disposition')" = proceed_on_codex_clearance ] || fail "G: spending cap was not handed to Codex"
+  [ "$FAIL" -ne "$before" ] || pass "G: the spending-cap body fires the Codex failover once with no sleep or retry"
+}
+
+# --- Test H: unknown warning prose is not a confirmed rate limit (#2657) -----
+test_unknown_prose_no_failover() {
+  local dir rc before=$FAIL
+  dir=$(make_case "unknown-prose" 300 0 true "$UNKNOWN_WARNING_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H: unknown prose invoked the Codex failover $(stub_calls "$dir") time(s)"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H: unknown prose classified as rate_limit_stalled"
+  [ "$(jqf "$dir" '.codex_failover_requested' 2>/dev/null)" != "true" ] || fail "H: unknown prose reported a failover"
+  [ "$FAIL" -ne "$before" ] || pass "H: unknown warning prose never fires the Codex failover (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null) disposition=$(jqf "$dir" '.disposition' 2>/dev/null))"
+}
 
 # #2139: drive the actual full clearance checker, then the fixture approval
 # step. CI is scoped out here; its production enforcement is covered separately.
@@ -547,6 +604,8 @@ test_failover_idempotent_across_retries
 test_newformat_fires
 test_newformat_window_parsed
 test_exact_head_substitution_approval
+test_spending_cap_fires
+test_unknown_prose_no_failover
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"
