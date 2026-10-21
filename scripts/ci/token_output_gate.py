@@ -1849,6 +1849,12 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
+                if nxt == "$":
+                    # PID special parameter: the second dollar cannot start a
+                    # named reference. Preserve raw spelling for word readers.
+                    cur_level()["word"].append("$$")
+                    i += 2
+                    continue
                 if nxt == "[":
                     # A raw legacy arithmetic bound withholds new ANSI proof
                     # without changing this loop's existing token semantics.
@@ -2879,6 +2885,9 @@ def _iter_refs_at(s):
             i += 2
             continue
         if ch == "$":
+            if s.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and s[i + 1] == "{":
                 name = braced_ref_at(s, i)
                 if name:
@@ -4349,6 +4358,9 @@ def _heredoc_data_has_positional(body):
         if body[i] == "\\" and body[i + 1:i + 2] in ("$", "`", "\\", "\n"):
             i += 2
             continue
+        if body.startswith("$$", i):
+            i += 2
+            continue
         if body.startswith("${", i):
             try:
                 end = _simple_parameter_end(body, i)
@@ -4423,6 +4435,9 @@ def _word_has_verbatim_positional_exact(w):
         if in_double and c == "$" and w[i + 1 : i + 2] == "{":
             _simple_parameter_end(w, i)  # raises on a word it cannot read
         if c == "$":
+            if w.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
                 if j < n and w[j] in "#!":
@@ -4463,6 +4478,9 @@ def _word_has_verbatim_positional_legacy(w):
             i = n if j == -1 else j + 1
             continue
         if c == "$":
+            if w.startswith("$$", i):
+                i += 2
+                continue
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
                 if j < n and w[j] in "#!":
@@ -15709,6 +15727,28 @@ KNOWN_BROADER.update({cid: (
     "option state are reconstructed (#1465 extglob review repair)."
 ) for cid in ('eval-extglob-extglob-not', 'eval-extglob-safe-matched-plus', 'eval-extglob-safe-unmatched-at', 'eval-extglob-opener-not-space')})
 
+def _pid_special_parameter_cases():
+    """Pin independent readers and later real-reference source coordinates."""
+    failures = []
+    for reader in (_word_has_verbatim_positional_exact,
+                   _word_has_verbatim_positional_legacy,
+                   _heredoc_data_has_positional):
+        for word, expected in (("$$1", False), ("$${1}", False),
+                               ("$$$1", True), ("$1", True),
+                               (r"\$\$1", False), (r"\$$1", True)):
+            if reader(word) != expected:
+                failures.append("PID %s: %r expected %s" %
+                                (reader.__name__, word, expected))
+    raw = '$$GH_TOKEN $${GH_TOKEN} $$$GH_TOKEN'
+    expected = [("GH_TOKEN", raw.rfind("$GH_TOKEN"))]
+    if _iter_refs_at(raw) != expected:
+        failures.append("PID raw references: expected only the adjacent real reference")
+    findings, errors = scan_text('echo "$$GH_TOKEN"\necho "$GH_TOKEN"\n')
+    if errors or len(findings) != 1 or findings[0].line != 2:
+        failures.append("PID later real reference: expected only physical line 2")
+    return failures
+
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -16352,6 +16392,33 @@ KNOWN_BROADER.update({cid: "A literal extglob operand makes pre-eval input uncer
 # #2228: paired quote, escape, non-prefix and redaction controls.
 CORPUS += [('eval-assignment-tilde-control-single-quoted', 'clean', 'HOME=\'; echo\'\neval X=\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-double-quoted', 'clean', 'HOME=\'; echo\'\neval X="~" \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-escaped', 'clean', 'HOME=\'; echo\'\neval X=\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-whole-quoted', 'clean', 'HOME=\'; echo\'\neval \'X=~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-quoted', 'clean', 'HOME=\'; echo\'\neval X=prefix:\'~\' \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-colon-escaped', 'clean', 'HOME=\'; echo\'\neval X=prefix:\\~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-name-quoted', 'clean', 'HOME=\'; echo\'\neval "X"=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-equal-escaped', 'clean', 'HOME=\'; echo\'\neval X\\=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-control-not-prefix', 'clean', 'HOME=\'; echo\'\neval X=prefix~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-safe-home', 'flag', 'HOME=safe\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-length', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${#GH_TOKEN}"\'\n'), ('eval-assignment-tilde-constant', 'clean', 'HOME=\'; echo\'\neval X=~ \': "${GH_TOKEN:+set}"\'\n')]
 KNOWN_BROADER["eval-assignment-tilde-safe-home"] = "A written assignment-tilde operand retains source-only eval uncertainty even when this oracle supplies a safe HOME value; no runtime value propagation is modeled (#2228)."
+
+
+# #1456: PID text is literal until another real expansion begins.
+CORPUS += [
+    ("pid-named-double-quoted", MUST_NOT_FLAG, 'echo "$$GH_TOKEN"\n'),
+    ("pid-named-unquoted", MUST_NOT_FLAG, 'echo $$GH_TOKEN\n'),
+    ("pid-named-braced-literal", MUST_NOT_FLAG, 'echo "$${GH_TOKEN}"\n'),
+    ("pid-named-single-quoted", MUST_NOT_FLAG, "echo '$$GH_TOKEN'\n"),
+    ("pid-named-later-real", MUST_FLAG, 'echo "$$GH_TOKEN"; echo "$GH_TOKEN"\n'),
+    ("pid-named-adjacent-real", MUST_FLAG, 'echo "$$$GH_TOKEN"\n'),
+    ("pid-named-adjacent-braced-real", MUST_FLAG, 'echo "$$${GH_TOKEN}"\n'),
+    ("pid-named-escaped-pair", MUST_NOT_FLAG, r'echo "\$\$GH_TOKEN"' + '\n'),
+    ("pid-named-escaped-first-real", MUST_FLAG, r'echo "\$$GH_TOKEN"' + '\n'),
+    ("pid-heredoc-named", MUST_NOT_FLAG, 'cat <<EOF\n$$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-braced-literal", MUST_NOT_FLAG, 'cat <<EOF\n$${GH_TOKEN}\nEOF\n'),
+    ("pid-heredoc-adjacent-real", MUST_FLAG, 'cat <<EOF\n$$$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-escaped-pair", MUST_NOT_FLAG, 'cat <<EOF\n\\$\\$GH_TOKEN\nEOF\n'),
+    ("pid-heredoc-escaped-first-real", MUST_FLAG, 'cat <<EOF\n\\$$GH_TOKEN\nEOF\n'),
+    ("pid-helper-positional", MUST_NOT_FLAG, 'show() { echo "$$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-braced-literal", MUST_NOT_FLAG, 'show() { echo "$${1}"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-real-positional", MUST_FLAG, 'show() { echo "$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-adjacent-real", MUST_FLAG, 'show() { echo "$$$1"; }; show "$GH_TOKEN"\n'),
+    ("pid-helper-escaped-pair", MUST_NOT_FLAG, r'show() { echo "\$\$1"; }; show "$GH_TOKEN"' + '\n'),
+    ("pid-helper-escaped-first-real", MUST_FLAG, r'show() { echo "\$$1"; }; show "$GH_TOKEN"' + '\n'),
+    ("pid-helper-heredoc", MUST_NOT_FLAG, 'show() { cat <<EOF\n$$1\nEOF\n}; show "$GH_TOKEN"\n'),
+    ("pid-helper-heredoc-real", MUST_FLAG, 'show() { cat <<EOF\n$1\nEOF\n}; show "$GH_TOKEN"\n'),
+]
 
 
 # Exact shape scopes are populated only from inspected measurements. Existing
@@ -17626,6 +17693,7 @@ def self_test():
         return 1
 
     failures.extend(_corpus_id_cases())
+    failures.extend(_pid_special_parameter_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
