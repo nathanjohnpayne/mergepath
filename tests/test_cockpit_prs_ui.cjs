@@ -154,3 +154,17 @@ test('assets remain fetch-free and scoped; shared motion tokens include normal a
   const css=fs.readFileSync(path.join(root,'mergepath/cockpit/assets/prs.css'),'utf8');assert.match(css,/var\(--t-pop\)/);assert.match(css,/var\(--t-glow\)/);assert.match(css,/prefers-reduced-motion:reduce/);assert.match(css,/\.ck\.rm/);assert.match(css,/max-width:720px/);
   const html=fs.readFileSync(path.join(root,'mergepath/cockpit/index.html'),'utf8');for(const asset of ['prs.css','pr_rows.js','prs.js'])assert.ok(html.includes('assets/'+asset));
 });
+
+test('a released owner tiebreak renders as released, never as a standing human stop',()=>{
+  const r=row();r.codex.human_stops=[];r.codex.owner_tiebreaks=[{kind:'runaway'},{kind:'untested',finding:'100'},{kind:'disagreement',finding:'9007199254740993'},{kind:'untested',finding:100}];
+  assert.equal(Rows.validRow(r),true);const view=new Rows.RowView(r);parent().append(view.node);
+  assert.equal(view.stops.hidden,false);assert.equal(view.stops.textContent,'Owner tiebreak released: runaway, untested #100, disagreement #9007199254740993, untested');assert.equal(view.stops.className,'pr-flag');
+  const standing=row();standing.codex.human_stops=['runaway'];standing.codex.owner_tiebreaks=null;view.update(standing,{now:0});
+  assert.equal(view.stops.textContent,'Human stop: runaway');assert.equal(view.stops.className,'pr-flag stop');
+  const partial=row();partial.codex.human_stops=['untested-rebuttal'];partial.codex.owner_tiebreaks=[{kind:'runaway'}];view.update(partial,{now:0});
+  assert.equal(view.stops.textContent,'Human stop: untested-rebuttal · Owner tiebreak released: runaway');assert.equal(view.stops.className,'pr-flag stop');
+  const unknown=row();unknown.codex.human_stops=null;delete unknown.codex.owner_tiebreaks;view.update(unknown,{now:0});
+  assert.equal(view.stops.textContent,'Human-stop evidence unknown');
+  const none=row();none.codex.human_stops=[];none.codex.owner_tiebreaks=[];view.update(none,{now:0});assert.equal(view.stops.hidden,true);
+  view.destroy();
+});
