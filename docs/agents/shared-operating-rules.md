@@ -23,6 +23,14 @@ This applies to every hand-rolled, mid-session investigative query, not just the
 
 The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh api --paginate` for the REST arrays, and the GraphQL reads use cursor loops --- so this rule is aimed at the ad-hoc queries those helpers do not cover. When in doubt, add `--paginate`: it is a no-op on a short list and the only safe default on a long one.
 
+## GitHub REST and GraphQL rate limits are separate budgets
+
+GitHub meters REST and GraphQL separately. A user token gets 5,000 REST requests per hour and, independently, 5,000 GraphQL points per hour; exhausting one leaves the other intact. When a GraphQL call fails on the primary rate limit (`API rate limit exceeded` from the GraphQL API, or `gh api rate_limit` showing `resources.graphql.remaining` at 0), switch that work to the equivalent REST endpoints and keep going, rather than waiting for the GraphQL window to reset.
+
+Several `gh` commands are GraphQL under the hood and spend that budget: `gh pr view --json`, `gh pr list`, `gh issue view --json`, `gh issue list`, `gh project ...` and `gh api graphql`. Their REST equivalents are plain `gh api` paths, for example `repos/OWNER/REPO/pulls/N`, `.../pulls/N/reviews`, `.../pulls/N/comments`, `.../issues/N`, `.../issues/N/comments` and `.../commits/SHA/check-runs`, each with `--paginate` under the rule above. Check both budgets with `gh api rate_limit --jq '.resources | {core, graphql}'`.
+
+This applies only to the primary quota. A secondary (abuse) rate limit, a 403 or 429 that mentions a secondary rate limit or carries `Retry-After`, applies across both APIs: switching to REST just hits it again. Back off for the stated interval instead. During a secondary limit `gh api rate_limit` can still read as healthy, so do not treat its answer as clearance. GitHub App installation tokens (CI workflows) have their own separate budget.
+
 ## Background jobs and expected duration
 
 A backgrounded command must have an expected duration stated when it is launched, and must be checked against that expectation. Never report "still running" as a status without comparing elapsed time to the expectation. A completion notification fires only on completion; a hung job produces no notification and no error — it is indistinguishable from a job legitimately working. Passive waiting has no failure detection by default.
