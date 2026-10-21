@@ -1153,6 +1153,60 @@ if [ "$rc" = 3 ] && [ ! -e "$WORK/integrity-adapter-ran" ] && [ ! -e "$P4B_TEST_
 else
   fail "admin override over a capture refusal (rc=$rc): $(tail -n 3 "$WORK/override-capture.stderr")"
 fi
+# Round-5 P1: once the override absorbed a tripwire, an adapter that yields no
+# usable verdict must not reach the exit-4 "reviewer unavailable" fallback that
+# wave-audit.sh may fan out on. The tripwire still holds: exit 8, no handoff,
+# and the summary keeps the override fields. The ordinary-* controls (no
+# tripwire absorbed) keep the exit-4 handoff, so dropping the absorbed-only
+# guard fails them.
+mk_fake fake-override-handoff "printf ran > \"$WORK/override-handoff-ran\""
+mk_fake fake-codex-override-fail "printf ran > \"$WORK/integrity-adapter-ran\"; exit 1"
+mk_fake fake-codex-override-slow "printf ran > \"$WORK/integrity-adapter-ran\"; sleep 30"
+mk_fake fake-codex-override-malformed \
+  "printf ran > \"$WORK/integrity-adapter-ran\"
+   printf '%s' '{\"verdict\":\"MAYBE\",\"summary\":\"?\"}'"
+mkdir -p "$WORK/override-no-adapter"
+for override_fail in missing-posting missing-retained cli-posting cli-retained timeout-posting malformed-posting ordinary-missing ordinary-cli; do
+  cp "$WORK/tripwire-original.diff" "$DIFF"
+  rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran" "$WORK/override-handoff-ran"
+  override_env=(CODEX_BIN="$BIN/fake-codex-override-fail") override_args=() want_rc=8
+  case "$override_fail" in
+    ordinary-*) printf 'src/app.js\0' > "$WORK/tripwire-paths"; want_rc=4 ;;
+    *) printf 'REVIEW_POLICY.md\0' > "$WORK/tripwire-paths" ;;
+  esac
+  case "$override_fail" in
+    *missing*) override_env=(P4B_ADAPTER_DIR="$WORK/override-no-adapter") ;;
+    timeout-*) override_env=(CODEX_BIN="$BIN/fake-codex-override-slow") ;;
+    malformed-*) override_env=(CODEX_BIN="$BIN/fake-codex-override-malformed") ;;
+  esac
+  case "$override_fail" in *-retained) override_args=(--dry-run --retain-evidence) ;; esac
+  rc=0
+  out="$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" "${override_env[@]}" \
+    P4B_ADAPTER_TIMEOUT_SECONDS=3 P4B_HANDOFF="$BIN/fake-override-handoff" \
+    P4B_ACCT_STATE_DIR="$WORK/override-fail-$override_fail-state" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    bash "$ORCH" 1757 --repo o/r --author claude --reviewer nathanpayne-codex ${override_args[@]+"${override_args[@]}"} \
+    --admin-override 'Owner: run it' \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+    2>"$WORK/override-fail-$override_fail.stderr")" || rc=$?
+  override_ok=false
+  if [ "$want_rc" = 8 ]; then
+    [ ! -e "$WORK/override-handoff-ran" ] \
+      && jq -e '.human_tiebreaker_required and .fell_back_to_manual == false and .review_posted == false
+        and .admin_override_quote == "Owner: run it"
+        and ([.admin_overridden[].tripwires[]?] | index("authorization-policy-publisher-or-credentials") != null)' <<<"$out" >/dev/null \
+      && override_ok=true
+  else
+    [ -e "$WORK/override-handoff-ran" ] \
+      && jq -e '.fell_back_to_manual and .admin_overridden == [] and .admin_override_quote == "Owner: run it"' <<<"$out" >/dev/null \
+      && override_ok=true
+  fi
+  if [ "$rc" = "$want_rc" ] && [ "$override_ok" = true ] && [ ! -e "$P4B_TEST_POSTED_REVIEW" ]; then
+    pass "admin override: $override_fail adapter failure keeps exit $want_rc with the override recorded"
+  else
+    fail "admin override $override_fail adapter failure (rc=$rc want=$want_rc): $out $(tail -n 3 "$WORK/override-fail-$override_fail.stderr")"
+  fi
+done
 # Missing adapters do not turn egregious input into the wave's exit-4
 # reviewer-unavailable continuation. Exercise both absent and inert adapters,
 # retaining ordinary fallback and genuine preview behavior as positive controls.

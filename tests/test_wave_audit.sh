@@ -126,7 +126,8 @@ if [ "${FAKE_ORCH_JSON:-}" = retained-tripwire ]; then
   fi
   FAKE_ORCH_JSON=clean
 fi
-case "${FAKE_ORCH_JSON:-}" in
+# FAKE_ORCH_OVERRIDE adds the orchestrator's admin override fields (#2633).
+{ case "${FAKE_ORCH_JSON:-}" in
   clean)
     jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
       '{dry_run:true,review_posted:false,head_sha:$head,direction:"codex-reviews-claude",
@@ -147,7 +148,10 @@ case "${FAKE_ORCH_JSON:-}" in
         reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",
         validated_verdict:{verdict:"CHANGES_REQUESTED",findings:[{priority:"P1",body:"fix"}],summary:"findings"}}'
     ;;
-esac
+esac; } | if [ -n "${FAKE_ORCH_OVERRIDE:-}" ]; then
+  jq -c '. + {admin_overridden:[{decision:"human-tiebreaker",tripwires:["reviewer-address"]}],
+    admin_override_quote:"Owner: run it"}'
+else cat; fi
 exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
@@ -613,11 +617,28 @@ git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | gr
   && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
 git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+# The orchestrator's quote checks apply before the budget exit (POLICY_SMALL
+# would exit 8 here) and before a capture writes its scope.
+for bad_quote in '  ' $'two\nlines' $'carriage\rreturn' "$(printf 'q%.0s' $(seq 1 501))"; do
+  rc=0
+  run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --admin-override "$bad_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+    && pass "admin override refuses an unusable quote (${#bad_quote} chars) before the budget exit" \
+    || fail "unusable admin override quote (${#bad_quote} chars) returned $rc"
+  rm -rf "$WORK/override-capture"; mkdir "$WORK/override-capture"
+  rc=0
+  run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --capture-input-dir "$WORK/override-capture" --admin-override "$bad_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ -z "$(ls -A "$WORK/override-capture")" ] \
+    && pass "admin override refuses an unusable quote (${#bad_quote} chars) before capture" \
+    || fail "capture accepted an unusable admin override quote (${#bad_quote} chars): rc=$rc"
+done
 rc=0
-run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-  --admin-override '  ' >/dev/null 2>&1 || rc=$?
-[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
-  && pass "admin override refuses a blank quote before dispatch" || fail "blank admin override quote returned $rc"
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run \
+  --admin-override "$(printf 'q%.0s' $(seq 1 500))" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && grep -Fxq -- '--admin-override' "$CAPTURE/args" \
+  && pass "admin override accepts a 500-character quote" || fail "500-character admin override quote returned $rc"
 
 # Equality remains eligible: mutate > to >= and this control fails.
 POLICY_EXACT="$WORK/policy-exact.yml"
@@ -785,6 +806,31 @@ FAKE_ORCH_JSON=retained-tripwire run_wa "$POLICY_GOOD" reset 81 --repo owner/con
   && jq -e '.dry_run and .receipt_written == false' "$WORK/historical-tripwire-preview.json" >/dev/null \
   && pass "top-level historical preview retains non-persisting model validation" \
   || fail "historical preview acquired retained-evidence enforcement or receipt authority"
+
+# #2633: a chunk validated past an overridden tripwire keeps the override in
+# its exit-9 summary and its persisted receipt, and in an exit-1 summary.
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --admin-override 'Owner: run it' \
+  > "$WORK/historical-override.json" 2> "$WORK/historical-override.err" || rc=$?
+git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2:refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2" 2>/dev/null || true
+[ "$rc" -eq 9 ] && jq -e '.admin_override_quote == "Owner: run it" and .admin_overridden[0].tripwires == ["reviewer-address"]' \
+    "$WORK/historical-override.json" >/dev/null \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2" \
+    | jq -e '.review_provenance.admin_override_quote == "Owner: run it"
+      and .review_provenance.admin_overridden[0].tripwires == ["reviewer-address"]' >/dev/null \
+  && pass "historical override keeps the override in its summary and prefix receipt" \
+  || fail "historical override dropped the override fields (rc=$rc): $(tail -n 2 "$WORK/historical-override.err")"
+git -C "$CANON" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
+git -C "$REMOTE" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
+rc=0
+FAKE_ORCH_JSON=advisory FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --admin-override 'Owner: run it' \
+  > "$WORK/historical-override-advisory.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 1 ] && jq -e '.admin_override_quote == "Owner: run it" and (.admin_overridden | length) == 1' \
+    "$WORK/historical-override-advisory.json" >/dev/null && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && pass "historical override keeps the override in a findings summary" \
+  || fail "historical override findings summary dropped the override fields (rc=$rc)"
 
 # Retain the first chunk while its first tag push fails. The local exact
 # receipt must make the identical retry a publish-only operation, with no

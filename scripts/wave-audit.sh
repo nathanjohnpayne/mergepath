@@ -211,11 +211,17 @@ case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -z "$CAPTURE_INPUT_DIR" ] || { [ -d "$CAPTURE_INPUT_DIR" ] && [ ! -L "$CAPTURE_INPUT_DIR" ]; } \
   || die 3 "capture directory must already exist and be a real directory"
 [ -x "$ORCH" ] || [ -f "$ORCH" ] || die 3 "orchestrator not found: $ORCH"
+# The orchestrator's quote checks, applied here before any capture, budget or
+# empty-scope exit can act on (or tag the watermark for) an unusable quote.
 if [ "$ADMIN_OVERRIDE_SET" = true ]; then
   case "$ADMIN_OVERRIDE_QUOTE" in
     *[![:space:]]*) ;;
     *) die 3 "--admin-override requires a non-empty owner authorization quote" ;;
   esac
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *$'\n'*|*$'\r'*) die 3 "--admin-override quote must be a single line" ;;
+  esac
+  [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || die 3 "--admin-override quote must be at most 500 characters"
 fi
 
 # --- config (fail-closed validation) ----------------------------------------
@@ -668,7 +674,9 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   provenance="$(printf '%s' "$summary" | jq -c '
     {direction, reviewer_identity, adapter, canary_head:.head_sha,
      repo, pr_number, reviewer_effort, adapter_timeout_seconds,
-     usage_source, token_count}')"
+     usage_source, token_count,
+     admin_overridden:(.admin_overridden // []),
+     admin_override_quote:(.admin_override_quote // null)}')"
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
     --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" \
     --arg chunk_base "$RANGE_BASE" --arg prefix_end "$RANGE_HEAD" \
@@ -880,6 +888,10 @@ if [ -n "$HISTORICAL_END" ]; then
            (.validated_verdict.findings | type == "array"))' "$ORCH_OUTPUT" 2>/dev/null)" \
     || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run returned no complete validated_verdict"; }
   verdict="$(printf '%s' "$orch_summary" | jq -c .validated_verdict)"
+  # #2633: a chunk validated past an overridden tripwire says so in every
+  # summary and in its retained receipt.
+  admin_override="$(printf '%s' "$orch_summary" | jq -c \
+    '{admin_overridden:(.admin_overridden // []),admin_override_quote:(.admin_override_quote // null)}')"
   if [ -n "$pr_head" ]; then
     [ "$(printf '%s' "$orch_summary" | jq -r '.head_sha // empty')" = "$pr_head" ] \
       || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run verdict is not pinned to lane-verified canary head $pr_head"; }
@@ -888,10 +900,10 @@ if [ -n "$HISTORICAL_END" ]; then
   printf '%s' "$verdict" | jq -e '.verdict == "APPROVED" and (.findings | length == 0)' >/dev/null && clean=true
   if [ "$clean" != true ]; then
     jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
-      --argjson verdict "$verdict" \
+      --argjson verdict "$verdict" --argjson ao "$admin_override" \
       '{historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
         prefix_receipt:null,watermark_advanced:false,fanout_authorized:false,
-        validated_verdict:$verdict}'
+        validated_verdict:$verdict} + $ao'
     log "historical chunk produced findings (including APPROVED advisories) — complete verdict retained for disposition; no receipt or clearance state written"
     exit 1
   fi
@@ -903,11 +915,11 @@ if [ -n "$HISTORICAL_END" ]; then
   fi
   jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
     --arg tag "$prefix_tag" --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
-    --argjson verdict "$verdict" '
+    --argjson verdict "$verdict" --argjson ao "$admin_override" '
       {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
        prefix_receipt:(if $tag == "null" then null else $tag end),
        receipt_written:($dry|not),watermark_advanced:false,fanout_authorized:false,
-       dry_run:$dry,validated_verdict:$verdict}'
+       dry_run:$dry,validated_verdict:$verdict} + $ao'
   log "historical chunk validated clean — retained as non-clearance prefix only; explicit --finalize-historical is still required"
   exit 9
 else
