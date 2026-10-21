@@ -1029,6 +1029,7 @@ class Segment:
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
         "_function_binding", "eval_pattern_uncertain", "tee_output_processes",
+        "tee_process_word_limit",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -1065,6 +1066,7 @@ class Segment:
         # Standalone output-process operands retain their already-lexed child
         # commands for the finite mid-pipeline tee side-write check (#1497).
         self.tee_output_processes = []
+        self.tee_process_word_limit = None
 
 
 class Ref:
@@ -2135,6 +2137,9 @@ class Lexer:
                     j += 1
                     continue
                 delim = "".join(delim_chars)
+                # A recorded << has already consumed its delimiter. An empty
+                # delimiter before >( ) instead leaves that operand pending.
+                cur_level()["tee_heredoc_delimiter_pending"] = not bool(delim)
                 if delim:
                     hd = HereDoc(delim, interpolating, strip_tabs, cur_level()["seg"])
                     pending_heredocs.append(hd)
@@ -2202,11 +2207,17 @@ class Lexer:
                 redirection = _REDIR_RE.match(previous)
                 probe = Segment(-1, None, False, line)
                 probe.words = list(parent_seg.words)
+                if (resolve_command(probe)[0] == "tee"
+                        and parent_seg.tee_process_word_limit is None):
+                    # A substitution is an argument even without a word marker;
+                    # exit-mode proof cannot skip it to reach a later option.
+                    parent_seg.tee_process_word_limit = len(parent_seg.words)
                 tee_operand = (
                     c == ">" and not cur_level()["word"]
                     and text[i - 1:i] in (" ", "\t", "\n")
                     and resolve_command(probe)[0] == "tee"
-                    and previous != "<<" and not _HERESTRING_RE.fullmatch(previous)
+                    and not cur_level().get("tee_heredoc_delimiter_pending", False)
+                    and not _HERESTRING_RE.fullmatch(previous)
                     and not (redirection and redirection.end() == len(previous))
                 )
                 if (parent_seg.words and _HERESTRING_RE.fullmatch(parent_seg.words[-1])
@@ -3358,14 +3369,36 @@ def tee_file_operands(seg):
     return files
 
 
-def _tee_process_substitution_sidewrite(seg):
+def _tee_exits_without_input(seg):
+    """Only literal exit modes before uncertain or non-option arguments."""
+    resolve_command(seg)
+    if seg._cmd_index is None:
+        return False
+    words = seg.words[:seg.tee_process_word_limit]
+    for _raw, literal in _command_arguments(words, seg._cmd_index + 1):
+        if literal in ("--help", "--version"):
+            return True
+        if (literal is not None and literal.startswith("-")
+                and len(literal) > 1 and set(literal[1:]) <= {"a", "i"}):
+            continue
+        return False  # Includes --, opaque arguments and unsupported options.
+    return False
+
+
+def _tee_process_substitution_sidewrite(seg, shadowed_stdin=frozenset()):
     """The measured single-cat stderr operand, not general stdin dataflow."""
     if resolve_command(seg)[0] != "tee":
+        return False
+    if (("tee" not in shadowed_stdin or seg._cmd_literal != "tee")
+            and _tee_exits_without_input(seg)):
         return False
     for children in seg.tee_output_processes:
         if len(children) != 1:
             continue  # No command-list or process-substitution pipeline model.
         child = children[0]
+        if (resolve_command(child)[0] == "cat" and "cat" in shadowed_stdin
+                and child._cmd_literal == "cat"):
+            continue  # A local function is not proven to forward its stdin.
         if (resolve_command(child)[0] == "cat" and child._cmd_index == 0
                 and child.pipe_to is None
                 and child.words[1:] in ([">&2"], ["1>&2"])):
@@ -3586,7 +3619,8 @@ def _test_numeric_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers, helper_routing=None):
+def reaches_output(ref, emitter_helpers, helper_routing=None,
+                   shadowed_stdin=frozenset()):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -3756,7 +3790,7 @@ def reaches_output(ref, emitter_helpers, helper_routing=None):
                     % (cmd or emitter or "output command"),
                 )
             tee_files = tee_file_operands(seg)
-            if _tee_process_substitution_sidewrite(seg):
+            if _tee_process_substitution_sidewrite(seg, shadowed_stdin):
                 return True, _why(
                     note, "tee, whose output process substitution writes to stderr"
                 )
@@ -5198,6 +5232,10 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
     # Preserve lone CR as shell data; only CRLF has established normalization.
     text = text.replace("\r\n", "\n")
     helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
+    shadowed_stdin = frozenset(
+        name for _match, name, _body in _iter_function_definitions(text)
+        if name in STDIN_ECHOERS
+    )
     lx = Lexer(text)
     findings = []
     pragma_errors = []
@@ -5342,7 +5380,9 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
         for ref in ll.refs:
             if ref.line in exempt_lines or ref.seg in exempt_segments:
                 continue
-            hit, why = reaches_output(ref, helpers, (routed_any, routed_fd1))
+            hit, why = reaches_output(
+                ref, helpers, (routed_any, routed_fd1), shadowed_stdin
+            )
             if not hit and _uncertain_eval_output:
                 hit, why = True, (
                     "uncertain pre-eval expansion may change how this "
@@ -15898,6 +15938,7 @@ def _tee_process_substitution_cases():
         'tee >(cat >&2)>(cat >/dev/null)\n',
         'tee >(cat >/dev/null)>(cat >&2)\n',
         'tee <<< >(cat >&2)\n', '>(cat >&2) tee\n',
+        'tee << >(cat >&2)\n',
         'cat >(cat >&2)\n',
     ]:
         lx = Lexer(text)
@@ -15911,7 +15952,53 @@ def _tee_process_substitution_cases():
     findings, errors = scan_text(text.replace('"$GH_TOKEN"', 'safe'))
     if findings or errors:
         failures.append("tee process sidewrite: invented a credential reference")
+    for cid, expected, body in _tee_review_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee review boundary: " + cid)
+    for text in [
+        'tee -- --help >(cat >&2)\n', 'tee "$option" --help >(cat >&2)\n',
+        'tee >(cat >&2) --help\n',
+    ]:
+        tee = next(seg for ll in Lexer(text).logical for seg in ll.segments
+                   if seg.parent is None and resolve_command(seg)[0] == "tee")
+        if _tee_exits_without_input(tee):
+            failures.append("tee exit mode: skipped an earlier argument " + repr(text))
     return failures
+
+
+def _tee_review_cases():
+    """Reviewed namespace, consumed-delimiter and literal exit-mode pairs."""
+    return [
+        ("tee-review-cat-shadow", MUST_NOT_FLAG,
+         'cat(){ :; }\nprintf \'%s\' "$GH_TOKEN" | tee >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-cat-shadow-absolute", MUST_FLAG,
+         'cat(){ :; }\nprintf \'%s\' "$GH_TOKEN" | tee >(/bin/cat >&2) | grep -qF zz\n'),
+        ("tee-review-heredoc-after", MUST_FLAG,
+         'tee <<EOF >(cat >&2) | grep -qF zz\n$GH_TOKEN\nEOF\n'),
+        ("tee-review-heredoc-before", MUST_FLAG,
+         'tee >(cat >&2) <<EOF | grep -qF zz\n$GH_TOKEN\nEOF\n'),
+        ("tee-review-heredoc-null", MUST_NOT_FLAG,
+         'tee <<EOF >(cat >/dev/null) | grep -qF zz\n$GH_TOKEN\nEOF\n'),
+        ("tee-review-heredoc-quoted", MUST_NOT_FLAG,
+         'tee <<\'EOF\' >(cat >&2) | grep -qF zz\n$GH_TOKEN\nEOF\n'),
+        ("tee-review-help", MUST_NOT_FLAG,
+         'printf \'%s\' "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-version", MUST_NOT_FLAG,
+         'printf \'%s\' "$GH_TOKEN" | tee --version >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-end-options", MUST_FLAG,
+         'printf \'%s\' "$GH_TOKEN" | tee -- --help >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-opaque-option", MUST_FLAG,
+         'option=--\nprintf \'%s\' "$GH_TOKEN" | tee "$option" --help >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-quoted-help", MUST_NOT_FLAG,
+         'printf \'%s\' "$GH_TOKEN" | tee \'--help\' >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-append-help", MUST_NOT_FLAG,
+         'printf \'%s\' "$GH_TOKEN" | tee -a --help >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-tee-shadow", MUST_FLAG,
+         'tee(){ /bin/cat >&2; }\nprintf \'%s\' "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'),
+        ("tee-review-qualified-tee-help", MUST_NOT_FLAG,
+         'tee(){ /bin/cat >&2; }\nprintf \'%s\' "$GH_TOKEN" | /usr/bin/tee --help >(cat >&2) | grep -qF zz\n'),
+    ]
 
 
 def _line_ending_normalization_cases(tmp, observe=None):
@@ -16949,6 +17036,9 @@ CORPUS += [
 # must name their scope explicitly and still disagree on every named cell.
 # Measured scopes are explicit per ID; agreement in a sibling shape does not
 # waive a declaration. Existing reasons and ordinary scanner rules stay intact.
+CORPUS += _tee_review_cases()
+
+
 KNOWN_MISS_SHAPES = {
     'ansi-c-plain-alias-invoked-inherited': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'array-double-quoted-apostrophe-after-nested-substitution': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
