@@ -9,10 +9,15 @@
 # Local-session preconditions (claude is this example's agent):
 #   eval "$(scripts/op-preflight.sh --agent claude --mode review)"
 #   export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
-# Cloud sessions need GraphQL transport and an author PAT with repo + project
-# scopes. The capability probe tests transport, not Project permissions;
-# otherwise use capable-session handback.
-# Do not invoke local 1Password preflight from cloud.
+# Cloud-session preconditions: provision OP_PREFLIGHT_AUTHOR_PAT, then select it:
+#   export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
+# For user-owned Projects v2, the author classic PAT needs project plus
+# public_repo for public repository operations; use repo only for private access.
+# These minimum scopes apply to both local and cloud credentials.
+# Cloud sessions also need GraphQL transport. The capability probe tests
+# transport, not Project permissions; otherwise use capable-session handback.
+# Follow docs/agents/cloud-environments.md; do not invoke local 1Password
+# preflight from cloud.
 #
 # Already-executed on 2026-04-18: produced parent issues #210, #215, #220, #225.
 # Re-running will create a duplicate set — the script is not idempotent. Use
