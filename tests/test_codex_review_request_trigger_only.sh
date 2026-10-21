@@ -88,6 +88,20 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir=${CODEX_TEST_STATE_DIR:?}
+# #2657: the request checkpoint posts through --body-file; record it apart
+# from triggers so trigger counts stay exact. It must never carry the phrase.
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--body-file" ] && grep -Fq 'mergepath-codex-request-checkpoint:v1' "$arg"; then
+    if grep -Eiq '@codex[[:space:]]+review' "$arg"; then echo "checkpoint carried the trigger phrase" >&2; exit 97; fi
+    [ "${CODEX_TEST_CHECKPOINT_FAIL:-0}" != 1 ] || { echo "checkpoint write refused" >&2; exit 1; }
+    n=0; [ -f "$state_dir/checkpoint-count" ] && n=$(cat "$state_dir/checkpoint-count")
+    n=$((n + 1)); printf '%s\n' "$n" >"$state_dir/checkpoint-count"; cp "$arg" "$state_dir/checkpoint-$n.md"
+    printf 'https://github.com/owner/repo/pull/999#issuecomment-%s\n' "$((5000 + n))"
+    exit 0
+  fi
+  prev="$arg"
+done
 if [ "${9:-}" != "@codex review" ]; then
   echo "trigger body was not exact '@codex review': $*" >&2; exit 98
 fi
@@ -274,6 +288,10 @@ case "$endpoint" in
       cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
       cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cp_four)          jq -cn --arg who "$author" --arg t "$old" '[range(4) | {id:(8700 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cp_five)          jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8710 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cp_five_existing) jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8720 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8730,user:{login:$who},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=x -->\nCheckpoint."}]' ;;
+      cp_five_foreign)  jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8740 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8750,user:{login:"someone-else"},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=x -->"}]' ;;
       cap_duplicate_ids) jq -cn --arg who "$author" --arg t "$old" '[range(12) | {id:(8200 + (. % 9)),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_bad_id)       jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8300 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       # #2534: ten prior requests, one of them a marked CodeRabbit failover.
@@ -309,6 +327,7 @@ run_trigger_only() {
       CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO="$scenario" \
       CODEX_TEST_BASE_POLICY_MODE="$base_policy_mode" \
+      CODEX_TEST_CHECKPOINT_FAIL="${CODEX_TEST_CHECKPOINT_FAIL:-0}" \
       MERGEPATH_PHASE_4A_GATED="$phase4a_gated" \
       ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
@@ -482,6 +501,39 @@ test_request_attempt_cap() {
     fi
     [ "$FAIL" -ne "$before" ] || pass "#813: $description"
   done
+}
+
+# #2657: the five-request checkpoint reuses the ceiling's request count, is
+# recorded once per PR by the author, and never blocks or changes a budget.
+cp_count() { if [ -f "$1/state/checkpoint-count" ]; then cat "$1/state/checkpoint-count"; else printf '0\n'; fi; }
+test_request_checkpoint() {
+  local scenario dir rc before want_cp want_rec
+  for scenario in cp_four cp_five cp_five_existing cp_five_foreign cap_below_limit cap_three; do
+    before=$FAIL
+    case "$scenario" in
+      cp_four|cap_three) want_cp=0; want_rec=null ;;
+      cp_five|cp_five_foreign|cap_below_limit) want_cp=1; want_rec=posted ;;
+      cp_five_existing) want_cp=0; want_rec=existing ;;
+    esac
+    dir=$(make_case "checkpoint-$scenario")
+    rc=$(run_trigger_only "$dir" "$scenario")
+    [ "$rc" = 0 ] || fail "#2657 $scenario: expected exit 0, got $rc; err=$(tail -n 3 "$dir/err.log")"
+    [ "$(trig_count "$dir")" = 1 ] || fail "#2657 $scenario: the request itself was not posted exactly once ($(trig_count "$dir"))"
+    [ "$(cp_count "$dir")" = "$want_cp" ] || fail "#2657 $scenario: expected $want_cp checkpoint posts, got $(cp_count "$dir")"
+    [ "$(jqf "$dir" '.request_checkpoint.recorded // "null"')" = "$want_rec" ] \
+      || fail "#2657 $scenario: request_checkpoint.recorded=$(jqf "$dir" '.request_checkpoint.recorded // "null"'), expected $want_rec"
+    if [ "$want_cp" = 1 ]; then
+      grep -Fq 'counted=' "$dir/state/checkpoint-1.md" && grep -Fq 'reassess the scope' "$dir/state/checkpoint-1.md" \
+        || fail "#2657 $scenario: checkpoint body lacks its count or guidance"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: $scenario posts $want_cp checkpoint(s), recorded=$want_rec, request still posts"
+  done
+  before=$FAIL
+  dir=$(make_case "checkpoint-write-fails")
+  rc=$(CODEX_TEST_CHECKPOINT_FAIL=1 run_trigger_only "$dir" cp_five)
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(jqf "$dir" '.request_checkpoint.recorded')" = failed ] \
+    || fail "#2657: a failed checkpoint write blocked or hid the request (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a failed checkpoint write never blocks the request"
 }
 
 test_nondefault_request_attempt_cap() {
@@ -1922,6 +1974,7 @@ test_author_containment_posts
 test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
 test_request_attempt_cap
+test_request_checkpoint
 test_nondefault_request_attempt_cap
 test_candidate_cannot_raise_governing_request_attempt_cap
 test_governing_cap_read_failure_refuses_new_write

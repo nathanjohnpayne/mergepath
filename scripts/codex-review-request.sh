@@ -193,6 +193,10 @@
 #     # the later codex-review-check.sh --diagnostic-signal-only probe maps the
 #     # provider-authored evidence to its Phase 4b exit-2 waiver.
 #     "trigger_posted": true | false,
+#     "request_checkpoint": null | {after, counted_requests, recorded, comment_id},
+#     # #2657: set when this run's new request found the PR already at five
+#     # or more counted requests. recorded is "posted", "existing" or "failed";
+#     # it is informational and never changes the exit code.
 #     "request_resumed": true | false,
 #     # true when this invocation resumed an earlier in-flight request
 #     # instead of posting one (#1550), including one that expired and was
@@ -2022,6 +2026,48 @@ run_feedback_accounting_gate() {
   esac
 }
 
+# #2657: five-request checkpoint. Once a PR already counts
+# CODEX_REQUEST_CHECKPOINT_AFTER counted requests (the same crqe_count_triggers
+# count the ceiling uses; failover triggers excluded), record ONE author-owned
+# marker comment before the next new request, so a restarted session sees it.
+# It asks the agent to reassess scope and recurring findings, batch the
+# remaining fixes and strengthen tests before continuing. It is informational:
+# it never blocks, never spends or refunds a request, and a failed write only
+# warns. The body must never contain the Codex trigger phrase.
+CODEX_REQUEST_CHECKPOINT_AFTER=5
+CODEX_REQUEST_CHECKPOINT_MARKER='<!-- mergepath-codex-request-checkpoint:v1'
+REQUEST_CHECKPOINT_JSON=null
+record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
+  local comments="$1" counted="$2" ceiling="$3" existing body_file
+  [ "$counted" -ge "$CODEX_REQUEST_CHECKPOINT_AFTER" ] || return 0
+  existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" --arg marker "$CODEX_REQUEST_CHECKPOINT_MARKER" \
+    '[.[] | select((.user.login // "" | ascii_downcase) == ($who | ascii_downcase))
+          | select((.body // "") | contains($marker)) | .id] | first // empty' 2>/dev/null) || existing=""
+  if [ -n "$existing" ]; then
+    REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" --arg id "$existing" \
+      '{after:5,counted_requests:$n,recorded:"existing",comment_id:($id|tonumber? // null)}')
+    return 0
+  fi
+  body_file=$(mktemp "${TMPDIR:-/tmp}/codex-request-checkpoint.XXXXXX") || { log "WARN: request checkpoint body could not be staged; continuing"; return 0; }
+  {
+    printf '%s counted=%s head=%s -->\n' "$CODEX_REQUEST_CHECKPOINT_MARKER" "$counted" "$HEAD_SHA"
+    printf '**Codex request checkpoint (#2657).** This PR already counts %s Codex requests (request ceiling %s, blocking-review budget %s).\n\n' \
+      "$counted" "$ceiling" "${GOVERNING_BLOCKING_REVIEW_BUDGET:-default}"
+    printf 'Before the next round: reassess the scope and any recurring findings, batch the remaining fixes into one push, and strengthen the tests or shared fixtures that let those findings through. This note is informational. It blocks nothing and changes no budget.\n'
+  } >"$body_file"
+  # A subshell contains post_author_pr_comment's `die`: the checkpoint must
+  # never abort the request it precedes.
+  if ( post_author_pr_comment "$(cat "$body_file")" "Codex request checkpoint" body-file ) >/dev/null 2>&1; then
+    log "request checkpoint (#2657): $counted counted requests; recorded a checkpoint comment — reassess scope, batch fixes, strengthen tests before continuing"
+    REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"posted",comment_id:null}')
+  else
+    log "WARN: request checkpoint (#2657) comment could not be posted; continuing (the checkpoint is informational)"
+    REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"failed",comment_id:null}')
+  fi
+  rm -f "$body_file"
+  return 0
+}
+
 post_author_pr_comment() { # <body> <purpose> [body-file|inline]
   local body="$1" purpose="$2" mode="${3:-body-file}" AS_AUTHOR bridge_author_pat=""
   local body_file="" output="" rc=0 identity_checker
@@ -2658,6 +2704,9 @@ post_codex_trigger() {
   # confirmed without spending another (#2631).
   local caller_mode="$REQUEST_MODE"
   [ "$TRIGGER_POSTED" != true ] || caller_mode=""
+  if [ "$TRIGGER_POSTED" != true ]; then
+    record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
+  fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
@@ -3219,6 +3268,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
     --arg bot_login "$BOT_LOGIN" \
     --argjson trigger_posted "$TRIGGER_POSTED" \
     --argjson failover_marker "$failover_marker" \
+    --argjson request_checkpoint "$REQUEST_CHECKPOINT_JSON" \
     --arg blocked_reason "$trigger_only_blocked_reason" '
     {
       pr_number: $pr_number,
@@ -3236,6 +3286,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       trigger_requested: true,
       trigger_only: true,
       failover_marker: $failover_marker,
+      request_checkpoint: $request_checkpoint,
       rounds_waited_seconds: 0
     }'
   exit 0
@@ -3365,6 +3416,7 @@ jq -n \
   --arg blocked_reason "$BLOCKED_REASON" \
   --argjson terminal_recorded "$PHASE4A_TERMINAL_RECORDED" \
   --arg terminal_comment_id "$PHASE4A_TERMINAL_COMMENT_ID" \
+  --argjson request_checkpoint "$REQUEST_CHECKPOINT_JSON" \
   --argjson elapsed "$ELAPSED" '
   {
     pr_number: $pr_number,
@@ -3385,6 +3437,7 @@ jq -n \
     trigger_posted: $trigger_posted,
     request_resumed: $request_resumed,
     trigger_requested: true,
+    request_checkpoint: $request_checkpoint,
     rounds_waited_seconds: $elapsed
   }
 '
