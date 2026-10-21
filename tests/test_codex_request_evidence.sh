@@ -253,7 +253,7 @@ completed-gate-c|completed|none|approved||1|1|completed summary observed.*inspec
 thumbs-unapproved|none|none|[]||1|1|no freshness-qualified author trigger|0
 gate-c|trigger|eyes|approved||1|1|linked eyes acknowledgement=true|1
 not-opted|trigger|eyes|[]||0|1|no reviewer identity|0
-same-agent-approved|none|none|approved||0|1|own reviewer identity (nathanpayne-claude), which this Phase 4 gate discounts.*run scripts/merge-clearance-gate.sh|0
+same-agent-approved|none|none|approved||0|1|no qualifying reviewer approval cleared gate (b): the latest-state APPROVED review from the authoring agent.s own reviewer identity (nathanpayne-claude) is discounted.*run scripts/merge-clearance-gate.sh.*--require-codex-on-head|0
 same-agent-unapproved|none|none|[]||0|1|no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent|0
 readiness|trigger|eyes|[]|--approval-readiness-only|1|1|no reviewer identity|0
 diagnostic|trigger|eyes|[]|--diagnostic-signal-only|1|1|Codex has not produced|0
