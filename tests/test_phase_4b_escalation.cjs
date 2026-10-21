@@ -146,4 +146,24 @@ test('captured Git objects determine both rename sides and complete wave scope',
   assert.equal(capturedInput(directory).decision, 'human-review');
   fs.appendFileSync(path.join(directory, 'pr.diff'), 'changed');
   assert.throws(() => capturedInput(directory));
+  // #2633: only the verified capture's wave_audit binding exempts the mirror,
+  // and the pr.diff digest still binds it.
+  fs.writeFileSync(path.join(directory, 'pr.diff'), diff);
+  metadata.wave_audit = { canonical_base_sha: base, canonical_head_sha: head };
+  writeMetadata();
+  assert.deepEqual(capturedInput(directory), { decision: 'model-review', tripwires: [], exemption: 'verified-propagation' });
+  for (const scope of [null, [], {}, { canonical_base_sha: base }, { canonical_base_sha: 'x', canonical_head_sha: head }]) {
+    metadata.wave_audit = scope; writeMetadata();
+    assert.equal(capturedInput(directory).decision, 'human-review', JSON.stringify(scope));
+  }
+  metadata.wave_audit = { canonical_base_sha: base, canonical_head_sha: head };
+  delete metadata.pr_diff_sha256; metadata.diff_sha256 = hash(diff);
+  fs.writeFileSync(path.join(directory, 'review.diff'), diff);
+  writeMetadata();
+  assert.equal(capturedInput(directory).decision, 'human-review', 'wave_audit without a wave capture does not exempt');
+  metadata.pr_diff_sha256 = hash(diff); metadata.diff_sha256 = hash(Buffer.from('+safe curated text\n'));
+  fs.writeFileSync(path.join(directory, 'review.diff'), '+safe curated text\n');
+  writeMetadata();
+  fs.appendFileSync(path.join(directory, 'pr.diff'), 'changed');
+  assert.throws(() => capturedInput(directory), 'a changed mirror still refuses under the exemption');
 });

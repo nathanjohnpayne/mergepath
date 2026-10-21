@@ -44,6 +44,18 @@
 #                     the caller will retain (historical prefix receipts).
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
+#   --admin-override "<owner authorization quote>"
+#                    admin automated 4b override (#2633). Each stop that would
+#                    wait for a human (a deterministic tripwire, a barrier
+#                    human tiebreaker, a Codex human stop at a spent request
+#                    ceiling) is recorded and the run continues to the real
+#                    adapter, whose verdict posts under the reviewer identity
+#                    as usual. The quote must be one non-empty line of at most
+#                    500 characters; it and every overridden stop are written
+#                    into the posted review body and the emitted JSON
+#                    (`admin_overridden`). Correctness stops are never
+#                    overridden: holds (6), feedback accounting (7), input
+#                    integrity and drift (3), request-budget evidence (10).
 #   --force-enabled  run this one invocation even when
 #                    phase_4b_automation.enabled is false/absent in
 #                    .github/review-policy.yml (#1046). Overrides ONLY
@@ -238,12 +250,17 @@ PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXP
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
+# #2633: owner-authorized admin automated 4b override. Its value is the
+# owner's quoted authorization, recorded in the posted review body.
+ADMIN_OVERRIDE_SET=false
+ADMIN_OVERRIDE_QUOTE=""
+ADMIN_OVERRIDDEN='[]'
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
   exit 3
 }
 
@@ -262,6 +279,9 @@ while [ $# -gt 0 ]; do
     --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
+    --admin-override)
+      [ $# -ge 2 ] || p4b_die 3 "--admin-override requires the owner's quoted authorization"
+      ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
     *)
@@ -269,6 +289,17 @@ while [ $# -gt 0 ]; do
       shift ;;
   esac
 done
+
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *[![:space:]]*) ;;
+    *) p4b_die 3 "--admin-override requires a non-empty owner authorization quote" ;;
+  esac
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
+  esac
+  [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
+fi
 
 if [ "$RETAIN_EVIDENCE" = true ]; then
   [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
@@ -797,6 +828,21 @@ hold_for_external_review() {
   exit 6
 }
 
+# #2633: under --admin-override, a stop that would wait for a human (a
+# deterministic tripwire or a Codex human stop) is recorded and the run
+# continues to the real adapter, whose verdict posts as usual. Correctness
+# stops (holds, integrity, drift, accounting) never come through here.
+admin_override_absorbs() {
+  [ "$ADMIN_OVERRIDE_SET" = true ] || return 1
+  local payload="$1" entry
+  entry="$(jq -c '{decision:(.decision // null),reason:(.reason // null),
+    tripwires:(.tripwire.tripwires // null),codex_evidence:(.codex_evidence // null)}' \
+    <<<"$payload" 2>/dev/null)" || entry='{"decision":"unreadable"}'
+  ADMIN_OVERRIDDEN="$(jq -c --argjson e "$entry" '. + [$e] | unique' <<<"$ADMIN_OVERRIDDEN")"
+  p4b_warn "admin override (#2633): continuing past a human stop ($(jq -r '.reason // "unreadable"' <<<"$entry")) to the real adapter"
+  return 0
+}
+
 stop_for_human_tiebreaker() {
   local payload="$1"
   if printf '%s' "$payload" | jq -e '.tripwire' >/dev/null 2>&1; then
@@ -878,7 +924,8 @@ run_same_head_barrier() {
       return 0
       ;;
     1) hold_for_external_review "$out" ;;
-    3) stop_for_human_tiebreaker "$out" ;;
+    3) admin_override_absorbs "$out" && return 0
+       stop_for_human_tiebreaker "$out" ;;
     4) stop_for_barrier_error "$out" ;;
     *)
       # A spent-ceiling waiver that escalated still carries its authority
@@ -1021,6 +1068,8 @@ revalidate_request_ceiling_authority() {
     0:clear) return 0 ;;
     0:stop)
       reason="A human stop appeared during external review at the spent Codex request ceiling ($(printf '%s' "$stops_json" | jq -r '.stops | join(", ")')); human tiebreaker required"
+      admin_override_absorbs "$(jq -nc --arg r "$reason" '{decision:"human-tiebreaker",reason:$r,codex_evidence:"request-ceiling-human-stop"}')" \
+        && return 0
       [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
         "Codex human stop" "the spent Codex request ceiling for ${REPO}#${PR}"
       payload="$(jq -nc --arg r "$reason" --argjson b "$budget_json" --argjson hs "$stops_json" \
@@ -1311,9 +1360,13 @@ revalidate_immutable_input() {
 if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; }; then
   escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
     || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
+  if [ "$(printf '%s' "$escalation" | jq -r '.exemption // empty')" = verified-propagation ]; then
+    p4b_warn "byte-verified propagation canary: tripwires do not re-gate canonical content that already merged on the hub (#2633)"
+  fi
   if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
-    stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
+    tripwire_payload="$(jq -nc --argjson escalation "$escalation" \
       '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
+    admin_override_absorbs "$tripwire_payload" || stop_for_human_tiebreaker "$tripwire_payload"
   fi
 fi
 
@@ -1678,6 +1731,12 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
       printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
       ;;
   esac
+  # #2633: say which human stops the owner's admin override ran past.
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
+    printf -- '- Admin override (#2633): owner authorization "%s"; this automated review ran past: %s\n' \
+      "$ADMIN_OVERRIDE_QUOTE" \
+      "$(jq -r 'map(if .tripwires then "tripwire (" + (.tripwires | join(", ")) + ")" else (.reason // .decision) end) | join("; ")' <<<"$ADMIN_OVERRIDDEN")"
+  fi
   # #1335: likewise for a CodeRabbit review carried from identical content.
   if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
     printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \
@@ -2137,6 +2196,7 @@ jq -n \
   --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
   --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" \
+  --argjson admin_overridden "$ADMIN_OVERRIDDEN" \
   --arg enabled_via "$ENABLED_VIA" '
   {
     pr_number: $pr,
@@ -2155,6 +2215,7 @@ jq -n \
     token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
     usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,
+    admin_overridden: $admin_overridden,
     automation_enabled: true,
     enabled_via: $enabled_via
   }
