@@ -405,6 +405,38 @@ for near_miss in \
   eq p1 "$(coderabbit_tier_of "$near_miss")" "cr_heading: nonexact heading remains classified: $near_miss"
 done
 
+# #2560: CodeRabbit prefixes a finding it could not verify with a status
+# banner, `⚠️ **Unverified finding**`. The banner is a verification status,
+# not a severity, so its bare warning glyph must not grade a finding
+# CodeRabbit badged 🟡 Minor as p1. Only the complete banner line is excluded
+# (blockquoted or not); a real `⚠️ Potential issue` under it keeps grading p1.
+UNVERIFIED_MINOR='`17-17`: **📐 Maintainability & Code Quality** | **🟡 Minor** | **⚡ Quick win**
+
+⚠️ **Unverified finding**
+Verification ran but could not confirm this finding. It is shown for review, not as a verified issue.
+
+Consider renaming the local for clarity.'
+eq p2   "$(coderabbit_tier_of "$UNVERIFIED_MINOR")"  "cr_banner: Unverified finding banner + Minor badge grades p2 (#2560)"
+eq "p2" "$(coderabbit_tiers_of "$UNVERIFIED_MINOR")" "cr_banner: Unverified finding banner contributes no marker (#2560)"
+for banner in \
+  '⚠️ **Unverified finding**' \
+  '> ⚠️ **Unverified finding**' \
+  '**⚠️ Unverified finding**' \
+  '> **⚠️ Unverified finding**' \
+  '⚠️ Unverified finding'; do
+  eq "" "$(coderabbit_tier_of "$banner")"  "cr_banner: banner alone has no tier: $banner"
+  eq "" "$(coderabbit_tiers_of "$banner")" "cr_banner: banner alone has no markers: $banner"
+  eq p2 "$(coderabbit_tier_of "$banner
+**🟡 Minor** Real finding under the banner.")" "cr_banner: Minor under the banner keeps p2: $banner"
+  eq p1 "$(coderabbit_tier_of "$banner
+**⚠️ Potential issue** Real required finding under the banner.")" "cr_banner: Potential issue under the banner stays p1: $banner"
+done
+for near_miss in \
+  '⚠️ **Unverified finding** _🟠 Major_ real finding on the same line' \
+  '⚠️ **Unverified finding**: investigate this'; do
+  eq p1 "$(coderabbit_tier_of "$near_miss")" "cr_banner: nonexact banner line remains classified: $near_miss"
+done
+
 # A failed heading read must discard partial output just like marker extraction.
 for classifier in coderabbit_tiers_of coderabbit_tier_of; do
   if (

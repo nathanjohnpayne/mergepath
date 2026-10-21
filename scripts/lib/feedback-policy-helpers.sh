@@ -417,6 +417,14 @@ coderabbit_tiers_of() {
   # either whole bodies or numbered lines, and retain their original text for
   # fingerprints and reporting. Extra finding text on a heading line must not
   # disappear along with its structural markers.
+  #
+  # The `⚠️ **Unverified finding**` status banner (#2560) is excluded on the
+  # same terms: CodeRabbit prefixes a finding it could not verify with it, and
+  # the banner states a verification status, not a severity, while its bare
+  # glyph matched the p1 marker and promoted a 🟡 Minor finding to a required
+  # p1. Only the complete banner line is dropped, so a `⚠️ Potential issue`
+  # under it still grades p1 and a banner sharing its line with other text
+  # stays classified.
   body=$(printf '%s\n' "$body" | awk '
     {
       heading = $0
@@ -424,7 +432,8 @@ coderabbit_tiers_of() {
       sub(/^[ \t]*(>[ \t]*)*/, "", heading)
       sub(/[ \t]+$/, "", heading)
       if (heading ~ /^\*\*(⚠️ )?Outside diff range comments \([0-9]+\)\*\*$/ \
-          || heading ~ /^<summary>(⚠️ )?Outside diff range comments \([0-9]+\)<\/summary>(<blockquote>)?$/) next
+          || heading ~ /^<summary>(⚠️ )?Outside diff range comments \([0-9]+\)<\/summary>(<blockquote>)?$/ \
+          || heading ~ /^(\*\*)?⚠️ (\*\*)?Unverified finding(\*\*)?$/) next
       print
     }
   ') || {

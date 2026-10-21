@@ -382,6 +382,7 @@ echo "${REPO_LINT_FULL:-unset} ${REPO_LINT_CHECKS_JSON:-unset} ${REPO_LINT_SHARD
 printf '%s\n' "$1" >> "$out/start-order"
 touch "$out/ran.$1"
 if [ -f "$out/slow.$1" ]; then sleep 3; fi
+if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 120; fi
 sleep 1
 rm -f "$out/running/$1"
 SH
@@ -547,6 +548,7 @@ touch "$PROBE_DIR/slow.check_env"
 commit_change feat/pass README.md
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/pass 2>&1) || rc=$?
 check "passing checks: push succeeds" "$rc" "0"
+check "the hook's first line is the unconditional invocation banner (#2578)" "$(printf '%s\n' "$out" | sed -n 1p)" "repo-lint pre-push: hook invoked for remote origin"
 check "passing checks: remote updated" "$(remote_tip feat/pass)" "$(git -C "$FIX" rev-parse HEAD)"
 case "$out" in *"PASS  check_ok"*"PASS"*) ok "per-check result lines are printed" ;; *) bad "missing per-check output: $out" ;; esac
 for c in check_ok check_flag check_env; do
@@ -761,6 +763,7 @@ touch "$PROBE_DIR/FLAG"
 # Both bypasses.
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_SKIP=1 git push origin feat/fail 2>&1) || rc=$?
 check "MERGEPATH_PREPUSH_SKIP=1 bypasses" "$rc" "0"
+case "$out" in *"hook invoked for remote origin"*"skipped (MERGEPATH_PREPUSH_SKIP=1)"*) ok "the skip bypass still prints the invocation banner first" ;; *) bad "skip bypass output: $out" ;; esac
 git -C "$FIX" push -q origin --delete feat/fail --no-verify
 rc=0; (cd "$FIX" && git push -q --no-verify origin feat/fail >/dev/null 2>&1) || rc=$?
 check "--no-verify bypasses" "$rc" "0"
@@ -788,6 +791,107 @@ rc=0; out=$(cd "$FIX" && git push origin v1 2>&1) || rc=$?
 check "tag push passes" "$rc" "0"
 [ ! -f "$PROBE_DIR/ran.check_ok" ] && ok "tag push runs no checks" || bad "tag push ran checks"
 
+# #2578: a hook that cannot check must fail the push, never pass it silently.
+# The observed shape: the primary's shared config gains `core.bare = true`
+# (what a fixture `git init` under an inherited GIT_DIR writes) while
+# extensions.worktreeConfig is on, so every linked worktree reads as bare and
+# `git rev-parse --show-toplevel` fails inside the hook.
+LINKED="$TMP/fix-linked"
+git -C "$FIX" worktree add -q -b feat/linked "$LINKED" feat/pass
+git -C "$LINKED" commit -q --allow-empty -m linked
+# Git reports physical paths (/private/var on macOS, where TMPDIR is /var).
+LINKED_P=$(cd "$LINKED" && pwd -P)
+FIX_P=$(cd "$FIX" && pwd -P)
+git -C "$FIX" config --local extensions.worktreeConfig true
+reset_probe
+rc=0; out=$(cd "$LINKED" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check passes from a linked worktree" "$rc" "0"
+case "$out" in *"inherits the relative core.hooksPath=scripts/git-hooks"*) ok "installer --check warns about the inherited relative core.hooksPath" ;; *) bad "inherited relative core.hooksPath not warned: $out" ;; esac
+case "$out" in *"this worktree runs $LINKED_P/scripts/git-hooks/pre-push"*) ok "installer --check names the hook git resolves from this worktree" ;; *) bad "resolved hook not named: $out" ;; esac
+rc=0; out=$(cd "$FIX" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
+case "$out" in *"inherits the relative"*) bad "primary checkout warned as a linked worktree: $out" ;; *) ok "the primary checkout gets no linked-worktree warning" ;; esac
+# A relative --git-common-dir resolves against the worktree root, not the
+# directory --check runs from.
+rc=0; out=$(cd "$FIX/scripts" && bash install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check passes from a subdirectory of the primary checkout" "$rc" "0"
+rc=0; out=$(cd "$LINKED/scripts" && bash install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check passes from a subdirectory of a linked worktree" "$rc" "0"
+git -C "$LINKED" config --worktree core.hooksPath "$TMP/no-such-hooks"
+rc=0; out=$(cd "$LINKED" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check fails when this worktree's effective hooks path has no pre-push" "$rc" "1"
+case "$out" in *"$TMP/no-such-hooks"*"no executable pre-push"*) ok "the unreachable hooks path is named" ;; *) bad "unreachable hooks path output: $out" ;; esac
+git -C "$LINKED" config --worktree --unset core.hooksPath
+git -C "$FIX" config --local core.bare true
+rc=0; out=$(cd "$LINKED" && bash scripts/install-git-hooks.sh --check 2>&1) || rc=$?
+check "installer --check fails while the shared config says core.bare = true" "$rc" "1"
+case "$out" in *"core.bare = true in $FIX_P/.git/config"*) ok "installer names the file that sets core.bare" ;; *) bad "installer bare output: $out" ;; esac
+rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
+check "shared core.bare = true: push from a linked worktree is blocked, not silently passed" "$rc" "1"
+check "shared core.bare = true: remote not updated" "$(remote_tip feat/linked)" "none"
+case "$out" in "repo-lint pre-push: hook invoked for remote origin"*"bare repository"*"core.bare false"*) ok "the bare-config failure prints the banner, names the state and the repair" ;; *) bad "bare-config output: $out" ;; esac
+rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/bare-primary 2>&1) || rc=$?
+check "core.bare = true: push from the primary checkout is blocked too" "$rc" "1"
+check "core.bare = true: primary push leaves the remote unchanged" "$(remote_tip feat/bare-primary)" "none"
+git -C "$FIX" config --local core.bare false
+git -C "$FIX" config --local --unset extensions.worktreeConfig
+
+# A runner that is present but unusable fails closed; only an absent runner
+# soft-passes (the consumer case below).
+mv "$LINKED/scripts/repo-lint-prepush.sh" "$TMP/saved-runner"
+mkdir "$LINKED/scripts/repo-lint-prepush.sh"
+rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
+check "unreadable runner: push blocked" "$rc" "1"
+case "$out" in *"is not a readable file"*) ok "unreadable runner is named" ;; *) bad "unreadable runner output: $out" ;; esac
+rmdir "$LINKED/scripts/repo-lint-prepush.sh"
+ln -s "$TMP/no-such-runner.sh" "$LINKED/scripts/repo-lint-prepush.sh"
+rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
+check "dangling runner symlink: push blocked, not soft-passed" "$rc" "1"
+case "$out" in *"SKIP (scripts/repo-lint-prepush.sh"*) bad "dangling runner symlink reported as an absent runner: $out" ;; *"is not a readable file"*) ok "dangling runner symlink is named as unusable" ;; *) bad "dangling runner symlink output: $out" ;; esac
+rm "$LINKED/scripts/repo-lint-prepush.sh"
+mv "$TMP/saved-runner" "$LINKED/scripts/repo-lint-prepush.sh"
+# exec failing: a `bash` on PATH whose interpreter does not exist. The wrapper
+# itself runs under the real bash, so only its exec of the runner fails.
+mkdir -p "$TMP/badbash"
+printf '#!/nonexistent/interpreter\n' > "$TMP/badbash/bash"
+chmod +x "$TMP/badbash/bash"
+rc=0; out=$(cd "$LINKED" && PATH="$TMP/badbash:$PATH" "$BASH" scripts/git-hooks/pre-push origin "$FIXREMOTE" </dev/null 2>&1) || rc=$?
+check "runner exec failure: hook exits 1" "$rc" "1"
+case "$out" in *"could not exec bash"*) ok "runner exec failure is named" ;; *) bad "exec failure output: $out" ;; esac
+
+# The #2578 sequence: a long hook run killed by SIGTERM to its process group
+# (as GNU timeout does), then an immediate re-push from the same worktree.
+# The kill must leave nothing that makes the next hook skip.
+reset_probe
+touch "$PROBE_DIR/hang.check_ok"
+rc=0; python3 -I - "$LINKED" "$PROBE_DIR/hanging.check_ok" <<'PY' > "$TMP/killed-push.log" 2>&1 || rc=$?
+import os, signal, subprocess, sys, time
+wt, marker = sys.argv[1], sys.argv[2]
+p = subprocess.Popen(["git", "push", "origin", "feat/linked"], cwd=wt, start_new_session=True,
+                     stdin=subprocess.DEVNULL)
+deadline = time.time() + 60
+while not os.path.exists(marker) and time.time() < deadline and p.poll() is None:
+    time.sleep(0.1)
+if not os.path.exists(marker):
+    sys.exit("hang marker never appeared")
+os.killpg(p.pid, signal.SIGTERM)
+sys.exit(0 if p.wait(timeout=60) != 0 else 3)
+PY
+check "killed push: the run was interrupted mid-check and failed" "$rc" "0"
+check "killed push: remote not updated" "$(remote_tip feat/linked)" "none"
+check "killed push: no snapshot worktree left behind" "$(git -C "$FIX" worktree list --porcelain | grep -c '^worktree ')" "2"
+leftover=$(find "$TMP/.fix-worktrees" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+check "killed push: no snapshot directory left behind" "$leftover" "0"
+check "killed push: no lock file left in the repository" "$(find "$FIX/.git" -name '*.lock' | wc -l | tr -d ' ')" "0"
+check "killed push: core.bare untouched" "$(git -C "$FIX" config --local --get core.bare)" "false"
+rm -f "$PROBE_DIR/hang.check_ok"
+reset_probe
+rc=0; out=$(cd "$LINKED" && git push origin feat/linked 2>&1) || rc=$?
+check "re-push after a killed run: push succeeds" "$rc" "0"
+case "$out" in "repo-lint pre-push: hook invoked for remote origin"*"checking committed tree"*"PASS"*) ok "re-push after a killed run runs the hook in full" ;; *) bad "re-push after a killed run: $out" ;; esac
+if [ -f "$PROBE_DIR/ran.check_ok" ]; then ok "re-push after a killed run executed its checks"; else bad "re-push after a killed run executed no check"; fi
+check "re-push after a killed run: remote receives the tip" "$(remote_tip feat/linked)" "$(git -C "$LINKED" rev-parse HEAD)"
+git -C "$FIX" worktree remove --force "$LINKED"
+
 # Hub-only: a checkout without the runner, and a consumer without the kit.
 CONS="$TMP/consumer"
 mkdir -p "$CONS/scripts/git-hooks"
@@ -802,6 +906,7 @@ git -C "$CONS" config --local core.hooksPath scripts/git-hooks
 rc=0; out=$(cd "$CONS" && git push origin main 2>&1) || rc=$?
 check "checkout without the runner: push passes" "$rc" "0"
 case "$out" in *"SKIP"*) ok "missing runner reports SKIP" ;; *) bad "missing runner output: $out" ;; esac
+case "$out" in "repo-lint pre-push: hook invoked for remote origin"*) ok "missing runner still prints the invocation banner first" ;; *) bad "missing runner banner: $out" ;; esac
 cp "$RUNNER" "$CONS/scripts/"
 rc=0; out=$(cd "$CONS" && printf '' | bash scripts/repo-lint-prepush.sh --paths-from - 2>&1) || rc=$?
 check "consumer without the scripts/ci kit: runner soft-passes" "$rc" "0"

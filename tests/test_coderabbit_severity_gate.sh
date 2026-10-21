@@ -3981,7 +3981,9 @@ i=0
 while [ "$i" -lt "$RACE_ITERS" ]; do
   # Deliberately the OLD racy idiom, run in a subshell with `set +e` so one
   # SIGPIPE-induced failure doesn't abort this test loop under `set -e`.
-  if ! (set +e; printf '%s\n' "$RACE_PAYLOAD" | grep -q "$NEEDLE"); then
+  # stderr is discarded: the broken-pipe warning is the expected symptom
+  # being measured here, not a test failure (#2569).
+  if ! (set +e; printf '%s\n' "$RACE_PAYLOAD" | grep -q "$NEEDLE") 2>/dev/null; then
     RACE_PIPED_FAILURES=$((RACE_PIPED_FAILURES + 1))
   fi
   # The fixed herestring idiom must never fail — this is the assertion.
