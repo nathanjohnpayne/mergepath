@@ -321,7 +321,9 @@ gh_resolve_token_for_identity() {
   # GH_TOKEN may belong to a different identity than the one this write needs
   # (e.g. a CI-default token), and the keyring may still hold the right one.
   if [ -n "${GH_TOKEN:-}" ]; then
-    if GH_TOKEN="$GH_TOKEN" "$checker" --expect-write-identity "$expected_login" 2>/dev/null; then
+    local ambient_diagnostics
+    if ambient_diagnostics=$(GH_TOKEN="$GH_TOKEN" "$checker" --expect-write-identity "$expected_login" 2>&1 >/dev/null); then
+      [ -z "$ambient_diagnostics" ] || printf '%s\n' "$ambient_diagnostics" >&2
       GH_RESOLVED_TOKEN="$GH_TOKEN"
       return 0
     fi
