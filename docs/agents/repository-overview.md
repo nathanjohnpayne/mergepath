@@ -183,3 +183,5 @@ CodeRabbit evidence escalation continues later nominated PRs after an expected p
 CodeRabbit recovery releases use the governing base policy author identity, with the existing absent-field fallback. The typed identity and full policy base bind the evidence episode; a changed live base prevents recovery output.
 
 The shared policy YAML reader rejects additional documents before the preferred `yq` path emits JSON, and conversion failures emit no partial value. The parser contract and native controls are in `specs/review_feedback_accounting.md` and `tests/test_feedback_policy_helpers.sh` (#2523).
+
+The Codex requester keeps polling its confirmed request when the author wrapper canonically refuses an acknowledgment retry as an existing trigger, without resetting the clock or weakening cross-invocation head proof. The contract and real-wrapper fixture are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_ack.sh` (#2582).

@@ -2088,6 +2088,25 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
       || rc=$?
   fi
   [ -z "$body_file" ] || rm -f "$body_file"
+  if [ "$rc" -ne 0 ] && [ "$TRIGGER_POSTED" = true ] \
+     && [ "$mode" = inline ] && [ "$body" = '@codex review' ] \
+     && grep -Fqx '[codex-review-request] ERROR: trigger not authorized: existing-trigger' <<< "$output"; then
+    # The real wrapper's canonical authorizer may refuse an ack retry as a
+    # duplicate. Preserve this run's confirmed request and its original poll
+    # clock, but only while fresh evidence still names that exact request.
+    local ack_comments ack_trigger
+    revalidate_request_freshness
+    ack_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "ack retry duplicate evidence") \
+      || die 3 "cannot confirm the refused acknowledgement retry's existing trigger"
+    ack_trigger=$(crqe_select_trigger "$ack_comments" "$AUTHOR_IDENTITY" "") \
+      || die 3 "cannot select the refused acknowledgement retry's existing trigger"
+    if printf '%s' "$ack_trigger" | jq -e --arg id "$TRIGGER_COMMENT_ID" --arg created "$TRIGGER_POST_TIME" \
+         '(.id | tostring) == $id and .created_at == $created' >/dev/null 2>&1; then
+      ACK_RETRY_REFUSED_BY_EXISTING=true
+      log "existing trigger $TRIGGER_COMMENT_ID refused the acknowledgement retry — continuing normal review poll"
+      return 1
+    fi
+  fi
   [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
   AUTHOR_COMMENT_OUTPUT="$output"
 }
@@ -2635,7 +2654,7 @@ post_codex_trigger() {
   # write.
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
-    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
+    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
 
@@ -2796,7 +2815,7 @@ run_trigger_ack_gate() {
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
     if ! post_codex_trigger; then
-      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ]; then
+      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ] || [ "$ACK_RETRY_REFUSED_BY_EXISTING" = true ]; then
         return 0
       fi
       die 3 "acknowledgement retry did not post a Codex trigger"
@@ -3101,6 +3120,7 @@ TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 ACK_RETRY_REFUSED_BY_CAP=false
+ACK_RETRY_REFUSED_BY_EXISTING=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0

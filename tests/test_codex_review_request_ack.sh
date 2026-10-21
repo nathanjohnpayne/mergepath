@@ -277,6 +277,8 @@ case "$endpoint" in
       exit 1
     elif [ "$scenario" = "poll-502-once" ] && [ "$reads" -gt 2 ]; then
       printf '[{"id":95,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response after a transient read failure"}]\n' "$bot"
+    elif [ "$scenario" = "wrapper-slow-ack" ] && [ -f "$state_dir/authorization-refused" ]; then
+      printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"delayed response to original request"}]\n' "$bot"
     elif [ "$scenario" = "review_after_retry" ]; then
       count=0
       if [ -f "$state_dir/trigger-count" ]; then
@@ -1512,6 +1514,79 @@ test_default_reply_deadline_is_1800() {
 }
 
 test_prior_reaction_cannot_clear_backdated_ordinary_push
+# Drive the shipped author wrapper and its canonical trigger authorization.
+# The existing transport fake remains only the final GH write sink.
+make_real_wrapper_case() {
+  local dir=$1 name
+  mv "$dir/scripts/gh-as-author.sh" "$dir/scripts/fixture-author-transport.sh"
+  cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author-real.sh"
+  for name in gh-token-resolver.sh gh-command-classifier.sh pr-body-contract.sh reviewers-helpers.sh credential-class.sh gh-comment-trigger-guard.sh gh-rest-transport.sh; do
+    cp "$ROOT/scripts/lib/$name" "$dir/scripts/lib/$name"
+  done
+  for name in gh-comment-trigger-guard.py owner-admin-override.py merge-writer.py; do
+    cp "$ROOT/scripts/workflow/$name" "$dir/scripts/workflow/$name"
+  done
+  printf '#!/bin/sh\nexit 0\n' > "$dir/scripts/identity-check.sh"
+  chmod +x "$dir/scripts/identity-check.sh"
+  mv "$dir/bin/gh" "$dir/bin/fixture-read-gh"
+  cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
+  exec "$here/../scripts/fixture-author-transport.sh" -- gh "$@"
+fi
+exec "$here/fixture-read-gh" "$@"
+SH
+  cat > "$dir/scripts/gh-as-author.sh" <<'SH'
+#!/usr/bin/env bash
+rc=0
+if [ "${CODEX_TEST_SCENARIO:-}" = wrapper-other-failure ] && [ -f "$CODEX_TEST_STATE_DIR/trigger-count" ]; then
+  echo 'unrelated wrapper transport failure' >&2
+  exit 42
+fi
+output=$("$(dirname "$0")/gh-as-author-real.sh" "$@" 2>&1) || rc=$?
+printf '%s\n' "$output"
+if [ "$rc" -ne 0 ] && grep -Fqx '[codex-review-request] ERROR: trigger not authorized: existing-trigger' <<< "$output"; then
+  touch "$CODEX_TEST_STATE_DIR/authorization-refused"
+  if [ "${CODEX_TEST_SCENARIO:-}" = wrapper-superseded ]; then
+    jq -cn '{id:9001,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:00:10Z"}' \
+      >> "$CODEX_TEST_STATE_DIR/comments.jsonl"
+  fi
+fi
+exit "$rc"
+SH
+  chmod +x "$dir/bin/gh" "$dir/scripts/gh-as-author.sh"
+}
+
+test_real_wrapper_duplicate_ack_retry_keeps_polling() {
+  local scenario dir rc expected before count
+  for scenario in wrapper-slow-ack wrapper-no-response wrapper-other-failure wrapper-superseded; do
+    before=$FAIL
+    dir=$(make_case "$scenario" 0 1)
+    make_real_wrapper_case "$dir"
+    rc=$(MERGEPATH_GH_TRANSPORT=gh run_case "$dir" "$scenario" 0 ghp_fixture_author)
+    count=$(trigger_count "$dir")
+    case "$scenario" in wrapper-slow-ack) expected=0 ;; wrapper-no-response) expected=4 ;; *) expected=3 ;; esac
+    [ "$rc" = "$expected" ] || fail "#2582 $scenario: exit $rc, expected $expected; stderr=$(cat "$dir/err.log")"
+    [ "$count" = 1 ] || fail "#2582 $scenario: expected only the confirmed original trigger, got $count"
+    if [ "$scenario" = wrapper-slow-ack ] || [ "$scenario" = wrapper-no-response ]; then
+      [ -f "$dir/state/authorization-refused" ] || fail "#2582 $scenario: real wrapper did not exercise canonical duplicate refusal"
+      grep -q 'existing trigger.*continuing normal review poll' "$dir/err.log" \
+        || fail "#2582 $scenario: missing bounded-poll recovery diagnostic"
+    elif [ "$scenario" = wrapper-other-failure ]; then
+      grep -q 'unrelated wrapper transport failure' "$dir/err.log" || fail '#2582 unrelated error was hidden'
+    else
+      [ -f "$dir/state/authorization-refused" ] || fail '#2582 superseded: canonical refusal was not exercised'
+      if grep -q 'existing trigger.*continuing normal review poll' "$dir/err.log"; then
+        fail '#2582 superseded: a newer request inherited the original poll recovery'
+      fi
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2582 real wrapper: $scenario keeps its intended poll/error disposition"
+  done
+}
+
+test_real_wrapper_duplicate_ack_retry_keeps_polling
+
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_ack_retry_ignores_blocking_budget_value
