@@ -1470,6 +1470,7 @@ class Lexer:
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
         self.quoted_data_offsets = set()  # Read-only function-header context.
+        self.parameter_data_offsets = set()  # WORD data cannot define functions.
         self.unterminated_ansi_c_quotes = []  # Original source offsets.
         self.unsupported_ansi_aliases = []  # Executable-context failure offsets.
         self.unsupported_ansi_sources = []  # Non-alias source-proof failures.
@@ -1490,6 +1491,9 @@ class Lexer:
             body_offset + i for i in sub.quoted_data_offsets
         )
         self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
+        self.parameter_data_offsets.update(
+            body_offset + i for i in sub.parameter_data_offsets
+        )
         self.xtrace_context_events.extend(
             (body_offset + pos, seg, word, eligible)
             for pos, seg, word, eligible in sub.xtrace_context_events
@@ -1617,6 +1621,7 @@ class Lexer:
         n = len(text)
         i = 0
         line = 1
+        parameter_backtick_end = -1
 
         cur_ll = LogicalLine(1)
         self.logical.append(cur_ll)
@@ -1750,6 +1755,15 @@ class Lexer:
             c = text[i]
             if "'" in quotes or '"' in quotes:
                 self.quoted_data_offsets.add(i)
+            if any(q.startswith("${") for q in quotes):
+                self.parameter_data_offsets.add(i)
+                # Retain executable backtick child context without changing
+                # the existing token/reference walk of the parameter WORD.
+                if c == "`" and "'" not in quotes and i >= parameter_backtick_end:
+                    end = _skip_backtick(text, i)
+                    if end > i + 1 and text[end - 1] == "`":
+                        self.function_source_children.append((i + 1, Lexer(text[i + 1:end - 1])))
+                        parameter_backtick_end = end
 
             # ---- inside a here-doc body ----
             if in_heredoc is not None:
@@ -3835,6 +3849,15 @@ def _mask_heredoc_body_lines(text, lx=None):
     return "".join(masked)
 
 
+def _function_header_is_data(lx, offset):
+    # Child source owns its own context, even when the containing WORD is data.
+    for start, child in lx.function_source_children:
+        if start <= offset < start + len(child.text):
+            return _function_header_is_data(child, offset - start)
+    return (offset in lx.quoted_data_offsets or offset in lx.comment_offsets
+            or offset in lx.parameter_data_offsets)
+
+
 def _iter_function_definitions(text):
     """Yield each recognized function definition as (match, name, body).
 
@@ -3856,10 +3879,7 @@ def _iter_function_definitions(text):
     lx = Lexer(text)
     structural = _mask_heredoc_body_lines(text, lx)
     for m in _FUNC_DEF_RE.finditer(structural):
-        if (
-            m.start("name") in lx.quoted_data_offsets
-            or m.start("name") in lx.comment_offsets
-        ):
+        if _function_header_is_data(lx, m.start("name")):
             continue
         name = m.group("name")
         if name in RESERVED_WORDS:
@@ -9035,6 +9055,47 @@ CORPUS = [
         'helper-backtick-next-line-code',
         MUST_FLAG,
         'out=`\nfunction log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2`\n',
+    ),
+    # Non-executable parameter WORD data and contained code (#2087).
+    (
+        'helper-parameter-word-header-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-\ntrue()\n(\n echo "$1"\n)\n}\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-quoted-header-data',
+        MUST_NOT_FLAG,
+        'data="${UNSET:-\ntrue()\n(\n echo "$1"\n)\n}"\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-actual-function',
+        MUST_FLAG,
+        'true()\n(\n echo "$1"\n)\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-word-substitution-emits',
+        MUST_FLAG,
+        'data=${UNSET:-$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-captured',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN")}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-nonemitter',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(function log\n{ : "$1"; }\nlog "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-substitution-quoted-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-$(value=\'\ntrue()\n{ echo "$1"; }\n\'\ntrue "$GH_TOKEN" >&2)}\n',
+    ),
+    (
+        'helper-parameter-word-nested-data',
+        MUST_NOT_FLAG,
+        'data=${UNSET:-${OTHER:-\ntrue()\n(\n echo "$1"\n)\n}}\ntrue "$GH_TOKEN"\n',
     ),
     (
         'helper-comment-header-data',
@@ -15804,6 +15865,39 @@ def _function_definition_cases():
         findings, errors = scan_text(PROLOGUE + text)
         if list(_iter_function_definitions(text)) or findings or errors:
             failures.append("quoted data acquired an emitting helper: %r" % text)
+    parameter_definitions = {'helper-parameter-word-header-data': [], 'helper-parameter-word-quoted-header-data': [], 'helper-parameter-word-actual-function': ['true'], 'helper-parameter-word-substitution-emits': ['log'], 'helper-parameter-word-substitution-captured': ['log'], 'helper-parameter-word-substitution-nonemitter': ['log'], 'helper-parameter-word-substitution-quoted-data': [], 'helper-parameter-word-nested-data': []}
+    # Backtick children keep their own executable/quoted/parameter context.
+    for text, expected in (
+        ('value=${U:-`\nfunction log\n{ : "$1"; }\n`}\n', ["log"]),
+        ('value="${U:-`\nfunction log\n{ : "$1"; }\n`}"\n', ["log"]),
+        ("value=${U:-`data='\ntrue()\n{ echo \"$1\"; }\n'\n`}\n", []),
+        ('value=${U:-`data=${V:-\ntrue()\n( echo "$1"; )\n}\n`}\n', []),
+    ):
+        definitions = list(_iter_function_definitions(text))
+        if [name for _match, name, _body in definitions] != expected:
+            failures.append("parameter WORD backtick source context: " + repr(text))
+        if len(_function_body_line_spans(text)) != len(expected):
+            failures.append("parameter WORD backtick source spans: " + repr(text))
+    parameter_corpus = {name: body for name, _rule, body in CORPUS}
+    for cid, expected in parameter_definitions.items():
+        text = parameter_corpus[cid]
+        definitions = list(_iter_function_definitions(text))
+        if [name for _match, name, _body in definitions] != expected:
+            failures.append("parameter WORD function discovery: " + cid)
+        spans, offsets = _function_body_line_spans(text, with_offsets=True)
+        expected_spans = [(text.count("\n", 0, match.end()) + 1,
+                           text.count("\n", 0, match.end()) + 1 + body.count("\n"))
+                          for match, _name, body in definitions]
+        expected_offsets = [(match.end() - 1, match.end() + len(body))
+                            for match, _name, body in definitions]
+        if spans != expected_spans or offsets != expected_offsets:
+            failures.append("parameter WORD function spans: " + cid)
+        for match, _name, body in definitions if expected else []:
+            opener = text.index("(\n") if cid.endswith("actual-function") else text.index("{ ")
+            if match.end() - 1 != opener or body != text[opener + 1:opener + 1 + len(body)]:
+                failures.append("parameter WORD actual body offset: " + cid)
+        if not expected and (spans or offsets or "true" in discover_emitter_helpers(text)):
+            failures.append("parameter WORD data acquired a helper or body span: " + cid)
     executed = ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n'
     findings, errors = scan_text(PROLOGUE + executed)
     if "log" not in discover_emitter_helpers(executed) or not findings or errors:
