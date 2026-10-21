@@ -111,7 +111,10 @@
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
 #      `max_ack_retries` if no acknowledgment appears. The eyes
-#      acknowledgment is never treated as clearance.
+#      acknowledgment is never treated as clearance. A retry that is not
+#      written (the request cap, the wrapper's authorization, or a failed
+#      write) leaves the run polling the request it already confirmed
+#      (#2582).
 #   5. Polls every 15 seconds for up to `review_timeout_seconds`
 #      measured from the latest trigger comment, while accepting a
 #      terminal response to any trigger posted in this run, for any of
@@ -2022,8 +2025,8 @@ run_feedback_accounting_gate() {
   esac
 }
 
-post_author_pr_comment() { # <body> <purpose> [body-file|inline]
-  local body="$1" purpose="$2" mode="${3:-body-file}" AS_AUTHOR bridge_author_pat=""
+post_author_pr_comment() { # <body> <purpose> [body-file|inline] [fatal|soft]
+  local body="$1" purpose="$2" mode="${3:-body-file}" on_failure="${4:-fatal}" AS_AUTHOR bridge_author_pat=""
   local body_file="" output="" rc=0 identity_checker
   local -a body_args
   AS_AUTHOR="$__CODEX_REQUEST_DIR/gh-as-author.sh"
@@ -2088,8 +2091,13 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
       || rc=$?
   fi
   [ -z "$body_file" ] || rm -f "$body_file"
-  [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
   AUTHOR_COMMENT_OUTPUT="$output"
+  if [ "$rc" -ne 0 ]; then
+    # A soft caller reports the failed write itself; the output is the same
+    # wrapper diagnostic the fatal path prints.
+    [ "$on_failure" = soft ] || die 3 "failed to post $purpose: $output"
+    return 1
+  fi
 }
 
 # The request-attempt cap is an intentional review-loop stop, not an API
@@ -2633,9 +2641,23 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
+  # An acknowledgement retry re-asks for a request this run already confirmed
+  # on the timeline (#2582). If the retry is not written, whether the
+  # canonical authorization refused it or the write failed, that confirmed
+  # request still gets its ordinary bounded poll, as when the request cap
+  # suppresses the retry. An initial request has nothing to poll and still
+  # fails closed.
+  local write_failure=fatal
+  [ "$TRIGGER_POSTED" != true ] || write_failure=soft
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
-  MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
-    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
+  if ! MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
+    MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$REQUEST_MODE" \
+    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline "$write_failure"; then
+    ACK_RETRY_NOT_POSTED=true
+    log "acknowledgement retry was not posted: $AUTHOR_COMMENT_OUTPUT"
+    log "continuing normal review poll on confirmed trigger comment ${TRIGGER_COMMENT_ID:-unknown}"
+    return 1
+  fi
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
 
@@ -2796,7 +2818,7 @@ run_trigger_ack_gate() {
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
     if ! post_codex_trigger; then
-      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ]; then
+      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ] || [ "$ACK_RETRY_NOT_POSTED" = true ]; then
         return 0
       fi
       die 3 "acknowledgement retry did not post a Codex trigger"
@@ -3085,6 +3107,7 @@ TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 ACK_RETRY_REFUSED_BY_CAP=false
+ACK_RETRY_NOT_POSTED=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
@@ -3099,19 +3122,41 @@ RESUMED_EVER=false
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
+# #2582: the no-write decisions below belong to a request mode. A requester
+# applies its own. The wrapper's authorization pass runs as --trigger-only, so
+# it applies the mode of the canonical requester that is about to write, which
+# names it in MERGEPATH_CODEX_TRIGGER_CALLER_MODE. Polling mode posts by design
+# while a trigger is already on HEAD (the eyes-ack retry, a pending request
+# with no provider evidence, a resumed request that expired), so authorizing
+# that write must not refuse it as a #489 duplicate. Without the variable the
+# stricter trigger-only decisions apply.
+REQUEST_MODE=poll
+[ "$TRIGGER_ONLY" != true ] || REQUEST_MODE="trigger-only"
+if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+  case "${MERGEPATH_CODEX_TRIGGER_CALLER_MODE:-trigger-only}" in
+    poll|trigger-only) REQUEST_MODE=${MERGEPATH_CODEX_TRIGGER_CALLER_MODE:-trigger-only} ;;
+    *) die 3 "canonical trigger authorization names an unknown caller mode" ;;
+  esac
+fi
+
 NO_WRITE_REASON=""
 if has_cleared_signal "$INITIAL_SCAN"; then
   NO_WRITE_REASON="already-cleared"
   log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"
-elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+elif [ "$REQUEST_MODE" = trigger-only ] && existing_codex_trigger_on_head; then
   NO_WRITE_REASON="existing-trigger"
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
-elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
+elif [ "$REQUEST_MODE" = trigger-only ] && auto_trigger_content_free; then
   NO_WRITE_REASON="content-free-auto-trigger"
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
-elif [ "$TRIGGER_ONLY" != "true" ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
+elif [ "$REQUEST_MODE" = poll ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
      && resume_pending_codex_request; then
-  log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
+  if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+    NO_WRITE_REASON="pending-request-running"
+    log "pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted — a new trigger is not authorized (#1550)"
+  else
+    log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
+  fi
 else
   post_codex_trigger
 fi

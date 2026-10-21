@@ -241,6 +241,11 @@ case "$endpoint" in
         [ -z "${CODEX_TEST_FRESHNESS_TRANSITION:-}" ] || touch "$CODEX_TEST_STATE_DIR/freshness-scan-complete"
         jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      # #2582: the same request, with Codex reporting a review of HEAD Running since.
+      dup_author_running)
+        jq -cn --arg who "$author" --arg t "$t" --arg h "${head_sha:0:7}" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"},
+          {id:7009,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,updated_at:$t,
+           body:("<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ⏳ **Running** | `" + $h + "` | Manual request |\n")}]' ;;
       dup_author_upper) jq -cn --arg who "$author" --arg t "$t" '[{id:7002,user:{login:$who},created_at:$t,body:"@CODEX REVIEW"}]' ;;
       author_prose)     jq -cn --arg who "$author" --arg t "$t" '[{id:7003,user:{login:$who},created_at:$t,body:"Status: @codex review was already requested."}]' ;;
       author_quoted)    jq -cn --arg who "$author" --arg t "$t" '[{id:7004,user:{login:$who},created_at:$t,body:"Earlier note:\n> @codex review\n\nDo not run it again."}]' ;;
@@ -1836,9 +1841,59 @@ test_write_boundary_authorization() {
   [ "$FAIL" -ne "$before" ] || pass "write-boundary authorization enforces budget and head without a POST"
 }
 
+# #2582: authorization applies the no-write decisions of the mode the
+# canonical requester writes from. Polling mode posts while a trigger is on
+# HEAD by design, so only its own refusals apply; an absent or trigger-only
+# mode keeps the #489 duplicate refusal, and an unknown mode fails closed.
+test_write_boundary_authorization_caller_mode() {
+  local label scenario mode auto want dir rc gate before=$FAIL
+  while IFS='|' read -r label scenario mode auto want; do
+    dir=$(make_case "authorize-mode-$label")
+    gate=$(write_gate_stub "$dir" false)
+    # The Running case needs a request still inside its own reply deadline.
+    sed -i.bak 's/^  review_timeout_seconds: 0$/  review_timeout_seconds: 999999999/' "$dir/.github/review-policy.yml"
+    cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
+    rc=0
+    (
+      cd "$dir"
+      PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+        CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$mode" \
+        MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
+        ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    ) || rc=$?
+    case "$want" in
+      authorized)
+        [ "$rc" = 0 ] && jq -e '.authorized == true and .head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$dir/out.json" >/dev/null \
+          || fail "#2582 authorization ($label): expected authorized (rc=$rc; $(cat "$dir/err.log"))" ;;
+      unknown-mode)
+        [ "$rc" = 3 ] && ! jq -e '.authorized == true' "$dir/out.json" >/dev/null 2>&1 \
+          && grep -q 'unknown caller mode' "$dir/err.log" \
+          || fail "#2582 authorization ($label): an unknown caller mode must fail closed (rc=$rc; $(cat "$dir/err.log"))" ;;
+      *)
+        [ "$rc" = 3 ] && jq -e --arg reason "$want" '.authorized == false and .reason == $reason' "$dir/out.json" >/dev/null \
+          || fail "#2582 authorization ($label): expected refusal '$want' (rc=$rc; $(cat "$dir/err.log"))" ;;
+    esac
+    [ "$(trig_count "$dir")" = 0 ] || fail "#2582 authorization must never post ($label)"
+  done <<'CASES'
+poll-dup|dup_author|poll|false|authorized
+poll-fresh|fresh|poll|false|authorized
+poll-content-free|fresh|poll|true|authorized
+poll-running|dup_author_running|poll|false|pending-request-running
+poll-cleared|body-P2|poll|false|already-cleared
+explicit-trigger-only-dup|dup_author|trigger-only|false|existing-trigger
+absent-dup|dup_author||false|existing-trigger
+bogus-mode|dup_author|polling|false|unknown-mode
+CASES
+  [ "$FAIL" -ne "$before" ] || pass "#2582: authorization applies the caller's request mode; trigger-only stays the default"
+}
+
 test_guard_dates_queued_checks
 test_guard_unknown_suite_branch
 test_write_boundary_authorization
+test_write_boundary_authorization_caller_mode
 
 test_fresh_posts_once_no_poll
 test_dup_author_skips

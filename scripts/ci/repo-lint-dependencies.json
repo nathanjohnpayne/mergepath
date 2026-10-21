@@ -168,6 +168,7 @@
       "scripts/lib/codex-review-ledger.sh",
       "tests/test_codex_review_ledger.sh",
       "scripts/phase-4b/lib.sh",
+      "scripts/lib/gh-comment-trigger-guard.sh",
       "scripts/workflow/gh-comment-trigger-guard.py",
       "tests/test_465_fail_closed.sh",
       "tests/test_655_repo_lint_local_observed.sh",
