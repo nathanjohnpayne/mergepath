@@ -26,6 +26,9 @@
 #                                                     # also rm -rf orphans
 #   scripts/worktree-cleanup.sh --apply --force-locked --orphan-clean
 #                                                     # everything
+#   scripts/worktree-cleanup.sh --apply --min-age 24h # unattended: keep
+#                                                     # anything touched
+#                                                     # in the last day
 #
 # Flags:
 #   --dry-run        Default. List candidates with branch/HEAD/state. No
@@ -44,6 +47,16 @@
 #                    under .claude/worktrees/ that have no entry in
 #                    `git worktree list --porcelain`. Opt-in because
 #                    orphans may be partial work the user wants to keep.
+#   --min-age AGE    With --apply, keep any candidate (worktree or orphan)
+#                    with activity newer than AGE, given as <N>m, <N>h or
+#                    <N>d. Activity is the newest modification time of a
+#                    regular file at most three levels into the worktree or
+#                    its git admin directory (HEAD, logs). Directories and
+#                    the admin index are ignored because this audit's own
+#                    status probe may touch them. A live session whose
+#                    PR merged is otherwise removable while it still works
+#                    there, so unattended runs should pass this. Default:
+#                    off.
 #   --no-color       Disable ANSI colors (auto-disabled when stdout is
 #                    not a TTY).
 #   -h, --help       Show this help and exit 0.
@@ -218,6 +231,8 @@ set -eo pipefail
 MODE="dry-run"
 FORCE_LOCKED=0
 ORPHAN_CLEAN=0
+MIN_AGE=""
+MIN_AGE_MINUTES=0
 USE_COLOR=1
 
 show_help() {
@@ -230,6 +245,20 @@ while [ $# -gt 0 ]; do
     --apply)         MODE="apply" ;;
     --force-locked)  FORCE_LOCKED=1 ;;
     --orphan-clean)  ORPHAN_CLEAN=1 ;;
+    --min-age)
+      MIN_AGE="${2:-}"
+      if [[ "$MIN_AGE" =~ ^([0-9]{1,6})([mhd])$ ]]; then
+        case "${BASH_REMATCH[2]}" in
+          m) MIN_AGE_MINUTES=$((10#${BASH_REMATCH[1]})) ;;
+          h) MIN_AGE_MINUTES=$((10#${BASH_REMATCH[1]} * 60)) ;;
+          d) MIN_AGE_MINUTES=$((10#${BASH_REMATCH[1]} * 1440)) ;;
+        esac
+      else
+        echo "worktree-cleanup.sh: --min-age needs <N>m, <N>h or <N>d, got: ${MIN_AGE:-<nothing>}" >&2
+        exit 1
+      fi
+      shift
+      ;;
     --no-color)      USE_COLOR=0 ;;
     -h|--help)       show_help; exit 0 ;;
     *)
@@ -1252,8 +1281,26 @@ print_record() {
   fi
 }
 
+# True when --min-age is set and something under the worktree, or under its
+# git admin directory, changed within that window. find(1) -mmin works on BSD
+# and GNU find alike and needs no reference file.
+recently_active() {
+  local path="$1" admin
+  [ "$MIN_AGE_MINUTES" -gt 0 ] || return 1
+  admin=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) || admin=""
+  # Regular files only: the status probe's index.lock bumps the admin
+  # directory's own mtime, and it may rewrite the admin index itself.
+  [ -n "$(find "$path" ${admin:+"$admin"} -maxdepth 3 -type f -mmin "-$MIN_AGE_MINUTES" \
+    ! -path "${admin:-/nonexistent}/index" -print -quit 2>/dev/null)" ]
+}
+
 try_remove() {
   local path="$1" locked="$2"
+  if recently_active "$path"; then
+    echo "    -> kept instead: activity within --min-age $MIN_AGE"
+    SUMMARY_SKIPPED+=("$path (active within --min-age $MIN_AGE)")
+    return 0
+  fi
   # Locked worktrees need `git worktree remove -f -f` (double force) per
   # git's docs — a single --force is not sufficient. We unlock first
   # for a cleaner error path and then call remove without --force, which
@@ -1281,7 +1328,13 @@ try_remove() {
   # anyway" is the stated intent. A non-force refusal elsewhere surfaces as
   # FAILED rather than deleting: the conservative direction for a tool whose
   # mistakes are unrecoverable.
-  if (cd "$MAIN_WORKTREE" && git worktree remove "$path") >/dev/null 2>&1; then
+  #
+  # A refusal is recorded and the run moves on to the next candidate: every
+  # caller is a bare statement under `set -e`, so returning non-zero here used
+  # to end the whole --apply run at the first refused worktree, before the
+  # remaining candidates, the summary or the prune.
+  local refusal
+  if refusal=$(cd "$MAIN_WORKTREE" && git worktree remove "$path" 2>&1 >/dev/null); then
     SUMMARY_REMOVED+=("$path")
     return 0
   fi
@@ -1291,8 +1344,9 @@ try_remove() {
       return 0
     fi
   fi
+  echo "    -> FAILED: ${refusal%%$'\n'*}"
   SUMMARY_FAILED+=("$path")
-  return 1
+  return 0
 }
 
 echo "${C_BOLD}worktree-cleanup.sh${C_RESET} — mode=${MODE} main=${MAIN_WORKTREE}"
@@ -1382,22 +1436,22 @@ while IFS= read -r -d '' WT_PATH \
     # untracked, gitignored or submodule content outright — the very loss the
     # gate below was added to prevent (#762 r3 P1).
     #
-    # Scoped to PR-slug paths on purpose: those are the ones this tool's
-    # convention says it owns and may delete unattended. A non-slug
-    # gone-upstream worktree keeps its long-standing behaviour.
-    if [ -n "$pr_num" ]; then
-      wt_state=$(worktree_content_state "$WT_PATH") || true
-      if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
-        print_record "[PR #${pr_num} gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
-          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
-        if [ "$wt_state" = "ignored" ]; then
-          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
-        else
-          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
-        fi
-        SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
-        continue
+    # This gate used to cover PR-slug paths only. Every other gone-upstream
+    # worktree relied on git's own refusal, which protects modified and
+    # untracked files but not gitignored ones (`.env`, keys), so --apply
+    # deleted those outright. With --apply running unattended from the daily
+    # launchd job, every gone-upstream worktree clears the gate.
+    wt_state=$(worktree_content_state "$WT_PATH") || true
+    if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
+      print_record "[${pr_num:+PR #${pr_num} }gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
+      if [ "$wt_state" = "ignored" ]; then
+        echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+      else
+        echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
       fi
+      SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
+      continue
     fi
     if [ "$WT_LOCKED" = "1" ]; then
       print_record "[LOCKED gone-upstream]" "$C_YELLOW" \
@@ -1793,7 +1847,10 @@ if [ -d "$ORPHAN_ROOT" ]; then
       print_record "[ORPHAN .claude/worktrees]" "$C_RED" \
         "$abs" "" "" "[orphan]" "" ""
       SUMMARY_ORPHAN+=("$abs")
-      if [ "$MODE" = "apply" ] && [ "$ORPHAN_CLEAN" = "1" ]; then
+      if [ "$MODE" = "apply" ] && [ "$ORPHAN_CLEAN" = "1" ] && recently_active "$abs"; then
+        echo "    -> skipped (orphan with activity within --min-age $MIN_AGE)"
+        SUMMARY_SKIPPED+=("$abs (orphan, active within --min-age $MIN_AGE)")
+      elif [ "$MODE" = "apply" ] && [ "$ORPHAN_CLEAN" = "1" ]; then
         echo "    -> rm -rf"
         if rm -rf "$abs"; then
           SUMMARY_REMOVED+=("$abs (orphan)")
@@ -1915,15 +1972,18 @@ if [ "$MODE" = "apply" ]; then
   printf "  removed:          %d\n" "${#SUMMARY_REMOVED[@]}"
   printf "  skipped:          %d\n" "${#SUMMARY_SKIPPED[@]}"
   printf "  failed:           %d\n" "${#SUMMARY_FAILED[@]}"
+  for item in "${SUMMARY_FAILED[@]}"; do
+    printf "    %s\n" "$item"
+  done
   echo ""
+  # `git worktree prune` cleans up administrative bits for paths that
+  # have already been removed manually. Safe to run after either
+  # --apply or no-op, and after a partial failure.
+  (cd "$MAIN_WORKTREE" && git worktree prune) || true
   if [ "${#SUMMARY_FAILED[@]}" -gt 0 ]; then
     echo "${C_RED}One or more removals failed.${C_RESET}" >&2
     exit 1
   fi
-  # `git worktree prune` cleans up administrative bits for paths that
-  # have already been removed manually. Safe to run after either
-  # --apply or no-op.
-  (cd "$MAIN_WORKTREE" && git worktree prune) || true
   exit 0
 fi
 
