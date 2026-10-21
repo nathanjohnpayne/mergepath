@@ -311,43 +311,83 @@ prepush_default_jobs() {
   fi
 }
 
-# Snapshot hygiene. A prepush-<sha>.* worktree is only ever created by this
-# tool, and under the lock no other run of this version is live, so a
-# leftover one belongs to a run that was killed. A run of an older version
-# of this script, which took no lock, could still be working in it: such a
-# run has a `--committed-snapshot` process whose working directory is the
-# snapshot, and that process is looked for before anything is removed. A
-# worktree that is not a snapshot (another session's checkout) is never
-# touched.
-process_cwd() {   # $1 pid; status 2 when nothing on this host can tell
-  if [ -d /proc/self ]; then
-    readlink "/proc/$1/cwd" 2>/dev/null || true
-    return 0
-  fi
-  if command -v lsof >/dev/null 2>&1; then
-    { lsof -a -p "$1" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p;'
-    return 0
-  fi
-  return 2
+# Snapshot hygiene. A snapshot is positively identified before anything is
+# removed: this tool creates it as `mktemp -d prepush-<12 hex of the tip>.XXXXXX`
+# and checks it out detached at a commit that prefix names, so a worktree
+# under the snapshots directory that is a branch checkout, carries another
+# name (prepush-debug), or sits at some other commit is never touched. Under
+# the lock no run of this version is live, so an owned snapshot is left only
+# by a killed run; a run of an older version, which took no lock, could
+# still be working in one, so a `--committed-snapshot` process whose working
+# directory is the snapshot protects it, and an inspection that fails, or a
+# live process whose working directory cannot be read, counts as in use.
+owned_snapshot() {   # $1 worktree path, $2 its HEAD sha, $3 detached (1/0)
+  local name sha12
+  name=$(basename "$1")
+  case "$name" in prepush-????????????.??????) ;; *) return 1 ;; esac
+  sha12=${name#prepush-}; sha12=${sha12%.*}
+  case "$sha12" in *[!0-9a-f]*) return 1 ;; esac
+  [ "$3" = 1 ] || return 1
+  case "$2" in "$sha12"*) return 0 ;; *) return 1 ;; esac
 }
 
-snapshot_in_use() {   # $1 snapshot path
-  local real pid cwd
+# Prints the pids of `--committed-snapshot` runs. Status 1: none. Status 2:
+# that cannot be established (no pgrep, or pgrep failing).
+snapshot_runs() {
+  local out rc=0
+  command -v pgrep >/dev/null 2>&1 || return 2
+  out=$(pgrep -f -- '[-]-committed-snapshot' 2>/dev/null) || rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$out"; return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+process_cwd() {   # $1 pid; prints its working directory, status 1 when it cannot be read
+  local d=''
+  if [ -d /proc/self ]; then
+    d=$(readlink "/proc/$1/cwd" 2>/dev/null) || d=''
+  elif command -v lsof >/dev/null 2>&1; then
+    d=$({ lsof -a -p "$1" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p;' | head -n 1)
+  fi
+  [ -n "$d" ] || return 1
+  printf '%s\n' "$d"
+}
+
+snapshot_in_use() {   # $1 snapshot path: 0 = in use, or that cannot be established; 1 = positively free
+  local real pids rc=0 pid cwd
   real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
-  for pid in $(pgrep -f -- '[-]-committed-snapshot' 2>/dev/null); do
+  pids=$(snapshot_runs) || rc=$?
+  [ "$rc" -ne 2 ] || return 0
+  [ "$rc" -eq 0 ] || return 1
+  for pid in $pids; do
     [ "$pid" != "$$" ] || continue
-    cwd=$(process_cwd "$pid") || return 0
+    if ! cwd=$(process_cwd "$pid"); then
+      kill -0 "$pid" 2>/dev/null || continue
+      return 0
+    fi
     case "$cwd" in "$real"|"$real"/*) return 0 ;; esac
   done
   return 1
 }
 
 retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lock
-  local wt
-  while IFS= read -r wt; do
+  local wt head detached prunable
+  while IFS=$'\t' read -r wt head detached prunable; do
     case "$wt" in "$1"/prepush-*) ;; *) continue ;; esac
+    if ! owned_snapshot "$wt" "$head" "$detached"; then
+      echo "$PREFIX: leaving $wt: not a snapshot this tool made (a detached prepush-<sha>.XXXXXX checkout at that commit)"
+      continue
+    fi
+    if [ "$prunable" = 1 ]; then
+      if git worktree prune 2>/dev/null; then
+        echo "$PREFIX: pruned the registration of missing snapshot $wt"
+      fi
+      continue
+    fi
     if snapshot_in_use "$wt"; then
-      echo "$PREFIX: leaving snapshot $wt: a hook run is still working in it"
+      echo "$PREFIX: leaving snapshot $wt: a hook run is still working in it, or that cannot be established"
       continue
     fi
     if git worktree remove --force "$wt" 2>/dev/null; then
@@ -355,7 +395,12 @@ retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lo
     else
       echo "$PREFIX: could not retire stale snapshot $wt" >&2
     fi
-  done < <(git worktree list --porcelain | sed -n 's/^worktree //p')
+  done < <(git worktree list --porcelain | awk '
+    /^worktree / { if (p != "") print p "\t" h "\t" d "\t" x; p = substr($0, 10); h = ""; d = 0; x = 0; next }
+    /^HEAD / { h = $2; next }
+    /^detached$/ { d = 1; next }
+    /^prunable/ { x = 1; next }
+    END { if (p != "") print p "\t" h "\t" d "\t" x }')
 }
 
 ORIGINAL_ARGS=("$@")

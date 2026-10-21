@@ -1066,39 +1066,70 @@ case "$out" in *"reaping the lock record of pid $SLEEPER (feat/reused), which is
 
 
 # Snapshot hygiene under the lock. The hook keeps its snapshots beside the
-# primary checkout, in a hidden folder named after it; a prepush-* worktree
-# nobody is working in is retired, one a (pre-lock) `--committed-snapshot`
-# run is working in is left alone, and a worktree that is not a snapshot is
-# never touched.
+# primary checkout, in a hidden folder named after it, as detached
+# prepush-<12 hex of the tip>.XXXXXX checkouts at that tip. One nobody is
+# working in is retired; one a (pre-lock) `--committed-snapshot` run is
+# working in is left alone; a worktree that is not positively a tool snapshot
+# (a branch checkout named prepush-debug with uncommitted work, a detached
+# checkout whose name does not match its commit) is never touched.
 SNAPS=$(cd "$TMP/.fix-worktrees" && pwd -P)
-git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-deadbeefcafe.stale" main
-git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-feedfacebeef.busy" main
+MAIN12=$(git -C "$FIX" rev-parse main | cut -c1-12)
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-$MAIN12.stale0" main
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-$MAIN12.busy00" main
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-000000000000.wrong0" main
+git -C "$FIX" worktree add -q -b prepush-debug "$SNAPS/prepush-debug" main
+printf 'uncommitted work\n' >> "$SNAPS/prepush-debug/README.md"
+printf 'scratch\n' > "$SNAPS/prepush-debug/notes.txt"
 git -C "$FIX" worktree add -q -b other/session "$SNAPS/other-session" main
 # shellcheck disable=SC2016 # the $1 is the inner bash's, not ours
-BUSY_PID=$(detach bash -c 'cd "$1" && sleep 300; :' --committed-snapshot "$SNAPS/prepush-feedfacebeef.busy")
+BUSY_PID=$(detach bash -c 'cd "$1" && sleep 300; :' --committed-snapshot "$SNAPS/prepush-$MAIN12.busy00")
 # Wait until that process has actually changed into the snapshot (bounded).
 busy_cwd() {
   if [ -d /proc/self ]; then readlink "/proc/$BUSY_PID/cwd" 2>/dev/null || true
   else { lsof -a -p "$BUSY_PID" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p'; fi
 }
 i=0
-until [ "$(busy_cwd)" = "$SNAPS/prepush-feedfacebeef.busy" ] || [ "$i" -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
-check "the busy process is working in its snapshot before the push" "$(busy_cwd)" "$SNAPS/prepush-feedfacebeef.busy"
+until [ "$(busy_cwd)" = "$SNAPS/prepush-$MAIN12.busy00" ] || [ "$i" -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+check "the busy process is working in its snapshot before the push" "$(busy_cwd)" "$SNAPS/prepush-$MAIN12.busy00"
 reset_probe
 commit_change feat/snapshots README.md
 rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
 pkill -P "$BUSY_PID" 2>/dev/null || true; kill "$BUSY_PID" 2>/dev/null || true
 check "a push with leftover snapshots around succeeds" "$rc" "0"
-case "$out" in *"retired stale snapshot "*"/prepush-deadbeefcafe.stale (left by an interrupted run)"*) ok "the stale snapshot is retired, with a message" ;; *) bad "retirement output: $out" ;; esac
-if [ ! -d "$SNAPS/prepush-deadbeefcafe.stale" ]; then ok "the stale snapshot directory is gone"; else bad "the stale snapshot directory remains"; fi
-case "$out" in *"leaving snapshot "*"/prepush-feedfacebeef.busy: a hook run is still working in it"*) ok "a snapshot a run is working in is left alone, with a message" ;; *) bad "busy snapshot output: $out" ;; esac
-if [ -d "$SNAPS/prepush-feedfacebeef.busy" ]; then ok "the busy snapshot directory survives"; else bad "the busy snapshot was removed"; fi
+case "$out" in *"retired stale snapshot "*"/prepush-$MAIN12.stale0 (left by an interrupted run)"*) ok "the stale snapshot is retired, with a message" ;; *) bad "retirement output: $out" ;; esac
+if [ ! -d "$SNAPS/prepush-$MAIN12.stale0" ]; then ok "the stale snapshot directory is gone"; else bad "the stale snapshot directory remains"; fi
+case "$out" in *"leaving snapshot "*"/prepush-$MAIN12.busy00: a hook run is still working in it"*) ok "a snapshot a run is working in is left alone, with a message" ;; *) bad "busy snapshot output: $out" ;; esac
+if [ -d "$SNAPS/prepush-$MAIN12.busy00" ]; then ok "the busy snapshot directory survives"; else bad "the busy snapshot was removed"; fi
+case "$out" in *"leaving "*"/prepush-debug: not a snapshot this tool made"*) ok "a branch checkout under the snapshots folder is named as not the tool's" ;; *) bad "prepush-debug output: $out" ;; esac
+if [ -d "$SNAPS/prepush-debug" ] && [ "$(tail -n 1 "$SNAPS/prepush-debug/README.md")" = "uncommitted work" ] && [ -f "$SNAPS/prepush-debug/notes.txt" ]; then ok "a dirty branch checkout named prepush-debug survives with its work intact"; else bad "the prepush-debug checkout or its uncommitted work was removed"; fi
+if [ -d "$SNAPS/prepush-000000000000.wrong0" ]; then ok "a detached checkout whose name does not match its commit survives"; else bad "the mismatched-name checkout was removed"; fi
 if [ -d "$SNAPS/other-session" ]; then ok "another checkout beside the snapshots is untouched"; else bad "the other checkout was removed"; fi
 registered=$(git -C "$FIX" worktree list --porcelain | sed -n 's/^worktree //p')
-case "$registered" in *prepush-deadbeefcafe.stale*) bad "the stale snapshot is still registered" ;; *) ok "the stale snapshot is unregistered" ;; esac
-case "$registered" in *prepush-feedfacebeef.busy*) ok "the busy snapshot stays registered" ;; *) bad "the busy snapshot was unregistered" ;; esac
+case "$registered" in *"prepush-$MAIN12.stale0"*) bad "the stale snapshot is still registered" ;; *) ok "the stale snapshot is unregistered" ;; esac
+case "$registered" in *"prepush-$MAIN12.busy00"*) ok "the busy snapshot stays registered" ;; *) bad "the busy snapshot was unregistered" ;; esac
+case "$registered" in *prepush-debug*) ok "the branch checkout stays registered" ;; *) bad "the branch checkout was unregistered" ;; esac
 case "$registered" in *other-session*) ok "the other checkout stays registered" ;; *) bad "the other checkout was unregistered" ;; esac
-git -C "$FIX" worktree remove --force "$SNAPS/prepush-feedfacebeef.busy" 2>/dev/null || true
+# A process inspection that fails is not evidence of an unused snapshot: with
+# pgrep failing, a free owned snapshot is left alone and says why.
+FAKEPS="$TMP/fakeps"
+mkdir -p "$FAKEPS"
+printf '#!/bin/sh\necho "pgrep: cannot enumerate processes" >&2\nexit 2\n' > "$FAKEPS/pgrep"
+chmod +x "$FAKEPS/pgrep"
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-$MAIN12.stale1" main
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m inspection-fails
+rc=0; out=$(cd "$FIX" && PATH="$FAKEPS:$PATH" git push origin feat/snapshots 2>&1) || rc=$?
+check "a failing process inspection does not block the push" "$rc" "0"
+case "$out" in *"leaving snapshot "*"/prepush-$MAIN12.stale1: a hook run is still working in it, or that cannot be established"*) ok "a free snapshot is left alone when liveness cannot be established" ;; *) bad "inspection-failure output: $out" ;; esac
+if [ -d "$SNAPS/prepush-$MAIN12.stale1" ]; then ok "the snapshot survives a failed inspection"; else bad "the snapshot was removed on a failed inspection"; fi
+# With inspection working again the same snapshot is retired.
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m inspection-works
+rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
+check "the next push with working inspection succeeds" "$rc" "0"
+case "$out" in *"retired stale snapshot "*"/prepush-$MAIN12.stale1 (left by an interrupted run)"*) ok "the same snapshot is retired once liveness can be established" ;; *) bad "post-inspection output: $out" ;; esac
+git -C "$FIX" worktree remove --force "$SNAPS/prepush-$MAIN12.busy00" 2>/dev/null || true
+git -C "$FIX" worktree remove --force "$SNAPS/prepush-000000000000.wrong0" 2>/dev/null || true
 
 # The default parallelism follows the machine. A fake sysctl/nproc first on
 # PATH reports 4 CPUs and the load each push chooses; the running line
