@@ -12,6 +12,8 @@ Sync commit and PR self-reviews share source-bound operation claims and describe
 
 Sync-all PR bodies retain the requested destination digest/count, manifest coverage, actual filter narrowing and omitted opted-in paths. Full replay claims require the complete requested manifest scope; consumer overrides and installed acceptance are separate. The contract and native materializer coverage live in `specs/pr_body_contract.md` and `tests/test_sync_to_downstream.sh` (#2490).
 
+The shared literal-source gh mutation classifier treats `--search` and `-S` values as queries in both accepted PR-list flag positions, preserving actual native merge and command-substitution detection. Its narrow normalization contract and native regressions are in `specs/repo_lint_execution.md` and `tests/test_gh_as_author.sh` (#1342).
+
 This repository is **Mergepath**, the reference implementation of the AI Agent Tooling Standard. It provides a canonical starting structure for projects that require consistent behavior across multiple AI coding agents and development tools.
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
