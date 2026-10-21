@@ -267,9 +267,7 @@ runs complete-history feedback accounting before emitting the reviewer prompt;
 it exits `4` with no handoff when an earlier finding is unaccounted (#1000).
 Automated-mode fallbacks run that accounting before announcing or rendering a manual handoff; a miss becomes orchestrator exit `7`, not fallback exit `4`.
 
-`max_review_rounds` is a declarative cap for the outer review flow. This
-reference helper performs one exhaustive adapter pass per invocation; callers
-that re-run it after `CHANGES_REQUESTED` own round counting and escalation.
+`max_review_rounds` is enforced (#2663): each invocation reserves a slot in the per-PR Git-ref round ledger before any adapter run, and a PR whose completed and in-flight rounds have reached the governing cap stops for an owner decision. The contract, including what frees a slot and what never does, is [the round-cap spec](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_round_cap.md).
 
 ## Try it (dry-run, offline, with fake CLIs)
 

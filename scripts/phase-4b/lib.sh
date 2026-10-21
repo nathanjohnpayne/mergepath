@@ -686,6 +686,121 @@ p4b_governing_policy_json() {
   printf '%s' "$base_json" | jq -ce 'select(type == "object")' 2>/dev/null || return 2
 }
 
+# p4b_completed_rounds_from_reviews <reviews-json> <author-login>
+# Pure (#2663). Count the completed automated Phase 4b rounds on a PR from its
+# GitHub reviews, the only store every machine, session and restart shares. A
+# round is a non-author review whose body opens with the orchestrator's
+# `**Automated Phase 4b review**` heading, carries its `_Posted by
+# scripts/phase-4b-review.sh` footer, and records a verdict: APPROVED,
+# CHANGES_REQUESTED, or DISMISSED (a dismissed verdict was still delivered).
+# The login is deliberately NOT checked against the current available_reviewers,
+# so rotating or removing a reviewer never erases its historical rounds. A
+# forged review can only inflate the count, which stops rounds early (a
+# liveness risk), never lets one past the cap. Holds, polls and attempts that
+# published nothing leave no review and are never counted. Each round reports
+# the run nonce it carries, which marks its reservation consumed. Prints
+# {completed, rounds:[{id,head,state,run}]}; returns 1 on a non-array or a
+# qualifying review without a numeric id (fail closed).
+p4b_completed_rounds_from_reviews() {
+  printf '%s' "${1:-}" | jq -ce --arg author "${2:-}" '
+    if type != "array" then error("reviews are not an array") else . end
+    | [ .[]
+        | select(type == "object")
+        | select(((.user.login // "") | ascii_downcase) != ($author | ascii_downcase))
+        | select((.state // "") as $s | ["APPROVED","CHANGES_REQUESTED","DISMISSED"] | index($s) != null)
+        | select((.body // "") | startswith("**Automated Phase 4b review**"))
+        | select((.body // "") | contains("_Posted by scripts/phase-4b-review.sh"))
+        | if (.id | type) == "number" then . else error("qualifying review without an id") end
+        | {id, head:(.commit_id // null), state,
+           run:(((.body // "") | capture("<!-- mergepath-p4b-run: (?<r>[A-Za-z0-9._-]+) -->") | .r)? // null)} ]
+    | unique_by(.id)
+    | {completed: length, rounds: .}' 2>/dev/null
+}
+
+# --- #2663 round ledger ------------------------------------------------------
+# The authoritative per-PR slot ledger is a git ref,
+#   refs/mergepath/p4b-rounds/pr-<N>
+# whose tip commit message carries the whole ledger as one JSON line:
+#   {"schema":"p4b-round-ledger/v1","pr":N,"entries":[{"run","head","state"}]}
+# state is "reserved" or "released" (released only by its own writer, before
+# it attempted any review POST). Every update is a single-parent commit on the
+# observed tip, published with force:false, so GitHub accepts it only as a
+# fast-forward: of two writers building on one tip exactly one wins, and the
+# other must re-read and re-evaluate. The ref is organisational state, not a
+# security boundary: anyone who can push can rewrite it, as they can a review.
+
+# p4b_round_ledger_parse <commit-message> -> entries JSON array, or rc 1.
+p4b_round_ledger_parse() {
+  # One jq pass, no early-exit pipeline: `grep | head` under pipefail can
+  # SIGPIPE the producer and read a valid ledger as malformed.
+  jq -cen --arg msg "${1:-}" '
+    [$msg | split("\n")[] | select(startswith("{\"schema\":\"p4b-round-ledger/v1\""))]
+    | if length != 1 then error("ledger line missing or repeated") else .[0] | fromjson end
+    | if .schema == "p4b-round-ledger/v1" and (.entries | type) == "array"
+         and all(.entries[]; (.run | type) == "string" and (.run | test("^[A-Za-z0-9._-]+$"))
+                            and (.state == "reserved" or .state == "released"))
+      then .entries else error("malformed ledger") end' 2>/dev/null
+}
+
+# p4b_round_ledger_message <pr> <entries-json> -> the commit message.
+p4b_round_ledger_message() {
+  local line
+  line=$(jq -nce --argjson pr "$1" --argjson e "$2" '{schema:"p4b-round-ledger/v1",pr:$pr,entries:$e}' 2>/dev/null) || return 1
+  printf 'mergepath Phase 4b round ledger (#2663)\n\n%s\n' "$line"
+}
+
+# p4b_round_occupancy <entries-json> <rounds-json> <cap>
+# Pure. A slot is occupied by every reserved ledger entry (consumed or still
+# in flight, and including an uncertain POST, which never frees its slot) and
+# by every completed round no reserved entry accounts for: a legacy review, a
+# review with no run id, or a review by a run whose entry reads released (a
+# writer that published anyway is counted, never dropped). Released entries
+# free their slot only while no review carries their run id. Duplicate runs
+# count once per entry. Prints {occupied, in_flight, completed, legacy, cap}.
+p4b_round_occupancy() {
+  local rounds_default='{"rounds":[]}'
+  jq -nce --argjson e "${1:-[]}" --argjson r "${2:-$rounds_default}" --argjson cap "${3:-0}" '
+    ([$e[] | select(.state == "reserved")]) as $res
+    | ([$res[].run]) as $ledger_runs
+    | ([$r.rounds[] | .run as $rr | select($rr == null or (($ledger_runs | index($rr)) == null))]) as $legacy
+    | ([$r.rounds[].run | strings]) as $done
+    | {occupied: (($res | length) + ($legacy | length)),
+       in_flight: ([$res[] | .run as $rr | select(($done | index($rr)) == null)] | length),
+       completed: ($r.rounds | length), legacy: ($legacy | length), cap: $cap}' 2>/dev/null
+}
+
+# p4b_reconcile_posted_review <reviews-json> <reviewer-login> <head-sha> <run-id>
+# Pure (#2663). After a review POST with an uncertain outcome, find THIS run's
+# publication: a review by the actual reviewer, on this head, carrying this
+# run's unique `<!-- mergepath-p4b-run: <id> -->` nonce. Prints it only when
+# exactly one matches; zero (not landed, or not yet visible) or several
+# (ambiguous) print nothing, and the caller then neither adopts nor reposts.
+p4b_reconcile_posted_review() {
+  printf '%s' "${1:-[]}" | jq -c --arg who "${2:-}" --arg head "${3:-}" \
+    --arg nonce "<!-- mergepath-p4b-run: ${4:-} -->" '
+    if type != "array" then empty else
+    [ .[] | select(type == "object")
+      | select(((.user.login // "") | ascii_downcase) == ($who | ascii_downcase))
+      | select(.commit_id == $head and ((.body // "") | contains($nonce))) ]
+    | if length == 1 then .[0] else empty end end' 2>/dev/null
+}
+
+# p4b_governing_round_cap <governing-policy-json>
+# Pure (#2663). Print phase_4b_automation.max_review_rounds from the PR's
+# GOVERNING base policy, so a PR cannot raise its own cap, or "none" when the
+# key is absent (the cap is then unenforced, as before). Returns 2 when the
+# value is present but is not a positive integer.
+p4b_governing_round_cap() {
+  printf '%s' "${1:-}" | jq -er '
+    if (.phase_4b_automation | type) != "object" then "none"
+    elif (.phase_4b_automation | has("max_review_rounds") | not) then "none"
+    elif (.phase_4b_automation.max_review_rounds | type) == "number"
+         and .phase_4b_automation.max_review_rounds >= 1
+         and (.phase_4b_automation.max_review_rounds | floor) == .phase_4b_automation.max_review_rounds
+      then (.phase_4b_automation.max_review_rounds | tostring)
+    else error("invalid") end' 2>/dev/null || return 2
+}
+
 # p4b_governing_codex_enabled <repo> <pr>
 # Prints true or false for codex.enabled in the PR's GOVERNING base policy,
 # the policy the substitute merge gate applies, rather than the local

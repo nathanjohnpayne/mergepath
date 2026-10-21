@@ -1755,6 +1755,15 @@ paths:
     consumers: all
     requires:
       - "scripts/phase-4b/"
+  # #2663: the round-cap protocol suite. It extracts the production block from
+  # scripts/phase-4b-review.sh and sources scripts/phase-4b/lib.sh, against a
+  # stateful fake GitHub; hard-required by scripts/ci/check_phase_4b_automation.
+  - path: tests/test_phase_4b_round_cap.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b-review.sh"
+      - "scripts/phase-4b/"
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
