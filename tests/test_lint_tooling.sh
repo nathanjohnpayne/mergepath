@@ -80,7 +80,7 @@ else fail "shellcheck missing local (rc=$rc, out=[$out])"; fi
 
 # Missing + CI: hard FAIL (rc 1).
 out="$( (export PATH="$NO_SC"; unset MERGEPATH_REQUIRE_SHELLCHECK; CI=true lint_tooling_require_shellcheck) 2>&1 )"; rc=$?
-if [ "$rc" = 1 ] && printf '%s' "$out" | grep "FAIL" >/dev/null && printf '%s' "$out" | grep -i "required" >/dev/null; then
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep "FAIL" >/dev/null && printf '%s' "$out" | grep "REQUIRED" >/dev/null; then
   pass "shellcheck missing + CI -> rc 1 with FAIL"
 else fail "shellcheck missing CI (rc=$rc, out=[$out])"; fi
 
