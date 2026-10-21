@@ -149,13 +149,14 @@ test('captured Git objects determine both rename sides and complete wave scope',
   // #2633: only the verified capture's binding of an ordinary wave from a
   // first-parent base exempts the mirror, and the pr.diff digest still binds it.
   fs.writeFileSync(path.join(directory, 'pr.diff'), diff);
-  const ordinary = () => ({ canonical_base_sha: base, canonical_head_sha: head, historical_end_sha: '', finalize_historical: false, base_on_first_parent: true });
+  const ordinary = () => ({ canonical_base_sha: base, canonical_head_sha: head, historical_end_sha: '', finalize_historical: false, base_on_first_parent: true, head_on_hub_default: true });
   metadata.wave_audit = ordinary();
   writeMetadata();
   assert.deepEqual(capturedInput(directory), { decision: 'model-review', tripwires: [], exemption: 'verified-propagation' });
   const variants = [null, [], {}, { canonical_base_sha: base },
     { ...ordinary(), canonical_base_sha: 'x' },
     { ...ordinary(), base_on_first_parent: false }, { ...ordinary(), base_on_first_parent: 'true' },
+    { ...ordinary(), head_on_hub_default: false }, (({ head_on_hub_default, ...rest }) => rest)(ordinary()),
     (({ base_on_first_parent, ...rest }) => rest)(ordinary()),
     { ...ordinary(), historical_end_sha: head }, { ...ordinary(), finalize_historical: true },
     (({ historical_end_sha, ...rest }) => rest)(ordinary())];
