@@ -56,7 +56,7 @@ case "$1" in
   repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; printf '%s\n' "${INLINE_COMMENTS_JSON:-[]}" ;;
   graphql)
     case "$*" in
-      *requiredStatusCheckContexts*) printf '%s\n' '{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["Build"]}}}}}' ;;
+      *requiredStatusCheckContexts*) printf '%s\n' '{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["Build"]}}}}}' ;;
       *statusCheckRollup*) printf '%s\n' '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext","context":"Build","state":"FAILURE","createdAt":"2026-09-14T00:03:00Z","isRequired":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}]}}}}}' ;;
       *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
     esac ;;
