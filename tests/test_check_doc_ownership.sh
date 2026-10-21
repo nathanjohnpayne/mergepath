@@ -1431,6 +1431,68 @@ else
   fail "Case 14i unexpected (rc=$rc): $out"
 fi
 
+# --- Case 14i2: literal path-token boundaries (#1431) ----------------
+# A longer filename or a different containing path is not the declared
+# hub-only doc. Assert the clean verdict as well as the exit status so
+# unrelated fixture failures cannot stand in for discrimination.
+# shellcheck disable=SC2016 # Backticks are literal Markdown fixture content.
+for body in \
+  'See `docs/agents/hub.md.orig`.' \
+  'See `other/docs/agents/hub.md`.' \
+  'See `prefixdocs/agents/hub.md`.' \
+  'See `docs/agents/hub.md-backup`.' \
+  'See `docs/agents/hub.md_more`.' \
+  'See `docs/agents/hub.md2`.' \
+  'See `docs/agents/hub.md/sub`.' \
+  'See `docs/agents/hub.md.orig`, or `other/docs/agents/hub.md`.'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$body
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "0" ] \
+     && grep -qF 'check_doc_ownership: PASS (2 docs/agents doc(s) classified;' <<<"$out" \
+     && ! grep -q '^FAIL:' <<<"$out"; then
+    pass "Case 14i2: longer path token passes: $body"
+  else
+    fail "Case 14i2 ($body) unexpected (rc=$rc): $out"
+  fi
+done
+
+# The boundary is lexical, not a Markdown parser: full paths in inline
+# code and prose still count, including punctuation and a sentence-final
+# period. A rejected occurrence must not hide a later genuine token.
+# shellcheck disable=SC2016 # Backticks are literal Markdown fixture content.
+for body in \
+  'docs/agents/hub.md' \
+  'See docs/agents/hub.md now.' \
+  'See docs/agents/hub.md.' \
+  'See (`docs/agents/hub.md`), then continue.' \
+  'See **docs/agents/hub.md**.' \
+  "See 'docs/agents/hub.md'." \
+  'See "docs/agents/hub.md"; then continue.' \
+  'Path=docs/agents/hub.md:42' \
+  'See docs/agents/hub.md#section or docs/agents/hub.md?plain=1.' \
+  'See `docs/agents/hub.md.orig`, then `docs/agents/hub.md`.' \
+  'See `other/docs/agents/hub.md`; actual: docs/agents/hub.md.'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$body
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  hits=$(grep -cF "references the hub-only doc 'docs/agents/hub.md' by repo-relative path" <<<"$out" || true)
+  if [ "$rc" = "1" ] && [ "$hits" = "1" ] \
+     && grep -qxF 'check_doc_ownership: FAIL' <<<"$out"; then
+    pass "Case 14i3: genuine literal path token fails once: $body"
+  else
+    fail "Case 14i3 ($body) unexpected (rc=$rc, hits=$hits): $out"
+  fi
+done
+
 # --- Case 14j: CONTROL — the path spelled as the LINK LABEL ----------
 # REVIEW_POLICY.md's real spelling of the escape hatch puts the
 # repo-relative path in the label and the absolute URL in the
