@@ -1292,7 +1292,13 @@ recently_active() {
   local path="$1" admin found
   [ "$MIN_AGE_MINUTES" -gt 0 ] || return 1
   [ -e "$path" ] || return 1
-  admin=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) || admin=""
+  # Only a worktree's own .git pointer names its admin directory. Without
+  # one (an orphan), git walks up to the main checkout, whose fetches and
+  # objects would count as this candidate's activity.
+  admin=""
+  if [ -e "$path/.git" ]; then
+    admin=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) || admin=""
+  fi
   # Regular files only: the status probe's index.lock bumps the admin
   # directory's own mtime, and it may rewrite the admin index itself.
   if ! found=$(find "$path" ${admin:+"$admin"} -maxdepth 3 -type f -mmin "-$MIN_AGE_MINUTES" \
