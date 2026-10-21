@@ -50,11 +50,9 @@
 #   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
 #           orchestrator requires human review (deterministic tripwire or
 #           Codex-cap human stop). No reviewer authority
-#           or tag follows. Never fan out on either shape. A byte-verified
-#           canary does not trip the deterministic tripwires (#2633), and
-#           --admin-override runs the adapter past a tripwire. The budget
-#           refusal is never overridden (use the historical-prefix path), and
-#           a Codex-cap human stop keeps its owner tiebreak (#2544).
+#           or tag follows. Never fan out on either shape. An ordinary wave
+#           whose byte-verified canary is audited from a first-parent base
+#           does not trip the deterministic tripwires (#2633).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
@@ -65,7 +63,6 @@
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
 #       [--base <sha>] [--head-sha <sha>] [--dry-run]
 #       [--historical-end <sha> | --finalize-historical]
-#       [--admin-override "<owner authorization quote>"]
 #   scripts/wave-audit.sh --parse-title-only "<pr title>"   # test/debug hook
 #
 # Config: top-level `propagation_audit:` block in .github/review-policy.yml
@@ -81,13 +78,6 @@
 # (#662): xhigh DNFs the 900s adapter cap on a catch-up-sized wave diff,
 # while high cleared the same 745 KB diff in 231s; steady-state wave ranges
 # are ~70 KB and fit trivially.
-#
-# --admin-override (#2633): the owner's authorization, quoted, for this run to
-# dispatch the real Phase 4b adapter past the orchestrator's deterministic
-# tripwires, and to post its verdict. It is passed through to
-# phase-4b-review.sh, recorded in the posted review body, and marked
-# `admin-override=true` on the watermark annotation. It never skips the byte
-# budget, the canary byte verification, drift checks or feedback accounting.
 #
 # Env (tests / manual runs):
 #   WAVE_AUDIT_REPO_DIR       canonical repo to diff/tag (default: this repo)
@@ -180,7 +170,6 @@ audit_list() {
 # --- args -------------------------------------------------------------------
 PR=""; REPO=""; BASE=""; HEAD_SHA=""; DRY_RUN=false; CAPTURE_INPUT_DIR=""
 HISTORICAL_END=""; FINALIZE_HISTORICAL=false
-ADMIN_OVERRIDE_SET=false; ADMIN_OVERRIDE_QUOTE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)      REPO="${2:-}"; shift 2 ;;
@@ -190,9 +179,6 @@ while [ $# -gt 0 ]; do
     --capture-input-dir) CAPTURE_INPUT_DIR="${2:-}"; DRY_RUN=true; shift 2 ;;
     --historical-end) HISTORICAL_END="${2:-}"; shift 2 ;;
     --finalize-historical) FINALIZE_HISTORICAL=true; shift ;;
-    --admin-override)
-      [ $# -ge 2 ] || die 3 "--admin-override requires the owner's quoted authorization"
-      ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     --parse-title-only)
       parse_title "${2:-}" || die 3 "no mergepath@<sha> in title: ${2:-}"
       exit 0 ;;
@@ -211,12 +197,6 @@ case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -z "$CAPTURE_INPUT_DIR" ] || { [ -d "$CAPTURE_INPUT_DIR" ] && [ ! -L "$CAPTURE_INPUT_DIR" ]; } \
   || die 3 "capture directory must already exist and be a real directory"
 [ -x "$ORCH" ] || [ -f "$ORCH" ] || die 3 "orchestrator not found: $ORCH"
-if [ "$ADMIN_OVERRIDE_SET" = true ]; then
-  case "$ADMIN_OVERRIDE_QUOTE" in
-    *[![:space:]]*) ;;
-    *) die 3 "--admin-override requires a non-empty owner authorization quote" ;;
-  esac
-fi
 
 # --- config (fail-closed validation) ----------------------------------------
 EFFORT="$(audit_field effort)"; EFFORT="${EFFORT:-high}"
@@ -649,7 +629,7 @@ advance_watermark() {
     revalidate_canary_pair "writing wave watermark"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
-        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}$([ "$ADMIN_OVERRIDE_SET" = true ] && printf ' admin-override=true')" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
         "$HEAD_FULL"
   fi
   revalidate_canary_pair "publishing wave watermark"
@@ -848,10 +828,6 @@ fi
 # the orchestrator's deterministic tripwires before its historical model run.
 if [ -n "$HISTORICAL_END" ] && [ "$DRY_RUN" = false ]; then
   orch_args[${#orch_args[@]}]="--retain-evidence"
-fi
-if [ "$ADMIN_OVERRIDE_SET" = true ]; then
-  orch_args[${#orch_args[@]}]="--admin-override"
-  orch_args[${#orch_args[@]}]="$ADMIN_OVERRIDE_QUOTE"
 fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"

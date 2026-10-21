@@ -594,31 +594,6 @@ for mode in operational dry-run; do
   remote_has_tag "$LARGE_HEAD" && fail "$mode over-budget pushed watermark" || pass "$mode over-budget leaves remote watermark untouched"
 done
 
-# #2633: the admin override never overrides the byte budget: an oversized
-# range keeps its deterministic exit 8 and dispatches nothing.
-rc=0
-run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-  --admin-override 'Owner: run it' >/dev/null 2>&1 || rc=$?
-[ "$rc" -eq 8 ] && [ ! -e "$CAPTURE/args" ] \
-  && pass "admin override does not bypass the byte budget" || fail "admin override over-budget returned $rc or dispatched"
-# Within budget it forwards the quote and marks the watermark it advances.
-rc=0
-run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-  --admin-override 'Owner: run it' > "$WORK/override.json" 2> "$WORK/override.err" || rc=$?
-[ "$rc" -eq 0 ] && pass "admin override dispatches a within-budget range" || fail "admin override returned $rc: $(tail -n 2 "$WORK/override.err")"
-grep -A1 -Fx -- '--admin-override' "$CAPTURE/args" 2>/dev/null | tail -n 1 | grep -Fxq 'Owner: run it' \
-  && pass "admin override quote is forwarded to the orchestrator" || fail "admin override quote not forwarded"
-git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-pass/$LARGE_HEAD:refs/tags/wave-audit-pass/$LARGE_HEAD" 2>/dev/null || true
-git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | grep -q 'admin-override=true' \
-  && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
-git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
-git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
-rc=0
-run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
-  --admin-override '  ' >/dev/null 2>&1 || rc=$?
-[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
-  && pass "admin override refuses a blank quote before dispatch" || fail "blank admin override quote returned $rc"
-
 # Equality remains eligible: mutate > to >= and this control fails.
 POLICY_EXACT="$WORK/policy-exact.yml"
 sed "s/diff_max_bytes: 800000/diff_max_bytes: $LARGE_BYTES/" "$POLICY_GOOD" > "$POLICY_EXACT"
