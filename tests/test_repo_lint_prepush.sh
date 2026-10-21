@@ -23,9 +23,9 @@
 # variable leaks into a check, and the hub-only soft-passes.
 #
 # Part 3, one hook run per machine (#2581): a second push waits for the
-# running one and names it, the wait is bounded, a dead holder is reaped, a
-# killed run's snapshot is retired under the lock, and the default
-# concurrency follows the load average.
+# running one and names it, the wait is bounded, a killed holder's stale
+# record is reported, a killed run's snapshot is retired under the lock, and
+# the default concurrency follows the load average.
 #
 # Hermetic: fixtures under one mktemp dir, GIT_CONFIG_GLOBAL=/dev/null.
 
@@ -54,7 +54,7 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 # under MERGEPATH_PREPUSH_LIVE=all, say) does not leak its opt-ins into the fixtures.
 unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
   MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
-  MERGEPATH_PREPUSH_LOCK_IMPL GITHUB_OUTPUT 2>/dev/null || true
+  GITHUB_OUTPUT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -915,7 +915,6 @@ echo "Part 3: one hook run per machine, load-sized jobs, stale snapshots (#2581)
 
 LOCK_DIR="$XDG_CACHE_HOME/mergepath"
 LOCK_FILE="$LOCK_DIR/prepush.lock"
-LOCK_HOLD="$LOCK_DIR/prepush.lock.d"
 lock_field() { { sed -n "s/^$1=//p" "$LOCK_FILE" 2>/dev/null || true; } | head -n 1; }
 peak_concurrency() { sort -n "$PROBE_DIR/concurrency" | tail -n 1; }
 # A helper process that is not a job of this shell, so killing it later
@@ -933,11 +932,11 @@ wait_for_lock_field() {  # $1 = field, $2 = glob it must match; up to 60 s
 }
 
 # Every Part 2 push took and released the lock: a clean release leaves an
-# empty record and no token.
+# empty record, and the lock file itself stays (the flock lives on its inode).
 check "a finished run leaves an empty lock record" "$(cat "$LOCK_FILE" 2>/dev/null)" ""
-if [ ! -d "$LOCK_HOLD" ]; then ok "a finished run leaves no lock token"; else bad "a lock token survived a finished run"; fi
+if [ -f "$LOCK_FILE" ]; then ok "the lock file itself survives a release"; else bad "the lock file was removed on release"; fi
 help_out=$(bash "$RUNNER" --help)
-for want in MERGEPATH_PREPUSH_LOCK_WAIT MERGEPATH_PREPUSH_LOCK_IMPL 'load average' 'take turns'; do
+for want in MERGEPATH_PREPUSH_LOCK_WAIT 'load average' 'take turns' 'fcntl'; do
   case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
 done
 
@@ -1005,55 +1004,6 @@ kill "$SLEEPER" 2>/dev/null || true
 check "a reused pid that is not a hook run does not hold the lock" "$rc" "0"
 case "$out" in *"reaping the lock record of pid $SLEEPER (feat/reused), which is no longer running"*) ok "the reused pid is reaped by name" ;; *) bad "reused-pid output: $out" ;; esac
 
-# The symlink-token fallback (MERGEPATH_PREPUSH_LOCK_IMPL=token, the path a
-# host without flock(1) and python3 takes): the token names its holder's
-# pid, contention serializes, a dead holder's token is taken over by one
-# waiter only, and a release leaves no token.
-export MERGEPATH_PREPUSH_LOCK_IMPL=token
-reset_probe; slow_all
-git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m token-hold
-git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m token-wait
-(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a3.out" 2>&1 &
-A_PID=$!
-if wait_for_lock_field branch feat/lock-a; then ok "token mode: the holder records its branch"; else bad "token mode: no holder record: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
-holder_pid=$(lock_field pid)
-check "token mode: the token names the holder's pid" "$(readlink "$LOCK_HOLD" 2>/dev/null)" "$holder_pid"
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
-check "token mode: a second push waits, then succeeds" "$rc" "0"
-case "$out" in *"waiting for the run of feat/lock-a (pid $holder_pid, started "*) ok "token mode: the waiter names the holder" ;; *) bad "token mode waiter output: $out" ;; esac
-rc_a=0; wait "$A_PID" || rc_a=$?
-check "token mode: the holder passes" "$rc_a" "0"
-check "token mode: the two runs' checks never overlapped" "$(peak_concurrency)" "1"
-if [ ! -L "$LOCK_HOLD" ] && [ ! -e "$LOCK_HOLD" ]; then ok "token mode: a finished run leaves no token"; else bad "token mode: a token survived the run"; fi
-# A dead holder's token is reaped by name.
-ln -s "$dead_pid" "$LOCK_HOLD"
-printf 'branch=feat/ghost\npid=%s\nstarted=00:00 UTC\nprogress=1 of 9\n' "$dead_pid" > "$LOCK_FILE"
-reset_probe
-git -C "$FIX" checkout -q feat/reap && git -C "$FIX" commit -q --allow-empty -m token-reap
-rc=0; out=$(cd "$FIX" && git push origin feat/reap 2>&1) || rc=$?
-check "token mode: a dead holder's token is reaped and the push proceeds" "$rc" "0"
-case "$out" in *"reaping the lock of pid $dead_pid (feat/ghost), which is no longer running"*) ok "token mode: the reaped holder is named" ;; *) bad "token mode reap output: $out" ;; esac
-if [ ! -L "$LOCK_HOLD" ] && [ ! -e "$LOCK_HOLD" ]; then ok "token mode: the dead holder's token is gone"; else bad "token mode: the dead holder's token survived"; fi
-# Two waiters meeting one stale token: the takeover is an atomic rename, so
-# exactly one of them reaps it, neither deletes the other's live token, and
-# their checks never overlap.
-ln -s "$dead_pid" "$LOCK_HOLD"
-printf 'branch=feat/ghost\npid=%s\nstarted=00:00 UTC\nprogress=1 of 9\n' "$dead_pid" > "$LOCK_FILE"
-reset_probe; slow_all
-git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m race-a
-git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m race-b
-(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/race-a.out" 2>&1 &
-A_PID=$!
-(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b) > "$TMP/race-b.out" 2>&1 &
-B_PID=$!
-rc_a=0; wait "$A_PID" || rc_a=$?
-rc_b=0; wait "$B_PID" || rc_b=$?
-check "token mode: both pushes racing for a stale token succeed" "$rc_a $rc_b" "0 0"
-check "token mode: exactly one waiter reaps the stale token" "$(cat "$TMP/race-a.out" "$TMP/race-b.out" | grep -c "reaping the lock of pid $dead_pid")" "1"
-check "token mode: the racing runs' checks never overlapped" "$(peak_concurrency)" "1"
-check "token mode: both racing tips reached the remote" "$(remote_tip feat/lock-a) $(remote_tip feat/lock-b)" "$(git -C "$FIX" rev-parse feat/lock-a) $(git -C "$FIX" rev-parse feat/lock-b)"
-if [ ! -L "$LOCK_HOLD" ] && [ ! -e "$LOCK_HOLD" ]; then ok "token mode: no token survives the race"; else bad "token mode: a token survived the race"; fi
-unset MERGEPATH_PREPUSH_LOCK_IMPL
 
 # Snapshot hygiene under the lock. The hook keeps its snapshots beside the
 # primary checkout, in a hidden folder named after it; a prepush-* worktree

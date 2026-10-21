@@ -74,18 +74,16 @@
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
 #   MERGEPATH_PREPUSH_LOCK_WAIT=S  wait up to S seconds for another hook run
 #                               on this machine to finish (default 3600)
-#   MERGEPATH_PREPUSH_LOCK_IMPL=token  use the symlink-token lock instead of
-#                               the kernel flock (diagnostic; see below)
 # Hook checks run in tool-owned detached worktrees of each pushed tip, so
 # working-tree modifications and untracked files cannot affect their result.
 # Python package metadata must equal the committed workflow pins.
 # Hook runs on one machine take turns (#2581): a run holds an exclusive
 # flock(2) on ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush.lock (through
-# flock(1), or python3's fcntl where that is absent; a pid-naming symlink
-# token where neither exists) from before its first snapshot until its last
-# check, a second push waits for it, naming the holder's branch, pid, start
-# time and progress every 30 s, and gives up after the bound above; a
-# snapshot left by a killed run is retired under that lock.
+# flock(1), or python3's fcntl where that is absent) from before its first
+# snapshot until its last check, a second push waits for it, naming the
+# holder's branch, pid, start time and progress every 30 s, and gives up
+# after the bound above; a snapshot left by a killed run is retired under
+# that lock. A host with neither tool fails closed (exit 2).
 # Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment
 # (including missing or mismatched CI packages).
 
@@ -131,28 +129,25 @@ fi
 # and stretched a 21-check run from 27 minutes to over an hour, so hook runs
 # on one machine take turns. The lock is an exclusive flock(2) on
 # ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush.lock, held on fd 9 for
-# the run's lifetime and dropped by the kernel with the holder: taken with
-# flock(1) where it exists, otherwise with python3's fcntl on the same
-# inherited fd (macOS ships no flock(1)). Where neither exists, or with
-# MERGEPATH_PREPUSH_LOCK_IMPL=token, a symlink token prepush.lock.d whose
-# target is the holder's pid stands in: creating it is atomic and names the
-# holder from birth, and a token whose holder is gone is taken over by an
-# atomic rename, checked to still name that dead holder, then removed, so
-# two waiters reaping at once cannot delete a live holder's token; a holder
-# re-reads its token shortly after taking it and yields if it was displaced.
-# The lock file carries the holder's branch, pid, start time and progress,
-# refreshed per completed check, so a waiter's message is specific. A waiter
-# polls every second, speaks every 30 s and gives up after
-# MERGEPATH_PREPUSH_LOCK_WAIT seconds (default 3600) rather than run
-# concurrently. Manual runs (--paths-from, HEAD vs merge-base, --plan) do
-# not lock: only the hook runs checks on a shared machine unattended.
+# the run's lifetime and dropped by the kernel with the holder, so nothing is
+# ever reaped by deleting a file (a lock reaped by deletion has a window in
+# which two waiters read the same dead pid; a kernel lock has none). It is
+# taken with flock(1) where that exists and otherwise with python3's fcntl on
+# the same inherited fd (macOS ships no flock(1); every host that can run the
+# checks has a python3, since the run requires one). Where neither exists the
+# hook fails closed as an environment error, like a missing ShellCheck. The
+# lock file carries the holder's branch, pid, start time and progress,
+# refreshed per completed check, so a waiter's message is specific; the file
+# is rewritten in place and never replaced or removed, because the lock lives
+# on its inode. A waiter polls every second, speaks every 30 s and gives up
+# after MERGEPATH_PREPUSH_LOCK_WAIT seconds (default 3600) rather than run
+# concurrently. Manual runs (--paths-from, HEAD vs merge-base, --plan) do not
+# lock: only the hook runs checks on a shared machine unattended.
 LOCK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 LOCK_FILE="$LOCK_DIR/prepush.lock"
-LOCK_HOLD="$LOCK_DIR/prepush.lock.d"
-LOCK_MODE=''      # kernel | token while this process holds the lock
-LOCK_IMPL=''      # kernel | token: what this host can use (lock_impl)
-LOCK_FLOCK=''     # flock(1), kernel mode
-LOCK_PY=''        # python3 with fcntl, kernel mode without flock(1)
+LOCK_HELD=0       # 1 while this process holds the lock
+LOCK_FLOCK=''     # flock(1) path, when present
+LOCK_PY=''        # python3 with fcntl, when flock(1) is absent
 LOCK_RECORD=''    # the record this run refreshes: the holder's, or via --lock-record
 LOCK_START=''
 
@@ -161,8 +156,8 @@ lock_field() {   # $1 field; empty when the record is absent (first run on a mac
   sed -n "/^$1=/{s/^$1=//p;q;}" "$LOCK_FILE" 2>/dev/null || true
 }
 
-# One write, in place: in kernel mode the lock lives on this inode, so the
-# file is never replaced, only rewritten.
+# One write, in place: the lock lives on this inode, so the file is never
+# replaced, only rewritten.
 lock_write_record() {   # $1 branch, $2 pid, $3 started, $4 progress
   printf 'branch=%s\npid=%s\nstarted=%s\nprogress=%s\n' "$1" "$2" "$3" "$4" > "$LOCK_FILE" 2>/dev/null || true
 }
@@ -185,32 +180,26 @@ holder_description() {   # "the run of <branch> (pid N, started HH:MM UTC, k of 
   printf 'the run of %s (pid %s, started %s, %s)' "${branch:-?}" "${pid:-?}" "${started:-?}" "$progress"
 }
 
-# Sets LOCK_IMPL (and LOCK_FLOCK or LOCK_PY): the implementation this host
-# can use, or the one MERGEPATH_PREPUSH_LOCK_IMPL forces.
-lock_impl() {
+# Sets LOCK_FLOCK or LOCK_PY, or dies: flock(1) first, then a python3 whose
+# fcntl answers the probe (a stub that merely exits 0 does not).
+lock_tooling() {
   local cand
-  case "${MERGEPATH_PREPUSH_LOCK_IMPL:-}" in
-    token) LOCK_IMPL=token; return 0 ;;
-    ''|kernel) ;;
-    *) die "MERGEPATH_PREPUSH_LOCK_IMPL must be kernel or token (got '$MERGEPATH_PREPUSH_LOCK_IMPL')" ;;
-  esac
   if LOCK_FLOCK=$(command -v flock 2>/dev/null) && [ -n "$LOCK_FLOCK" ]; then
-    LOCK_IMPL=kernel; return 0
+    return 0
   fi
   LOCK_FLOCK=''
   for cand in python3 "${MERGEPATH_PREPUSH_PYTHON:-}"; do
     [ -n "$cand" ] || continue
-    if command -v "$cand" >/dev/null 2>&1 && "$cand" -I -c 'import fcntl' >/dev/null 2>&1; then
-      LOCK_PY=$(command -v "$cand"); LOCK_IMPL=kernel; return 0
+    if command -v "$cand" >/dev/null 2>&1 \
+       && [ "$("$cand" -I -c 'import fcntl; print("fcntl-ok")' 2>/dev/null)" = fcntl-ok ]; then
+      LOCK_PY=$(command -v "$cand")
+      return 0
     fi
   done
-  if [ "${MERGEPATH_PREPUSH_LOCK_IMPL:-}" = kernel ]; then
-    die "MERGEPATH_PREPUSH_LOCK_IMPL=kernel needs flock(1) or a python3 with fcntl"
-  fi
-  LOCK_IMPL=token
+  die "the machine-wide hook lock needs flock(1) or a python3 with fcntl; neither is available"
 }
 
-lock_try_kernel() {   # non-blocking exclusive flock(2) on fd 9; the lock stays with the fd
+lock_try() {   # non-blocking exclusive flock(2) on fd 9; the lock stays with the fd
   if [ -n "$LOCK_FLOCK" ]; then
     "$LOCK_FLOCK" -n 9
   else
@@ -222,62 +211,14 @@ except OSError:
   fi
 }
 
-# Token mode: take over a token whose holder is gone. The rename is atomic,
-# so of several waiters only one gets the token; it then checks the token it
-# got still names that dead pid before removing it. A live holder's token
-# caught in the gap is put back if nothing has taken its place, and that
-# holder's own re-read after taking the token settles any remaining race.
-lock_reap_token() {   # $1 = the dead pid the token named
-  local grab="$LOCK_HOLD.reap.$$"
-  mv "$LOCK_HOLD" "$grab" 2>/dev/null || return 0
-  if [ "$(readlink "$grab" 2>/dev/null || true)" = "$1" ]; then
-    echo "$PREFIX: reaping the lock of pid $1 ($(lock_field branch)), which is no longer running"
-    rm -f "$grab"
-    : > "$LOCK_FILE" 2>/dev/null || true
-  else
-    [ -L "$LOCK_HOLD" ] || mv "$grab" "$LOCK_HOLD" 2>/dev/null || true
-    rm -f "$grab"
-  fi
-}
-
 prepush_lock_acquire() {   # $1 = the pushed branch this run checks
-  local bound="${MERGEPATH_PREPUSH_LOCK_WAIT:-3600}" mode t0 now last pid unreadable=0
+  local bound="${MERGEPATH_PREPUSH_LOCK_WAIT:-3600}" t0 now last pid
   case "$bound" in ''|*[!0-9]*) die "MERGEPATH_PREPUSH_LOCK_WAIT must be a whole number of seconds (got '$bound')" ;; esac
   mkdir -p "$LOCK_DIR" 2>/dev/null || die "cannot create $LOCK_DIR for the machine-wide hook lock"
-  lock_impl
-  mode="$LOCK_IMPL"
-  if [ "$mode" = kernel ]; then
-    exec 9>>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
-  fi
+  lock_tooling
+  exec 9>>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
   t0=$(date +%s); last=$((t0 - 30))
-  while :; do
-    if [ "$mode" = kernel ]; then
-      lock_try_kernel && break
-    else
-      if ln -s "$$" "$LOCK_HOLD" 2>/dev/null; then
-        # Taken. Re-read after a moment: a reaper that grabbed the previous
-        # token in the same instant may have displaced this one.
-        sleep 0.5
-        [ "$(readlink "$LOCK_HOLD" 2>/dev/null || true)" = "$$" ] && break
-        continue
-      fi
-      pid=$(readlink "$LOCK_HOLD" 2>/dev/null || true)
-      if [ -n "$pid" ] && ! holder_alive "$pid"; then
-        lock_reap_token "$pid"
-        continue
-      fi
-      if [ -z "$pid" ] && { [ -e "$LOCK_HOLD" ] || [ -L "$LOCK_HOLD" ]; }; then
-        # Something that is not a pid-naming symlink sits where the token
-        # goes (a leftover of some other shape). Ten seconds, then clear it.
-        unreadable=$((unreadable + 1))
-        if [ "$unreadable" -ge 10 ]; then
-          echo "$PREFIX: clearing an unreadable lock token at $LOCK_HOLD"
-          rm -rf "$LOCK_HOLD"
-          unreadable=0
-          continue
-        fi
-      fi
-    fi
+  until lock_try; do
     now=$(date +%s)
     if [ $((now - t0)) -ge "$bound" ]; then
       echo "$PREFIX: gave up after $((now - t0)) s waiting for $(holder_description); MERGEPATH_PREPUSH_LOCK_WAIT=<seconds> waits longer, MERGEPATH_PREPUSH_SKIP=1 or --no-verify bypasses" >&2
@@ -290,11 +231,10 @@ prepush_lock_acquire() {   # $1 = the pushed branch this run checks
     sleep 1
   done
   # Held. A clean release leaves an empty record, so a record naming a dead
-  # holder here means that run was killed (kernel mode: the kernel already
-  # freed its lock; token mode printed its message when it reaped).
-  LOCK_MODE="$mode"
+  # holder here means that run was killed and the kernel freed its lock.
+  LOCK_HELD=1
   pid=$(lock_field pid)
-  if [ "$mode" = kernel ] && [ -n "$pid" ] && [ "$pid" != "$$" ] && ! holder_alive "$pid"; then
+  if [ -n "$pid" ] && [ "$pid" != "$$" ] && ! holder_alive "$pid"; then
     echo "$PREFIX: reaping the lock record of pid $pid ($(lock_field branch)), which is no longer running"
   fi
   LOCK_START="$(date -u +%H:%M) UTC"
@@ -305,14 +245,10 @@ prepush_lock_acquire() {   # $1 = the pushed branch this run checks
 # Invoked indirectly by the hook's EXIT trap.
 # shellcheck disable=SC2329
 prepush_lock_release() {
-  [ -n "$LOCK_MODE" ] || return 0
+  [ "$LOCK_HELD" -eq 1 ] || return 0
   : > "$LOCK_FILE" 2>/dev/null || true
-  if [ "$LOCK_MODE" = token ]; then
-    [ "$(readlink "$LOCK_HOLD" 2>/dev/null || true)" != "$$" ] || rm -f "$LOCK_HOLD"
-  else
-    exec 9>&-
-  fi
-  LOCK_MODE=''
+  exec 9>&-
+  LOCK_HELD=0
 }
 
 prepush_lock_progress() {   # $1 completed, $2 total: refresh the record's progress line in place
