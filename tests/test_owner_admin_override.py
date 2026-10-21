@@ -75,6 +75,20 @@ def completion_fixture(*, requests=None, replies=False, response_time='2026-01-0
     return requests, [review], json.loads(result.stdout)
 
 
+def automatic_terminal_summary():
+    state = {'code_review': {'commit_sha': None, 'has_any_findings': False,
+                            'has_unresolved_findings': False, 'status': 'completed'},
+             'security_review': {'commit_sha': None, 'has_any_findings': None,
+                                'has_unresolved_findings': None, 'status': None}}
+    body = ('<!-- codex-pull-request-review-summary -->\n'
+            '<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->\n'
+            '| 📝 **Code Review** | ✅ **Completed** <relative-time '
+            'datetime="2026-01-01T00:00:02.123456Z">2026-01-01T00:00:02.123456Z</relative-time> '
+            '| — | PR opened |')
+    return {'id': 2, 'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:00Z',
+            'updated_at': '2026-01-01T00:00:02Z', 'body': body}
+
+
 class OverrideTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -669,6 +683,90 @@ print(json.dumps(result))
                      'Reviewed commit: ' + HEAD[:10] + '\nReviewed commit: ' + HEAD):
             self.state['comments'][1]['body'] = body
             self.assertEqual(self.run_prepare().returncode, 2)
+
+    def test_unanchored_automatic_terminal_is_idle_without_response_credit(self):
+        summary = automatic_terminal_summary()
+        self.state['comments'] = [summary]
+        for mode in ('prepare', 'check'):
+            with self.subTest(mode=mode):
+                result = self.run_prepare(mode=mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(override.response_anchor(summary['body'], HEAD))
+        request = {'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review',
+                   'created_at': '2026-01-01T00:00:01Z'}
+        self.state['comments'].insert(0, request)
+        for mode in ('prepare', 'check'):
+            self.assertEqual(self.run_prepare(mode=mode).returncode, 2)
+        response = {'id': 3, 'user': {'login': override.BOT}, 'body': 'Completed review',
+                    'commit_id': HEAD, 'submitted_at': '2026-01-01T00:00:03Z'}
+        self.assertFalse(override.codex_inflight([request, summary], [response], [], HEAD, 'nathanjohnpayne'))
+        response['commit_id'] = 'b' * 40
+        self.assertTrue(override.codex_inflight([request, summary], [response], [], HEAD, 'nathanjohnpayne'))
+
+    def test_unanchored_completed_with_unspecified_findings_is_only_idle(self):
+        summary = automatic_terminal_summary()
+        summary['body'] = summary['body'].replace('"has_any_findings": false', '"has_any_findings": null').replace(
+            '"has_unresolved_findings": false', '"has_unresolved_findings": null')
+        self.state['comments'] = [summary]
+        result = self.run_prepare(mode='check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(override.response_anchor(summary['body'], HEAD))
+        self.state['comments'].append({'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review',
+                                       'created_at': '2026-01-01T00:00:01Z'})
+        self.assertEqual(self.run_prepare(mode='check').returncode, 2)
+
+    def test_unanchored_terminal_rejects_ambiguous_machine_and_table_shapes(self):
+        summary = automatic_terminal_summary()
+        body = summary['body']
+        replacements = [('"status": "completed"', '"status": "running"'),
+                        ('"has_any_findings": false', '"has_any_findings": true'),
+                        ('"has_unresolved_findings": false', '"has_unresolved_findings": null'),
+                        ('"has_any_findings": false', '"has_any_findings": 0'),
+                        ('"commit_sha": null', '"commit_sha": "' + HEAD + '"'),
+                        ('codex-review-state:v1', 'codex-review-state:v2'),
+                        ('"code_review": {', '"code_review": {"status": "completed",'),
+                        ('"security_review": {', '"security_review": {"extra": null,'),
+                        ('✅ **Completed**', '🔄 **Running**'), ('PR opened', 'Manual request'),
+                        ('| — |', '| unknown |'), ('02.123456Z', '03.123456Z'),
+                        ('2026-01-01T00:00:02.123456Z</relative-time>', 'different</relative-time>')]
+        variants = [body.replace(old, new, 1) for old, new in replacements]
+        variants += [body + '\n' + body, body + '\n| 📝 **Code Review** | unknown | — | PR opened |',
+                     body + '\n| **Security Review** | Running | — | PR opened |',
+                     body.replace('<!-- codex-review-state:v1 ', '<!-- codex-review-state:v1 broken')]
+        for index, candidate in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(candidate, body)
+                self.state['comments'] = [{**summary, 'body': candidate}]
+                self.assertEqual(self.run_prepare(mode='check').returncode, 2)
+
+    def test_unanchored_terminal_rejects_case_variant_activity_rows(self):
+        summary = automatic_terminal_summary()
+        for label in ('SECURITY REVIEW', 'security review', 'CoDe ReViEw'):
+            for status in ('Running', 'Unknown'):
+                for unspecified in (False, True):
+                    body = summary['body']
+                    if unspecified:
+                        body = body.replace('"has_any_findings": false', '"has_any_findings": null').replace(
+                            '"has_unresolved_findings": false', '"has_unresolved_findings": null')
+                    candidate = {**summary, 'body': body + '\n| **' + label + '** | ' + status + ' | — | PR opened |'}
+                    with self.subTest(label=label, status=status, unspecified=unspecified):
+                        self.assertFalse(override.unanchored_terminal_summary(candidate))
+                        self.assertTrue(override.codex_inflight([candidate], [], [], HEAD, 'nathanjohnpayne'))
+        self.state['comments'] = [{**summary, 'body': summary['body']
+                                  + '\n| **SECURITY REVIEW** | Running | — | PR opened |'}]
+        for mode in ('prepare', 'check'):
+            self.assertEqual(self.run_prepare(mode=mode).returncode, 2)
+
+    def test_unanchored_terminal_never_suppresses_other_activity_or_edited_history(self):
+        summary = automatic_terminal_summary()
+        for anchor in (HEAD[:8], 'b' * 8):
+            for status in ('Running', 'Unknown'):
+                active = {**summary, 'id': 3, 'updated_at': '2026-01-01T00:00:03Z',
+                          'body': '<!-- codex-pull-request-review-summary -->\n'
+                          '| 📝 **Code Review** | **' + status + '** | `' + anchor + '` | PR opened |'}
+                self.assertTrue(override.codex_inflight([summary, active], [], [], HEAD, 'nathanjohnpayne'))
+        self.assertTrue(override.codex_inflight([summary], [], [], HEAD, 'nathanjohnpayne',
+                                              at='2026-01-01T00:00:01Z'))
 
     def test_running_summary_without_an_explicit_request_blocks(self):
         self.state['comments'] = [{'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:01Z',

@@ -1116,10 +1116,53 @@ run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$C
   --capture-input-dir "$WORK/capture-normal" >/dev/null 2>"$WORK/capture-normal.err"
 if [ ! -e "$CAPTURE/args" ] && grep -q '^diff --git a/scripts/a.sh' "$WORK/capture-normal/review.diff" \
    && jq -e --arg base "$C1" --arg head "$C2" \
-     '.canonical_base_sha == $base and .canonical_head_sha == $head and .historical_end_sha == "" and .finalize_historical == false' \
+     '.canonical_base_sha == $base and .canonical_head_sha == $head and .historical_end_sha == "" and .finalize_historical == false and .base_on_first_parent == true' \
      "$WORK/capture-normal/scope.json" >/dev/null; then
   pass "normal capture regenerates curated bytes and complete scope without dispatch"
 else fail "normal capture"; fi
+# #2633: a base reached only through a merge's second parent is not a merged
+# hub state; capture records that so escalation keeps the tripwires.
+SIDE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'side branch, never merged on its own')"
+MERGED="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C2" -p "$SIDE" -m 'merge side')"
+mkdir "$WORK/capture-second-parent"
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$SIDE" --head-sha "$MERGED" \
+  --capture-input-dir "$WORK/capture-second-parent" >/dev/null 2>"$WORK/capture-second-parent.err" || true
+if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.json" >/dev/null 2>&1; then
+  pass "capture records a second-parent base as off the first-parent history"
+else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
+# The audited head must have merged: it is on the first-parent history of the
+# trusted checkout's default-branch ref, not merely byte-equal to some commit.
+saved_default=$(git -C "$CANON" rev-parse --verify --quiet refs/remotes/origin/main || true)
+FEATURE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'unmerged feature commit on the watermark')"
+git -C "$CANON" update-ref refs/remotes/origin/main "$MERGED"
+for hcase in "$C2:true:a merged head on the default branch" "$FEATURE:false:an unmerged feature commit sitting on the watermark" "$SIDE:false:a commit reachable only through a merge's second parent"; do
+  h=${hcase%%:*}; rest=${hcase#*:}; want=${rest%%:*}; label=${rest#*:}
+  rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
+  run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$h" \
+    --capture-input-dir "$WORK/capture-default" >/dev/null 2>"$WORK/capture-default.err" || true
+  if jq -e --argjson want "$want" '.head_on_hub_default == $want' "$WORK/capture-default/scope.json" >/dev/null 2>&1; then
+    pass "capture records head_on_hub_default=$want for $label"
+  else fail "head_on_hub_default for $label: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
+done
+if [ -n "$saved_default" ]; then git -C "$CANON" update-ref refs/remotes/origin/main "$saved_default"; else git -C "$CANON" update-ref -d refs/remotes/origin/main; fi
+# A recent base with more than a pipe buffer of older history behind it
+# (2,500 commits of 41 bytes is ~100 KiB) is the real watermark shape. rev-list
+# prints newest first, so an early `grep -q` exit on the base SIGPIPEs it
+# under pipefail and reads the valid base as off the history.
+LONG_TIP="$C2"
+for _ in $(seq 1 2500); do
+  LONG_TIP="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$LONG_TIP" -m 'long first-parent history')"
+done
+RECENT_BASE="$LONG_TIP"
+for _ in 1 2 3; do
+  LONG_TIP="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$LONG_TIP" -m 'recent wave')"
+done
+mkdir "$WORK/capture-long-history"
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$RECENT_BASE" --head-sha "$LONG_TIP" \
+  --capture-input-dir "$WORK/capture-long-history" >/dev/null 2>"$WORK/capture-long-history.err" || true
+if jq -e '.base_on_first_parent == true' "$WORK/capture-long-history/scope.json" >/dev/null 2>&1; then
+  pass "capture finds a recent first-parent base with a full pipe buffer of history behind it"
+else fail "long-history base provenance: $(tail -n 2 "$WORK/capture-long-history.err")"; fi
 run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$CHURN_BASE" --head-sha "$EMPTY_HIST_HEAD" \
   --historical-end "$CHURN_MIDDLE" --capture-input-dir "$WORK/capture-chunk" >/dev/null 2>"$WORK/capture-chunk.err"
 if [ ! -e "$CAPTURE/args" ] && grep -q '^-old' "$WORK/capture-chunk/review.diff" \

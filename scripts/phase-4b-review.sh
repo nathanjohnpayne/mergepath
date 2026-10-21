@@ -1311,6 +1311,9 @@ revalidate_immutable_input() {
 if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; }; then
   escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
     || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
+  if [ "$(printf '%s' "$escalation" | jq -r '.exemption // empty')" = verified-propagation ]; then
+    p4b_warn "byte-verified propagation canary: tripwires do not re-gate canonical content that already merged on the hub (#2633)"
+  fi
   if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
     stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
       '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
