@@ -269,8 +269,8 @@ if bash "$WA" --parse-title-only "sync: no sha named here" >/dev/null 2>&1; then
   fail "sha-less title accepted"
 else pass "sha-less title rejected"; fi
 help_text="$(bash "$WA" --help)"
-printf '%s' "$help_text" | grep -q -- '--historical-end <sha> | --finalize-historical' \
-  && printf '%s' "$help_text" | grep -q 'exit 9' \
+grep -q -- '--historical-end <sha> | --finalize-historical' <<<"$help_text" \
+  && grep -q 'exit 9' <<<"$help_text" \
   && pass "help renders historical flags and partial-progress exit" \
   || fail "help truncated historical usage contract"
 

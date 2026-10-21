@@ -338,7 +338,7 @@ if [ "$rc" -eq 0 ] && grep -Fq 'issue create --repo octo/demo --title Repo-lint 
    && grep -Fq '| ordinary PR |' "$S1/created-body.md" \
    && grep -Fq 'https://example.test/run/1' "$S1/created-body.md" \
    && ! grep -Fq 'label create' "$S1/calls.log" \
-   && printf '%s\n' "$out" | grep -Fxq 'issue=123'; then
+   && grep -Fxq 'issue=123' <<<"$out"; then
   pass "alert with no tracking issue opens one, labelled, marker-keyed, carrying the report"
 else
   fail "alert create (rc=$rc): $out $(calls "$S1")"
@@ -359,7 +359,7 @@ if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title Repo-lint
    && ! grep -Fq 'issue comment' "$S2/calls.log" \
    && ! grep -Fq 'issue edit 90' "$S2/calls.log" \
    && ! grep -Fq 'issue edit 60' "$S2/calls.log" \
-   && printf '%s\n' "$out" | grep -Fxq 'issue=77'; then
+   && grep -Fxq 'issue=77' <<<"$out"; then
   pass "alert with an existing marker issue refreshes the lowest-numbered workflow-authored one in place, ignores a planted marker and a PR, and posts no comment when the alert set is unchanged"
 else
   fail "alert refresh (rc=$rc): $out $(calls "$S2")"
@@ -385,10 +385,10 @@ S3A="$SHIM/s3a"; mkdir -p "$S3A"
 cp "$S3/issues.json" "$S3A/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3A/labels.txt"; : > "$S3A/comment-fail"
 set +e; out=$(route "$S3A" 1 2>&1); rc=$?; set -e
 first_write=$(grep -n -E 'issue (comment|edit) 77' "$S3A/calls.log" | head -n 1)
-if [ "$rc" -eq 1 ] && printf '%s' "$first_write" | grep -Fq 'issue comment 77' \
+if [ "$rc" -eq 1 ] && grep -Fq 'issue comment 77' <<<"$first_write" \
    && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3A/calls.log" \
    && grep -Fxq '<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->' "$S3A/edited-body.md" \
-   && printf '%s' "$out" | grep -Fq '::error::The alert-set change on #77 could not be commented; the next run retries it.'; then
+   && grep -Fq '::error::The alert-set change on #77 could not be commented; the next run retries it.' <<<"$out"; then
   pass "a failed alert-change comment keeps the previous alert set in the marker for a retry and fails the step"
 else
   fail "comment failure (rc=$rc): $out $(calls "$S3A")"
@@ -399,7 +399,7 @@ S3B="$SHIM/s3b"; mkdir -p "$S3B"
 cp "$S3/issues.json" "$S3B/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3B/labels.txt"; : > "$S3B/add-label-fail"
 set +e; out=$(route "$S3B" 1 2>&1); rc=$?; set -e
 if [ "$rc" -eq 1 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3B/calls.log" \
-   && printf '%s' "$out" | grep -Fq '::error::A tracking label could not be ensured'; then
+   && grep -Fq '::error::A tracking label could not be ensured' <<<"$out"; then
   pass "a failed label re-apply on the existing tracker still refreshes it and then fails the step"
 else
   fail "add-label failure (rc=$rc): $out $(calls "$S3B")"
@@ -452,7 +452,7 @@ fi
 S6="$SHIM/s6"; mkdir -p "$S6"
 printf '[]' > "$S6/issues.json"; printf 'audit\narea:ci-infra\n' > "$S6/labels.txt"; : > "$S6/list-fail"
 set +e; out=$(route "$S6" 1 2>&1); rc=$?; set -e
-if [ "$rc" -eq 1 ] && ! grep -Fq 'issue create' "$S6/calls.log" && printf '%s' "$out" | grep -Fq '::error::Could not list open issues' \
+if [ "$rc" -eq 1 ] && ! grep -Fq 'issue create' "$S6/calls.log" && grep -Fq '::error::Could not list open issues' <<<"$out" \
    && grep -Fq 'api --paginate repos/octo/demo/issues?state=open&per_page=100' "$S6/calls.log"; then
   pass "the dedupe read is paginated, and when it fails the step exits 1 without opening a duplicate"
 else
@@ -469,7 +469,7 @@ set +e; out8=$(route "$S8" 1 2>&1); rc8=$?; set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'label create area:ci-infra --repo octo/demo' "$S7/calls.log" && grep -Fq 'label create audit --repo octo/demo' "$S7/calls.log" \
    && grep -Fq -- '--label area:ci-infra --label audit --body-file' "$S7/calls.log" \
    && [ "$rc8" -eq 1 ] && grep -Fq 'issue create --repo octo/demo --title Repo-lint latency audit alert --label audit --body-file' "$S8/calls.log" \
-   && printf '%s' "$out8" | grep -Fq '::error::A tracking label could not be ensured'; then
+   && grep -Fq '::error::A tracking label could not be ensured' <<<"$out8"; then
   pass "missing labels are created; an unensurable label still files the issue and then fails the step"
 else
   fail "label handling (rc=$rc rc8=$rc8): $(calls "$S7") --- $(calls "$S8") $out8"

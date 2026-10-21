@@ -306,7 +306,7 @@ fi
 #    caller a non-empty JSON blob with the guard passing.
 LEGACY_OUT=$(PATH="$SCALAR_BIN:$PATH" S799_MODE=err1 \
   bash -c 'x="$(gh api repos/o/r/pulls/1 --jq ".base.sha" 2>/dev/null || true)"; printf "%s" "$x"')
-if [ -n "$LEGACY_OUT" ] && printf '%s' "$LEGACY_OUT" | grep -q '"message"'; then
+if [ -n "$LEGACY_OUT" ] && grep -q '"message"' <<<"$LEGACY_OUT"; then
   pass "#799: the pre-fix shape really does capture the error body (guard-defeating input confirmed: ${#LEGACY_OUT} bytes)"
 else
   fail "#799: the legacy-shape control did not reproduce the defect (out='$LEGACY_OUT')"
@@ -326,7 +326,7 @@ fi
 #     WITHOUT a shape, an exit-0 error body passes through. This is why
 #     --shape exists and why every sha/login/timestamp site names one.
 scalar_call err0 "$WORK/s10.err" "PR body" "repos/o/r/pulls/1" --jq '.body // ""'
-if [ "$SC_RC" -eq 0 ] && printf '%s' "$SC_OUT" | grep -q '"message"'; then
+if [ "$SC_RC" -eq 0 ] && grep -q '"message"' <<<"$SC_OUT"; then
   pass "#799: --shape any passes an exit-0 payload through (documents why shaped sites must name a shape)"
 else
   fail "#799: unexpected --shape any behaviour (rc=$SC_RC out='$SC_OUT')"

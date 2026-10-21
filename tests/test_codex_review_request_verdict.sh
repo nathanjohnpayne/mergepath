@@ -475,8 +475,8 @@ STUB
     fetch_api_array "repos/o/r/x" "widgets" || printf "rc=%s\n" "$?"
   ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
 
-  if printf '%s' "$fetch_err_output" | grep -q 'HTTP 502 upstream exploded' \
-    && printf '%s' "$fetch_err_output" | grep -q 'rc=3'; then
+  if grep -q 'HTTP 502 upstream exploded' <<<"$fetch_err_output" \
+    && grep -q 'rc=3' <<<"$fetch_err_output"; then
     pass "fetch_api_array: a failed fetch still returns 3 and logs gh's stderr"
   else
     fail "fetch_api_array lost the failure status or the stderr diagnostic; got: $fetch_err_output"
@@ -520,8 +520,8 @@ STUB
     printf "kind=%s msg=%s\n" "$GH_API_ARRAY_ERROR_KIND" "$GH_API_ARRAY_ERROR"
   ' _ "$ARRAY_LIB" 2>/dev/null)"
 
-  if printf '%s' "$kind_output" | grep -q 'kind=flatten' \
-    && printf '%s' "$kind_output" | grep -q 'failed to flatten widgets pagination output'; then
+  if grep -q 'kind=flatten' <<<"$kind_output" \
+    && grep -q 'failed to flatten widgets pagination output' <<<"$kind_output"; then
     pass "gh_api_array: a parse failure is reported as kind=flatten, distinct from a fetch failure (#1008)"
   else
     fail "gh_api_array mislabelled a flatten failure; got: $kind_output"
@@ -541,8 +541,8 @@ STUB
     printf "kind=%s detail=%s\n" "$GH_API_ARRAY_ERROR_KIND" "$GH_API_ARRAY_DETAIL"
   ' _ "$ARRAY_LIB" 2>/dev/null)"
 
-  if printf '%s' "$kind_fetch_output" | grep -q 'kind=fetch' \
-    && printf '%s' "$kind_fetch_output" | grep -q 'HTTP 502 upstream exploded'; then
+  if grep -q 'kind=fetch' <<<"$kind_fetch_output" \
+    && grep -q 'HTTP 502 upstream exploded' <<<"$kind_fetch_output"; then
     pass "gh_api_array: a transport failure is reported as kind=fetch with gh's stderr as the detail (#1008)"
   else
     fail "gh_api_array mislabelled a fetch failure; got: $kind_fetch_output"

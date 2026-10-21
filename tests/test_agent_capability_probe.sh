@@ -316,7 +316,7 @@ for wording in unavailable reworded other; do
     >"$WORKDIR/cloud-$wording.json" 2>/dev/null
   set -e
   r="$(reason "$WORKDIR/cloud-$wording.json" graphql)"
-  if { [ "$wording" != other ] && printf '%s' "$r" | grep -q 'proxy GraphQL ceiling'; } \
+  if { [ "$wording" != other ] && grep -q 'proxy GraphQL ceiling' <<<"$r"; } \
      || { [ "$wording" = other ] && [ "$r" = "viewer query returned 403" ]; }; then
     pass "claude-cloud: GraphQL 403 with the '$wording' wording classified correctly ($r)"
   else
@@ -817,7 +817,7 @@ for mutation in '.capabilities.read = true' '.capabilities["author-writes"].gran
   out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
   set -e
   cp "$WORKDIR/good.json" "$CF"
-  if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q '^export ' && ! bash -c "$out; echo reached" 2>/dev/null | grep -q reached; then
+  if [ "$rc" -eq 2 ] && ! grep -q '^export ' <<<"$out" && ! bash -c "$out; echo reached" 2>/dev/null | grep -q reached; then
     pass "malformed cache ($mutation): exit 2, no export printed, guard fails under eval"
   else
     fail "malformed cache ($mutation): rc=$rc out=$out"
@@ -1051,8 +1051,8 @@ r_on="$(jq -r '.capabilities["author-writes"].reason' "$WORKDIR/opaque-in.json")
 # probe measures it through the login/role/scope checks (here it verifies the
 # login and then stops on unreadable token permissions), never on its class.
 if [ "$(jq -r '.capabilities["author-writes"].granted' "$WORKDIR/opaque.json")" = "false" ] \
-   && ! printf '%s' "$r_on" | grep -q "cannot be established" \
-   && printf '%s' "$r_on" | grep -q "^verified nathanjohnpayne"; then
+   && ! grep -q "cannot be established" <<<"$r_on" \
+   && grep -q "^verified nathanjohnpayne" <<<"$r_on"; then
   pass "opt-in: an unidentifiable token is measured through login/role/scope checks, not denied on its class"
 else
   fail "opt-in grant: off=$r_off on=$r_on"

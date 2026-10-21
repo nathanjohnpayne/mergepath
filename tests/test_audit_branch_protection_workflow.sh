@@ -82,7 +82,7 @@ else
   fail "workflow_dispatch must NOT be a trigger: it runs the definition from the dispatcher's ref, so the job's own ref guard is rewritable by the attacker and an admin-scoped PAT leaks to a feature branch"
 fi
 dispatch_types="$(yq -r '.on.repository_dispatch.types[]' "$WORKFLOW" 2>/dev/null || true)"
-if printf '%s\n' "$dispatch_types" | grep -qx "branch-protection-audit"; then
+if grep -qx "branch-protection-audit" <<<"$dispatch_types"; then
   pass "repository_dispatch trigger typed 'branch-protection-audit' (manual runs stay on the default branch)"
 else
   fail "expected a repository_dispatch trigger with type branch-protection-audit — got: [$dispatch_types]"
@@ -139,7 +139,7 @@ if [ "$audit_token" = '${{ secrets.BRANCH_PROTECTION_AUDIT_TOKEN }}' ]; then
 else
   fail "audit step must use secrets.BRANCH_PROTECTION_AUDIT_TOKEN — got: $audit_token"
 fi
-if echo "$audit_token" | grep -q "REVIEWER_ASSIGNMENT_TOKEN"; then
+if grep -q "REVIEWER_ASSIGNMENT_TOKEN" <<<"$audit_token"; then
   fail "audit step must NOT use the reviewer PAT (no Administration:read; 403s on every repo)"
 else
   pass "audit step does not use the reviewer PAT"
@@ -188,7 +188,7 @@ else
 fi
 
 # Label color: exactly six hex digits, no leading '#'.
-if printf '%s' "$WF_LABEL_COLOR" | grep -qE '^[0-9a-fA-F]{6}$'; then
+if grep -qE '^[0-9a-fA-F]{6}$' <<<"$WF_LABEL_COLOR"; then
   pass "tracking-label color '$WF_LABEL_COLOR' is a bare 6-digit hex value"
 else
   fail "tracking-label color must be exactly 6 hex digits with no leading '#' — got '$WF_LABEL_COLOR'"
@@ -266,7 +266,7 @@ run_audit_step() {  # <stub rc> <gh token>  → prints step stdout+stderr; sets 
 
 # rc 0 → clean, step succeeds.
 run_audit_step 0 "admin-pat"
-if [ "$STEP_RC" -eq 0 ] && echo "$STEP_OUTPUTS" | grep -qx "result=clean" && echo "$STEP_OUTPUTS" | grep -qx "exit_code=0"; then
+if [ "$STEP_RC" -eq 0 ] && grep -qx "result=clean" <<<"$STEP_OUTPUTS" && grep -qx "exit_code=0" <<<"$STEP_OUTPUTS"; then
   pass "audit rc=0 → result=clean, step succeeds"
 else
   fail "audit rc=0 mishandled (rc=$STEP_RC outputs=[$STEP_OUTPUTS])"
@@ -274,7 +274,7 @@ fi
 
 # rc 3 → drift, step succeeds so the rollup steps can run.
 run_audit_step 3 "admin-pat"
-if [ "$STEP_RC" -eq 0 ] && echo "$STEP_OUTPUTS" | grep -qx "result=drift" && echo "$STEP_OUTPUTS" | grep -qx "exit_code=3"; then
+if [ "$STEP_RC" -eq 0 ] && grep -qx "result=drift" <<<"$STEP_OUTPUTS" && grep -qx "exit_code=3" <<<"$STEP_OUTPUTS"; then
   pass "audit rc=3 → result=drift, step succeeds so the rollup runs"
 else
   fail "audit rc=3 mishandled (rc=$STEP_RC outputs=[$STEP_OUTPUTS])"
@@ -286,11 +286,11 @@ fi
 run_audit_step 2 "admin-pat"
 if [ "$STEP_RC" -ne 2 ]; then
   fail "audit rc=2 must fail the step with 2, got $STEP_RC"
-elif echo "$STEP_OUTPUTS" | grep -q "^result="; then
+elif grep -q "^result=" <<<"$STEP_OUTPUTS"; then
   fail "audit rc=2 must NOT set a result (would let the rollup steps fire): [$STEP_OUTPUTS]"
-elif ! echo "$STEP_TEXT" | grep -q "::error::"; then
+elif ! grep -q "::error::" <<<"$STEP_TEXT"; then
   fail "audit rc=2 must emit an ::error:: annotation; got: $STEP_TEXT"
-elif ! echo "$STEP_TEXT" | grep -q "NOT drift"; then
+elif ! grep -q "NOT drift" <<<"$STEP_TEXT"; then
   fail "audit rc=2 diagnostic must distinguish infrastructure failure from drift; got: $STEP_TEXT"
 else
   pass "audit rc=2 → job fails loudly, no result set, rollup issue untouched"
@@ -298,7 +298,7 @@ fi
 
 # rc 1 (usage/prereq) → same posture as rc 2.
 run_audit_step 1 "admin-pat"
-if [ "$STEP_RC" -eq 1 ] && ! echo "$STEP_OUTPUTS" | grep -q "^result=" && echo "$STEP_TEXT" | grep -q "::error::"; then
+if [ "$STEP_RC" -eq 1 ] && ! grep -q "^result=" <<<"$STEP_OUTPUTS" && grep -q "::error::" <<<"$STEP_TEXT"; then
   pass "audit rc=1 → job fails loudly, no result set"
 else
   fail "audit rc=1 mishandled (rc=$STEP_RC outputs=[$STEP_OUTPUTS])"
@@ -306,7 +306,7 @@ fi
 
 # An unexpected code is contract drift, not a pass.
 run_audit_step 7 "admin-pat"
-if [ "$STEP_RC" -eq 7 ] && echo "$STEP_TEXT" | grep -q "unexpected code 7"; then
+if [ "$STEP_RC" -eq 7 ] && grep -q "unexpected code 7" <<<"$STEP_TEXT"; then
   pass "audit rc=7 → job fails with a contract-drift diagnostic"
 else
   fail "unexpected audit rc mishandled (rc=$STEP_RC text=$STEP_TEXT)"
@@ -320,11 +320,11 @@ if [ "$STEP_RC" -eq 0 ]; then
   fail "empty BRANCH_PROTECTION_AUDIT_TOKEN must fail the job, got rc=0"
 elif ! grep -q "BRANCH_PROTECTION_AUDIT_TOKEN" <<<"$STEP_TEXT"; then
   fail "empty-token diagnostic must name the secret; got: $STEP_TEXT"
-elif ! echo "$STEP_TEXT" | grep -q "Administration:read"; then
+elif ! grep -q "Administration:read" <<<"$STEP_TEXT"; then
   fail "empty-token diagnostic must name the required scope; got: $STEP_TEXT"
 elif grep -q "stub fleet audit ran" <<<"$STEP_TEXT"; then
   fail "empty-token guard must run BEFORE the audit"
-elif echo "$STEP_OUTPUTS" | grep -q "^result="; then
+elif grep -q "^result=" <<<"$STEP_OUTPUTS"; then
   fail "empty-token path must NOT set a result: [$STEP_OUTPUTS]"
 else
   pass "empty BRANCH_PROTECTION_AUDIT_TOKEN → fails before auditing, names secret + scope"
@@ -353,7 +353,7 @@ else
     'docs/architecture/0002-branch-protection-enforcement-posture.md' \
     'event_type=branch-protection-audit'
   do
-    printf '%s' "$STEP_SUMMARY" | grep -qF "$needle" || missing="$missing [$needle]"
+    grep -qF "$needle" <<<"$STEP_SUMMARY" || missing="$missing [$needle]"
   done
 
   # `Administration: write` may appear only as the thing NOT to grant.
@@ -361,7 +361,7 @@ else
   # it would hand a weekly unattended credential the power to rewrite the
   # protection this audit exists to check.
   write_ok=1
-  if printf '%s' "$STEP_SUMMARY" | grep -qF 'Administration: write'; then
+  if grep -qF 'Administration: write' <<<"$STEP_SUMMARY"; then
     if ! printf '%s' "$STEP_SUMMARY" | grep -F 'Administration: write' | grep -qi 'never'; then
       write_ok=0
     fi
@@ -488,7 +488,7 @@ if [ "${1:-}" = "label" ] && [ "${2:-}" = "create" ]; then
     echo "HTTP 422: Validation Failed (description is too long (maximum is 100 characters))" >&2
     exit 1
   fi
-  if ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
+  if ! grep -qE '^[0-9a-fA-F]{6}$' <<<"$color"; then
     echo "HTTP 422: Validation Failed (color is invalid: must be 6 hex digits without a leading '#')" >&2
     exit 1
   fi
@@ -652,7 +652,7 @@ elif grep -q -- "issue create .*--label" "$ISSUE_WS/gh-calls.log"; then
   fail "with the label unensured the create must NOT pass --label (gh rejects an unknown label and the whole report is lost); calls: $(cat "$ISSUE_WS/gh-calls.log")"
 elif ! grep -q "short audit output line" "$ISSUE_BODY"; then
   fail "the degraded path must still assemble a full issue body"
-elif ! echo "$ISSUE_TEXT" | grep -q "::error::"; then
+elif ! grep -q "::error::" <<<"$ISSUE_TEXT"; then
   fail "the degraded path must emit an ::error:: annotation, not degrade silently; got: $ISSUE_TEXT"
 else
   pass "label unensured → drift is still reported (unlabelled), annotated, and the job then fails"
@@ -713,7 +713,7 @@ run_close_step() {  # env: GH_STUB_EXISTING / GH_STUB_LIST_FAIL
 run_close_step
 if [ "$CLOSE_RC" -ne 0 ]; then
   fail "clean audit with no open rollup issue must succeed, got rc=$CLOSE_RC: $CLOSE_TEXT"
-elif echo "$CLOSE_CALLS" | grep -q "issue close"; then
+elif grep -q "issue close" <<<"$CLOSE_CALLS"; then
   fail "nothing was open, yet the step tried to close something: $CLOSE_CALLS"
 else
   pass "clean audit, no open rollup issue → no-op success"
@@ -726,7 +726,7 @@ run_close_step
 unset GH_STUB_EXISTING
 if [ "$CLOSE_RC" -ne 0 ]; then
   fail "clean audit with open rollup issues must succeed, got rc=$CLOSE_RC: $CLOSE_TEXT"
-elif ! echo "$CLOSE_CALLS" | grep -q "issue close 77" || ! echo "$CLOSE_CALLS" | grep -q "issue close 88"; then
+elif ! grep -q "issue close 77" <<<"$CLOSE_CALLS" || ! grep -q "issue close 88" <<<"$CLOSE_CALLS"; then
   fail "clean audit must close every open rollup issue; calls: $CLOSE_CALLS"
 else
   pass "clean audit closes every open rollup issue"
@@ -744,11 +744,11 @@ run_close_step
 unset GH_STUB_LIST_FAIL
 if [ "$CLOSE_RC" -eq 0 ]; then
   fail "a failing 'gh issue list' must fail the step, not report an empty result (rc=0, text: $CLOSE_TEXT)"
-elif echo "$CLOSE_TEXT" | grep -q "nothing to do"; then
+elif grep -q "nothing to do" <<<"$CLOSE_TEXT"; then
   fail "a failing lookup must not be reported as 'no open rollup issue': $CLOSE_TEXT"
-elif ! echo "$CLOSE_TEXT" | grep -q "::error::"; then
+elif ! grep -q "::error::" <<<"$CLOSE_TEXT"; then
   fail "a failing lookup must emit an ::error:: annotation; got: $CLOSE_TEXT"
-elif echo "$CLOSE_CALLS" | grep -q "issue close"; then
+elif grep -q "issue close" <<<"$CLOSE_CALLS"; then
   fail "a failing lookup must not close anything; calls: $CLOSE_CALLS"
 else
   pass "a failing rollup lookup fails the step instead of masquerading as an empty result"
@@ -799,9 +799,9 @@ run_label_step() {  # <description>  → LABEL_RC / LABEL_TEXT / LABEL_OUTPUTS /
 run_label_step "$WF_LABEL_DESC"
 if [ "$LABEL_RC" -ne 0 ]; then
   fail "creating the tracking label with the workflow's own values failed: $LABEL_TEXT"
-elif ! echo "$LABEL_OUTPUTS" | grep -qx "ready=true"; then
+elif ! grep -qx "ready=true" <<<"$LABEL_OUTPUTS"; then
   fail "the workflow's own label values were REJECTED by GitHub's validation — the label is never created. Output: $LABEL_TEXT"
-elif ! echo "$LABEL_CALLS" | grep -q "label create"; then
+elif ! grep -q "label create" <<<"$LABEL_CALLS"; then
   fail "expected a label create call; calls: $LABEL_CALLS"
 else
   pass "the workflow's own label name/color/description pass GitHub's validation and yield ready=true"
@@ -812,8 +812,8 @@ GH_STUB_LABELS="$WF_LABEL_NAME"
 export GH_STUB_LABELS
 run_label_step "$WF_LABEL_DESC"
 unset GH_STUB_LABELS
-if [ "$LABEL_RC" -eq 0 ] && echo "$LABEL_OUTPUTS" | grep -qx "ready=true" \
-   && ! echo "$LABEL_CALLS" | grep -q "label create"; then
+if [ "$LABEL_RC" -eq 0 ] && grep -qx "ready=true" <<<"$LABEL_OUTPUTS" \
+   && ! grep -q "label create" <<<"$LABEL_CALLS"; then
   pass "existing label → ready=true with no create attempt"
 else
   fail "an existing label must short-circuit the create (rc=$LABEL_RC outputs=[$LABEL_OUTPUTS] calls: $LABEL_CALLS)"
@@ -828,7 +828,7 @@ GH_STUB_LABEL_LIST_FAIL=1
 export GH_STUB_LABELS GH_STUB_LABEL_LIST_FAIL
 run_label_step "$WF_LABEL_DESC"
 unset GH_STUB_LABELS GH_STUB_LABEL_LIST_FAIL
-if [ "$LABEL_RC" -eq 0 ] && echo "$LABEL_OUTPUTS" | grep -qx "ready=true"; then
+if [ "$LABEL_RC" -eq 0 ] && grep -qx "ready=true" <<<"$LABEL_OUTPUTS"; then
   pass "a failed label listing + an 'already exists' create is still ready=true"
 else
   fail "'already exists' means the label is present, not that ensuring it failed (rc=$LABEL_RC outputs=[$LABEL_OUTPUTS] text: $LABEL_TEXT)"
@@ -842,11 +842,11 @@ while [ "${#overlong}" -lt 101 ]; do overlong="${overlong}x"; done
 run_label_step "$overlong"
 if [ "$LABEL_RC" -ne 0 ]; then
   fail "a label failure must not fail the step — the rollup issue has not been written yet (rc=$LABEL_RC, text: $LABEL_TEXT)"
-elif ! echo "$LABEL_OUTPUTS" | grep -qx "ready=false"; then
+elif ! grep -qx "ready=false" <<<"$LABEL_OUTPUTS"; then
   fail "an unrecoverable label failure must report ready=false so the rollup step degrades; outputs=[$LABEL_OUTPUTS]"
-elif ! echo "$LABEL_TEXT" | grep -q "::warning::"; then
+elif ! grep -q "::warning::" <<<"$LABEL_TEXT"; then
   fail "a label failure must be annotated, not swallowed; got: $LABEL_TEXT"
-elif ! echo "$LABEL_TEXT" | grep -qi "maximum is 100"; then
+elif ! grep -qi "maximum is 100" <<<"$LABEL_TEXT"; then
   fail "the underlying gh/GitHub error must be surfaced in the log; got: $LABEL_TEXT"
 else
   pass "an over-long description degrades to ready=false with a ::warning:: instead of killing the report"

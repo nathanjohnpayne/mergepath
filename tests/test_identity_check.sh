@@ -112,9 +112,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-author mismatch: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "expected 'nathanjohnpayne'"; then
+elif ! grep -qi "expected 'nathanjohnpayne'" <<<"$out"; then
   fail "--expect-author mismatch: missing 'expected nathanjohnpayne' in output: $out"
-elif ! echo "$out" | grep -qi "use the token wrapper for guarded writes"; then
+elif ! grep -qi "use the token wrapper for guarded writes" <<<"$out"; then
   fail "--expect-author mismatch: missing remediation hint; output: $out"
 else
   pass "--expect-author mismatch: exit 2 with remediation"
@@ -159,7 +159,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-reviewer (cursor expected, claude active): exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "expected 'nathanpayne-cursor'"; then
+elif ! grep -qi "expected 'nathanpayne-cursor'" <<<"$out"; then
   fail "--expect-reviewer (cursor expected, claude active): missing expected identity; output: $out"
 else
   pass "--expect-reviewer cross-agent mismatch: exit 2"
@@ -183,7 +183,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "--expect-reviewer missing MERGEPATH_AGENT: exit $rc, expected 0 (fallback to claude); output: $out"
-elif ! echo "$out" | grep -qi "MERGEPATH_AGENT is unset"; then
+elif ! grep -qi "MERGEPATH_AGENT is unset" <<<"$out"; then
   fail "--expect-reviewer missing MERGEPATH_AGENT: missing warning; output: $out"
 else
   pass "--expect-reviewer missing MERGEPATH_AGENT: warns + falls back to claude"
@@ -213,7 +213,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-external codex (active=claude): exit $rc, expected 2"
-elif ! echo "$out" | grep -qi "expected 'nathanpayne-codex'"; then
+elif ! grep -qi "expected 'nathanpayne-codex'" <<<"$out"; then
   fail "--expect-external codex (active=claude): missing expected identity; output: $out"
 else
   pass "--expect-external codex mismatch: exit 2"
@@ -256,9 +256,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "--expect-token-identity mismatch: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "GH_TOKEN resolves to identity 'nathanjohnpayne'"; then
+elif ! grep -qi "GH_TOKEN resolves to identity 'nathanjohnpayne'" <<<"$out"; then
   fail "--expect-token-identity mismatch: missing actual identity; output: $out"
-elif ! echo "$out" | grep -qi "graphql write — PAT-attributed"; then
+elif ! grep -qi "graphql write — PAT-attributed" <<<"$out"; then
   fail "--expect-token-identity mismatch: missing matrix pointer; output: $out"
 else
   pass "--expect-token-identity mismatch: exit 2 with matrix pointer"
@@ -275,7 +275,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "--expect-token-identity no GH_TOKEN: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "GH_TOKEN is empty"; then
+elif ! grep -qi "GH_TOKEN is empty" <<<"$out"; then
   fail "--expect-token-identity no GH_TOKEN: missing diagnostic; output: $out"
 else
   pass "--expect-token-identity no GH_TOKEN: exit 3 (fail closed)"
@@ -291,7 +291,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "--expect-token-identity api failure: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "gh api user.*failed"; then
+elif ! grep -qi "gh api user.*failed" <<<"$out"; then
   fail "--expect-token-identity api failure: missing diagnostic; output: $out"
 else
   pass "--expect-token-identity api failure: exit 3 (fail closed)"
@@ -306,7 +306,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "keyring read failure: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qi "returned empty"; then
+elif ! grep -qi "returned empty" <<<"$out"; then
   fail "keyring read failure: missing diagnostic; output: $out"
 else
   pass "keyring read failure: exit 3 (fail closed)"
@@ -319,7 +319,7 @@ set +e
 out=$(run_check 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "no mode specified"; then
+if [ "$rc" -eq 1 ] && grep -qi "no mode specified" <<<"$out"; then
   pass "no mode: exit 1"
 else
   fail "no mode: exit $rc, output: $out"
@@ -332,7 +332,7 @@ set +e
 out=$(run_check --expect-author --expect-reviewer 2>&1)
 rc=$?
 set -e
-if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "conflicting modes"; then
+if [ "$rc" -eq 1 ] && grep -qi "conflicting modes" <<<"$out"; then
   pass "conflicting modes: exit 1"
 else
   fail "conflicting modes: exit $rc, output: $out"
@@ -369,7 +369,7 @@ write_case "user-held PAT reading as another login" 2 ghp_x STUB_TOKEN_LOGIN=nat
 write_case "cloud placeholder that reads as the login" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne
 if [ -s "$WORKDIR/api.log" ]; then
   fail "--expect-write-identity placeholder: GET /user was called before the class refused it"
-elif ! printf '%s' "$WRITE_OUT" | grep -q "credential class is 'brokered'"; then
+elif ! grep -q "credential class is 'brokered'" <<<"$WRITE_OUT"; then
   fail "--expect-write-identity placeholder: diagnostic does not name the class; output: $WRITE_OUT"
 else
   pass "--expect-write-identity placeholder: refused on class, before any API call"
@@ -416,7 +416,7 @@ else
 fi
 write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
 write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
-if printf '%s' "$WRITE_OUT" | grep -q "WARNING"; then
+if grep -q "WARNING" <<<"$WRITE_OUT"; then
   pass "--expect-write-identity opt-in: accepted with a stderr warning"
 else
   fail "--expect-write-identity opt-in: no warning; output: $WRITE_OUT"

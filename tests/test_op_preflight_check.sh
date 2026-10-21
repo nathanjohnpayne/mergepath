@@ -225,11 +225,11 @@ test_check_fresh_cache() {
     fail "test_check_fresh_cache: expected rc=0, got rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-1"; then
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-1" <<<"$out"; then
     fail "test_check_fresh_cache: stdout missing reviewer PAT export; got $out"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_AUTHOR_PAT=author-pat-1"; then
+  if ! grep -q "OP_PREFLIGHT_AUTHOR_PAT=author-pat-1" <<<"$out"; then
     fail "test_check_fresh_cache: stdout missing author PAT export; got $out"
     return
   fi
@@ -265,7 +265,7 @@ test_check_missing_cache() {
     fail "test_check_missing_cache: stdout on miss is not an eval-failing guard, got $(cat "$WORKDIR/case2.out")"
     return
   fi
-  if ! echo "$err" | grep -q "cache missing or stale"; then
+  if ! grep -q "cache missing or stale" <<<"$err"; then
     fail "test_check_missing_cache: stderr missing remediation; got $err"
     return
   fi
@@ -338,14 +338,14 @@ test_status_alias() {
   fi
   # The alias must track the CURRENT default, not the pre-#1021 one: bare
   # --status is a liveness check and must not leak either PAT.
-  if echo "$out" | grep -q "rev-pat-5\|author-pat-5"; then
+  if grep -q "rev-pat-5\|author-pat-5" <<<"$out"; then
     fail "test_status_alias: bare --status leaked a PAT on stdout"
     return
   fi
   local out_exp rc_exp=0
   out_exp=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
     "$SCRIPT" --agent claude --status --print-exports 2>/dev/null) || rc_exp=$?
-  if [ "$rc_exp" -ne 0 ] || ! echo "$out_exp" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-5"; then
+  if [ "$rc_exp" -ne 0 ] || ! grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-5" <<<"$out_exp"; then
     fail "test_status_alias: --status --print-exports did not emit the reviewer PAT"
     return
   fi
@@ -601,11 +601,11 @@ test_quiet_mode() {
     fail "test_quiet_mode: expected rc=0, got rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$err" | grep -q "no biometric burned"; then
+  if ! grep -q "no biometric burned" <<<"$err"; then
     fail "test_quiet_mode: stderr missing single-line confirmation; got $err"
     return
   fi
-  if echo "$err" | grep -q "── Preflight cached hit"; then
+  if grep -q "── Preflight cached hit" <<<"$err"; then
     fail "test_quiet_mode: stderr still contains verbose block; got $err"
     return
   fi
@@ -625,11 +625,11 @@ test_default_mode_is_review() {
     return
   fi
   err=$(cat "$WORKDIR/case7.err")
-  if ! echo "$err" | grep -q "mode review"; then
+  if ! grep -q "mode review" <<<"$err"; then
     fail "test_default_mode_is_review: dry-run header missing 'mode review'; got $err"
     return
   fi
-  if echo "$err" | grep -q "Would read: GCP ADC"; then
+  if grep -q "Would read: GCP ADC" <<<"$err"; then
     fail "test_default_mode_is_review: default mode should NOT load GCP ADC; got $err"
     return
   fi
@@ -655,11 +655,11 @@ test_default_ttl_is_ten_hours() {
     fail "test_default_ttl_is_ten_hours: 5h-old cache should be fresh under the 10h default; rc=$rc stderr=$err"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-8"; then
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-8" <<<"$out"; then
     fail "test_default_ttl_is_ten_hours: stdout missing reviewer PAT export; got $out"
     return
   fi
-  if ! echo "$err" | grep -q "TTL 36000s"; then
+  if ! grep -q "TTL 36000s" <<<"$err"; then
     fail "test_default_ttl_is_ten_hours: stderr should report the 36000s default TTL; got $err"
     return
   fi
@@ -685,7 +685,7 @@ test_ttl_override_both_directions() {
     fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=60 should expire a 5h-old cache, got rc=0"
     return
   fi
-  if ! echo "$err" | grep -q "cache missing or stale"; then
+  if ! grep -q "cache missing or stale" <<<"$err"; then
     fail "test_ttl_override_both_directions: shortened TTL missing remediation; got $err"
     return
   fi
@@ -704,11 +704,11 @@ test_ttl_override_both_directions() {
     fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=86400 should revive an 11h-old cache; rc=$rc stderr=$err"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-9b"; then
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-9b" <<<"$out"; then
     fail "test_ttl_override_both_directions: lengthened TTL missing reviewer PAT export; got $out"
     return
   fi
-  if ! echo "$err" | grep -q "TTL 86400s"; then
+  if ! grep -q "TTL 86400s" <<<"$err"; then
     fail "test_ttl_override_both_directions: stderr should report the overridden TTL; got $err"
     return
   fi
@@ -774,11 +774,11 @@ EOF
     fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy returned rc=$rc; out=$out"
     return
   fi
-  if echo "$out" | grep -q "invoked python3"; then
+  if grep -q "invoked python3" <<<"$out"; then
     fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy invoked python3 (ADC probe leaked)"
     return
   fi
-  if ! echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS="; then
+  if ! grep -q "export GOOGLE_APPLICATION_CREDENTIALS=" <<<"$out"; then
     fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy did not emit ADC export; out=$out"
     return
   fi
@@ -850,11 +850,11 @@ EOF
     fail "test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports returned rc=$rc; out=$out"
     return
   fi
-  if echo "$out" | grep -q "invoked python3"; then
+  if grep -q "invoked python3" <<<"$out"; then
     fail "test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports invoked python3; out=$out"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=" <<<"$out"; then
     fail "test_check_deploy_firebase_sa_no_python3_probe: missing Firebase SA marker export; out=$out"
     return
   fi
@@ -921,11 +921,11 @@ EOF
     fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: --check should fail closed; out=$out"
     return
   fi
-  if echo "$out" | grep -q "invoked python3"; then
+  if grep -q "invoked python3" <<<"$out"; then
     fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: --check invoked python3; out=$out"
     return
   fi
-  if ! echo "$out" | grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'"; then
+  if ! grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'" <<<"$out"; then
     fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: missing mismatch warning; out=$out"
     return
   fi
@@ -1016,15 +1016,15 @@ EOF
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=" <<<"$out"; then
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: missing Firebase SA marker export; out=$out"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$project"; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$project" <<<"$out"; then
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: missing Firebase project export; out=$out"
     return
   fi
-  if echo "$out" | grep -q "export OP_PREFLIGHT_ADC_TMPFILE"; then
+  if grep -q "export OP_PREFLIGHT_ADC_TMPFILE" <<<"$out"; then
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: should not export shared ADC marker; out=$out"
     return
   fi
@@ -1032,7 +1032,7 @@ EOF
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: op read touched shared GCP ADC; log=$(cat "$op_log")"
     return
   fi
-  if ! echo "$err" | grep -q "Firebase SA key ($project): loaded"; then
+  if ! grep -q "Firebase SA key ($project): loaded" <<<"$err"; then
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: summary missing Firebase SA loaded line; stderr=$err"
     return
   fi
@@ -1139,7 +1139,7 @@ EOF
     fail "test_deploy_mode_refreshes_unusable_cached_firebase_sa: rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$err" | grep -q "refreshing deploy credentials"; then
+  if ! grep -q "refreshing deploy credentials" <<<"$err"; then
     fail "test_deploy_mode_refreshes_unusable_cached_firebase_sa: missing refresh warning; stderr=$err"
     return
   fi
@@ -1151,7 +1151,7 @@ EOF
     fail "test_deploy_mode_refreshes_unusable_cached_firebase_sa: refresh touched shared GCP ADC; log=$(cat "$op_log")"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=" <<<"$out"; then
     fail "test_deploy_mode_refreshes_unusable_cached_firebase_sa: missing refreshed Firebase SA marker export; out=$out"
     return
   fi
@@ -1269,7 +1269,7 @@ EOF
     fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$err" | grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'"; then
+  if ! grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'" <<<"$err"; then
     fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: missing project mismatch warning; stderr=$err"
     return
   fi
@@ -1281,7 +1281,7 @@ EOF
     fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: refresh touched shared GCP ADC; log=$(cat "$op_log")"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$current_project"; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$current_project" <<<"$out"; then
     fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: missing refreshed current-project export; out=$out"
     return
   fi
@@ -1404,7 +1404,7 @@ EOF
     fail "test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch: rc=$rc; stderr=$err"
     return
   fi
-  if ! echo "$err" | grep -q "cached Firebase project SA key file does not match current project '$current_project'"; then
+  if ! grep -q "cached Firebase project SA key file does not match current project '$current_project'" <<<"$err"; then
     fail "test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch: missing file mismatch warning; stderr=$err"
     return
   fi
@@ -1416,7 +1416,7 @@ EOF
     fail "test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch: refresh touched shared GCP ADC; log=$(cat "$op_log")"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$current_project"; then
+  if ! grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$current_project" <<<"$out"; then
     fail "test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch: missing refreshed current-project export; out=$out"
     return
   fi
@@ -1442,25 +1442,25 @@ EOF
     fail "test_check_review_mode_omits_deploy_creds: expected rc=0, got rc=$rc"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-ms"; then
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-ms" <<<"$out"; then
     fail "test_check_review_mode_omits_deploy_creds: review PAT missing; out=$out"
     return
   fi
-  if echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS"; then
+  if grep -q "export GOOGLE_APPLICATION_CREDENTIALS" <<<"$out"; then
     fail "test_check_review_mode_omits_deploy_creds: deploy ADC exported into review-mode output; out=$out"
     return
   fi
-  if echo "$out" | grep -q "export CF_API_TOKEN"; then
+  if grep -q "export CF_API_TOKEN" <<<"$out"; then
     fail "test_check_review_mode_omits_deploy_creds: CF_API_TOKEN exported into review-mode output; out=$out"
     return
   fi
   # #466 r2: review mode must ALSO actively unset stale deploy vars that a
   # prior --mode deploy/all eval left in the caller's shell.
-  if ! echo "$out" | grep -q "unset .*GOOGLE_APPLICATION_CREDENTIALS"; then
+  if ! grep -q "unset .*GOOGLE_APPLICATION_CREDENTIALS" <<<"$out"; then
     fail "test_check_review_mode_omits_deploy_creds: review mode did not unset stale deploy vars; out=$out"
     return
   fi
-  if ! echo "$out" | grep -q "unset .*CF_API_TOKEN"; then
+  if ! grep -q "unset .*CF_API_TOKEN" <<<"$out"; then
     fail "test_check_review_mode_omits_deploy_creds: review mode did not unset CF_API_TOKEN; out=$out"
     return
   fi
@@ -1584,20 +1584,20 @@ EOF
     fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: --mode deploy with unreadable ADC unexpectedly succeeded (rc=0); out=$out"
     return
   fi
-  if echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS"; then
+  if grep -q "export GOOGLE_APPLICATION_CREDENTIALS" <<<"$out"; then
     fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: exported GOOGLE_APPLICATION_CREDENTIALS despite unreadable ADC; out=$out"
     return
   fi
-  if echo "$out" | grep -q "export OP_PREFLIGHT_DONE=1"; then
+  if grep -q "export OP_PREFLIGHT_DONE=1" <<<"$out"; then
     fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: emitted OP_PREFLIGHT_DONE=1 on a failed deploy; out=$out"
     return
   fi
   # #534.3: the warning must include op's stderr reason.
-  if ! echo "$err" | grep -q "could not read GCP ADC"; then
+  if ! grep -q "could not read GCP ADC" <<<"$err"; then
     fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: missing could-not-read warning; stderr=$err"
     return
   fi
-  if ! echo "$err" | grep -q "vault is locked"; then
+  if ! grep -q "vault is locked" <<<"$err"; then
     fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: warning did not surface op stderr reason (#534.3); stderr=$err"
     return
   fi
@@ -1656,7 +1656,7 @@ test_preflight_mode_is_exported() {
     fail "test_preflight_mode_is_exported: cache-hit --check --print-exports rc=$rc"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_MODE=review"; then
+  if ! grep -q "export OP_PREFLIGHT_MODE=review" <<<"$out"; then
     fail "test_preflight_mode_is_exported: cache-hit path did not export OP_PREFLIGHT_MODE; out=$out"
     return
   fi
@@ -1690,7 +1690,7 @@ EOF
     fail "test_preflight_mode_is_exported: full-fetch --mode review rc=$rc"
     return
   fi
-  if ! echo "$out" | grep -q "export OP_PREFLIGHT_MODE=review"; then
+  if ! grep -q "export OP_PREFLIGHT_MODE=review" <<<"$out"; then
     fail "test_preflight_mode_is_exported: full-fetch path did not export OP_PREFLIGHT_MODE; out=$out"
     return
   fi
@@ -1812,7 +1812,7 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     "$cache_dir/op-preflight-claude-deploy-adc.slot" > "$cache_dir/slot.tmp" && mv "$cache_dir/slot.tmp" "$cache_dir/op-preflight-claude-deploy-adc.slot"
   cf_out=$(cd "$case_dir" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     "$SCRIPT" --agent claude --mode all --skip-ssh 2>/dev/null || true)
-  if ! printf '%s\n' "$cf_out" | grep -q '^export CF_API_TOKEN=pre-slot-cf-token$'; then
+  if ! grep -q '^export CF_API_TOKEN=pre-slot-cf-token$' <<<"$cf_out"; then
     fail "all-degraded: a newer pre-slot CF_API_TOKEN was discarded by an older degraded slot"
     return
   fi
@@ -2458,11 +2458,11 @@ test_newer_pre_slot_write_supersedes_slot() {
       fail "legacy-vs-slot[$label]: --mode all failed (op must not be needed); stderr=$(cat "$case_dir/$label.err")"
       return
     fi
-    if [ "$label" = newer ] && ! printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$adc_file$"; then
+    if [ "$label" = newer ] && ! grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$adc_file$" <<<"$out"; then
       fail "legacy-vs-slot[newer]: a newer pre-slot write did not supersede an older degraded slot; out=$(printf '%s\n' "$out" | grep -v PAT)"
       return
     fi
-    if [ "$label" = older ] && printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS="; then
+    if [ "$label" = older ] && grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=" <<<"$out"; then
       fail "legacy-vs-slot[older]: an older pre-slot write overrode a newer slot; out=$(printf '%s\n' "$out" | grep -v PAT)"
       return
     fi
@@ -2488,7 +2488,7 @@ test_newer_pre_slot_write_supersedes_slot() {
     rc=0
     out=$(cd "$case_dir/kappa" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       "$SCRIPT" --agent claude --mode all --skip-ssh 2>"$case_dir/kappa-$variant.err") || rc=$?
-    if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$sa_file$"; then
+    if [ "$rc" -ne 0 ] || ! grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$sa_file$" <<<"$out"; then
       fail "legacy-vs-slot[$variant]: a newer pre-slot write for another context displaced proj-kappa's SA slot (rc=$rc); out=$(printf '%s\n' "$out" | grep -v PAT) err=$(cat "$case_dir/kappa-$variant.err")"
       return
     fi

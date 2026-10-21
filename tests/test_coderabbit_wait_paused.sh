@@ -381,9 +381,9 @@ test_paused_resume_then_review_clears() {
     fail "paused resume->review: resume posts=$resumes, expected exactly 1"
   elif [ "$retries" != "1" ]; then
     fail "paused resume->review: resume_retries=$retries, expected 1"
-  elif ! printf '%s' "$bodies" | grep -Fq "@coderabbitai resume"; then
+  elif ! grep -Fq "@coderabbitai resume" <<<"$bodies"; then
     fail "paused resume->review: did not post '@coderabbitai resume'; posts=[$bodies]"
-  elif printf '%s' "$bodies" | grep -Fq "try again"; then
+  elif grep -Fq "try again" <<<"$bodies"; then
     fail "paused resume->review: posted a rate-limit 'try again' instead of resume; posts=[$bodies]"
   else
     pass "auto-pause detected → @coderabbitai resume → review clears (exit 0, resume_retries=1)"

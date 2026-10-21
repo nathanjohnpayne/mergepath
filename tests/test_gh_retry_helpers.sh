@@ -121,7 +121,7 @@ OUT=$(FAKE_GH_STDOUT='{"ok":true}' \
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = '{"ok":true}' ] \
-   && ! printf '%s' "$OUT" | grep -q 'DEPRECATION-NOISE-MARKER'; then
+   && ! grep -q 'DEPRECATION-NOISE-MARKER' <<<"$OUT"; then
   pass "success path drops stderr noise entirely (merged stream is just stdout)"
 else
   fail "expected merged output to be just stdout; got rc=$RC out=[$OUT]"
@@ -143,7 +143,7 @@ ERR=$(FAKE_GH_STDOUT='' \
 RC=$?
 attempts_used=$(cat "$ATTEMPT_FILE")
 set -e
-if [ "$RC" = 1 ] && [ "$attempts_used" = 1 ] && printf '%s' "$ERR" | grep -q 'HTTP 404'; then
+if [ "$RC" = 1 ] && [ "$attempts_used" = 1 ] && grep -q 'HTTP 404' <<<"$ERR"; then
   pass "HTTP 404 classified permanent → 1 attempt, combined stream on stderr"
 else
   fail "expected fail-fast (1 attempt) with HTTP 404 on stderr; got rc=$RC attempts=$attempts_used err=[$ERR]"
@@ -190,7 +190,7 @@ ERR=$(FAKE_GH_STDOUT='partial-body' \
 RC=$?
 attempts_used=$(cat "$ATTEMPT_FILE")
 set -e
-if [ "$RC" = 1 ] && [ "$attempts_used" = 3 ] && printf '%s' "$ERR" | grep -q 'HTTP 503'; then
+if [ "$RC" = 1 ] && [ "$attempts_used" = 3 ] && grep -q 'HTTP 503' <<<"$ERR"; then
   pass "exhausted retries → 3 attempts, last rc=1, combined stream on stderr"
 else
   fail "expected 3 attempts + rc=1 + 503 on stderr; got rc=$RC attempts=$attempts_used err=[$ERR]"

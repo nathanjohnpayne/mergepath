@@ -792,7 +792,7 @@ TS_UNUSED_RULE='@typescript-eslint/no-unused-vars'
 for tpl in "$ESM_TEMPLATE" "$CJS_TEMPLATE"; do
   b=$(basename "$tpl")
   out_astro=$(reset_facts; export MERGEPATH_FACT_FRAMEWORKS="astro typescript"; source "$LIB"; template_substitution::render "$tpl")
-  if printf '%s' "$out_astro" | grep -qF "$ASTRO_TS_GLOB"; then
+  if grep -qF "$ASTRO_TS_GLOB" <<<"$out_astro"; then
     echo "PASS: 14a $b astro+ts render carries the .astro TS unused-vars glob"
     PASS=$((PASS + 1))
   else
@@ -800,7 +800,7 @@ for tpl in "$ESM_TEMPLATE" "$CJS_TEMPLATE"; do
     FAIL=$((FAIL + 1))
   fi
   out_react=$(reset_facts; export MERGEPATH_FACT_FRAMEWORKS="react"; source "$LIB"; template_substitution::render "$tpl")
-  if printf '%s' "$out_react" | grep -qF "$TS_UNUSED_RULE"; then
+  if grep -qF "$TS_UNUSED_RULE" <<<"$out_react"; then
     echo "FAIL: 14b $b react-only render leaks $TS_UNUSED_RULE without the typescript fact" >&2
     FAIL=$((FAIL + 1))
   else

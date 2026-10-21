@@ -229,7 +229,7 @@ git -C "$SIDE" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
 git_quiet -C "$SIDE" checkout -q -b unmerged-feature
 git_quiet -C "$SIDE" commit -q --allow-empty -m "unreviewed side-branch commit"
 prov_verify "$SIDE"
-if [ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q "is NOT on mergepath's default branch"; then
+if [ "$RC" -eq 1 ] && grep -q "is NOT on mergepath's default branch" <<<"$ERR"; then
   pass "source commit not on the default branch → exit 1, even when bytes match"
 else
   fail "side-branch source commit expected exit 1 + ancestry diagnostic, got $RC: $ERR"
@@ -264,7 +264,7 @@ git -C "$MERGED" update-ref refs/remotes/origin/main "$MERGE_SHA"
 git -C "$MERGED" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
 git_quiet -C "$MERGED" checkout -q --detach "$PR_BRANCH_SHA"
 prov_verify "$MERGED" "$PR_BRANCH_SHA"
-if [ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q "first-parent history"; then
+if [ "$RC" -eq 1 ] && grep -q "first-parent history" <<<"$ERR"; then
   pass "second-parent-only commit of a true merge → exit 1 (ancestor but never a default-branch state)"
 else
   fail "second-parent-only commit expected exit 1 + first-parent diagnostic, got $RC: $ERR"
@@ -279,11 +279,11 @@ prov_verify "$MP" "$MP_SHA"
 [ "$RC" -eq 0 ] && pass "full source_sha equal to HEAD → exit 0" \
   || fail "matching full source_sha expected exit 0, got $RC: $ERR"
 prov_verify "$MP" "${MP_SHA:0:7}"
-[ "$RC" -eq 2 ] && printf '%s' "$ERR" | grep -q "full 40-hex" \
+[ "$RC" -eq 2 ] && grep -q "full 40-hex" <<<"$ERR" \
   && pass "abbreviated source_sha → exit 2" \
   || fail "abbreviated source_sha expected exit 2, got $RC: $ERR"
 prov_verify "$SIDE" "$MP_SHA"
-[ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q "is not the requested source commit" \
+[ "$RC" -eq 1 ] && grep -q "is not the requested source commit" <<<"$ERR" \
   && pass "source_sha differing from mergepath_dir HEAD → exit 1" \
   || fail "mismatched source_sha expected exit 1, got $RC: $ERR"
 
@@ -291,14 +291,14 @@ prov_verify "$SIDE" "$MP_SHA"
 PLAIN="$WORKDIR/mp-plain"; mkdir -p "$PLAIN"
 cp -R "$MP/scripts" "$MP/.mergepath-sync.yml" "$PLAIN/"
 prov_verify "$PLAIN"
-[ "$RC" -eq 2 ] && printf '%s' "$ERR" | grep -q "not the top of a git checkout" \
+[ "$RC" -eq 2 ] && grep -q "not the top of a git checkout" <<<"$ERR" \
   && pass "mergepath_dir that is not a git checkout → exit 2" \
   || fail "plain-dir mergepath expected exit 2, got $RC: $ERR"
 NOHEAD="$WORKDIR/mp-nohead"
 git clone -q "$MP" "$NOHEAD" 2>/dev/null
 git -C "$NOHEAD" symbolic-ref --delete refs/remotes/origin/HEAD
 prov_verify "$NOHEAD"
-[ "$RC" -eq 2 ] && printf '%s' "$ERR" | grep -q "records no default branch" \
+[ "$RC" -eq 2 ] && grep -q "records no default branch" <<<"$ERR" \
   && pass "no recorded default branch (origin/HEAD) → exit 2" \
   || fail "missing origin/HEAD expected exit 2, got $RC: $ERR"
 

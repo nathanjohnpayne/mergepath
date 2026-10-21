@@ -130,7 +130,7 @@ rc=$?
 set -e
 if [[ $rc -eq 0 ]]; then
   fail "one missing: expected nonzero exit, got 0; output: $out"
-elif ! echo "$out" | grep -q "check_bar"; then
+elif ! grep -q "check_bar" <<<"$out"; then
   fail "one missing: diagnostic does not name check_bar; output: $out"
 else
   pass "one missing: fails closed and names check_bar"
@@ -186,7 +186,7 @@ rc=$?
 set -e
 if [[ $rc -eq 0 ]]; then
   fail "comment-only mention: expected fail, comment should not count as wired; output: $out"
-elif ! echo "$out" | grep -q "check_foo"; then
+elif ! grep -q "check_foo" <<<"$out"; then
   fail "comment-only mention: diagnostic does not name check_foo; output: $out"
 else
   pass "comment-only mention: NOT counted as wired"
@@ -217,7 +217,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_not_ready_yet"; then
+if [[ $rc -ne 0 ]] && grep -q "check_not_ready_yet" <<<"$out"; then
   pass "non-executable check file: still required to be wired (r5 — workflow chmods regardless of pre-state)"
 else
   fail "non-executable check file: expected exit 1 with 'check_not_ready_yet' in diagnostic, got rc=$rc; output: $out"
@@ -333,7 +333,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_nowhere"; then
+if [[ $rc -ne 0 ]] && grep -q "check_nowhere" <<<"$out"; then
   pass "annex present, unwired in both: fails closed and names check_nowhere"
 else
   fail "annex present, unwired in both: expected nonzero exit naming check_nowhere, got rc=$rc; output: $out"
@@ -355,7 +355,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_nowhere"; then
+if [[ $rc -ne 0 ]] && grep -q "check_nowhere" <<<"$out"; then
   pass "annex comment-only mention: NOT counted as wired"
 else
   fail "annex comment-only mention: expected nonzero exit naming check_nowhere, got rc=$rc; output: $out"
@@ -390,7 +390,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "no push/pull_request trigger"; then
+if [[ $rc -ne 0 ]] && grep -q "no push/pull_request trigger" <<<"$out"; then
   pass "annex without any on: trigger is rejected — cannot satisfy wiring (#624)"
 else
   fail "shapeless annex accepted (rc=$rc); output: $out"
@@ -423,7 +423,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "no push/pull_request trigger"; then
+if [[ $rc -ne 0 ]] && grep -q "no push/pull_request trigger" <<<"$out"; then
   pass "workflow_dispatch-only annex is rejected — not a wiring vehicle (#624)"
 else
   fail "dispatch-only annex accepted (rc=$rc); output: $out"
@@ -516,7 +516,7 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_bar" && [[ ! -f "$repo/.github/workflows/repo_lint_local.yml" ]]; then
+if [[ $rc -ne 0 ]] && grep -q "check_bar" <<<"$out" && [[ ! -f "$repo/.github/workflows/repo_lint_local.yml" ]]; then
   pass "annex absent: single-file behavior preserved (fails closed, names check_bar)"
 else
   fail "annex absent: expected nonzero exit naming check_bar with no annex on disk, got rc=$rc; output: $out"
