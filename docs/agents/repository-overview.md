@@ -181,3 +181,5 @@ CodeRabbit recovery-helper GitHub reads and writes are bounded to30 seconds per 
 CodeRabbit evidence escalation continues later nominated PRs after an expected per-PR failure, emits a PR-bound diagnostic and retains a failing final status. Immutable tuples, owner recovery and uncertain-write behavior remain enforced.
 
 CodeRabbit recovery releases use the governing base policy author identity, with the existing absent-field fallback. The typed identity and full policy base bind the evidence episode; a changed live base prevents recovery output.
+
+The shared policy YAML reader rejects additional documents before the preferred `yq` path emits JSON, and conversion failures emit no partial value. The parser contract and native controls are in `specs/review_feedback_accounting.md` and `tests/test_feedback_policy_helpers.sh` (#2523).
