@@ -1127,6 +1127,7 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # makes these anchors correct rather than merely narrower.
 _FD_PREFIX = r"(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9]*)"
 _REDIR_RE = re.compile(r"^" + _FD_PREFIX + r"(&>>|&>|>>|>\||>&|<&|<>|<|>)")
+_HERESTRING_RE = re.compile(r"^" + _FD_PREFIX + r"<<<$")
 # OUTPUT redirections only.  Only these can carry a value past a capture --
 # `_v=$(printf %s "$PAT" >&2)` is the escape #1012 measured.  An INPUT
 # redirection (`<`, `<<`, `<<<`) feeds the command and cannot escape anything,
@@ -2064,8 +2065,14 @@ class Lexer:
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
-                    # here-string: the following word belongs to this segment
-                    cur_level()["seg"].words.append("<<<")
+                    # Reuse the existing redirection prefix grammar: an
+                    # adjacent descriptor belongs to the operator, not its word.
+                    prefix = "".join(cur_level()["word"])
+                    if not _is_fd_prefix(prefix):
+                        finish_word()
+                        prefix = ""
+                    cur_level()["word"] = []
+                    cur_level()["seg"].words.append(prefix + "<<<")
                     i += 3
                     continue
                 j = i + 2
@@ -2188,6 +2195,11 @@ class Lexer:
                 # process substitution: a NON-capturing level, so the emitter
                 # inside is judged on its own merits
                 parent_seg = cur_level()["seg"]
+                if (parent_seg.words and _HERESTRING_RE.fullmatch(parent_seg.words[-1])
+                        and not cur_level()["word"]):
+                    # This child still occupies the here-string operand word.
+                    # A width-only marker must not look like output redirection.
+                    cur_level()["word"].append("<()")
                 seg = self._new_segment(parent_seg, False, line)
                 cur_ll.segments.append(seg)
                 levels.append(
@@ -3166,8 +3178,19 @@ def resolve_command(seg):
         if w in ("{", "}"):
             idx += 1
             continue
-        if w == "<<" or w == "<<<":
+        if w == "<<":
+            # The lexer already consumed the here-doc delimiter.
             idx += 1
+            continue
+        if _HERESTRING_RE.fullmatch(w):
+            # Spaced and attached source forms retain a separate operand word.
+            if (idx + 1 < len(words)
+                    and _unquote_command_word(words[idx + 1], allow_empty=True) is None):
+                # Expanding operands can diagnose before the command runs.
+                # Keep the parent's opaque reading, without grading expansion.
+                seg._cmd = (UNRESOLVED, has_redir)
+                return seg._cmd
+            idx += 2
             continue
         if _ASSIGN_RE.match(w):
             idx += 1
@@ -3285,7 +3308,7 @@ def tee_file_operands(seg):
             continue
         if w in ("{", "}", "<<"):
             continue
-        if w == "<<<":
+        if _HERESTRING_RE.fullmatch(w):
             skip_next = True  # the here-string word, not a file operand
             continue
         m = _REDIR_RE.match(w)
@@ -3662,7 +3685,7 @@ def reaches_output(ref, emitter_helpers, helper_routing=None):
         # `cat`/`tee` write their standard input, so a here-doc body or a
         # here-string handed to one is an emission by the same rule.
         elif kind != EMIT and cmd in STDIN_ECHOERS:
-            if note is not None or "<<<" in seg.words:
+            if note is not None or any(_HERESTRING_RE.fullmatch(w) for w in seg.words):
                 kind = EMIT
                 if note is None:
                     note = "here-string"
@@ -4068,7 +4091,7 @@ def discover_emitter_helpers(text, return_routing=False):
                         if not (
                             cmd in STDIN_ECHOERS
                             and cmd not in bodies
-                            and "<<<" in seg.words
+                            and any(_HERESTRING_RE.fullmatch(w) for w in seg.words)
                         ):
                             continue
                     for w in seg.words:
@@ -5549,7 +5572,7 @@ def _command_arguments(words, start):
             continue
         if word in ("{", "}", "<<"):
             continue
-        if word == "<<<":
+        if _HERESTRING_RE.fullmatch(word):
             skip_next = True
             continue
         match = _REDIR_RE.match(word)
@@ -15800,6 +15823,108 @@ def _pid_continuation_cases():
     return failures
 
 
+def _leading_herestring_cases():
+    """Here-string operands precede commands; here-doc delimiters are absent."""
+    failures = []
+    cases = [
+        ('<<< x echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('<<<x echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('<<< x printf \'%s\\n\' "$GH_TOKEN"\n', "printf", 2, False),
+        ('echo "$GH_TOKEN" <<< x\n', "echo", 0, False),
+        ('<<< x : "$GH_TOKEN"\n', ":", 2, False),
+        ('< /dev/null echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('</dev/null echo "$GH_TOKEN"\n', "echo", 1, False),
+        ('>out echo "$GH_TOKEN"\n', "echo", 1, True),
+        ('<<EOF echo "$GH_TOKEN"\nx\nEOF\n', "echo", 1, False),
+        ('< /dev/null : "$GH_TOKEN"\n', ":", 2, False),
+    ]
+    for source, command, index, redirected in cases:
+        lx = Lexer(source)
+        seg = next(seg for ll in lx.logical for seg in ll.segments if seg.words)
+        actual = resolve_command(seg)
+        if actual != (command, redirected) or seg._cmd_index != index:
+            failures.append("leading here-string resolution: %r expected %s at %d, got %r at %s" %
+                            (source, command, index, actual, seg._cmd_index))
+        if source.startswith("<<<") and seg.words[:2] != ["<<<", "x"]:
+            failures.append("leading here-string lexer: operator and operand must be separate")
+    return failures
+
+
+def _herestring_operand_cases():
+    """Pin lexical operand width/order and inherited expansion opacity."""
+    failures = []
+    for source, words, command, index in (
+        ('echo<<< x "$GH_TOKEN"\n',
+         ['echo', '<<<', 'x', '"$GH_TOKEN"'], 'echo', 0),
+        ('printf<<<x \'%s\\n\' "$GH_TOKEN"\n',
+         ['printf', '<<<', 'x', "'%s\\n'", '"$GH_TOKEN"'], 'printf', 0),
+        ('<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN"\n',
+         ['<<<', '<()', 'printf', "'%s\\n'", '"$GH_TOKEN"'], 'printf', 2),
+        ('<<< <(printf x)suffix : "$GH_TOKEN"\n',
+         ['<<<', '<()suffix', ':', '"$GH_TOKEN"'], ':', 2),
+        ('<<< >(:) echo "$GH_TOKEN"\n',
+         ['<<<', '<()', 'echo', '"$GH_TOKEN"'], 'echo', 2),
+        ('<<< \'<()\' : "$GH_TOKEN"\n',
+         ['<<<', "'<()'", ':', '"$GH_TOKEN"'], ':', 2),
+        ('<<< $((1/$GH_TOKEN)) :\n',
+         ['<<<', '$((1/$GH_TOKEN))', ':'], UNRESOLVED, None),
+        ('<<< "$GH_TOKEN" :\n',
+         ['<<<', '"$GH_TOKEN"', ':'], UNRESOLVED, None),
+        ('<<< \'$((1/$GH_TOKEN))\' : "$GH_TOKEN"\n',
+         ['<<<', "'$((1/$GH_TOKEN))'", ':', '"$GH_TOKEN"'], ':', 2),
+        ('\'<<<\' x echo "$GH_TOKEN"\n',
+         ["'<<<'", 'x', 'echo', '"$GH_TOKEN"'], '<<<', 0),
+    ):
+        lx = Lexer(source)
+        seg = next(seg for ll in lx.logical for seg in ll.segments if seg.words)
+        actual = resolve_command(seg)
+        if seg.words != words or actual != (command, False) or seg._cmd_index != index:
+            failures.append("here-string operand boundary: %r expected %r/%s/%s, got %r/%r/%s" %
+                            (source, words, command, index, seg.words, actual, seg._cmd_index))
+    return failures
+
+
+def _herestring_descriptor_cases():
+    """Keep bound descriptors and empty operands separate from command proof."""
+    failures = []
+    for prefix in ("0", "00", "12", "{fd}"):
+        for operand, command in (("echo", ":"), ("x", "echo")):
+            source = '%s<<< %s %s "$GH_TOKEN"\n' % (prefix, operand, command)
+            lx = Lexer(source)
+            seg = next(seg for ll in lx.logical for seg in ll.segments if seg.words)
+            if (seg.words != [prefix + "<<<", operand, command, '"$GH_TOKEN"']
+                    or resolve_command(seg) != (command, False) or seg._cmd_index != 2):
+                failures.append("here-string descriptor binding: %r got %r/%r/%s" %
+                                (source, seg.words, resolve_command(seg), seg._cmd_index))
+    for source, command, index in (
+        ('<<< \'\' : "$GH_TOKEN"\n', ':', 2),
+        ('<<< "" : "$GH_TOKEN"\n', ':', 2),
+        ('<<< \'\' "$cmd" "$GH_TOKEN"\n', UNRESOLVED, None),
+        ('<<< \'\' \'\' "$GH_TOKEN"\n', UNRESOLVED, None),
+        ('0 <<< x echo "$GH_TOKEN"\n', '0', 0),
+        ('"0"<<< x echo "$GH_TOKEN"\n', '0', 0),
+        ('\\0<<< x echo "$GH_TOKEN"\n', '0', 0),
+        ('0<<< <(printf x) echo "$GH_TOKEN"\n', 'echo', 2),
+    ):
+        seg = next(seg for ll in Lexer(source).logical for seg in ll.segments if seg.words)
+        if resolve_command(seg) != (command, False) or seg._cmd_index != index:
+            failures.append("here-string descriptor/empty boundary: %r got %r/%s" %
+                            (source, resolve_command(seg), seg._cmd_index))
+    seg = Lexer('tee 12<<< input out.txt\n').logical[0].segments[0]
+    if tee_file_operands(seg) != ['out.txt']:
+        failures.append("here-string descriptor: tee operand became a file")
+    if list(_command_arguments(seg.words, 1)) != [('out.txt', 'out.txt')]:
+        failures.append("here-string descriptor: redirection operand became an argument")
+    for descriptor in ('0', '3'):
+        # Preserve the prior conservative presence rule, not a descriptor model.
+        findings, errors = scan_text('cat %s<<< "$GH_TOKEN"\n' % descriptor)
+        if not findings or errors:
+            failures.append("here-string descriptor: stdin-echoer presence rule changed")
+    if 'log' not in discover_emitter_helpers('log(){ cat 0<<< "$1"; }\n'):
+        failures.append("here-string descriptor: stdin-echoer helper lost")
+    return failures
+
+
 def _pid_special_parameter_cases():
     """Pin independent readers and later real-reference source coordinates."""
     failures = []
@@ -16514,6 +16639,60 @@ CORPUS += [
     ("pid-continuation-helper-braced-real", MUST_FLAG, "show(){ echo \"$\\\n$${1}\"; }; show \"$GH_TOKEN\"\n"),
     ("pid-continuation-helper-heredoc-real", MUST_FLAG, "show(){ cat <<EOF\n$\\\n$$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
     ("pid-continuation-helper-heredoc-literal", MUST_NOT_FLAG, "show(){ cat <<EOF\n$\\\n$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
+]
+
+
+# #1462: a leading here-string's literal operand is not the command word.
+CORPUS += [
+    ("leading-herestring-spaced-echo", MUST_FLAG, '<<< x echo "$GH_TOKEN"\n'),
+    ("leading-herestring-attached-echo", MUST_FLAG, '<<<x echo "$GH_TOKEN"\n'),
+    ("leading-herestring-spaced-printf", MUST_FLAG, '<<< x printf \'%s\\n\' "$GH_TOKEN"\n'),
+    ("leading-herestring-trailing-echo-control", MUST_FLAG, 'echo "$GH_TOKEN" <<< x\n'),
+    ("leading-herestring-safe-colon-control", MUST_NOT_FLAG, '<<< x : "$GH_TOKEN"\n'),
+]
+
+
+# #1462 review repair: lexical ordering/width and leading operand diagnostics.
+CORPUS += [
+    ("herestring-review-attached-echo", MUST_FLAG, 'echo<<< x "$GH_TOKEN"\n'),
+    ("herestring-review-attached-echo-compact", MUST_FLAG, 'echo<<<x "$GH_TOKEN"\n'),
+    ("herestring-review-attached-printf", MUST_FLAG, 'printf<<< x \'%s\\n\' "$GH_TOKEN"\n'),
+    ("herestring-review-attached-quiet", MUST_NOT_FLAG, ':<<< x "$GH_TOKEN"\n'),
+    ("herestring-review-process-operand", MUST_FLAG, '<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN"\n'),
+    ("herestring-review-process-suffix", MUST_FLAG, '<<< <(printf x)suffix echo "$GH_TOKEN"\n'),
+    ("herestring-review-process-quiet", MUST_NOT_FLAG, '<<< <(printf x) : "$GH_TOKEN"\n'),
+    ("herestring-review-process-output-operand", MUST_FLAG, '<<< >(:) echo "$GH_TOKEN"\n'),
+    ("herestring-review-process-output-captured", MUST_NOT_FLAG, 'saved=$(<<< >(:) echo "$GH_TOKEN")\n'),
+    ("herestring-review-process-captured", MUST_NOT_FLAG, 'saved=$(<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN")\n'),
+    ("herestring-review-process-child-stderr", MUST_FLAG, '<<< <(printf \'%s\' "$GH_TOKEN" >&2) :\n'),
+    ("herestring-review-process-trailing", MUST_FLAG, 'printf \'%s\\n\' "$GH_TOKEN" <<< <(printf x)\n'),
+    ("herestring-review-command-operand", MUST_FLAG, '<<< "$(printf x)" echo "$GH_TOKEN"\n'),
+    ("herestring-review-arithmetic-diagnostic", MUST_FLAG, '<<< $(($GH_TOKEN/0)) :\n'),
+    ("herestring-review-quoted-arithmetic", MUST_NOT_FLAG, '<<< \'$((1/$GH_TOKEN))\' : "$GH_TOKEN"\n'),
+    ("herestring-review-quoted-process", MUST_NOT_FLAG, '<<< \'<(printf x)\' : "$GH_TOKEN"\n'),
+]
+
+
+# #1462 descriptor preservation: existing prefix grammar and empty operands.
+CORPUS += [
+    ("herestring-descriptor-zero-quiet", MUST_NOT_FLAG, '0<<< echo : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-zero-emitter", MUST_FLAG, '0<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-zeroes-quiet", MUST_NOT_FLAG, '00<<< echo : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-zeroes-emitter", MUST_FLAG, '00<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-twelve-quiet", MUST_NOT_FLAG, '12<<< echo : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-twelve-emitter", MUST_FLAG, '12<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-variable-quiet", MUST_NOT_FLAG, '{fd}<<< echo : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-variable-emitter", MUST_FLAG, '{fd}<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-spaced-number", MUST_NOT_FLAG, '0 <<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-quoted-number", MUST_NOT_FLAG, '"0"<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-escaped-number", MUST_NOT_FLAG, '\\0<<< x echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-process-operand", MUST_FLAG, '0<<< <(printf x) echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-stdin-echoer", MUST_FLAG, 'cat 0<<< "$GH_TOKEN"\n'),
+    ("herestring-descriptor-helper-stdin", MUST_FLAG, 'log(){ cat 0<<< "$1"; }; log "$GH_TOKEN"\n'),
+    ("herestring-descriptor-empty-single", MUST_NOT_FLAG, '<<< \'\' : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-empty-double", MUST_NOT_FLAG, '<<< "" : "$GH_TOKEN"\n'),
+    ("herestring-descriptor-empty-emitter", MUST_FLAG, '<<< \'\' echo "$GH_TOKEN"\n'),
+    ("herestring-descriptor-empty-variable-command", MUST_FLAG, 'cmd=echo; <<< "" "$cmd" "$GH_TOKEN"\n'),
 ]
 
 
@@ -17791,6 +17970,9 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_pid_special_parameter_cases())
     failures.extend(_pid_continuation_cases())
+    failures.extend(_leading_herestring_cases())
+    failures.extend(_herestring_operand_cases())
+    failures.extend(_herestring_descriptor_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
