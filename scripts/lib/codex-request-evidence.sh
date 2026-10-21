@@ -449,6 +449,71 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
   '
 }
 
+# #2664: the provider-run state of the request posted at <request-created-at>
+# on <head>, read from Codex's Review Summary row and nothing else (never a
+# check-run or status publisher). A row last updated before the request is an
+# old placeholder and proves nothing about this request, so it reads as
+# "none". "running" is an active run. "completed" says the run ended; with no
+# qualifying result the caller treats it as inactive. "failed" and
+# "canceled" are confirmed terminal failures. Any other status text is
+# "unknown", which never authorizes a retry. retry_after_seconds is a retry
+# window the provider states in that comment ("retry after N seconds", "try
+# again in N minutes"), else null.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request-created-at
+  printf '%s\n' "${1:-[]}" | jq -c \
+    --arg bot "${2:-}" --arg sha "${3:-}" --arg since "${4:-}" '
+    ($sha | ascii_downcase) as $head
+    | if $since == "" then error("request time required") else . end
+    | [ .[]
+      | select((.user.login // "") == $bot)
+      | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+      | . as $comment
+      | ((.body // "")
+          | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+          // null) as $row
+      | select($row != null)
+      | select($head | startswith($row.commit | ascii_downcase))
+      | ($comment.updated_at // $comment.created_at // "") as $observed
+      | select($observed != "" and $observed >= $since)
+      | ((.body // "")
+          | [match("(?i)(?:retry[- ]after|try again in)[:[:space:]]*([0-9]+)[[:space:]]*(seconds?|secs?|s|minutes?|mins?|m)?\\b"; "g")
+             | (.captures[0].string | tonumber) * (if ((.captures[1].string // "s") | test("^m"; "i")) then 60 else 1 end)]
+          | max // null) as $retry_after
+      | { state:
+            (if ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
+             elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
+             elif ($row.status | test("\\*\\*(Failed|Error|Errored)\\*\\*"; "i")) then "failed"
+             elif ($row.status | test("\\*\\*Cancell?ed\\*\\*"; "i")) then "canceled"
+             else "unknown" end),
+          observed_at: $observed,
+          comment_id: ($comment.id // 0),
+          retry_after_seconds: $retry_after }
+    ]
+    | max_by([.observed_at, .comment_id]) // {state: "none", observed_at: null, comment_id: null, retry_after_seconds: null}
+  '
+}
+
+# #2664: whether request <id> is itself an automatic retry. The requester
+# records `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> -->` as an
+# author comment immediately before a retry, and the retry is the first
+# configured-author request after that marker, within 300 seconds by
+# GitHub's timestamps. A marker no request followed is not a retry. Any such
+# marker counts, whatever head it names, so the predicate can only withhold
+# a retry, never grant one. Prints true or false.
+crqe_request_is_retry() { # issue-comments-json author request-id
+  printf '%s\n' "${1:-[]}" | jq -r --arg author "$2" --argjson id "$3" '
+    def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+    [ .[] | select((.user.login // "") == $author) ] as $own
+    | [ $own[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] | sort_by(.id) as $requests
+    | [ $own[] | select((.body // "") | test("\\A<!-- mergepath-codex-retry:v1 head=[0-9a-f]{40} original=[1-9][0-9]* -->")) ] as $markers
+    | any($markers[]; . as $m
+        | ([ $requests[] | select(.id > $m.id) ] | first) as $next
+        | $next != null and $next.id == $id and (($next.created_at | epoch) - ($m.created_at | epoch)) <= 300)
+  '
+}
+
 # Parse every Codex-bot issue comment that is a verdict into
 # {comment_id, created_at, reviewed_shas, affirmative}, oldest first. A
 # verdict is a comment carrying a "Reviewed commit: <sha>" anchor or headed

@@ -25,12 +25,22 @@ cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 # Simulates the governed budget turning malformed after the initial request.
 [ -z "${CODEX_LEDGER_STUB_BREAK_POLICY:-}" ] \
   || printf '  max_blocking_reviews: false\n' >>"$CODEX_LEDGER_STUB_BREAK_POLICY"
+# Simulates the governed blocking-review budget being spent after the first
+# request (#2664): later reads govern, and report, a budget of zero.
+budget=10
+if [ -n "${CODEX_LEDGER_STUB_SPEND_POLICY:-}" ]; then
+  if grep -q 'max_blocking_reviews' "$CODEX_LEDGER_STUB_SPEND_POLICY"; then
+    budget=0
+  else
+    printf '  max_blocking_reviews: 0\n' >>"$CODEX_LEDGER_STUB_SPEND_POLICY"
+  fi
+fi
 head=""
 while [ $# -gt 0 ]; do
   case "$1" in --expect-head) head=$2; shift 2 ;; --expect-policy) fp=$2; shift 2 ;; *) shift ;; esac
 done
-jq -nc --arg h "$head" --arg fp "${fp:-}" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
-  '{head_sha: $h, author: $a, max_blocking_reviews: 10, policy_fingerprint: $fp, responses: []}'
+jq -nc --arg h "$head" --arg fp "${fp:-}" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" --argjson budget "$budget" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: $budget, policy_fingerprint: $fp, responses: []}'
 LEDGER_EOF
 chmod +x "$LEDGER_STUB"
 export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"
@@ -134,8 +144,13 @@ done
 case "$body" in
   '@codex review') kind=trigger ;;
   '<!-- mergepath-phase-4a-terminal:'*) kind=terminal ;;
+  '<!-- mergepath-codex-retry:v1 '*) kind=retry-marker ;;
   *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
 esac
+# #2664: the fake time of every trigger, for the retry backoff assertions.
+if [ "$kind" = trigger ] && [ -f "$state_dir/fake-time" ]; then
+  cat "$state_dir/fake-time" >>"$state_dir/trigger-times"
+fi
 
 count=0
 if [ -f "$state_dir/$kind-count" ]; then
@@ -229,6 +244,14 @@ case "$endpoint" in
         exit 0
       fi
     fi
+    # #2664: the automatic retry's head fence is the first scalar head read
+    # after a trigger was posted.
+    if [ "${2:-}" = "--jq" ] && [ -f "$state_dir/trigger-count" ]; then
+      case "$scenario" in
+        retry-head-changed) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'; exit 0 ;;
+        retry-late-at-fence) touch "$state_dir/late-result" ;;
+      esac
+    fi
     if [ "${2:-}" = "--jq" ]; then
       printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     else
@@ -279,6 +302,12 @@ case "$endpoint" in
       printf '[{"id":95,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response after a transient read failure"}]\n' "$bot"
     elif [ "$scenario" = "wrapper-slow-ack" ] && [ -f "$state_dir/authorization-refused" ]; then
       printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"delayed response to original request"}]\n' "$bot"
+    elif [ "$scenario" = "retry-late-at-fence" ] && [ -f "$state_dir/late-result" ]; then
+      printf '[{"id":78,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:01:30Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"late response to the original request"}]\n' "$bot"
+    elif [ "$scenario" = "retry-concurrent" ] && [ -f "$state_dir/trigger-count" ]; then
+      printf '[{"id":79,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:05:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the retry"}]\n' "$bot"
+    elif [ "$scenario" = "retry-completes" ] && [ "$(cat "$state_dir/trigger-count" 2>/dev/null || echo 0)" -ge 2 ]; then
+      printf '[{"id":80,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:05:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the retry"}]\n' "$bot"
     elif [ "$scenario" = "review_after_retry" ]; then
       count=0
       if [ -f "$state_dir/trigger-count" ]; then
@@ -355,6 +384,23 @@ case "$endpoint" in
         fi
         ;;
     esac
+    # #2664: the posted request's run is seen Running, then Completed with
+    # no result, on the third comments read after the trigger.
+    if [ "$scenario" = "retry-completes" ] && [ -f "$state_dir/trigger-count" ]; then
+      pt=0; [ ! -f "$state_dir/post-trigger-reads" ] || pt=$(cat "$state_dir/post-trigger-reads")
+      pt=$((pt + 1)); printf '%s\n' "$pt" >"$state_dir/post-trigger-reads"
+      if [ "$pt" -eq 3 ]; then
+        body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | Manual request |\n')
+        jq -cn --arg body "$body" '{id:3004,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:00:30Z",updated_at:"2026-06-04T00:00:30Z"}' >>"$state_dir/comments.jsonl"
+      fi
+    fi
+    # #2664: the resumed request's run fails a minute after it was posted.
+    if [ "$scenario" = "retry-concurrent" ] && [ ! -f "$state_dir/run-failed" ] \
+       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + 60 ))" ]; then
+      touch "$state_dir/run-failed"
+      body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ❌ **Failed** | `aaaaaaa` | Manual request |\n')
+      jq -cn --arg body "$body" '{id:3003,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:01:00Z",updated_at:"2026-06-04T00:01:00Z"}' >>"$state_dir/comments.jsonl"
+    fi
     if [ "$scenario" = "resume-blocked" ]; then
       # Reads 1-2 are the pre-flight scan and the resume check; the account
       # block lands while the resumed request is being polled.
@@ -1194,9 +1240,9 @@ test_secret_descriptor_never_reveals_the_value() {
 
 RESUME_TRIGGER_AT="2026-06-04T00:00:00Z"
 
-seed_codex_summary() { # <fixture-dir> <status-cell> <commit> <updated-at>
+seed_codex_summary() { # <fixture-dir> <status-cell> <commit> <updated-at> [extra-text]
   local dir=$1 status=$2 commit=$3 updated=$4 body
-  body=$(printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | Manual request |\n' "$status" "$commit")
+  body=$(printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | Manual request |\n%s' "$status" "$commit" "${5:-}")
   jq -cn --arg body "$body" --arg updated "$updated" \
     '{id:3001,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:$updated,updated_at:$updated}' \
     >>"$dir/state/comments.jsonl"
@@ -1733,6 +1779,238 @@ test_persistent_transient_failure_fails_closed
 test_permanent_poll_failure_is_not_retried
 test_missing_classifier_degrades_to_fail_closed
 test_default_reply_deadline_is_1800
+
+# --- #2664 bounded automatic retry -------------------------------------------
+# The fake clock drives every timing: the poll sleeps 15 s per step, the retry
+# backoff is 60 s (or the provider's longer window), the diagnostic is at 300
+# s and an active or unknown run is reported at the 1800 s review timeout.
+
+run_retry_case() { # <fixture-dir> <scenario> [VAR=value ...]
+  local dir=$1 scenario=$2 rc=0
+  shift 2
+  (
+    cd "$dir"
+    unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+    env "$@" PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_FAKE_CLOCK=1 CODEX_TEST_SCENARIO="$scenario" \
+      ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  printf '%s\n' "$rc"
+}
+
+retry_markers() { # <fixture-dir> -> the retry markers the requester posted
+  [ -f "$1/state/comments.jsonl" ] || return 0
+  jq -r 'select(.body | startswith("<!-- mergepath-codex-retry:v1 ")) | .body | split("\n")[0]' "$1/state/comments.jsonl"
+}
+
+trigger_gap() { # <fixture-dir> -> seconds between the first two triggers
+  sed -n '1p;2p' "$1/state/trigger-times" | paste -sd' ' - | awk '{print $2 - $1}'
+}
+
+seed_old_triggers() { # <fixture-dir> <count>
+  local i
+  for i in $(seq 1 "$2"); do
+    seed_author_trigger "$1" "$((800 + i))" "2026-06-03T00:00:0${i:0:1}Z"
+  done
+}
+
+FAILED_ROW='❌ **Failed**'
+
+test_retry_after_confirmed_failure() {
+  local label status dir rc before scenario
+  while IFS='|' read -r label status; do
+    before=$FAIL
+    dir=$(make_case "retry-$label" 0 0 400)
+    seed_codex_summary "$dir" "$status" aaaaaaa "2026-06-04T00:00:10Z"
+    # completed: seen Running first, then Completed with no result.
+    scenario=review_after_retry; [ "$label" != completed ] || scenario=retry-completes
+    rc=$(run_retry_case "$dir" "$scenario")
+    [ "$rc" = 0 ] || fail "#2664 $label: exit $rc, expected the retry's response; stderr=$(tail -5 "$dir/err.log")"
+    [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 $label: $(trigger_count "$dir") triggers, expected the original and one retry"
+    jq -e --arg reason "$label" '.retry.state == "posted" and .retry.reason == $reason and .retry.backoff_seconds == 60
+        and .retry.original_comment_id == 1001 and .retry.retry_comment_id == 1003' "$dir/out.json" >/dev/null \
+      || fail "#2664 $label: retry JSON $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+    [ "$(retry_markers "$dir")" = "<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=1001 -->" ] \
+      || fail "#2664 $label: expected one marker for request 1001 before the retry; got $(retry_markers "$dir")"
+    # Seen failed by the scan right after the post (completed: two polls
+    # later), then 60 s of backoff.
+    [ "$(trigger_gap "$dir")" -ge 60 ] && [ "$(trigger_gap "$dir")" -le 105 ] \
+      || fail "#2664 $label: retry posted $(trigger_gap "$dir")s after the original, expected 60-105"
+    [ "$FAIL" -ne "$before" ] || pass "#2664: a $label run is retried once, 60 s after it is confirmed"
+  done <<'CASES'
+failed|❌ **Failed**
+canceled|🚫 **Cancelled**
+completed|⏳ **Running**
+CASES
+}
+
+# A Completed row that this run never saw Running may describe an earlier
+# request's run that finished after this request was posted: no retry.
+test_retry_withheld_for_unproven_completion() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-unproven-completed" 0 0 400)
+  seed_codex_summary "$dir" '✅ **Completed**' aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent)
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 unproven completion: $(trigger_count "$dir") triggers, expected no retry"
+  [ -z "$(retry_markers "$dir")" ] || fail "#2664 unproven completion: a retry marker was recorded"
+  jq -e '.retry.state == "escalated" and .retry.reason == "unknown"' "$dir/out.json" >/dev/null \
+    || fail "#2664 unproven completion: $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a Completed row never seen Running for this request is not proof of inactivity"
+}
+
+test_retry_honors_longer_provider_window() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-window" 0 0 600)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z" 'Codex is busy. Please try again in 3 minutes.'
+  rc=$(run_retry_case "$dir" review_after_retry)
+  [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 window: exit $rc, $(trigger_count "$dir") triggers"
+  jq -e '.retry.backoff_seconds == 180' "$dir/out.json" >/dev/null || fail "#2664 window: $(jq -c .retry "$dir/out.json")"
+  [ "$(trigger_gap "$dir")" -ge 180 ] && [ "$(trigger_gap "$dir")" -le 195 ] \
+    || fail "#2664 window: retry posted $(trigger_gap "$dir")s after the original, expected 180-195"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a provider retry window longer than 60 s sets the backoff"
+}
+
+test_retry_refused_by_late_result_or_moved_head() {
+  local scenario dir rc want before
+  for scenario in retry-late-at-fence retry-head-changed; do
+    before=$FAIL
+    dir=$(make_case "$scenario" 0 0 400)
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    rc=$(run_retry_case "$dir" "$scenario")
+    case "$scenario" in retry-late-at-fence) want=late-result ;; *) want=head-changed ;; esac
+    [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 $scenario: $(trigger_count "$dir") triggers, expected no retry"
+    [ -z "$(retry_markers "$dir")" ] || fail "#2664 $scenario: a retry marker was recorded"
+    grep -q "automatic Codex retry for request 1001 not posted: $want" "$dir/err.log" \
+      || fail "#2664 $scenario: expected refusal '$want'; stderr=$(tail -5 "$dir/err.log")"
+    if [ "$scenario" = retry-late-at-fence ]; then
+      [ "$rc" = 0 ] || fail "#2664 late result: exit $rc, expected the late response to end the wait"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2664: $want immediately before posting prevents the retry"
+  done
+}
+
+test_retry_never_chains() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-no-chain" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent)
+  [ "$rc" = 4 ] || fail "#2664 chain: exit $rc, expected the retry's own timeout"
+  [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 chain: $(trigger_count "$dir") triggers, expected exactly one retry"
+  [ "$(retry_markers "$dir" | wc -l | tr -d ' ')" = 1 ] || fail "#2664 chain: $(retry_markers "$dir" | wc -l) markers"
+  jq -e '.retry.state == "posted"' "$dir/out.json" >/dev/null || fail "#2664 chain: $(jq -c .retry "$dir/out.json")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a failed retry is never retried"
+}
+
+test_retry_withheld_from_a_retry_request() {
+  # A marker just before this run's own request marks that request as a
+  # retry (another handler, or an earlier session, already retried).
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-of-retry" 0 0 400)
+  jq -cn '{id:999,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=990 -->\nAutomatic retry.",created_at:"2026-06-03T23:59:59Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent)
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 retry-of-retry: $(trigger_count "$dir") triggers"
+  grep -q 'not posted: retry-of-retry' "$dir/err.log" || fail "#2664 retry-of-retry: $(tail -5 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a request that is itself a retry is never retried (persisted across sessions)"
+}
+
+test_retry_withheld_while_active_or_unknown() {
+  local label status updated dir rc want before
+  while IFS='|' read -r label status updated want; do
+    before=$FAIL
+    dir=$(make_case "retry-$label" 0 0 1800)
+    seed_codex_summary "$dir" "$status" aaaaaaa "$updated"
+    rc=$(run_retry_case "$dir" absent)
+    [ "$rc" = 4 ] || fail "#2664 $label: exit $rc, expected the 1800 s escalation"
+    [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 $label: $(trigger_count "$dir") triggers, expected no retry"
+    [ -z "$(retry_markers "$dir")" ] || fail "#2664 $label: a retry marker was recorded"
+    jq -e --arg want "$want" '.retry.state == "escalated" and .retry.reason == $want
+        and .retry.diagnostic.after_seconds >= 300 and .retry.diagnostic.after_seconds < 315
+        and .rounds_waited_seconds >= 1800' "$dir/out.json" >/dev/null \
+      || fail "#2664 $label: $(jq -c '{retry, rounds_waited_seconds}' "$dir/out.json" 2>/dev/null)"
+    [ "$FAIL" -ne "$before" ] || pass "#2664: a $label run gets a 300 s diagnostic and is reported at 1800 s, never retried"
+  done <<'CASES'
+active|⏳ **Running**|2026-06-04T00:00:10Z|active
+stale-placeholder|⏳ **Running**|2026-06-03T23:00:00Z|unknown
+unknown-status|❓ **Queued**|2026-06-04T00:00:10Z|unknown
+CASES
+}
+
+test_retry_respects_request_and_blocking_budgets() {
+  local label prior spend dir rc before
+  while IFS='|' read -r label prior spend; do
+    before=$FAIL
+    dir=$(make_case "retry-budget-$label" 0 0 400)
+    seed_old_triggers "$dir" "$prior"
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    if [ "$spend" = spend ]; then
+      rc=$(run_retry_case "$dir" review_after_retry CODEX_LEDGER_STUB_SPEND_POLICY="$dir/state/base-review-policy.yml")
+    else
+      rc=$(run_retry_case "$dir" review_after_retry)
+    fi
+    case "$label" in
+      tenth-allowed)
+        [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 2 ] \
+          || fail "#2664 $label: the tenth request may be the retry (exit $rc, $(trigger_count "$dir") triggers)" ;;
+      ceiling)
+        [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 1 ] && jq -e '.retry.reason == "request-ceiling"' "$dir/out.json" >/dev/null \
+          || fail "#2664 $label: exit $rc, $(trigger_count "$dir") triggers, $(jq -c .retry "$dir/out.json" 2>/dev/null)" ;;
+      blocking|both)
+        [ "$rc" = 7 ] && [ "$(trigger_count "$dir")" = 1 ] && jq -e '.cap_exhausted.kind == "blocking-reviews"' "$dir/out.json" >/dev/null \
+          || fail "#2664 $label: exit $rc, $(trigger_count "$dir") triggers, $(jq -c .cap_exhausted "$dir/out.json" 2>/dev/null)" ;;
+    esac
+    [ -z "$(retry_markers "$dir")" ] || [ "$label" = tenth-allowed ] \
+      || fail "#2664 $label: a retry marker was recorded although the budget refused the retry"
+    [ "$FAIL" -ne "$before" ] || pass "#2664 budgets: $label"
+  done <<'CASES'
+tenth-allowed|8|no
+ceiling|9|no
+blocking|0|spend
+both|9|spend
+CASES
+}
+
+# Two sessions resumed on the same request both see its run fail. Retry
+# deduplication through the guarded, claimed path posts exactly one retry.
+test_concurrent_handlers_post_one_retry() {
+  local dir before=$FAIL n pid_a pid_b rc_a=0 rc_b=0 posted
+  dir=$(make_case "retry-concurrent" 0 0 400)
+  make_real_wrapper_case "$dir"
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  for n in a b; do
+    (
+      cd "$dir"
+      unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+      PATH="$dir/bin:$PATH" GH_TOKEN=ghp_fixture_author CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_FAKE_CLOCK=1 \
+        CODEX_TEST_SCENARIO=retry-concurrent MERGEPATH_GH_TRANSPORT=gh \
+        ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.$n.json" 2>"$dir/err.$n.log"
+    ) &
+    if [ "$n" = a ]; then pid_a=$!; else pid_b=$!; fi
+  done
+  wait "$pid_a" || rc_a=$?
+  wait "$pid_b" || rc_b=$?
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 concurrent: $(trigger_count "$dir") retries posted, expected one"
+  posted=$(jq -s '[.[] | select(.retry.state == "posted")] | length' "$dir/out.a.json" "$dir/out.b.json" 2>/dev/null || echo error)
+  [ "$posted" = 1 ] || fail "#2664 concurrent: $posted handlers report a posted retry (rc a=$rc_a b=$rc_b); $(tail -3 "$dir/err.a.log" "$dir/err.b.log")"
+  # The other stands down at whichever check sees the winner first: the
+  # latest-request check, the claimed generation fence, or the result.
+  jq -s -e '[.[] | select(.retry.state == "refused") | .retry.reason] | length == 1 and (.[0] | IN("superseded", "concurrent-request", "existing-trigger", "already-cleared"))' \
+    "$dir/out.a.json" "$dir/out.b.json" >/dev/null || fail "#2664 concurrent: the other handler must stand down; $(jq -c .retry "$dir/out.a.json" "$dir/out.b.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: two concurrent handlers post exactly one retry for the same request"
+}
+
+test_retry_after_confirmed_failure
+test_retry_withheld_for_unproven_completion
+test_retry_honors_longer_provider_window
+test_retry_refused_by_late_result_or_moved_head
+test_retry_never_chains
+test_retry_withheld_from_a_retry_request
+test_retry_withheld_while_active_or_unknown
+test_retry_respects_request_and_blocking_budgets
+test_concurrent_handlers_post_one_retry
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
