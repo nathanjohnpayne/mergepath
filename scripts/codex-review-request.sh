@@ -2040,9 +2040,11 @@ REQUEST_CHECKPOINT_JSON=null
 record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
   local comments="$1" counted="$2" ceiling="$3" existing body body_file
   [ "$counted" -ge "$CODEX_REQUEST_CHECKPOINT_AFTER" ] || return 0
-  existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" --arg marker "$CODEX_REQUEST_CHECKPOINT_MARKER" \
+  # Only a generated marker line opening the comment counts, never a quote
+  # of the marker text in an ordinary comment.
+  existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" \
     '[.[] | select((.user.login // "" | ascii_downcase) == ($who | ascii_downcase))
-          | select((.body // "") | contains($marker)) | .id] | first // empty' 2>/dev/null) || existing=""
+          | select((.body // "") | test("\\A<!-- mergepath-codex-request-checkpoint:v1 counted=[0-9]+ head=[0-9a-f]{40,64} -->(\\n|\\z)")) | .id] | first // empty' 2>/dev/null) || existing=""
   if [ -n "$existing" ]; then
     REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" --arg id "$existing" \
       '{after:5,counted_requests:$n,recorded:"existing",comment_id:($id|tonumber? // null)}')
@@ -2715,7 +2717,9 @@ post_codex_trigger() {
   # confirmed without spending another (#2631).
   local caller_mode="$REQUEST_MODE"
   [ "$TRIGGER_POSTED" != true ] || caller_mode=""
-  if [ "$TRIGGER_POSTED" != true ]; then
+  # A CodeRabbit failover stands in for a lost review, not a deliberate
+  # round, so it never records (and so never uses up) the checkpoint.
+  if [ "$TRIGGER_POSTED" != true ] && [ "$FAILOVER" != true ]; then
     record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
   fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
