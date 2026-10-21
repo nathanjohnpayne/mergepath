@@ -43,7 +43,7 @@ run_check_on_fixture() {
 run_check_on_fixture "clean.sh" '#!/usr/bin/env bash
 foo=$(mktemp -d "${TMPDIR:-/tmp}/clean.XXXXXX")
 '
-if [ "$RC" = "0" ] && echo "$OUT" | grep -q "PASS"; then
+if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
   pass "clean fixture (portable form): exits 0 with PASS"
 else
   fail "clean fixture: rc=$RC out=$OUT"
@@ -54,7 +54,7 @@ rm -f "$WORKDIR/clean.sh"
 run_check_on_fixture "bad-bare-t.sh" '#!/usr/bin/env bash
 foo=$(mktemp -t mergepath-bad)
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "bare -t form: caught (BSD-incompatible)"
 else
   fail "bare -t form: rc=$RC out=$OUT"
@@ -65,7 +65,7 @@ rm -f "$WORKDIR/bad-bare-t.sh"
 run_check_on_fixture "bad-d-then-t.sh" '#!/usr/bin/env bash
 foo=$(mktemp -d -t mergepath-bad)
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "-d -t (separate) form: caught"
 else
   fail "-d -t form: rc=$RC out=$OUT"
@@ -77,7 +77,7 @@ rm -f "$WORKDIR/bad-d-then-t.sh"
 run_check_on_fixture "bad-compact-dt.sh" '#!/usr/bin/env bash
 foo=$(mktemp -dt mergepath-bad)
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "compact -dt form: caught (#286 r2 regression)"
 else
   fail "compact -dt form: rc=$RC out=$OUT  (regex did not catch combined -dt)"
@@ -88,7 +88,7 @@ rm -f "$WORKDIR/bad-compact-dt.sh"
 run_check_on_fixture "bad-compact-pdt.sh" '#!/usr/bin/env bash
 foo=$(mktemp -Pdt mergepath-bad)
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "compact -Pdt form: caught (any flags before t)"
 else
   fail "compact -Pdt form: rc=$RC out=$OUT"
@@ -100,7 +100,7 @@ rm -f "$WORKDIR/bad-compact-pdt.sh"
 run_check_on_fixture "clean-d-only.sh" '#!/usr/bin/env bash
 foo=$(mktemp -d "/tmp/keep.XXXXXX")
 '
-if [ "$RC" = "0" ] && echo "$OUT" | grep -q "PASS"; then
+if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
   pass "-d only with quoted template: passes"
 else
   fail "-d only: rc=$RC out=$OUT"
@@ -113,7 +113,7 @@ run_check_on_fixture "comment-mention.sh" '#!/usr/bin/env bash
 # Never use: mktemp -t legacy-bsd-form
 foo=$(mktemp -d "/tmp/safe.XXXXXX")
 '
-if [ "$RC" = "0" ] && echo "$OUT" | grep -q "PASS"; then
+if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
   pass "comment-line mention of -t: not flagged"
 else
   fail "comment-line mention: rc=$RC out=$OUT"
@@ -124,7 +124,7 @@ rm -f "$WORKDIR/comment-mention.sh"
 run_check_on_fixture "bad-quoted-bare.sh" '#!/usr/bin/env bash
 foo=$(mktemp -t "prefix")
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "double-quoted bare prefix: caught (#286 r3)"
 else
   fail "double-quoted bare prefix: rc=$RC out=$OUT"
@@ -135,7 +135,7 @@ rm -f "$WORKDIR/bad-quoted-bare.sh"
 run_check_on_fixture "bad-squoted-bare.sh" '#!/usr/bin/env bash
 foo=$(mktemp -t '"'"'prefix'"'"')
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "single-quoted bare prefix: caught"
 else
   fail "single-quoted bare prefix: rc=$RC out=$OUT"
@@ -147,7 +147,7 @@ run_check_on_fixture "bad-quoted-var.sh" '#!/usr/bin/env bash
 prefix=foo
 foo=$(mktemp -t "$prefix")
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "double-quoted variable prefix: caught (#286 r3)"
 else
   fail "double-quoted variable prefix: rc=$RC out=$OUT"
@@ -159,7 +159,7 @@ run_check_on_fixture "bad-bare-var.sh" '#!/usr/bin/env bash
 prefix=foo
 foo=$(mktemp -t $prefix)
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "bare variable prefix: caught"
 else
   fail "bare variable prefix: rc=$RC out=$OUT"
@@ -171,7 +171,7 @@ run_check_on_fixture "bad-braced-var.sh" '#!/usr/bin/env bash
 prefix=foo
 foo=$(mktemp -t ${prefix})
 '
-if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+if [ "$RC" = "1" ] && grep -q "FAIL" <<<"$OUT"; then
   pass "braced variable prefix: caught"
 else
   fail "braced variable prefix: rc=$RC out=$OUT"
@@ -184,7 +184,7 @@ rm -f "$WORKDIR/bad-braced-var.sh"
 run_check_on_fixture "clean-quoted-template.sh" '#!/usr/bin/env bash
 foo=$(mktemp -d "${TMPDIR:-/tmp}/safe.XXXXXX")
 '
-if [ "$RC" = "0" ] && echo "$OUT" | grep -q "PASS"; then
+if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
   pass "portable quoted template (slashes inside quotes): not flagged"
 else
   fail "portable quoted template: rc=$RC out=$OUT"

@@ -193,9 +193,12 @@ REQUEST_IDS=$(crqe_trigger_generation "$ISSUE_COMMENTS" "$AUTHOR") \
 # exempts nothing.
 FAILOVER_HEADS='[]'
 if crqe_failover_markers_present "$ISSUE_COMMENTS" "$AUTHOR"; then
+  # Force-push heads come from GraphQL (#2591); a failed read leaves only
+  # them out.
+  fo_forced=$(crqe_force_push_heads "$REPO" "$PR_NUMBER" 2>/dev/null) || fo_forced='[]'
   if fo_commits=$(gh_api_array "repos/$REPO/pulls/$PR_NUMBER/commits" "PR commits" 2>/dev/null) \
      && fo_timeline=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline" 2>/dev/null); then
-    FAILOVER_HEADS=$(crqe_pr_head_set "$fo_commits" "$fo_timeline" "$HEAD_SHA") || FAILOVER_HEADS='[]'
+    FAILOVER_HEADS=$(crqe_pr_head_set "$fo_commits" "$fo_timeline" "$HEAD_SHA" "$fo_forced") || FAILOVER_HEADS='[]'
   fi
 fi
 FAILOVER_IDS=$(crqe_failover_trigger_ids "$ISSUE_COMMENTS" "$AUTHOR" "$FAILOVER_HEADS") \

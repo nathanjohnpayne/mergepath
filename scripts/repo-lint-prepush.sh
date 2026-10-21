@@ -24,7 +24,14 @@
 #                `wrappers` map, and inline steps: the cheap repository
 #                assertions (about 30 s of CI time in total). Always run.
 #   selected   - graph-declared wrappers the classifier selected (all of them
-#                when it selects the complete surface). Always run.
+#                when it selects the complete surface for a reason other than
+#                an undeclared path). Always run.
+#   fallback   - graph-declared wrappers CI runs only because a changed path
+#                is undeclared (#2580). CI's classifier fails closed to the
+#                complete surface for a path no wrapper, trigger or full
+#                trigger declares; the hook re-classifies without those paths,
+#                names them in one loud line, and leaves the expansion to
+#                CI's `lint`. Run with MERGEPATH_PREPUSH_LIVE=all.
 #   unselected - graph-declared wrappers the classifier did not select. The
 #                graph is CI's own record of which paths each of these
 #                expensive wrappers depends on, and the hub classifier fails
@@ -35,7 +42,9 @@
 #                (check_git_identity_hygiene's identity-write scan,
 #                check_mktemp_portability) can still fail in CI on a path
 #                outside its declared inputs.
-#   deep       - the deep-lane steps the scope bits select: the enrolled
+#   deep       - the deep-lane steps the scope bits select (without the
+#                undeclared-path expansion, which is the `deep_fallback` lane
+#                and runs only with MERGEPATH_PREPUSH_LIVE=all plus DEEP): the enrolled
 #                `--self-test` suites of `deep_self_tests`, the consumer-smoke
 #                and residue legs of `deep_safety`, and the complete consumer
 #                replay. Only with MERGEPATH_PREPUSH_DEEP=1 (or --deep);
@@ -65,7 +74,9 @@
 # Environment:
 #   MERGEPATH_PREPUSH_SKIP=1    bypass entirely (as does git push --no-verify)
 #   MERGEPATH_PREPUSH_DEEP=1    run the selected deep-lane steps too
-#   MERGEPATH_PREPUSH_LIVE=all  run the unselected graph wrappers too
+#   MERGEPATH_PREPUSH_LIVE=all  run the unselected and undeclared-path fallback
+#                               graph wrappers too (CI's whole fast lane, and
+#                               with DEEP=1 CI's exact deep selection)
 #   MERGEPATH_PREPUSH_JOBS=N    concurrency cap; default 2 below one CPU's
 #                               worth of load per core, 1 at or above it
 #   MERGEPATH_PREPUSH_NICE=N    nice level for every check, default 10
@@ -651,25 +662,99 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 unset GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH 2>/dev/null || true
 
 # ── scope: the CI classifier, fed the same changed-path list ──
+PATHS=$(printf '%s' "$CHANGED" | sed '/^$/d' | LC_ALL=C sort -u)
+classify_paths() {  # stdin: changed paths, one per line
+  bash "$CLASSIFIER" --event "$EVENT" --head-ref "$HEAD_REF"
+}
 if [ "$FAIL_CLOSED" -eq 1 ]; then
   # The CI scope job's "PR diff unavailable" branch.
   SCOPE=$'deep=true\nfull=true\nchecks=[]\nconsumer_replay=true\nself_tests=true'
   echo "$PREFIX: the pushed range has no merge base with the remote default branch; failing closed to the complete selection, as CI does"
 else
   if [ "$EVENT" = "pull_request" ]; then
-    SCOPE=$(printf '%s' "$CHANGED" | sed '/^$/d' | LC_ALL=C sort -u \
-      | bash "$CLASSIFIER" --event "$EVENT" --head-ref "$HEAD_REF") || die "$CLASSIFIER failed"
+    SCOPE=$(printf '%s\n' "$PATHS" | classify_paths) || die "$CLASSIFIER failed"
   else
     SCOPE=$(printf '' | bash "$CLASSIFIER" --event "$EVENT") || die "$CLASSIFIER failed"
   fi
 fi
-scope_get() { printf '%s\n' "$SCOPE" | sed -n "s/^$1=//p" | head -n 1; }
-S_DEEP=$(scope_get deep); S_FULL=$(scope_get full); S_CHECKS=$(scope_get checks)
-S_REPLAY=$(scope_get consumer_replay); S_SELF=$(scope_get self_tests)
-for v in "$S_DEEP" "$S_FULL" "$S_REPLAY" "$S_SELF"; do
-  case "$v" in true|false) ;; *) die "unexpected classifier output: $SCOPE" ;; esac
-done
-jq -e 'type == "array"' >/dev/null 2>&1 <<<"$S_CHECKS" || die "unexpected classifier checks: $S_CHECKS"
+scope_get() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -n 1; }
+scope_parse() {  # $1 = classifier output; sets P_DEEP P_FULL P_CHECKS P_REPLAY P_SELF
+  P_DEEP=$(scope_get deep "$1"); P_FULL=$(scope_get full "$1"); P_CHECKS=$(scope_get checks "$1")
+  P_REPLAY=$(scope_get consumer_replay "$1"); P_SELF=$(scope_get self_tests "$1")
+  for v in "$P_DEEP" "$P_FULL" "$P_REPLAY" "$P_SELF"; do
+    case "$v" in true|false) ;; *) die "unexpected classifier output: $1" ;; esac
+  done
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$P_CHECKS" || die "unexpected classifier checks: $P_CHECKS"
+}
+scope_parse "$SCOPE"
+S_DEEP=$P_DEEP; S_FULL=$P_FULL; S_CHECKS=$P_CHECKS; S_REPLAY=$P_REPLAY; S_SELF=$P_SELF
+
+# ── undeclared-path fallback (#2580) ──
+# CI's classifier fails closed: a changed path that no wrapper, trigger or
+# full trigger declares selects the complete surface, and CI keeps doing so.
+# Locally that turned a one-file change into every graph wrapper and every
+# deep step. The hook re-classifies without those paths instead: each
+# undeclared path keeps only the always-run live assertions here, is named
+# in one loud line, and CI's `lint` runs the complete surface for it. A
+# complete selection for any other reason (a full trigger, a push event, a
+# propagation-lane head, no merge base, an unreadable graph) is unchanged.
+# An undeclared path is one that selects the complete surface alone and is
+# not a full trigger; the classifier decides the first half, so the hook
+# re-implements only the full-trigger glob match.
+UNDECLARED=''
+FULL_REASON=''
+L_SCOPE="$SCOPE"
+if [ "$S_FULL" = true ]; then
+  GRAPH=scripts/ci/repo-lint-dependencies.json
+  if [ "$FAIL_CLOSED" -eq 1 ]; then
+    FULL_REASON='no merge base with the remote default branch'
+  elif [ "$EVENT" != pull_request ]; then
+    FULL_REASON="a $EVENT event"
+  else
+    case "$HEAD_REF" in mergepath-sync/*) FULL_REASON='a propagation-lane head' ;; esac
+  fi
+  if [ -z "$FULL_REASON" ]; then
+    # An empty list is valid; only a missing or malformed one is unreadable.
+    if ! full_trigger_globs=$(jq -r 'if (.full_triggers | type) == "array" then .full_triggers[] | select(type == "string") else error("no full_triggers") end' "$GRAPH" 2>/dev/null); then
+      FULL_REASON='the dependency graph is unreadable'
+    fi
+  fi
+  if [ -z "$FULL_REASON" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      trigger=0
+      while IFS= read -r glob; do
+        [ -n "$glob" ] || continue
+        # shellcheck disable=SC2254 # graph entries are case globs by design
+        case "$p" in $glob) trigger=1; break ;; esac
+      done <<<"$full_trigger_globs"
+      if [ "$trigger" -eq 1 ]; then
+        FULL_REASON="a full trigger ($p)"
+        UNDECLARED=''
+        break
+      fi
+      one=$(printf '%s\n' "$p" | classify_paths) || die "$CLASSIFIER failed"
+      if [ "$(scope_get full "$one")" = true ]; then
+        UNDECLARED="${UNDECLARED}${p}
+"
+      fi
+    done <<<"$PATHS"
+  fi
+  if [ -z "$FULL_REASON" ] && [ -n "$UNDECLARED" ]; then
+    L_SCOPE=$(LC_ALL=C comm -23 <(printf '%s\n' "$PATHS") <(printf '%s' "$UNDECLARED" | LC_ALL=C sort -u) \
+      | sed '/^$/d' | classify_paths) || die "$CLASSIFIER failed"
+    if [ "$(scope_get full "$L_SCOPE")" = true ]; then
+      # Something besides the undeclared paths selects everything.
+      FULL_REASON='the complete-surface rule'
+      UNDECLARED=''
+      L_SCOPE="$SCOPE"
+    fi
+  elif [ -z "$FULL_REASON" ]; then
+    FULL_REASON='the complete-surface rule'
+  fi
+fi
+scope_parse "$L_SCOPE"
+L_DEEP=$P_DEEP; L_FULL=$P_FULL; L_CHECKS=$P_CHECKS; L_REPLAY=$P_REPLAY; L_SELF=$P_SELF
 
 # ── plan: derive the step list from the workflow ──
 JOBS_JSON=$(yq -o=json '.jobs' "$WORKFLOW") || die "cannot parse $WORKFLOW"
@@ -677,12 +762,21 @@ JOBS_JSON=$(yq -o=json '.jobs' "$WORKFLOW") || die "cannot parse $WORKFLOW"
 # every wrapper in the always-run lane (the classifier fails closed too).
 GRAPH_WRAPPERS=$(jq -c '.wrappers | keys' scripts/ci/repo-lint-dependencies.json 2>/dev/null) || GRAPH_WRAPPERS='[]'
 jq -e 'type == "array"' >/dev/null 2>&1 <<<"$GRAPH_WRAPPERS" || GRAPH_WRAPPERS='[]'
+# Two selections: CI's (S_*) decides which steps are in the plan at all, the
+# local one (L_*, CI's minus the undeclared-path expansion) which of them run
+# by default. They are equal unless UNDECLARED is set. Deep steps take the
+# local scope values in their env, so a locally run harness sees the local
+# selection; under MERGEPATH_PREPUSH_LIVE=all they take CI's, as CI runs them.
+if [ "$ALL_LIVE" -eq 1 ]; then ENV_FULL=$S_FULL; ENV_CHECKS=$S_CHECKS; else ENV_FULL=$L_FULL; ENV_CHECKS=$L_CHECKS; fi
 PLAN_JSON=$(jq -c \
   --argjson deep "$S_DEEP" --argjson full "$S_FULL" --argjson checks "$S_CHECKS" \
+  --argjson ldeep "$L_DEEP" --argjson lfull "$L_FULL" --argjson lchecks "$L_CHECKS" \
   --argjson graph "$GRAPH_WRAPPERS" \
   --argjson replay "$S_REPLAY" --argjson self "$S_SELF" \
-  --arg fullstr "$S_FULL" --arg checksstr "$S_CHECKS" '
+  --argjson lreplay "$L_REPLAY" --argjson lself "$L_SELF" \
+  --arg fullstr "$ENV_FULL" --arg checksstr "$ENV_CHECKS" '
   def need($j): (.[$j] // error("workflow job \($j) is missing; the pre-push mirror needs updating"));
+  def st_on($d; $s; $f; $c; $w): $d and $s and ($f or (($c | index($w)) != null));
   def wrapper: [(.run // "") | capture("^\\./scripts/ci/(?<w>check_[A-Za-z0-9_]+)") | .w] | first;
   def check_steps: [.steps[] | select(wrapper != null and wrapper != "check_git_identity_hygiene")];
   # ${{ needs.scope.outputs.* }} becomes the classifier value; a matrix
@@ -703,28 +797,64 @@ PLAN_JSON=$(jq -c \
         | if (.if | test("^matrix\\.shard == [0-9]+$")) then
             wrapper as $w
             | {lane: (if $w == null or ($graph | index($w)) == null then "live"
-                      elif $full or ($checks | index($w)) != null then "selected"
+                      elif $lfull or ($lchecks | index($w)) != null then "selected"
+                      elif $full or ($checks | index($w)) != null then "fallback"
                       else "unselected" end),
                job: "lint_fast", name, run, env: []}
           elif (.if | test("^matrix\\.shard != [0-9]+$")) then empty
           else error("lint_fast step \(.name) has an unrecognized if: \(.if)") end),
       ($st | check_steps[] as $s
-        | select($deep and $self and ($full or (($checks | index($s | wrapper)) != null)))
-        | {lane: "deep", job: "deep_self_tests", name: $s.name, run: $s.run, env: envlist($st; $s)}),
+        | select(st_on($deep; $self; $full; $checks; $s | wrapper))
+        | {lane: (if st_on($ldeep; $lself; $lfull; $lchecks; $s | wrapper) then "deep" else "deep_fallback" end),
+           job: "deep_self_tests", name: $s.name, run: $s.run, env: envlist($st; $s)}),
       ($safety | check_steps[] as $s | select($deep)
-        | {lane: "deep", job: "deep_safety", name: $s.name, run: $s.run, env: envlist($safety; $s)}),
+        | {lane: (if $ldeep then "deep" else "deep_fallback" end),
+           job: "deep_safety", name: $s.name, run: $s.run, env: envlist($safety; $s)}),
       ($rep | check_steps[] as $s | select($deep and $replay)
-        | {lane: "deep", job: "deep_consumer_replay", name: $s.name, run: $s.run, env: envlist($rep; $s)})
+        | {lane: (if $ldeep and $lreplay then "deep" else "deep_fallback" end),
+           job: "deep_consumer_replay", name: $s.name, run: $s.run, env: envlist($rep; $s)})
     ] | .[]' <<<"$JOBS_JSON") || die "cannot derive the step list from $WORKFLOW"
 
 lane_count() { printf '%s\n' "$PLAN_JSON" | jq -s --arg l "$1" '[.[] | select(.lane == $l)] | length'; }
 LIVE_N=$(lane_count live); SEL_N=$(lane_count selected); UNSEL_N=$(lane_count unselected); DEEP_N=$(lane_count deep)
+FB_N=$(lane_count fallback); DEEPFB_N=$(lane_count deep_fallback)
 [ "$LIVE_N" -gt 0 ] || die "no live checks found in $WORKFLOW (extraction broken?)"
+
+# Why the graph wrappers are selected, printed beside the run line.
+if [ -n "$FULL_REASON" ]; then
+  SELECTION_REASON="$SEL_N wrappers selected by the complete-surface rule ($FULL_REASON)"
+else
+  SELECTION_REASON="$SEL_N wrappers selected by path, $FB_N by undeclared-path fallback"
+fi
+undeclared_notice() {
+  [ -n "$UNDECLARED" ] || return 0
+  local list ran
+  list=$(printf '%s' "$UNDECLARED" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g')
+  # Say what this invocation does with the expansion: --plan runs nothing,
+  # LIVE=all runs the fallback wrappers (and with DEEP=1 the deep steps).
+  if [ "$PLAN" -eq 1 ]; then
+    ran="a hook run executes only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps are not run by default)"
+  elif [ "$ALL_LIVE" -eq 1 ] && [ "$DEEP" -eq 1 ]; then
+    ran="MERGEPATH_PREPUSH_LIVE=all and MERGEPATH_PREPUSH_DEEP=1 run it here too ($FB_N fallback wrappers and $DEEPFB_N deep steps)"
+  elif [ "$ALL_LIVE" -eq 1 ]; then
+    ran="MERGEPATH_PREPUSH_LIVE=all runs its $FB_N fallback wrappers here; its $DEEPFB_N deep steps also need MERGEPATH_PREPUSH_DEEP=1"
+  else
+    ran="this hook runs only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps not run here; MERGEPATH_PREPUSH_LIVE=all runs the wrappers, and with MERGEPATH_PREPUSH_DEEP=1 as well the deep steps)"
+  fi
+  echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; $ran."
+}
 
 if [ "$PLAN" -eq 1 ]; then
   printf 'scope\tdeep=%s full=%s checks=%s consumer_replay=%s self_tests=%s\n' \
     "$S_DEEP" "$S_FULL" "$S_CHECKS" "$S_REPLAY" "$S_SELF"
+  if [ -n "$UNDECLARED" ]; then
+    printf 'local_scope\tdeep=%s full=%s checks=%s consumer_replay=%s self_tests=%s\n' \
+      "$L_DEEP" "$L_FULL" "$L_CHECKS" "$L_REPLAY" "$L_SELF"
+    printf '%s' "$UNDECLARED" | sed '/^$/d' | sed 's/^/undeclared\t/'
+  fi
+  printf 'selection\t%s\n' "$SELECTION_REASON"
   printf '%s\n' "$PLAN_JSON" | jq -r '[.lane, .job, .name] | @tsv'
+  undeclared_notice >&2
   exit 0
 fi
 
@@ -797,8 +927,9 @@ fi
 # check starts first and the concurrency cap is used evenly.
 TIMINGS="${TIMINGS_ROOT:-$ROOT}/.mergepath/prepush-timings.tsv"
 lanes='"live","selected"'
-[ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"unselected\""
+[ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"fallback\",\"unselected\""
 [ "$DEEP" -eq 1 ] && lanes="$lanes,\"deep\""
+[ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"deep_fallback\""
 id=0
 while IFS= read -r step; do
   id=$((id + 1))
@@ -818,7 +949,9 @@ done < <(printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))")
 # One host reading per run (#2575, #2581): the load that sized the jobs
 # default is the one printed here; the verdict line reads it again at the end.
 LOAD_START="$LOAD_1"
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
+echo "$PREFIX: selection: $SELECTION_REASON"
+undeclared_notice
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
 fi

@@ -130,7 +130,7 @@ if [ "$1" = "api" ]; then
     graphql)
       # Per-thread nested comments pagination (node(id:...) query). Served
       # from $FIXTURE_TCOMMENTS_<node_id>_<cursor> if present.
-      if printf '%s' "$q" | grep -q 'PullRequestReviewThread'; then
+      if grep -q 'PullRequestReviewThread' <<<"$q"; then
         f="FIXTURE_TCOMMENTS_${node_id}_${cursor}"
         cat "${!f:-/dev/null}"
         exit 0
@@ -406,7 +406,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
   pass "legacy P1 scan disabled exits 0 after accounting with no legacy API calls"
 else
@@ -430,7 +430,7 @@ OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/gh-calls.l
   env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q "PR_NUMBER required" \
+if [ "$RC" = 2 ] && grep -q "PR_NUMBER required" <<<"$OUT" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
   pass "#1000: default-on accounting requires PR context even when the legacy scan is disabled"
 else
@@ -447,7 +447,7 @@ OUT=$(MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_GATE_STUB" \
   run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q 'review feedback is unaccounted' \
+if [ "$RC" = 1 ] && grep -q 'review feedback is unaccounted' <<<"$OUT" \
     && ! grep -q '^gh' "$WORKDIR/gh-calls.log"; then
   pass "#1000: feedback accounting miss blocks every consumer before legacy P1 reads"
 else
@@ -463,7 +463,7 @@ OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="aaaa1111" FIXTURE_PR="$FIXTURE_PR" \
   run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q 'PR head drifted during gate evaluation'; then
+if [ "$RC" = 2 ] && grep -q 'PR head drifted during gate evaluation' <<<"$OUT"; then
   pass "#1000: a synchronize during issue-comment evaluation fails closed"
 else
   fail "#1000 expected-head drift guard (rc=$RC, out=$OUT)"
@@ -479,7 +479,7 @@ OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="cafe1234" FIXTURE_PR="$FIXTURE_PR" \
   run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q 'Codex blocking-tier unresolved: 0'; then
+if [ "$RC" = 0 ] && grep -q 'Codex blocking-tier unresolved: 0' <<<"$OUT"; then
   pass "#1008: successful drift read ignores gh stderr chatter"
 else
   fail "#1008 drift-read stream isolation (rc=$RC, out=$OUT)"
@@ -493,7 +493,7 @@ OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" \
   env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q "PR_NUMBER required"; then
+if [ "$RC" = 2 ] && grep -q "PR_NUMBER required" <<<"$OUT"; then
   pass "#447 control: enabled gate + no env → exit 2 (env still required when enabled)"
 else
   fail "#447 control: expected rc=2 + 'PR_NUMBER required'; got rc=$RC, output:"
@@ -519,7 +519,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "no P1s → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -555,7 +555,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "P1 + resolved → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -591,8 +591,8 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "src/foo.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "src/foo.ts:42" <<<"$OUT"; then
   pass "P1 + unresolved → exit 1 with path listed"
 else
   fail "expected rc=1 with 'unresolved: 1' + path; got rc=$RC"
@@ -629,7 +629,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "P1 on stale SHA → out of scope, exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -668,7 +668,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "P1 body from human → ignored, exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -718,9 +718,9 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "src/bar.ts:99" \
-    && ! echo "$OUT" | grep -qE "Unresolved.*foo\.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "src/bar.ts:99" <<<"$OUT" \
+    && ! grep -qE "Unresolved.*foo\.ts:42" <<<"$OUT"; then
   pass "mix → exit 1, count=1, only bar.ts listed"
 else
   fail "expected rc=1, count=1, bar.ts listed, foo.ts NOT listed; got rc=$RC"
@@ -737,7 +737,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" "not-a-number" owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "PR_NUMBER must be an integer"; then
+if [ "$RC" = 2 ] && grep -qi "PR_NUMBER must be an integer" <<<"$OUT"; then
   pass "malformed PR_NUMBER → exit 2"
 else
   fail "expected rc=2 with PR_NUMBER error; got rc=$RC"
@@ -761,7 +761,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q "GH_TOKEN is required"; then
+if [ "$RC" = 2 ] && grep -q "GH_TOKEN is required" <<<"$OUT"; then
   pass "missing GH_TOKEN → exit 2"
 else
   fail "expected rc=2 with GH_TOKEN error; got rc=$RC"
@@ -806,8 +806,8 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "src/foo.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "src/foo.ts:42" <<<"$OUT"; then
   pass ">100 threads → page 2 paginated, unresolved P1 → exit 1"
 else
   fail "expected rc=1 with 'unresolved: 1' + path (page-2 pagination); got rc=$RC"
@@ -825,7 +825,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "missing p1_gate block → accounting clears, legacy scan defaults disabled"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -875,7 +875,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT"; then
   pass "#817: enabled: 'true' enables the gate (was exit 2)"
 else
   fail "#817: expected rc=1 with 'unresolved: 1'; got rc=$RC"
@@ -900,7 +900,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT"; then
   pass "#817: single-quoted bot_login counts the bot's finding (was a vacuous pass)"
 else
   fail "#817: expected rc=1 with 'unresolved: 1'; got rc=$RC"
@@ -918,7 +918,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
   pass "#817: enabled: 'false' → accounting pass then no legacy API calls"
 else
@@ -952,7 +952,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "env-only PR_NUMBER + REPO → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -974,7 +974,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "PR_NUMBER required"; then
+if [ "$RC" = 2 ] && grep -qi "PR_NUMBER required" <<<"$OUT"; then
   pass "missing PR_NUMBER → exit 2"
 else
   fail "expected rc=2 with 'PR_NUMBER required'; got rc=$RC"
@@ -1011,7 +1011,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "absent feedback_policy → unresolved P0 out of scope (P1-only) → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0' (P0 ∉ {p1}); got rc=$RC"
@@ -1046,8 +1046,8 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "\[P0\] src/foo.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "\[P0\] src/foo.ts:42" <<<"$OUT"; then
   pass "p0 required → unresolved P0 → exit 1, listed as [P0]"
 else
   fail "expected rc=1 with 'unresolved: 1' + [P0] path; got rc=$RC"
@@ -1082,7 +1082,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "p2 discretionary → unresolved P2 out of scope → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0' (P2 ∉ {p0,p1}); got rc=$RC"
@@ -1112,8 +1112,8 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "\[P3\] src/foo.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "\[P3\] src/foo.ts:42" <<<"$OUT"; then
   pass "address-all → unresolved P3 → exit 1, listed as [P3]"
 else
   fail "expected rc=1 with 'unresolved: 1' + [P3] path; got rc=$RC"
@@ -1147,7 +1147,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "malformed feedback_policy"; then
+if [ "$RC" = 2 ] && grep -qi "malformed feedback_policy" <<<"$OUT"; then
   pass "malformed feedback_policy tier → exit 2 (fail closed)"
 else
   fail "expected rc=2 with 'malformed feedback_policy'; got rc=$RC"
@@ -1188,7 +1188,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "P1 resolved on threads page 2 → collected + honored → exit 0"
 else
   fail "expected rc=0 (page-2 resolution honored); got rc=$RC"
@@ -1222,8 +1222,8 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "src/foo.ts:42"; then
+if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT" \
+    && grep -q "src/foo.ts:42" <<<"$OUT"; then
   pass "blocking comment id on nested page 2 → caught, unresolved → exit 1"
 else
   fail "expected rc=1 with 'unresolved: 1' + path (nested pagination); got rc=$RC"
@@ -1254,7 +1254,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+if [ "$RC" = 0 ] && grep -q "Codex blocking-tier unresolved: 0" <<<"$OUT"; then
   pass "blocking id on nested page 2, thread resolved → exit 0"
 else
   fail "expected rc=0 (nested-page resolution honored); got rc=$RC"
@@ -1285,7 +1285,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "malformed thread comments"; then
+if [ "$RC" = 2 ] && grep -qi "malformed thread comments" <<<"$OUT"; then
   pass "nested comments page-2 error → fail closed exit 2"
 else
   fail "expected rc=2 with 'malformed thread comments'; got rc=$RC"
@@ -1315,7 +1315,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "malformed reviewThreads"; then
+if [ "$RC" = 2 ] && grep -qi "malformed reviewThreads" <<<"$OUT"; then
   pass "reviewThreads page-2 error → fail closed exit 2"
 else
   fail "expected rc=2 with 'malformed reviewThreads'; got rc=$RC"
@@ -1343,7 +1343,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "hasNextPage but no endCursor"; then
+if [ "$RC" = 2 ] && grep -qi "hasNextPage but no endCursor" <<<"$OUT"; then
   pass "hasNextPage=true + null endCursor → fail closed exit 2"
 else
   fail "expected rc=2 with 'hasNextPage but no endCursor'; got rc=$RC"

@@ -2886,13 +2886,15 @@ record_phase4a_timeout_determination() {
 }
 
 # #2553: the heads a failover marker may name, read only when one is present.
-# An unreadable read prints [], so every trigger counts.
+# An unreadable read prints [], so every trigger counts. The force-push heads
+# come from GraphQL (#2591); if that read fails, only they are left out.
 failover_head_set() { # <comments-json>
-  local commits timeline
+  local commits timeline forced
   if ! crqe_failover_markers_present "$1" "$AUTHOR_IDENTITY"; then printf '[]'; return 0; fi
+  forced=$(crqe_force_push_heads "$REPO" "$PR_NUMBER" 2>/dev/null) || forced='[]'
   if commits=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/commits" "PR commits for failover markers" 2>/dev/null) \
      && timeline=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline for failover markers" 2>/dev/null) \
-     && crqe_pr_head_set "$commits" "$timeline" "$HEAD_SHA"; then
+     && crqe_pr_head_set "$commits" "$timeline" "$HEAD_SHA" "$forced"; then
     return 0
   fi
   log "failover markers: the PR's head set is unreadable; every trigger counts toward the request ceiling"

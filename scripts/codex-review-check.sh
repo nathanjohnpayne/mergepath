@@ -2485,12 +2485,10 @@ crc_render_request_evidence() {
   [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ] || return 1
   # shellcheck source=lib/codex-request-evidence.sh
   . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" || return 1
-  local trigger id posted age reactions ack=unknown review budget ack_budget summary_advice diagnostic_comments
-  # The request helper writes exactly this literal. Prefilter only diagnostic
-  # candidates, then leave author/freshness/order semantics with the shared
-  # selector that requester deduplication also uses.
-  diagnostic_comments=$(printf '%s\n' "$ISSUE_COMMENTS_JSON" | jq -c '[.[] | select((.body // "") == "@codex review")]') || return 1
-  trigger=$(crqe_select_trigger "$diagnostic_comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  local trigger id posted age reactions ack=unknown review budget ack_budget summary_advice
+  # Share the case-insensitive complete-command, author, freshness and ordering
+  # contract with requester deduplication, without narrowing its input first.
+  trigger=$(crqe_select_trigger "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
   review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") || return 1
   log "request evidence (informational; BLOCKED unchanged):"
   # Independent observations: an older terminal artifact must not hide a newer run.

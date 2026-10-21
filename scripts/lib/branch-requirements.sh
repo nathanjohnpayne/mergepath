@@ -89,10 +89,11 @@
 # see the completeness probe in br_required_checks, which reads `/rulesets` (a
 # configuration listing, not an actor-scoped evaluation) and accepts the
 # response only when no active ruleset has any bypass actor. The classic
-# surface carries the same caveat in principle; in practice
-# `refUpdateRule.requiredStatusCheckContexts` reports the branch rule rather
-# than a per-actor evaluation, and no reader-independent cross-check for it
-# exists below `Administration:read`.
+# surface is actor-scoped too (#2571): admins exempted from protection see an
+# empty `refUpdateRule` list. Prefer the `branchProtectionRule` configuration
+# listing when visible. Otherwise accept the projection only for a proven
+# non-admin viewer on a personal repository, which has no custom bypass roles.
+# Organization/custom-role or unreadable viewer evidence remains unknown.
 #
 # ─────────────────────────────────────────────────────────────────────
 # The tri-state, and why "unknown" is not "empty"
@@ -267,8 +268,10 @@ br_required_checks() {
   if classic_out="$(_br_retry gh api graphql \
       -f query='query($owner:String!,$name:String!,$qualifiedName:String!){
         repository(owner:$owner,name:$name){
+          isInOrganization viewerPermission
           ref(qualifiedName:$qualifiedName){
             refUpdateRule{ requiredStatusCheckContexts }
+            branchProtectionRule{ requiredStatusCheckContexts }
           }
         }
       }' \
@@ -295,7 +298,15 @@ br_required_checks() {
         # surface was not understood, which is the same as not having read it —
         # the fail-closed treatment the ruleset payloads already get.
         if classic_ctx="$(printf '%s' "$classic_out" | jq -c '
-            (.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // []) as $ctx
+            .data.repository as $repo | $repo.ref as $ref |
+            (if $ref.branchProtectionRule != null then
+               if ($ref.branchProtectionRule | type) != "object" then error("invalid classic configuration")
+               else $ref.branchProtectionRule.requiredStatusCheckContexts end
+             elif $repo.isInOrganization == false and $repo.viewerPermission == "WRITE" then
+               if $ref.refUpdateRule == null then []
+               elif ($ref.refUpdateRule | type) != "object" then error("invalid classic projection")
+               else $ref.refUpdateRule.requiredStatusCheckContexts end
+             else error("classic projection completeness unproven for this viewer") end) as $ctx
             | if ($ctx | type) != "array"
               then error("requiredStatusCheckContexts is not an array (\($ctx | type))")
               elif ($ctx | map(select(type != "string")) | length) > 0

@@ -53,7 +53,7 @@ export BR_RETRY_SLEEP=0
 # parameter expansion and the remainder is appended as literal text, so the
 # stub emits malformed JSON and every assertion downstream reads a parse
 # failure instead of the fixture it asked for.
-GH_CLASSIC_DEFAULT='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
+GH_CLASSIC_DEFAULT='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
 GH_RULESETS_DEFAULT='[]'
 
 gh() {
@@ -67,7 +67,7 @@ gh() {
         fail)     echo '{"message":"Bad credentials","status":"401"}'
                   echo "gh: Bad credentials (HTTP 401)" >&2; return 1 ;;
         gqlerror) echo '{"data":null,"errors":[{"message":"Resource not accessible by integration"}]}'; return 0 ;;
-        noref)    echo '{"data":{"repository":{"ref":null}}}'; return 0 ;;
+        noref)    echo '{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":null}}}'; return 0 ;;
         *)        echo "${GH_CLASSIC_BODY:-$GH_CLASSIC_DEFAULT}"; return 0 ;;
       esac
       ;;
@@ -128,6 +128,36 @@ field() { printf '%s' "$1" | jq -r "$2"; }
 
 RULESET_ONE='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"build"}]}}]'
 
+# #2571: the same protected branch projects an empty list for an admin who
+# can bypass, and the complete list for a personal-repo WRITE collaborator.
+# A configuration listing is authoritative even when the projection differs.
+for classic_case in admin-config admin-empty-config admin-projection nonadmin-projection \
+  org-projection org-config missing-viewer missing-owner read-viewer null-context missing-context malformed-config; do
+  fixture="$GH_CLASSIC_DEFAULT"; want_state=known; want_ctx='["lint"]'
+  case "$classic_case" in
+    admin-config|admin-empty-config|admin-projection)
+      fixture=$(printf '%s' "$fixture" | jq '.data.repository.viewerPermission="ADMIN" |
+        .data.repository.ref.refUpdateRule.requiredStatusCheckContexts=[]')
+      case "$classic_case" in
+        admin-config) fixture=$(printf '%s' "$fixture" | jq '.data.repository.ref.branchProtectionRule={requiredStatusCheckContexts:["lint"]}') ;;
+        admin-empty-config) fixture=$(printf '%s' "$fixture" | jq '.data.repository.ref.branchProtectionRule={requiredStatusCheckContexts:[]}'); want_ctx='[]' ;;
+        *) want_state=unknown; want_ctx='[]' ;;
+      esac ;;
+    org-projection) fixture=$(printf '%s' "$fixture" | jq '.data.repository.isInOrganization=true'); want_state=unknown; want_ctx='[]' ;;
+    org-config) fixture=$(printf '%s' "$fixture" | jq '.data.repository.isInOrganization=true | .data.repository.ref.branchProtectionRule={requiredStatusCheckContexts:["lint"]}') ;;
+    missing-viewer) fixture=$(printf '%s' "$fixture" | jq 'del(.data.repository.viewerPermission)'); want_state=unknown; want_ctx='[]' ;;
+    missing-owner) fixture=$(printf '%s' "$fixture" | jq 'del(.data.repository.isInOrganization)'); want_state=unknown; want_ctx='[]' ;;
+    read-viewer) fixture=$(printf '%s' "$fixture" | jq '.data.repository.viewerPermission="READ"'); want_state=unknown; want_ctx='[]' ;;
+    null-context) fixture=$(printf '%s' "$fixture" | jq '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts=null'); want_state=unknown; want_ctx='[]' ;;
+    missing-context) fixture=$(printf '%s' "$fixture" | jq 'del(.data.repository.ref.refUpdateRule.requiredStatusCheckContexts)'); want_state=unknown; want_ctx='[]' ;;
+    malformed-config) fixture=$(printf '%s' "$fixture" | jq '.data.repository.ref.branchProtectionRule={requiredStatusCheckContexts:["lint",7]}'); want_state=unknown; want_ctx='[]' ;;
+  esac
+  out=$(GH_CLASSIC_BODY="$fixture" br_required_checks owner/repo main)
+  if [ "$(field "$out" .state)" = "$want_state" ] && [ "$(field "$out" '.contexts | sort | tojson')" = "$(printf '%s' "$want_ctx" | jq -c .)" ]; then
+    pass "classic $classic_case: configuration or proven personal WRITE projection, otherwise unknown"
+  else fail "classic $classic_case expected $want_state/$want_ctx, got $out"; fi
+done
+
 # ── 1. Both surfaces answer: known, complete, unioned.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
   br_required_checks owner/repo main)
@@ -154,7 +184,7 @@ fi
 # Same emptiness, opposite meaning — this is the whole bug in one assertion.
 unknown_out=$(GH_CLASSIC=fail GH_RULESETS=fail br_required_checks owner/repo main)
 empty_out=$(GH_CLASSIC=ok GH_RULESETS=ok \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$unknown_out" '.contexts | length')" = "$(field "$empty_out" '.contexts | length')" ] \
    && [ "$(field "$unknown_out" .state)" != "$(field "$empty_out" .state)" ]; then
@@ -212,7 +242,7 @@ fi
 # BOTH surfaces answer, which is the normal case (classic answers with an
 # empty rule set on a ruleset-only repo).
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | join(",")')" = "build" ]; then
@@ -226,7 +256,7 @@ fi
 # treat the null data as "no protection".
 out=$(GH_CLASSIC=gqlerror GH_RULESETS=fail br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'not accessible'; then
+   && grep -q 'not accessible' <<<"$out"; then
   pass "a GraphQL errors payload counts as an unreadable surface and keeps its message"
 else
   fail "GraphQL errors payload: expected unknown carrying the message, got $out"
@@ -276,10 +306,10 @@ enc_case "non-ASCII is UTF-8 percent-encoded"   'feat/ü'        'feat/%C3%BC'
 # "this branch has no ruleset requirements" on the strength of an error body.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok \
   GH_RULESETS_BODY='{"message":"Server Error","status":"500"}' \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'non-array'; then
+   && grep -q 'non-array' <<<"$out"; then
   pass "a 2xx object body is classified as an unread rulesets surface, not an empty one"
 else
   fail "non-array rulesets page: expected unknown naming the shape, got $out"
@@ -296,10 +326,10 @@ for malformed in \
   '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":123}]}}]'
 do
   out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$malformed" \
-    GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+    GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
     br_required_checks owner/repo main)
   if [ "$(field "$out" .state)" = "unknown" ] \
-     && printf '%s' "$out" | grep -q 'malformed'; then
+     && grep -q 'malformed' <<<"$out"; then
     pass "a malformed required_status_checks rule is an unread surface, not an empty one"
   else
     fail "malformed rule ($malformed): expected unknown, got $out"
@@ -310,7 +340,7 @@ done
 # the payload check.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok \
   GH_RULESETS_BODY='[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]' \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | length')" = "0" ]; then
@@ -323,10 +353,10 @@ fi
 # `[]`, which every downstream shape check accepts vacuously, so the surface
 # would be recorded readable-and-empty without a byte having been read.
 out=$(GH_CLASSIC=ok GH_RULESETS=empty \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'no pages at all'; then
+   && grep -q 'no pages at all' <<<"$out"; then
   pass "an empty rulesets response is an unread surface, not an empty rule set"
 else
   fail "empty rulesets stream: expected unknown, got $out"
@@ -334,7 +364,7 @@ fi
 
 # The documented array shape still resolves normally.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | join(",")')" = "build" ]; then
@@ -352,17 +382,17 @@ fi
 # only when it can be PROVEN complete: a ruleset with no bypass actors cannot
 # have been hidden from anybody.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=bypass \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'bypass actors'; then
+   && grep -q 'bypass actors' <<<"$out"; then
   pass "a ruleset with bypass actors leaves the viewer-scoped response unproven, so the union is unknown"
 else
   fail "bypassable ruleset: expected unknown naming the bypass actors, got $out"
 fi
 
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=clean \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
@@ -372,7 +402,7 @@ else
 fi
 
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=fail \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ]; then
   pass "a ruleset whose detail cannot be read leaves completeness unproven"
@@ -381,7 +411,7 @@ else
 fi
 
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=fail \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ]; then
   pass "an unreadable ruleset listing leaves completeness unproven"
@@ -392,7 +422,7 @@ fi
 # An `evaluate`-mode ruleset does not gate merges, so it cannot hide an
 # enforced requirement and must not degrade the result.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=evaluate GH_RULESET_DETAIL=bypass \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ]; then
   pass "a non-active ruleset does not gate merges and does not degrade the union"
@@ -402,7 +432,7 @@ fi
 
 # The fleet's actual shape: no rulesets at all, so nothing can be hidden.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=none \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
@@ -417,10 +447,10 @@ fi
 # absence-versus-inability-to-look conflation, inside the probe written to
 # catch it.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=omitted \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'bypass_actors array'; then
+   && grep -q 'bypass_actors array' <<<"$out"; then
   pass "an omitted bypass_actors leaves completeness unproven rather than reading as empty"
 else
   fail "omitted bypass_actors: expected unknown, got $out"
@@ -431,7 +461,7 @@ fi
 # otherwise a repo whose only bypassable ruleset governs tags could never clear
 # gate (a) on any PR.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=tag GH_RULESET_DETAIL=bypass \
-  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "known" ] \
    && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
@@ -447,7 +477,7 @@ fi
 # nobody read.
 for inventory_shape in silent object; do
   out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST="$inventory_shape" \
-    GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+    GH_CLASSIC_BODY='{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
     br_required_checks owner/repo main)
   if [ "$(field "$out" .state)" = "unknown" ]; then
     pass "an unparseable ruleset inventory ($inventory_shape) leaves completeness unproven"
@@ -473,7 +503,7 @@ gh_flaky_once() {
         echo "gh: Internal Server Error (HTTP 500)" >&2
         return 1
       fi
-      echo '{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
+      echo '{"data":{"repository":{"isInOrganization":false,"viewerPermission":"WRITE","ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
       return 0
       ;;
     */rulesets/*)     echo '{"bypass_actors":[]}'; return 0 ;;

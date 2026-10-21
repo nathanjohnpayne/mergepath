@@ -49,8 +49,8 @@ expect_rc "surplus flag pair exits 2" 2 "$(run_checker python3 "$CHECKER" --chec
 
 # The usage diagnostic is part of the contract, not just the exit code.
 usage_out="$(python3 "$CHECKER" --check unexpected 2>&1 || true)"
-echo "$usage_out" | grep -q "owl-rules-check"; check "surplus argument prints the usage docstring" $?
-echo "$usage_out" | grep -q "Exit codes:"; check "usage output names the exit-code contract" $?
+grep -q "owl-rules-check" <<<"$usage_out"; check "surplus argument prints the usage docstring" $?
+grep -q "Exit codes:" <<<"$usage_out"; check "usage output names the exit-code contract" $?
 
 # Missing fixture: a scratch tree mirroring the script-relative layout, with
 # the violations fixture removed. These branches also precede the import.
@@ -70,8 +70,8 @@ if "$PYTHON" -c 'import rdflib, owlrl' >/dev/null 2>&1; then
   rc="$(run_checker "$PYTHON" "$SCRATCH/scripts/owl-rules-check.py" --check)"
   expect_rc "corrupted TBox exits 2 (load error, not traceback)" 2 "$rc"
   out="$("$PYTHON" "$SCRATCH/scripts/owl-rules-check.py" --check 2>&1 || true)"
-  echo "$out" | grep -q "failed to parse"; check "parse failure names the file" $?
-  ! echo "$out" | grep -q "Traceback"; check "parse failure emits no traceback" $?
+  grep -q "failed to parse" <<<"$out"; check "parse failure names the file" $?
+  ! grep -q "Traceback" <<<"$out"; check "parse failure emits no traceback" $?
 else
   echo "SKIP: rdflib/owlrl not available; skipping parse-error assertions (self-bootstrap)"
 fi

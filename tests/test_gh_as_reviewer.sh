@@ -226,7 +226,7 @@ elif ! grep -q $'GH_TOKEN=gho_fallback-claude-token GITHUB_TOKEN= gh\tpr\treview
 elif grep -q $'GH_TOKEN=ghp_author-token GITHUB_TOKEN= gh\tpr\treview' "$WORKDIR/calls.log"; then
   fail "ambient token wrong identity: wrong ambient token reached the wrapped write"
   cat "$WORKDIR/calls.log" >&2
-elif ! echo "$err" | grep -q "ambient GH_TOKEN did not verify"; then
+elif ! grep -q "ambient GH_TOKEN did not verify" <<<"$err"; then
   fail "ambient token wrong identity: missing fallthrough diagnostic"
   echo "$err" >&2
 else

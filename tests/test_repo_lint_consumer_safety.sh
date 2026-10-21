@@ -821,7 +821,7 @@ self_run() {  # $1 = tree; prints output, returns the wrapper's exit code
 
 self_tree "$GUARD_DIR/self-residue" "" "test"
 set +e; out=$(self_run "$GUARD_DIR/self-residue"); rc=$?; set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'check_repo_lint_consumer_safety: SKIP (consumer checkout' \
+if [ "$rc" -eq 0 ] && grep -q 'check_repo_lint_consumer_safety: SKIP (consumer checkout' <<<"$out" \
    && ! printf '%s' "$out" | grep -q INNER-SUITE-RAN; then
   pass "marker-first: a consumer carrying the wrapped test as bootstrap residue SKIPs without running it"
 else
@@ -830,7 +830,7 @@ fi
 
 self_tree "$GUARD_DIR/self-hubmissing" "marker" ""
 set +e; out=$(self_run "$GUARD_DIR/self-hubmissing"); rc=$?; set -e
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'ERROR (missing'; then
+if [ "$rc" -ne 0 ] && grep -q 'ERROR (missing' <<<"$out"; then
   pass "marker-first: the hub (marker present) hard-errors when the wrapped test is missing"
 else
   fail "marker-first: hub with the wrapped test missing must hard-error (rc=$rc): $out"

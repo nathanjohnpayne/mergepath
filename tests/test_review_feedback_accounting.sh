@@ -70,6 +70,18 @@ if [ -n "${GH_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$GH_FAIL_ENDPOINT" ]; then
   exit 1
 fi
 
+# GitHub's edit history of one inline comment (#2598): the paginated, slurped
+# page array the gate reads, keyed by the node id the query is given.
+if [ "${1:-}" = api ] && [ "${2:-}" = graphql ]; then
+  [ "${GH_FAIL_ENDPOINT:-}" != graphql ] || { echo 'synthetic GraphQL failure' >&2; exit 1; }
+  node=""
+  for arg in "$@"; do case "$arg" in id=*) node="${arg#id=}" ;; esac; done
+  fixture="$GH_FIXTURE_DIR/edits-$node.json"
+  [ -f "$fixture" ] || { echo "unexpected graphql node: $node" >&2; exit 2; }
+  cat "$fixture"
+  exit 0
+fi
+
 # Alert-number GET (#1113): mimics real gh's client-side --jq filtering,
 # which none of the other fixture endpoints below need (they're consumed
 # by fetch_api_array, whose callers apply their own jq on the captured
@@ -214,7 +226,7 @@ feedback_archive:
     - {login: nathanpayne-codex, provider: reviewer, status: retired}
     - {login: nathanpayne-release, provider: reviewer, status: active}
 YAML
-  rm -f "$TMP/fixtures"/reactions-*.json
+  rm -f "$TMP/fixtures"/reactions-*.json "$TMP/fixtures"/edits-*.json
   : >"$TMP/gh-calls.log"
 }
 
@@ -973,6 +985,25 @@ jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.
 archive_of "$TMP/acked-once-body.txt" 8701
 run_gate
 assert_eq 0 "$RUN_RC" "an archived first-acknowledgement revision collapses with the twice-acknowledged live finding"
+
+# #2568: CodeRabbit's acknowledgement edit can also prepend the invisible
+# `<!-- coderabbit-ai-generated:v1 -->` header to a finding created without
+# it (observed on nathanpaynedotcom#1445). That header is framing, not
+# content: the reply before the edit still accounts for the live finding, and
+# the archived pre-edit revision demands no acknowledgement token.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "an acknowledgement edit that also prepends the generated header keeps the finding accounted (#2568)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "the header-only difference demands no inline acknowledgement token (#2568)"
+# Negative control: the header is stripped only as the first line, so a real
+# content change that comes with it is still an ordinary edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\nAlso rename the flag.\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8703
+run_gate
+assert_eq 1 "$RUN_RC" "a content change delivered with the generated header still raises the floor (#2568)"
 cp "$TMP/fixtures/inline-acked-crlf.json" "$TMP/fixtures/inline.json"
 jq -r '.[0].body' "$TMP/fixtures/inline-before-ack-crlf.json" >"$TMP/pre-ack-body-crlf.txt"
 archive_of "$TMP/pre-ack-body-crlf.txt" 8702
@@ -1050,12 +1081,14 @@ archive_entry() {
 }
 # Shape 5: the footer rewritten to the reply marker with no confirmation line,
 # CodeRabbit's edit after a reply it does not confirm. With the relay's record
-# the edit is provably content-free; without it, it is an ordinary edit.
+# the edit is provably content-free; without it, GitHub's edit history decides
+# (#2598, below), and a finding with no node id to read it by is an ordinary edit.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->")' "2026-08-18T21:02:00Z"
 printf '[]\n' >"$TMP/fixtures/issues.json"
 run_gate
-assert_eq 1 "$RUN_RC" "a footer rewrite with no confirmation line and no archived record is an ordinary edit"
+assert_eq 1 "$RUN_RC" "a footer rewrite with no confirmation line, no archived record and no node id is an ordinary edit"
+assert_match 'carries no node id' "$RUN_ERR" "the missing node id is named as the cause"
 archive_of "$PRE_ACK_BODY" 8706
 run_gate
 assert_eq 0 "$RUN_RC" "a footer rewrite with no confirmation line keeps the floor when the archived revision has the same content (#1167)"
@@ -1091,6 +1124,112 @@ assert_eq 0 "$RUN_RC" "on a fork pull request the marker-based decision still st
 GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7" run_gate
 assert_eq 2 "$RUN_RC" "a failed pull request fetch fails the gate closed"
 set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+
+# #2598: the no-line shape with no record applying is decided from GitHub's own
+# edit history. The fixture is nathanjohnpayne/mergepath#2585's finding
+# 4331100484: created 22:41:12Z, rebutted 22:58:55Z, footer rewritten 22:58:59Z
+# with no confirmation line, withdrawn by CodeRabbit 22:59:20Z, no archive record.
+# edit_history <node id> <editedAt>=<body file>[@deleted]... — GitHub's record of one
+# comment as the graphql fixture, newest first; an empty file name is withheld text.
+edit_history() {
+  local node="$1" nodes='[]' rev at file deleted
+  shift
+  for rev in "$@"; do
+    at="${rev%%=*}"
+    file="${rev#*=}"
+    deleted=null
+    case "$file" in *@deleted) file="${file%@deleted}"; deleted='"2026-10-21T01:00:00Z"' ;; esac
+    if [ -n "$file" ]; then
+      nodes=$(printf '%s' "$nodes" | jq -c --arg at "$at" --argjson deleted "$deleted" --rawfile body "$file" \
+        '. + [{editedAt: $at, deletedAt: $deleted, diff: ($body | rtrimstr("\n"))}]')
+    else
+      nodes=$(printf '%s' "$nodes" | jq -c --arg at "$at" '. + [{editedAt: $at, deletedAt: null, diff: null}]')
+    fi
+  done
+  printf '%s' "$nodes" | jq '[{data: {node: {userContentEdits: {pageInfo: {hasNextPage: false, endCursor: null}, nodes: .}}}}]' \
+    >"$TMP/fixtures/edits-$node.json"
+}
+graphql_calls() { grep -c -- '^api graphql ' "$TMP/gh-calls.log" || true; }
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {"id": 4331100484, "node_id": "PRRC_fixture4331100484", "in_reply_to_id": null, "created_at": "2026-10-20T22:41:12Z", "updated_at": "2026-10-20T22:58:59Z", "user": {"login": "coderabbitai[bot]"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "<!-- coderabbit-ai-generated:v1 -->\n\n**🩺 Stability & Availability** | **🟡 Minor** | **⚡ Quick win**\n\n**Bound the API poll, not only the loop.**\n\nThe deadline check runs only after `gh api ... | grep` returns false. A stalled `gh api` can block past `end`.\n\n<!-- cr-comment:v1:606865b508ac692e6731b1aa -->\n\n<!-- This is an auto-generated reply by CodeRabbit -->"},
+  {"id": 4331223186, "in_reply_to_id": 4331100484, "created_at": "2026-10-20T22:58:55Z", "user": {"login": "nathanjohnpayne"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "Rebuttal: the documented command already bounds every poll with the SECONDS deadline and a per-request timeout.\n\n[mergepath-resolve: rebuttal-recorded]"},
+  {"id": 4331226967, "in_reply_to_id": 4331100484, "created_at": "2026-10-20T22:59:20Z", "user": {"login": "coderabbitai[bot]"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "@nathanjohnpayne I withdraw this finding; the deadline already bounds the poll.\n\n<!-- This is an auto-generated reply by CodeRabbit -->"}
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-2585.json"
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/live-2585.txt"
+sed 's/auto-generated reply by CodeRabbit/auto-generated comment by CodeRabbit/' "$TMP/live-2585.txt" >"$TMP/created-2585.txt"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+run_gate
+assert_eq 0 "$RUN_RC" "a footer-only rewrite with no record applying keeps the floor at the creation GitHub's history reaches, so the reply four seconds before it counts (#2598)"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "the rewritten finding is the one posted finding"
+assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "the pre-edit reply is its evidence"
+assert_eq 1 "$(graphql_calls)" "GitHub's edit history is read once for the finding"
+# The twin: one body character changed at the same edit.
+sed 's/Bound the API poll/Bound the API polls/' "$TMP/created-2585.txt" >"$TMP/created-2585-twin.txt"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585-twin.txt"
+run_gate
+assert_eq 1 "$RUN_RC" "a rewrite that also changed one body character raises the floor to that edit, so the earlier reply does not count"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "the content-changed live finding is what is missing"
+jq '. + [{"id": 4331843596, "in_reply_to_id": 4331100484, "created_at": "2026-10-21T00:41:35Z", "user": {"login": "nathanjohnpayne"}, "path": "REVIEW_POLICY.md", "line": 580, "body": "Restating the disposition after the edit: rebutted, see above."}]' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 0 "$RUN_RC" "a reply after the content-changing rewrite is evidence for it"
+assert_eq 0 "$(graphql_calls)" "a finding the marker rule already accounts never reads the history"
+# Fail closed: an unreadable history, withheld or deleted text, or a newest revision that is not the live body.
+cp "$TMP/fixtures/inline-2585.json" "$TMP/fixtures/inline.json"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+GH_FAIL_ENDPOINT=graphql run_gate
+assert_eq 1 "$RUN_RC" "an unreadable edit history leaves the rewrite an ordinary edit"
+assert_match 'could not read GitHub.s edit history for inline finding 4331100484' "$RUN_ERR" "the unreadable history is named as the cause"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z="
+run_gate
+assert_eq 1 "$RUN_RC" "a revision whose text GitHub withholds ends the content-free run at the newer edit"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt@deleted"
+run_gate
+assert_eq 1 "$RUN_RC" "a deleted revision cannot prove the rewrite content-free, even with its text present"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/created-2585-twin.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+run_gate
+assert_eq 1 "$RUN_RC" "a history whose newest revision is not the live body decides nothing"
+assert_match 'does not show the live body' "$RUN_ERR" "the mismatch is named as the cause"
+# Scope: the relay's record decides when one applies; a confirmed acknowledgement
+# and an edit that kept the comment footer never read the history.
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+rendered=$("$RENDER_ARCHIVE" inline 4331100484 'coderabbitai[bot]' '2026-10-20T22:58:59Z' "$TMP/created-2585-twin.txt")
+jq -n --arg archive "$rendered" '[{"id": 8720, "created_at": "2026-10-20T22:59:00Z", "updated_at": "2026-10-20T22:59:00Z", "user": {"login": "github-actions[bot]"}, "body": $archive}]' >"$TMP/fixtures/issues.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "a record that applies decides, and one showing a content change is not overruled by the history"
+assert_eq 0 "$(graphql_calls)" "the history is not read when a record applies"
+printf '[]\n' >"$TMP/fixtures/issues.json"
+jq '.[0].body |= sub("<!-- This is an auto-generated reply by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit 65a7aec")' \
+  "$TMP/fixtures/inline-2585.json" >"$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 0 "$RUN_RC" "a confirmed acknowledgement is decided by the marker rule"
+assert_eq 0 "$(graphql_calls)" "and never reads the history"
+jq 'del(.[1])' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "a confirmed acknowledgement with no reply is unaccounted at its creation floor"
+assert_eq 0 "$(graphql_calls)" "and the history is not read for it either"
+jq '.[0].body |= sub("<!-- This is an auto-generated reply by CodeRabbit -->$"; "\n<!-- This is an auto-generated comment by CodeRabbit -->")' \
+  "$TMP/fixtures/inline-2585.json" >"$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "an edit that kept the comment footer is an ordinary edit, whatever it changed"
+assert_eq 0 "$(graphql_calls)" "only the reply-marker rewrite reads the history"
+# A fork cannot write GitHub's record, so it decides the shape on a fork pull request too.
+cp "$TMP/fixtures/inline-2585.json" "$TMP/fixtures/inline.json"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "on a fork pull request GitHub's record still decides the footer-only rewrite (#1210 bars only the relay's record)"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+reset_fixtures
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 # A content change delivered with an acknowledgement is still an edit, and its archive still needs a token.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"

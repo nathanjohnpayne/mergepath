@@ -5125,6 +5125,10 @@ case "$endpoint" in
     printf '%s\n' "$comments_json" ;;
   repos/owner/repo/issues/7/timeline)
     printf '%s\n' "${P4B_TEST_TIMELINE_JSON-[]}" ;;
+  # #2591: the GraphQL force-push timeline; empty unless a case sets it.
+  graphql)
+    no_force_push='{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}'
+    printf '%s\n' "${P4B_TEST_GRAPHQL_JSON:-$no_force_push}" ;;
   repos/owner/repo/compare/*)
     # #1335: the carry-forward's changed-file set, bound to the head by the
     # compare range. Content never matters (the fingerprint delegate is
@@ -5864,6 +5868,27 @@ _cap_failover=$(printf '%s' "$_cap_old" | jq -c '. + [{id: 5103, user: {login: "
   body: "<!-- mergepath-codex-failover:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=5102 -->"}]')
 # A marker naming a head this PR never had exempts nothing (#2553).
 _cap_failover_foreign=$(printf '%s' "$_cap_failover" | jq -c 'map(if .id == 5103 then .body |= sub("head=a{40}"; "head=" + ("1" * 40)) else . end)')
+# A marker on a head a force-push replaced (#2591): only the GraphQL timeline
+# names it, so it exempts its trigger with that read and not without it.
+_cap_failover_forced=$(printf '%s' "$_cap_failover" | jq -c 'map(if .id == 5103 then .body |= sub("head=a{40}"; "head=" + ("9" * 40)) else . end)')
+_forced_gql='{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":false},"nodes":[{"beforeCommit":{"oid":"9999999999999999999999999999999999999999"},"afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}}}}'
+for _fo in "$_cap_failover_forced:exhausted:2" "$_cap_failover_forced:available:1:gql"; do
+  _fo_gql=""; case "$_fo" in *:gql) _fo_gql=$_forced_gql; _fo=${_fo%:gql} ;; esac
+  _fo_comments=${_fo%:*:*}; _fo_rest=${_fo#"$_fo_comments":}
+  out="$(
+    export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-candidate.yml"
+    export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+    export P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml"
+    export P4B_TEST_COMMENTS_JSON="$_fo_comments" P4B_TEST_LIVE_HEAD="$_p4a_head"
+    export P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' P4B_TEST_TIMELINE_JSON='[]'
+    [ -z "$_fo_gql" ] || export P4B_TEST_GRAPHQL_JSON="$_fo_gql"
+    export PATH="$WORK/barrier-bin:$PATH"
+    p4b_codex_request_budget_state owner/repo 7 "$_p4a_head"
+  )" && rc=0 || rc=$?
+  [ "$rc" = 0 ] && printf '%s' "$out" | jq -e --arg st "${_fo_rest%:*}" --argjson n "${_fo_rest#*:}" \
+      '.state == $st and .request_attempts == $n and .max_request_attempts == 2' >/dev/null 2>&1 \
+    || bad="$bad failover-forced-ceiling-read(${_fo_rest}${_fo_gql:+,gql},rc=$rc,out=$out)"
+done
 for _fo in "$_cap_old:exhausted:2" "$_cap_failover:available:1" "$_cap_failover_foreign:exhausted:2"; do
   _fo_comments=${_fo%:*:*}; _fo_rest=${_fo#"$_fo_comments":}
   out="$(

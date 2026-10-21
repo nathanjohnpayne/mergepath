@@ -435,7 +435,13 @@ crl_human_stops() {
                              and (.ceiling_exempt == null or (.ceiling_exempt | type) == \"boolean\"))
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
-                              and (.blocking_unlocated | type) == \"boolean\")
+                              and (.blocking_unlocated | type) == \"boolean\"
+                              # last_at feeds the runaway marker's floor (#2561): a
+                              # non-string sorts below every instant and would drop
+                              # the response out of it, so it fails like first_at.
+                              # Absent is the older-ledger case and falls back to
+                              # first_at; present (null included) must be an instant.
+                              and ((has(\"last_at\") | not) or (.last_at | type) == \"string\"))
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))
         # The fixed-finding evidence is optional (older ledgers read as
@@ -570,11 +576,30 @@ crl_apply_owner_tiebreaks() {
       any($tb[]; .kind == "rebuttal" and (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
       ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
+    # Instants compare as whole seconds, never as text (#2561): ISO strings
+    # collate "...00Z" after "...00.5Z", and any non-instant string sorts
+    # above every real one, so a lexicographic test let a same-second,
+    # fractional or malformed timestamp release the stop. GitHub comment
+    # timestamps carry no fraction, so "strictly later second" is the finest
+    # order the evidence supports; a malformed instant on either side holds.
+    # Absolute anchors, as crl_ledger validates: in this regex dialect `$`
+    # also matches before one trailing newline, and fromdateiso8601 then
+    # converts "…Z\n" as if it were an instant (Codex on #2567).
+    def seconds:
+      if type == "string" and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
+      then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
+      else null end;
     # The runaway formed with the latest request or response, so the marker
-    # must postdate every one of them.
-    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ] | max // "") as $runaway_floor
+    # must postdate every one of them. Every candidate is converted before
+    # the maximum is taken: a textual max would discard a malformed candidate
+    # that sorts below a valid one, so one bad instant anywhere makes the
+    # floor null, and a null floor holds.
+    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ]
+     | map(seconds)
+     | if length == 0 or any(.[]; type != "number") then null else max end) as $runaway_floor
     | (($stops.stops | index("runaway")) != null
-       and any($tb[]; .kind == "runaway" and .at > $runaway_floor)) as $runaway
+       and ($runaway_floor | type) == "number"
+       and any($tb[]; .kind == "runaway" and ((.at | seconds) as $a | ($a | type) == "number" and $a > $runaway_floor))) as $runaway
     | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements
@@ -589,4 +614,38 @@ crl_apply_owner_tiebreaks() {
     | .stops = [ .stops[] | select((. == "untested-rebuttal" and ($untested | length) == 0) | not)
                           | select((. == "disagreement" and ($disagreements | length) == 0) | not)
                           | select((. == "runaway" and $runaway) | not) ]' 2>/dev/null
+}
+
+# crl_resolved_human_stops <ledger-json> <head> <author> <max-blocking-reviews>
+#                          <request-ceiling> <pr-url> [comments-reader [args...]]
+#
+# The one consumer-facing stop calculation (#2558): crl_human_stops with the
+# owner's tiebreak markers applied. The Phase 4b barrier (p4b_codex_human_stops)
+# and Cockpit's PR read both call it, so the two cannot disagree about whether
+# an owner tiebreak released a stop. Prints crl_human_stops' output for the
+# ledger, head, author, budget and ceiling. When a dispute stop (an untested
+# rebuttal or a disagreement, #2511) or a runaway stop (#2534) holds, it runs
+# the reader to obtain the PR's issue comments as one JSON array, parses the
+# markers with crl_owner_tiebreaks against <pr-url> and <head>, and applies them
+# with crl_apply_owner_tiebreaks, so the output carries `owner_tiebreaks` (empty
+# when no marker settled anything). A reader that fails or prints anything but
+# one array, or no reader at all, leaves the stops as crl_human_stops computed
+# them, without `owner_tiebreaks`: missing evidence never reads as a decision.
+# With no such stop the reader never runs, so a PR with nothing to release costs
+# no read; `blocking-budget` alone is not releasable. Returns nonzero, printing
+# nothing, when crl_human_stops does.
+crl_resolved_human_stops() {
+  local ledger="$1" head="$2" author="$3" max="$4" ceiling="$5" url="$6"
+  local stops comments marks applied
+  shift 6
+  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling") || return 1
+  if [ $# -gt 0 ] && printf '%s' "$stops" | jq -e '(.untested_rebuttals | length) + (.disagreements | length) > 0
+       or (.stops | index("runaway")) != null' >/dev/null 2>&1; then
+    if comments=$("$@" 2>/dev/null) \
+       && marks=$(crl_owner_tiebreaks "$comments" "$author" "$url" "$head") \
+       && applied=$(crl_apply_owner_tiebreaks "$stops" "$(printf '%s' "$ledger" | jq -sc '.[0]')" "$marks"); then
+      stops="$applied"
+    fi
+  fi
+  printf '%s\n' "$stops"
 }
