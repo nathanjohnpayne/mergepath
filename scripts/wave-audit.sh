@@ -769,15 +769,20 @@ if [ -n "$CAPTURE_INPUT_DIR" ]; then
   if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fx -- "$BASE_FULL" >/dev/null; then
     base_on_first_parent=true
   fi
-  # The audited head itself must be a merged hub state: on the first-parent
-  # history of the trusted checkout's default-branch ref. The propagation
+  # The audited head itself must be a merged hub state. The propagation
   # verifier byte-checks the canary against the source SHA but does not prove
   # that SHA merged, so without this an unmerged commit sitting on the
-  # watermark would pass the base test above. A stale local ref can only
+  # watermark would pass the base test above.
+  #
+  # The trust anchor is the commit this trusted checkout is running from: the
+  # orchestrator must run from a trusted main checkout (#628), and the capture
+  # child runs this script from that same checkout. No branch name or remote
+  # symref is consulted (#2694): a stale `refs/remotes/origin/HEAD` could name
+  # an old, since-unprotected branch, and a fresh fetch cannot authenticate in
+  # the capture child's isolated environment. An older checkout can only
   # withhold the exemption (a human is asked), never grant it.
   head_on_hub_default=false
-  hub_default=$(git -C "$REPO_DIR" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || printf refs/remotes/origin/main)
-  if hub_tip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "${hub_default}^{commit}") \
+  if hub_tip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "HEAD^{commit}") \
      && git -C "$REPO_DIR" rev-list --first-parent "$hub_tip" | grep -Fx -- "$HEAD_FULL" >/dev/null; then
     head_on_hub_default=true
   fi
