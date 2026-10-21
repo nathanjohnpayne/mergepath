@@ -559,6 +559,18 @@ done
 [ ! -f "$PROBE_DIR/ran.check_selftested" ] && ok "unselected self-test not run" || bad "unselected self-test ran"
 [ ! -f "$PROBE_DIR/ran.check_graphed" ] && ok "unselected graph wrapper not run by default" || bad "unselected graph wrapper ran"
 check "concurrency cap 1 holds" "$(sort -n "$PROBE_DIR/concurrency" | tail -n 1)" "1"
+# #2575: the host load is printed beside the cap and in the verdict, so an
+# hour-long run on a saturated machine reads as the machine.
+if grep -Eq '^repo-lint pre-push: running [0-9]+ checks \(jobs=1, nice=10, host load ([0-9.]+|unknown) on ([0-9]+|\?) CPUs\)' <<<"$out"; then
+  ok "the jobs= line reports the host load and CPU count"
+else
+  bad "no host load beside jobs=: $out"
+fi
+if grep -Eq '^repo-lint pre-push: PASS \([0-9]+ checks in [0-9]+m[0-9]+s; host load ([0-9.]+|unknown) at start, ([0-9.]+|unknown) at end\)' <<<"$out"; then
+  ok "the verdict line reports the host load at start and end"
+else
+  bad "no host load in the verdict: $out"
+fi
 base_nice=$(ps -o nice= -p $$ | tr -d ' ')
 # Discover the kernel's ceiling independently of the runner. Only this
 # disposable Python child changes priority: Linux clamps 20 to 19, while
@@ -666,6 +678,34 @@ rc=0; out=$(cd "$FIX" && GIT_DIR="$FIX/.git" GIT_WORK_TREE="$FIX" GIT_INDEX_FILE
 check "explicit hook-local git environment: exact non-HEAD tip passes" "$rc" "0"
 check "hook-local index remains unchanged" "$(git hash-object "$FIX/.git/index")" "$index_before"
 check "hook-local environment remote receives exact tip" "$(remote_tip feat/hook-env)" "$(git -C "$FIX" rev-parse feat/pass)"
+
+# #2575: the --exec-step worker itself clears git's hook-local variables, so
+# a check never resolves a fixture against the pushing repository even when
+# the worker is reached without the runner's own scrub. Under a leaked
+# GIT_DIR, `git init "$d"` reinitializes that repository instead (it sets the
+# shared core.bare = true, the #2578 footprint) and creates nothing in $d.
+WORKER="$TMP/worker-run"
+mkdir -p "$WORKER/steps" "$WORKER/logs" "$WORKER/results"
+printf '%s\n' "$FIX" > "$WORKER/root"
+printf '0\n' > "$WORKER/nice"
+printf 'check_worker_env\n' > "$WORKER/steps/001.name"
+: > "$WORKER/steps/001.env"
+cat > "$WORKER/steps/001.sh" <<'SH'
+env | grep -E '^GIT_(DIR|WORK_TREE|INDEX_FILE|PREFIX|COMMON_DIR|OBJECT_DIRECTORY)=' > "$WORKER_ENV_OUT" || true
+d=$(mktemp -d "${TMPDIR:-/tmp}/worker-fixture.XXXXXX")
+git init -q "$d"
+[ -d "$d/.git" ]
+rm -rf "$d"
+SH
+bare_before=$(git -C "$FIX" config --local --get core.bare)
+rc=0; GIT_DIR="$FIX/.git" GIT_WORK_TREE="$FIX" GIT_INDEX_FILE="$FIX/.git/index" GIT_PREFIX='' \
+  GIT_COMMON_DIR="$FIX/.git" WORKER_ENV_OUT="$TMP/worker-env.out" \
+  bash "$RUNNER" --exec-step "$WORKER" 001 > "$TMP/worker.out" 2>&1 || rc=$?
+check "worker invoked with git's hook-local variables exits 0" "$rc" "0"
+check "worker passes a fixture git init under leaked GIT_* variables" "$(cut -f1 "$WORKER/results/001" 2>/dev/null)" "0"
+check "no hook-local GIT_* variable reaches the check" "$(cat "$TMP/worker-env.out" 2>/dev/null)" ""
+check "a fixture git init under the worker leaves the pushing repository's core.bare alone" "$(git -C "$FIX" config --local --get core.bare)" "$bare_before"
+git -C "$FIX" config --local core.bare "$bare_before"
 
 # A deleted tracked requirement, recreated only as an untracked local file,
 # must fail exactly as CI does. The old checkout-based runner passes this.
@@ -1079,19 +1119,19 @@ reset_probe; slow_all
 commit_change feat/load README.md
 rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=0.50 git push origin feat/load 2>&1) || rc=$?
 check "quiet machine: push succeeds" "$rc" "0"
-case "$out" in *"(jobs=2, nice=10, load 0.50 on 4 CPUs)"*) ok "load below the CPU count defaults to jobs=2, and both are printed" ;; *) bad "quiet-machine running line: $out" ;; esac
+case "$out" in *"(jobs=2, nice=10, host load 0.50 on 4 CPUs)"*) ok "load below the CPU count defaults to jobs=2, and both are printed" ;; *) bad "quiet-machine running line: $out" ;; esac
 check "quiet machine: two checks run at once" "$(peak_concurrency)" "2"
 reset_probe; slow_all
 git -C "$FIX" commit -q --allow-empty -m loaded
 rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=4.00 git push origin feat/load 2>&1) || rc=$?
 check "loaded machine: push succeeds" "$rc" "0"
-case "$out" in *"(jobs=1, nice=10, load 4.00 on 4 CPUs)"*) ok "load at the CPU count defaults to jobs=1, and both are printed" ;; *) bad "loaded-machine running line: $out" ;; esac
+case "$out" in *"(jobs=1, nice=10, host load 4.00 on 4 CPUs)"*) ok "load at the CPU count defaults to jobs=1, and both are printed" ;; *) bad "loaded-machine running line: $out" ;; esac
 check "loaded machine: checks run one at a time" "$(peak_concurrency)" "1"
 reset_probe; slow_all
 git -C "$FIX" commit -q --allow-empty -m override
 rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=512.25 MERGEPATH_PREPUSH_JOBS=2 git push origin feat/load 2>&1) || rc=$?
 check "MERGEPATH_PREPUSH_JOBS overrides the load-derived default" "$rc" "0"
-case "$out" in *"(jobs=2, nice=10, load 512.25 on 4 CPUs)"*) ok "the override is printed beside the load" ;; *) bad "override running line: $out" ;; esac
+case "$out" in *"(jobs=2, nice=10, host load 512.25 on 4 CPUs)"*) ok "the override is printed beside the load" ;; *) bad "override running line: $out" ;; esac
 check "override: two checks run at once" "$(peak_concurrency)" "2"
 
 echo ""

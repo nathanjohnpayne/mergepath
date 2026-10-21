@@ -103,6 +103,18 @@ if [ "${1:-}" = "--exec-step" ]; then
   start=$(date +%s)
   rc=0
   (
+    # Each check starts from the environment a CI job gives it (#2575),
+    # whatever path invoked this worker. Git exports its hook-local
+    # repository variables to a pre-push hook (GIT_DIR=<primary>/.git/
+    # worktrees/<name> from a linked worktree); a fixture `git init` or
+    # `git config` under them writes into the real repository instead, the
+    # #777 identity leak and a shared `core.bare = true` (#2578). The literal
+    # names cover a git that cannot list them.
+    # shellcheck disable=SC2046
+    unset $(git rev-parse --local-env-vars 2>/dev/null) 2>/dev/null || true
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_IMPLICIT_WORK_TREE \
+      GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT 2>/dev/null || true
     cd "$(cat "$run_dir/root")"
     if [ -s "$run_dir/steps/$id.env" ]; then
       while IFS= read -r kv; do
@@ -264,20 +276,35 @@ prepush_lock_progress() {   # $1 completed, $2 total: refresh the record's progr
   printf '%s\nprogress=%s of %s\n' "$rec" "$1" "$2" > "$LOCK_RECORD" 2>/dev/null || true
 }
 
+# Host load and CPU count, best effort (#2575): the one-minute load average
+# and the online CPUs, or `unknown` / `?`. sysctl is asked first, so a test
+# can stand in for the host; /proc, getconf and nproc answer where it is not.
+host_load() {
+  local l=''
+  l=$({ sysctl -n vm.loadavg 2>/dev/null || true; } | awk '{ print $2 }')
+  [ -n "$l" ] || l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || true)
+  case "$l" in ''|*[!0-9.]*|*.*.*|.) l=unknown ;; esac
+  printf '%s' "$l"
+}
+host_cpus() {
+  local n=''
+  n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || n=$(nproc 2>/dev/null) || n=''
+  case "$n" in ''|*[!0-9]*) n='?' ;; esac
+  printf '%s' "$n"
+}
+
 # The default concurrency follows the machine: two checks at once while the
 # one-minute load average is below the CPU count, one once it is not. Either
 # reading unavailable keeps the historical default of 2. Sets DEFAULT_JOBS,
-# LOAD_1 and CPU_N (the last two are printed on the `running` line).
+# LOAD_1 and CPU_N (printed on the `running` line).
 LOAD_1=''
 CPU_N=''
 DEFAULT_JOBS=2
 prepush_default_jobs() {
-  CPU_N=$(sysctl -n hw.ncpu 2>/dev/null) || CPU_N=$(nproc 2>/dev/null) || CPU_N=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || CPU_N=''
-  LOAD_1=$({ sysctl -n vm.loadavg 2>/dev/null || true; } | awk '{ print $2 }')
-  [ -n "$LOAD_1" ] || LOAD_1=$(awk '{ print $1 }' /proc/loadavg 2>/dev/null || true)
-  case "$CPU_N" in ''|*[!0-9]*) CPU_N='' ;; esac
-  case "$LOAD_1" in ''|*[!0-9.]*|*.*.*|.) LOAD_1='' ;; esac
-  if [ -n "$CPU_N" ] && [ -n "$LOAD_1" ] && awk -v l="$LOAD_1" -v c="$CPU_N" 'BEGIN { exit !(l + 0 >= c + 0) }'; then
+  LOAD_1=$(host_load)
+  CPU_N=$(host_cpus)
+  if [ "$LOAD_1" != unknown ] && [ "$CPU_N" != '?' ] \
+     && awk -v l="$LOAD_1" -v c="$CPU_N" 'BEGIN { exit !(l + 0 >= c + 0) }'; then
     DEFAULT_JOBS=1
   else
     DEFAULT_JOBS=2
@@ -734,7 +761,10 @@ while IFS= read -r step; do
   printf '%s\t%s\n' "$prev" "$sid" >> "$RUN_DIR/order"
 done < <(printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))")
 
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, load ${LOAD_1:-unknown} on ${CPU_N:-unknown} CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
+# One host reading per run (#2575, #2581): the load that sized the jobs
+# default is the one printed here; the verdict line reads it again at the end.
+LOAD_START="$LOAD_1"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
 fi
@@ -778,8 +808,9 @@ if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
 fi
 
 mins=$((ELAPSED / 60)); secs=$((ELAPSED % 60))
+LOAD_NOTE="host load $LOAD_START at start, $(host_load) at end"
 if [ "$failed" -eq 0 ]; then
-  echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s). CI lint still runs and remains authoritative."
+  echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s; $LOAD_NOTE). CI lint still runs and remains authoritative."
   if [ "${MERGEPATH_PREPUSH_KEEP_LOGS:-0}" = "1" ]; then
     echo "$PREFIX: logs kept in $RUN_DIR"
   else
@@ -798,6 +829,6 @@ for f in "$RUN_DIR"/results/*; do
   tail -n 30 "$RUN_DIR/logs/$sid.log" >&2
   echo "" >&2
 done
-echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s); the push is blocked. Logs: $RUN_DIR" >&2
+echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s; $LOAD_NOTE); the push is blocked. Logs: $RUN_DIR" >&2
 echo "$PREFIX: fix and push again. Bypass only in an emergency: git push --no-verify, or MERGEPATH_PREPUSH_SKIP=1 git push (CI lint still gates the merge)." >&2
 exit 1
