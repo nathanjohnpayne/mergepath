@@ -298,6 +298,50 @@ if [ "${SUMMARY_HOLD_MUTATION_CHILD:-0}" = 1 ]; then
   exit 0
 fi
 
+# A mutation counts only when the child reports its specific behavioral
+# assertion. Extraction and prerequisite errors are failures, not evidence that
+# the mutation was detected.
+expect_mutation_failure() {
+  local label="$1" rc="$2" expected="$3" output="$4"
+  if [ "$rc" -eq 1 ] && grep -Fqx -- "$expected" "$output"; then
+    echo "PASS: $label failed at the intended assertion"
+    return 0
+  fi
+  echo "FAIL: $label did not fail at the intended assertion (child exit $rc; expected: $expected)"
+  cat "$output"
+  return 1
+}
+
+# A real failed extraction must not satisfy the mutation predicate even though
+# the child exits nonzero. This keeps the expected-marker check itself covered.
+python3 - "$WORKFLOW" "$TMP/no-publish-step.yml" <<'PY3'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+old = 'name: Resolve targets, evaluate gates, publish'
+assert text.count(old) == 1
+Path(sys.argv[2]).write_text(text.replace(old, 'name: unrelated step', 1))
+PY3
+set +e
+REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-publish-step.yml" \
+  SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/unrelated-child.out" 2>&1
+mutation_rc=$?
+set -e
+if expect_mutation_failure "unrelated extraction failure control" "$mutation_rc" \
+    'FAIL: recognized CodeRabbit finding publishes failure' "$TMP/unrelated-child.out" \
+    >"$TMP/unrelated-control.out" 2>&1; then
+  echo "FAIL: unrelated extraction failure counted as mutation detection"
+  fail=$((fail + 1))
+elif grep -Fq 'did not fail at the intended assertion' "$TMP/unrelated-control.out" \
+    && grep -Fq 'could not extract the publisher publish step' "$TMP/unrelated-child.out"; then
+  echo "PASS: unrelated extraction failure is rejected as mutation evidence"
+  pass=$((pass + 1))
+else
+  echo "FAIL: unrelated extraction control did not report its cause"
+  cat "$TMP/unrelated-control.out" "$TMP/unrelated-child.out"
+  fail=$((fail + 1))
+fi
+
 # Each mutation reruns this same extracted caller/helper suite. The failure is
 # behavioral: the mutated shipped caller writes when it should hold or stops
 # exporting the classifier flag, rather than a permanent spacing-sensitive pin.
@@ -309,12 +353,14 @@ old = '"$PR" "$head_sha" true'
 assert text.count(old) == 1
 Path(sys.argv[2]).write_text(text.replace(old, '"$PR" "$head_sha"', 1))
 PY
-if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-opt-in.yml" \
-    SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/no-opt-in.out" 2>&1; then
-  echo "FAIL: runtime suite accepted removal of the CodeRabbit opt-in"
-  exit 1
-fi
-echo "PASS: runtime suite rejects removal of the CodeRabbit opt-in"
+set +e
+REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-opt-in.yml" \
+  SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/no-opt-in.out" 2>&1
+mutation_rc=$?
+set -e
+expect_mutation_failure "removal of the CodeRabbit opt-in" "$mutation_rc" \
+  'FAIL: recognized CodeRabbit finding publishes failure' "$TMP/no-opt-in.out" \
+  || fail=$((fail + 1))
 
 python3 - "$WORKFLOW" "$TMP/no-withhold.yml" <<'PY2'
 from pathlib import Path
@@ -324,11 +370,17 @@ old = 'title="$context — evidence hold; explicit recovery required after escal
 assert text.count(old) == 1
 Path(sys.argv[2]).write_text(text.replace(old, 'conclusion="success"; ' + old, 1))
 PY2
-if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-withhold.yml" \
-    SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/no-withhold.out" 2>&1; then
-  echo "FAIL: runtime suite accepted an unrecognized-evidence success"
+set +e
+REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-withhold.yml" \
+  SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/no-withhold.out" 2>&1
+mutation_rc=$?
+set -e
+expect_mutation_failure "unrecognized-evidence success mutation" "$mutation_rc" \
+  'FAIL: unknown current-head CodeRabbit run closes its owned generation red' "$TMP/no-withhold.out" \
+  || fail=$((fail + 1))
+
+if [ "$fail" -ne 0 ]; then
+  echo "$fail failed, $pass passed"
   exit 1
 fi
-echo "PASS: runtime suite rejects an unrecognized-evidence success"
-
-echo "All $pass required-check publisher summary-hold behavior tests and 2 mutations passed."
+echo "All $pass required-check publisher summary-hold behavior tests, 2 mutations, and unrelated-failure control passed."
