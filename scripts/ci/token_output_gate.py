@@ -2225,6 +2225,12 @@ class Lexer:
                     # This child still occupies the here-string operand word.
                     # A width-only marker must not look like output redirection.
                     cur_level()["word"].append("<()")
+                elif (resolve_command(probe)[0] == "tee" and redirection
+                        and redirection.end() == len(previous)
+                        and not cur_level()["word"]):
+                    # Consume this tee redirection's target word, so a later
+                    # standalone process operand is not mistaken for its target.
+                    cur_level()["word"].append("<()")
                 seg = self._new_segment(parent_seg, False, line)
                 cur_ll.segments.append(seg)
                 levels.append(
@@ -3396,9 +3402,6 @@ def _tee_process_substitution_sidewrite(seg, shadowed_stdin=frozenset()):
         if len(children) != 1:
             continue  # No command-list or process-substitution pipeline model.
         child = children[0]
-        if (resolve_command(child)[0] == "cat" and "cat" in shadowed_stdin
-                and child._cmd_literal == "cat"):
-            continue  # A local function is not proven to forward its stdin.
         if (resolve_command(child)[0] == "cat" and child._cmd_index == 0
                 and child.pipe_to is None
                 and child.words[1:] in ([">&2"], ["1>&2"])):
@@ -5237,6 +5240,11 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
         if name in STDIN_ECHOERS
     )
     lx = Lexer(text)
+    if any(resolve_command(seg)[0] in ("alias", "unalias", "eval", "source", ".")
+           for ll in lx.logical for seg in ll.segments):
+        # Namespace setup may replace the unqualified tee command or its options.
+        # Withhold only the new exit-mode proof; do not infer setup execution.
+        shadowed_stdin = shadowed_stdin | {"tee"}
     findings = []
     pragma_errors = []
     for offset in lx.unsupported_ansi_aliases:
@@ -15964,13 +15972,60 @@ def _tee_process_substitution_cases():
                    if seg.parent is None and resolve_command(seg)[0] == "tee")
         if _tee_exits_without_input(tee):
             failures.append("tee exit mode: skipped an earlier argument " + repr(text))
+    for cid, expected, body in _tee_round2_cases() + _tee_namespace_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee round2 boundary: " + cid)
     return failures
+
+
+def _tee_round2_cases():
+    """Consumed targets and uncertain command bindings cannot hide side writes."""
+    pipe = 'printf %s "$GH_TOKEN" | tee >(cat >&2) | grep -qF zz\n'
+    alias = "shopt -s expand_aliases; alias tee='command tee --'\n"
+    return [
+        ("tee-round2-consumed-target", MUST_FLAG,
+         'printf %s "$GH_TOKEN" | tee 3> >(cat >/dev/null) >(cat >&2) | grep -qF zz\n'),
+        ("tee-round2-consumed-target-null", MUST_NOT_FLAG,
+         'printf %s "$GH_TOKEN" | tee 3> >(cat >/dev/null) >(cat >/dev/null) | grep -qF zz\n'),
+        ("tee-round2-cat-after", MUST_FLAG, pipe + 'cat(){ :; }\n'),
+        ("tee-round2-cat-false", MUST_FLAG, 'if false; then cat(){ :; }; fi; ' + pipe),
+        ("tee-round2-cat-subshell", MUST_FLAG, '(cat(){ :; })\n' + pipe),
+        ("tee-round2-alias-help", MUST_FLAG,
+         alias + pipe.replace('tee >(', 'tee --help >(')),
+        ("tee-round2-alias-version", MUST_FLAG,
+         alias + pipe.replace('tee >(', 'tee --version >(')),
+        ("tee-round2-alias-null", MUST_NOT_FLAG,
+         alias + pipe.replace('tee >(', 'tee --help >(').replace('cat >&2', 'cat >/dev/null')),
+        ("tee-round2-alias-qualified", MUST_NOT_FLAG,
+         alias + pipe.replace('tee >(', '/usr/bin/tee --help >(')),
+    ]
+
+
+def _tee_namespace_cases():
+    """Known setup builtins withhold only the optional unqualified exit proof."""
+    pipe = 'printf %s "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'
+    setups = (
+        ("eval", "eval \"alias tee='command tee --'\"\n"),
+        ("source", "source <(printf %s \"alias tee='command tee --'\")\n"),
+        ("dot", ". <(printf %s \"alias tee='command tee --'\")\n"),
+    )
+    return [
+        ("tee-round2-setup-" + name + "-" + suffix, rule,
+         'shopt -s expand_aliases\n' + setup + pipeline)
+        for name, setup in setups
+        for suffix, rule, pipeline in (
+            ("leak", MUST_FLAG, pipe),
+            ("null", MUST_NOT_FLAG, pipe.replace('cat >&2', 'cat >/dev/null')),
+            ("qualified", MUST_NOT_FLAG, pipe.replace('| tee ', '| /usr/bin/tee ')),
+        )
+    ]
 
 
 def _tee_review_cases():
     """Reviewed namespace, consumed-delimiter and literal exit-mode pairs."""
     return [
-        ("tee-review-cat-shadow", MUST_NOT_FLAG,
+        ("tee-review-cat-shadow", MUST_FLAG,
          'cat(){ :; }\nprintf \'%s\' "$GH_TOKEN" | tee >(cat >&2) | grep -qF zz\n'),
         ("tee-review-cat-shadow-absolute", MUST_FLAG,
          'cat(){ :; }\nprintf \'%s\' "$GH_TOKEN" | tee >(/bin/cat >&2) | grep -qF zz\n'),
@@ -17037,6 +17092,14 @@ CORPUS += [
 # Measured scopes are explicit per ID; agreement in a sibling shape does not
 # waive a declaration. Existing reasons and ordinary scanner rules stay intact.
 CORPUS += _tee_review_cases()
+CORPUS += _tee_round2_cases()
+CORPUS += _tee_namespace_cases()
+# The same reviewed case/body now records the approved conservative reduction.
+KNOWN_BROADER["tee-review-cat-shadow"] = (
+    "Literal cat side writes remain conservative without executed callsite binding; "
+    "the measured local no-op is quiet in all three shapes. "
+    "Deferred: https://github.com/nathanjohnpayne/mergepath/issues/2658"
+)
 
 
 KNOWN_MISS_SHAPES = {
@@ -17091,6 +17154,7 @@ KNOWN_MISS_SHAPES = {
 }
 
 KNOWN_BROADER_SHAPES = {
+    'tee-review-cat-shadow': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'alias-defined-and-used-on-one-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'capture-stderr-only-redirection': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'capture-stderr-onto-stdout': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
