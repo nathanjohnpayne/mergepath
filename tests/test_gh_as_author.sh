@@ -137,6 +137,116 @@ assert_allowed_source "a pre-verb long label value that spells merge" \
   'gh pr --label merge list'
 assert_prohibited_source "a short label value cannot hide a later merge verb" \
   'gh pr -l merge merge 7'
+
+# #1342: search queries may precede or follow the list verb. Their literal
+# value must never become a native verb, while real writes with the same
+# option placements and executable substitutions remain inspectable.
+for search_flag in --search -S; do
+  assert_allowed_source "$search_flag query before the list verb" \
+    "gh pr $search_flag merge list"
+  assert_allowed_source "$search_flag query after the list verb" \
+    "gh pr list $search_flag merge"
+  assert_allowed_source "$search_flag quoted query before the list verb" \
+    "gh pr $search_flag 'merge' list"
+  assert_allowed_source "$search_flag attached query before the list verb" \
+    "gh pr $search_flag=merge list"
+  assert_allowed_source "$search_flag attached query after the list verb" \
+    "gh pr list $search_flag=merge"
+  assert_prohibited_source "$search_flag query cannot hide a later merge verb" \
+    "gh pr $search_flag merge merge 7"
+  assert_prohibited_source "$search_flag ordinary query cannot hide a later merge verb" \
+    "gh pr $search_flag topic merge 7"
+  assert_prohibited_source "$search_flag query after a real merge verb" \
+    "gh pr merge 7 $search_flag merge"
+  assert_prohibited_source "$search_flag pre-verb query substitution still exposes a merge" \
+    "gh pr $search_flag \"\$(gh pr merge 7)\" list"
+  assert_prohibited_source "$search_flag post-verb query substitution still exposes a merge" \
+    "gh pr list $search_flag \"\$(gh pr merge 7)\""
+  assert_prohibited_source "$search_flag read cannot hide a separate native merge" \
+    "gh pr $search_flag merge list; gh pr merge 7"
+done
+
+# #1324: a separately supplied quoted scalar repo/host value is one argv
+# operand, not a dynamic command group or PR verb. Unquoted/multiword forms
+# and unknown option binding retain the classifier's conservative boundary.
+escaped_quote='\"'
+for repo_flag in -R --repo --hostname; do
+  assert_allowed_source "$repo_flag quoted scalar before the PR group" \
+    "gh $repo_flag \"\$REPO\" pr view 1"
+  assert_allowed_source "$repo_flag quoted scalar after the PR group" \
+    "gh pr $repo_flag \"\$REPO\" list"
+  assert_allowed_source "$repo_flag quoted braced scalar before the PR group" \
+    "gh $repo_flag \"\${REPO}\" pr view 1"
+  assert_allowed_source "$repo_flag quoted braced scalar after the PR group" \
+    "gh pr $repo_flag \"\${REPO}\" list"
+  assert_prohibited_source "$repo_flag quoted scalar cannot hide a native merge" \
+    "gh $repo_flag \"\$REPO\" pr merge 7"
+  assert_prohibited_source "$repo_flag quoted scalar cannot hide a PR merge verb" \
+    "gh pr $repo_flag \"\$REPO\" merge 7"
+  assert_prohibited_source "$repo_flag quoted braced scalar cannot hide a native merge" \
+    "gh $repo_flag \"\${REPO}\" pr merge 7"
+  assert_prohibited_source "$repo_flag quoted braced scalar cannot hide a PR merge verb" \
+    "gh pr $repo_flag \"\${REPO}\" merge 7"
+  assert_prohibited_source "$repo_flag global value substitution still exposes a merge" \
+    "gh $repo_flag \"\$(gh pr merge 7)\" pr view 1"
+  assert_prohibited_source "$repo_flag PR value substitution still exposes a merge" \
+    "gh pr $repo_flag \"\$(gh pr merge 7)\" list"
+  assert_prohibited_source "$repo_flag unquoted global value remains opaque" \
+    "gh $repo_flag \$REPO pr view 1"
+  assert_prohibited_source "$repo_flag unquoted PR value remains opaque" \
+    "gh pr $repo_flag \$REPO list"
+  assert_prohibited_source "$repo_flag quote-sandwiched global value can split" \
+    "gh $repo_flag \"\"\$REPO\"\" pr view 1"
+  assert_prohibited_source "$repo_flag quote-sandwiched PR value can split" \
+    "gh pr $repo_flag \"\"\$REPO\"\" list"
+  assert_prohibited_source "$repo_flag escaped global quotes do not prevent splitting" \
+    "gh $repo_flag ${escaped_quote}\$REPO${escaped_quote} pr view 1"
+  assert_prohibited_source "$repo_flag escaped PR quotes do not prevent splitting" \
+    "gh pr $repo_flag ${escaped_quote}\$REPO${escaped_quote} list"
+  assert_prohibited_source "$repo_flag quoted positional array remains opaque" \
+    "gh $repo_flag \"\$@\" pr view 1"
+  assert_prohibited_source "$repo_flag quoted named array remains opaque" \
+    "gh pr $repo_flag \"\${REPOS[@]}\" list"
+  assert_prohibited_source "$repo_flag cannot be another option's operand" \
+    "gh -q $repo_flag \"\$REPO\" pr view 1"
+  assert_prohibited_source "$repo_flag cannot restart parsing at an option's gh operand" \
+    "gh -q gh $repo_flag \"\$REPO\" pr view 1"
+  assert_prohibited_source "$repo_flag cannot restart parsing at a gh command-group operand" \
+    "gh gh $repo_flag \"\$REPO\" pr view 1"
+  assert_prohibited_source "$repo_flag cannot restart parsing at a gh PR-verb operand" \
+    "gh pr gh $repo_flag \"\$REPO\" list"
+  assert_prohibited_source "$repo_flag wrapper value cannot hide a later merge" \
+    "sudo $repo_flag \"\$REPO\" gh pr merge 7"
+  assert_allowed_source "$repo_flag static value retains its read path" \
+    "gh $repo_flag owner/repo pr view 1"
+  assert_allowed_source "$repo_flag quoted scalar with a path-qualified gh" \
+    "env FIXTURE=1 /opt/bin/gh $repo_flag \"\$REPO\" pr view 1"
+  assert_prohibited_source "$repo_flag path-qualified write stays prohibited" \
+    "env FIXTURE=1 /opt/bin/gh $repo_flag \"\$REPO\" pr merge 7"
+done
+assert_allowed_source "literal repo prefix preserves a later quoted hostname read" \
+  "gh -R owner/repo --hostname \"\$HOST\" pr view 1"
+assert_prohibited_source "literal repo prefix cannot hide a quoted hostname write" \
+  "gh -R owner/repo --hostname \"\$HOST\" pr merge 7"
+assert_allowed_source "quoted hostname preserves an explicit REST GET" \
+  "gh --hostname \"\$HOST\" api repos/o/r/pulls -X GET -f state=open"
+assert_prohibited_source "quoted hostname cannot hide an explicit REST write" \
+  "gh --hostname \"\$HOST\" api repos/o/r/pulls/7/merge -X PUT"
+assert_prohibited_source "quoted hostname cannot hide an implicit REST write" \
+  "gh --hostname \"\$HOST\" api repos/o/r/pulls/7/reviews -f event=APPROVE"
+assert_prohibited_source "quoted hostname cannot hide a GraphQL mutation" \
+  "gh --hostname \"\$HOST\" api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'"
+assert_prohibited_source "an unrelated quoted dynamic option stays opaque" \
+  "gh --unknown \"\$REPO\" pr view 1"
+assert_prohibited_source "a separate merge remains visible after a quoted repo read" \
+  "gh -R \"\$REPO\" pr view 1; gh pr merge 7"
+assert_allowed_source "quoted jq flag retains its existing value collapse" \
+  'gh pr "--jq" merge view 1'
+assert_allowed_source "quoted search flag retains its existing value collapse" \
+  'gh pr "--search" merge list'
+assert_allowed_source "quoted gh executable retains the search read path" \
+  '"gh" pr --search merge list'
+
 # The method flag is a gh option and is legal on either side of `api`; gh sends
 # the fields as a query string, so this is an explicit read.
 assert_allowed_source "an explicit GET pinned before the api command" \
@@ -1344,13 +1454,13 @@ mkdir -p "$WORKDIR/fake-exec"
 env_out="$(GIT_EXEC_PATH="$WORKDIR/fake-exec" GIT_TRACE_CURL="$WORKDIR/trace.log" GIT_TRACE_REDACT=0 \
   GIT_SSL_NO_VERIFY=1 PATH="$CRED_DIR:$PATH" \
   bash -c '. "$1"; gh_author_git_exec ghp_env-token -c alias.showenv="!env" showenv' _ "$ROOT/scripts/lib/gh-token-resolver.sh" 2>&1)"
-if printf '%s\n' "$env_out" | grep -q "GIT_EXEC_PATH=$WORKDIR/fake-exec" \
-   || printf '%s\n' "$env_out" | grep -qE '^GIT_(TRACE_CURL|TRACE_REDACT|SSL_NO_VERIFY)='; then
+if grep -q "GIT_EXEC_PATH=$WORKDIR/fake-exec" <<<"$env_out" \
+   || grep -qE '^GIT_(TRACE_CURL|TRACE_REDACT|SSL_NO_VERIFY)=' <<<"$env_out"; then
   fail "inherited GIT_* reached the token-bearing git: $(printf '%s\n' "$env_out" | grep '^GIT_' | tr '\n' ' ')"
-elif printf '%s\n' "$env_out" | grep -q '^GH_TOKEN=ghp_env-token$'; then
+elif grep -q '^GH_TOKEN=ghp_env-token$' <<<"$env_out"; then
   pass "inherited GIT_EXEC_PATH, GIT_TRACE_CURL, GIT_TRACE_REDACT and GIT_SSL_NO_VERIFY never reach the token-bearing git"
 else
-  fail "GIT_* isolation probe did not run: $env_out"
+  fail "GIT_* isolation probe did not run: expected fixture token marker absent"
 fi
 
 # A gh the repository ships is never the credential helper, even with "."

@@ -965,23 +965,50 @@ for hold_label in human-hold needs-human-review policy-violation; do
 done
 
 # These queries describe external-review applicability/coverage, not permission
-# to merge. A hold must not change their boolean contract.
+# to merge. Pin a baseline-true answer first, then prove each human hold leaves
+# that answer unchanged. An under-threshold fixture would make false pass even
+# if the query accidentally treated a hold as an applicability exemption.
 SCRATCH=$(make_scratch true true)
-FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" nathanjohnpayne '[{"name":"human-hold"}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_PROTECTION=$(make_protection_fixture '[]')
+for hold_query in --derive-external-requiredness --derive-phase-4-requiredness --derive-rate-limit-protection; do
+  for hold_label in baseline human-hold needs-human-review policy-violation; do
+    if [ "$hold_label" = baseline ]; then
+      hold_labels='[]'
+    else
+      hold_labels="[{\"name\":\"$hold_label\"}]"
+    fi
+    FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" nathanjohnpayne "$hold_labels")
+    if [ "$hold_query" = --derive-rate-limit-protection ]; then
+      set +e
+      OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+        FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
+        MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+        CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=0 \
+        run_gate "$SCRATCH" "$hold_query" 99 owner/repo 2>/dev/null)
+      RC=$?
+      set -e
+    else
+      set +e
+      OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+        run_gate "$SCRATCH" "$hold_query" 99 owner/repo 2>/dev/null)
+      RC=$?
+      set -e
+    fi
+    if [ "$RC" = 0 ] && [ "$OUT" = true ]; then
+      pass "#1418: $hold_query remains true with $hold_label"
+    else
+      fail "#1418: $hold_query with $hold_label expected true/0; got '$OUT'/$RC"
+    fi
+  done
+done
+
+# Restore the ordinary under-threshold context used by the following exact-
+# label control; the positive fixtures above intentionally cross threshold.
+SCRATCH=$(make_scratch true true)
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
-for hold_query in --derive-external-requiredness --derive-phase-4-requiredness --derive-rate-limit-protection; do
-  set +e
-  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-    run_gate "$SCRATCH" "$hold_query" 99 owner/repo 2>/dev/null)
-  RC=$?
-  set -e
-  if [ "$RC" = 0 ] && [ "$OUT" = false ]; then
-    pass "#1277: hold preserves $hold_query"
-  else
-    fail "#1277: $hold_query expected false/0; got '$OUT'/$RC"
-  fi
-done
 
 # Exact-label control: issue-triage labels and similar names are not holds.
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" nathanjohnpayne '[{"name":"decision-needed"},{"name":"human-hold-extra"}]')

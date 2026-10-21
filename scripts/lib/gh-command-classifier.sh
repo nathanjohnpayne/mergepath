@@ -520,6 +520,7 @@ gh_source_has_direct_literal_pr_mutation() {
         if (escaped) {
           if (char == "$") char = literal_prefix "DOLLAR"
           if (char == "`") char = literal_prefix "BACKTICK"
+          if (char == "\"") char = literal_prefix "DQUOTE"
           if (char == " " || char == "\t") {
             char = literal_prefix "SPACE"
           }
@@ -632,8 +633,6 @@ gh_source_has_direct_literal_pr_mutation() {
   # in another command's argument position and standalone empty quoted words
   # may still fail closed. A content-only view restores markers only after one
   # real direct `gh api graphql` segment has been selected below.
-  dynamic_scan=$(printf '%s\n' "$protected_source" \
-    | tr '\n' ';' | tr -d "\"'") || return 2
   # Option run between a command word and the next command word. Enumerating
   # the options we happen to know (-R/--repo/--hostname) is the FAIL-OPEN
   # shape: any option outside the list ends the match, so `gh --verbose pr
@@ -665,17 +664,49 @@ gh_source_has_direct_literal_pr_mutation() {
   # `sudo -H gh` as `sudo -H=gh` erases the command we must inspect. Quoted
   # whitespace and separators already carry literal markers, so tokenize only
   # the unquoted boundaries here and reset at each shell command separator.
-  dynamic_scan=$(printf '%s\n' "$dynamic_scan" | LC_ALL=C awk '
-    function collapse(segment, words, n, i, active, result, word) {
+  # Keep quote evidence through this same pass for #1324. Only the initial
+  # literal gh/pr prefix proves repo/host operand binding; an unknown option
+  # may consume a following -R token, so it ends that proof. Replace a complete
+  # quoted ordinary scalar with an inert operand, not its still-opaque dollar.
+  dynamic_scan=$(printf '%s\n' "$protected_source" \
+    | LC_ALL=C awk -v literal_prefix="$literal_marker_prefix" '
+    function quoted_scalar(word, name, open_marker, close_marker) {
+      if (substr(word, 1, 2) != "\"$" || substr(word, length(word), 1) != "\"") return 0
+      name = substr(word, 3, length(word) - 3)
+      open_marker = literal_prefix "LBRACE"
+      close_marker = literal_prefix "RBRACE"
+      if (substr(name, 1, length(open_marker)) == open_marker \
+          && substr(name, length(name) - length(close_marker) + 1) == close_marker) {
+        name = substr(name, length(open_marker) + 1, length(name) - length(open_marker) - length(close_marker))
+      }
+      if (index(name, literal_prefix)) return 0
+      return name ~ /^[[:alpha:]_][[:alnum:]_]*$/
+    }
+    function collapse(segment, words, n, i, active, prefix, result, word, option_word, value) {
       n = split(segment, words, /[[:space:]]+/)
       active = 0
+      prefix = 0
       result = ""
       for (i = 1; i <= n; i++) {
         word = words[i]
         if (word == "") continue
-        if (word ~ /(^|\/)gh$/) active = 1
-        if (active && word ~ /^(-q|--jq|-t|--template|-H|--header|--cache|-l|--label)$/ && i < n) {
-          word = word "=" words[++i]
+        option_word = word
+        gsub(literal_prefix "DQUOTE", "\"", option_word)
+        gsub(/["\047]/, "", option_word)
+        if (option_word ~ /(^|\/)gh$/) {
+          active = 1
+          if (prefix == 0) prefix = word == option_word && word !~ /[$`]/ ? 1 : -1
+          else if (prefix > 0) prefix = -1
+        } else if (prefix > 0 && word ~ /^(-R|--repo|--hostname)$/ && i < n) {
+          value = words[++i]
+          if (quoted_scalar(value)) value = literal_prefix "OPTION_VALUE"
+          word = word " " value
+        } else {
+          if (prefix == 1 && word == "pr") prefix = 2
+          else if (prefix > 0) prefix = -1
+          if (active && option_word ~ /^(-q|--jq|-t|--template|-H|--header|--cache|-l|--label|-S|--search)$/ && i < n) {
+            word = word "=" words[++i]
+          }
         }
         result = result (result == "" ? "" : " ") word
       }
@@ -693,6 +724,11 @@ gh_source_has_direct_literal_pr_mutation() {
       print collapse(segment)
     }
   ') || return 2
+  # Escaped literal quotes cannot prove scalar quoting. Restore them only
+  # after that proof, preserving the legacy scan after its quote erasure.
+  dynamic_scan=${dynamic_scan//"${literal_marker_prefix}DQUOTE"/\"}
+  dynamic_scan=$(printf '%s\n' "$dynamic_scan" \
+    | tr '\n' ';' | tr -d "\"'") || return 2
   # Active legacy backticks were rejected by the pre-lexer. Keep this
   # defensive normalization so an unexpected raw delimiter cannot join words.
   normalized=${dynamic_scan//\`/;}

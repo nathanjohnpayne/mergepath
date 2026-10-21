@@ -122,9 +122,16 @@ crqe_failover_markers_present() { # comments-json author
 # Prints a sorted array of lowercase full SHAs. Fails on input that is not
 # arrays and a full SHA; callers then use [] so that nothing is exempt.
 crqe_pr_head_set() { # commits-json timeline-json current-head [force-push-heads-json]
-  jq -nce --argjson c "$1" --argjson t "$2" --arg h "$3" --argjson f "${4:-[]}" '
+  # Histories are unbounded. Stream each independently parsed document rather
+  # than placing it in an exec argument (Linux caps one argument at 128 KiB).
+  jq -nce --slurpfile c <(printf '%s\n' "$1") \
+    --slurpfile t <(printf '%s\n' "$2") --arg h "$3" \
+    --slurpfile f <(printf '%s\n' "${4-[]}") '
     def sha: select(type == "string") | ascii_downcase | select(test("^([0-9a-f]{40}|[0-9a-f]{64})$"));
-    if ($c | type) != "array" or ($t | type) != "array" or ($f | type) != "array"
+    if ($c | length) != 1 or ($t | length) != 1 or ($f | length) != 1
+    then error("head set") else . end
+    | $c[0] as $c | $t[0] as $t | $f[0] as $f
+    | if ($c | type) != "array" or ($t | type) != "array" or ($f | type) != "array"
        or (($h | ascii_downcase) | test("^([0-9a-f]{40}|[0-9a-f]{64})$") | not)
     then error("head set") else . end
     | [ ($h | sha),

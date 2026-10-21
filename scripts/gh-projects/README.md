@@ -13,7 +13,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 ## Prerequisites
 
 - `gh` installed (via Homebrew on this machine).
-- An author PAT with `repo` + `project` scopes. Use the cached `OP_PREFLIGHT_AUTHOR_PAT` from [REVIEW_POLICY.md § PAT lookup table](../../REVIEW_POLICY.md#pat-lookup-table); these helpers verify that `GH_TOKEN` resolves to `nathanjohnpayne` before mutating issues or Project v2 items.
+- An author classic PAT with `project` for user-owned Projects v2, plus `public_repo` for public repository operations; use `repo` only when private repository access is needed. See GitHub’s [Projects API authentication](https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects) and [scope definitions](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps). These helpers verify that `GH_TOKEN` resolves to `nathanjohnpayne` before mutating issues or Project v2 items.
 - Local sessions run [scripts/op-preflight.sh](../op-preflight.sh) in review mode once to cache credentials. Cloud sessions use provisioned credentials and the capability probe in [Cloud Agent Environments](../../docs/agents/cloud-environments.md), without invoking local 1Password preflight. If the session cannot perform the GraphQL-backed Project operations, hand them to a capable local session under that guide.
 - The target Project v2 board must have a `Status` single-select field with the canonical options `Backlog`, `Ready`, `In progress`, `In review`, `Done`. `move-item.sh` discovers the field by that exact name. GitHub's default board template does not provide these options, so edit the board's `Status` field by hand to have exactly these five. The set is the one mergepath's new-repo bootstrap gives the board it provisions with a new repo ([`scripts/bootstrap/board-and-summary.sh`](https://github.com/nathanjohnpayne/mergepath/blob/main/scripts/bootstrap/board-and-summary.sh); hub-only, so the link is absolute). That bootstrap scaffolds a whole repo, so it is not a way to create a board for an initiative.
 
@@ -23,7 +23,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 eval "$(scripts/op-preflight.sh --agent claude --mode review)"
 ```
 
-Select the author PAT before calling these helpers in a prepared local session or a cloud session with GraphQL transport and the required `repo` + `project` PAT scopes. The capability probe tests GraphQL transport; it does not verify Project scopes or mutations. In cloud this selects the provisioned credential; do not run local preflight there. Exporting a token does not remove a transport ceiling, so Claude cloud still hands these operations to a capable session.
+For a local session, select the cached `OP_PREFLIGHT_AUTHOR_PAT` from [REVIEW_POLICY.md § PAT lookup table](../../REVIEW_POLICY.md#pat-lookup-table) after preflight. For a cloud session, provision `OP_PREFLIGHT_AUTHOR_PAT` with the minimum classic PAT scopes above and follow [Cloud Agent Environments](../../docs/agents/cloud-environments.md); do not run local 1Password preflight there. The capability probe tests GraphQL transport, not Project permissions or mutations. Exporting a token does not remove a transport ceiling, so Claude cloud still hands these operations to a capable session.
 
 ```bash
 export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
