@@ -3347,6 +3347,14 @@ for surface in inline issues reviews; do
   export CODERABBIT_EXTRACT_FAIL=0
   run_gate
   assert_eq 1 "$RUN_RC" "$surface control: readable Major remains an unaccounted finding"
+  expected_kind=inline
+  case "$surface" in
+    issues) expected_kind=issue-comment ;;
+    reviews) expected_kind=review-body ;;
+  esac
+  assert_eq "$expected_kind" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$surface control identifies the intended feedback surface"
+  assert_eq 'coderabbitai[bot]' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "$surface control preserves the readable Major author identity"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$surface control preserves the readable Major required tier"
 done
 
 printf '_🟠 Major_\n' >"$TMP/failed-archive-body.txt"
@@ -3361,6 +3369,9 @@ assert_eq called "$(cat "$CODERABBIT_EXTRACT_FAIL_LOG")" "archive failure reache
 ARCHIVE_OUT=$(PATH="$TMP/bin:$PATH" CODERABBIT_EXTRACT_FAIL=0 "$RENDER_ARCHIVE" \
   issue-comment 87802 'coderabbitai[bot]' '2026-09-13T01:00:00Z' "$TMP/failed-archive-body.txt")
 assert_match '^<!-- mergepath-feedback-archive:v1 ' "$ARCHIVE_OUT" "archive control: readable Major produces its history record"
+ARCHIVE_PAYLOAD=$(printf '%s' "$ARCHIVE_OUT" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson')
+assert_eq 'coderabbitai[bot]' "$(printf '%s' "$ARCHIVE_PAYLOAD" | jq -r '.source_login')" "archive control preserves the readable Major author identity"
+assert_eq p1 "$(printf '%s' "$ARCHIVE_PAYLOAD" | jq -r '.coderabbit_tiers[0]')" "archive control preserves the readable Major required tier"
 unset CODERABBIT_EXTRACT_FAIL CODERABBIT_EXTRACT_FAIL_LOG
 rm "$TMP/bin/grep"
 
