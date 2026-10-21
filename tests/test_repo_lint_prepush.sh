@@ -54,7 +54,7 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 # under MERGEPATH_PREPUSH_LIVE=all, say) does not leak its opt-ins into the fixtures.
 unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
   MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
-  GITHUB_OUTPUT 2>/dev/null || true
+  MERGEPATH_PREPUSH_LOCK_TOOL GITHUB_OUTPUT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -936,7 +936,7 @@ wait_for_lock_field() {  # $1 = field, $2 = glob it must match; up to 60 s
 check "a finished run leaves an empty lock record" "$(cat "$LOCK_FILE" 2>/dev/null)" ""
 if [ -f "$LOCK_FILE" ]; then ok "the lock file itself survives a release"; else bad "the lock file was removed on release"; fi
 help_out=$(bash "$RUNNER" --help)
-for want in MERGEPATH_PREPUSH_LOCK_WAIT 'load average' 'take turns' 'fcntl'; do
+for want in MERGEPATH_PREPUSH_LOCK_WAIT MERGEPATH_PREPUSH_LOCK_TOOL 'load average' 'take turns' 'fcntl'; do
   case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
 done
 
@@ -965,6 +965,26 @@ case "$out" in *" UTC, "[0-9]*" of 3 checks)"*|*" UTC, preparing)"*) ok "the wai
 check "both tips reached the remote" "$(remote_tip feat/lock-a) $(remote_tip feat/lock-b)" "$(git -C "$FIX" rev-parse feat/lock-a) $(git -C "$FIX" rev-parse feat/lock-b)"
 check "the two runs' checks never overlapped" "$(peak_concurrency)" "1"
 check "the waiter's checks all ran after the holder's" "$(sed -n '1,3p' "$PROBE_DIR/start-order" | sort | tr '\n' ' ')" "check_env check_flag check_ok "
+
+# The python3 fcntl path is the one every macOS machine takes; a Linux runner
+# has flock(1) and would otherwise never exercise it, so contention is
+# repeated with that path forced.
+reset_probe; slow_all
+git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m py-hold
+git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m py-wait
+(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='python3' MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a-py.out" 2>&1 &
+A_PID=$!
+if wait_for_lock_field branch feat/lock-a; then ok "python3 fcntl lock: the holder records its branch"; else bad "python3 fcntl lock: no holder record: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
+holder_pid=$(lock_field pid)
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='python3' MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
+check "python3 fcntl lock: a second push waits, then succeeds" "$rc" "0"
+case "$out" in *"waiting for the run of feat/lock-a (pid $holder_pid, started "*) ok "python3 fcntl lock: the waiter names the holder" ;; *) bad "python3 fcntl lock waiter output: $out" ;; esac
+rc_a=0; wait "$A_PID" || rc_a=$?
+check "python3 fcntl lock: the holder passes" "$rc_a" "0"
+check "python3 fcntl lock: the two runs' checks never overlapped" "$(peak_concurrency)" "1"
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='mkdir' git push origin feat/lock-b:refs/heads/feat/lock-tool-bad 2>&1) || rc=$?
+check "an unknown MERGEPATH_PREPUSH_LOCK_TOOL refuses the push" "$rc" "1"
+case "$out" in *"MERGEPATH_PREPUSH_LOCK_TOOL must be flock or python3"*) ok "the unknown lock tool is named" ;; *) bad "unknown lock tool output: $out" ;; esac
 
 # The wait is bounded: a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up
 # nonzero, says so, pushes nothing, and leaves the holder undisturbed.
@@ -1016,7 +1036,14 @@ git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-feedfacebeef.busy" main
 git -C "$FIX" worktree add -q -b other/session "$SNAPS/other-session" main
 # shellcheck disable=SC2016 # the $1 is the inner bash's, not ours
 BUSY_PID=$(detach bash -c 'cd "$1" && sleep 300; :' --committed-snapshot "$SNAPS/prepush-feedfacebeef.busy")
-sleep 1
+# Wait until that process has actually changed into the snapshot (bounded).
+busy_cwd() {
+  if [ -d /proc/self ]; then readlink "/proc/$BUSY_PID/cwd" 2>/dev/null || true
+  else { lsof -a -p "$BUSY_PID" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p'; fi
+}
+i=0
+until [ "$(busy_cwd)" = "$SNAPS/prepush-feedfacebeef.busy" ] || [ "$i" -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+check "the busy process is working in its snapshot before the push" "$(busy_cwd)" "$SNAPS/prepush-feedfacebeef.busy"
 reset_probe
 commit_change feat/snapshots README.md
 rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?

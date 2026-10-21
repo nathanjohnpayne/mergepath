@@ -74,6 +74,8 @@
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
 #   MERGEPATH_PREPUSH_LOCK_WAIT=S  wait up to S seconds for another hook run
 #                               on this machine to finish (default 3600)
+#   MERGEPATH_PREPUSH_LOCK_TOOL=T  take the lock with flock(1) or python3's
+#                               fcntl (default: flock(1) if present, else python3)
 # Hook checks run in tool-owned detached worktrees of each pushed tip, so
 # working-tree modifications and untracked files cannot affect their result.
 # Python package metadata must equal the committed workflow pins.
@@ -182,12 +184,16 @@ holder_description() {   # "the run of <branch> (pid N, started HH:MM UTC, k of 
 
 # Sets LOCK_FLOCK or LOCK_PY, or dies: flock(1) first, then a python3 whose
 # fcntl answers the probe (a stub that merely exits 0 does not).
+# MERGEPATH_PREPUSH_LOCK_TOOL=python3 skips flock(1) so the path every macOS
+# machine takes can be exercised on a Linux runner; =flock insists on it.
 lock_tooling() {
-  local cand
-  if LOCK_FLOCK=$(command -v flock 2>/dev/null) && [ -n "$LOCK_FLOCK" ]; then
+  local cand tool="${MERGEPATH_PREPUSH_LOCK_TOOL:-}"
+  case "$tool" in ''|flock|python3) ;; *) die "MERGEPATH_PREPUSH_LOCK_TOOL must be flock or python3 (got '$tool')" ;; esac
+  if [ "$tool" != python3 ] && LOCK_FLOCK=$(command -v flock 2>/dev/null) && [ -n "$LOCK_FLOCK" ]; then
     return 0
   fi
   LOCK_FLOCK=''
+  [ "$tool" != flock ] || die "MERGEPATH_PREPUSH_LOCK_TOOL=flock, but flock(1) is not on PATH"
   for cand in python3 "${MERGEPATH_PREPUSH_PYTHON:-}"; do
     [ -n "$cand" ] || continue
     if command -v "$cand" >/dev/null 2>&1 \
