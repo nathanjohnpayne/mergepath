@@ -2064,7 +2064,10 @@ class Lexer:
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
-                    # here-string: the following word belongs to this segment
+                    # An attached ordinary word precedes the operator, while
+                    # descriptor prefixes keep their existing representation.
+                    if not _is_fd_prefix("".join(cur_level()["word"])):
+                        finish_word()
                     cur_level()["seg"].words.append("<<<")
                     i += 3
                     continue
@@ -2188,6 +2191,10 @@ class Lexer:
                 # process substitution: a NON-capturing level, so the emitter
                 # inside is judged on its own merits
                 parent_seg = cur_level()["seg"]
+                if parent_seg.words[-1:] == ["<<<"] and not cur_level()["word"]:
+                    # This child still occupies the here-string operand word.
+                    # A width-only marker must not look like output redirection.
+                    cur_level()["word"].append("<()")
                 seg = self._new_segment(parent_seg, False, line)
                 cur_ll.segments.append(seg)
                 levels.append(
@@ -3172,6 +3179,11 @@ def resolve_command(seg):
             continue
         if w == "<<<":
             # Spaced and attached source forms retain a separate operand word.
+            if idx + 1 < len(words) and _unquote_command_word(words[idx + 1]) is None:
+                # Expanding operands can diagnose before the command runs.
+                # Keep the parent's opaque reading, without grading expansion.
+                seg._cmd = (UNRESOLVED, has_redir)
+                return seg._cmd
             idx += 2
             continue
         if _ASSIGN_RE.match(w):
@@ -15832,6 +15844,40 @@ def _leading_herestring_cases():
     return failures
 
 
+def _herestring_operand_cases():
+    """Pin lexical operand width/order and inherited expansion opacity."""
+    failures = []
+    for source, words, command, index in (
+        ('echo<<< x "$GH_TOKEN"\n',
+         ['echo', '<<<', 'x', '"$GH_TOKEN"'], 'echo', 0),
+        ('printf<<<x \'%s\\n\' "$GH_TOKEN"\n',
+         ['printf', '<<<', 'x', "'%s\\n'", '"$GH_TOKEN"'], 'printf', 0),
+        ('<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN"\n',
+         ['<<<', '<()', 'printf', "'%s\\n'", '"$GH_TOKEN"'], 'printf', 2),
+        ('<<< <(printf x)suffix : "$GH_TOKEN"\n',
+         ['<<<', '<()suffix', ':', '"$GH_TOKEN"'], ':', 2),
+        ('<<< >(:) echo "$GH_TOKEN"\n',
+         ['<<<', '<()', 'echo', '"$GH_TOKEN"'], 'echo', 2),
+        ('<<< \'<()\' : "$GH_TOKEN"\n',
+         ['<<<', "'<()'", ':', '"$GH_TOKEN"'], ':', 2),
+        ('<<< $((1/$GH_TOKEN)) :\n',
+         ['<<<', '$((1/$GH_TOKEN))', ':'], UNRESOLVED, None),
+        ('<<< "$GH_TOKEN" :\n',
+         ['<<<', '"$GH_TOKEN"', ':'], UNRESOLVED, None),
+        ('<<< \'$((1/$GH_TOKEN))\' : "$GH_TOKEN"\n',
+         ['<<<', "'$((1/$GH_TOKEN))'", ':', '"$GH_TOKEN"'], ':', 2),
+        ('\'<<<\' x echo "$GH_TOKEN"\n',
+         ["'<<<'", 'x', 'echo', '"$GH_TOKEN"'], '<<<', 0),
+    ):
+        lx = Lexer(source)
+        seg = next(seg for ll in lx.logical for seg in ll.segments if seg.words)
+        actual = resolve_command(seg)
+        if seg.words != words or actual != (command, False) or seg._cmd_index != index:
+            failures.append("here-string operand boundary: %r expected %r/%s/%s, got %r/%r/%s" %
+                            (source, words, command, index, seg.words, actual, seg._cmd_index))
+    return failures
+
+
 def _pid_special_parameter_cases():
     """Pin independent readers and later real-reference source coordinates."""
     failures = []
@@ -16556,6 +16602,27 @@ CORPUS += [
     ("leading-herestring-spaced-printf", MUST_FLAG, '<<< x printf \'%s\\n\' "$GH_TOKEN"\n'),
     ("leading-herestring-trailing-echo-control", MUST_FLAG, 'echo "$GH_TOKEN" <<< x\n'),
     ("leading-herestring-safe-colon-control", MUST_NOT_FLAG, '<<< x : "$GH_TOKEN"\n'),
+]
+
+
+# #1462 review repair: lexical ordering/width and leading operand diagnostics.
+CORPUS += [
+    ("herestring-review-attached-echo", MUST_FLAG, 'echo<<< x "$GH_TOKEN"\n'),
+    ("herestring-review-attached-echo-compact", MUST_FLAG, 'echo<<<x "$GH_TOKEN"\n'),
+    ("herestring-review-attached-printf", MUST_FLAG, 'printf<<< x \'%s\\n\' "$GH_TOKEN"\n'),
+    ("herestring-review-attached-quiet", MUST_NOT_FLAG, ':<<< x "$GH_TOKEN"\n'),
+    ("herestring-review-process-operand", MUST_FLAG, '<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN"\n'),
+    ("herestring-review-process-suffix", MUST_FLAG, '<<< <(printf x)suffix echo "$GH_TOKEN"\n'),
+    ("herestring-review-process-quiet", MUST_NOT_FLAG, '<<< <(printf x) : "$GH_TOKEN"\n'),
+    ("herestring-review-process-output-operand", MUST_FLAG, '<<< >(:) echo "$GH_TOKEN"\n'),
+    ("herestring-review-process-output-captured", MUST_NOT_FLAG, 'saved=$(<<< >(:) echo "$GH_TOKEN")\n'),
+    ("herestring-review-process-captured", MUST_NOT_FLAG, 'saved=$(<<< <(printf x) printf \'%s\\n\' "$GH_TOKEN")\n'),
+    ("herestring-review-process-child-stderr", MUST_FLAG, '<<< <(printf \'%s\' "$GH_TOKEN" >&2) :\n'),
+    ("herestring-review-process-trailing", MUST_FLAG, 'printf \'%s\\n\' "$GH_TOKEN" <<< <(printf x)\n'),
+    ("herestring-review-command-operand", MUST_FLAG, '<<< "$(printf x)" echo "$GH_TOKEN"\n'),
+    ("herestring-review-arithmetic-diagnostic", MUST_FLAG, '<<< $(($GH_TOKEN/0)) :\n'),
+    ("herestring-review-quoted-arithmetic", MUST_NOT_FLAG, '<<< \'$((1/$GH_TOKEN))\' : "$GH_TOKEN"\n'),
+    ("herestring-review-quoted-process", MUST_NOT_FLAG, '<<< \'<(printf x)\' : "$GH_TOKEN"\n'),
 ]
 
 
@@ -17834,6 +17901,7 @@ def self_test():
     failures.extend(_pid_special_parameter_cases())
     failures.extend(_pid_continuation_cases())
     failures.extend(_leading_herestring_cases())
+    failures.extend(_herestring_operand_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
