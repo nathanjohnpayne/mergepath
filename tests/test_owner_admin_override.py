@@ -739,6 +739,24 @@ print(json.dumps(result))
                 self.state['comments'] = [{**summary, 'body': candidate}]
                 self.assertEqual(self.run_prepare(mode='check').returncode, 2)
 
+    def test_unanchored_terminal_rejects_case_variant_activity_rows(self):
+        summary = automatic_terminal_summary()
+        for label in ('SECURITY REVIEW', 'security review', 'CoDe ReViEw'):
+            for status in ('Running', 'Unknown'):
+                for unspecified in (False, True):
+                    body = summary['body']
+                    if unspecified:
+                        body = body.replace('"has_any_findings": false', '"has_any_findings": null').replace(
+                            '"has_unresolved_findings": false', '"has_unresolved_findings": null')
+                    candidate = {**summary, 'body': body + '\n| **' + label + '** | ' + status + ' | — | PR opened |'}
+                    with self.subTest(label=label, status=status, unspecified=unspecified):
+                        self.assertFalse(override.unanchored_terminal_summary(candidate))
+                        self.assertTrue(override.codex_inflight([candidate], [], [], HEAD, 'nathanjohnpayne'))
+        self.state['comments'] = [{**summary, 'body': summary['body']
+                                  + '\n| **SECURITY REVIEW** | Running | — | PR opened |'}]
+        for mode in ('prepare', 'check'):
+            self.assertEqual(self.run_prepare(mode=mode).returncode, 2)
+
     def test_unanchored_terminal_never_suppresses_other_activity_or_edited_history(self):
         summary = automatic_terminal_summary()
         for anchor in (HEAD[:8], 'b' * 8):

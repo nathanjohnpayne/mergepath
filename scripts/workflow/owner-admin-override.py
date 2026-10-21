@@ -345,7 +345,7 @@ def unanchored_terminal_summary(comment):
         if (code['commit_sha'] is not None or code['status'] != 'completed'
                 or not flags or any(value is not None for value in security.values())):
             return False
-        rows = re.findall(r'(?m)^\|[^\n]*(?:Code Review|Security Review)[^\n]*\|\s*$', body)
+        rows = re.findall(r'(?m)^\|[^\n]*(?:Code Review|Security Review)[^\n]*\|\s*$', body, re.I)
         if len(rows) != 1:
             return False
         row = re.fullmatch(r'\|\s*📝\s*\*\*Code Review\*\*\s*\|\s*✅\s*\*\*Completed\*\*\s*'
