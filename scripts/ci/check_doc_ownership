@@ -56,7 +56,7 @@
 #      same governance fact and must not disagree.
 #  10. Consumer-truthfulness: a `canonical` doc must not reference a
 #      `hub-only` doc by repo-relative path, in EITHER spelling — the
-#      literal full path anywhere in the text, or a Markdown link whose
+#      literal full path as a token in the text, or a Markdown link whose
 #      target resolves to it from that doc's own directory (the sibling
 #      forms `[x](hub-only.md)` / `[x](./hub-only.md)`, which contain no
 #      `docs/agents/` prefix to grep for). Canonical docs are mirrored
@@ -1933,6 +1933,38 @@ mp_resolve_relative() {
   printf '%s' "$out"
 }
 
+# Print lines containing a whole literal repo-relative path token.
+# The exact separator contract lives in specs/doc_ownership_validation.md.
+# Compare with index(), never a regex: inventory paths can contain regex
+# metacharacters and literal backslashes. ENVIRON avoids awk -v decoding
+# those backslashes a second time. Read all input, even after a match, so
+# a producer cannot receive SIGPIPE under pipefail.
+mp_literal_path_mentions() {
+  MP_DOC_LITERAL_PATH="$1" awk '
+    function boundary(c) {
+      return c == "" || c ~ /[[:space:]]/ ||
+        index("`*[](){}<>\",:;!?#|=", c) > 0 || c == sprintf("%c", 39)
+    }
+    BEGIN { path = ENVIRON["MP_DOC_LITERAL_PATH"] }
+    {
+      start = 1
+      while (offset = index(substr($0, start), path)) {
+        hit = start + offset - 1
+        after = hit + length(path)
+        left = hit == 1 ? "" : substr($0, hit - 1, 1)
+        right = substr($0, after, 1)
+        # One sentence-final period is punctuation; .orig is path data.
+        if (boundary(left) && (boundary(right) ||
+            (right == "." && boundary(substr($0, after + 1, 1))))) {
+          print
+          break
+        }
+        start = hit + 1
+      }
+    }
+  '
+}
+
 # Blank out every sanctioned absolute reference on stdin, replacing each
 # with a single space. Used by check 10's literal pass.
 #
@@ -2673,8 +2705,9 @@ fi
 # TWO passes, because one spelling of the same broken link is invisible
 # to the other:
 #
-#   (a) LITERAL — the full repo-relative path appears anywhere in the
-#       text (`see \`docs/agents/coderabbit-audit.md\``), link or prose.
+#   (a) LITERAL — the full repo-relative path appears as a whole token
+#       (`see \`docs/agents/coderabbit-audit.md\``), link or prose. The
+#       boundary contract excludes longer paths and filename suffixes.
 #       An absolute URL *contains* the path as a substring, so every
 #       absolute URL is MASKED OUT of the matched text first and the
 #       remainder re-tested; the exemption is therefore scoped to the
@@ -2762,15 +2795,15 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue
       spelling=""
-      # (a) literal path mention. `grep -v` (not -q) reads its input to
-      # completion: with `set -o pipefail`, an early-exiting `grep -q`
-      # could SIGPIPE the producer and turn a real hit into a silent pass.
+      # (a) literal path token. The matcher reads its input to completion:
+      # with pipefail, an early exit could SIGPIPE a masking producer and
+      # turn a real hit into a silent pass.
       # Mask portable inline/bare URLs and reference-style link uses,
       # then search the remainder. Reading the full file is necessary:
       # a reference definition may live far from the label it licenses.
       bare=$(mp_mask_absolute_reference_links "$REPO_ROOT/$canon_doc" \
         | mp_mask_absolute_urls \
-        | grep -F -- "$hub_doc" || true)
+        | mp_literal_path_mentions "$hub_doc" || true)
       [ -n "$bare" ] && spelling="by repo-relative path"
       # (b) relative link target that resolves to it. Same `grep -q`
       # caution as above — match with `-xF` and test the captured output.

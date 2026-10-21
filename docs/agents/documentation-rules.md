@@ -36,6 +36,8 @@ No CI check rejects a direct edit to a repo-owned `docs/**` file, and CodeRabbit
 
 Generated project-documentation `source_ref` headers use full Git commit object IDs, preserving the existing `-dirty` marker and `unknown` fallback. Run the canonical materializer to update old abbreviated metadata; the contract and native coverage are in `specs/project_doc_sync.md` and `tests/test_project_doc_sync.sh` (#2138).
 
+Canonical-document reference checks use the literal path-token boundary in [the documentation ownership specification](../../specs/doc_ownership_validation.md#literal-path-token-boundaries); `tests/test_check_doc_ownership.sh` covers longer-path controls alongside genuine references, relative Markdown targets and portable URLs (#1431).
+
 ## Canonical-source discipline
 
 A new cross-repo or agent-agnostic convention is authored in mergepath **first** — in a small dedicated `docs/agents/*.md` file when it is universal enough to sync as a `canonical` manifest entry (the pattern `docs/agents/worktree-placement.md` establishes; see #739), otherwise in the appropriate existing `docs/agents/` sub-file. Only then is it mirrored into vendor-specific or machine-local files — a machine's `~/GitHub/CLAUDE.md`, a global `~/.codex/AGENTS.md`, a consumer repo's own docs — and every such mirror carries a `> Canonical source: mergepath/<path>` annotation pointing back at the authored source. Never author a convention downstream-first: content added directly to one vendor file is invisible to every other agent CLI and to every other machine, and nothing catches the omission (the worktree-placement convention lived only in one machine's `~/GitHub/CLAUDE.md` for months — the #739 gap).
