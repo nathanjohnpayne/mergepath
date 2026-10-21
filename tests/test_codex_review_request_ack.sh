@@ -1587,6 +1587,40 @@ test_real_wrapper_duplicate_ack_retry_keeps_polling() {
 
 test_real_wrapper_duplicate_ack_retry_keeps_polling
 
+# #2582: polling mode posts a new request while an earlier trigger is on HEAD
+# by design. The real wrapper's authorization must apply that mode, not refuse
+# the write as a #489 duplicate: a pending request with no provider evidence,
+# and the replacement for a resumed request that expired.
+test_real_wrapper_authorizes_polling_mode_new_requests() {
+  local scenario dir rc count before
+  for scenario in unproven-pending resumed-expiry; do
+    before=$FAIL
+    dir=$(make_case "wrapper-$scenario" 0 0 60)
+    make_real_wrapper_case "$dir"
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    [ "$scenario" != resumed-expiry ] || seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 30
+    rc=$(MERGEPATH_GH_TRANSPORT=gh run_case "$dir" absent 1 ghp_fixture_author)
+    count=$(trigger_count "$dir")
+    case "$scenario" in
+      unproven-pending)
+        grep -q 'pending request 900 has no Codex Running summary' "$dir/err.log" \
+          || fail "#2582 $scenario: the pending request was not considered for resume" ;;
+      resumed-expiry)
+        grep -q 'resumed request 900 drew no Codex response.*re-running as a fresh request' "$dir/err.log" \
+          || fail "#2582 $scenario: the resumed request did not expire into a fresh run" ;;
+    esac
+    [ ! -f "$dir/state/authorization-refused" ] && ! grep -q 'trigger not authorized' "$dir/err.log" \
+      || fail "#2582 $scenario: the real authorization refused a polling-mode new request; stderr=$(cat "$dir/err.log")"
+    [ "$count" = 1 ] || fail "#2582 $scenario: $count trigger(s), expected exactly one new request"
+    [ "$rc" = 4 ] && [ "$(jq -r '.terminal_determination.outcome // "none"' "$dir/out.json")" = timeout ] \
+      || fail "#2582 $scenario: exit $rc, expected 4 with the new request's recorded timeout; stderr=$(cat "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "#2582 real wrapper: $scenario posts its new request through the canonical authorization"
+  done
+}
+
+test_real_wrapper_authorizes_polling_mode_new_requests
+
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_ack_retry_ignores_blocking_budget_value

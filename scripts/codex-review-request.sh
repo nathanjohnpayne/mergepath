@@ -2652,8 +2652,15 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
+  # A new request names this run's mode for the wrapper's authorization
+  # (#2582). An eyes-ack retry names none: the authorization then refuses it
+  # as the existing trigger, and this run keeps polling the request it
+  # confirmed without spending another (#2631).
+  local caller_mode="$REQUEST_MODE"
+  [ "$TRIGGER_POSTED" != true ] || caller_mode=""
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
+    MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
@@ -3135,19 +3142,42 @@ RESUMED_EVER=false
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
+# The no-write decisions below belong to a request mode. A requester applies
+# its own. The wrapper's authorization pass runs as --trigger-only, so it
+# applies the mode the canonical requester names in
+# MERGEPATH_CODEX_TRIGGER_CALLER_MODE (#2582). Polling mode posts a new request
+# while an earlier trigger is on HEAD by design (a pending request with no
+# provider evidence, the replacement for a resumed request that expired), so
+# authorizing that write must not refuse it as a #489 duplicate. Without the
+# variable, the stricter trigger-only decisions apply; the eyes-ack retry
+# relies on that refusal to keep polling without spending a request.
+REQUEST_MODE=poll
+[ "$TRIGGER_ONLY" != true ] || REQUEST_MODE="trigger-only"
+if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+  case "${MERGEPATH_CODEX_TRIGGER_CALLER_MODE:-trigger-only}" in
+    poll|trigger-only) REQUEST_MODE=${MERGEPATH_CODEX_TRIGGER_CALLER_MODE:-trigger-only} ;;
+    *) die 3 "canonical trigger authorization names an unknown caller mode" ;;
+  esac
+fi
+
 NO_WRITE_REASON=""
 if has_cleared_signal "$INITIAL_SCAN"; then
   NO_WRITE_REASON="already-cleared"
   log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"
-elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+elif [ "$REQUEST_MODE" = trigger-only ] && existing_codex_trigger_on_head; then
   NO_WRITE_REASON="existing-trigger"
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
-elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
+elif [ "$REQUEST_MODE" = trigger-only ] && auto_trigger_content_free; then
   NO_WRITE_REASON="content-free-auto-trigger"
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
-elif [ "$TRIGGER_ONLY" != "true" ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
+elif [ "$REQUEST_MODE" = poll ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
      && resume_pending_codex_request; then
-  log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
+  if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+    NO_WRITE_REASON="pending-request-running"
+    log "pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted — a new trigger is not authorized (#1550)"
+  else
+    log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
+  fi
 else
   post_codex_trigger
 fi
