@@ -2212,9 +2212,20 @@ class Lexer:
                     # A substitution is an argument even without a word marker;
                     # exit-mode proof cannot skip it to reach a later option.
                     parent_seg.tee_process_word_limit = len(parent_seg.words)
+                # Test the logical preceding character without rewriting
+                # source offsets. An escaped backslash leaves LF as a boundary.
+                operand_start = i
+                while text[max(0, operand_start - 2):operand_start] == "\\\n":
+                    slash = operand_start - 2
+                    run_start = slash
+                    while run_start > 0 and text[run_start - 1] == "\\":
+                        run_start -= 1
+                    if (slash - run_start) % 2:
+                        break
+                    operand_start -= 2
                 tee_operand = (
                     c == ">" and not cur_level()["word"]
-                    and text[i - 1:i] in (" ", "\t", "\n")
+                    and text[operand_start - 1:operand_start] in (" ", "\t", "\n")
                     and resolve_command(probe)[0] == "tee"
                     and not cur_level().get("tee_heredoc_delimiter_pending", False)
                     and not _HERESTRING_RE.fullmatch(previous)
@@ -2412,9 +2423,13 @@ class Lexer:
                     finish_word()
                     kind = levels[-1]["kind"]
                     owner = levels[-1].get("tee_output_owner")
+                    operand_end = i + 1
+                    while (owner is not None
+                           and text[operand_end:operand_end + 2] == "\\\n"):
+                        operand_end += 2
                     if (owner is not None
-                            and text[i + 1:i + 3] not in ("<(", ">(")
-                            and (i + 1 == n or text[i + 1] in " \t\n;&|()<>")):
+                            and text[operand_end:operand_end + 2] not in ("<(", ">(")
+                            and (operand_end == n or text[operand_end] in " \t\n;&|()<>")):
                         # Concatenated pathname words and redirection targets
                         # are not standalone tee operands. Keep only direct
                         # children; nested substitutions retain their own role.
@@ -15976,7 +15991,57 @@ def _tee_process_substitution_cases():
         findings, errors = scan_text(body)
         if bool(findings) != (expected == MUST_FLAG) or errors:
             failures.append("tee round2 boundary: " + cid)
+    for cid, expected, body in _tee_continuation_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee continuation boundary: " + cid)
+        if cid.startswith("tee-continuation-"):
+            owners = [seg for ll in Lexer(body).logical for seg in ll.segments
+                      if seg.parent is None and resolve_command(seg)[0] == "tee"]
+            expected_links = 1 if cid in (
+                "tee-continuation-space", "tee-continuation-pipe",
+                "tee-continuation-repeated", "tee-continuation-null",
+            ) else 0
+            if sum(len(seg.tee_output_processes) for seg in owners) != expected_links:
+                failures.append("tee continuation child links: " + cid)
+    for suffix, expected_links in (
+        ('\\\n', 1),
+        ('\\\\\n', 0),
+        ('\\\\\\\n', 0),
+        ('\\\r\n', 0),
+        ('\\\r', 0),
+    ):
+        text = 'tee >(cat >&2)' + suffix
+        links = sum(len(seg.tee_output_processes)
+                    for ll in Lexer(text).logical for seg in ll.segments)
+        if links != expected_links:
+            failures.append("tee continuation raw boundary: " + repr(suffix))
+    body = _tee_continuation_cases()[2][2] + 'echo "$GH_TOKEN"\n'
+    findings, errors = scan_text(body)
+    if errors or [f.line for f in findings] != [1, body.count("\n")]:
+        failures.append("tee continuation boundary: physical finding lines changed")
     return failures
+
+
+def _tee_continuation_cases():
+    """Logical operand boundaries retain continued separation and concatenation."""
+    continuation = "\\\n"
+    head = 'printf %s "$GH_TOKEN" | tee '
+    tail = ' | grep -qF zz\n'
+    return [
+        ('tee-continuation-space', MUST_FLAG, head + '>(cat >&2)' + continuation + tail),
+        ('tee-continuation-pipe', MUST_FLAG, head + '>(cat >&2)' + continuation + '| grep -qF zz\n'),
+        ('tee-continuation-repeated', MUST_FLAG, head + '>(cat >&2)' + continuation * 2 + '\t| grep -qF zz\n'),
+        ('tee-continuation-null', MUST_NOT_FLAG, head + '>(cat >/dev/null)' + continuation + tail),
+        ('tee-continuation-suffix', MUST_FLAG, head + '>(cat >&2)' + continuation + 'suffix' + tail),
+        ('tee-continuation-adjacent-first', MUST_NOT_FLAG, head + '>(cat >&2)' + continuation + '>(cat >/dev/null)' + tail),
+        ('tee-continuation-adjacent-last', MUST_NOT_FLAG, head + '>(cat >/dev/null)' + continuation + '>(cat >&2)' + tail),
+        ('tee-deferred-target-options', MUST_FLAG, head + '3> >(cat >/dev/null) --help >(cat >&2)' + tail),
+        ('tee-deferred-herestring-options', MUST_FLAG, head + '<<< >(cat >/dev/null) --help >(cat >&2)' + tail),
+        ('tee-deferred-stdin-null', MUST_FLAG, head + '</dev/null >(cat >&2)' + tail),
+        ('tee-deferred-stdin-herestring', MUST_FLAG, head + '<<< safe >(cat >&2)' + tail),
+        ('tee-deferred-stdin-heredoc', MUST_FLAG, head + '<<EOF >(cat >&2)' + tail + 'safe\nEOF\n'),
+    ]
 
 
 def _tee_round2_cases():
@@ -17094,7 +17159,41 @@ CORPUS += [
 CORPUS += _tee_review_cases()
 CORPUS += _tee_round2_cases()
 CORPUS += _tee_namespace_cases()
+CORPUS += _tee_continuation_cases()
 # The same reviewed case/body now records the approved conservative reduction.
+KNOWN_BROADER.update({
+    "tee-continuation-suffix": (
+        "The inherited literal-file policy flags a continued pathname suffix "
+        "whose runtime process-path open fails quietly in all three shapes; "
+        "both original914 and published510 scanners flag it. Path evaluation "
+        "is outside the finite process-operand boundary."
+    ),
+    "tee-deferred-target-options": (
+        "A consumed redirection process target bounds the optional tee exit "
+        "proof, conservatively flagging this quiet help invocation in all "
+        "three shapes. Deferred to https://github.com/nathanjohnpayne/mergepath/issues/2670"
+    ),
+    "tee-deferred-herestring-options": (
+        "A consumed here-string process target bounds the optional tee exit "
+        "proof, conservatively flagging this quiet help invocation in all "
+        "three shapes. Deferred to https://github.com/nathanjohnpayne/mergepath/issues/2670"
+    ),
+    "tee-deferred-stdin-null": (
+        "The tee side-write route conservatively retains upstream input despite "
+        "this quiet literal null stdin override in all three shapes. Deferred "
+        "to https://github.com/nathanjohnpayne/mergepath/issues/2671"
+    ),
+    "tee-deferred-stdin-herestring": (
+        "The tee side-write route conservatively retains upstream input despite "
+        "this quiet safe here-string stdin override in all three shapes. Deferred "
+        "to https://github.com/nathanjohnpayne/mergepath/issues/2671"
+    ),
+    "tee-deferred-stdin-heredoc": (
+        "The tee side-write route conservatively retains upstream input despite "
+        "this quiet safe here-doc stdin override in all three shapes. Deferred "
+        "to https://github.com/nathanjohnpayne/mergepath/issues/2671"
+    ),
+})
 KNOWN_BROADER["tee-review-cat-shadow"] = (
     "Literal cat side writes remain conservative without executed callsite binding; "
     "the measured local no-op is quiet in all three shapes. "
@@ -17154,6 +17253,12 @@ KNOWN_MISS_SHAPES = {
 }
 
 KNOWN_BROADER_SHAPES = {
+    'tee-continuation-suffix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-deferred-target-options': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-deferred-herestring-options': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-deferred-stdin-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-deferred-stdin-herestring': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-deferred-stdin-heredoc': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-review-cat-shadow': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'alias-defined-and-used-on-one-line': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'capture-stderr-only-redirection': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
