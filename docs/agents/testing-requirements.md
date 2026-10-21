@@ -28,6 +28,8 @@ The token-output self-test runs the full oracle once under a quoted `TMPDIR`, co
 
 For token-output PID-reference changes, preserve the `$$` versus real named/positional expansion distinction across the lexer, raw here-doc and exact/fallback positional readers. Run the module-owned PID corpus and direct reader controls through the full self-test, then `scripts/ci/check_no_token_in_output --scan .`; deletion controls should independently expose each reader's regression. Keep the finite boundary and existing oracle disagreements described in `specs/repo_lint_execution.md` (#1456).
 
+PID dollars separated by active backslash-LF must pair before later reference detection. Retain the original PID corpus and add split-dollar oracle/direct-reader controls, inactive-backslash controls and physical source-line assertions. Independently remove the shared continuation extent and the physical-line here-doc bridge to prove the controls fail, then run the full module self-test and actual hub scan. Preserve all existing oracle declarations and leave numeric PID collision handling to #2641; the bounded continuation contract lives in `specs/repo_lint_execution.md` (#1456 repair).
+
 ## Phase 4b automation suite
 
 Run `tests/test_phase_4b_automation.sh` with stdin closed (`bash tests/test_phase_4b_automation.sh < /dev/null`). Its tripwire case (#1757) drives `phase-4b-review.sh` against a fake handoff that reads stdin, so a session that leaves stdin open, such as an agent's backgrounded shell, blocks that case forever at 0% CPU instead of failing. A run that sits on one case for minutes is this hang, not a slow suite: kill it and rerun with `< /dev/null`.
