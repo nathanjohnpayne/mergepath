@@ -199,14 +199,22 @@ holder_description() {   # "the run of <branch> (pid N, started HH:MM UTC, k of 
 # MERGEPATH_PREPUSH_LOCK_TOOL=python3 skips flock(1) so the path every macOS
 # machine takes can be exercised on a Linux runner; =flock insists on it.
 lock_tooling() {
-  local cand tool="${MERGEPATH_PREPUSH_LOCK_TOOL:-}"
+  local cand d tool="${MERGEPATH_PREPUSH_LOCK_TOOL:-}"
+  # A git client may run hooks with a minimal PATH: look where the run's own
+  # tool discovery looks (Homebrew), before deciding nothing is available.
+  for d in /opt/homebrew/bin /usr/local/bin; do
+    case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$PATH:$d" ;; esac
+  done
+  export PATH
   case "$tool" in ''|flock|python3) ;; *) die "MERGEPATH_PREPUSH_LOCK_TOOL must be flock or python3 (got '$tool')" ;; esac
   if [ "$tool" != python3 ] && LOCK_FLOCK=$(command -v flock 2>/dev/null) && [ -n "$LOCK_FLOCK" ]; then
     return 0
   fi
   LOCK_FLOCK=''
   [ "$tool" != flock ] || die "MERGEPATH_PREPUSH_LOCK_TOOL=flock, but flock(1) is not on PATH"
-  for cand in python3 "${MERGEPATH_PREPUSH_PYTHON:-}"; do
+  # Any interpreter with fcntl will do for the lock: the explicit one first,
+  # then the candidates the run itself accepts, in its order.
+  for cand in "${MERGEPATH_PREPUSH_PYTHON:-}" python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3; do
     [ -n "$cand" ] || continue
     if command -v "$cand" >/dev/null 2>&1 \
        && [ "$("$cand" -I -c 'import fcntl; print("fcntl-ok")' 2>/dev/null)" = fcntl-ok ]; then
@@ -381,9 +389,9 @@ retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lo
       continue
     fi
     if [ "$prunable" = 1 ]; then
-      if git worktree prune 2>/dev/null; then
-        echo "$PREFIX: pruned the registration of missing snapshot $wt"
-      fi
+      # Its directory is gone. `git worktree prune` would act on every
+      # registration in the repository, not this one, so it is left alone.
+      echo "$PREFIX: leaving the registration of missing snapshot $wt (its directory is gone; git worktree prune clears it)"
       continue
     fi
     if snapshot_in_use "$wt"; then
@@ -508,11 +516,12 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
       # shellcheck disable=SC2046
       unset $(git rev-parse --local-env-vars) 2>/dev/null || true
       cd "$snapshot"
-      # The inner run refreshes the lock record's progress but holds no lock
-      # of its own: fd 9 is closed so no check's stray child can keep the
-      # machine-wide lock alive after this run ends.
+      # The inner run and every check it starts inherit fd 9, and a flock(2)
+      # lives as long as any descriptor of it is open: if this supervisor is
+      # killed mid-run, the checks it already started keep the machine-wide
+      # lock until they end, so a waiting push cannot overlap them.
       bash "$SELF" --committed-snapshot --timings-root "$ROOT" --lock-record "$LOCK_FILE" "${ORIGINAL_ARGS[@]}" \
-        <<<"$local_ref $local_sha $remote_ref $remote_sha" 9>&-
+        <<<"$local_ref $local_sha $remote_ref $remote_sha"
     )
     git worktree remove --force "$snapshot"
     snapshot=''

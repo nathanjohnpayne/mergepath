@@ -382,7 +382,7 @@ echo "${REPO_LINT_FULL:-unset} ${REPO_LINT_CHECKS_JSON:-unset} ${REPO_LINT_SHARD
 printf '%s\n' "$1" >> "$out/start-order"
 touch "$out/ran.$1"
 if [ -f "$out/slow.$1" ]; then sleep 3; fi
-if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 120; fi
+if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 120; touch "$out/unhung.$1"; fi
 sleep 1
 rm -f "$out/running/$1"
 SH
@@ -1026,6 +1026,43 @@ rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='mkdir' git push origin fea
 check "an unknown MERGEPATH_PREPUSH_LOCK_TOOL refuses the push" "$rc" "1"
 case "$out" in *"MERGEPATH_PREPUSH_LOCK_TOOL must be flock or python3"*) ok "the unknown lock tool is named" ;; *) bad "unknown lock tool output: $out" ;; esac
 
+# A flock-less host whose only usable interpreter is a versioned python3.13
+# (python3 itself unusable) still takes the lock.
+VPY="$TMP/versioned-py"
+mkdir -p "$VPY"
+printf '#!/bin/sh\nexit 1\n' > "$VPY/python3"
+ln -s "$(command -v python3)" "$VPY/python3.13"
+chmod +x "$VPY/python3"
+reset_probe
+git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m versioned-py
+rc=0; out=$(cd "$FIX" && PATH="$VPY:$PATH" MERGEPATH_PREPUSH_LOCK_TOOL='python3' git push origin feat/lock-a 2>&1) || rc=$?
+check "a versioned python3.13 alone is enough for the lock" "$rc" "0"
+case "$out" in *"needs flock(1) or a python3 with fcntl"*) bad "the versioned interpreter was not found: $out" ;; *) ok "the lock found the versioned interpreter" ;; esac
+
+# A supervisor killed mid-run leaves its started checks running, and they
+# keep the lock: a waiting push starts only after they end.
+# The first check hangs (the probe's hang.<check>, about two minutes), so the
+# surviving worker plainly outlives its supervisor.
+reset_probe
+for c in check_ok check_flag check_env; do touch "$PROBE_DIR/hang.$c"; done
+git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m killed-holder
+git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m after-kill
+(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/killed-a.out" 2>&1 &
+A_PID=$!
+i=0
+hung_marker() { for f in "$PROBE_DIR"/hanging.*; do [ -e "$f" ] && { printf '%s\n' "${f##*/hanging.}"; return 0; }; done; return 1; }
+until hung_marker >/dev/null || [ "$i" -ge 600 ]; do sleep 0.1; i=$((i + 1)); done
+rm -f "$PROBE_DIR"/hang.*
+fix_phys=$(cd "$FIX" && pwd -P)
+sup=$(pgrep -o -f -- "--committed-snapshot --timings-root $fix_phys " || true)
+if [ -n "$sup" ]; then ok "the holder's supervisor is running a check"; else bad "no supervisor found to kill"; fi
+[ -z "$sup" ] || kill "$sup" 2>/dev/null || true
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
+wait "$A_PID" 2>/dev/null || true
+check "a push after a killed supervisor still succeeds" "$rc" "0"
+hung=$(hung_marker || true)
+if [ -n "$hung" ] && [ -f "$PROBE_DIR/unhung.$hung" ]; then ok "the killed supervisor's surviving check finished before the next push did"; else bad "the next push finished while the killed supervisor's $hung check was still running"; fi
+
 # The wait is bounded: a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up
 # nonzero, says so, pushes nothing, and leaves the holder undisturbed.
 reset_probe; slow_all
@@ -1081,6 +1118,12 @@ git -C "$FIX" worktree add -q -b prepush-debug "$SNAPS/prepush-debug" main
 printf 'uncommitted work\n' >> "$SNAPS/prepush-debug/README.md"
 printf 'scratch\n' > "$SNAPS/prepush-debug/notes.txt"
 git -C "$FIX" worktree add -q -b other/session "$SNAPS/other-session" main
+# An unrelated worktree that is temporarily unavailable, and a tool snapshot
+# whose directory is gone: neither registration may be pruned.
+git -C "$FIX" worktree add -q -b other/away "$TMP/away-checkout" main
+mv "$TMP/away-checkout" "$TMP/away-checkout.moved"
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-$MAIN12.gone00" main
+rm -rf "$SNAPS/prepush-$MAIN12.gone00"
 # shellcheck disable=SC2016 # the $1 is the inner bash's, not ours
 BUSY_PID=$(detach bash -c 'cd "$1" && sleep 300; :' --committed-snapshot "$SNAPS/prepush-$MAIN12.busy00")
 # Wait until that process has actually changed into the snapshot (bounded).
@@ -1109,6 +1152,9 @@ case "$registered" in *"prepush-$MAIN12.stale0"*) bad "the stale snapshot is sti
 case "$registered" in *"prepush-$MAIN12.busy00"*) ok "the busy snapshot stays registered" ;; *) bad "the busy snapshot was unregistered" ;; esac
 case "$registered" in *prepush-debug*) ok "the branch checkout stays registered" ;; *) bad "the branch checkout was unregistered" ;; esac
 case "$registered" in *other-session*) ok "the other checkout stays registered" ;; *) bad "the other checkout was unregistered" ;; esac
+case "$registered" in *away-checkout*) ok "an unavailable unrelated worktree keeps its registration" ;; *) bad "an unavailable unrelated worktree was pruned" ;; esac
+case "$out" in *"leaving the registration of missing snapshot "*"/prepush-$MAIN12.gone00"*) ok "a missing snapshot's registration is left, with a message" ;; *) bad "missing snapshot output: $out" ;; esac
+mv "$TMP/away-checkout.moved" "$TMP/away-checkout"
 # A process inspection that fails is not evidence of an unused snapshot: with
 # pgrep failing, a free owned snapshot is left alone and says why.
 FAKEPS="$TMP/fakeps"
