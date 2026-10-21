@@ -30,6 +30,8 @@ For token-output PID-reference changes, preserve the `$$` versus real named/posi
 
 PID dollars separated by active backslash-LF must pair before later reference detection. Retain the original PID corpus and add split-dollar oracle/direct-reader controls, inactive-backslash controls and physical source-line assertions. Independently remove the shared continuation extent and the physical-line here-doc bridge to prove the controls fail, then run the full module self-test and actual hub scan. Preserve all existing oracle declarations and leave numeric PID collision handling to #2641; the bounded continuation contract lives in `specs/repo_lint_execution.md` (#1456 repair).
 
+For token-output leading here-string resolution, retain separate lexer operator/operand words for both spaced and attached source forms, while `<<` retains its consumed delimiter. Run the module-owned five-case oracle corpus and direct command-index/redirection controls through the full self-test and actual `--scan .`; removing the two-word skip must fail the leading emitter controls. The finite command-selection contract lives in `specs/repo_lint_execution.md` (#1462).
+
 ## Phase 4b automation suite
 
 Run `tests/test_phase_4b_automation.sh` with stdin closed (`bash tests/test_phase_4b_automation.sh < /dev/null`). Its tripwire case (#1757) drives `phase-4b-review.sh` against a fake handoff that reads stdin, so a session that leaves stdin open, such as an agent's backgrounded shell, blocks that case forever at 0% CPU instead of failing. A run that sits on one case for minutes is this hang, not a slow suite: kill it and rerun with `< /dev/null`.

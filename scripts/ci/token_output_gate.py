@@ -3166,8 +3166,13 @@ def resolve_command(seg):
         if w in ("{", "}"):
             idx += 1
             continue
-        if w == "<<" or w == "<<<":
+        if w == "<<":
+            # The lexer already consumed the here-doc delimiter.
             idx += 1
+            continue
+        if w == "<<<":
+            # Spaced and attached source forms retain a separate operand word.
+            idx += 2
             continue
         if _ASSIGN_RE.match(w):
             idx += 1
@@ -15800,6 +15805,33 @@ def _pid_continuation_cases():
     return failures
 
 
+def _leading_herestring_cases():
+    """Here-string operands precede commands; here-doc delimiters are absent."""
+    failures = []
+    cases = [
+        ('<<< x echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('<<<x echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('<<< x printf \'%s\\n\' "$GH_TOKEN"\n', "printf", 2, False),
+        ('echo "$GH_TOKEN" <<< x\n', "echo", 0, False),
+        ('<<< x : "$GH_TOKEN"\n', ":", 2, False),
+        ('< /dev/null echo "$GH_TOKEN"\n', "echo", 2, False),
+        ('</dev/null echo "$GH_TOKEN"\n', "echo", 1, False),
+        ('>out echo "$GH_TOKEN"\n', "echo", 1, True),
+        ('<<EOF echo "$GH_TOKEN"\nx\nEOF\n', "echo", 1, False),
+        ('< /dev/null : "$GH_TOKEN"\n', ":", 2, False),
+    ]
+    for source, command, index, redirected in cases:
+        lx = Lexer(source)
+        seg = next(seg for ll in lx.logical for seg in ll.segments if seg.words)
+        actual = resolve_command(seg)
+        if actual != (command, redirected) or seg._cmd_index != index:
+            failures.append("leading here-string resolution: %r expected %s at %d, got %r at %s" %
+                            (source, command, index, actual, seg._cmd_index))
+        if source.startswith("<<<") and seg.words[:2] != ["<<<", "x"]:
+            failures.append("leading here-string lexer: operator and operand must be separate")
+    return failures
+
+
 def _pid_special_parameter_cases():
     """Pin independent readers and later real-reference source coordinates."""
     failures = []
@@ -16514,6 +16546,16 @@ CORPUS += [
     ("pid-continuation-helper-braced-real", MUST_FLAG, "show(){ echo \"$\\\n$${1}\"; }; show \"$GH_TOKEN\"\n"),
     ("pid-continuation-helper-heredoc-real", MUST_FLAG, "show(){ cat <<EOF\n$\\\n$$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
     ("pid-continuation-helper-heredoc-literal", MUST_NOT_FLAG, "show(){ cat <<EOF\n$\\\n$1\nEOF\n}; show \"$GH_TOKEN\"\n"),
+]
+
+
+# #1462: a leading here-string's literal operand is not the command word.
+CORPUS += [
+    ("leading-herestring-spaced-echo", MUST_FLAG, '<<< x echo "$GH_TOKEN"\n'),
+    ("leading-herestring-attached-echo", MUST_FLAG, '<<<x echo "$GH_TOKEN"\n'),
+    ("leading-herestring-spaced-printf", MUST_FLAG, '<<< x printf \'%s\\n\' "$GH_TOKEN"\n'),
+    ("leading-herestring-trailing-echo-control", MUST_FLAG, 'echo "$GH_TOKEN" <<< x\n'),
+    ("leading-herestring-safe-colon-control", MUST_NOT_FLAG, '<<< x : "$GH_TOKEN"\n'),
 ]
 
 
@@ -17791,6 +17833,7 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_pid_special_parameter_cases())
     failures.extend(_pid_continuation_cases())
+    failures.extend(_leading_herestring_cases())
     failures.extend(_oracle_sample_cases())
     failures.extend(_oracle_signal_binding_cases())
     failures.extend(_printf_allowlist_cases())
