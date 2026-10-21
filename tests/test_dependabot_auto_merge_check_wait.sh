@@ -283,6 +283,7 @@ case "$1 ${2:-}" in
     case "$3" in
       repos/owner/repo/pulls/1/commits\?per_page=100)
         [ "${PROV_MODE:-}" != unreadable ] || { echo "HTTP 502" >&2; exit 1; }
+        [ "${PROV_MODE:-}" != nonarray ] || { echo '{"message":"Bad credentials"}'; exit 0; }
         cat "$PROV_COMMITS"
         ;;
       *) echo "gh shim: unexpected api endpoint: $3" >&2; exit 91 ;;
@@ -364,13 +365,30 @@ else
   fail "provenance step: foreign/unarmed case rc=$rc log=$(cat "$PROV_DIR/gh.log"): $out"
 fi
 
+# #2554: the reason gh_api_array composed must reach the step's ::error::
+# line. It used to be lost across `commits=$(gh_api_array …)`, so every
+# failed read logged the generic `failed to read PR commits` and the
+# operator could not tell an API error from a budget or output refusal.
 set +e
 out=$(run_prov_step "$PROV_DIR/trusted.json" unreadable false 2>&1); rc=$?
 set -e
-if [ "$rc" -ne 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output"; then
-  pass "provenance step: unreadable commits → job fails, trusted=false"
+if [ "$rc" -ne 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output" \
+   && [[ "$out" == *"Could not verify Dependabot commit provenance on $PROV_HEAD: failed to fetch PR commits: HTTP 502. Refusing auto-merge."* ]] \
+   && [[ "$out" != *"failed to read PR commits"* ]]; then
+  pass "provenance step: unreadable commits → job fails, trusted=false, and the error names gh's reason"
 else
   fail "provenance step: unreadable case rc=$rc output=$(cat "$PROV_DIR/output"): $out"
+fi
+
+set +e
+out=$(run_prov_step "$PROV_DIR/trusted.json" nonarray false 2>&1); rc=$?
+set -e
+if [ "$rc" -ne 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output" \
+   && [[ "$out" == *"PR commits (repos/owner/repo/pulls/1/commits?per_page=100) came back as a stream of object values"* ]] \
+   && [[ "$out" != *"failed to read PR commits"* ]]; then
+  pass "provenance step: a 200 that is not a list → job fails, trusted=false, and the error names the shape"
+else
+  fail "provenance step: non-list case rc=$rc output=$(cat "$PROV_DIR/output"): $out"
 fi
 
 # The in-step re-check that guards the approve and both merge paths.
@@ -395,10 +413,79 @@ out_u=$(run_recheck "$PROV_DIR/trusted.json" unreadable 2>&1); rc_u=$?
 set -e
 if [ "$rc_t" -eq 0 ] && [[ "$out_t" == *REACHED_ACTION* ]] \
    && [ "$rc_f" -eq 0 ] && [[ "$out_f" != *REACHED_ACTION* ]] && [ "$withdrew_f" -eq 1 ] \
-   && [ "$rc_u" -ne 0 ] && [[ "$out_u" != *REACHED_ACTION* ]]; then
-  pass "require_dependabot_provenance: trusted proceeds; foreign withdraws an armed auto-merge and stops cleanly; unreadable fails"
+   && [ "$rc_u" -ne 0 ] && [[ "$out_u" != *REACHED_ACTION* ]] \
+   && [[ "$out_u" == *"failed to fetch PR commits: HTTP 502"* ]]; then
+  pass "require_dependabot_provenance: trusted proceeds; foreign withdraws an armed auto-merge and stops cleanly; unreadable fails naming gh's reason"
 else
   fail "require_dependabot_provenance: t=$rc_t/$out_t f=$rc_f/$out_f u=$rc_u/$out_u"
+fi
+
+# The helper's own rc-3 contract (#2554): a failed read returns 3, writes
+# NOTHING to stdout, and reports gh_api_array's diagnostic verbatim. The
+# helper's stdout is captured to a file, not a command substitution, so the
+# REASON global is read in the same shell that set it.
+run_prov_helper() {  # <commits_file> <mode> [tmpdir] [helper_path]
+  ( cd "$ROOT" && PATH="$PROV_DIR/bin:$PATH" PROV_LOG="$PROV_DIR/gh.log" \
+      PROV_COMMITS="$1" PROV_MODE="$2" TMPDIR="${3:-${TMPDIR:-/tmp}}" \
+      bash -c 'set -uo pipefail
+        . scripts/lib/gh-api-array.sh
+        . "$2"
+        rc=0
+        dependabot_commit_provenance owner/repo 1 "$1" >"$3" || rc=$?
+        printf "rc=%s\nstdout=%s\nreason=%s\n" "$rc" "$(cat "$3")" "$DEPENDABOT_PROVENANCE_REASON"' \
+      bash "$PROV_HEAD" "${4:-scripts/lib/dependabot-commit-provenance.sh}" "$PROV_DIR/helper.stdout" )
+}
+helper_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+
+set +e
+res_fetch=$(run_prov_helper "$PROV_DIR/trusted.json" unreadable)
+res_shape=$(run_prov_helper "$PROV_DIR/trusted.json" nonarray)
+set -e
+if [ "$(helper_field "$res_fetch" rc)" = 3 ] && [ -z "$(helper_field "$res_fetch" stdout)" ] \
+   && [ "$(helper_field "$res_fetch" reason)" = "failed to fetch PR commits: HTTP 502" ] \
+   && [ "$(helper_field "$res_shape" rc)" = 3 ] && [ -z "$(helper_field "$res_shape" stdout)" ] \
+   && [[ "$(helper_field "$res_shape" reason)" == "PR commits (repos/owner/repo/pulls/1/commits?per_page=100) came back as a stream of object values"* ]]; then
+  pass "dependabot_commit_provenance: a failed read returns 3 with nothing on stdout and gh_api_array's fetch or shape diagnostic as the reason"
+else
+  fail "dependabot_commit_provenance: rc-3 contract: fetch=[$res_fetch] shape=[$res_shape]"
+fi
+
+# Temporary storage costs the diagnostic, never the verdict: with no scratch
+# directory the helper still judges the commits, and a failed read says the
+# cause was not captured rather than claiming one.
+set +e
+res_notmp_ok=$(run_prov_helper "$PROV_DIR/trusted.json" ok "$PROV_DIR/no-such-tmpdir")
+res_notmp_fail=$(run_prov_helper "$PROV_DIR/trusted.json" unreadable "$PROV_DIR/no-such-tmpdir")
+set -e
+if [ "$(helper_field "$res_notmp_ok" rc)" = 0 ] \
+   && [[ "$(helper_field "$res_notmp_ok" reason)" == *"signature verified"* ]] \
+   && [ "$(helper_field "$res_notmp_fail" rc)" = 3 ] && [ -z "$(helper_field "$res_notmp_fail" stdout)" ] \
+   && [ "$(helper_field "$res_notmp_fail" reason)" = "failed to read PR commits (reason not captured: mktemp unavailable)" ]; then
+  pass "dependabot_commit_provenance: without a scratch directory the verdict still stands and a failed read says the reason was not captured"
+else
+  fail "dependabot_commit_provenance: no-tmpdir contract: ok=[$res_notmp_ok] fail=[$res_notmp_fail]"
+fi
+
+# Mutation check: put the command substitution back in a scratch copy of
+# the helper and confirm the fetch assertion above would catch it — the
+# reason must degrade to the generic fallback, which is the defect. The sed
+# is verified to have changed the copy, so a no-op rewrite cannot pass this
+# vacuously.
+MUTANT="$PROV_DIR/provenance-mutant.sh"
+# shellcheck disable=SC2016  # the sed pattern and the grep below quote the helper's own source text
+sed 's|gh_api_array "$endpoint" "PR commits" >"$commits_tmp"|commits=$(gh_api_array "$endpoint" "PR commits")|' \
+  "$ROOT/scripts/lib/dependabot-commit-provenance.sh" >"$MUTANT"
+set +e
+res_mutant=$(run_prov_helper "$PROV_DIR/trusted.json" unreadable "" "$MUTANT")
+set -e
+# shellcheck disable=SC2016  # literal source text, see above
+if grep -Fq 'if ! commits=$(gh_api_array "$endpoint" "PR commits"); then' "$MUTANT" \
+   && ! cmp -s "$MUTANT" "$ROOT/scripts/lib/dependabot-commit-provenance.sh" \
+   && [ "$(helper_field "$res_mutant" rc)" = 3 ] \
+   && [ "$(helper_field "$res_mutant" reason)" = "failed to read PR commits" ]; then
+  pass "mutation: restoring commits=\$(gh_api_array …) loses the reason to the generic fallback, so the assertion above discriminates"
+else
+  fail "mutation: expected the substitution form to degrade the reason; got [$res_mutant]"
 fi
 
 # Ordering: the approve is bound to a verified SHA, and each merge path

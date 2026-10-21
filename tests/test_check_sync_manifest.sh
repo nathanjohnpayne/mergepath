@@ -89,7 +89,7 @@ scripts/ci/fixtures/foo.json"
 set +e
 out=$(run_with_fixture "$MANIFEST_SAT" "$PATHS_SAT"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 1: requires: satisfied by exact + kit-prefix coverage"
 else
   fail "Case 1 unexpected (rc=$rc): $out"
@@ -112,7 +112,7 @@ set +e
 out=$(run_with_fixture "$MANIFEST_UNCOV" "$PATHS_UNCOV"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "requires 'tests/missing.sh' but that path is not covered"; then
+   grep -q "requires 'tests/missing.sh' but that path is not covered" <<<"$out"; then
   pass "Case 2: uncovered requires fails closed with named-path diagnostic"
 else
   fail "Case 2 unexpected (rc=$rc): $out"
@@ -132,7 +132,7 @@ tests/test_foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_NOREQ" "$PATHS_NOREQ"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "PASS"; then
+if [ "$rc" = "0" ] && grep -q "PASS" <<<"$out"; then
   pass "Case 3: missing requires: is valid (optional field)"
 else
   fail "Case 3 unexpected (rc=$rc): $out"
@@ -155,7 +155,7 @@ out=$(run_with_fixture "$MANIFEST_MAL" "$PATHS_MAL"); rc=$?
 set -e
 # yq's `.requires[]` on a scalar errors OR splits per-char depending on
 # version; either way the check must exit non-zero with FAIL output.
-if [ "$rc" = "1" ] && echo "$out" | grep -q "FAIL"; then
+if [ "$rc" = "1" ] && grep -q "FAIL" <<<"$out"; then
   pass "Case 4: scalar requires: rejected (fails closed)"
 else
   fail "Case 4 unexpected (rc=$rc): $out"
@@ -181,7 +181,7 @@ set +e
 out=$(run_with_fixture "$MANIFEST_BOUND" "$PATHS_BOUND"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "requires 'scripts/cinema/foo.sh' but that path is not covered"; then
+   grep -q "requires 'scripts/cinema/foo.sh' but that path is not covered" <<<"$out"; then
   pass "Case 5: kit-prefix is slash-bounded (scripts/ci/ does NOT cover scripts/cinema/)"
 else
   fail "Case 5 unexpected (rc=$rc): $out"
@@ -225,8 +225,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_SCOPE_GAP" "$PATHS_SCOPE_GAP"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "does NOT cover the requirer" && \
-   echo "$out" | grep -qE "requirer is consumers: all|matchline"; then
+   grep -q "does NOT cover the requirer" <<<"$out" && \
+   grep -qE "requirer is consumers: all|matchline" <<<"$out"; then
   pass "Case 6: requires: with narrower consumer scope fails closed (all → matchline gap)"
 else
   fail "Case 6 unexpected (rc=$rc): $out"
@@ -253,8 +253,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_NAMED_GAP" "$PATHS_NAMED_GAP"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "does NOT cover" && \
-   echo "$out" | grep -q "swipewatch"; then
+   grep -q "does NOT cover" <<<"$out" && \
+   grep -q "swipewatch" <<<"$out"; then
   pass "Case 6b: named-consumer-list requires: gap fails closed and names the missing consumer (swipewatch)"
 else
   fail "Case 6b unexpected (rc=$rc): $out"
@@ -280,7 +280,7 @@ tests/test_foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_SCOPE_OK" "$PATHS_SCOPE_OK"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 7: requires: covered by superset consumer scope passes"
 else
   fail "Case 7 unexpected (rc=$rc): $out"
@@ -302,7 +302,7 @@ tests/test_foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_ALL_ALL" "$PATHS_ALL_ALL"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 8: consumers: all → all trivially passes"
 else
   fail "Case 8 unexpected (rc=$rc): $out"
@@ -328,7 +328,7 @@ PATHS_TPL_OK="examples/eslint.config.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_TPL_OK" "$PATHS_TPL_OK"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 9: templated with source/dest passes"
 else
   fail "Case 9 unexpected (rc=$rc): $out"
@@ -344,7 +344,7 @@ PATHS_TPL_NODEST="examples/eslint.config.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_TPL_NODEST" "$PATHS_TPL_NODEST"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "WARN: templated path" && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "WARN: templated path" <<<"$out" && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 10: templated without dest warns but passes"
 else
   fail "Case 10 unexpected (rc=$rc): $out"
@@ -361,7 +361,7 @@ PATHS_DEST_ABS="examples/x.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_DEST_ABS" "$PATHS_DEST_ABS"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "dest '/etc/passwd' that is absolute"; then
+if [ "$rc" = "1" ] && grep -q "dest '/etc/passwd' that is absolute" <<<"$out"; then
   pass "Case 11: absolute dest rejected"
 else
   fail "Case 11 unexpected (rc=$rc): $out"
@@ -397,7 +397,7 @@ PATHS_SRC_MISSING="eslint.config.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_SRC_MISSING" "$PATHS_SRC_MISSING"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "source 'examples/missing.js' must be a regular file for templated entries"; then
+if [ "$rc" = "1" ] && grep -q "source 'examples/missing.js' must be a regular file for templated entries" <<<"$out"; then
   pass "Case 13: source ≠ path with missing source rejected (templated: requires regular file)"
 else
   fail "Case 13 unexpected (rc=$rc): $out"
@@ -418,7 +418,7 @@ examples/somedir/"
 set +e
 out=$(run_with_fixture "$MANIFEST_SRC_ISDIR" "$PATHS_SRC_ISDIR"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a regular file for templated entries"; then
+if [ "$rc" = "1" ] && grep -q "must be a regular file for templated entries" <<<"$out"; then
   pass "Case 13b: templated source pointing at a directory rejected"
 else
   fail "Case 13b unexpected (rc=$rc): $out"
@@ -443,7 +443,7 @@ PATHS_FACTS_OK="scripts/foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_FACTS_OK" "$PATHS_FACTS_OK"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 14: valid consumer facts (scalar + list) pass"
 else
   fail "Case 14 unexpected (rc=$rc): $out"
@@ -465,7 +465,7 @@ paths:
 set +e
 out=$(run_with_fixture "$MANIFEST_FACTS_KEY_BAD" "scripts/foo.sh"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "facts: key 'Frameworks' must match"; then
+if [ "$rc" = "1" ] && grep -q "facts: key 'Frameworks' must match" <<<"$out"; then
   pass "Case 15: facts key with uppercase rejected"
 else
   fail "Case 15 unexpected (rc=$rc): $out"
@@ -489,7 +489,7 @@ paths:
 set +e
 out=$(run_with_fixture "$MANIFEST_FACTS_NESTED" "scripts/foo.sh"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "unsupported value type '!!map'"; then
+if [ "$rc" = "1" ] && grep -q "unsupported value type '!!map'" <<<"$out"; then
   pass "Case 16: facts value as nested mapping rejected"
 else
   fail "Case 16 unexpected (rc=$rc): $out"
@@ -514,7 +514,7 @@ paths:
 set +e
 out=$(run_with_fixture "$MANIFEST_FACTS_SEQ" "scripts/foo.sh"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "facts: must be a YAML mapping (got tag '!!seq')"; then
+if [ "$rc" = "1" ] && grep -q "facts: must be a YAML mapping (got tag '!!seq')" <<<"$out"; then
   pass "Case 17b: facts as sequence rejected"
 else
   fail "Case 17b unexpected (rc=$rc): $out"
@@ -536,7 +536,7 @@ PATHS_DEST_EMPTY="examples/foo.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_DEST_EMPTY" "$PATHS_DEST_EMPTY"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit dest: "" — dest must be non-empty when set'; then
+if [ "$rc" = "1" ] && grep -q 'explicit dest: "" — dest must be non-empty when set' <<<"$out"; then
   pass "Case 18: explicit empty dest: \"\" rejected"
 else
   fail "Case 18 unexpected (rc=$rc): $out"
@@ -558,7 +558,7 @@ paths: []
 set +e
 out=$(run_with_fixture "$MANIFEST_EMPTY_PATHS" ""); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 18bis: empty .paths: [] passes (no false-positive from has_path check)"
 else
   fail "Case 18bis unexpected (rc=$rc): $out"
@@ -575,7 +575,7 @@ PATHS_NO_PATH="scripts/foo.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_NO_PATH" "$PATHS_NO_PATH"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'path' field"; then
+if [ "$rc" = "1" ] && grep -q "has no 'path' field" <<<"$out"; then
   pass "Case 18c: .paths[] entry without path field rejected (fail-closed)"
 else
   fail "Case 18c unexpected (rc=$rc): $out"
@@ -608,7 +608,7 @@ MANIFEST_SRC_EMPTY="$MIN_HEADER
 set +e
 out=$(run_with_fixture "$MANIFEST_SRC_EMPTY" "examples/foo.js"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit source: "" — source must be non-empty when set'; then
+if [ "$rc" = "1" ] && grep -q 'explicit source: "" — source must be non-empty when set' <<<"$out"; then
   pass "Case 18b: explicit empty source: \"\" rejected"
 else
   fail "Case 18b unexpected (rc=$rc): $out"
@@ -628,7 +628,7 @@ paths:
 set +e
 out=$(run_with_fixture "$MANIFEST_NO_FACTS" "scripts/foo.sh"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 17: consumer without facts: passes (facts is optional)"
 else
   fail "Case 17 unexpected (rc=$rc): $out"
@@ -650,7 +650,7 @@ scripts/notadir"
 set +e
 out=$(run_with_fixture "$MANIFEST_KIT_SRC_FILE" "$PATHS_KIT_SRC_FILE"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a directory for kit entries"; then
+if [ "$rc" = "1" ] && grep -q "must be a directory for kit entries" <<<"$out"; then
   pass "Case 19: kit source override pointing at a regular file rejected"
 else
   fail "Case 19 unexpected (rc=$rc): $out"
@@ -684,7 +684,7 @@ scripts/main.sh"
 set +e
 out=$(run_with_fixture "$MANIFEST_UNION" "$PATHS_UNION"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 20: union coverage (narrow exact + broad kit) satisfies an all-scoped requirer"
 else
   fail "Case 20 unexpected (rc=$rc): $out"
@@ -730,7 +730,7 @@ scripts/ci/"
 set +e
 out=$(run_with_fixture_assert_rl "$MANIFEST_RL_OK" "$PATHS_RL_OK"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 21: repo_lint.yml wiring contract satisfied passes (#601)"
 else
   fail "Case 21 unexpected (rc=$rc): $out"
@@ -748,8 +748,8 @@ set +e
 out=$(run_with_fixture_assert_rl "$MANIFEST_RL_MISSING" "$PATHS_RL_MISSING"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "manifest has no entry for '.github/workflows/repo_lint.yml'" && \
-   echo "$out" | grep -q "#601"; then
+   grep -q "manifest has no entry for '.github/workflows/repo_lint.yml'" <<<"$out" && \
+   grep -q "#601" <<<"$out"; then
   pass "Case 22: missing repo_lint.yml canonical entry fails closed citing #601"
 else
   fail "Case 22 unexpected (rc=$rc): $out"
@@ -772,8 +772,8 @@ set +e
 out=$(run_with_fixture_assert_rl "$MANIFEST_RL_NO_KIT_REQ" "$PATHS_RL_OK"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "kit entry's requires: must include '.github/workflows/repo_lint.yml'" && \
-   echo "$out" | grep -q "#601"; then
+   grep -q "kit entry's requires: must include '.github/workflows/repo_lint.yml'" <<<"$out" && \
+   grep -q "#601" <<<"$out"; then
   pass "Case 23: kit requires: missing repo_lint.yml fails closed citing #601"
 else
   fail "Case 23 unexpected (rc=$rc): $out"
@@ -798,8 +798,8 @@ set +e
 out=$(run_with_fixture_assert_rl "$MANIFEST_RL_NARROW" "$PATHS_RL_OK"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "must be consumers: all" && \
-   echo "$out" | grep -q "#601"; then
+   grep -q "must be consumers: all" <<<"$out" && \
+   grep -q "#601" <<<"$out"; then
   pass "Case 24: narrowed repo_lint.yml consumers fails closed citing #601"
 else
   fail "Case 24 unexpected (rc=$rc): $out"
@@ -812,7 +812,7 @@ fi
 set +e
 out=$(run_with_fixture "$MANIFEST_RL_MISSING" "$PATHS_RL_MISSING"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 25: #601 assertion scoped off for non-opted-in fixture runs"
 else
   fail "Case 25 unexpected (rc=$rc): $out"
@@ -865,7 +865,7 @@ scripts/codex-review-request.sh"
 set +e
 out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "$CC_REV")" "$PATHS_CC"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case CC1: coupled callers declared in both directions pass (#2253)"
 else
   fail "Case CC1 unexpected (rc=$rc): $out"
@@ -877,8 +877,8 @@ set +e
 out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "")" "$PATHS_CC"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'scripts/codex-review-request.sh' must list 'scripts/coderabbit-wait.sh' in requires:" && \
-   ! echo "$out" | grep -q "'scripts/coderabbit-wait.sh' must list"; then
+   grep -q "'scripts/codex-review-request.sh' must list 'scripts/coderabbit-wait.sh' in requires:" <<<"$out" && \
+   ! grep -q "'scripts/coderabbit-wait.sh' must list" <<<"$out"; then
   pass "Case CC2: a callee that does not require its caller fails closed (#2253)"
 else
   fail "Case CC2 unexpected (rc=$rc): $out"
@@ -889,8 +889,8 @@ set +e
 out=$(run_with_fixture_assert_cc "$(cc_manifest "" "$CC_REV")" "$PATHS_CC"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'scripts/coderabbit-wait.sh' must list 'scripts/codex-review-request.sh' in requires:" && \
-   ! echo "$out" | grep -q "'scripts/codex-review-request.sh' must list"; then
+   grep -q "'scripts/coderabbit-wait.sh' must list 'scripts/codex-review-request.sh' in requires:" <<<"$out" && \
+   ! grep -q "'scripts/codex-review-request.sh' must list" <<<"$out"; then
   pass "Case CC3: a caller that does not require its callee fails closed (#2253)"
 else
   fail "Case CC3 unexpected (rc=$rc): $out"
@@ -907,8 +907,8 @@ set +e
 out=$(run_with_fixture_assert_cc "$MANIFEST_CC_NONE" "scripts/other.sh"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'scripts/codex-review-request.sh' has no manifest entry" && \
-   echo "$out" | grep -q "'scripts/coderabbit-wait.sh' has no manifest entry"; then
+   grep -q "'scripts/codex-review-request.sh' has no manifest entry" <<<"$out" && \
+   grep -q "'scripts/coderabbit-wait.sh' has no manifest entry" <<<"$out"; then
   pass "Case CC4: a coupled pair member missing from the manifest fails closed (#2253)"
 else
   fail "Case CC4 unexpected (rc=$rc): $out"
@@ -919,7 +919,7 @@ fi
 set +e
 out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "$CC_REV")" "$PATHS_CC" 'scripts/coderabbit-wait.sh'); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "malformed coupled-caller row"; then
+if [ "$rc" = "1" ] && grep -q "malformed coupled-caller row" <<<"$out"; then
   pass "Case CC5: a malformed coupled-caller row fails closed (#2253)"
 else
   fail "Case CC5 unexpected (rc=$rc): $out"
@@ -930,7 +930,7 @@ fi
 set +e
 out=$(run_with_fixture "$(cc_manifest "" "")" "$PATHS_CC"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case CC6: #2253 assertion scoped off for non-opted-in fixture runs"
 else
   fail "Case CC6 unexpected (rc=$rc): $out"
@@ -951,8 +951,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_CANON" "BRAND.md"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 26: canonical identity doc (BRAND.md) fails closed citing #743"
 else
   fail "Case 26 unexpected (rc=$rc): $out"
@@ -970,9 +970,9 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_KIT" "$PATHS_ID_KIT"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'docs/agents/repository-overview.md' is a per-repo-owned identity/hub-only doc" && \
-   echo "$out" | grep -q "kit-contains" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "'docs/agents/repository-overview.md' is a per-repo-owned identity/hub-only doc" <<<"$out" && \
+   grep -q "kit-contains" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 27: kit dir containing an identity doc fails closed (kit-contains, #743)"
 else
   fail "Case 27 unexpected (rc=$rc): $out"
@@ -989,7 +989,7 @@ MANIFEST_ID_TPL="$MIN_HEADER
 set +e
 out=$(run_with_fixture "$MANIFEST_ID_TPL" "examples/brand.md"); rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+if [ "$rc" = "0" ] && grep -q "check_sync_manifest: PASS" <<<"$out"; then
   pass "Case 28: templated render onto an identity doc is exempt (escape hatch)"
 else
   fail "Case 28 unexpected (rc=$rc): $out"
@@ -1007,8 +1007,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_DEST" "docs/brand-source.md"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 29: canonical dest remapped onto an identity doc fails closed (#743)"
 else
   fail "Case 29 unexpected (rc=$rc): $out"
@@ -1027,8 +1027,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_DOTSLASH" "BRAND.md"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 30: './BRAND.md' spelling normalized + fails closed (#745)"
 else
   fail "Case 30 unexpected (rc=$rc): $out"
@@ -1046,8 +1046,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_TPL_SRC" "BRAND.md"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "templated entry uses the identity/hub-only doc 'BRAND.md' as its source" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "templated entry uses the identity/hub-only doc 'BRAND.md' as its source" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 31: templated-from-the-identity-doc-itself fails closed (#745)"
 else
   fail "Case 31 unexpected (rc=$rc): $out"
@@ -1064,8 +1064,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_ROOTKIT" "."); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "repo-root-kit" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "repo-root-kit" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 32: repo-root kit (path: .) fails closed as containing every denied doc (#745)"
 else
   fail "Case 32 unexpected (rc=$rc): $out"
@@ -1085,8 +1085,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_CANON_SRC" "$(printf 'docs/brand-mirror.md\nBRAND.md')"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "BRAND.md" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "BRAND.md" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 33: canonical entry sourced FROM an identity doc fails closed (#763)"
 else
   fail "Case 33 unexpected (rc=$rc): $out"
@@ -1106,8 +1106,8 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_KIT_SRC" "$(printf 'docs/mirrored/\nBRAND.md')"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "repo-root-kit" && \
-   echo "$out" | grep -q "#743"; then
+   grep -q "repo-root-kit" <<<"$out" && \
+   grep -q "#743" <<<"$out"; then
   pass "Case 34: kit whose source DIRECTORY contains an identity doc fails closed (#763)"
 else
   fail "Case 34 unexpected (rc=$rc): $out"
