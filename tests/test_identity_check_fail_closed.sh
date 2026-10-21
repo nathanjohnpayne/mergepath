@@ -159,12 +159,12 @@ fi
 #      '@codex review'` through the wrapper and never reaches a bare gh.
 
 # Part 1: the call site inside post_codex_trigger (the only trigger writer;
-# the eyes-ack retry re-enters it).
+# the eyes-ack retry re-enters it, passing its soft failure mode, #2582).
 crr_trigger_fn=$(awk '/^post_codex_trigger\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CRR")
 if [ -z "$crr_trigger_fn" ]; then
   fail "codex-review-request: post_codex_trigger() not found — cannot locate the '@codex review' trigger write"
 elif printf '%s\n' "$crr_trigger_fn" \
-     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline[[:space:]]*$'; then
+     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline( "\$write_failure"; then)?[[:space:]]*$'; then
   pass "codex-review-request: post_codex_trigger posts '@codex review' via post_author_pr_comment (inline --body mode)"
 else
   fail "codex-review-request: post_codex_trigger does not post '@codex review' via post_author_pr_comment ... inline"
