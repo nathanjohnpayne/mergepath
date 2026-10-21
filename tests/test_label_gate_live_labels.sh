@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
+WORKFLOW="${LABEL_GATE_TEST_WORKFLOW:-$ROOT/.github/workflows/pr-review-policy.yml}"
 AGENT_WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
 
 for tool in yq node; do
@@ -339,7 +339,20 @@ case "$*" in
   "pr view 42 --repo o/r --json labels --jq .labels[].name")
     cat "$GH_STUB_DIR/labels.txt" ;;
   "pr view 42 --repo o/r --json comments --jq .comments[].body")
-    cat "$GH_STUB_DIR/pr-comments.txt" ;;
+    # Model gh pr view's bounded connection for the known-bad control.
+    awk 'NR <= 100' "$GH_STUB_DIR/pr-comments.txt" ;;
+  "api --paginate repos/o/r/issues/42/comments --jq .[].body")
+    printf 'page-1\n' >>"$GH_STUB_DIR/comment-pages"
+    awk 'NR <= 100' "$GH_STUB_DIR/pr-comments.txt"
+    if [ "$(wc -l <"$GH_STUB_DIR/pr-comments.txt")" -gt 100 ]; then
+      printf 'page-2\n' >>"$GH_STUB_DIR/comment-pages"
+      if [ -f "$GH_STUB_DIR/fail-later-comment-page" ]; then
+        printf '{"message":"fixture page two failed"}\n'
+        echo 'gh: fixture page two failed (HTTP 503)' >&2
+        exit 1
+      fi
+      awk 'NR > 100' "$GH_STUB_DIR/pr-comments.txt"
+    fi ;;
   "api repos/o/r/pulls/42 --jq {head:.head.sha,base:.base.sha}")
     [ ! -f "$GH_STUB_DIR/fail-live-head" ] || exit 1
     count=$(cat "$GH_STUB_DIR/pair-count" 2>/dev/null || echo 0)
@@ -355,7 +368,11 @@ case "$*" in
   "pr edit 42 --remove-label needs-external-review --repo o/r")
     printf 'removed\n' >>"$GH_STUB_DIR/label-removals" ;;
   "pr comment 42 --repo o/r --body "*)
-    printf '%s' "${7-}" >>"$GH_STUB_DIR/comment-writes" ;;
+    printf '%s' "${7-}" >>"$GH_STUB_DIR/comment-writes"
+    # Subsequent label/edit deliveries see comments the earlier run posted.
+    if [ -f "$GH_STUB_DIR/pr-comments.txt" ]; then
+      printf '%s\n' "${7-}" >>"$GH_STUB_DIR/pr-comments.txt"
+    fi ;;
   "api -X POST repos/o/r/dispatches "*)
     printf 'dispatched\n' >>"$GH_STUB_DIR/dispatches" ;;
   "api --paginate repos/o/r/issues/42/timeline")
@@ -565,6 +582,83 @@ if [ "$rc" -eq 0 ] && [ ! -f "$P1D/comment-writes" ] \
 else
   fail "current-pair marker did not deduplicate publication (rc=$rc out=$(cat "$P1D/out") err=$(cat "$P1D/err"))"
 fi
+
+# #1501: marker lookup must finish all pages before deciding whether the
+# pair has already been published. Each noise line is one fixture comment.
+write_long_propagation_history() { # <fixture-dir>
+  local dir=$1
+  awk 'BEGIN { for (i = 1; i <= 150; i++) print "fixture unrelated comment " i }' \
+    >"$dir/pr-comments.txt"
+}
+P1E="$WORK/propagation-existing-page-two"
+write_propagation_fixture "$P1E" "$HEAD40"
+write_long_propagation_history "$P1E"
+printf '%s\n' "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" >>"$P1E/pr-comments.txt"
+for delivery in labeled edited; do
+  rc=$(EVENT_ACTION="$delivery" run_propagation "$P1E")
+  if [ "$rc" -eq 0 ] && [ ! -f "$P1E/comment-writes" ] && [ ! -f "$P1E/dispatches" ]; then
+    pass "later-page current-pair marker suppresses duplicate publication on $delivery"
+  else
+    fail "later-page marker missed on $delivery (rc=$rc out=$(cat "$P1E/out") err=$(cat "$P1E/err"))"
+  fi
+done
+if [ "$(grep -c '^page-2$' "$P1E/comment-pages" 2>/dev/null || true)" = 2 ]; then
+  pass 'both repeated deliveries completely read the later comment page'
+else
+  fail 'repeated deliveries did not complete pagination'
+fi
+
+P1F="$WORK/propagation-absent-long-history"
+write_propagation_fixture "$P1F" "$HEAD40"
+write_long_propagation_history "$P1F"
+for delivery in opened labeled edited; do
+  rc=$(EVENT_ACTION="$delivery" run_propagation "$P1F")
+  if [ "$rc" -ne 0 ]; then
+    fail "long-history publication failed on $delivery (rc=$rc err=$(cat "$P1F/err"))"
+  fi
+done
+if [ "$(grep -Fc "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" "$P1F/comment-writes" 2>/dev/null || true)" = 1 ] \
+   && [ "$(grep -c '^dispatched$' "$P1F/dispatches" 2>/dev/null || true)" = 1 ] \
+   && [ "$(grep -c '^page-2$' "$P1F/comment-pages" 2>/dev/null || true)" = 3 ]; then
+  pass 'absent marker publishes once; later label/edit deliveries do not repeat comment or dispatch'
+else
+  fail 'long-history repeated deliveries duplicated or omitted publication'
+fi
+
+P1G="$WORK/propagation-other-head-page-two"
+write_propagation_fixture "$P1G" "$HEAD40"
+write_long_propagation_history "$P1G"
+printf '%s\n' "<!-- mergepath-propagation-lane:v2 verified-head=$OTHER_HEAD40 verified-base=$BASE40 -->" >>"$P1G/pr-comments.txt"
+rc=$(run_propagation "$P1G")
+if [ "$rc" -eq 0 ] && [ -s "$P1G/comment-writes" ] \
+   && grep -Fq "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" "$P1G/comment-writes" \
+   && [ "$(cat "$P1G/dispatches" 2>/dev/null)" = dispatched ]; then
+  pass "another head's later-page marker does not suppress current-pair publication"
+else
+  fail "other-head marker suppressed publication (rc=$rc out=$(cat "$P1G/out") err=$(cat "$P1G/err"))"
+fi
+
+for earlier_marker in absent present; do
+  P1H="$WORK/propagation-failed-page-two-$earlier_marker"
+  write_propagation_fixture "$P1H" "$HEAD40"
+  write_long_propagation_history "$P1H"
+  if [ "$earlier_marker" = present ]; then
+    # Even seeing a marker on page one cannot excuse an incomplete read.
+    printf '%s\n' "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" >"$P1H/marker"
+    cat "$P1H/marker" "$P1H/pr-comments.txt" >"$P1H/history"
+    mv "$P1H/history" "$P1H/pr-comments.txt"
+  fi
+  touch "$P1H/fail-later-comment-page"
+  rc=$(run_propagation "$P1H")
+  if [ "$rc" -ne 0 ] && [ ! -f "$P1H/comment-writes" ] \
+     && [ ! -f "$P1H/dispatches" ] && [ ! -f "$P1H/label-removals" ] \
+     && grep -q '^page-2$' "$P1H/comment-pages" \
+     && grep -Fq 'Could not read complete propagation-lane marker history' "$P1H/err"; then
+    pass "failed later page refuses all writes with earlier marker $earlier_marker"
+  else
+    fail "failed later page became usable history ($earlier_marker rc=$rc out=$(cat "$P1H/out") err=$(cat "$P1H/err"))"
+  fi
+done
 
 P2="$WORK/propagation-stale-head"
 write_propagation_fixture "$P2" "$OTHER_HEAD40"

@@ -90,9 +90,10 @@ crqe_latest_trigger_time() { # comments-json author
 # A trigger is exempt only when that marker is the whole body of an unedited
 # configured-author comment that names an exact configured-author trigger,
 # follows it within CRQE_FAILOVER_MARKER_WINDOW_SECONDS by GitHub's own
-# timestamps, and has no other author trigger between the two. So a marker
-# cannot be added to an old request later, and at most one trigger per named
-# head is exempt. Anything else, malformed or unreadable, leaves the trigger
+# timestamps, has no other author trigger between the two, and names a head
+# this PR actually had (crqe_pr_head_set; #2553). So a marker cannot be added
+# to an old request later, and at most one trigger per real head is exempt: a
+# marker naming an invented head exempts nothing. Anything else, malformed or unreadable, leaves the trigger
 # counted: a missing exemption costs a request slot, never the ceiling. The
 # trigger stays in the request generation; only the ceiling skips it.
 CRQE_FAILOVER_MARKER_WINDOW_SECONDS=300
@@ -102,9 +103,72 @@ crqe_failover_marker_body() { # full-head-sha trigger-comment-id
   printf '<!-- mergepath-codex-failover:v1 head=%s trigger_comment_id=%s -->' "$1" "$2"
 }
 
-# Prints the sorted ids of the exempt failover triggers.
-crqe_failover_trigger_ids() { # comments-json author
-  printf '%s\n' "$1" | jq -cer --arg author "$2" --argjson window "$CRQE_FAILOVER_MARKER_WINDOW_SECONDS" '
+# True when any comment by <author> starts with the failover marker namespace,
+# so callers read the PR's head set only when a marker could use it.
+crqe_failover_markers_present() { # comments-json author
+  printf '%s\n' "$1" | jq -e --arg author "$2" '
+    any(.[]?; type == "object" and (.user.login // "") == $author
+              and ((.body // "") | type) == "string"
+              and ((.body // "") | startswith("<!-- mergepath-codex-failover:")))' >/dev/null 2>&1
+}
+
+# The heads this PR has had (#2553): <current-head>, every commit in the PR's
+# commit list, the commits the timeline records (`committed` events and a
+# `head_ref_force_pushed` event's commit_id when REST fills it), and the before
+# and after commits of every force-push (<force-push-heads>, from
+# crqe_force_push_heads; #2591). REST does not name the head a force-push
+# replaced, so without that read a marker on a head that was later
+# force-pushed away stops exempting its trigger: it counts, the safe side.
+# Prints a sorted array of lowercase full SHAs. Fails on input that is not
+# arrays and a full SHA; callers then use [] so that nothing is exempt.
+crqe_pr_head_set() { # commits-json timeline-json current-head [force-push-heads-json]
+  jq -nce --argjson c "$1" --argjson t "$2" --arg h "$3" --argjson f "${4:-[]}" '
+    def sha: select(type == "string") | ascii_downcase | select(test("^([0-9a-f]{40}|[0-9a-f]{64})$"));
+    if ($c | type) != "array" or ($t | type) != "array" or ($f | type) != "array"
+       or (($h | ascii_downcase) | test("^([0-9a-f]{40}|[0-9a-f]{64})$") | not)
+    then error("head set") else . end
+    | [ ($h | sha),
+        ($c[] | objects | .sha | sha),
+        ($t[] | objects | select(.event == "committed") | .sha | sha),
+        ($t[] | objects | select(.event == "head_ref_force_pushed")
+             | .commit_id | sha),
+        ($f[] | sha) ]
+    | unique' 2>/dev/null
+}
+
+# The before and after commits of every force-push on <repo>#<pr>, from the
+# GraphQL timeline (#2591): the REST event names neither. Prints a sorted array
+# of lowercase SHAs. Fails when the read fails or a page has no timeline;
+# callers then pass [], which only drops force-pushed heads from the set.
+crqe_force_push_heads() { # repo pr
+  local out
+  out=$(gh api graphql --paginate -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f query='
+    query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ... on HeadRefForcePushedEvent { beforeCommit { oid } afterCommit { oid } } }
+          }
+        }
+      }
+    }' 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -sce '
+    if length == 0 or any(.[]; (.data.repository.pullRequest.timelineItems.nodes | type) != "array")
+    then error("force-push timeline") else . end
+    | [ .[].data.repository.pullRequest.timelineItems.nodes[]
+        | (.beforeCommit.oid, .afterCommit.oid)
+        | select(type == "string") | ascii_downcase
+        | select(test("^([0-9a-f]{40}|[0-9a-f]{64})$")) ]
+    | unique' 2>/dev/null
+}
+
+
+# Prints the sorted ids of the exempt failover triggers. <heads-json> is
+# crqe_pr_head_set's output; absent or [] exempts nothing.
+crqe_failover_trigger_ids() { # comments-json author [heads-json]
+  printf '%s\n' "$1" | jq -cer --arg author "$2" --argjson window "$CRQE_FAILOVER_MARKER_WINDOW_SECONDS" \
+    --argjson heads "${3:-[]}" '
     def epoch: try fromdateiso8601 catch null;
     [ .[] | select(type == "object" and (.user.login // "") == $author) ] as $mine
     | [ $mine[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] as $triggers
@@ -114,6 +178,7 @@ crqe_failover_trigger_ids() { # comments-json author
         | . as $m
         | ($m.body | capture("\\A<!-- mergepath-codex-failover:v1 head=(?<head>[0-9a-f]{40}|[0-9a-f]{64}) trigger_comment_id=(?<trigger>[1-9][0-9]*) -->\\z"))
         | .head as $head
+        | select($heads | index($head) != null)
         | (.trigger | tonumber) as $tid
         | ([ $triggers[] | select(.id == $tid) ] | first) as $t
         | select($t != null and ($t.created_at | type) == "string")
@@ -125,10 +190,11 @@ crqe_failover_trigger_ids() { # comments-json author
 }
 
 # The requests that spend the ceiling: the generation less exempt failovers.
-crqe_count_triggers() { # comments-json author
+# Without <heads-json> nothing is exempt.
+crqe_count_triggers() { # comments-json author [heads-json]
   local generation exempt
   generation=$(crqe_trigger_generation "$1" "$2") || return 1
-  exempt=$(crqe_failover_trigger_ids "$1" "$2") || return 1
+  exempt=$(crqe_failover_trigger_ids "$1" "$2" "${3:-[]}") || return 1
   jq -ner --argjson g "$generation" --argjson x "$exempt" '[ $g[] | select(. as $i | $x | index($i) | not) ] | length'
 }
 
@@ -350,7 +416,7 @@ crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
 # codex-review-check.sh (gate diagnostics) and codex-review-request.sh (#1550
 # resume check).
 crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
-  echo "${1:-[]}" | jq -c \
+  printf '%s\n' "${1:-[]}" | jq -c \
     --arg bot "${2:-}" --arg sha "${3:-}" '
     ($sha | ascii_downcase) as $head
     | [ .[]

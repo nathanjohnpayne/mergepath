@@ -65,9 +65,9 @@
 #      gh api user failed, etc.), or --expect-write-identity could not
 #      establish that the token is user-held — fail closed
 #
-# All diagnostics go to stderr; no stdout output. The script is silent
-# on success so it can be dropped at the top of any helper without
-# noise.
+# All diagnostics go to stderr; no stdout output. Ordinary success is
+# silent; an unidentifiable-token opt-in or empty legacy-header capture
+# retains its diagnostic.
 #
 # IDENTITY: keyring vs PAT
 #
@@ -241,6 +241,9 @@ if [ "$MODE" = "write" ]; then
     CLASS_HEADERS="$(mktemp "${TMPDIR:-/tmp}/identity-check-headers.XXXXXX")"
     trap 'rm -f "$CLASS_HEADERS"' EXIT
     gh api -i user --hostname github.com 2>/dev/null | tr -d '\r' | sed '/^$/q' >"$CLASS_HEADERS" || true
+    if [ ! -s "$CLASS_HEADERS" ]; then
+      echo "identity-check: WARNING legacy token response headers are empty; credential classification is unavailable." >&2
+    fi
   fi
   WRITE_CLASS="$(credential_class "$GH_TOKEN" "$CLASS_HEADERS")"
   case "$WRITE_CLASS" in

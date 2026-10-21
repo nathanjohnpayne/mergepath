@@ -89,6 +89,18 @@ if [ "${1:-}" = "--exec-step" ]; then
   start=$(date +%s)
   rc=0
   (
+    # Each check starts from the environment a CI job gives it (#2575),
+    # whatever path invoked this worker. Git exports its hook-local
+    # repository variables to a pre-push hook (GIT_DIR=<primary>/.git/
+    # worktrees/<name> from a linked worktree); a fixture `git init` or
+    # `git config` under them writes into the real repository instead, the
+    # #777 identity leak and a shared `core.bare = true` (#2578). The literal
+    # names cover a git that cannot list them.
+    # shellcheck disable=SC2046
+    unset $(git rev-parse --local-env-vars 2>/dev/null) 2>/dev/null || true
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_IMPLICIT_WORK_TREE \
+      GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT 2>/dev/null || true
     cd "$(cat "$run_dir/root")"
     if [ -s "$run_dir/steps/$id.env" ]; then
       while IFS= read -r kv; do
@@ -436,11 +448,11 @@ PY_SHIM=''
 PY_OK=0
 # An explicit MERGEPATH_PREPUSH_PYTHON is the only candidate when set.
 if [ -n "${MERGEPATH_PREPUSH_PYTHON:-}" ]; then
-  PY_CANDIDATES="$MERGEPATH_PREPUSH_PYTHON"
+  PY_CANDIDATES=("$MERGEPATH_PREPUSH_PYTHON")
 else
-  PY_CANDIDATES='python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3'
+  PY_CANDIDATES=(python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3)
 fi
-for cand in $PY_CANDIDATES; do
+for cand in "${PY_CANDIDATES[@]}"; do
   if command -v "$cand" >/dev/null 2>&1 && "$cand" -I -c "$PY_PROBE" "$CI_PY_PINS" "$DEEP" >/dev/null 2>&1; then
     PY_SHIM=$(command -v "$cand")
     PY_OK=1
@@ -467,7 +479,13 @@ printf '%s\n' "$ROOT" > "$RUN_DIR/root"
 printf '%s\n' "$NICE" > "$RUN_DIR/nice"
 if [ -n "$PY_SHIM" ]; then
   mkdir -p "$RUN_DIR/bin"
-  ln -s "$PY_SHIM" "$RUN_DIR/bin/python3"
+  # Preserve the selected executable path: invoking a venv Python through an
+  # external symlink can lose pyvenv.cfg and its verified site-packages.
+  # Nested fixtures may deliberately omit bash from PATH. Keep this launcher
+  # self-contained and quote the interpreter for POSIX sh, including apostrophes.
+  PY_SHIM_QUOTED="'${PY_SHIM//\'/\'\\\'\'}'"
+  printf '#!/bin/sh\nexec %s "$@"\n' "$PY_SHIM_QUOTED" > "$RUN_DIR/bin/python3"
+  chmod +x "$RUN_DIR/bin/python3"
   PATH="$RUN_DIR/bin:$PATH"; export PATH
 fi
 
@@ -493,7 +511,27 @@ while IFS= read -r step; do
   printf '%s\t%s\n' "$prev" "$sid" >> "$RUN_DIR/order"
 done < <(printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))")
 
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
+# Host load next to the concurrency cap (#2575): a run that takes an hour on
+# a machine already running several hooks at once is the machine, not the
+# change, and the log should say so. Best effort: unknown is printed as such.
+host_load() {
+  local l=''
+  if [ -r /proc/loadavg ]; then
+    l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null) || l=''
+  else
+    l=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print $2 }') || l=''
+  fi
+  case "$l" in ''|*[!0-9.]*) l=unknown ;; esac
+  printf '%s' "$l"
+}
+host_cpus() {
+  local n
+  n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || n=''
+  case "$n" in ''|*[!0-9]*) n='?' ;; esac
+  printf '%s' "$n"
+}
+LOAD_START=$(host_load)
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $(host_cpus) CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")"
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
 fi
@@ -530,8 +568,9 @@ if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
 fi
 
 mins=$((ELAPSED / 60)); secs=$((ELAPSED % 60))
+LOAD_NOTE="host load $LOAD_START at start, $(host_load) at end"
 if [ "$failed" -eq 0 ]; then
-  echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s). CI lint still runs and remains authoritative."
+  echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s; $LOAD_NOTE). CI lint still runs and remains authoritative."
   if [ "${MERGEPATH_PREPUSH_KEEP_LOGS:-0}" = "1" ]; then
     echo "$PREFIX: logs kept in $RUN_DIR"
   else
@@ -550,6 +589,6 @@ for f in "$RUN_DIR"/results/*; do
   tail -n 30 "$RUN_DIR/logs/$sid.log" >&2
   echo "" >&2
 done
-echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s); the push is blocked. Logs: $RUN_DIR" >&2
+echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s; $LOAD_NOTE); the push is blocked. Logs: $RUN_DIR" >&2
 echo "$PREFIX: fix and push again. Bypass only in an emergency: git push --no-verify, or MERGEPATH_PREPUSH_SKIP=1 git push (CI lint still gates the merge)." >&2
 exit 1

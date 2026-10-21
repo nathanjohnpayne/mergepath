@@ -55,7 +55,10 @@
 #         (the branch moved under the caller), or gh_api_array is not
 #         defined. Same rc-3 "unreadable" status as gh-api-array.sh /
 #         gh-api-scalar.sh; each caller maps it to its own failure action.
-#         DEPENDABOT_PROVENANCE_REASON carries the diagnostic.
+#         DEPENDABOT_PROVENANCE_REASON carries the diagnostic: on a failed
+#         read it is gh_api_array's own message (`failed to fetch PR
+#         commits: <gh stderr>`, or its flatten / shape diagnostic), so the
+#         caller's log names the cause (#2554).
 #
 # rc 1 and rc 3 are deliberately distinct: rc 1 is a positive verdict ("this
 # PR is not Dependabot-only") that a caller can act on safely by withholding
@@ -89,8 +92,31 @@ dependabot_commit_provenance() {
     return 3
   fi
 
-  if ! commits=$(gh_api_array "repos/$repo/pulls/$pr/commits?per_page=100" "PR commits"); then
-    DEPENDABOT_PROVENANCE_REASON="${GH_API_ARRAY_ERROR:-failed to read PR commits}"
+  # gh_api_array hands its diagnostic back in globals, and a command
+  # substitution runs it in a subshell where those assignments die, so
+  # `commits=$(gh_api_array …)` reported every failed read as the generic
+  # fallback (#2554). Call it in THIS shell and pass the array through a
+  # scratch file, as codex-review-request.sh does. Without a scratch file the
+  # read still decides the verdict — temporary storage costs the diagnostic,
+  # never the verdict (gh-api-array.sh, "Reconciled drift" note 2) — and the
+  # reason then says why the cause is missing rather than inventing one.
+  local endpoint="repos/$repo/pulls/$pr/commits?per_page=100"
+  local commits_tmp=""
+  commits_tmp=$(mktemp "${TMPDIR:-/tmp}/dependabot-provenance-commits.XXXXXX" 2>/dev/null) || commits_tmp=""
+  if [ -n "$commits_tmp" ]; then
+    if ! gh_api_array "$endpoint" "PR commits" >"$commits_tmp"; then
+      rm -f "$commits_tmp"
+      DEPENDABOT_PROVENANCE_REASON="${GH_API_ARRAY_ERROR:-failed to read PR commits}"
+      return 3
+    fi
+    commits=$(cat "$commits_tmp") || {
+      rm -f "$commits_tmp"
+      DEPENDABOT_PROVENANCE_REASON="could not read back the PR commits scratch file"
+      return 3
+    }
+    rm -f "$commits_tmp"
+  elif ! commits=$(gh_api_array "$endpoint" "PR commits"); then
+    DEPENDABOT_PROVENANCE_REASON="failed to read PR commits (reason not captured: mktemp unavailable)"
     return 3
   fi
 

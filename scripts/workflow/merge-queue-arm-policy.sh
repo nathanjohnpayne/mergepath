@@ -139,11 +139,33 @@ read_arm_snapshot() {
       author:$pr.author.login,auto_merge:$pr.autoMergeRequest
     }
   ') || return 1
-  labels=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" \
-    "PR labels") || {
-      echo "$GH_API_ARRAY_ERROR" >&2
+  # Called in this shell, not in $( ), so GH_API_ARRAY_ERROR survives to name
+  # the cause (#2554): a command substitution runs gh_api_array in a subshell
+  # where its diagnostic globals die, and the echo below printed a blank line.
+  # The array goes through a scratch file; without one the read still
+  # decides, and the message says why the cause is missing.
+  local labels_tmp=""
+  labels_tmp=$(mktemp "${TMPDIR:-/tmp}/merge-queue-arm-labels.XXXXXX" 2>/dev/null) || labels_tmp=""
+  if [ -n "$labels_tmp" ]; then
+    gh_api_array "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" \
+      "PR labels" >"$labels_tmp" || {
+        rm -f "$labels_tmp"
+        echo "$GH_API_ARRAY_ERROR" >&2
+        return 1
+      }
+    labels=$(cat "$labels_tmp") || {
+      rm -f "$labels_tmp"
+      echo "could not read back the PR labels scratch file" >&2
       return 1
     }
+    rm -f "$labels_tmp"
+  else
+    labels=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" \
+      "PR labels") || {
+        echo "failed to fetch PR labels (reason not captured: mktemp unavailable)" >&2
+        return 1
+      }
+  fi
   jq -cn --argjson pr "$pr" --argjson labels "$labels" \
     '$pr + {labels:([$labels[].name] | sort)}'
 }

@@ -100,6 +100,10 @@ resolve_current_repo() {
     echo "post-phase-4b-handoff.sh: a bare <num> ref was passed but the current dir is not a gh-resolvable repo" >&2
     exit 3
   fi
+  if [[ -z "$CURRENT_REPO" ]]; then
+    echo "post-phase-4b-handoff.sh: gh repo view returned an empty repository for a bare <num> ref" >&2
+    exit 3
+  fi
 }
 
 # Parse one ref into "<owner>/<repo>\t<num>" lines (tab-separated).
@@ -119,8 +123,21 @@ parse_ref() {
 # Build a tab-separated table of (repo, num) pairs.
 REFS_TSV=""
 for raw in "$@"; do
-  REFS_TSV+="$(parse_ref "$raw")"$'\n'
+  parsed_ref=$(parse_ref "$raw")
+  # Separate records without a trailing empty row; here-strings supply the
+  # final structural newline for both consumers below.
+  [[ -z "$REFS_TSV" ]] || REFS_TSV+=$'\n'
+  REFS_TSV+="$parsed_ref"
 done
+
+# Validate the complete table before any accounting or metadata reads, even
+# if malformed resolver output introduced an additional incomplete record.
+while IFS=$'\t' read -r parsed_repo parsed_pr; do
+  if [[ -z "$parsed_repo" || -z "$parsed_pr" ]]; then
+    echo "post-phase-4b-handoff.sh: invalid parsed pr-ref: repository and PR number are required" >&2
+    exit 3
+  fi
+done <<<"$REFS_TSV"
 
 # A manual handoff is a real reviewer dispatch. Reconcile every prior finding
 # before rendering the artifact that starts that round, just as the automated
@@ -132,7 +149,6 @@ command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
 }
 ACCOUNTING_TSV=""
 while IFS=$'\t' read -r accounting_repo accounting_pr; do
-  [[ -n "$accounting_repo" && -n "$accounting_pr" ]] || continue
   accounting_json=""
   accounting_rc=0
   accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$accounting_pr" "$accounting_repo") \
@@ -390,7 +406,6 @@ EOF
 # head_short, base_short, content_note, unresolved.
 ROWS_TSV=""
 while IFS=$'\t' read -r repo num; do
-  [[ -n "$repo" && -n "$num" ]] || continue
   meta=$(fetch_pr_metadata "$repo" "$num")
   IFS=$'\t' read -r head_sha head_short base_sha base_short head_ref commits unresolved url reviewer <<<"$meta"
   content=$(classify_content "$head_ref" "$commits")

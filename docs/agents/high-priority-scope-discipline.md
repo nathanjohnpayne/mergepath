@@ -26,6 +26,8 @@ Before opening a PR, write a short implementation contract containing:
 
 An agent can explain and freeze a coherent but unnecessary contract — #1189 did, in its first commit header, and was never asked whether that was the contract to buy. Explanation is not ratification, and a contract the author wrote and the author approved is not a control on the author. Ratification costs one exchange at PR open. Once ratified, review may identify defects in satisfying the contract; it may not silently enlarge it, and neither may the author.
 
+The contract also needs exactly one implementer. Before writing it, read the issue's newest comments and any open pull request that links the issue, and leave the one-line claim that `docs/agents/shared-operating-rules.md` § Link the issue a pull request resolves describes; two sessions carried #2534 to two pull requests on the same day, each unaware of the other until a merge conflict (#2562), and the author wrapper now refuses the second pull request, but only once the first exists.
+
 ## 2. Classify every review finding before changing code
 
 Every automated-review finding receives exactly one disposition.
