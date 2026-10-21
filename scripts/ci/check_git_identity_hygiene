@@ -1750,9 +1750,23 @@ scan_unscoped_identity_writes() {
       if (quote != "" || i > length(w) + 1) return ""
       value = dequote_word(w); literal_valid = 1; return value
     }
+    # Normalize only already-proven literal path bytes. Keep parent segments
+    # opaque and reject directory-only suffixes; no filesystem lookup occurs.
+    function normalized_config_path(value,   parts, n, i, result) {
+      if (value ~ /\/$/ || value ~ /\/\.$/) return ""
+      result = (substr(value, 1, 1) == "/" ? "/" : "")
+      n = split(value, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (result != "" && result != "/") result = result "/"
+        result = result parts[i]
+      }
+      return result
+    }
     function repo_config_value(value) {
-      return (value == ".git/config" || value == "./.git/config" || value == root ".git/config" ||
-              value == ".git/config.worktree" || value == "./.git/config.worktree" || value == root ".git/config.worktree")
+      value = normalized_config_path(value)
+      return (value == ".git/config" || value == normalized_config_path(root ".git/config") ||
+              value == ".git/config.worktree" || value == normalized_config_path(root ".git/config.worktree"))
     }
     function repo_config_path(word,   value) {
       value = literal_word(word)

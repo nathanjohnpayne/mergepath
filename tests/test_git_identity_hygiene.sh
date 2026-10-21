@@ -4109,7 +4109,8 @@ if [ "$RC" = 0 ]; then pass "backslash inside span cannot escape its equal-width
 fi
 for SCOPE in GLOBAL SYSTEM; do
   FLAG="$(printf '%s' "$SCOPE" | tr '[:upper:]' '[:lower:]')"
-  for TARGET in .git/config ./.git/config .git/config.worktree '".git/config"' "'$ROOT/.git/config'"; do
+  for TARGET in .git/config ./.git/config .git/config.worktree '".git/config"' "'$ROOT/.git/config'" \
+      .git/./config .//.git//config.worktree '"././.git/./config"'; do
     for REL in tests/scope-file-override.sh docs/scope-file-override.md; do
       run_on_fixture "$REL" "GIT_CONFIG_$SCOPE=$TARGET git config --$FLAG user.email fixture@example.invalid
 "
@@ -4138,18 +4139,26 @@ done
 for OPTIONS in \
   '--file .git/config' '--file=./.git/config' '-f.git/config' '-f .git/config' \
   '--file ".git/config"' '"--file=.git/config"' '--fil=.git/config' \
-  '--file .git/config.worktree' '-f./.git/config.worktree'; do
+  '--file .git/config.worktree' '-f./.git/config.worktree' \
+  '--file=.git/./config' '--file .//.git//config.worktree' \
+  '-f././.git/./config' '"--fil=.git//./config.worktree"'; do
   run_on_fixture tests/literal-config-file.sh "git config $OPTIONS user.email fixture@example.invalid
 "
   if [ "$RC" = 1 ]; then pass "literal repo config file operand is not a scope exemption"; else
     fail "literal file operand escaped: options='$OPTIONS' rc=$RC out=$OUT"
   fi
 done
+# shellcheck disable=SC2016 # Runtime syntax is inert source for the scanner.
 for SOURCE in \
   'git config --file fixture/config user.email fixture@example.invalid' \
   'git config -ffixture/config user.email fixture@example.invalid' \
   'git config -f=.git/config user.email fixture@example.invalid' \
   'git config --file "$FIX/.git/config" user.email fixture@example.invalid' \
+  'git config --file "$FIX/.git/./config" user.email fixture@example.invalid' \
+  'git config --file fixture//./config user.email fixture@example.invalid' \
+  'git config --file .git/../.git/config user.email fixture@example.invalid' \
+  'git config --file .git/config/ user.email fixture@example.invalid' \
+  'git config --file .git/config/. user.email fixture@example.invalid' \
   'git -C fixture config --file .git/config user.email fixture@example.invalid' \
   'git config --file .git/config --get user.email fixture@example.invalid'; do
   run_on_fixture tests/literal-config-file-control.sh "$SOURCE
@@ -4168,7 +4177,7 @@ cp "$CHECK" "$LITERAL_CONSUMER/scripts/ci/check_git_identity_hygiene"
 cp "$ROOT/tests/test_git_identity_hygiene.sh" "$LITERAL_CONSUMER/tests/"
 cp "$LITERAL_CONSUMER/.git/config" "$WORKDIR/literal-config-before"
 LITERAL_PHYSICAL_ROOT="$(cd "$LITERAL_CONSUMER" && pwd -P)"
-for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-file absolute-worktree-file absolute-override runtime-glob literal-glob; do
+for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-file absolute-worktree-file absolute-override normalized-file normalized-absolute-file normalized-absolute-override runtime-glob literal-glob; do
   REL=REVIEW_POLICY.md; EXPECTED=1
   case "$CONTROL" in
     prose) SOURCE='**git config user.email fixture@example.invalid**' ;;
@@ -4186,6 +4195,9 @@ for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-
     override-global) SOURCE='GIT_CONFIG_GLOBAL=.git/config git config --global user.email fixture@example.invalid' ;;
     override-system) REL=literal.sh; SOURCE='GIT_CONFIG_SYSTEM=.git/config git config --system user.email fixture@example.invalid' ;;
     absolute-override) REL=literal.sh; SOURCE="GIT_CONFIG_GLOBAL='$LITERAL_PHYSICAL_ROOT/.git/config' git config --global user.email fixture@example.invalid" ;;
+    normalized-file) SOURCE='git config --file=.git/./config user.email fixture@example.invalid' ;;
+    normalized-absolute-file) REL=literal.sh; SOURCE="git config --file='$LITERAL_PHYSICAL_ROOT//.git/./config.worktree' user.email fixture@example.invalid" ;;
+    normalized-absolute-override) REL=literal.sh; SOURCE="GIT_CONFIG_SYSTEM='$LITERAL_PHYSICAL_ROOT/./.git//config' git config --system user.email fixture@example.invalid" ;;
     runtime-glob) REL=literal.sh; SOURCE="*/bash -c 'git config user.email fixture@example.invalid'"; EXPECTED=0 ;;
     literal-glob) REL=literal.sh; SOURCE="'*/bash' -c 'git config user.email fixture@example.invalid'" ;;
     quoted-data) REL=literal.sh; SOURCE="printf '%s' 'git config user.email fixture@example.invalid'"; EXPECTED=0 ;;
