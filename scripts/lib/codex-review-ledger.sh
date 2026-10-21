@@ -103,6 +103,9 @@ crl_ledger() {
               # inline findings carry a path; body findings and inline findings
               # without one cannot be located.
               blocking_paths: ([ .root_findings[] | select(blocking_tier(.tier)) | .path | select(type == "string") ] | unique),
+              # The blocking inline findings themselves, for the fixed-finding
+              # rule a runaway reads (#2534).
+              blocking_findings: ([ .root_findings[] | select(blocking_tier(.tier)) | {id: .comment_id, path: (.path // null)} ]),
               blocking_unlocated: ((.body_tiers | any(. as $x | blocking_tier($x)))
                                    or any(.root_findings[]; blocking_tier(.tier) and ((.path | type) != "string"))) } ]
         + [ $in.verdicts[]
@@ -169,6 +172,7 @@ crl_ledger() {
               first_at: ([$grp.sigs[].t] | min),
               last_at: ([$grp.sigs[].t] | max),
               blocking_paths: ([ $grp.sigs[] | select(.kind == "review") | .blocking_paths[] ] | unique),
+              blocking_findings: ([ $grp.sigs[] | select(.kind == "review") | .blocking_findings[] ] | unique_by(.id)),
               blocking_unlocated: ($c.class == "unknown_tier" or $c.conflicting
                                    or any($grp.sigs[]; .kind == "review" and .blocking_unlocated)),
               signals: [$grp.sigs[].sid],
@@ -275,6 +279,9 @@ crl_ledger() {
       responses: $responses,
       thread_reply_reviews: [ $wrappers[] | {id, submitted_at, commit_id, reply_markers} ],
       rebuttals: ($in.rebuttals // [] | sort_by(.at, (.finding | tostring))),
+      # Inline findings with a plain fix disposition (#2534); the CLI adds
+      # head_changes once the response heads are known.
+      fixes: ($in.fixes // [] | unique),
       current_summary: $in.summary,
       limits: [
         "a request comment names no commit; request heads are never inferred",
@@ -325,6 +332,59 @@ __CRL_VALID='type == "object" and (.responses | type) == "array"
                         and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
                                              "unknown_tier", "provider_blocked"] | index($c)) != null)'
 
+# A blocking response whose every blocking finding was FIXED does not count as
+# a runaway window (#2534): finding a real defect in each round and fixing it
+# is the review working, not a loop. A finding is fixed only when all three
+# hold, so no single act by the author can claim it:
+#   disposition  it is in .fixes: a non-bot thumbs-up on its root
+#                (codex-record-feedback.sh's fixed verdict), no thumbs-down, no
+#                [mergepath-resolve: <class>] tag in its thread other than the
+#                fix class addressed-elsewhere, not rebutted;
+#   a commit     a later head that descends from the reviewed one changed the
+#                finding's file (.head_changes: the compare of the two heads,
+#                status "ahead", lists the path);
+#   a re-read    Codex reviewed that later head, in a graded response the
+#                ledger attributes to a counted request posted after this one,
+#                and no later Codex response has a blocking finding on the same
+#                path or one it cannot locate.
+# A response with an unlocated, unknown-tier or conflicting blocking finding is
+# never fixed. Missing fixes or head_changes read as nothing fixed. The rule
+# never touches the blocking-review budget.
+__CRL_FIXED_DEF='def crl_same_head($a; $b):
+    ($a | ascii_downcase) as $x | ($b | ascii_downcase) as $y
+    | ($x | startswith($y)) or ($y | startswith($x));
+  # Whole seconds, so a fractional timestamp cannot sort a same-second
+  # request after the response it preceded; unreadable is null.
+  def crl_second: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
+  def crl_fixed_rids:
+    . as $l
+    | ($l.fixes // []) as $fixes
+    | ($l.head_changes // []) as $changes
+    | [ ($l.rebuttals // [])[] | .finding ] as $rebutted
+    | $l.responses as $rs
+    | $l.requests as $reqs
+    | [ $rs[] | . as $r
+        | select($r.class == "blocking" and ($r.conflicting | not) and ($r.blocking_unlocated | not)
+                 and ($r.anchor | type) == "string" and (($r.blocking_findings // []) | length) > 0)
+        | (($r.last_at // $r.first_at) | crl_second) as $done
+        | select($done != null)
+        | ([ $reqs[] | select(.counted == true and .outcome == "attributed"
+                              and ((.created_at | crl_second) as $t | $t != null and $t > $done)) | .responses[] ]) as $proven
+        | ([ $rs[] | select(.window > $r.window and (.rid as $id | $proven | index($id)) != null
+                            and (.anchor | type) == "string" and (crl_same_head(.anchor; $r.anchor) | not)
+                            and (.conflicting | not)
+                            and (.class as $c | ["blocking", "discretionary", "no_findings", "clean"] | index($c)) != null) ]) as $looks
+        | ([ $rs[] | select(.window > $r.window and (.class == "blocking" or .class == "unknown_tier" or .conflicting)) ]) as $later
+        | select(all($r.blocking_findings[]; . as $f
+            | ($f.path | type) == "string"
+              and ($fixes | index($f.id)) != null
+              and ($rebutted | index($f.id)) == null
+              and any($looks[]; . as $p
+                    | any($changes[]; .base == $r.anchor and .head == $p.anchor and .status == "ahead"
+                                     and ((.files | index($f.path)) != null)))
+              and all($later[]; (.blocking_unlocated | not) and ((.blocking_paths | index($f.path)) == null))))
+        | $r.rid ];'
+
 # crl_blocking_count <ledger-json> <head> <author>
 # Prints the count. Returns nonzero when the ledger is malformed or names
 # another head or author.
@@ -341,9 +401,10 @@ crl_blocking_count() {
 # The human-stop conditions the Phase 4b barrier re-evaluates before it lets a
 # spent request ceiling dispatch the automated adapter (#1560 slice 3, S3-4):
 #   blocking-budget    the counted responses reach the budget;
-#   runaway            the request windows with a counted response reach the
-#                      request ceiling before the budget: every request the
-#                      ceiling allowed drew a
+#   runaway            the request windows with a counted response, other
+#                      than a fully fixed one (crl_fixed_rids, #2534), reach
+#                      the request ceiling before the budget: every request
+#                      the ceiling allowed drew a
 #                      blocking review, so a ceiling below the budget (for
 #                      example max_review_rounds 2 against the default budget
 #                      of 10) never reads as cost exhaustion (#1560 canary);
@@ -359,7 +420,7 @@ crl_blocking_count() {
 # a policy snapshot with the same max_blocking_reviews.
 crl_human_stops() {
   printf '%s\n' "$1" | jq -sec --arg head "$2" --arg author "$3" --argjson max "$4" \
-    --argjson ceiling "${5:-null}" "
+    --argjson ceiling "${5:-null}" "$__CRL_FIXED_DEF
     if length != 1 then error(\"documents\") else .[0] end
     | if (($__CRL_VALID) and .head_sha == \$head and .author == \$author
         and .max_blocking_reviews == \$max
@@ -376,8 +437,17 @@ crl_human_stops() {
                               and (.blocking_paths | type) == \"array\"
                               and (.blocking_unlocated | type) == \"boolean\")
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
-                              and ((.path | type) == \"string\" or .path == null))) | not
+                              and ((.path | type) == \"string\" or .path == null))
+        # The fixed-finding evidence is optional (older ledgers read as
+        # nothing fixed), but present and malformed fails.
+        and (.fixes == null or ((.fixes | type) == \"array\" and all(.fixes[]; type == \"number\")))
+        and (.head_changes == null or ((.head_changes | type) == \"array\"
+             and all(.head_changes[]; (.base | type) == \"string\" and (.head | type) == \"string\"
+                                      and (.status | type) == \"string\" and (.files | type) == \"array\")))
+        and all(.responses[]; .blocking_findings == null or ((.blocking_findings | type) == \"array\"
+             and all(.blocking_findings[]; (.id | type) == \"number\" and ((.path | type) == \"string\" or .path == null))))) | not
     then error(\"ledger\") else . end
+    | crl_fixed_rids as \$fixed
     | .responses as \$rs
     | .requests as \$reqs
     | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
@@ -386,7 +456,8 @@ crl_human_stops() {
     # Only windows opened by COUNTED (configured-author) requests, which is
     # what the ceiling counts; a foreign mention opens a window too (#1584).
     # A failover request is the author's but spends no ceiling (#2534).
-    | ([ \$rs[] | select($__CRL_COUNTS) | .window
+    # A fully fixed response is no runaway window (#2534).
+    | ([ \$rs[] | select($__CRL_COUNTS) | select(.rid as \$id | \$fixed | index(\$id) | not) | .window
          | select(. > 0 and (\$reqs[. - 1].counted == true) and (\$reqs[. - 1].ceiling_exempt != true)) ]
        | unique | length) as \$nw
     # A runaway needs EVERY counted request to have drawn a blocking review,
@@ -423,6 +494,7 @@ crl_human_stops() {
         disagreements: [ \$disputes[] | select(.kind == \"disagreement\") | del(.kind) ] }
     | .request_ceiling = \$ceiling
     | .blocking_windows = \$nw
+    | .fixed_responses = \$fixed
     | .counted_requests = \$nr
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
                    (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr >= \$ceiling and \$nw >= \$nr then \"runaway\" else empty end),

@@ -404,9 +404,10 @@ EOF
 test_scan_is_head_pinned_to_latest_round() {
   local dir rc
   dir=$(make_case "scan-head-pinned")
-  # gh stub modeling: HEAD=head-sha; a STALE review (old, not HEAD) carries a
-  # P1 finding, and the CURRENT-HEAD latest review (id 200) carries 1301. The
-  # scan must pick up ONLY 1301 (latest round on HEAD), never the stale one.
+  # gh stub modeling: HEAD=head-sha; a STALE review (old, not HEAD) carries
+  # 1300 (named by --verdict) and 1302 (unnamed); the CURRENT-HEAD latest
+  # review (id 200) carries 1301. The scan collects ONLY 1301: the unnamed
+  # stale 1302 never surfaces, the named stale 1300 is fetched by id (#2565).
   cat >"$dir/bin/gh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -421,7 +422,9 @@ case "\$ep" in
   repos/owner/repo/pulls/999/reviews)
     printf '[{"id":100,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-01T00:00:00Z","commit_id":"old-sha"},{"id":200,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-02T00:00:00Z","commit_id":"head-sha"}]\n' "\$bot" "\$bot" ;;
   repos/owner/repo/pulls/999/comments)
-    printf '[{"id":1300,"user":{"login":"%s"},"pull_request_review_id":100,"path":"old","line":1,"body":"STALE P1. $SOLICIT"},{"id":1301,"user":{"login":"%s"},"pull_request_review_id":200,"path":"new","line":2,"body":"![P1 Badge] current. $SOLICIT"}]\n' "\$bot" "\$bot" ;;
+    printf '[{"id":1300,"user":{"login":"%s"},"pull_request_review_id":100,"path":"old","line":1,"body":"STALE P1. $SOLICIT"},{"id":1301,"user":{"login":"%s"},"pull_request_review_id":200,"path":"new","line":2,"body":"![P1 Badge] current. $SOLICIT"},{"id":1302,"user":{"login":"%s"},"pull_request_review_id":100,"path":"old2","line":3,"body":"![P2 Badge] unnamed stale. $SOLICIT"}]\n' "\$bot" "\$bot" "\$bot" ;;
+  repos/owner/repo/pulls/comments/1300)
+    printf '{"id":1300,"user":{"login":"%s"},"pull_request_url":"https://api.github.com/repos/owner/repo/pulls/999","pull_request_review_id":100,"commit_id":"old-sha","path":"old","line":null,"original_line":1,"body":"![P1 Badge] STALE P1. $SOLICIT"}\n' "\$bot" ;;
   repos/owner/repo/pulls/comments/*/reactions) printf '[]\n' ;;
   *) echo "unexpected gh api endpoint: \$ep" >&2; exit 9 ;;
 esac
@@ -431,14 +434,70 @@ EOF
 
   if [ "$rc" != "0" ]; then
     fail "scan head-pinned: exit $rc; stderr=$(cat "$dir/err.log")"
-  elif grep -q 'comments/1300/reactions' "$(posts_file "$dir")" 2>/dev/null; then
-    fail "scan head-pinned: reacted on the STALE (non-HEAD) finding 1300"
   elif ! grep -q 'comments/1301/reactions' "$(posts_file "$dir")" 2>/dev/null; then
     fail "scan head-pinned: did not react on the current-HEAD finding 1301; posts=$(cat "$(posts_file "$dir")" 2>/dev/null)"
-  elif [ "$(jq -r '[.skipped[] | select(.comment_id==1300 and .why=="not-found")] | length' "$dir/out.json")" != "1" ]; then
-    fail "scan head-pinned: verdict for stale 1300 should be reported not-found"
+  elif grep -q 'comments/1302/reactions' "$(posts_file "$dir")" 2>/dev/null \
+    || [ "$(jq -r '[.skipped[] | select(.comment_id==1302)] | length' "$dir/out.json")" != "0" ]; then
+    fail "scan head-pinned: the unnamed stale finding 1302 surfaced; out=$(cat "$dir/out.json")"
+  elif ! grep -q 'gh api -X POST repos/owner/repo/pulls/comments/1300/reactions -f content=+1' "$(posts_file "$dir")" 2>/dev/null; then
+    fail "scan head-pinned: named stale 1300 not fetched by id and reacted on (#2565); posts=$(cat "$(posts_file "$dir")" 2>/dev/null) stderr=$(cat "$dir/err.log")"
+  elif [ "$(jq -r '[.recorded[] | select(.comment_id==1300 and .priority=="P1" and .location=="pull_request_review_comment" and .action=="posted")] | length' "$dir/out.json")" != "1" ]; then
+    fail "scan head-pinned: named stale 1300 not recorded with its badge and location; out=$(cat "$dir/out.json")"
+  elif [ "$(jq -r '[.skipped[] | select(.why=="not-found")] | length' "$dir/out.json")" != "0" ]; then
+    fail "scan head-pinned: a named finding on this PR was reported not-found; out=$(cat "$dir/out.json")"
   else
-    pass "scan picks up only the current-HEAD latest-round finding (HEAD-pinned)"
+    pass "scan picks up only the current-HEAD latest-round finding; a named earlier-round finding is fetched by id (#2565)"
+  fi
+}
+
+test_scan_named_offhead_rejections() {
+  # #2565 boundary: another PR's comment, a non-bot comment and a 404 stay
+  # not-found with no reaction; a failed direct read exits 3 and posts nothing.
+  local dir rc
+  dir=$(make_case "scan-named-rejections")
+  cat >"$dir/bin/gh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+[ "\${1:-}" = "api" ] || { echo "unexpected gh: \$*" >&2; exit 9; }
+shift
+[ "\${1:-}" = "--paginate" ] && shift
+ep=\${1:-}
+bot='chatgpt-codex-connector[bot]'
+case "\$ep" in
+  repos/owner/repo/pulls/999) printf '{"head":{"sha":"head-sha"}}\n' ;;
+  repos/owner/repo/pulls/999/reviews) printf '[]\n' ;;
+  repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
+  repos/owner/repo/pulls/comments/1310)
+    printf '{"id":1310,"user":{"login":"%s"},"pull_request_url":"https://api.github.com/repos/owner/repo/pulls/998","path":"a","line":1,"body":"![P1 Badge] other PR. $SOLICIT"}\n' "\$bot" ;;
+  repos/owner/repo/pulls/comments/1311)
+    printf '{"id":1311,"user":{"login":"somebody-else"},"pull_request_url":"https://api.github.com/repos/owner/repo/pulls/999","path":"b","line":1,"body":"![P1 Badge] human. $SOLICIT"}\n' ;;
+  repos/owner/repo/pulls/comments/1399)
+    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  repos/owner/repo/pulls/comments/1300)
+    echo "error connecting to api.github.com" >&2; exit 1 ;;
+  repos/owner/repo/pulls/comments/*/reactions) printf '[]\n' ;;
+  *) echo "unexpected gh api endpoint: \$ep" >&2; exit 9 ;;
+esac
+EOF
+  chmod +x "$dir/bin/gh"
+  rc=$(run_case "$dir" -- 999 owner/repo --scan --verdict 1310=fixed --verdict 1311=fixed --verdict 1399=fixed)
+  if [ "$rc" != "0" ]; then
+    fail "named rejections: exit $rc; stderr=$(cat "$dir/err.log")"
+  elif [ -s "$(posts_file "$dir")" ]; then
+    fail "named rejections: a rejected id was reacted on; posts=$(cat "$(posts_file "$dir")")"
+  elif [ "$(jq -r '[.skipped[] | select(.why=="not-found") | .comment_id] | sort' "$dir/out.json" | jq -c .)" != "[1310,1311,1399]" ]; then
+    fail "named rejections: expected 1310, 1311 and 1399 not-found; out=$(cat "$dir/out.json")"
+  else
+    pass "a named id on another PR, by a non-bot author, or missing stays not-found with no reaction (#2565)"
+  fi
+
+  rc=$(run_case "$dir" -- 999 owner/repo --scan --verdict 1300=fixed)
+  if [ "$rc" != "3" ]; then
+    fail "named transport failure: exit $rc, expected 3; stderr=$(cat "$dir/err.log")"
+  elif [ -s "$(posts_file "$dir")" ]; then
+    fail "named transport failure: reacted despite the failed read"
+  else
+    pass "a failed direct read of a named finding exits 3 and posts nothing (#2565)"
   fi
 }
 
@@ -695,6 +754,7 @@ test_idempotent_existing_reviewer_reaction
 test_dry_run_posts_nothing
 test_unrecognized_verdict_fails_before_any_post
 test_scan_is_head_pinned_to_latest_round
+test_scan_named_offhead_rejections
 test_issue_comment_endpoint_selected_by_location
 test_findings_from_stdin
 test_post_failure_exits_1_and_skips_ledger

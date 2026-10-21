@@ -223,6 +223,10 @@ case "$endpoint" in
     esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
+  # #2553: the PR's commits, for failover markers' heads.
+  repos/owner/repo/pulls/999/commits)
+    if [ "${CODEX_TEST_COMMITS_FAIL:-0}" = 1 ]; then echo 'simulated commits read failure' >&2; exit 1; fi
+    printf '%s\n' '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]' ;;
   repos/owner/repo/pulls/999/reviews)
     case "$scenario" in
       reply-only|body-P1|body-P2)
@@ -263,6 +267,10 @@ case "$endpoint" in
       cap_failover)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8400 + (. * 2)),user:{login:$who},created_at:$t,body:"@codex review"}]
                           + [{id:8401,user:{login:$who},created_at:$t,updated_at:$t,
                               body:"<!-- mergepath-codex-failover:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=8400 -->"}]' ;;
+      # #2553: the same, with the marker naming a head this PR never had.
+      cap_failover_foreign) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8400 + (. * 2)),user:{login:$who},created_at:$t,body:"@codex review"}]
+                          + [{id:8401,user:{login:$who},created_at:$t,updated_at:$t,
+                              body:"<!-- mergepath-codex-failover:v1 head=1111111111111111111111111111111111111111 trigger_comment_id=8400 -->"}]' ;;
       # #2534: what the failover stub has posted so far.
       live)             if [ -f "$CODEX_TEST_STATE_DIR/live-comments.json" ]; then cat "$CODEX_TEST_STATE_DIR/live-comments.json"; else printf '[]\n'; fi ;;
       *)                printf '[]\n' ;;
@@ -1990,12 +1998,24 @@ test_trigger_only_future_head_preserves_recent_blocks
 test_failover_marker() {
   local dir rc before
   before=$FAIL
+  # A real head, so the PR head set (#2553) is readable.
+  local fo_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   dir=$(make_case failover-ceiling)
-  rc=$(run_trigger_only "$dir" cap_failover)
+  rc=$(CODEX_TEST_HEAD=$fo_head run_trigger_only "$dir" cap_failover)
   [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] \
     || fail "#2534: ten requests with one marked failover must leave a slot (rc=$rc posts=$(trig_count "$dir")); err=$(tail -3 "$dir/err.log")"
   grep -q 'request attempts 9/10' "$dir/err.log" \
     || fail "#2534: the marked failover was counted: $(grep 'request attempts' "$dir/err.log")"
+  # #2553: a marker naming a foreign head, or an unreadable head set, exempts nothing.
+  dir=$(make_case failover-ceiling-foreign)
+  rc=$(CODEX_TEST_HEAD=$fo_head run_trigger_only "$dir" cap_failover_foreign)
+  [ "$rc" = 7 ] && [ "$(trig_count "$dir")" = 0 ] \
+    && grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
+    || fail "#2553: a marker naming a foreign head must not exempt its trigger (rc=$rc posts=$(trig_count "$dir"))"
+  dir=$(make_case failover-ceiling-unreadable)
+  rc=$(CODEX_TEST_HEAD=$fo_head CODEX_TEST_COMMITS_FAIL=1 run_trigger_only "$dir" cap_failover)
+  [ "$rc" = 7 ] && [ "$(trig_count "$dir")" = 0 ] && grep -q "head set is unreadable" "$dir/err.log" \
+    || fail "#2553: an unreadable head set must exempt nothing (rc=$rc posts=$(trig_count "$dir"))"
 
   # A failover stub that records both writes, so the readback sees them.
   write_failover_stub() {

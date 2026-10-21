@@ -44,7 +44,8 @@
 #                       Legacy real/useful/+1 aliases still mean fixed.
 #                       Use deferred for accepted findings not fixed here.
 #                       A comment_id with no matching collected finding is
-#                       skipped with a `not-found` note, not an error.
+#                       skipped with a `not-found` note, not an error (under
+#                       --scan, after the by-id fetch described there).
 #   --findings-json F   Read a findings array from F (a file, or "-" for
 #                       stdin). Accepts either an object with a `findings`
 #                       array or a bare array of
@@ -57,7 +58,11 @@
 #                       coderabbit.bot_login (default `coderabbitai[bot]`)
 #                       whose commit_id or original_commit_id equals the PR
 #                       HEAD — the same current-finding scope
-#                       scripts/coderabbit-severity-gate.sh gates on.
+#                       scripts/coderabbit-severity-gate.sh gates on. A
+#                       --verdict comment_id outside that scope is fetched
+#                       by id and accepted as a coderabbit.bot_login comment
+#                       on this PR (#2565); a 404 stays not-found, any other
+#                       read failure exits 3.
 #   --ledger F          Append per-finding disposition records (JSONL) to F.
 #                       Defaults to $CODERABBIT_FEEDBACK_LEDGER, else
 #                       .mergepath/coderabbit-feedback-ledger.jsonl under the
@@ -495,6 +500,45 @@ if [ "$DO_SCAN" -eq 1 ]; then
     ]
   ')
   COLLECTED=$(jq -n --argjson a "$COLLECTED" --argjson b "$SCANNED" '$a + $b')
+
+  # #2565: a --verdict naming a comment the current-HEAD scan did not collect
+  # is fetched by id. A pushed fix leaves the fixed finding anchored on the
+  # earlier SHA, so the SHA scope above dropped exactly the findings a
+  # `fixed` verdict follows and the verdict skipped as not-found with exit 0.
+  # The scan stays HEAD-pinned for unnamed findings; a fetched comment is
+  # accepted only as the configured bot's comment on this PR; a 404 keeps the
+  # not-found skip, and any other read failure exits 3, never a silent skip.
+  SCANNED_IDS=$(echo "$COLLECTED" | jq '[.[].comment_id]')
+  for ((di = 0; di < ${#VERDICT_IDS[@]}; di++)); do
+    did=${VERDICT_IDS[$di]}
+    if [ "$(echo "$SCANNED_IDS" | jq --argjson c "$did" 'index($c) != null')" = "true" ]; then
+      continue
+    fi
+    drc=0
+    DIRECT_OUT=$(gh api "repos/$REPO/pulls/comments/$did" 2>&1) || drc=$?
+    if [ "$drc" -ne 0 ]; then
+      case "$DIRECT_OUT" in
+        *"HTTP 404"*) log "comment $did named by --verdict is outside the current-HEAD scan and was not found by id (HTTP 404); skipping the verdict"; continue ;;
+        *) die 3 "failed to fetch comment $did named by --verdict: $DIRECT_OUT" ;;
+      esac
+    fi
+    DIRECT_ID=$(printf '%s' "$DIRECT_OUT" | jq -r '.id // empty' 2>/dev/null) || DIRECT_ID=""
+    [ "$DIRECT_ID" = "$did" ] \
+      || die 3 "unexpected response fetching comment $did named by --verdict: $DIRECT_OUT"
+    DIRECT_LOGIN=$(printf '%s' "$DIRECT_OUT" | jq -r '.user.login // ""')
+    DIRECT_PR=$(printf '%s' "$DIRECT_OUT" | jq -r '(.pull_request_url // "") | sub(".*/pulls/"; "")')
+    if [ "$DIRECT_LOGIN" != "$BOT_LOGIN" ]; then
+      log "comment $did (author ${DIRECT_LOGIN:-unknown}) is not authored by $BOT_LOGIN; skipping the verdict"
+      continue
+    fi
+    if [ "$DIRECT_PR" != "$PR_NUMBER" ]; then
+      log "comment $did belongs to another pull request (#${DIRECT_PR:-unknown}); skipping the verdict"
+      continue
+    fi
+    log "comment $did named by --verdict is outside the current-HEAD scan; fetched by id ($BOT_LOGIN finding on PR #$PR_NUMBER, commit $(printf '%s' "$DIRECT_OUT" | jq -r '.commit_id // "?"'))"
+    DIRECT_FINDING=$(printf '%s' "$DIRECT_OUT" | jq -c '{ path: (.path // null), line: (.line // .original_line // null), comment_id: .id, body: (.body // ""), tier: null }')
+    COLLECTED=$(jq -n --argjson a "$COLLECTED" --argjson b "[$DIRECT_FINDING]" '$a + $b')
+  done
 fi
 
 # Deduplicate by comment_id (a finding present in both the JSON and the scan
