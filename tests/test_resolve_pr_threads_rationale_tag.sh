@@ -2571,6 +2571,161 @@ for reply in \
   fi
 done
 
+
+# #1001: disposition polarity must survive an incidental anchored-file touch.
+# These are real CLI probes against the existing fake-gh mutation/readback net.
+for scenario in defer long-defer deferring deferred follow-up tracked-local tracked-cross wontfix structured-defer defer-auto rebuttal-reply structured-rebuttal negative canonical-negative positive canonical-positive negative-then-positive positive-then-negative unknown unknown-after-positive malformed stale-negative wrong-repo reraised-negative reraised-positive defer-then-fixed fixed-then-defer rebuttal-then-fixed unproven-later-fixed unknown-prose unknown-prefix explicit-fixed-negative human stale-head; do
+  reply=""; later_reply=""; verdict=""; disposition=""; mode=(--resolve-actioned)
+  expected_tag=addressed-elsewhere; expected_rc=0
+  comments=$(jq -nc '[{author:{login:"coderabbitai"},body:"Finding on the anchored file",databaseId:1001,createdAt:"2026-01-01T00:00:00Z"}]')
+  case "$scenario" in
+    defer|defer-auto) reply='Defer this to #997; it is not fixed in this PR.'; expected_tag=deferred-to-followup ;;
+    long-defer) printf -v padding '%60000s' x; reply="Deferring this to #997, not fixing here. $padding"; expected_tag=deferred-to-followup ;;
+    deferring) reply='Deferring this to #997, not fixing here.'; expected_tag=deferred-to-followup ;;
+    deferred) reply='Deferred to #997; no implementation change here.'; expected_tag=deferred-to-followup ;;
+    follow-up) reply='Follow-up: #997 owns this change after the present PR.'; expected_tag=deferred-to-followup ;;
+    tracked-local) reply='Tracked in #997; intentionally left for that follow-up.'; expected_tag=deferred-to-followup ;;
+    tracked-cross) reply='Tracked in test/repo#997; intentionally deferred.'; expected_tag=deferred-to-followup ;;
+    wontfix) reply='Wontfix: deferred to the explicitly tracked follow-up.'; expected_tag=deferred-to-followup ;;
+    structured-defer) reply='Disposition: deferred-to-follow-up; tracked in #997.'; expected_tag=deferred-to-followup ;;
+    rebuttal-reply) reply='Rebuttal: this requirement is already covered; no change is needed here.'; expected_tag=rebuttal-recorded ;;
+    structured-rebuttal) reply='Disposition: rebutted; the existing boundary already covers this case.'; expected_tag=rebuttal-recorded ;;
+    negative|explicit-fixed-negative) verdict=-1; expected_tag=rebuttal-recorded ;;
+    canonical-negative) verdict=false-positive; disposition=rebutted; expected_tag=rebuttal-recorded ;;
+    positive) verdict=+1 ;;
+    canonical-positive) verdict=useful; disposition=fixed ;;
+    negative-then-positive) verdict=-1 ;;
+    positive-then-negative) verdict=+1; expected_tag=rebuttal-recorded ;;
+    unknown|unknown-after-positive) verdict=maybe; expected_rc=3; expected_tag="" ;;
+    malformed) verdict=+1; expected_rc=3; expected_tag="" ;;
+    stale-negative|wrong-repo) verdict=-1; reply='Fixed in abc1234.' ;;
+    reraised-negative) verdict=-1; expected_rc=3; expected_tag="" ;;
+    reraised-positive) verdict=-1 ;;
+    defer-then-fixed) reply='Deferred to #997; not fixed in this PR.'; later_reply='Fixed in abc1234.' ;;
+    fixed-then-defer) reply='Fixed in abc1234.'; later_reply='Deferring this to #997, not fixing here.'; expected_tag=deferred-to-followup ;;
+    rebuttal-then-fixed|unproven-later-fixed) reply='Disagree with the requirement; no CI check is needed here.'; later_reply='Fixed in abc1234.' ;;
+    unknown-prose) reply='The quoted example contains the word defer but is ordinary explanatory prose.' ;;
+    unknown-prefix) reply='Deferredness is a category label and does not match the finite leading vocabulary.' ;;
+    human|stale-head) verdict=+1; expected_rc=3; expected_tag="" ;;
+  esac
+  case "$scenario" in
+    defer|long-defer|deferring|deferred|follow-up|tracked-local|tracked-cross|wontfix|structured-defer|fixed-then-defer) expected_rc=3; expected_tag="" ;;
+    defer-auto|stale-head) mode=(--auto-resolve-bots) ;;
+    explicit-fixed-negative) mode=(--thread PRT_1001 --disposition fixed); expected_tag=addressed-elsewhere ;;
+    unproven-later-fixed) expected_rc=3; expected_tag="" ;;
+  esac
+  if [ -n "$reply" ]; then comments=$(jq -c --arg b "$reply" '. + [{author:{login:"nathanpayne-claude"},body:$b,databaseId:1002,createdAt:"2026-01-02T00:00:00Z"}]' <<<"$comments"); fi
+  if [ -n "$later_reply" ]; then comments=$(jq -c --arg b "$later_reply" '. + [{author:{login:"nathanpayne-claude"},body:$b,databaseId:1004,createdAt:"2026-01-04T00:00:00Z"}]' <<<"$comments"); fi
+  case "$scenario" in
+    reraised-negative|reraised-positive)
+      comments=$(jq -c '. + [{author:{login:"coderabbitai"},body:"Finding re-raised",databaseId:1003,createdAt:"2026-01-04T00:00:00Z"}]' <<<"$comments") ;;
+  esac
+  fixture=$(jq -nc --argjson c "$comments" '{data:{repository:{pullRequest:{reviewThreads:{totalCount:1,pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"PRT_1001",isResolved:false,isOutdated:false,commentsFirst:{nodes:[{author:{login:"coderabbitai"},path:"scripts/foo.sh",body:"Finding on the anchored file",databaseId:1001,createdAt:"2026-01-01T00:00:00Z"}]},commentsLast:{nodes:[{commit:{oid:"HEADCURRENT"}}]},allComments:{nodes:$c}}]}}}}}')
+  [ "$scenario" != stale-head ] || fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0].commentsLast.nodes[0].commit.oid="OLDHEAD"' <<<"$fixture")
+  [ "$scenario" != human ] || fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0] |= (.commentsFirst.nodes[0].author.login="real-human" | .allComments.nodes[0].author.login="real-human")' <<<"$fixture")
+  ledger="$SCRATCH/t1001-$scenario.jsonl"; : > "$ledger"
+  if [ "$scenario" = unknown-after-positive ]; then jq -nc '{repo:"test/repo",comment_id:1001,verdict:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger"; fi
+  if [ -n "$verdict" ]; then
+    jq -nc --arg v "$verdict" --arg d "$disposition" '{repo:"test/repo",comment_id:1001,verdict:$v,recorded_at:"2026-01-02T00:00:00Z"} + (if $d=="" then {} else {disposition:$d} end)' >> "$ledger"
+  fi
+  case "$scenario" in
+    negative-then-positive) jq -nc '{repo:"test/repo",comment_id:1001,verdict:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger" ;;
+    positive-then-negative) jq -nc '{repo:"test/repo",comment_id:1001,verdict:"-1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger" ;;
+    stale-negative) jq -c '.comment_id=999' "$ledger" > "$ledger.tmp"; mv "$ledger.tmp" "$ledger" ;;
+    wrong-repo) jq -c '.repo="other/repo"' "$ledger" > "$ledger.tmp"; mv "$ledger.tmp" "$ledger" ;;
+    reraised-positive) jq -nc '{repo:"test/repo",comment_id:1003,verdict:"+1",recorded_at:"2020-01-01T00:00:00Z"}' >> "$ledger" ;;
+    malformed) printf '%s\n' 'not JSON' >> "$ledger" ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/t1001-$scenario.log"; : > "$GH_ARGV_LOG"
+  files_map='{"abc1234567":["scripts/foo.sh"]}'
+  [ "$scenario" != unproven-later-fixed ] || files_map='{"abc1234567":["scripts/bar.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" '["scripts/foo.sh","scripts/bar.sh"]' '[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]' "$files_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" CODEX_FEEDBACK_LEDGER="$ledger" CODERABBIT_FEEDBACK_LEDGER="$SCRATCH/t1001-absent" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "${mode[@]}" 2>&1)
+  rc=$?
+  set -e
+  okay=true
+  [ "$rc" -eq "$expected_rc" ] || okay=false
+  if [ -n "$expected_tag" ]; then
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || okay=false
+    tag_before_resolve "$GH_ARGV_LOG" || okay=false
+    if [ "$scenario" = negative ] && ! grep -q 'negative/rebutted verdict recorded' "$GH_ARGV_LOG"; then okay=false; fi
+  else
+    if grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG"; then okay=false; fi
+  fi
+  if $okay; then
+    pass=$((pass+1)); echo "  PASS: #1001 $scenario preserves finding disposition polarity"
+  else
+    fail=$((fail+1)); echo "  FAIL: #1001 $scenario (rc=$rc expected=$expected_rc tag=$expected_tag)" >&2
+    printf '%s\n' "$out" >&2; tail -15 "$GH_ARGV_LOG" >&2
+  fi
+done
+
+# #1001: actual recorder row formats retain raw verdict aliases. Codex adds
+# reaction, without disposition; CodeRabbit adds disposition, without reaction.
+for scenario in writer-codex-fixed writer-codex-real writer-codex-useful writer-codex-+1 writer-codex-thumbsup writer-codex-thumbs-up writer-codex-up writer-codex-rebutted writer-codex-false-positive writer-codex-false_positive writer-codex-falsepositive writer-codex-not-useful writer-codex-not_useful writer-codex-notuseful writer-codex--1 writer-codex-thumbsdown writer-codex-thumbs-down writer-codex-down writer-codex-REAL writer-cr-fixed writer-cr-rebutted writer-cr-deferred writer-cr-tracked writer-cr-split writer-cr-deferred-to-followup writer-cr-deferred-to-follow-up writer-positive-reaction-conflict writer-negative-reaction-conflict writer-positive-signed-conflict writer-negative-signed-conflict writer-disposition-conflict writer-deferred-reaction-conflict writer-unknown-verdict writer-unknown-reaction writer-unknown-disposition writer-no-anchor writer-defer-after-positive writer-defer-auto; do
+  writer=codex; verdict=real; reaction=+1; disposition=""; expected_tag=addressed-elsewhere; expected_rc=0; mode=(--resolve-actioned)
+  case "$scenario" in
+    writer-codex-*)
+      verdict="${scenario#writer-codex-}"
+      case "$verdict" in rebutted|false-positive|false_positive|falsepositive|not-useful|not_useful|notuseful|-1|thumbsdown|thumbs-down|down) reaction=-1; expected_tag=rebuttal-recorded ;; esac ;;
+    writer-cr-*)
+      writer=coderabbit; reaction=""; verdict="${scenario#writer-cr-}"; disposition=fixed
+      case "$verdict" in
+        rebutted) disposition=rebutted; expected_tag=rebuttal-recorded ;;
+        deferred|tracked|split|deferred-to-followup|deferred-to-follow-up) disposition=deferred-to-followup; expected_rc=3; expected_tag="" ;;
+      esac ;;
+    writer-positive-reaction-conflict) reaction=-1; expected_rc=3; expected_tag="" ;;
+    writer-negative-reaction-conflict) verdict=false-positive; expected_rc=3; expected_tag="" ;;
+    writer-positive-signed-conflict) verdict=+1; reaction=-1; expected_rc=3; expected_tag="" ;;
+    writer-negative-signed-conflict) verdict=-1; expected_rc=3; expected_tag="" ;;
+    writer-disposition-conflict) writer=coderabbit; reaction=""; disposition=rebutted; expected_rc=3; expected_tag="" ;;
+    writer-deferred-reaction-conflict) verdict=deferred; disposition=deferred-to-followup; expected_rc=3; expected_tag="" ;;
+    writer-unknown-verdict) verdict=maybe; expected_rc=3; expected_tag="" ;;
+    writer-unknown-reaction) reaction=maybe; expected_rc=3; expected_tag="" ;;
+    writer-unknown-disposition) writer=coderabbit; reaction=""; disposition=maybe; expected_rc=3; expected_tag="" ;;
+    writer-no-anchor) expected_rc=3; expected_tag="" ;;
+    writer-defer-after-positive|writer-defer-auto)
+      writer=coderabbit; reaction=""; verdict=tracked; disposition=deferred-to-followup; expected_rc=3; expected_tag=""
+      if [ "$scenario" = writer-defer-auto ]; then mode=(--auto-resolve-bots); expected_rc=0; expected_tag=deferred-to-followup; fi ;;
+  esac
+  # Keep a valid on-thread Fixed reply so an incompatible/contradictory row
+  # cannot silently disappear behind otherwise valid fix evidence.
+  fixture='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRT_1001","isResolved":false,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Finding on the anchored file","databaseId":1001,"createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},"allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on the anchored file","databaseId":1001,"createdAt":"2026-01-01T00:00:00Z"},{"author":{"login":"nathanpayne-claude"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"}]}}]}}}}}'
+  ledger="$SCRATCH/t1001-$scenario.jsonl"; : > "$ledger"
+  if [ "$scenario" = writer-defer-after-positive ]; then
+    jq -nc '{pr_number:99999,repo:"test/repo",comment_id:1001,verdict:"real",reaction:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger"
+  fi
+  jq -nc --arg w "$writer" --arg v "$verdict" --arg r "$reaction" --arg d "$disposition" '
+    {repo:"test/repo",comment_id:1001,verdict:$v,reason:null,recorded_at:"2026-01-02T00:00:00Z"}
+    + (if $w=="codex" then {pr_number:99999,priority:"P2",reaction:$r,location:"pull_request_review_comment",action:"posted",reviewer_identity:"nathanpayne-claude"}
+       else {pr:99999,head_sha:"HEADCURRENT",path:"scripts/foo.sh",line:1,tier:"P2",disposition:$d,resolved:false,superseded_prior:false} end)
+    + (if $d!="" then {disposition:$d} else {} end)' >> "$ledger"
+  GH_ARGV_LOG="$SCRATCH/t1001-$scenario.log"; : > "$GH_ARGV_LOG"
+  files_map='{"abc1234567":["scripts/foo.sh"]}'
+  [ "$scenario" != writer-no-anchor ] || files_map='{"abc1234567":["scripts/bar.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" '["scripts/foo.sh","scripts/bar.sh"]' '[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]' "$files_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" CODEX_FEEDBACK_LEDGER="$ledger" CODERABBIT_FEEDBACK_LEDGER="$SCRATCH/t1001-absent" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "${mode[@]}" 2>&1)
+  rc=$?
+  set -e
+  okay=true
+  [ "$rc" -eq "$expected_rc" ] || okay=false
+  if [ -n "$expected_tag" ]; then
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || okay=false
+    tag_before_resolve "$GH_ARGV_LOG" || okay=false
+  elif grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG"; then okay=false
+  fi
+  case "$scenario" in
+    *conflict|writer-unknown-*) grep -q 'unusable newest row' <<<"$out" || okay=false ;;
+  esac
+  if $okay; then pass=$((pass+1)); echo "  PASS: #1001 $scenario preserves writer-compatible polarity"
+  else fail=$((fail+1)); echo "  FAIL: #1001 $scenario (rc=$rc expected=$expected_rc tag=$expected_tag)" >&2; printf '%s\n' "$out" >&2; tail -15 "$GH_ARGV_LOG" >&2
+  fi
+done
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
