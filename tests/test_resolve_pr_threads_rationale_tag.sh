@@ -2475,6 +2475,7 @@ for reply in \
   '  fixed by moving the glossary entry to CONTEXT.md in a4c3e4ca; nothing else changed here.' \
   'FIXED in a4c3e4ca (head ab17bfa2); the glossary entry now lives in CONTEXT.md.' \
   '**Fixed** in a4c3e4ca; the glossary entry now lives in CONTEXT.md.' \
+  '_Fixed_: the glossary entry now lives in CONTEXT.md, see a4c3e4ca on this PR.' \
   'Fixed: the glossary entry now lives in CONTEXT.md, see a4c3e4ca on this PR.'; do
   t2555_run "$SCRATCH/t2555a.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
   if [ "$rc" -eq 3 ] \
@@ -2555,7 +2556,9 @@ echo
 echo "Test 2555-E: a rebuttal that merely begins with the letters of 'Fixed' is still a rebuttal (Codex P2 on #2599)"
 for reply in \
   'Fixed-width inputs cannot reach this branch; the finding does not apply to this spec line.' \
-  'Fixedly anchored definitions are the point of this spec; the glossary defers to it, no change.'; do
+  'Fixedly anchored definitions are the point of this spec; the glossary defers to it, no change.' \
+  '`fixed_width` inputs cannot reach this branch; the finding does not apply here.' \
+  'fixed_width inputs cannot reach this branch; the finding does not apply here.'; do
   t2555_run "$SCRATCH/t2555e.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
   if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
      && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \

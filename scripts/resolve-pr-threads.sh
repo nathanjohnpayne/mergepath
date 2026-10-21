@@ -2561,12 +2561,20 @@ verify_propagation_content() {
 # the reply (#2555; Codex P2 on #2599). "FIXED in abc1234" and
 # "**Fixed** in abc1234" are fix claims; "Fixed-width inputs …" is not.
 reply_is_fix_claim() {
-  local lead bt='`' punct=':.,;!?'
+  # Closing emphasis counts only when it exactly closes the stripped opener
+  # (Codex P2 on #2599): "`fixed_width`" and "fixed_width" are not claims.
+  local lead open rest bt='`' punct=':.,;!?'
   lead=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   lead="${lead#"${lead%%[![:space:]]*}"}"
-  lead="${lead#"${lead%%[!*_$bt]*}"}"
-  case "$lead" in
-    fixed|fixed[[:space:]]*|fixed[*_$bt]*|fixed[$punct]*) return 0 ;;
+  open="${lead%%[!*_$bt]*}"
+  lead="${lead#"$open"}"
+  case "$lead" in fixed*) ;; *) return 1 ;; esac
+  rest="${lead#fixed}"
+  if [ -n "$open" ]; then
+    case "$rest" in "$open"*) rest="${rest#"$open"}" ;; esac
+  fi
+  case "$rest" in
+    ''|[[:space:]]*|[$punct]*) return 0 ;;
   esac
   return 1
 }
