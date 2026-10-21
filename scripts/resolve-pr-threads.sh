@@ -28,6 +28,9 @@
 #
 #   fixed or rebutted        → --resolve-actioned  (addressed-elsewhere /
 #                                                    rebuttal-recorded)
+#   fixed outside the        → --thread <id> --disposition fixed
+#     anchored file             (addressed-elsewhere; --resolve-actioned
+#                               cannot prove it and warns, #2555)
 #   explicitly deferred      → --auto-resolve-bots (deferred-to-followup)
 #   propagated from upstream → --resolve-verified-propagation
 #                                                   (verified-propagation)
@@ -97,7 +100,12 @@
 #                           addressed-elsewhere (an agent commit touching the
 #                           anchored file, after the latest re-raise) or
 #                           rebuttal-recorded (a substantive agent rebuttal
-#                           after the latest re-raise). Routing-only classes
+#                           after the latest re-raise; a reply that leads
+#                           with "Fixed" is a fix claim, not a rebuttal, so
+#                           without a commit touching the anchored file it
+#                           is left unresolved with a warning naming the
+#                           --thread --disposition fixed mode that records
+#                           a cross-file fix, #2555). Routing-only classes
 #                           — canonical-coverage / templated-render — are
 #                           NOT actioned here: they show WHERE a fix belongs
 #                           (upstream), not that one happened, so a fresh
@@ -331,7 +339,8 @@
 #     nitpick-noted         severity is Nitpick/Trivial/P3 and no
 #                           stronger signal applies
 #     rebuttal-recorded     a substantive agent-authored reply (≥30
-#                           chars) is on the thread
+#                           chars, not leading with "Fixed", #2555) is
+#                           on the thread
 #     deferred-to-followup  default fallback / --rationale override
 #     verified-propagation  consumer content at the anchored path (at the
 #                           compared ref: PR head while open, default
@@ -2546,6 +2555,30 @@ verify_propagation_content() {
   return 1
 }
 
+# reply_is_fix_claim <reply-body> → exit 0 when the reply leads with the word
+# "Fixed" in any case, through any leading Markdown emphasis, with the word
+# ending at whitespace, closing emphasis, sentence punctuation or the end of
+# the reply (#2555; Codex P2 on #2599). "FIXED in abc1234" and
+# "**Fixed** in abc1234" are fix claims; "Fixed-width inputs …" is not.
+reply_is_fix_claim() {
+  # Closing emphasis counts only when it exactly closes the stripped opener
+  # (Codex P2 on #2599): "`fixed_width`" and "fixed_width" are not claims.
+  local lead open rest bt='`' punct=':.,;!?'
+  lead=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  lead="${lead#"${lead%%[![:space:]]*}"}"
+  open="${lead%%[!*_$bt]*}"
+  lead="${lead#"$open"}"
+  case "$lead" in fixed*) ;; *) return 1 ;; esac
+  rest="${lead#fixed}"
+  if [ -n "$open" ]; then
+    case "$rest" in "$open"*) rest="${rest#"$open"}" ;; esac
+  fi
+  case "$rest" in
+    ''|[[:space:]]*|[$punct]*) return 0 ;;
+  esac
+  return 1
+}
+
 # derive_tag_class — given the thread JSON (one line of UNRESOLVED),
 # return one of the rollup's class strings on stdout.
 #
@@ -2564,6 +2597,7 @@ verify_propagation_content() {
 #   2. addressed-elsewhere    agent-author commit after createdAt
 #                             touching the anchored file
 #   3. rebuttal-recorded      ≥30-char agent-author reply on thread
+#                             that does not lead with "Fixed" (#2555)
 #   4. nitpick-noted          severity is Nitpick/Trivial/P3
 #   5. deferred-to-followup   fallback
 #
@@ -2773,6 +2807,18 @@ derive_tag_class() {
         "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
       esac
       if [ -n "$r_login" ] && [ "$r_body_len" -ge 30 ] && is_agent_author_local "$r_login"; then
+        # #2555: a reply that leads with "Fixed" is a fix claim, not a
+        # rebuttal. Step 2 found no agent commit after the latest re-raise
+        # touching the anchored file, so the claim is unproven here: record
+        # nothing rather than a rebuttal that never happened, say so, and
+        # keep scanning for a genuine rebuttal. A cross-file fix is recorded
+        # by the explicit --thread <id> --disposition fixed mode (#2196),
+        # which the warning names; the file-touch rule itself is unchanged.
+        if reply_is_fix_claim "$r_body"; then
+          echo "WARN: the agent reply on [$thread_path] leads with 'Fixed' but no agent commit after the latest re-raise touches that file, so it is not recorded as a rebuttal; record a cross-file fix with --thread <id> --disposition fixed --commit <sha> (#2555)" >&2
+          k=$((k + 1))
+          continue
+        fi
         echo "rebuttal-recorded"
         return
       fi
