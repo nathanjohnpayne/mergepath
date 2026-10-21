@@ -8,6 +8,8 @@ The bare-write scanner admission and error contract is defined in the [canonical
 
 Captured-output assertions must retain both the expected exit and diagnostic without an early-closing pipeline reader changing the result. The observed lint predicates and project-document mirror ownership check use here-string input; keep pipefail and the original diagnostic/ownership conditions (#2488).
 
+The workflow-parser and Firebase parser-parity guards require successful positive controls before accepting rejection evidence. The D11 runtime keeps the absent-workflow skip used by propagated consumers; extraction failure or empty extraction in a present workflow fails. See `specs/repo_lint_execution.md` and the native guards in `tests/test_465_fail_closed.sh` and `tests/test_op_preflight_check.sh` (#1527).
+
 ## Repo-lint execution
 
 Lint-fast supplies active npm Dependabot alternate-target refs through its bounded depth-one setup step before checking coupled families. It retains `persist-credentials: false`, fetches no unrelated branch history and fails on unavailable declared targets. The workflow-step fixtures in `tests/test_dependabot_coupled_groups.sh` and `specs/repo_lint_execution.md` own this checkout contract (#2464).

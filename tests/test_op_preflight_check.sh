@@ -2356,6 +2356,41 @@ test_firebaserc_parsers_agree() {
   mkdir -p "$case_dir"
   awk '/^(detect_firebase_project|firebaserc_default_project_no_python)\(\) \{/,/^\}/' "$SCRIPT" > "$case_dir/parsers.sh"
 
+  # Equality alone also accepts two absent/broken functions. These positive
+  # controls require each real parser to run and independently return a fixed
+  # non-empty answer before empty results can count as rejection parity.
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "firebaserc-parity: python3 is required for an independent parser"
+    return
+  fi
+  local -a known_cases=(
+    'root|right|{ "projects": { "default": "right" } }'
+    'nested|right|{ "nested": { "projects": { "default": "wrong" } }, "projects": { "default": "right" } }'
+    'last-default|second|{ "projects": { "default": "first", "default": "second" } }'
+  )
+  local control expected control_json control_name control_py control_awk
+  # shellcheck disable=SC2016  # "$1" expands in the child bash, by design
+  for control in "${known_cases[@]}"; do
+    control_name="${control%%|*}"
+    control="${control#*|}"
+    expected="${control%%|*}"
+    control_json="${control#*|}"
+    mkdir -p "$case_dir/control-$control_name"
+    printf '%s\n' "$control_json" > "$case_dir/control-$control_name/.firebaserc"
+    if ! control_py=$(cd "$case_dir/control-$control_name" && env -u OP_PREFLIGHT_FIREBASE_PROJECT_ID bash -c '. "$1"; detect_firebase_project' _ "$case_dir/parsers.sh"); then
+      fail "firebaserc-parity control[$control_name]: python parser did not run successfully"
+      return
+    fi
+    if ! control_awk=$(cd "$case_dir/control-$control_name" && bash -c '. "$1"; firebaserc_default_project_no_python' _ "$case_dir/parsers.sh"); then
+      fail "firebaserc-parity control[$control_name]: no-python parser did not run successfully"
+      return
+    fi
+    if [ -z "$control_py" ] || [ -z "$control_awk" ] || [ "$control_py" != "$expected" ] || [ "$control_awk" != "$expected" ]; then
+      fail "firebaserc-parity control[$control_name]: expected '$expected', got python '$control_py' and no-python '$control_awk'"
+      return
+    fi
+  done
+
   local -a cases=(
     'simple|{ "projects": { "default": "right" } }'
     'nested-projects-first|{ "targets": { "x": { "projects": { "default": "wrong" } } }, "projects": { "default": "right" } }'
