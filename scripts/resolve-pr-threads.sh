@@ -2579,6 +2579,44 @@ reply_is_fix_claim() {
   return 1
 }
 
+# Finite leading vocabulary only; unknown prose keeps the existing ladder.
+reply_disposition_polarity() {
+  local lead
+  lead=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  lead="${lead#"${lead%%[![:space:]]*}"}"
+  case "$lead" in
+    disposition:*) lead="${lead#disposition:}"; lead="${lead#"${lead%%[![:space:]]*}"}" ;;
+  esac
+  if reply_is_fix_claim "$lead"; then printf 'fixed'; return; fi
+  if LC_ALL=C grep -Eq '^(defer|deferred|deferring|follow-up|wontfix|deferred-to-followup|deferred-to-follow-up)([[:space:]:.,;!?]|$)|^tracked in ([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+([[:space:]:.,;!?]|$)' <<<"$lead"; then
+    printf 'deferred'
+  elif [ "${#1}" -ge 30 ] && LC_ALL=C grep -Eq '^(rebuttal|rebutted|disagree)([[:space:]:.,;!?]|$)' <<<"$lead"; then
+    printf 'rebutted'
+  fi
+}
+
+# The caller already found the latest non-agent index over complete comments.
+# Unknown replies and generated markers cannot cancel recognized polarity.
+thread_reply_polarity() {
+  local tj="$1" k=$(($2 + 1)) count login body trimmed current result=""
+  [ "$k" -ge 1 ] || k=1
+  count=$(printf '%s' "$tj" | jq '.all_comments | length')
+  while [ "$k" -lt "$count" ]; do
+    login=$(printf '%s' "$tj" | jq -r ".all_comments[$k].author.login // \"\"")
+    body=$(printf '%s' "$tj" | jq -r ".all_comments[$k].body // \"\"")
+    trimmed="${body#"${body%%[![:space:]]*}"}"
+    case "$trimmed" in
+      "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
+    esac
+    if is_agent_author_local "$login"; then
+      current=$(reply_disposition_polarity "$body")
+      [ -z "$current" ] || result="$current"
+    fi
+    k=$((k + 1))
+  done
+  printf '%s' "$result"
+}
+
 # derive_tag_class — given the thread JSON (one line of UNRESOLVED),
 # return one of the rollup's class strings on stdout.
 #
@@ -2715,6 +2753,17 @@ derive_tag_class() {
     return
   fi
 
+  # Preserve recognized finding-bound polarity before incidental file touches.
+  # Marker/routing precedence above and the separate action-evidence gate stay
+  # unchanged. Unreadable ledger state still fails closed in that gate (#1010).
+  local reply_polarity ledger_polarity=""
+  reply_polarity=$(thread_reply_polarity "$thread_json" "$last_nonagent_idx")
+  ledger_polarity=$(thread_ledger_polarity "$thread_json") || ledger_polarity=""
+  case "$reply_polarity:$ledger_polarity" in
+    deferred:*|*:deferred) echo "deferred-to-followup"; return ;;
+    rebutted:*|*:rebutted) echo "rebuttal-recorded"; return ;;
+  esac
+
   # 2. addressed-elsewhere — an agent-authored commit that BOTH (a)
   # post-dates the latest bot/reviewer comment (the #565 staleness guard)
   # AND (b) actually TOUCHES the anchored file. Both are required.
@@ -2816,6 +2865,12 @@ derive_tag_class() {
         # which the warning names; the file-touch rule itself is unchanged.
         if reply_is_fix_claim "$r_body"; then
           echo "WARN: the agent reply on [$thread_path] leads with 'Fixed' but no agent commit after the latest re-raise touches that file, so it is not recorded as a rebuttal; record a cross-file fix with --thread <id> --disposition fixed --commit <sha> (#2555)" >&2
+          k=$((k + 1))
+          continue
+        fi
+        # A later recognized fix claim supersedes older rebuttal prose, but
+        # still needs step 2's commit proof (or the explicit fixed mode).
+        if [ "$reply_polarity" = fixed ]; then
           k=$((k + 1))
           continue
         fi
@@ -3039,31 +3094,51 @@ current_round_finding_ids() {
   '
 }
 
-# An explicit current deferral is not fix/rebuttal evidence, even when an
-# older ledger row or a reply would otherwise qualify (#1010). A later
-# superseding fixed/rebutted row restores the normal evidence path.
-thread_has_current_deferral() {
-  local tj="$1" floor ids f rc state
+# Current finding polarity uses newest append order in each ledger, never
+# cross-clock timestamp ordering. Unusable state retains #1010's closed gate.
+thread_ledger_polarity() {
+  local tj="$1" floor ids f rc state result=none
   floor=$(latest_nonagent_created "$tj")
   ids=$(current_round_finding_ids "$tj" "$floor") || return 2
   while IFS= read -r f; do
     [ -f "$f" ] || continue
     if state=$(jq -r -s --argjson ids "$ids" --arg repo "$REPO" '
+      # Both recorder writers preserve raw verdict aliases; Codex adds
+      # reaction without disposition, CodeRabbit adds canonical disposition.
+      def verdict_polarity:
+        if type != "string" then "unusable" else
+          ascii_downcase as $v
+          | if (["fixed", "real", "useful", "+1", "thumbsup", "thumbs-up", "up"] | index($v)) != null then "fixed"
+            elif (["rebutted", "false-positive", "false_positive", "falsepositive", "not-useful", "not_useful", "notuseful", "-1", "thumbsdown", "thumbs-down", "down"] | index($v)) != null then "rebutted"
+            elif (["deferred", "tracked", "split", "deferred-to-followup", "deferred-to-follow-up"] | index($v)) != null then "deferred"
+            else "unusable" end
+        end;
       [.[] | select(.repo == $repo)
              | select(.comment_id as $id | ($ids | index($id)) != null)]
       | group_by(.comment_id) | map(last)
-      | map(if .disposition == "deferred-to-follow-up"
-            then .disposition = "deferred-to-followup" else . end)
-      | if any(.[];
-          ((.recorded_at | type == "string" and length > 0)
-           and (.disposition == "deferred-to-followup"
-                or (.verdict | type == "string" and length > 0))) | not)
-        then "unusable"
-        elif any(.[]; .disposition == "deferred-to-followup") then "deferred"
-        else "clear" end
+      | map(
+          (.verdict | verdict_polarity) as $v
+          | (if .disposition == null or .disposition == "" then $v
+             elif .disposition == "fixed" then "fixed"
+             elif .disposition == "rebutted" then "rebutted"
+             elif .disposition == "deferred-to-followup" or .disposition == "deferred-to-follow-up" then "deferred"
+             else "unusable" end) as $d
+          | if (.recorded_at | type != "string" or length == 0) then "unusable"
+            # Preserve the existing metadata-only explicit deferral rows.
+            elif $d == "deferred" and (.verdict == null or .verdict == "") and (.reaction == null or .reaction == "") then "deferred"
+            elif $v == "unusable" or $d == "unusable" or $v != $d then "unusable"
+            elif .reaction == null or .reaction == "" then $d
+            elif (.reaction == "+1" and $v == "fixed") or (.reaction == "-1" and $v == "rebutted") then $d
+            else "unusable" end)
+      | if any(.[]; . == "unusable") then "unusable"
+        elif any(.[]; . == "deferred") then "deferred"
+        elif any(.[]; . == "rebutted") then "rebutted"
+        elif any(.[]; . == "fixed") then "fixed" else "none" end
     ' "$f" 2>/dev/null); then
       case "$state" in
-        deferred) return 0 ;;
+        deferred) result=deferred ;;
+        rebutted) [ "$result" = deferred ] || result=rebutted ;;
+        fixed) [ "$result" != none ] || result=fixed ;;
         unusable)
           echo "WARN: ledger $f has an unusable newest row for the current finding; refusing actioned classification (#1010)" >&2
           return 2 ;;
@@ -3078,7 +3153,13 @@ thread_has_current_deferral() {
   done <<EOF
 $(ledger_paths)
 EOF
-  return 1
+  printf '%s' "$result"
+}
+
+thread_has_current_deferral() {
+  local polarity
+  polarity=$(thread_ledger_polarity "$1") || return 2
+  [ "$polarity" = deferred ]
 }
 
 # finding_dispositioned <thread_json> → prints the evidence description,
@@ -3198,7 +3279,11 @@ synth_rationale() {
       echo "nitpick/trivial severity; noted, no code change."
       ;;
     rebuttal-recorded)
-      echo "agent rebuttal posted on thread; resolving."
+      if [ "$(thread_ledger_polarity "$thread_json")" = rebutted ]; then
+        echo "negative/rebutted verdict recorded for this finding; resolving."
+      else
+        echo "agent rebuttal posted on thread; resolving."
+      fi
       ;;
     deferred-to-followup|*)
       echo "deferred to follow-up; resolving for branch-protection conversation gate."
