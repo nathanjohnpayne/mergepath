@@ -400,6 +400,58 @@ _fo_mark_z=$(printf '%s\n' "$T1" "$(fo_c 11 nathanjohnpayne 2026-10-01T00:00:05Z
 [ "$(crqe_failover_trigger_ids "$_fo_mark_z" nathanjohnpayne "$(crqe_pr_head_set '[]' '[]' "$FO_HA" "[\"$FO_HZ\"]")")" = '[10]' ] \
   && [ "$(crqe_failover_trigger_ids "$_fo_mark_z" nathanjohnpayne "$(crqe_pr_head_set '[]' '[]' "$FO_HA")")" = '[]' ] \
   || { echo "FAIL: failover: a marker on a force-pushed-away head must count only with the GraphQL heads" >&2; exit 1; }
+# #2600 BEGIN: keep every unbounded history off external command argv.
+# The shell-function shim reproduces Linux's per-argument limit on other OSes.
+(
+  jq() {
+    local argument
+    for argument in "$@"; do
+      if [ "${#argument}" -ge 131072 ]; then
+        return 91
+      fi
+    done
+    command jq "$@"
+  }
+  hs_commits=$(jq -nc --arg h "$FO_HB" '[range(0;4000) | {sha:$h}]')
+  hs_timeline=$(jq -nc --arg h "$FO_HY" '[{event:"committed",sha:$h}, {event:"commented",body:("x" * 150000)}]')
+  hs_force=$(jq -nc --arg h "$FO_HZ" '[range(0;4000) | $h]')
+  hs_expected=$(jq -nc --arg a "$FO_HA" --arg b "$FO_HB" --arg y "$FO_HY" --arg z "$FO_HZ" '[$a,$b,$y,$z] | sort')
+  # Prove the limit shim is live without executing an oversized argv.
+  if jq -n --argjson c "$hs_commits" '$c' >/dev/null; then
+    echo "FAIL: head set argument-limit control did not reject oversized argv" >&2
+    exit 1
+  fi
+  hs_actual=$(crqe_pr_head_set "$hs_commits" "$hs_timeline" "$FO_HA" "$hs_force") \
+    && [ "$hs_actual" = "$hs_expected" ] \
+    || { echo "FAIL: oversized histories lost PR heads" >&2; exit 1; }
+  # Each document must independently be exactly one array. Do not combine
+  # documents and let an empty input compensate for an adjacent extra one.
+  for hs_bad in '' '[] []' 'null' '{}' '["unterminated' '[] garbage'; do
+    for hs_slot in commits timeline force; do
+      hs_c='[]'; hs_t='[]'; hs_f='[]'
+      case "$hs_slot" in
+        commits) hs_c=$hs_bad ;;
+        timeline) hs_t=$hs_bad ;;
+        force) hs_f=$hs_bad ;;
+      esac
+      if crqe_pr_head_set "$hs_c" "$hs_t" "$FO_HA" "$hs_f" >"$DIR/head-set-invalid"; then
+        echo "FAIL: head set accepted malformed $hs_slot input" >&2
+        exit 1
+      fi
+      [ ! -s "$DIR/head-set-invalid" ] \
+        || { echo "FAIL: malformed head set emitted partial output" >&2; exit 1; }
+    done
+  done
+  if crqe_pr_head_set '[] []' '' "$FO_HA" '[]' >"$DIR/head-set-invalid" \
+     || crqe_pr_head_set '[' ']' "$FO_HA" '[]' >"$DIR/head-set-invalid"; then
+    echo "FAIL: head set accepted cross-input document compensation" >&2
+    exit 1
+  fi
+  [ ! -s "$DIR/head-set-invalid" ] || exit 1
+)
+echo "PASS: oversized PR histories stream independently and malformed documents fail closed (#2600)"
+# #2600 END
+
 # crqe_force_push_heads reads every page through gh's GraphQL pagination,
 # which needs the $endCursor variable, and fails on a failed or shapeless read.
 FP_DIR=$(mktemp -d)
