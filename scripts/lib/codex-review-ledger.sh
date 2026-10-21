@@ -435,7 +435,13 @@ crl_human_stops() {
                              and (.ceiling_exempt == null or (.ceiling_exempt | type) == \"boolean\"))
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
-                              and (.blocking_unlocated | type) == \"boolean\")
+                              and (.blocking_unlocated | type) == \"boolean\"
+                              # last_at feeds the runaway marker's floor (#2561): a
+                              # non-string sorts below every instant and would drop
+                              # the response out of it, so it fails like first_at.
+                              # Absent is the older-ledger case and falls back to
+                              # first_at; present (null included) must be an instant.
+                              and ((has(\"last_at\") | not) or (.last_at | type) == \"string\"))
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))
         # The fixed-finding evidence is optional (older ledgers read as
@@ -570,11 +576,30 @@ crl_apply_owner_tiebreaks() {
       any($tb[]; .kind == "rebuttal" and (.finding | tostring) == ($e.finding | tostring) and .at > $floor);
     def latest_response($e):
       ([ $ledger.responses[] | select(.rid as $id | ($e.responses // []) | index($id)) | (.last_at // .first_at) ] | max) // "";
+    # Instants compare as whole seconds, never as text (#2561): ISO strings
+    # collate "...00Z" after "...00.5Z", and any non-instant string sorts
+    # above every real one, so a lexicographic test let a same-second,
+    # fractional or malformed timestamp release the stop. GitHub comment
+    # timestamps carry no fraction, so "strictly later second" is the finest
+    # order the evidence supports; a malformed instant on either side holds.
+    # Absolute anchors, as crl_ledger validates: in this regex dialect `$`
+    # also matches before one trailing newline, and fromdateiso8601 then
+    # converts "…Z\n" as if it were an instant (Codex on #2567).
+    def seconds:
+      if type == "string" and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
+      then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
+      else null end;
     # The runaway formed with the latest request or response, so the marker
-    # must postdate every one of them.
-    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ] | max // "") as $runaway_floor
+    # must postdate every one of them. Every candidate is converted before
+    # the maximum is taken: a textual max would discard a malformed candidate
+    # that sorts below a valid one, so one bad instant anywhere makes the
+    # floor null, and a null floor holds.
+    ([ ($ledger.responses[] | (.last_at // .first_at)), ($ledger.requests[] | .created_at) ]
+     | map(seconds)
+     | if length == 0 or any(.[]; type != "number") then null else max end) as $runaway_floor
     | (($stops.stops | index("runaway")) != null
-       and any($tb[]; .kind == "runaway" and .at > $runaway_floor)) as $runaway
+       and ($runaway_floor | type) == "number"
+       and any($tb[]; .kind == "runaway" and ((.at | seconds) as $a | ($a | type) == "number" and $a > $runaway_floor))) as $runaway
     | ($stops.untested_rebuttals | map(. as $e | select(settled($e; $e.at) | not))) as $untested
     | ($stops.disagreements | map(. as $e
         | select(settled($e; ([$e.at, latest_response($e)] | max)) | not))) as $disagreements
