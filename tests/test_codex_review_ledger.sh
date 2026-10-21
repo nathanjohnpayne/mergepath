@@ -686,6 +686,15 @@ stop_check "runaway tiebreak: a floor that is not an instant leaves the runaway 
 # A malformed candidate that is NOT the maximum ("!" sorts below every digit)
 # must hold too: a textual max would discard it before the floor is checked
 # (Codex on #2567).
+# A trailing newline passes a `$`-anchored grammar in this regex dialect and
+# fromdateiso8601 still converts it (Codex on #2567): the grammar must use
+# absolute anchors so such a candidate holds even against a later marker.
+stop_check "runaway tiebreak: a candidate with a trailing newline is malformed and holds against a later marker" \
+  "$(crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$(printf '%s' "$L_RW_FRAC" | jq -c '.responses[-1].last_at = "2026-09-25T03:00:00Z\n"')" "$(crl_owner_tiebreaks "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$RM")" | arr)" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
+stop_check "runaway tiebreak: a marker whose own timestamp carries a trailing newline does not clear" \
+  "$(rw_frac "$(printf '%s\n' "$(cm 1 nathanjohnpayne $'2026-09-25T04:00:00Z\n' $'2026-09-25T04:00:00Z\n' "$RM")" | arr)")" \
+  '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'
 stop_check "runaway tiebreak: a malformed candidate below the maximum still leaves the runaway standing" \
   "$(crl_apply_owner_tiebreaks "$ST_RW_FRAC" "$(printf '%s' "$L_RW_FRAC" | jq -c '.responses[0].last_at = "!"')" "$(crl_owner_tiebreaks "$(printf '%s\n' "$(cm 1 nathanjohnpayne 2026-09-25T04:00:00Z 2026-09-25T04:00:00Z "$RM")" | arr)" nathanjohnpayne "$PR_URL" "$HEAD_A")")" \
   '.stops == ["runaway"] and (.owner_tiebreaks | length) == 0'

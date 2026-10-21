@@ -510,8 +510,11 @@ crl_apply_owner_tiebreaks() {
     # fractional or malformed timestamp release the stop. GitHub comment
     # timestamps carry no fraction, so "strictly later second" is the finest
     # order the evidence supports; a malformed instant on either side holds.
+    # Absolute anchors, as crl_ledger validates: in this regex dialect `$`
+    # also matches before one trailing newline, and fromdateiso8601 then
+    # converts "…Z\n" as if it were an instant (Codex on #2567).
     def seconds:
-      if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
+      if type == "string" and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
       then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
       else null end;
     # The runaway formed with the latest request or response, so the marker
