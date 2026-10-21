@@ -11,7 +11,9 @@
 #   PROJECT  — Project v2 number (integer)
 #
 # Required auth:
-#   GH_TOKEN must be set to an author PAT with `repo` + `project` scopes.
+#   Set GH_TOKEN from OP_PREFLIGHT_AUTHOR_PAT: an author classic PAT with
+#   `project` for user-owned Projects v2 plus `public_repo` for public repo
+#   operations. Use `repo` only when private repository access is needed.
 #
 # Placeholders in body files:
 #   __PARENT_NUM__ — replaced with the parent issue number
@@ -23,7 +25,7 @@ set -euo pipefail
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set (v2 number)}"
-: "${GH_TOKEN:?GH_TOKEN must be set to the author PAT with repo + project scopes (every helper here mutates GitHub; failing fast at source-time is better than letting gh fall through to ambient auth and posting under the wrong identity)}"
+: "${GH_TOKEN:?Set GH_TOKEN from OP_PREFLIGHT_AUTHOR_PAT (author classic PAT): project for user-owned Projects v2 plus public_repo for public repository operations; repo only for private repository access (every helper here mutates GitHub; failing fast at source-time is better than letting gh fall through to ambient auth and posting under the wrong identity)}"
 
 GHP_EXPECTED_IDENTITY="${GHP_EXPECTED_IDENTITY:-nathanjohnpayne}"
 GHP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
