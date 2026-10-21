@@ -2555,6 +2555,22 @@ verify_propagation_content() {
   return 1
 }
 
+# reply_is_fix_claim <reply-body> → exit 0 when the reply leads with the word
+# "Fixed" in any case, through any leading Markdown emphasis, with the word
+# ending at whitespace, closing emphasis, sentence punctuation or the end of
+# the reply (#2555; Codex P2 on #2599). "FIXED in abc1234" and
+# "**Fixed** in abc1234" are fix claims; "Fixed-width inputs …" is not.
+reply_is_fix_claim() {
+  local lead bt='`' punct=':.,;!?'
+  lead=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  lead="${lead#"${lead%%[![:space:]]*}"}"
+  lead="${lead#"${lead%%[!*_$bt]*}"}"
+  case "$lead" in
+    fixed|fixed[[:space:]]*|fixed[*_$bt]*|fixed[$punct]*) return 0 ;;
+  esac
+  return 1
+}
+
 # derive_tag_class — given the thread JSON (one line of UNRESOLVED),
 # return one of the rollup's class strings on stdout.
 #
@@ -2790,12 +2806,11 @@ derive_tag_class() {
         # keep scanning for a genuine rebuttal. A cross-file fix is recorded
         # by the explicit --thread <id> --disposition fixed mode (#2196),
         # which the warning names; the file-touch rule itself is unchanged.
-        case "$r_body_trimmed" in
-          [Ff]ixed*)
-            echo "WARN: the agent reply on [$thread_path] leads with 'Fixed' but no agent commit after the latest re-raise touches that file, so it is not recorded as a rebuttal; record a cross-file fix with --thread <id> --disposition fixed --commit <sha> (#2555)" >&2
-            k=$((k + 1))
-            continue ;;
-        esac
+        if reply_is_fix_claim "$r_body"; then
+          echo "WARN: the agent reply on [$thread_path] leads with 'Fixed' but no agent commit after the latest re-raise touches that file, so it is not recorded as a rebuttal; record a cross-file fix with --thread <id> --disposition fixed --commit <sha> (#2555)" >&2
+          k=$((k + 1))
+          continue
+        fi
         echo "rebuttal-recorded"
         return
       fi

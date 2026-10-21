@@ -2472,7 +2472,10 @@ echo
 echo "Test 2555-A: a 'Fixed' reply with the fix in another file is not recorded as a rebuttal"
 for reply in \
   'Fixed in a4c3e4ca (head ab17bfa2). Disposition: required; the glossary entry now lives in CONTEXT.md.' \
-  '  fixed by moving the glossary entry to CONTEXT.md in a4c3e4ca; nothing else changed here.'; do
+  '  fixed by moving the glossary entry to CONTEXT.md in a4c3e4ca; nothing else changed here.' \
+  'FIXED in a4c3e4ca (head ab17bfa2); the glossary entry now lives in CONTEXT.md.' \
+  '**Fixed** in a4c3e4ca; the glossary entry now lives in CONTEXT.md.' \
+  'Fixed: the glossary entry now lives in CONTEXT.md, see a4c3e4ca on this PR.'; do
   t2555_run "$SCRATCH/t2555a.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
   if [ "$rc" -eq 3 ] \
      && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
@@ -2547,6 +2550,23 @@ else
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
+
+echo
+echo "Test 2555-E: a rebuttal that merely begins with the letters of 'Fixed' is still a rebuttal (Codex P2 on #2599)"
+for reply in \
+  'Fixed-width inputs cannot reach this branch; the finding does not apply to this spec line.' \
+  'Fixedly anchored definitions are the point of this spec; the glossary defers to it, no change.'; do
+  t2555_run "$SCRATCH/t2555e.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
+  if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+     && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+     && ! grep -q "$T2555_WARN" <<<"$out"; then
+    pass=$((pass + 1)); echo "  PASS: not a fix claim, recorded as a rebuttal with no warning: ${reply:0:30}..."
+  else
+    fail=$((fail + 1)); echo "  FAIL: '${reply:0:30}...' was treated as a fix claim (rc=$rc)" >&2
+    echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+    echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+  fi
+done
 
 echo
 if [ "$fail" -eq 0 ]; then
