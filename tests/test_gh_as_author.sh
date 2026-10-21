@@ -604,8 +604,8 @@ GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' GH_AS_A
 GH_API_PULLS_RC=1 dup_case "with --repo an unreadable REST list refuses" 1 no "$DUP_BODY" --repo example/repo
 # gh accepts the repository flag before the verb (`gh --repo o/r pr create`);
 # the check must read that repository, not the checkout's (Codex on #2576).
-GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
-  dup_case "a --repo given before the verb is read by the check" 7 no "$DUP_BODY" --repo other/repo
+# These two cases place the flag before the verb themselves: dup_case appends
+# its arguments after it (CodeRabbit on #2576).
 reset_log
 set +e
 OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_VIEW_AUTHOR="nathanjohnpayne" GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12","state":"open"}]]' \
