@@ -2153,6 +2153,10 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
       return 1
     fi
   fi
+  if [ "$rc" -ne 0 ] && [ "$mode" = inline ] && [ "$body" = '@codex review' ] && [ "$TRIGGER_POSTED" != true ] \
+     && grep -Eqx '\[codex-review-request\] ERROR: trigger not authorized: (concurrent-request|existing-trigger)' <<< "$output"; then
+    die 3 "another guarded Codex request for $REPO#$PR_NUMBER posted first (#1362); this run posted nothing. Rerun to poll that request instead of adding one: $output"
+  fi
   [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
   AUTHOR_COMMENT_OUTPUT="$output"
 }
@@ -2683,6 +2687,19 @@ post_codex_trigger() {
     live=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha) \
       || die 3 "cannot fence the authorized trigger head"
     [ "$live" = "$expected" ] || die 3 "trigger head moved during authorization"
+    # #1362: this pass runs inside the wrapper's per-PR claim. The canonical
+    # requester names the request generation it decided to post against; a
+    # request that landed since (a concurrent requester that won the claim,
+    # or one typed in the web UI) refuses this one rather than adding a
+    # second. An absent or unreadable generation fails closed.
+    local observed="${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" current
+    current=$(crqe_trigger_generation "$request_comments" "$AUTHOR_IDENTITY") \
+      || die 3 "cannot read the Codex request generation for authorization"
+    if ! jq -en --argjson observed "${observed:-null}" --argjson current "$current" \
+         '($observed | type) == "array" and $observed == $current' >/dev/null 2>&1; then
+      jq -n '{authorized:false,reason:"concurrent-request"}'
+      die 3 "trigger not authorized: concurrent-request"
+    fi
     jq -n --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" \
       '{authorized:true,repo:$repo,pr_number:$pr,head_sha:$head,author_identity:$author}'
     exit 0
@@ -2707,9 +2724,15 @@ post_codex_trigger() {
   if [ "$TRIGGER_POSTED" != true ]; then
     record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
   fi
+  # #1362: the wrapper's claimed recount refuses this write if the request
+  # generation it was decided against has changed since this read.
+  local observed_generation
+  observed_generation=$(crqe_trigger_generation "$request_comments" "$AUTHOR_IDENTITY") \
+    || die 3 "cannot read the Codex request generation; refusing a new '@codex review' trigger"
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
+    MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$observed_generation" \
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
