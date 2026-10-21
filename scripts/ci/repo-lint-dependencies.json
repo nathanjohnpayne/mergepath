@@ -199,6 +199,7 @@
     "check_codex_p1_gate": [
       "tests/test_codex_p1_gate.sh",
       "tests/test_codex_p1_workflow_runtime.sh",
+      "tests/test_codex_p1_pending.sh",
       "tests/test_feedback_archive_relay_source.sh",
       ".github/workflows/codex-p1-gate.yml",
       ".github/workflows/codex-feedback-archive-relay.yml",

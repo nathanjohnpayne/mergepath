@@ -3,6 +3,14 @@
 
 Exit 0 clear, 1 feedback blocked, 2 unreadable/config/head failure, 3 bounded
 snapshot recovery exhausted. No lease creation or identity/credential changes.
+
+Pending (#2618): when the caller names CODEX_P1_PENDING_VERDICT_FILE, the
+driver removes that file first and writes exactly `pending` there only when
+the verdict it published is rc 1, the gate wrote `pending` to its own private
+verdict file on that same attempt (codex-p1-gate.sh's MERGEPATH_GATE_VERDICT_FILE
+contract: the only blocker is a non-blocking finding awaiting disposition), and
+the lease PATCH that closed the generation red succeeded. A drifted attempt's
+file never counts, and every other outcome leaves the caller's file absent.
 """
 import fcntl
 import os
@@ -42,6 +50,16 @@ def transport():
 # recognized providers and non-ignored tiers) is the accounting spec's, so the
 # title does not restate it.
 ACCOUNTING_FAILURE = 'review feedback is unaccounted'
+PENDING_ENV = 'CODEX_P1_PENDING_VERDICT_FILE'
+GATE_VERDICT_ENV = 'MERGEPATH_GATE_VERDICT_FILE'
+
+
+def read_pending(path):
+    """True only when the gate wrote exactly `pending` to its private file."""
+    try:
+        return path.read_text() in ('pending', 'pending\n')
+    except OSError:
+        return False
 
 
 def verdict_title(gate_rc, gate_text):
@@ -72,10 +90,18 @@ def main():
     if not real_gh:
         print('gh is unavailable; cannot close the existing check lease', file=sys.stderr)
         return 2
+    pending_out = os.environ.get(PENDING_ENV, '')
+    if pending_out:
+        # A stale file from an earlier run must never speak for this one.
+        try:
+            os.unlink(pending_out)
+        except FileNotFoundError:
+            pass
     start = time.monotonic()
     deadline = start + SECONDS
     messages = []
     rc = 2
+    pending = False
     title = 'Codex feedback gate — evaluation failed closed'
     with tempfile.TemporaryDirectory(prefix='codex-p1-snapshot-') as tmp:
         counter = Path(tmp, 'count')
@@ -85,12 +111,16 @@ def main():
         env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'],
                    SNAPSHOT_REAL_GH=real_gh, SNAPSHOT_API_COUNTER=str(counter),
                    SNAPSHOT_EXHAUSTED=str(exhausted), CODEX_P1_EXPECTED_HEAD_SHA=head)
+        # The gate is asked for the pending distinction only through a private
+        # per-attempt file, never through anything inherited.
+        env.pop(GATE_VERDICT_ENV, None)
+        env.pop(PENDING_ENV, None)
 
-        def run(command):
+        def run(command, extra_env=None):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise Exhausted('180-second recovery deadline reached')
-            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+            process = subprocess.Popen(command, env=dict(env, **(extra_env or {})), stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
                 out, err = process.communicate(timeout=remaining)
@@ -125,7 +155,9 @@ def main():
                 pinned_head()
                 before = fingerprint()
                 mark = len(messages)
-                gate_rc, output = run(['scripts/codex-p1-gate.sh', pr, repo])
+                verdict_file = Path(tmp, f'verdict-{attempt}')
+                gate_env = {GATE_VERDICT_ENV: str(verdict_file)} if pending_out else None
+                gate_rc, output = run(['scripts/codex-p1-gate.sh', pr, repo], gate_env)
                 gate_text = '\n'.join(messages[mark:] + [output])
                 messages.append(f'Feedback snapshot attempt {attempt}/{ATTEMPTS}:\n{output}')
                 # Configuration/read errors do not become transient just because
@@ -150,6 +182,9 @@ def main():
                     continue
                 rc = gate_rc
                 title = verdict_title(gate_rc, gate_text)
+                pending = bool(pending_out) and gate_rc == 1 and read_pending(verdict_file)
+                if pending:
+                    messages.append('Only non-blocking findings await disposition, and no blocking-tier finding is open (#2618). The lease closes red and keeps the PR blocked until the disposition exists.')
                 break
         except Exhausted as error:
             rc = 3
@@ -190,8 +225,14 @@ def main():
                 print(f'::error::{diagnostic}', file=sys.stderr)
                 summary += '\n' + diagnostic
             if status == 0:
+                if pending and rc == 1 and conclusion == 'failure':
+                    try:
+                        Path(pending_out).write_text('pending\n')
+                    except OSError as error:
+                        print(f'::warning::Could not record the pending verdict ({error}); the native run fails as before.', file=sys.stderr)
                 return rc
             rc = 2
+            pending = False
             conclusion = 'failure'
             title = 'Codex feedback gate — lease publication failed'
             summary += '\nPublication failed; refusing to retry an old success.'
