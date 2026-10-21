@@ -3410,16 +3410,18 @@ def _tee_process_substitution_sidewrite(seg, shadowed_stdin=frozenset()):
     """The measured single-cat stderr operand, not general stdin dataflow."""
     if resolve_command(seg)[0] != "tee":
         return False
-    if (("tee" not in shadowed_stdin or seg._cmd_literal != "tee")
+    if (seg._cmd_literal == "tee" and "tee" not in shadowed_stdin
             and _tee_exits_without_input(seg)):
         return False
     for children in seg.tee_output_processes:
         if len(children) != 1:
             continue  # No command-list or process-substitution pipeline model.
         child = children[0]
-        if (resolve_command(child)[0] == "cat" and child._cmd_index == 0
+        if (resolve_command(child)[0] == "cat" and child._cmd_index is not None
+                and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word)
+                        for word in child.words[:child._cmd_index])
                 and child.pipe_to is None
-                and child.words[1:] in ([">&2"], ["1>&2"])):
+                and child.words[child._cmd_index + 1:] in ([">&2"], ["1>&2"])):
             return True
     return False
 
@@ -16020,7 +16022,56 @@ def _tee_process_substitution_cases():
     findings, errors = scan_text(body)
     if errors or [f.line for f in findings] != [1, body.count("\n")]:
         failures.append("tee continuation boundary: physical finding lines changed")
+    for cid, expected, body in _tee_identity_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee identity boundary: " + cid)
+    for consumer in (
+        "command cat >&2", "command -v cat >&2", "env LC_ALL=C cat >&2",
+        "LC_ALL=C command cat >&2", "LC_ALL=C cat -- >&2",
+        "A[0]=x cat >&2", "A+=x cat >&2",
+    ):
+        text = 'tee >(' + consumer + ')\n'
+        tee = next(seg for ll in Lexer(text).logical for seg in ll.segments
+                   if seg.parent is None and resolve_command(seg)[0] == "tee")
+        if _tee_process_substitution_sidewrite(tee):
+            failures.append("tee scalar prefix boundary: " + consumer)
     return failures
+
+
+def _tee_identity_cases():
+    """Unproven tee implementations and scalar-prefix cat consumers."""
+    local = (
+        "cat >tee <<'LOCAL_TEE'\n"
+        '#!/bin/sh\n'
+        'for target in "$@"; do\n'
+        '  case "$target" in /dev/fd/*) exec /bin/cat >"$target";; esac\n'
+        'done\n'
+        'LOCAL_TEE\n'
+        'chmod +x tee\n'
+    )
+    noop = "printf '#!/bin/sh\\nexit 0\\n' >tee\nchmod +x tee\n"
+    pipe = 'printf %s "$GH_TOKEN" | tee >(cat >&2) | grep -qF zz\n'
+    return [
+        ('tee-path-local-help', MUST_FLAG, local + pipe.replace('| tee >(', '| ./tee --help >(')),
+        ('tee-path-local-version', MUST_FLAG, local + pipe.replace('| tee >(', '| ./tee --version >(')),
+        ('tee-path-local-null', MUST_NOT_FLAG, local + pipe.replace('| tee >(', '| ./tee --help >(').replace('cat >&2', 'cat >/dev/null')),
+        ('tee-path-local-safe', MUST_NOT_FLAG, local + pipe.replace('| tee >(', '| ./tee --help >(').replace('"$GH_TOKEN"', 'safe')),
+        ('tee-path-local-noop', MUST_FLAG, noop + pipe.replace('| tee >(', '| ./tee --help >(')),
+        ('tee-assignment-cat-stderr', MUST_FLAG, pipe.replace('>(cat', '>(LC_ALL=C cat')),
+        ('tee-assignment-cat-multiple', MUST_FLAG, pipe.replace('>(cat', '>(LC_ALL=C EXTRA="safe value" cat')),
+        ('tee-assignment-cat-fd1', MUST_FLAG, pipe.replace('>(cat >&2)', '>(LC_ALL=C cat 1>&2)')),
+        ('tee-assignment-cat-null', MUST_NOT_FLAG, pipe.replace('>(cat >&2)', '>(LC_ALL=C cat >/dev/null)')),
+        ('tee-assignment-cat-query', MUST_NOT_FLAG, pipe.replace('>(cat', '>(LC_ALL=C command -v cat')),
+        ('tee-enclosing-brace-null-stderr', MUST_FLAG, '{ ' + pipe.rstrip() + '; } 2>/dev/null\n'),
+        ('tee-enclosing-subshell-null-stderr', MUST_FLAG, '(' + pipe.rstrip() + ') 2>/dev/null\n'),
+        ('tee-enclosing-brace-stderr', MUST_FLAG, '{ ' + pipe.rstrip() + '; }\n'),
+        ('tee-enclosing-subshell-stderr', MUST_FLAG, '(' + pipe.rstrip() + ')\n'),
+        ('tee-path-qualified-function-usr', MUST_FLAG,
+         '/usr/bin/tee(){ /bin/cat >&2; }\n' + pipe.replace('| tee >(', '| /usr/bin/tee --help >(')),
+        ('tee-path-qualified-function-bin', MUST_FLAG,
+         '/bin/tee(){ /bin/cat >&2; }\n' + pipe.replace('| tee >(', '| /bin/tee --help >(')),
+    ]
 
 
 def _tee_continuation_cases():
@@ -16062,7 +16113,7 @@ def _tee_round2_cases():
          alias + pipe.replace('tee >(', 'tee --version >(')),
         ("tee-round2-alias-null", MUST_NOT_FLAG,
          alias + pipe.replace('tee >(', 'tee --help >(').replace('cat >&2', 'cat >/dev/null')),
-        ("tee-round2-alias-qualified", MUST_NOT_FLAG,
+        ("tee-round2-alias-qualified", MUST_FLAG,
          alias + pipe.replace('tee >(', '/usr/bin/tee --help >(')),
     ]
 
@@ -16082,7 +16133,7 @@ def _tee_namespace_cases():
         for suffix, rule, pipeline in (
             ("leak", MUST_FLAG, pipe),
             ("null", MUST_NOT_FLAG, pipe.replace('cat >&2', 'cat >/dev/null')),
-            ("qualified", MUST_NOT_FLAG, pipe.replace('| tee ', '| /usr/bin/tee ')),
+            ("qualified", MUST_FLAG, pipe.replace('| tee ', '| /usr/bin/tee ')),
         )
     ]
 
@@ -16116,7 +16167,7 @@ def _tee_review_cases():
          'printf \'%s\' "$GH_TOKEN" | tee -a --help >(cat >&2) | grep -qF zz\n'),
         ("tee-review-tee-shadow", MUST_FLAG,
          'tee(){ /bin/cat >&2; }\nprintf \'%s\' "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'),
-        ("tee-review-qualified-tee-help", MUST_NOT_FLAG,
+        ("tee-review-qualified-tee-help", MUST_FLAG,
          'tee(){ /bin/cat >&2; }\nprintf \'%s\' "$GH_TOKEN" | /usr/bin/tee --help >(cat >&2) | grep -qF zz\n'),
     ]
 
@@ -17160,7 +17211,32 @@ CORPUS += _tee_review_cases()
 CORPUS += _tee_round2_cases()
 CORPUS += _tee_namespace_cases()
 CORPUS += _tee_continuation_cases()
+CORPUS += _tee_identity_cases()
 # The same reviewed case/body now records the approved conservative reduction.
+KNOWN_BROADER.update({cid: (
+    "Qualified tee paths do not prove implementation identity: Bash can invoke "
+    "a literal function even named /usr/bin/tee or /bin/tee. This unchanged "
+    "quiet own fixture is conservatively flagged in all three shapes after "
+    "withholding optional qualified exit proof. Precision is deferred to "
+    "https://github.com/nathanjohnpayne/mergepath/issues/2670"
+) for cid in (
+    "tee-review-qualified-tee-help", "tee-round2-alias-qualified",
+    "tee-round2-setup-eval-qualified", "tee-round2-setup-source-qualified",
+    "tee-round2-setup-dot-qualified",
+)})
+KNOWN_BROADER["tee-path-local-noop"] = (
+    "This local executable is natively quiet in all three shapes, but a "
+    "qualified tee name has no optional exit-only proof. No executable "
+    "contents or binding model is inferred; precision is deferred to "
+    "https://github.com/nathanjohnpayne/mergepath/issues/2670"
+)
+KNOWN_BROADER.update({cid: (
+    "The process side-write inventory retains the credential reference despite "
+    "this measured enclosing stderr-null sink in all three shapes. Enclosing "
+    "fd precision is deferred to https://github.com/nathanjohnpayne/mergepath/issues/2699; no general fd-flow model is added."
+) for cid in (
+    "tee-enclosing-brace-null-stderr", "tee-enclosing-subshell-null-stderr",
+)})
 KNOWN_BROADER.update({
     "tee-continuation-suffix": (
         "The inherited literal-file policy flags a continued pathname suffix "
@@ -17253,6 +17329,14 @@ KNOWN_MISS_SHAPES = {
 }
 
 KNOWN_BROADER_SHAPES = {
+    'tee-review-qualified-tee-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-round2-alias-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-round2-setup-eval-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-round2-setup-source-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-round2-setup-dot-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-path-local-noop': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-enclosing-brace-null-stderr': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-enclosing-subshell-null-stderr': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-continuation-suffix': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-deferred-target-options': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-deferred-herestring-options': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
