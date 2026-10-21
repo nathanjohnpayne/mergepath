@@ -152,11 +152,14 @@ else
 
   # Consumer-shape inputs select the complete consumer replay (the sharded
   # deep_consumer_replay job) without forcing every self-test; a change to
-  # the bootstrap exclusion list also selects its own wrapper.
+  # the bootstrap exclusion list also selects its own wrapper (and, since
+  # #2580, every other wrapper whose suites name it).
   manifest_scope=$(classify pull_request .mergepath-sync.yml | LC_ALL=C sort | tr '\n' ' ')
   mirror_scope=$(classify pull_request scripts/bootstrap/template-mirror.sh | LC_ALL=C sort | tr '\n' ' ')
+  mirror_checks=$(scope_value checks pull_request scripts/bootstrap/template-mirror.sh)
   if [ "$manifest_scope" = "checks=[] consumer_replay=true deep=true full=false self_tests=false " ] \
-     && [ "$mirror_scope" = 'checks=["check_bootstrap_template_mirror"] consumer_replay=true deep=true full=false self_tests=false ' ]; then
+     && case "$mirror_scope" in *"consumer_replay=true deep=true full=false "*) true ;; *) false ;; esac \
+     && jq -e 'index("check_bootstrap_template_mirror") != null' <<<"$mirror_checks" >/dev/null 2>&1; then
     pass "consumer-shape inputs select the complete consumer replay without the full surface"
   else
     fail "manifest/bootstrap-exclusion changes must select consumer_replay=true with full=false (manifest: $manifest_scope; mirror: $mirror_scope)"
@@ -311,6 +314,53 @@ else
       pass "every top-level script a declared wrapper or its suites name is declared under that wrapper ($script_edges edges)"
     else
       fail "scripts named by a wrapper or its suites but not declared under that wrapper in repo-lint-dependencies.json (declare each under that wrapper; #2580; edges=$script_edges, gh-as-author witness=$gh_as_author_witness, wrapper-direct witness=$wrapper_direct_witness):$script_gaps"
+    fi
+
+    # Libraries (scripts/lib/*.sh, scripts/bootstrap/*.sh) follow the same
+    # rule once declared under ANY wrapper: a partial declaration is what
+    # makes CI select that wrapper alone and skip the others whose suites
+    # name the library (#1839: dependabot-commit-provenance.sh was declared
+    # only under check_merge_clearance_gate). Adding a wrapper to a declared
+    # library only widens CI's selection. A library no wrapper declares is
+    # left alone: CI keeps the complete surface for it, and declaring it
+    # safely needs the wrappers of every script that sources it, which a
+    # name scan cannot see.
+    all_patterns=$(jq -r '.wrappers[][]' "$DEPENDENCIES")
+    declared_libs=$(find "$ROOT/scripts/lib" "$ROOT/scripts/bootstrap" -maxdepth 1 -type f -name '*.sh' 2>/dev/null \
+      | sed "s|^$ROOT/||" | LC_ALL=C sort -u | while IFS= read -r lib; do
+          if matches_any_glob "$lib" "$all_patterns"; then printf '%s\n' "$lib"; fi
+        done)
+    lib_gaps=""
+    lib_edges=0
+    provenance_witness=0
+    while IFS= read -r wrapper; do
+      [ -n "$wrapper" ] || continue
+      [ -f "$ROOT/scripts/ci/$wrapper" ] || continue
+      wrapper_patterns=$(jq -r --arg w "$wrapper" '.wrappers[$w][]' "$DEPENDENCIES")
+      suites=$(grep -o 'tests/test_[A-Za-z0-9_]*\.\(sh\|py\|cjs\)' "$ROOT/scripts/ci/$wrapper" | LC_ALL=C sort -u || true)
+      named=$({
+          grep -o 'scripts/\(lib\|bootstrap\)/[A-Za-z0-9_.-]*\.sh' "$ROOT/scripts/ci/$wrapper" || true
+          while IFS= read -r suite; do
+            [ -n "$suite" ] && [ -f "$ROOT/$suite" ] || continue
+            grep -o 'scripts/\(lib\|bootstrap\)/[A-Za-z0-9_.-]*\.sh' "$ROOT/$suite" || true
+          done <<<"$suites"
+        } | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(printf '%s\n' "$declared_libs"))
+      while IFS= read -r lib; do
+        [ -n "$lib" ] || continue
+        if matches_any_glob "$lib" "$full_trigger_patterns"; then
+          continue
+        fi
+        lib_edges=$((lib_edges + 1))
+        if [ "$wrapper" = check_workflow_parsers ] && [ "$lib" = scripts/lib/dependabot-commit-provenance.sh ]; then
+          provenance_witness=1
+        fi
+        matches_any_glob "$lib" "$wrapper_patterns" || lib_gaps="$lib_gaps $wrapper:$lib"
+      done <<<"$named"
+    done < <(jq -r '.wrappers | keys[]' "$DEPENDENCIES")
+    if [ -z "$lib_gaps" ] && [ "$lib_edges" -gt 0 ] && [ "$provenance_witness" -eq 1 ]; then
+      pass "every declared library is declared under each wrapper that it or its suites name ($lib_edges edges)"
+    else
+      fail "declared libraries missing from a wrapper that names them, which CI then skips (declare each under that wrapper; #1839, #2580; edges=$lib_edges, provenance witness=$provenance_witness):$lib_gaps"
     fi
   fi
 
@@ -494,10 +544,11 @@ else
     fail "shared auto-clear self-test inputs must select check_auto_clear_workflow"
   fi
 
+  # At least these two source it; since #2580 every other wrapper whose
+  # suites name it is selected as well.
   selected=$(scope_value checks pull_request scripts/lib/gh-command-classifier.sh)
   if jq -e '
-      length == 2
-      and (index("check_auto_clear_workflow") != null)
+      (index("check_auto_clear_workflow") != null)
       and (index("check_self_approval_detector") != null)
     ' <<<"$selected" >/dev/null 2>&1; then
     pass "the command classifier selects every wrapper that sources it"

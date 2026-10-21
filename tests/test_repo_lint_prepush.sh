@@ -323,6 +323,14 @@ while IFS='|' read -r id branch paths undeclared; do
       *"UNDECLARED PATH: "*"CI's lint runs the complete surface"*) ok "[$id] the undeclared path is announced" ;;
       *) bad "[$id] no undeclared-path notice: $(cat "$TMP/plan_err.$id")" ;;
     esac
+    notice=$(sed -n '/UNDECLARED PATH:/p' "$TMP/plan_err.$id")
+    while IFS= read -r upath; do
+      [ -n "$upath" ] || continue
+      case "$notice" in
+        *"$upath"*) ok "[$id] the notice names $upath" ;;
+        *) bad "[$id] the undeclared-path notice omits $upath: $notice" ;;
+      esac
+    done < <(printf '%s\n' "$undeclared" | tr ';' '\n')
   else
     check "[$id] no local scope without an undeclared path" "$(grep -c '^local_scope' "$TMP/plan.$id" || true)" "0"
   fi
