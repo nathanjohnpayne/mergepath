@@ -5148,7 +5148,8 @@ def _text_enables_xtrace(text, outer_only=False):
 def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
               _uncertain_eval_output=False):
     """Return (findings, pragma_errors)."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Preserve lone CR as shell data; only CRLF has established normalization.
+    text = text.replace("\r\n", "\n")
     helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
     lx = Lexer(text)
     findings = []
@@ -5638,6 +5639,8 @@ def shell_file_operands(text):
     the operand, so the fragment behind it kept its non-shell classification
     and was never read while bash executed it (#1032 round 3 P1).
     """
+    # This discovery lexer receives raw text, independently of scan_text.
+    text = text.replace("\r\n", "\n")
     out = []
     lx = Lexer(text)
     for ll in lx.logical:
@@ -5672,7 +5675,8 @@ def source_operands(text):
 
 
 def _read_text(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    # Keep raw line endings until the separate scan/discovery lexer entries.
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
         return fh.read()
 
 
@@ -5825,8 +5829,7 @@ def scan_tree(root):
     findings = []
     for p in shell:
         try:
-            with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
+            text = _read_text(p)
         except OSError as exc:
             errors.append("%s: unreadable: %s" % (p, exc))
             continue
@@ -14341,8 +14344,8 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None, sample=None, fix
     path = os.path.join(workdir, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     text = (shebang if shebang is not None else oracle_prologue(sample)) + body
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    with open(path, "wb") as fh:
+        fh.write(text.encode("utf-8"))
     os.chmod(path, 0o755)
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -15823,6 +15826,134 @@ def _pid_continuation_cases():
     return failures
 
 
+def _line_ending_normalization_cases(tmp, observe=None):
+    """Raw reads and each lexer entry retain the lone CR before CRLF."""
+    global Lexer
+
+    failures = []
+    text = '# boundary\r\r\nprintf safe\n'
+    expected = text.replace("\r\n", "\n")
+    root = os.path.join(tmp, "normalize-once")
+    path = os.path.join(root, "scripts", "fixture.sh")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(text.encode("utf-8"))
+    preserved = _read_text(path) == text
+    if not preserved:
+        failures.append("line ending raw read: CR/CRLF bytes changed before lexing")
+    original = Lexer
+    seen = []
+
+    def observe_lexer(source):
+        if source.startswith("# boundary"):
+            seen.append(source)
+        return original(source)
+
+    try:
+        Lexer = observe_lexer
+        for label, action in (
+            ("direct", lambda: scan_text(text)),
+            ("discovery", lambda: shell_file_operands(text)),
+            ("tree", lambda: scan_tree(root)),
+        ):
+            seen.clear()
+            action()
+            passed = bool(seen) and all(source == expected for source in seen)
+            if not passed:
+                failures.append("line ending %s: expected one normalization, got %r" % (label, seen))
+            if observe is not None:
+                observe(dict(cid="normalize-once-" + label, raw_read_preserved=preserved,
+                             expected=repr(expected), observed=[repr(source) for source in seen],
+                             passed=passed and preserved))
+    finally:
+        Lexer = original
+    return failures
+
+
+def _line_ending_ingress_cases(tmp, run_programs=True, observe=None):
+    """Exact bytes distinguish direct scanning, tree reads and promotion."""
+    import hashlib
+
+    failures = []
+    for cid, rule, body in CORPUS:
+        if not cid.startswith("line-ending-"):
+            continue
+        root = os.path.join(tmp, cid)
+        path = os.path.join(root, "scripts", "fixture.sh")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        text = oracle_prologue() + body
+        raw = text.encode("utf-8")
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        with open(path, "rb") as fh:
+            exact = fh.read() == raw
+        direct, direct_errors = scan_text(text, cid)
+        tree, tree_errors, count = scan_tree(root)
+        expected = rule == MUST_FLAG
+        line = oracle_prologue().count("\n") + (2 if "heredoc" in cid else 3)
+        read_preserved = _read_text(path) == text
+        passed = (exact and read_preserved and not direct_errors and not tree_errors
+                  and bool(direct) == expected and bool(tree) == expected and count == 1
+                  and all(f.line == line for f in direct + tree))
+        if observe is not None:
+            observe(dict(cid=cid, bytes_sha256=hashlib.sha256(raw).hexdigest(), exact_bytes=exact,
+                         read_preserved=read_preserved, direct_lines=[f.line for f in direct],
+                         direct_errors=direct_errors, tree_lines=[f.line for f in tree],
+                         tree_errors=tree_errors, count=count, passed=passed))
+        if not passed:
+            failures.append("line ending ingress %s: exact=%s preserved=%s direct=%s/%s tree=%s/%s count=%d" %
+                            (cid, exact, read_preserved, [f.line for f in direct], direct_errors,
+                             [f.line for f in tree], tree_errors, count))
+
+    for cid, body, expected in (
+        ("lone-cr-promoted", ': # \r read x <<EOF\n. ./payload.env\nEOF\n', True),
+        ("lone-cr-comment-data", ': # \r. ./payload.env\n', False),
+        ("crlf-promoted", '. ./payload.env\r\n', True),
+    ):
+        root = os.path.join(tmp, cid)
+        entry = os.path.join(root, "scripts", "main.sh")
+        os.makedirs(os.path.dirname(entry), exist_ok=True)
+        payload = os.path.join(root, "scripts", "payload.env")
+        entry_raw = (oracle_prologue() + body).encode("utf-8")
+        payload_raw = b'echo "$GH_TOKEN"\n'
+        with open(entry, "wb") as fh:
+            fh.write(entry_raw)
+        with open(payload, "wb") as fh:
+            fh.write(payload_raw)
+        with open(entry, "rb") as fh:
+            exact = fh.read() == entry_raw
+        with open(payload, "rb") as fh:
+            exact = exact and fh.read() == payload_raw
+        shell, discovery_errors, _roots = discover_shell_files(root)
+        findings, errors, count = scan_tree(root)
+        expected_count = 2 if expected else 1
+        passed = (exact and not discovery_errors and not errors and len(shell) == expected_count
+                  and count == expected_count and bool(findings) == expected
+                  and all(f.path == "scripts/payload.env" and f.line == 1 for f in findings))
+        leaked = out = err = None
+        # This CRLF source-operand case pins established discovery
+        # compatibility, like fs-crlf; it is not a raw Bash execution claim.
+        if run_programs and cid != "crlf-promoted":
+            leaked, out, err = run_oracle(body, root, "scripts/main.sh")
+            passed = passed and leaked is expected
+            with open(entry, "rb") as fh:
+                passed = passed and fh.read() == (oracle_prologue() + body).encode("utf-8")
+        if observe is not None:
+            observe(dict(cid=cid, expected=expected, discovery_count=len(shell), count=count,
+                         exact_bytes=exact, entry_sha256=hashlib.sha256(entry_raw).hexdigest(),
+                         payload_sha256=hashlib.sha256(payload_raw).hexdigest(),
+                         discovery_errors=discovery_errors, errors=errors,
+                         findings=[str(f) for f in findings], leaked=leaked,
+                         oracle_run=run_programs and cid != "crlf-promoted",
+                         stdout=out, stderr=err, passed=passed))
+        if not passed:
+            failures.append("line ending promotion %s: discovered=%d/%s scanned=%d/%s findings=%s leaked=%s stdout=%r stderr=%r" %
+                            (cid, len(shell), discovery_errors, count, errors,
+                             [str(f) for f in findings], leaked, out, err))
+    failures.extend(_line_ending_normalization_cases(tmp, observe=observe))
+    return failures
+
+
 def _leading_herestring_cases():
     """Here-string operands precede commands; here-doc delimiters are absent."""
     failures = []
@@ -16693,6 +16824,17 @@ CORPUS += [
     ("herestring-descriptor-empty-double", MUST_NOT_FLAG, '<<< "" : "$GH_TOKEN"\n'),
     ("herestring-descriptor-empty-emitter", MUST_FLAG, '<<< \'\' echo "$GH_TOKEN"\n'),
     ("herestring-descriptor-empty-variable-command", MUST_FLAG, 'cmd=echo; <<< "" "$cmd" "$GH_TOKEN"\n'),
+]
+
+
+# #1466: only the contested separator changes; other command endings stay LF.
+CORPUS += [
+    ("line-ending-lone-cr-heredoc", MUST_FLAG, ': # \r read x <<EOF\necho "$GH_TOKEN"\nEOF\n'),
+    ("line-ending-lf-heredoc", MUST_NOT_FLAG, ': # \n read x <<EOF\necho "$GH_TOKEN"\nEOF\n'),
+    ("line-ending-crlf-heredoc", MUST_NOT_FLAG, ': # \r\n read x <<EOF\necho "$GH_TOKEN"\nEOF\n'),
+    ("line-ending-lone-cr-xtrace", MUST_FLAG, 'set -x\n: # \rset +x\n: "$GH_TOKEN"\n'),
+    ("line-ending-lf-xtrace", MUST_NOT_FLAG, 'set -x\n: # \nset +x\n: "$GH_TOKEN"\n'),
+    ("line-ending-crlf-xtrace", MUST_NOT_FLAG, 'set -x\n: # \r\nset +x\n: "$GH_TOKEN"\n'),
 ]
 
 
@@ -18156,6 +18298,7 @@ def self_test():
         failures.extend(_shebang_xtrace_cases())
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_shell_file_promotion_cases(tmp))
+        failures.extend(_line_ending_ingress_cases(tmp))
         failures.extend(_path_independence_case(tmp))
 
     failures.extend(_sentinel_window_cases())
