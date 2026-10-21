@@ -226,7 +226,7 @@ fi
 # treat the null data as "no protection".
 out=$(GH_CLASSIC=gqlerror GH_RULESETS=fail br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'not accessible'; then
+   && grep -q 'not accessible' <<<"$out"; then
   pass "a GraphQL errors payload counts as an unreadable surface and keeps its message"
 else
   fail "GraphQL errors payload: expected unknown carrying the message, got $out"
@@ -279,7 +279,7 @@ out=$(GH_CLASSIC=ok GH_RULESETS=ok \
   GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'non-array'; then
+   && grep -q 'non-array' <<<"$out"; then
   pass "a 2xx object body is classified as an unread rulesets surface, not an empty one"
 else
   fail "non-array rulesets page: expected unknown naming the shape, got $out"
@@ -299,7 +299,7 @@ do
     GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
     br_required_checks owner/repo main)
   if [ "$(field "$out" .state)" = "unknown" ] \
-     && printf '%s' "$out" | grep -q 'malformed'; then
+     && grep -q 'malformed' <<<"$out"; then
     pass "a malformed required_status_checks rule is an unread surface, not an empty one"
   else
     fail "malformed rule ($malformed): expected unknown, got $out"
@@ -326,7 +326,7 @@ out=$(GH_CLASSIC=ok GH_RULESETS=empty \
   GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'no pages at all'; then
+   && grep -q 'no pages at all' <<<"$out"; then
   pass "an empty rulesets response is an unread surface, not an empty rule set"
 else
   fail "empty rulesets stream: expected unknown, got $out"
@@ -355,7 +355,7 @@ out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=byp
   GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'bypass actors'; then
+   && grep -q 'bypass actors' <<<"$out"; then
   pass "a ruleset with bypass actors leaves the viewer-scoped response unproven, so the union is unknown"
 else
   fail "bypassable ruleset: expected unknown naming the bypass actors, got $out"
@@ -420,7 +420,7 @@ out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=omi
   GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
   br_required_checks owner/repo main)
 if [ "$(field "$out" .state)" = "unknown" ] \
-   && printf '%s' "$out" | grep -q 'bypass_actors array'; then
+   && grep -q 'bypass_actors array' <<<"$out"; then
   pass "an omitted bypass_actors leaves completeness unproven rather than reading as empty"
 else
   fail "omitted bypass_actors: expected unknown, got $out"

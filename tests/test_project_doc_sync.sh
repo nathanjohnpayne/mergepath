@@ -78,9 +78,9 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "initial audit should report missing generated mirrors (rc=$rc): $out"
-echo "$out" | grep -q "MISS  app prd:app" \
+grep -q "MISS  app prd:app" <<<"$out" \
   || fail "initial audit should report missing app PRD mirror: $out"
-echo "$out" | grep -q "MISS  app spec:feature" \
+grep -q "MISS  app spec:feature" <<<"$out" \
   || fail "initial audit should report missing app spec mirror: $out"
 
 set +e
@@ -88,7 +88,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "unknown project filter should fail closed (rc=$rc): $out"
-echo "$out" | grep -q "unknown project in --projects: typo" \
+grep -q "unknown project in --projects: typo" <<<"$out" \
   || fail "unknown project filter should name the bad slug: $out"
 
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >"$WORKDIR/project-doc-sync-materialize.out"
@@ -171,7 +171,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "audit should catch orphaned generated spec mirror (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app spec:old orphan" \
+grep -q "DRIFT app spec:old orphan" <<<"$out" \
   || fail "orphan generated spec mirror should report drift: $out"
 
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
@@ -192,7 +192,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "audit should catch orphaned generated PRD mirror (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app prd:legacy orphan" \
+grep -q "DRIFT app prd:legacy orphan" <<<"$out" \
   || fail "orphan generated PRD mirror should report drift: $out"
 
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
@@ -246,7 +246,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$SYMLINK_MP" MERGEPATH_PROJECT_DOCS_CACHE="$CACHE
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "audit should refuse symlinked cache checkout (rc=$rc): $out"
-echo "$out" | grep -qi "symbolic link" \
+grep -qi "symbolic link" <<<"$out" \
   || fail "symlinked cache refusal should name the symlink cause, not just exit 2: $out"
 
 printf '\nlocal edit\n' >>"$DOCS/projects/app/specs/feature.md"
@@ -255,7 +255,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "audit should catch manually edited generated spec mirror (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app spec:feature" \
+grep -q "DRIFT app spec:feature" <<<"$out" \
   || fail "manual central spec edit should report drift: $out"
 
 # ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "F1 audit should flag orphan PRD mirror after prds mapping removed (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app prd:app orphan" \
+grep -q "DRIFT app prd:app orphan" <<<"$out" \
   || fail "F1: orphan PRD mirror not reported after prds mapping removed: $out"
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
 [ ! -e "$APP/docs/projects/app/prds/app.md" ] \
@@ -330,7 +330,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "F2 audit should flag orphan spec mirror after specs mapping removed (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app spec:feature orphan" \
+grep -q "DRIFT app spec:feature orphan" <<<"$out" \
   || fail "F2: orphan spec mirror not reported after specs mapping removed: $out"
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
 [ ! -e "$DOCS/projects/app/specs/feature.md" ] \
@@ -345,7 +345,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "F4 audit should flag orphan spec mirror when source emptied (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT app spec:feature orphan" \
+grep -q "DRIFT app spec:feature orphan" <<<"$out" \
   || fail "F4: orphan spec mirror not reported when source emptied: $out"
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
 [ ! -e "$DOCS/projects/app/specs/feature.md" ] \
@@ -369,7 +369,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "F3 full audit should flag central spec mirror of a removed project (rc=$rc): $out"
-echo "$out" | grep -q "app spec:feature orphan (project not in manifest)" \
+grep -q "app spec:feature orphan (project not in manifest)" <<<"$out" \
   || fail "F3: removed-project central spec mirror not reported: $out"
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize >/dev/null
 [ ! -e "$DOCS/projects/app/specs/feature.md" ] \
@@ -432,7 +432,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --material
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "traversal mirror path should fail closed (rc=$rc): $out"
-echo "$out" | grep -q "traversal component" || fail "traversal path should be named in the error: $out"
+grep -q "traversal component" <<<"$out" || fail "traversal path should be named in the error: $out"
 [ ! -e "$WORKDIR/escape.md" ] && [ ! -e "$APP/escape.md" ] \
   || fail "traversal path must never be written"
 restore_manifest; resync
@@ -490,7 +490,7 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "owner.name with '..' should fail closed (rc=$rc): $out"
-echo "$out" | grep -q "traversal component" || fail "name traversal should be named in the error: $out"
+grep -q "traversal component" <<<"$out" || fail "name traversal should be named in the error: $out"
 restore_manifest; resync
 
 # ---------------------------------------------------------------------------
@@ -620,7 +620,7 @@ out=$(fm_sync --audit --no-clone 2>&1)
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "front matter: audit should catch a manual mirror edit (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT fm prd:fm " \
+grep -q "DRIFT fm prd:fm " <<<"$out" \
   || fail "front matter: manual mirror edit should report drift: $out"
 fm_sync --materialize >/dev/null
 
@@ -645,7 +645,7 @@ out=$(fm_sync --audit --no-clone 2>&1)
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "front matter: header-first mirror should be drift (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT fm prd:fm " \
+grep -q "DRIFT fm prd:fm " <<<"$out" \
   || fail "front matter: header-first mirror should report drift, not orphan: $out"
 fm_sync --materialize >/dev/null
 cmp -s "$WORKDIR/fm-prd.before" "$FM_PRD" \
@@ -660,9 +660,9 @@ out=$(fm_sync --audit --no-clone 2>&1)
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "front matter: audit should flag orphan mirrors (rc=$rc): $out"
-echo "$out" | grep -q "DRIFT fm prd:stale orphan" \
+grep -q "DRIFT fm prd:stale orphan" <<<"$out" \
   || fail "front matter: front-matter-first orphan not reported: $out"
-echo "$out" | grep -q "DRIFT fm prd:stale-legacy orphan" \
+grep -q "DRIFT fm prd:stale-legacy orphan" <<<"$out" \
   || fail "front matter: header-first orphan not reported: $out"
 fm_sync --materialize >/dev/null
 [ ! -e "$FM_APP/docs/projects/fm/prds/stale.md" ] \
@@ -676,7 +676,7 @@ set +e
 out=$(fm_sync --audit --no-clone 2>&1)
 rc=$?
 set -e
-echo "$out" | grep -q "DRIFT fm spec:fm-spec orphan" \
+grep -q "DRIFT fm spec:fm-spec orphan" <<<"$out" \
   || fail "front matter: front-matter-first spec orphan not reported (rc=$rc): $out"
 fm_sync --materialize >/dev/null
 [ ! -e "$FM_SPEC" ] || fail "front matter: materialize should remove the spec orphan"

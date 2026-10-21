@@ -278,7 +278,7 @@ fi
 # --- 2: one context missing is still a recovery case -----------------------
 echo; echo "--- 2: only Label Gate reported -> still nudge"
 run_nudge open sha222 "$VALID_BODY" "$ONLY_GATE"
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$OUT" | grep -q "Self-Review Required"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && grep -q "Self-Review Required" <<<"$OUT"; then
   pass "a partially-reported head is nudged and names the missing context"
 else
   fail "expected rc=0 naming the missing context; rc=$RC out='$OUT' err='$ERR'"
@@ -426,7 +426,7 @@ run_nudge closed sha888 "$VALID_BODY" "$NEITHER"
 # The trailing assertion is not cosmetic bookkeeping: `die` takes the exit
 # code as its second argument, so a `$*` there silently appends the status to
 # every error line the operator reads.
-if [ "$RC" = 1 ] && [ "$WROTE" = 0 ] && ! printf '%s' "$ERR" | grep -q "not open 1"; then
+if [ "$RC" = 1 ] && [ "$WROTE" = 0 ] && ! grep -q "not open 1" <<<"$ERR"; then
   pass "a closed PR is refused, and the message does not leak the exit code"
 else
   fail "expected rc=1, no edit, and a clean message; rc=$RC wrote=$WROTE err='$ERR'"
@@ -499,7 +499,7 @@ done
 
 echo "--- 12: a failed edit is reported as a failure, not as a nudge"
 run_nudge open shaccc "$VALID_BODY" "$NEITHER" STUB_EDIT_RC=1
-if [ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q "was not nudged"; then
+if [ "$RC" = 2 ] && grep -q "was not nudged" <<<"$ERR"; then
   pass "a failed write does not report success"
 else
   fail "expected rc=2 saying the workflow was not nudged; rc=$RC err='$ERR'"
@@ -519,7 +519,7 @@ fi
 echo "--- 14: a validator that cannot RUN -> rc 2, no write (127 is infra, not 'invalid')"
 run_nudge open shaddd "$VALID_BODY" "$NEITHER" \
   MERGEPATH_NUDGE_VALIDATE_BIN="$TMP/bin/validate-broken.sh"
-if [ "$RC" = 2 ] && [ "$WROTE" = 0 ] && printf '%s' "$ERR" | grep -q "could not run"; then
+if [ "$RC" = 2 ] && [ "$WROTE" = 0 ] && grep -q "could not run" <<<"$ERR"; then
   pass "a validator exiting 127 fails closed instead of reading as a nonzero-to-nonzero delta"
 else
   fail "expected rc=2 with no edit and a could-not-run message; rc=$RC wrote=$WROTE err='$ERR'"
@@ -557,7 +557,7 @@ echo "--- 17: a concurrent body edit -> rc 5, no write"
 # is a body mutation far outside the one marker this script may make.
 printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: an edit someone else just made\n' > "$TMP/live-body.txt"
 run_nudge open shaggg "$VALID_BODY" "$NEITHER" STUB_LIVE_BODY_FILE="$TMP/live-body.txt"
-if [ "$RC" = 5 ] && [ "$WROTE" = 0 ] && printf '%s' "$ERR" | grep -q "changed while this ran"; then
+if [ "$RC" = 5 ] && [ "$WROTE" = 0 ] && grep -q "changed while this ran" <<<"$ERR"; then
   pass "a description edited under us is not overwritten"
 else
   fail "expected rc=5 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
@@ -580,7 +580,7 @@ fi
 # app/association cases fail on their intended predicate, not the time floor.
 echo "--- 18a: both reported but the head MOVED -> nudge, do not refuse"
 run_nudge open sha18a "$VALID_BODY" "$BOTH" STUB_LIVE_HEAD=sha18a-new
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "the head moved to sha18a-new"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && grep -q "the head moved to sha18a-new" <<<"$ERR"; then
   pass "a presence answer pinned to a superseded head does not become a refusal"
 else
   fail "expected a nudge naming the moved head; rc=$RC wrote=$WROTE err='$ERR'"
@@ -609,7 +609,7 @@ fi
 
 echo "--- 18c: the head re-read fails -> nudge (unknown is not 'nothing to do')"
 run_nudge open sha18c "$VALID_BODY" "$BOTH" STUB_HEADREAD_RC=1
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be re-read"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && grep -q "could not be re-read" <<<"$ERR"; then
   pass "an unreadable head confirmation nudges rather than refusing"
 else
   fail "expected a nudge on an unreadable head; rc=$RC wrote=$WROTE err='$ERR'"
@@ -668,7 +668,7 @@ echo "--- 19: a body ending inside an unterminated fence is nudged, with a warni
 # that is already malformed, and any other placement is a larger mutation.
 UNCLOSED=$(printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: fine\n\n```\nnot closed\n')
 run_nudge open sha19 "$UNCLOSED" "$NEITHER"
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && grep -q "unterminated code fence" <<<"$ERR"; then
   pass "an unterminated fence warns about the visible marker but still recovers the PR"
 else
   fail "expected a nudge with a fence warning; rc=$RC wrote=$WROTE err='$ERR'"
@@ -676,7 +676,7 @@ fi
 
 echo "--- 19b: a well-formed body does NOT get the fence warning"
 run_nudge open sha19b "$VALID_BODY" "$NEITHER"
-if [ "$RC" = 0 ] && ! printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+if [ "$RC" = 0 ] && ! grep -q "unterminated code fence" <<<"$ERR"; then
   pass "the fence notice does not fire on ordinary bodies"
 else
   fail "the fence notice fired spuriously; err='$ERR'"
@@ -687,7 +687,7 @@ echo "--- 19c: an unterminated TILDE fence warns too"
 # left the warning silent on the other.
 UNCLOSED_TILDE=$(printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: fine\n\n~~~\nnot closed\n')
 run_nudge open sha19c "$UNCLOSED_TILDE" "$NEITHER"
-if [ "$RC" = 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+if [ "$RC" = 0 ] && grep -q "unterminated code fence" <<<"$ERR"; then
   pass "a tilde fence is recognized as well as a backtick fence"
 else
   fail "expected the fence warning on a tilde fence; rc=$RC err='$ERR'"

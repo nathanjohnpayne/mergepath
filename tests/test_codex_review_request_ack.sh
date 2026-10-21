@@ -1168,20 +1168,20 @@ test_secret_descriptor_never_reveals_the_value() {
   i=0
   while [ $((i + 4)) -le ${#secret_tail} ]; do
     chunk=${secret_tail:$i:4}
-    if printf '%s' "$rendered" | grep -qF "$chunk"; then
+    if grep -qF "$chunk" <<<"$rendered"; then
       window=$chunk
       break
     fi
     i=$((i + 1))
   done
 
-  if printf '%s' "$rendered" | grep -qF "$CREDENTIAL_SENTINEL"; then
+  if grep -qF "$CREDENTIAL_SENTINEL" <<<"$rendered"; then
     fail "secret descriptor: the rendering still contains the whole value"
   elif [ -n "$window" ]; then
     fail "secret descriptor: the rendering leaks a 4-char run of the value's entropy (found '$window' in '$rendered')"
   elif [ "$rendered" = "$empty_rendered" ]; then
     fail "secret descriptor: set and unset render identically ('$rendered'), so no message can tell them apart"
-  elif ! printf '%s' "$rendered" | grep -qF "${#CREDENTIAL_SENTINEL} chars"; then
+  elif ! grep -qF "${#CREDENTIAL_SENTINEL} chars" <<<"$rendered"; then
     fail "secret descriptor: the rendering omits the length that makes it debuggable (got '$rendered')"
   else
     pass "describe_secret reports class and length only, never the value ($rendered)"

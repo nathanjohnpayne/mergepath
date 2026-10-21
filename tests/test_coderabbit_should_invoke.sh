@@ -205,7 +205,7 @@ wait_is() {  # <name> <body> <expect_wait> [expect_rc]
     fail "$name: expected wait=$want rc=$want_rc, got rc=$rc out=$out"
   fi
   out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 2>/dev/null )
-  printf '%s' "$out" | grep -q "(wait_for_review: $want)" \
+  grep -q "(wait_for_review: $want)" <<<"$out" \
     && pass "$name: text line carries wait_for_review: $want" \
     || fail "$name: text line should carry '(wait_for_review: $want)', got: $out"
 }
@@ -225,11 +225,11 @@ case_is "wait_for_review: true does not turn a skip into an invoke" "$CX"$'\n'" 
 # `sed -n 2,40p` range was cut short by the #2166 header and lost Usage,
 # exit codes and the output contract.
 _help=$("$SCRIPT" --help 2>/dev/null); _rc=$?
-if [ "$_rc" = 0 ] && printf '%s\n' "$_help" | grep -q '^Usage:' \
-   && printf '%s\n' "$_help" | grep -q '^Exit codes:' \
-   && printf '%s\n' "$_help" | grep -q '^Output:' \
-   && printf '%s\n' "$_help" | grep -q 'Bash 3.2 portable' \
-   && ! printf '%s\n' "$_help" | grep -q '^set -uo pipefail'; then
+if [ "$_rc" = 0 ] && grep -q '^Usage:' <<<"$_help" \
+   && grep -q '^Exit codes:' <<<"$_help" \
+   && grep -q '^Output:' <<<"$_help" \
+   && grep -q 'Bash 3.2 portable' <<<"$_help" \
+   && ! grep -q '^set -uo pipefail' <<<"$_help"; then
   pass "--help prints the whole header (Usage, exit codes, output) and stops before code"
 else
   fail "--help is truncated or runs into code (rc=$_rc): $(printf '%s' "$_help" | tail -3)"
@@ -632,7 +632,7 @@ _diag() {  # <classifier-body> <expected-substring> <name>
   printf '%s\n' "$1" >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
   printf 'coderabbit:\n  enabled: true\n  invoke: complex-changes\n' >"$dir/.github/review-policy.yml"
   local out; out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 2>/dev/null )
-  printf '%s' "$out" | grep -q "$2" && pass "$3" || fail "$3 (got: $out)"
+  grep -q "$2" <<<"$out" && pass "$3" || fail "$3 (got: $out)"
 }
 _diag '#!/usr/bin/env bash
 exit 2' 'classifier failed (exit 2)' 'an API failure reports as a failure'

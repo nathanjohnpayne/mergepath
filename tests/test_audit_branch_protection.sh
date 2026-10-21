@@ -686,11 +686,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "auth 403: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "Administration:read"; then
+elif ! grep -qi "Administration:read" <<<"$out"; then
   fail "auth 403: diagnostic missing 'Administration:read' hint; output: $out"
-elif echo "$out" | grep -q "PR merges are completely unprotected"; then
+elif grep -q "PR merges are completely unprotected" <<<"$out"; then
   fail "auth 403: must NOT emit false 'unprotected' verdict; output: $out"
-elif ! echo "$out" | grep -qi "author/admin"; then
+elif ! grep -qi "author/admin" <<<"$out"; then
   fail "auth 403: diagnostic missing 'author/admin' guidance; output: $out"
 else
   pass "auth 403: exits 2 with auth diagnostic, no false-unprotected verdict"
@@ -705,7 +705,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "auth 401: exit $rc, expected 2; output: $out"
-elif echo "$out" | grep -q "PR merges are completely unprotected"; then
+elif grep -q "PR merges are completely unprotected" <<<"$out"; then
   fail "auth 401: must NOT emit false 'unprotected' verdict; output: $out"
 else
   pass "auth 401: exits 2, no false-unprotected verdict"
@@ -721,7 +721,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "no protection: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "no rulesets target main"; then
+elif ! grep -q "no rulesets target main" <<<"$out"; then
   fail "no protection: diagnostic missing 'no rulesets target main'; output: $out"
 else
   pass "no protection (true 404 + empty rulesets): exits 3 with unprotected verdict"
@@ -736,7 +736,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "classic protection: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "classic protection: missing PASS line; output: $out"
 else
   pass "classic protection present: exits 0 with PASS"
@@ -752,7 +752,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "classic foreign producer: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "no required status checks configured"; then
+elif ! grep -q "no required status checks configured" <<<"$out"; then
   fail "classic foreign producer: missing canonical-gap diagnostic; output: $out"
 else
   pass "classic same-named checks from a foreign app do not count"
@@ -767,7 +767,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "ruleset ~ALL: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "ruleset ~ALL: missing PASS line; output: $out"
 else
   pass "ruleset ~ALL targeting main: exits 0 (canonical checks present)"
@@ -783,7 +783,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "ruleset foreign producer: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "no required status checks configured"; then
+elif ! grep -q "no required status checks configured" <<<"$out"; then
   fail "ruleset foreign producer: missing canonical-gap diagnostic; output: $out"
 else
   pass "ruleset same-named checks from a foreign integration do not count"
@@ -798,7 +798,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "ruleset refs/heads/* glob: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "ruleset refs/heads/* glob: missing PASS line; output: $out"
 else
   pass "ruleset refs/heads/* glob: matches main and exits 0"
@@ -816,9 +816,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "ruleset dev-only: exit $rc, expected 3; output: $out"
-elif echo "$out" | grep -q "dev-only-check"; then
+elif grep -q "dev-only-check" <<<"$out"; then
   fail "ruleset dev-only: 'dev-only-check' leaked into main's audit; output: $out"
-elif ! echo "$out" | grep -q "no rulesets target main"; then
+elif ! grep -q "no rulesets target main" <<<"$out"; then
   fail "ruleset dev-only: missing 'no rulesets target main' verdict; output: $out"
 else
   pass "ruleset dev-only: does NOT contaminate audit of main"
@@ -836,9 +836,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "mixed rulesets: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "dev-only-check"; then
+elif grep -q "dev-only-check" <<<"$out"; then
   fail "mixed rulesets: 'dev-only-check' leaked from unrelated ruleset; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "mixed rulesets: missing PASS line; output: $out"
 else
   pass "mixed rulesets: only matching ruleset's checks counted; PASS"
@@ -856,7 +856,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "ruleset all-but-main-excluded: exit $rc, expected 3 (excluded ruleset must not protect); output: $out"
-elif ! echo "$out" | grep -q "no rulesets target main"; then
+elif ! grep -q "no rulesets target main" <<<"$out"; then
   fail "ruleset all-but-main-excluded: missing 'no rulesets target main' verdict; output: $out"
 else
   pass "ruleset all-but-main-excluded: exclude correctly disqualifies the ~ALL include"
@@ -874,7 +874,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "missing clearance gate: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "Merge clearance gate"; then
+elif ! grep -q "Merge clearance gate" <<<"$out"; then
   fail "missing clearance gate: diagnostic must name 'Merge clearance gate'; output: $out"
 else
   pass "missing 'Merge clearance gate' required check: exits 3 (canonical gap flagged)"
@@ -901,9 +901,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "~DEFAULT_BRANCH on a trunk-defaulted repo: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "no rulesets target trunk"; then
+elif grep -q "no rulesets target trunk" <<<"$out"; then
   fail "~DEFAULT_BRANCH must resolve to the repo's real default branch, not main/master; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "~DEFAULT_BRANCH on a trunk-defaulted repo: missing PASS line; output: $out"
 else
   pass "~DEFAULT_BRANCH resolves to the repo's real default branch (trunk), not a main/master guess"
@@ -920,7 +920,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "~DEFAULT_BRANCH must not match main on a trunk-defaulted repo: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "no rulesets target main"; then
+elif ! grep -q "no rulesets target main" <<<"$out"; then
   fail "~DEFAULT_BRANCH on a trunk-defaulted repo audited at main: expected 'no rulesets target main'; output: $out"
 else
   pass "~DEFAULT_BRANCH does not falsely protect main on a repo whose default is trunk"
@@ -945,9 +945,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "admins-bypass with --require-admin-enforcement: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "enforce_admins"; then
+elif ! grep -q "enforce_admins" <<<"$out"; then
   fail "admins-bypass: diagnostic must name enforce_admins; output: $out"
-elif echo "$out" | grep -q "PASS:"; then
+elif grep -q "PASS:" <<<"$out"; then
   fail "admins-bypass: must NOT report PASS just because all five checks are listed; output: $out"
 else
   pass "all five checks required but enforce_admins off + --require-admin-enforcement: exits 3"
@@ -964,7 +964,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "admins-bypass without the flag: exit $rc, expected 0 (consumers are not audited for it); output: $out"
-elif echo "$out" | grep -q "enforce_admins"; then
+elif grep -q "enforce_admins" <<<"$out"; then
   fail "admins-bypass without the flag must not report an admin-enforcement gap; output: $out"
 else
   pass "enforce_admins is only audited when --require-admin-enforcement is passed"
@@ -979,7 +979,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "admins-enforced: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+elif ! grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "admins-enforced: expected an explicit admin-enforcement OK line; output: $out"
 else
   pass "enforce_admins enabled + all canonical checks: exits 0"
@@ -996,9 +996,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "ruleset bypass actors: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "bypass"; then
+elif ! grep -q "bypass" <<<"$out"; then
   fail "ruleset bypass actors: diagnostic must name the bypass list; output: $out"
-elif ! echo "$out" | grep -q "RepositoryRole"; then
+elif ! grep -q "RepositoryRole" <<<"$out"; then
   fail "ruleset bypass actors: diagnostic should identify the actor; output: $out"
 else
   pass "ruleset with bypass actors + --require-admin-enforcement: exits 3 (checks are skippable)"
@@ -1013,7 +1013,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "ruleset without bypass actors: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+elif ! grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "ruleset without bypass actors: expected an explicit admin-enforcement OK line; output: $out"
 else
   pass "ruleset with an empty bypass list satisfies --require-admin-enforcement"
@@ -1034,9 +1034,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "bypass on an unrelated rule: exit $rc, expected 0 (no canonical check is skippable); output: $out"
-elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+elif ! grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "bypass on an unrelated rule: expected an explicit admin-enforcement OK line; output: $out"
-elif echo "$out" | grep -q "are skippable"; then
+elif grep -q "are skippable" <<<"$out"; then
   fail "bypass on an unrelated rule: must not report the canonical checks as skippable; output: $out"
 else
   pass "bypass on a ruleset requiring no canonical check: does not read as an admin-bypass gap"
@@ -1055,9 +1055,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "evaluate-only ruleset: exit $rc, expected 3 (a non-enforcing ruleset gates nothing); output: $out"
-elif ! echo "$out" | grep -q "enforcement is 'evaluate'"; then
+elif ! grep -q "enforcement is 'evaluate'" <<<"$out"; then
   fail "evaluate-only ruleset: output must say why the ruleset was not counted; output: $out"
-elif echo "$out" | grep -q "PASS:"; then
+elif grep -q "PASS:" <<<"$out"; then
   fail "evaluate-only ruleset: must NOT report PASS; output: $out"
 else
   pass "evaluate-mode ruleset: its required checks are not credited as gating"
@@ -1106,11 +1106,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "bypass_actors absent: exit $rc, expected 2 (unreadable, not proof of no bypass); output: $out"
-elif echo "$out" | grep -q "Admin enforcement: OK"; then
+elif grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "bypass_actors absent: must NOT report admin enforcement OK on an unread list; output: $out"
-elif echo "$out" | grep -q "PASS:"; then
+elif grep -q "PASS:" <<<"$out"; then
   fail "bypass_actors absent: must NOT report PASS; output: $out"
-elif ! echo "$out" | grep -q "bypass_actors"; then
+elif ! grep -q "bypass_actors" <<<"$out"; then
   fail "bypass_actors absent: diagnostic must name the field; output: $out"
 else
   pass "ruleset payload without a bypass_actors array: exits 2 (unknown), never a PASS"
@@ -1126,9 +1126,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "bypass_actors non-array: exit $rc, expected 2; output: $out"
-elif echo "$out" | grep -q "Admin enforcement: OK"; then
+elif grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "bypass_actors non-array: must NOT report admin enforcement OK; output: $out"
-elif ! echo "$out" | grep -q "object"; then
+elif ! grep -q "object" <<<"$out"; then
   fail "bypass_actors non-array: diagnostic should report the type it actually saw; output: $out"
 else
   pass "ruleset payload with a non-array bypass_actors: exits 2 (unknown)"
@@ -1147,7 +1147,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "bypass_actors absent without the flag: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "bypass_actors"; then
+elif grep -q "bypass_actors" <<<"$out"; then
   fail "bypass_actors absent without the flag: must not report on a field it never reads; output: $out"
 else
   pass "unreadable bypass_actors is only fatal when --require-admin-enforcement asks the question"
@@ -1170,11 +1170,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "read-only clean ruleset: exit $rc, expected 0 — a read-only token must be able to reach a verdict; output: $out"
-elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+elif ! grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "read-only clean ruleset: expected an explicit admin-enforcement OK line; output: $out"
-elif ! echo "$out" | grep -q "current_user_can_bypass"; then
+elif ! grep -q "current_user_can_bypass" <<<"$out"; then
   fail "read-only clean ruleset: the OK line must disclose which signal it rests on; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "read-only clean ruleset: expected an overall PASS; output: $out"
 else
   pass "read-only token (bypass_actors withheld, current_user_can_bypass=never) reaches a clean verdict"
@@ -1192,9 +1192,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "read-only admin bypass: exit $rc, expected 3 (drift); output: $out"
-elif echo "$out" | grep -q "Admin enforcement: OK"; then
+elif grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "read-only admin bypass: must NOT report admin enforcement OK; output: $out"
-elif ! echo "$out" | grep -q "current_user_can_bypass=always"; then
+elif ! grep -q "current_user_can_bypass=always" <<<"$out"; then
   fail "read-only admin bypass: diagnostic must name the signal and value; output: $out"
 else
   pass "read-only token: current_user_can_bypass=always is reported as drift"
@@ -1213,7 +1213,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "read-only pull_requests_only: exit $rc, expected 3 (drift); output: $out"
-elif ! echo "$out" | grep -q "current_user_can_bypass=pull_requests_only"; then
+elif ! grep -q "current_user_can_bypass=pull_requests_only" <<<"$out"; then
   fail "read-only pull_requests_only: diagnostic must name the value; output: $out"
 else
   pass "read-only token: current_user_can_bypass=pull_requests_only counts as a bypass"
@@ -1234,11 +1234,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "read-only non-admin identity: exit $rc, expected 2 (cannot conclude); output: $out"
-elif echo "$out" | grep -q "Admin enforcement: OK"; then
+elif grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "read-only non-admin identity: must NOT report admin enforcement OK; output: $out"
-elif echo "$out" | grep -q "PASS:"; then
+elif grep -q "PASS:" <<<"$out"; then
   fail "read-only non-admin identity: must NOT report PASS; output: $out"
-elif ! echo "$out" | grep -q "permissions.admin"; then
+elif ! grep -q "permissions.admin" <<<"$out"; then
   fail "read-only non-admin identity: diagnostic must say what it could not establish; output: $out"
 else
   pass "current_user_can_bypass from a NON-admin identity exits 2, never a clean verdict"
@@ -1259,11 +1259,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "read-only admin probe failure: exit $rc, expected 2; output: $out"
-elif echo "$out" | grep -q "PASS:"; then
+elif grep -q "PASS:" <<<"$out"; then
   fail "read-only admin probe failure: must NOT report PASS; output: $out"
-elif ! echo "$out" | grep -q "permissions.admin"; then
+elif ! grep -q "permissions.admin" <<<"$out"; then
   fail "read-only admin probe failure: diagnostic must name the probe that failed; output: $out"
-elif ! echo "$out" | grep -q "'unreadable'"; then
+elif ! grep -q "'unreadable'" <<<"$out"; then
   fail "read-only admin probe failure: must report the permission as unreadable, not as 'false'; output: $out"
 else
   pass "an unreadable .permissions.admin exits 2 and is distinguished from a confirmed non-admin"
@@ -1284,11 +1284,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "write-scope disagreeing signals: exit $rc, expected 3 — bypass_actors must win; output: $out"
-elif echo "$out" | grep -q "Admin enforcement: OK"; then
+elif grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "write-scope disagreeing signals: must NOT report admin enforcement OK; output: $out"
-elif ! echo "$out" | grep -q "actor_type=Team"; then
+elif ! grep -q "actor_type=Team" <<<"$out"; then
   fail "write-scope disagreeing signals: must report the actual bypass actor; output: $out"
-elif echo "$out" | grep -q "current_user_can_bypass"; then
+elif grep -q "current_user_can_bypass" <<<"$out"; then
   fail "write-scope disagreeing signals: must not fall back when the full list was returned; output: $out"
 else
   pass "bypass_actors outranks current_user_can_bypass when GitHub returns both"
@@ -1335,9 +1335,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "~DEFAULT_BRANCH unreadable on a non-main branch: exit $rc, expected 2 (infrastructure); output: $out"
-elif echo "$out" | grep -q "completely unprotected"; then
+elif grep -q "completely unprotected" <<<"$out"; then
   fail "~DEFAULT_BRANCH unreadable: must NOT report the branch unprotected on a failed metadata read; output: $out"
-elif ! echo "$out" | grep -q "unknown"; then
+elif ! grep -q "unknown" <<<"$out"; then
   fail "~DEFAULT_BRANCH unreadable: diagnostic must say the answer is unknown; output: $out"
 else
   pass "unresolvable ~DEFAULT_BRANCH on a non-main branch: exits 2, never a drift verdict"
@@ -1362,9 +1362,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "leaked error body as default branch: exit $rc, expected 2 (infrastructure); output: $out"
-elif echo "$out" | grep -q "completely unprotected"; then
+elif grep -q "completely unprotected" <<<"$out"; then
   fail "leaked error body: must NOT report the branch unprotected; output: $out"
-elif echo "$out" | grep -q '"message"'; then
+elif grep -q '"message"' <<<"$out"; then
   fail "leaked error body: an API payload must never be echoed as a branch name; output: $out"
 else
   pass "an API error body reaching the caller with rc=0 is rejected by shape, not audited as a branch"
@@ -1394,7 +1394,7 @@ if [ "$rc" -ne 0 ]; then
   fail "--default-branch seed: exit $rc, expected 0; output: $out"
 elif [ "$seeded_calls" -ne 0 ]; then
   fail "--default-branch seed: made $seeded_calls metadata call(s), expected 0 (the fact was handed in)"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "--default-branch seed: expected a PASS verdict; output: $out"
 else
   pass "--default-branch seeds the fact: correct verdict with zero metadata reads"
@@ -1411,7 +1411,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "--fleet + --default-branch: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q -- "--default-branch is a per-repo fact"; then
+elif ! grep -q -- "--default-branch is a per-repo fact" <<<"$out"; then
   fail "--fleet + --default-branch: diagnostic missing; output: $out"
 else
   pass "--fleet + --default-branch: rejected rather than silently ignored"
@@ -1526,13 +1526,13 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet all-pass: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "stub-audit reached testowner/hub"; then
+elif ! grep -q "stub-audit reached testowner/hub" <<<"$out"; then
   fail "fleet all-pass: hub repo was not audited; output: $out"
-elif ! echo "$out" | grep -q "stub-audit reached testowner/alpha"; then
+elif ! grep -q "stub-audit reached testowner/alpha" <<<"$out"; then
   fail "fleet all-pass: manifest consumer alpha was not audited; output: $out"
-elif ! echo "$out" | grep -q "stub-audit reached testowner/beta"; then
+elif ! grep -q "stub-audit reached testowner/beta" <<<"$out"; then
   fail "fleet all-pass: manifest consumer beta was not audited; output: $out"
-elif ! echo "$out" | grep -q "Audited 3 repo(s): 3 pass, 0 drift, 0 error."; then
+elif ! grep -q "Audited 3 repo(s): 3 pass, 0 drift, 0 error." <<<"$out"; then
   fail "fleet all-pass: tally line wrong; output: $out"
 else
   pass "fleet all-pass: exits 0 and audits the hub plus every manifest consumer"
@@ -1548,9 +1548,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "fleet one-drift: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta@main$"; then
+elif ! grep -qE "^DRIFT +rc=3 +testowner/beta@main$" <<<"$out"; then
   fail "fleet one-drift: beta not marked DRIFT in the verdict table; output: $out"
-elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 1 drift, 0 error."; then
+elif ! grep -q "Audited 3 repo(s): 2 pass, 1 drift, 0 error." <<<"$out"; then
   fail "fleet one-drift: tally line wrong; output: $out"
 else
   pass "fleet one-drift: exits 3 and marks the drifting repo DRIFT"
@@ -1565,7 +1565,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "fleet hub-drift: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/hub@main$"; then
+elif ! grep -qE "^DRIFT +rc=3 +testowner/hub@main$" <<<"$out"; then
   fail "fleet hub-drift: hub not marked DRIFT; output: $out"
 else
   pass "fleet hub-drift: hub drift alone exits 3"
@@ -1586,13 +1586,13 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "fleet drift+auth-error: exit $rc, expected 2 (infra beats drift); output: $out"
-elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/alpha@main$"; then
+elif ! grep -qE "^ERROR +rc=2 +testowner/alpha@main$" <<<"$out"; then
   fail "fleet drift+auth-error: alpha not marked ERROR; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta@main$"; then
+elif ! grep -qE "^DRIFT +rc=3 +testowner/beta@main$" <<<"$out"; then
   fail "fleet drift+auth-error: beta's drift verdict must still be reported; output: $out"
-elif ! echo "$out" | grep -q "Administration:read"; then
+elif ! grep -q "Administration:read" <<<"$out"; then
   fail "fleet drift+auth-error: diagnostic must name the missing scope; output: $out"
-elif ! echo "$out" | grep -q "NOT a drift verdict"; then
+elif ! grep -q "NOT a drift verdict" <<<"$out"; then
   fail "fleet drift+auth-error: diagnostic must say this is not drift; output: $out"
 else
   pass "fleet drift+auth-error: exits 2 (infrastructure) rather than 3, and says why"
@@ -1617,11 +1617,11 @@ else
   summary_body="$(cat "$SUMMARY_OUT")"
   missing=""
   for r in testowner/hub testowner/alpha testowner/beta; do
-    echo "$summary_body" | grep -q " $r@" || missing="$missing $r"
+    grep -q " $r@" <<<"$summary_body" || missing="$missing $r"
   done
   if [ -n "$missing" ]; then
     fail "fleet --summary-file: table missing repo(s):$missing; body: $summary_body"
-  elif ! echo "$summary_body" | grep -q "Audited 3 repo(s):"; then
+  elif ! grep -q "Audited 3 repo(s):" <<<"$summary_body"; then
     fail "fleet --summary-file: table missing the tally line; body: $summary_body"
   else
     pass "fleet --summary-file: writes the complete per-repo verdict table"
@@ -1642,7 +1642,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "fleet missing manifest: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q "manifest not found"; then
+elif ! grep -q "manifest not found" <<<"$out"; then
   fail "fleet missing manifest: diagnostic missing; output: $out"
 else
   pass "fleet missing manifest: exits 1 (prerequisite), never a clean 0"
@@ -1657,7 +1657,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "fleet+--repo: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q "mutually exclusive"; then
+elif ! grep -q "mutually exclusive" <<<"$out"; then
   fail "fleet+--repo: diagnostic missing; output: $out"
 else
   pass "fleet + --repo: rejected with exit 1"
@@ -1675,7 +1675,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "--summary-file without --fleet: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q -- "--summary-file requires --fleet"; then
+elif ! grep -q -- "--summary-file requires --fleet" <<<"$out"; then
   fail "--summary-file without --fleet: diagnostic missing; output: $out"
 elif [ -e "$WORKDIR/ignored.txt" ]; then
   fail "--summary-file without --fleet: must not write the summary file"
@@ -1697,13 +1697,13 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet per-repo default branch: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "stub-audit branch=trunk repo=testowner/beta"; then
+elif ! grep -q "stub-audit branch=trunk repo=testowner/beta" <<<"$out"; then
   fail "fleet per-repo default branch: beta must be audited on 'trunk', not a fleet-wide 'main'; output: $out"
-elif ! echo "$out" | grep -q "stub-audit branch=master repo=testowner/alpha"; then
+elif ! grep -q "stub-audit branch=master repo=testowner/alpha" <<<"$out"; then
   fail "fleet per-repo default branch: alpha must be audited on 'master'; output: $out"
-elif ! echo "$out" | grep -q "stub-audit branch=main repo=testowner/hub"; then
+elif ! grep -q "stub-audit branch=main repo=testowner/hub" <<<"$out"; then
   fail "fleet per-repo default branch: hub must be audited on its own default 'main'; output: $out"
-elif ! echo "$out" | grep -qE "^PASS +rc=0 +testowner/beta@trunk$"; then
+elif ! grep -qE "^PASS +rc=0 +testowner/beta@trunk$" <<<"$out"; then
   fail "fleet per-repo default branch: verdict table must name the branch actually audited; output: $out"
 else
   pass "fleet resolves and audits each repo's own default branch"
@@ -1721,11 +1721,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet explicit --branch: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "branch=trunk"; then
+elif grep -q "branch=trunk" <<<"$out"; then
   fail "fleet explicit --branch must override per-repo defaults; output: $out"
-elif ! echo "$out" | grep -q "stub-audit branch=main repo=testowner/beta"; then
+elif ! grep -q "stub-audit branch=main repo=testowner/beta" <<<"$out"; then
   fail "fleet explicit --branch: beta must be audited on the pinned 'main'; output: $out"
-elif ! echo "$out" | grep -q "explicit --branch"; then
+elif ! grep -q "explicit --branch" <<<"$out"; then
   fail "fleet explicit --branch: the report should say the branch was pinned; output: $out"
 else
   pass "fleet honours an explicit --branch across every repo"
@@ -1745,11 +1745,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "fleet unresolvable default branch: exit $rc, expected 2 (infrastructure); output: $out"
-elif echo "$out" | grep -q "stub-audit reached testowner/beta"; then
+elif grep -q "stub-audit reached testowner/beta" <<<"$out"; then
   fail "fleet unresolvable default branch: must not audit beta on a guessed branch; output: $out"
-elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$"; then
+elif ! grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$" <<<"$out"; then
   fail "fleet unresolvable default branch: beta must be marked ERROR in the table; output: $out"
-elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error."; then
+elif ! grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error." <<<"$out"; then
   fail "fleet unresolvable default branch: tally wrong; output: $out"
 else
   pass "fleet marks a repo with an unresolvable default branch ERROR, not drift"
@@ -1779,11 +1779,11 @@ if [ "$rc" -eq 0 ]; then
   fail "fleet leaked-body default branch: exit 0 — a failed metadata read presented as a CLEAN fleet audit; output: $out"
 elif [ "$rc" -ne 2 ]; then
   fail "fleet leaked-body default branch: exit $rc, expected 2 (infrastructure); output: $out"
-elif echo "$out" | grep -q '"message"'; then
+elif grep -q '"message"' <<<"$out"; then
   fail "fleet leaked-body default branch: an API payload was printed as a branch label; output: $out"
-elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$"; then
+elif ! grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$" <<<"$out"; then
   fail "fleet leaked-body default branch: beta must be marked ERROR in the table; output: $out"
-elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error."; then
+elif ! grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error." <<<"$out"; then
   fail "fleet leaked-body default branch: tally wrong; output: $out"
 else
   pass "a leaked API error body never becomes a branch name — no broken fleet reports as clean"
@@ -1802,13 +1802,13 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet admin-enforcement: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes"; then
+elif grep -q "repo=testowner/hub admin_enforcement=yes" <<<"$out"; then
   fail "fleet must NOT single the hub out for --require-admin-enforcement (ADR 0002 Exceptions, 2026-08-28); output: $out"
-elif echo "$out" | grep -q "repo=testowner/alpha admin_enforcement=yes"; then
+elif grep -q "repo=testowner/alpha admin_enforcement=yes" <<<"$out"; then
   fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
-elif echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
+elif grep -q "repo=testowner/beta admin_enforcement=yes" <<<"$out"; then
   fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=no"; then
+elif ! grep -q "repo=testowner/hub admin_enforcement=no" <<<"$out"; then
   fail "fleet must still audit the hub, just without the admin flag; output: $out"
 else
   pass "fleet audits the hub and unactivated consumers without admin enforcement"
@@ -1850,15 +1850,15 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "fleet Five admin bypass: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+elif ! grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes" <<<"$out"; then
   fail "fleet Five admin bypass: Five must receive --require-admin-enforcement; output: $out"
-elif echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes" \
-  || echo "$out" | grep -q "repo=testowner/alpha admin_enforcement=yes" \
-  || echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
+elif grep -q "repo=testowner/hub admin_enforcement=yes" <<<"$out" \
+  || grep -q "repo=testowner/alpha admin_enforcement=yes" <<<"$out" \
+  || grep -q "repo=testowner/beta admin_enforcement=yes" <<<"$out"; then
   fail "fleet Five admin bypass: hub and unactivated consumers must retain their exception; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +nathanjohnpayne/fiveacross@main$"; then
+elif ! grep -qE "^DRIFT +rc=3 +nathanjohnpayne/fiveacross@main$" <<<"$out"; then
   fail "fleet Five admin bypass: Five must be reported as fleet drift; output: $out"
-elif ! echo "$out" | grep -q "Audited 4 repo(s): 3 pass, 1 drift, 0 error."; then
+elif ! grep -q "Audited 4 repo(s): 3 pass, 1 drift, 0 error." <<<"$out"; then
   fail "fleet Five admin bypass: tally line wrong; output: $out"
 else
   pass "fleet stages Five admin enforcement: false is drift while hub and other consumers pass"
@@ -1870,9 +1870,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet Five admin enforcement: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+elif ! grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes" <<<"$out"; then
   fail "fleet Five admin enforcement: Five must retain --require-admin-enforcement; output: $out"
-elif ! echo "$out" | grep -q "Audited 4 repo(s): 4 pass, 0 drift, 0 error."; then
+elif ! grep -q "Audited 4 repo(s): 4 pass, 0 drift, 0 error." <<<"$out"; then
   fail "fleet Five admin enforcement: tally line wrong; output: $out"
 else
   pass "fleet clears after staged Five admin enforcement is enabled"
@@ -1894,9 +1894,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet Five-as-hub: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=no"; then
+elif ! grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=no" <<<"$out"; then
   fail "fleet Five-as-hub: hub override must retain its exception; output: $out"
-elif echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+elif grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes" <<<"$out"; then
   fail "fleet Five-as-hub: a hub must never receive the consumer flag; output: $out"
 else
   pass "fleet Five-as-hub retains the hub exception"
@@ -1915,7 +1915,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "--fleet + --require-admin-enforcement: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q -- "--require-admin-enforcement is selected by --fleet for staged consumers"; then
+elif ! grep -q -- "--require-admin-enforcement is selected by --fleet for staged consumers" <<<"$out"; then
   fail "--fleet + --require-admin-enforcement: diagnostic missing; output: $out"
 else
   pass "--fleet + --require-admin-enforcement: rejected rather than silently ignored"
@@ -1937,9 +1937,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet default-branch handoff: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/beta admin_enforcement=no default_branch=trunk"; then
+elif ! grep -q "repo=testowner/beta admin_enforcement=no default_branch=trunk" <<<"$out"; then
   fail "fleet default-branch handoff: beta's child must receive --default-branch trunk; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=no default_branch=main"; then
+elif ! grep -q "repo=testowner/hub admin_enforcement=no default_branch=main" <<<"$out"; then
   fail "fleet default-branch handoff: the hub's child must receive it too; output: $out"
 else
   pass "fleet hands each child the default branch it resolved (no redundant metadata read)"
@@ -1959,9 +1959,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet explicit --branch handoff: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "default_branch=main"; then
+elif grep -q "default_branch=main" <<<"$out"; then
   fail "fleet explicit --branch: must not pass the pinned branch as the repo's default; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/beta admin_enforcement=no default_branch=<unset>"; then
+elif ! grep -q "repo=testowner/beta admin_enforcement=no default_branch=<unset>" <<<"$out"; then
   fail "fleet explicit --branch: child must be given no default-branch fact; output: $out"
 else
   pass "fleet withholds --default-branch when --branch pinned the fleet (no invented fact)"
@@ -1995,9 +1995,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "fleet unsupported manifest version: exit $rc, expected 1 (prerequisite); output: $out"
-elif echo "$out" | grep -q "stub-audit reached"; then
+elif grep -q "stub-audit reached" <<<"$out"; then
   fail "fleet unsupported manifest version: must not audit anything from a manifest it cannot interpret; output: $out"
-elif ! echo "$out" | grep -q "version '2'"; then
+elif ! grep -q "version '2'" <<<"$out"; then
   fail "fleet unsupported manifest version: diagnostic must name the version it saw; output: $out"
 else
   pass "fleet refuses an unsupported manifest schema version (exit 1, no verdict)"
@@ -2023,7 +2023,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "fleet versionless manifest: exit $rc, expected 1; output: $out"
-elif echo "$out" | grep -q "stub-audit reached"; then
+elif grep -q "stub-audit reached" <<<"$out"; then
   fail "fleet versionless manifest: must not audit anything; output: $out"
 else
   pass "fleet refuses a manifest with no schema version at all"
@@ -2048,7 +2048,7 @@ if [ "$rc" -ne 1 ]; then
   fail "fleet unwritable --summary-file: exit $rc, expected 1 (prerequisite), not a verdict; output: $out"
 elif [ -e "$UNWRITABLE_SUMMARY" ]; then
   fail "fleet unwritable --summary-file: the file must genuinely not exist for this test to mean anything"
-elif ! echo "$out" | grep -q "could not write the fleet summary"; then
+elif ! grep -q "could not write the fleet summary" <<<"$out"; then
   fail "fleet unwritable --summary-file: diagnostic missing; output: $out"
 else
   pass "fleet exits 1 when the summary file cannot be written (never a 0/3 with no summary)"
@@ -2067,7 +2067,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "fleet summary path is a directory: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q "could not write the fleet summary"; then
+elif ! grep -q "could not write the fleet summary" <<<"$out"; then
   fail "fleet summary path is a directory: diagnostic missing; output: $out"
 else
   pass "fleet exits 1 when the summary path is unwritable for any reason"
@@ -2096,9 +2096,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "classic ∪ ruleset: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "classic ∪ ruleset: missing PASS line; output: $out"
-elif ! echo "$out" | grep -q "Merge clearance gate"; then
+elif ! grep -q "Merge clearance gate" <<<"$out"; then
   fail "classic ∪ ruleset: the ruleset-supplied check must appear in the enforced list; output: $out"
 else
   pass "a canonical check supplied by a ruleset counts on a classically protected branch"
@@ -2118,9 +2118,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "union admin enforcement: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+elif ! grep -q "Admin enforcement: OK" <<<"$out"; then
   fail "union admin enforcement: expected an explicit admin-enforcement OK line; output: $out"
-elif echo "$out" | grep -q "skippable"; then
+elif grep -q "skippable" <<<"$out"; then
   fail "union admin enforcement: an unbypassable ruleset requiring the same checks keeps them mandatory; output: $out"
 else
   pass "enforce_admins off is not an admin-bypass gap when an unbypassable ruleset requires the same checks"
@@ -2139,9 +2139,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "classic-only admin bypass under the union: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -q "skippable"; then
+elif ! grep -q "skippable" <<<"$out"; then
   fail "classic-only admin bypass: expected the checks to be reported skippable; output: $out"
-elif ! echo "$out" | grep -q "enforce_admins"; then
+elif ! grep -q "enforce_admins" <<<"$out"; then
   fail "classic-only admin bypass: the remediation must still name enforce_admins; output: $out"
 else
   pass "classic-only enforce_admins gap survives the unified analysis (named, and exit 3)"
@@ -2163,9 +2163,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "paginated ruleset inventory: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "PASS:"; then
+elif ! grep -q "PASS:" <<<"$out"; then
   fail "paginated ruleset inventory: missing PASS line; output: $out"
-elif echo "$out" | grep -q "no rulesets target main"; then
+elif grep -q "no rulesets target main" <<<"$out"; then
   fail "paginated ruleset inventory: page 2 was never read; output: $out"
 else
   pass "ruleset inventory is paginated — a governing ruleset on page 2 is still found"
@@ -2493,9 +2493,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   fail "fleet with a '#' in the default branch: exit $rc, expected 0; output: $out"
-elif echo "$out" | grep -q "ERROR"; then
+elif grep -q "ERROR" <<<"$out"; then
   fail "fleet with a '#' in the default branch: must not report an infrastructure ERROR; output: $out"
-elif ! echo "$out" | grep -qE "^PASS +rc=0 +testowner/hub@feat#2$"; then
+elif ! grep -qE "^PASS +rc=0 +testowner/hub@feat#2$" <<<"$out"; then
   fail "fleet with a '#' in the default branch: expected the repo audited on 'feat#2'; output: $out"
 else
   pass "a default branch containing '#' is audited, not turned into a fleet ERROR"
@@ -2529,7 +2529,7 @@ set +e
 out=$(run_audit ruleset_all --branch release --require-credential-isolation 2>&1)
 rc=$?
 set -e
-if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q '"status": "PASS"'; then
+if [ "$rc" -ne 0 ] || ! grep -q '"status": "PASS"' <<<"$out"; then
   fail "credential isolation used the protection target instead of main: rc=$rc output=$out"
 else
   pass "credential isolation uses the actual default branch when --branch selects release"
@@ -2546,7 +2546,7 @@ for protection_scenario in no_protection ruleset_untrusted_producer; do
     expected=3; expected_status=PASS
     [ "$isolation_mode" != drift ] || expected_status=DRIFT
     if [ "$isolation_mode" = error ]; then expected=2; expected_status=ERROR; fi
-    if [ "$rc" = "$expected" ] && echo "$out" | grep -q "\"status\": \"$expected_status\""; then
+    if [ "$rc" = "$expected" ] && grep -q "\"status\": \"$expected_status\"" <<<"$out"; then
       pass "isolation $isolation_mode remains visible after protection drift ($protection_scenario)"
     else
       fail "isolation was skipped or misclassified ($protection_scenario/$isolation_mode rc=$rc output=$out)"

@@ -871,7 +871,7 @@ else
 fi
 
 # Case 1: healthy worktree must NOT appear in any classification.
-if echo "$OUT" | grep -Fq -- "$HEALTHY_WT"; then
+if grep -Fq -- "$HEALTHY_WT" <<<"$OUT"; then
   fail "healthy worktree appeared in output (should be silent)"
   show_out_on_fail
 else
@@ -879,8 +879,8 @@ else
 fi
 
 # Case 2: gone-upstream worktree listed as STALE gone-upstream.
-if echo "$OUT" | grep -Fq "STALE gone-upstream" \
-   && echo "$OUT" | grep -Fq -- "$GONE_WT"; then
+if grep -Fq "STALE gone-upstream" <<<"$OUT" \
+   && grep -Fq -- "$GONE_WT" <<<"$OUT"; then
   pass "gone-upstream worktree listed as STALE gone-upstream"
 else
   fail "gone-upstream worktree not listed correctly"
@@ -888,8 +888,8 @@ else
 fi
 
 # Case 3: detached mergepath-pr-<num> with closed PR listed as STALE detached.
-if echo "$OUT" | grep -Fq "STALE detached PR #${PR_NUM}" \
-   && echo "$OUT" | grep -Fq -- "$PR_WT"; then
+if grep -Fq "STALE detached PR #${PR_NUM}" <<<"$OUT" \
+   && grep -Fq -- "$PR_WT" <<<"$OUT"; then
   pass "detached closed-PR worktree listed as STALE detached"
 else
   fail "detached closed-PR worktree not listed correctly"
@@ -898,8 +898,8 @@ fi
 
 # Case 12 (#739): hidden-folder pr-<n>-<desc> worktree is PR-state checked
 # and flagged STALE detached (the stub reports the PR MERGED).
-if echo "$OUT" | grep -Fq "STALE detached PR #${HIDDEN_PR_NUM}" \
-   && echo "$OUT" | grep -Fq -- "$HIDDEN_PR_WT"; then
+if grep -Fq "STALE detached PR #${HIDDEN_PR_NUM}" <<<"$OUT" \
+   && grep -Fq -- "$HIDDEN_PR_WT" <<<"$OUT"; then
   pass "hidden-folder pr-<n>-<desc> detached worktree PR-state checked + flagged STALE"
 else
   fail "hidden-folder detached PR worktree not recognized by the matcher"
@@ -913,7 +913,7 @@ NONPR_WT_LABEL=$(echo "$OUT" | awk -v p="$HIDDEN_NONPR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$NONPR_WT_LABEL" | grep -Fq "detached non-PR"; then
+if grep -Fq "detached non-PR" <<<"$NONPR_WT_LABEL"; then
   pass "free-form hidden-folder slug listed as detached non-PR (no PR number parsed)"
 else
   fail "free-form hidden-folder slug mislabeled (label='$NONPR_WT_LABEL')"
@@ -927,13 +927,13 @@ BRANCH_PR_LABEL=$(echo "$OUT" | awk -v p="$BRANCH_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$BRANCH_PR_LABEL" | grep -Fq "STALE PR #${BRANCH_PR_NUM} (MERGED) branch worktree"; then
+if grep -Fq "STALE PR #${BRANCH_PR_NUM} (MERGED) branch worktree" <<<"$BRANCH_PR_LABEL"; then
   pass "branch-attached pr-<n> worktree (live upstream, MERGED PR) flagged stale"
 else
   fail "branch-attached pr-<n> worktree not PR-state checked (label='$BRANCH_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "PR-slug branch stale: +[1-9]"; then
+if grep -qE "PR-slug branch stale: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 PR-slug branch stale"
 else
   fail "summary PR-slug-branch-stale count missing/zero"
@@ -946,25 +946,25 @@ DIRTY_PR_LABEL=$(echo "$OUT" | awk -v p="$DIRTY_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$DIRTY_PR_LABEL" | grep -Fq "working tree is not clean — review manually, keeping"; then
+if grep -Fq "working tree is not clean — review manually, keeping" <<<"$DIRTY_PR_LABEL"; then
   pass "dirty closed-PR branch worktree surfaced under a review-manually record"
 else
   fail "dirty closed-PR branch worktree not surfaced for review (label='$DIRTY_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$DIRTY_PR_LABEL" | grep -Fq "STALE PR"; then
+if grep -Fq "STALE PR" <<<"$DIRTY_PR_LABEL"; then
   fail "dirty closed-PR branch worktree wrongly flagged as a removal candidate"
   show_out_on_fail
 else
   pass "dirty closed-PR branch worktree is NOT a removal candidate"
 fi
-if echo "$OUT" | grep -qE "unclean PR worktrees \(review\): +[1-9]"; then
+if grep -qE "unclean PR worktrees \(review\): +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 unclean PR worktree awaiting review"
 else
   fail "summary unclean-PR-worktree count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -Fq "uncommitted or untracked content"; then
+if grep -Fq "uncommitted or untracked content" <<<"$OUT"; then
   pass "dirty worktree carries the uncommitted/untracked remediation line"
 else
   fail "dirty worktree missing its uncommitted/untracked remediation line"
@@ -976,7 +976,7 @@ OPEN_PR_LABEL=$(echo "$OUT" | awk -v p="$OPEN_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$OPEN_PR_LABEL" | grep -Fq "OPEN PR #${OPEN_PR_NUM} — keeping"; then
+if grep -Fq "OPEN PR #${OPEN_PR_NUM} — keeping" <<<"$OPEN_PR_LABEL"; then
   pass "branch-attached worktree for an OPEN PR reported still-active"
 else
   fail "branch-attached OPEN-PR worktree mislabeled (label='$OPEN_PR_LABEL')"
@@ -991,13 +991,13 @@ IGNORED_PR_LABEL=$(echo "$OUT" | awk -v p="$IGNORED_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$IGNORED_PR_LABEL" | grep -Fq "working tree is not clean — review manually, keeping"; then
+if grep -Fq "working tree is not clean — review manually, keeping" <<<"$IGNORED_PR_LABEL"; then
   pass "gitignored-only closed-PR branch worktree surfaced under a review-manually record"
 else
   fail "gitignored-only worktree not surfaced for review (label='$IGNORED_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$IGNORED_PR_LABEL" | grep -Fq "STALE PR"; then
+if grep -Fq "STALE PR" <<<"$IGNORED_PR_LABEL"; then
   fail "gitignored-only worktree wrongly flagged as a removal candidate"
   show_out_on_fail
 else
@@ -1005,7 +1005,7 @@ else
 fi
 # The remediation must be TRUE for ignored content: you cannot commit or
 # stash a gitignored file, so the dirty-path wording would be wrong advice.
-if echo "$OUT" | grep -Fq "gitignored content only"; then
+if grep -Fq "gitignored content only" <<<"$OUT"; then
   pass "gitignored-only worktree carries an ignored-specific remediation line"
 else
   fail "gitignored-only worktree missing its ignored-specific remediation line"
@@ -1020,7 +1020,7 @@ SUBMOD_PR_LABEL=$(echo "$OUT" | awk -v p="$SUBMOD_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$SUBMOD_PR_LABEL" | grep -Fq "working tree is not clean"; then
+if grep -Fq "working tree is not clean" <<<"$SUBMOD_PR_LABEL"; then
   pass "submodule-dirty worktree reported not-clean despite diff.ignoreSubmodules=all"
 else
   fail "submodule-dirty worktree mislabeled (label='$SUBMOD_PR_LABEL')"
@@ -1033,13 +1033,13 @@ PRUNE_PR_LABEL=$(echo "$OUT" | awk -v p="$PRUNE_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$PRUNE_PR_LABEL" | grep -Fq "worktree directory is MISSING — prunable"; then
+if grep -Fq "worktree directory is MISSING — prunable" <<<"$PRUNE_PR_LABEL"; then
   pass "missing-directory branch worktree classified prunable"
 else
   fail "missing-directory branch worktree mislabeled (label='$PRUNE_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$PRUNE_PR_LABEL" | grep -Fq "not clean"; then
+if grep -Fq "not clean" <<<"$PRUNE_PR_LABEL"; then
   fail "missing-directory worktree wrongly reported as unclean (nothing exists to commit/stash)"
   show_out_on_fail
 else
@@ -1048,7 +1048,7 @@ fi
 # Exactly ONE prunable entry — the unlocked Case 18 fixture. Case 19b is
 # locked, and prune cannot clear a locked entry, so counting it here would
 # advertise a self-clearing candidate that never clears (#762 r3 P2).
-if echo "$OUT" | grep -qE "prunable PR worktrees: +1$"; then
+if grep -qE "prunable PR worktrees: +1$" <<<"$OUT"; then
   pass "summary counts exactly 1 prunable PR worktree (the UNLOCKED one)"
 else
   fail "summary prunable-PR-worktree count wrong: $(echo "$OUT" | grep -E 'prunable PR worktrees:')"
@@ -1061,13 +1061,13 @@ LOCKMISS_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKMISS_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$LOCKMISS_PR_LABEL" | grep -Fq "LOCKED PR #${LOCKMISS_PR_NUM} (MERGED) worktree directory is MISSING"; then
+if grep -Fq "LOCKED PR #${LOCKMISS_PR_NUM} (MERGED) worktree directory is MISSING" <<<"$LOCKMISS_PR_LABEL"; then
   pass "locked+missing branch worktree listed under the LOCKED record"
 else
   fail "locked+missing branch worktree mislabeled (label='$LOCKMISS_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$LOCKMISS_PR_LABEL" | grep -Fq "prunable"; then
+if grep -Fq "prunable" <<<"$LOCKMISS_PR_LABEL"; then
   fail "locked+missing worktree wrongly advertised as prunable (git worktree prune skips locked entries)"
   show_out_on_fail
 else
@@ -1080,7 +1080,7 @@ LOCKED_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKED_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$LOCKED_PR_LABEL" | grep -Fq "LOCKED PR #${LOCKED_PR_NUM} (CLOSED) branch worktree"; then
+if grep -Fq "LOCKED PR #${LOCKED_PR_NUM} (CLOSED) branch worktree" <<<"$LOCKED_PR_LABEL"; then
   pass "locked clean closed-PR branch worktree listed under the LOCKED record"
 else
   fail "locked closed-PR branch worktree mislabeled (label='$LOCKED_PR_LABEL')"
@@ -1094,7 +1094,7 @@ UNKNOWN_PR_LABEL=$(echo "$OUT" | awk -v p="$UNKNOWN_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$UNKNOWN_PR_LABEL" | grep -Fq "PR #${UNKNOWN_PR_NUM} state unknown — branch worktree"; then
+if grep -Fq "PR #${UNKNOWN_PR_NUM} state unknown — branch worktree" <<<"$UNKNOWN_PR_LABEL"; then
   pass "PR-state-unknown branch worktree surfaced under its own record"
 else
   fail "PR-state-unknown branch worktree mislabeled (label='$UNKNOWN_PR_LABEL')"
@@ -1104,7 +1104,7 @@ fi
 # case-14 worktree and this unknown one) must both land in the bucket that
 # feeds the dry-run exit 2. A refactor that moves unknowns out of the
 # bucket drops this to 1 and fails here.
-if echo "$OUT" | grep -qE "PR-slug branch stale: +2$"; then
+if grep -qE "PR-slug branch stale: +2$" <<<"$OUT"; then
   pass "PR-state-unknown branch worktree IS counted in the exit-2 bucket (count is 2)"
 else
   fail "PR-slug-branch bucket does not hold both the MERGED and the unknown entry"
@@ -1112,9 +1112,9 @@ else
 fi
 
 # Case 4: locked worktree listed AND flagged as locked.
-if echo "$OUT" | grep -Fq "LOCKED gone-upstream" \
-   && echo "$OUT" | grep -Fq -- "$LOCKED_WT" \
-   && echo "$OUT" | grep -Fq "pretend agent owns this"; then
+if grep -Fq "LOCKED gone-upstream" <<<"$OUT" \
+   && grep -Fq -- "$LOCKED_WT" <<<"$OUT" \
+   && grep -Fq "pretend agent owns this" <<<"$OUT"; then
   pass "locked worktree listed AND flagged with lock reason"
 else
   fail "locked worktree not listed/flagged correctly"
@@ -1122,8 +1122,8 @@ else
 fi
 
 # Case 5: orphan listed as ORPHAN .claude/worktrees.
-if echo "$OUT" | grep -Fq "ORPHAN .claude/worktrees" \
-   && echo "$OUT" | grep -Fq -- "$ORPHAN_DIR"; then
+if grep -Fq "ORPHAN .claude/worktrees" <<<"$OUT" \
+   && grep -Fq -- "$ORPHAN_DIR" <<<"$OUT"; then
   pass "orphan .claude/worktrees/ dir listed as ORPHAN"
 else
   fail "orphan dir not listed correctly"
@@ -1144,7 +1144,7 @@ report_label_for() {
 # pass while proving nothing (CodeRabbit 🟡 on #892). Pinning the extractor
 # against a path whose label IS known makes that failure mode loud instead.
 ORPHAN_CONTROL_LABEL=$(report_label_for "$ORPHAN_DIR")
-if echo "$ORPHAN_CONTROL_LABEL" | grep -Fq "ORPHAN .claude/worktrees"; then
+if grep -Fq "ORPHAN .claude/worktrees" <<<"$ORPHAN_CONTROL_LABEL"; then
   pass "report label extractor resolves a known path to its record label"
 else
   fail "report label extractor did not resolve the orphan fixture (negative assertions below would be vacuous)"
@@ -1156,7 +1156,7 @@ fi
 # reported at all. Either is correct. What it must never be is swept into the
 # orphan bucket merely for living under .claude/worktrees/.
 REGISTERED_CLAUDE_LABEL=$(report_label_for "$REGISTERED_CLAUDE_WT")
-if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -Fq "ORPHAN .claude/worktrees"; then
+if ! grep -Fq "ORPHAN .claude/worktrees" <<<"$REGISTERED_CLAUDE_LABEL"; then
   pass "registered .claude/worktrees/ worktree is not misclassified as an orphan"
 else
   fail "registered .claude/worktrees/ worktree was misclassified as an orphan"
@@ -1164,8 +1164,8 @@ else
 fi
 
 # Case 6: verified-merged local branch listed as MERGED local branch.
-if echo "$OUT" | grep -Fq "MERGED local branch" \
-   && echo "$OUT" | grep -Fq -- "$MERGED_BRANCH"; then
+if grep -Fq "MERGED local branch" <<<"$OUT" \
+   && grep -Fq -- "$MERGED_BRANCH" <<<"$OUT"; then
   pass "verified-merged local branch listed"
 else
   fail "verified-merged local branch not listed"
@@ -1187,13 +1187,13 @@ DIVERGED_LABEL=$(echo "$OUT" | awk -v b="$DIVERGED_BRANCH" '
 # entire middle of the label, so any future record beginning "MERGED PR" and
 # ending "review manually, keeping" satisfied it regardless of the reason text
 # in between — which is the only part that distinguishes this class.
-if echo "$DIVERGED_LABEL" | grep -Fq -- "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]"; then
+if grep -Fq -- "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]" <<<"$DIVERGED_LABEL"; then
   pass "diverged merged branch (extra commit on top) is surfaced under a review-manually record"
 else
   fail "diverged merged branch not surfaced for review (label='$DIVERGED_LABEL')"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -Fq "beyond the merged head"; then
+if grep -Fq "beyond the merged head" <<<"$OUT"; then
   pass "diverged merged branch surfaced with a CLEAR 'beyond the merged head' reason line"
 else
   fail "no 'beyond the merged head' reason line for the diverged branch (silent-skip risk)"
@@ -1203,14 +1203,14 @@ fi
 # Case 9 (#605): a gone-upstream branch with NO merged PR is EXAMINED and
 # kept, with an explicit "no merged PR" line — distinguishing "evaluated,
 # not a candidate" from "not evaluated".
-if echo "$OUT" | grep -Fq -- "$NOPR_BRANCH" \
-   && echo "$OUT" | grep -Fq "no merged PR"; then
+if grep -Fq -- "$NOPR_BRANCH" <<<"$OUT" \
+   && grep -Fq "no merged PR" <<<"$OUT"; then
   pass "gone-upstream branch with no merged PR is examined + kept with a clear reason"
 else
   fail "gone-upstream unmerged branch not surfaced as examined-but-kept"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "gone kept \(unmerged\): +[1-9]"; then
+if grep -qE "gone kept \(unmerged\): +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 gone-kept-unmerged (examined-not-candidate visibility)"
 else
   fail "summary gone-kept-unmerged count missing/zero"
@@ -1225,7 +1225,7 @@ NOPR_LABEL=$(echo "$OUT" | awk -v b="$NOPR_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$NOPR_LABEL" | grep -Fq "MERGED local branch"; then
+if grep -Fq "MERGED local branch" <<<"$NOPR_LABEL"; then
   fail "unmerged branch wrongly flagged as MERGED candidate (label=$NOPR_LABEL)"
   show_out_on_fail
 else
@@ -1239,13 +1239,13 @@ UNKNOWN_LABEL=$(echo "$OUT" | awk -v b="$UNKNOWN_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$UNKNOWN_LABEL" | grep -Fq "lookup FAILED"; then
+if grep -Fq "lookup FAILED" <<<"$UNKNOWN_LABEL"; then
   pass "lookup-failure branch surfaced as NOT EVALUATED (lookup FAILED label)"
 else
   fail "lookup-failure branch mislabeled (label=$UNKNOWN_LABEL)"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "gone unverified \(lookup failed\): +[1-9]"; then
+if grep -qE "gone unverified \(lookup failed\): +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 gone-unverified (lookup-failure visibility)"
 else
   fail "summary gone-unverified count missing/zero"
@@ -1266,20 +1266,20 @@ else
   fail "#822 stale-unpruned merged branch missing from dry-run output entirely (silent retention regression)"
   show_out_on_fail
 fi
-if echo "$STALE_LABEL" | grep -Fq "MERGED local branch"; then
+if grep -Fq "MERGED local branch" <<<"$STALE_LABEL"; then
   pass "#822 stale-unpruned merged branch classified as a MERGED local branch"
 else
   fail "#822 stale-unpruned merged branch misclassified (label=$STALE_LABEL)"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -Fq -- "$STALE_UNPRUNED_BRANCH" \
-   && echo "$OUT" | grep -Fq "remote-tracking ref is stale"; then
+if grep -Fq -- "$STALE_UNPRUNED_BRANCH" <<<"$OUT" \
+   && grep -Fq "remote-tracking ref is stale" <<<"$OUT"; then
   pass "#822 dry-run explains the stale-remote-tracking-ref reason"
 else
   fail "#822 no stale-remote-tracking-ref reason line found"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "gone \(stale remote ref, unpruned\): +[1-9]"; then
+if grep -qE "gone \(stale remote ref, unpruned\): +[1-9]" <<<"$OUT"; then
   pass "#822 summary shows ≥1 stale-unpruned gone branch"
 else
   fail "#822 summary stale-unpruned count missing/zero"
@@ -1369,31 +1369,31 @@ else
 fi
 
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
-if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
+if grep -qE "gone-upstream: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 gone-upstream"
 else
   fail "summary gone-upstream count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "detached stale: +[1-9]"; then
+if grep -qE "detached stale: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 detached stale"
 else
   fail "summary detached count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "locked: +[1-9]"; then
+if grep -qE "locked: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 locked"
 else
   fail "summary locked count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "merged branches: +[1-9]"; then
+if grep -qE "merged branches: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 merged branch"
 else
   fail "summary merged branch count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -qE "orphan dirs: +[1-9]"; then
+if grep -qE "orphan dirs: +[1-9]" <<<"$OUT"; then
   pass "summary shows ≥1 orphan"
 else
   fail "summary orphan count missing/zero"
@@ -1432,7 +1432,7 @@ else
   echo "$OUT3" >&2
 fi
 
-if echo "$OUT3" | grep -Fq -- "$GONE_WT"; then
+if grep -Fq -- "$GONE_WT" <<<"$OUT3"; then
   fail "gone-upstream worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1476,7 +1476,7 @@ else
   fail "DATA LOSS: --apply deleted the gitignored canary in the stale-unpruned worktree $STALE_WT"
   echo "$OUT3" >&2
 fi
-if echo "$OUT3" | grep -Fq -- "$PR_WT"; then
+if grep -Fq -- "$PR_WT" <<<"$OUT3"; then
   fail "detached closed-PR worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1484,7 +1484,7 @@ else
 fi
 # Case 12 (#739): the hidden-folder merged-PR worktree is removed by the
 # same --apply pass as the legacy shape.
-if [ -d "$HIDDEN_PR_WT" ] || echo "$OUT3" | grep -Fq -- "$HIDDEN_PR_WT"; then
+if [ -d "$HIDDEN_PR_WT" ] || grep -Fq -- "$HIDDEN_PR_WT" <<<"$OUT3"; then
   fail "hidden-folder detached merged-PR worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1502,7 +1502,7 @@ fi
 # and the BRANCH REF it was attached to survives (worktree removal never
 # deletes a ref, which is exactly why a clean working tree is sufficient
 # evidence that nothing is lost).
-if [ -d "$BRANCH_PR_WT" ] || echo "$OUT3" | grep -Fq -- "$BRANCH_PR_WT"; then
+if [ -d "$BRANCH_PR_WT" ] || grep -Fq -- "$BRANCH_PR_WT" <<<"$OUT3"; then
   fail "branch-attached merged-PR worktree still present after --apply"
   echo "$OUT2" >&2
 else
@@ -1646,7 +1646,7 @@ fi
 # stale administrative entry, so the missing-directory worktree is gone from
 # the follow-up dry-run. This is what makes the prunable bucket self-clearing
 # (unlike the unclean bucket, which waits on a human).
-if echo "$OUT3" | grep -Fq -- "$PRUNE_PR_WT"; then
+if grep -Fq -- "$PRUNE_PR_WT" <<<"$OUT3"; then
   fail "prunable branch worktree entry still registered after --apply"
   echo "$OUT3" >&2
 else
@@ -1677,7 +1677,7 @@ LOCKMISS_APPLY_BLOCK=$(echo "$OUT2" | awk -v p="$LOCKMISS_PR_WT" '
   $1 == "path:" && $2 == p { want = 1 }
   END      { if (want) print buf }
 ')
-if echo "$LOCKMISS_APPLY_BLOCK" | grep -Fq "skipped (locked; pass --force-locked to remove)"; then
+if grep -Fq "skipped (locked; pass --force-locked to remove)" <<<"$LOCKMISS_APPLY_BLOCK"; then
   pass "locked+missing entry reported as skipped-locked by bare --apply"
 else
   fail "locked+missing entry not reported as skipped-locked by bare --apply (block='$LOCKMISS_APPLY_BLOCK')"
@@ -1715,13 +1715,13 @@ else
   echo "$OUT2" >&2
 fi
 
-if echo "$OUT3" | grep -Fq -- "$LOCKED_WT"; then
+if grep -Fq -- "$LOCKED_WT" <<<"$OUT3"; then
   pass "locked worktree retained after --apply (no --force-locked)"
 else
   fail "locked worktree disappeared without --force-locked"
   echo "$OUT3" >&2
 fi
-if echo "$OUT3" | grep -Fq -- "$ORPHAN_DIR"; then
+if grep -Fq -- "$ORPHAN_DIR" <<<"$OUT3"; then
   pass "orphan retained after --apply (no --orphan-clean)"
 else
   fail "orphan disappeared without --orphan-clean"
@@ -1765,7 +1765,7 @@ fi
 # its branch ref in the SAME run (re-snapshot after removals). Assert both
 # the worktree is gone AND the branch ref is gone AND the removal+deletion
 # were both driven by the single OUT2 invocation.
-if echo "$OUT3" | grep -Fq -- "$SAMERUN_WT"; then
+if grep -Fq -- "$SAMERUN_WT" <<<"$OUT3"; then
   fail "same-run: gone-upstream worktree $SAMERUN_WT still present after --apply"
   echo "$OUT2" >&2
 else
@@ -1793,10 +1793,10 @@ SAMERUN_LABEL=$(echo "$OUT2" | awk -v b="$SAMERUN_BRANCH" '
   /^  \[MERGED local branch/ { label = $0; want = 1; next }
   want && $1 == "branch:" { if ($2 == b) { print label; exit } want = 0 }
 ')
-if echo "$SAMERUN_LABEL" | grep -Fq "checked out — keeping"; then
+if grep -Fq "checked out — keeping" <<<"$SAMERUN_LABEL"; then
   fail "same-run: OUT2 labeled $SAMERUN_BRANCH 'checked out — keeping' (stale snapshot regression)"
   echo "$OUT2" >&2
-elif echo "$SAMERUN_LABEL" | grep -Fq "MERGED local branch"; then
+elif grep -Fq "MERGED local branch" <<<"$SAMERUN_LABEL"; then
   pass "same-run: OUT2 classified the just-un-worktree'd branch as a deletable MERGED record"
 else
   fail "same-run: could not find a MERGED-sweep record for $SAMERUN_BRANCH in OUT2 (label='$SAMERUN_LABEL')"
@@ -1875,7 +1875,7 @@ OUT5=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC5=$?
 set -e
 
-if [ "$RC5" -eq 2 ] && echo "$OUT5" | grep -qE "merged\+extra \(review\): +[1-9]"; then
+if [ "$RC5" -eq 2 ] && grep -qE "merged\+extra \(review\): +[1-9]" <<<"$OUT5"; then
   pass "final dry-run stays exit 2 while the diverged branch awaits manual review"
 else
   fail "final dry-run expected exit 2 with merged+extra >=1, got exit $RC5"
@@ -1970,7 +1970,7 @@ else
 fi
 
 # The helper must have emitted a SKIP diagnostic on the symlink.
-if echo "$OUT_ESC" | grep -qE "SKIP.*symlink"; then
+if grep -qE "SKIP.*symlink" <<<"$OUT_ESC"; then
   pass "symlink escape: helper emitted SKIP diagnostic for symlinked orphan"
 else
   fail "symlink escape: no SKIP diagnostic in helper output"
@@ -2061,7 +2061,7 @@ set -e
 # stale. The fail-closed gate declines to evaluate the repo instead, so the
 # branch is absent and the class counter reads 0.
 if [ "$RC_MAPPED_DRY" -eq 0 ] \
-   && ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "branch:   stable"; then
+   && ! grep -Fq -- "branch:   stable" <<<"$OUT_MAPPED_DRY"; then
   pass "#892 a renamed release→origin/stable mapping is not misread as a stale ref"
 else
   fail "#892 dry-run misclassified a live renamed remote mapping as stale"
@@ -2117,8 +2117,8 @@ set -e
 # advisory "gone kept (unmerged)" bucket, which is deliberately not a removal
 # candidate. The record and the counter are the observable, not the exit code.
 if [ "$RC_PIPE" -eq 0 ] \
-   && echo "$OUT_PIPE" | grep -Fq -- "branch:   $PIPE_BRANCH" \
-   && echo "$OUT_PIPE" | grep -qE "gone \(stale remote ref, unpruned\): +1"; then
+   && grep -Fq -- "branch:   $PIPE_BRANCH" <<<"$OUT_PIPE" \
+   && grep -qE "gone \(stale remote ref, unpruned\): +1" <<<"$OUT_PIPE"; then
   pass "#892 a stale branch whose legal name contains | survives the snapshot round-trip"
 else
   fail "#892 a stale branch containing | was lost while serializing records"
@@ -2204,7 +2204,7 @@ RC_COLLIDE=$?
 set -e
 if [ "$RC_COLLIDE" -eq 0 ] \
    && git -C "$COLLIDE_MAIN" rev-parse --verify -q "refs/heads/$COLLIDE_BRANCH" >/dev/null \
-   && echo "$OUT_COLLIDE" | grep -Fq -- "local tip has unmerged commit(s) on top"; then
+   && grep -Fq -- "local tip has unmerged commit(s) on top" <<<"$OUT_COLLIDE"; then
   pass "#892 --apply preserves a diverged branch when a tag has the same short name"
 else
   fail "DATA LOSS: a branch/tag short-name collision made --apply delete local follow-up work"
@@ -2314,8 +2314,8 @@ set -e
 # Exit 0 for the same reason as case 25: no merged PR, so the branch is
 # reported and counted but is not a removal candidate.
 if [ "$RC_UPSTREAM_DRY" -eq 0 ] \
-   && echo "$OUT_UPSTREAM_DRY" | grep -Fq -- "branch:   $UPSTREAM_BRANCH" \
-   && echo "$OUT_UPSTREAM_DRY" | grep -qE "gone \(stale remote ref, unpruned\): +1"; then
+   && grep -Fq -- "branch:   $UPSTREAM_BRANCH" <<<"$OUT_UPSTREAM_DRY" \
+   && grep -qE "gone \(stale remote ref, unpruned\): +1" <<<"$OUT_UPSTREAM_DRY"; then
   pass "#892 dry-run finds the stale branch when %(upstream:short) is ambiguous"
 else
   fail "#892 ambiguous short upstream caused dry-run to omit a stale branch"
@@ -2402,7 +2402,7 @@ OUT_PORCELAIN_FAIL=$( cd "$MAIN" && REAL_GIT="$(command -v git)" PATH="$PORCELAI
 RC_PORCELAIN_FAIL=$?
 set -e
 if [ "$RC_PORCELAIN_FAIL" -ne 0 ] \
-   && echo "$OUT_PORCELAIN_FAIL" | grep -Fq "could not read git worktree porcelain records"; then
+   && grep -Fq "could not read git worktree porcelain records" <<<"$OUT_PORCELAIN_FAIL"; then
   pass "#892 unreadable NUL porcelain inventory fails closed instead of looking empty"
 else
   fail "#892 an unreadable NUL porcelain inventory did not fail closed"
@@ -2538,7 +2538,7 @@ OUT_BADSPEC=$( cd "$BADSPEC_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-
 RC_BADSPEC=$?
 set -e
 if [ "$RC_BADSPEC" -ne 0 ] \
-   && echo "$OUT_BADSPEC" | grep -Fq -- "could not read local branch tracking state"; then
+   && grep -Fq -- "could not read local branch tracking state" <<<"$OUT_BADSPEC"; then
   pass "#920 an unreadable branch inventory names the failure instead of dying silently"
 else
   fail "#920 a git-rejected remote.origin.fetch aborted the audit with no diagnostic (rc=$RC_BADSPEC)"
@@ -2547,8 +2547,8 @@ fi
 # The other half of the acceptance criterion: failing closed must not mean
 # failing loudly-and-wrongly. No branch may be classified off an inventory the
 # run never read, so the report must carry no records at all.
-if ! echo "$OUT_BADSPEC" | grep -Fq -- "    path:     " \
-   && ! echo "$OUT_BADSPEC" | grep -Fq -- "    branch:   "; then
+if ! grep -Fq -- "    path:     " <<<"$OUT_BADSPEC" \
+   && ! grep -Fq -- "    branch:   " <<<"$OUT_BADSPEC"; then
   pass "#920 no classification records are emitted from an inventory that could not be read"
 else
   fail "#920 the audit classified branches despite an unreadable branch inventory"
@@ -2793,7 +2793,7 @@ set -e
 # line, so no line-oriented grep over the records can tell the two apart —
 # the #920 finding-3 prefix hazard in its sharpest form. The counter is
 # unambiguous.
-if echo "$OUT_NULORPH" | grep -qE "orphan dirs: +1$"; then
+if grep -qE "orphan dirs: +1$" <<<"$OUT_NULORPH"; then
   pass "#992 an orphan matching a registered path's newline fragment is reported"
 else
   fail "#992 the orphan was swallowed by a split registered path (rc=$RC_NULORPH)"
@@ -2801,7 +2801,7 @@ else
 fi
 # The registered worktree must not ALSO be counted, which the single-digit
 # match above already pins: 1, not 2.
-if echo "$OUT_NULORPH" | grep -Fq -- "[ORPHAN .claude/worktrees]"; then
+if grep -Fq -- "[ORPHAN .claude/worktrees]" <<<"$OUT_NULORPH"; then
   pass "#992 the orphan is emitted with the ORPHAN label"
 else
   fail "#992 no ORPHAN record was emitted despite an unregistered directory"
@@ -2910,7 +2910,7 @@ set +e
 OUT_NLTAIL=$( cd "$NLTAIL_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_NLTAIL=$?
 set -e
-if echo "$OUT_NLTAIL" | grep -qE "orphan dirs: +0$"; then
+if grep -qE "orphan dirs: +0$" <<<"$OUT_NLTAIL"; then
   pass "#1103 a registered worktree whose path ends in a newline is not misread as an orphan"
 else
   fail "#1103 the trailing newline was truncated and the registered worktree was classified an orphan (rc=$RC_NLTAIL)"
@@ -2996,7 +2996,7 @@ else
   fail "#992 an unreadable remote snapshot exited $RC_UNK (expected 3)"
   echo "$OUT_UNK" >&2
 fi
-if echo "$OUT_UNK" | grep -Fq -- "NOT MEASURED"; then
+if grep -Fq -- "NOT MEASURED" <<<"$OUT_UNK"; then
   pass "#992 the zero count is annotated as not-measured rather than left to read as clean"
 else
   fail "#992 the summary presented an unmeasured count as a measurement"
@@ -3004,7 +3004,7 @@ else
 fi
 # The count itself must still be 0 — the fix adds a qualifier, it does not
 # invent a number the run could not obtain.
-if echo "$OUT_UNK" | grep -qE "gone \(stale remote ref, unpruned\): +0$"; then
+if grep -qE "gone \(stale remote ref, unpruned\): +0$" <<<"$OUT_UNK"; then
   pass "#992 the unmeasured counter still reports 0 rather than a fabricated figure"
 else
   fail "#992 the stale-unpruned counter changed value on an unreadable remote"
@@ -3020,7 +3020,7 @@ set +e
 OUT_UNK2=$( cd "$UNK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_UNK2=$?
 set -e
-if echo "$OUT_UNK2" | grep -qE "orphan dirs: +1$"; then
+if grep -qE "orphan dirs: +1$" <<<"$OUT_UNK2"; then
   pass "#992 precedence fixture: the run really did find a candidate"
 else
   fail "fixture setup: the orphan was not detected, so the precedence assertion below is vacuous"
@@ -3033,7 +3033,7 @@ else
   echo "$OUT_UNK2" >&2
 fi
 # Raising the status must not cost the operator the hint or the findings.
-if echo "$OUT_UNK2" | grep -Fq -- "Re-run with --apply"; then
+if grep -Fq -- "Re-run with --apply" <<<"$OUT_UNK2"; then
   pass "#992 the --apply hint survives the raised exit status"
 else
   fail "#992 raising the exit status suppressed the dry-run hint"
@@ -3050,7 +3050,7 @@ if [ "$RC_MAPPED_DRY" -eq 0 ]; then
 else
   fail "#992 the declined path was conflated with the unknown one (rc=$RC_MAPPED_DRY)"
 fi
-if ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "NOT MEASURED"; then
+if ! grep -Fq -- "NOT MEASURED" <<<"$OUT_MAPPED_DRY"; then
   pass "#992 a declined probe is not annotated as an unmeasured failure"
 else
   fail "#992 a documented limitation was reported as a failed read"
@@ -3113,7 +3113,7 @@ else
   fail "#1105 an irrelevant remote read made the audit incomplete (rc=$RC_NOELIG, expected 0)"
   echo "$OUT_NOELIG" >&2
 fi
-if ! echo "$OUT_NOELIG" | grep -Fq -- "NOT MEASURED"; then
+if ! grep -Fq -- "NOT MEASURED" <<<"$OUT_NOELIG"; then
   pass "#1105 a provably-empty stale set is not annotated as unmeasured"
 else
   fail "#1105 the audit claimed a hole where the answer was known locally"
@@ -3198,13 +3198,13 @@ if [ ! -s "$TMPFAIL_LOG" ]; then
   fail "fixture setup: the eligible-list allocation was never attempted, so case 44c asserts nothing"
   echo "$OUT_TMPFAIL" >&2
 fi
-if [ "$RC_TMPFAIL" -eq 3 ] && echo "$OUT_TMPFAIL" | grep -Fq -- "NOT MEASURED"; then
+if [ "$RC_TMPFAIL" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_TMPFAIL"; then
   pass "#1105 a local allocation failure is still an incomplete audit (exit 3)"
 else
   fail "#1105 a local allocation failure did not surface as exit 3 + NOT MEASURED (rc=$RC_TMPFAIL)"
   echo "$OUT_TMPFAIL" >&2
 fi
-if echo "$OUT_TMPFAIL" | grep -Fq -- "LOCAL failure"; then
+if grep -Fq -- "LOCAL failure" <<<"$OUT_TMPFAIL"; then
   pass "#1105 the remedy names the local cause rather than the remote"
 else
   fail "#1105 a local failure was not identified as local"
@@ -3216,7 +3216,7 @@ fi
 # exact capitalised string, and a mutation that restored the old lowercase
 # wording slipped straight past it. The claim being guarded is "no wording
 # that blames the remote", not "not this one spelling".
-if ! echo "$OUT_TMPFAIL" | grep -Fqi -- "remote could not be read"; then
+if ! grep -Fqi -- "remote could not be read" <<<"$OUT_TMPFAIL"; then
   pass "#1105 a reachable remote is not blamed for a local failure"
 else
   fail "#1105 the audit blamed a remote it had never even contacted"
@@ -3313,7 +3313,7 @@ else
 fi
 # And the failed probe still lands as an incomplete audit rather than a clean
 # one — the #992 contract must not regress under the new wrapper.
-if [ "$RC_SSHPROBE" -eq 3 ] && echo "$OUT_SSHPROBE" | grep -Fq -- "NOT MEASURED"; then
+if [ "$RC_SSHPROBE" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_SSHPROBE"; then
   pass "#933 a refused probe is reported as an incomplete audit, not a clean one"
 else
   fail "#933 a refused probe did not surface as exit 3 + NOT MEASURED (rc=$RC_SSHPROBE)"
@@ -3398,7 +3398,7 @@ fi
 # assertion is conjunctive — exit 3 AND the summary present — because
 # reaching the summary is the only thing that distinguishes "reported an
 # incomplete audit" from "was killed mid-audit and happened to exit 3".
-if [ "$RC_AWKFAIL" -eq 3 ] && echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+if [ "$RC_AWKFAIL" -eq 3 ] && grep -qE "orphan dirs: +[0-9]" <<<"$OUT_AWKFAIL"; then
   pass "#1105 a failed snapshot write reports an incomplete audit instead of dying"
 else
   fail "#1105 a failed snapshot write exited $RC_AWKFAIL without completing the audit"
@@ -3406,14 +3406,14 @@ else
 fi
 # The summary must actually have been emitted — the pre-fix failure killed the
 # run BEFORE this point, so its presence is the proof the run survived.
-if echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+if grep -qE "orphan dirs: +[0-9]" <<<"$OUT_AWKFAIL"; then
   pass "#1105 the summary is still emitted after a failed snapshot write"
 else
   fail "#1105 the run died before printing its summary"
   echo "$OUT_AWKFAIL" >&2
 fi
-if echo "$OUT_AWKFAIL" | grep -Fq -- "NOT MEASURED" \
-   && echo "$OUT_AWKFAIL" | grep -Fq -- "LOCAL failure"; then
+if grep -Fq -- "NOT MEASURED" <<<"$OUT_AWKFAIL" \
+   && grep -Fq -- "LOCAL failure" <<<"$OUT_AWKFAIL"; then
   pass "#1105 a failed snapshot write is attributed to local storage, not the remote"
 else
   fail "#1105 a failed snapshot write was not reported as an unmeasured local failure"
@@ -3514,14 +3514,14 @@ if [ ! -s "$FULLWRITE_LOG" ]; then
 fi
 # Conjunctive for the same reason as 44d: an unchecked pipeline can exit with
 # a status that looks right while the run never reached its summary.
-if [ "$RC_FULLWRITE" -eq 3 ] && echo "$OUT_FULLWRITE" | grep -qE "orphan dirs: +[0-9]"; then
+if [ "$RC_FULLWRITE" -eq 3 ] && grep -qE "orphan dirs: +[0-9]" <<<"$OUT_FULLWRITE"; then
   pass "#1105 a failed eligible-list write reports an incomplete audit instead of dying"
 else
   fail "#1105 a failed eligible-list write exited $RC_FULLWRITE without completing the audit"
   echo "$OUT_FULLWRITE" >&2
 fi
-if echo "$OUT_FULLWRITE" | grep -Fq -- "NOT MEASURED" \
-   && echo "$OUT_FULLWRITE" | grep -Fq -- "LOCAL failure"; then
+if grep -Fq -- "NOT MEASURED" <<<"$OUT_FULLWRITE" \
+   && grep -Fq -- "LOCAL failure" <<<"$OUT_FULLWRITE"; then
   pass "#1105 a failed eligible-list write is attributed to local storage"
 else
   fail "#1105 a failed eligible-list write was not reported as an unmeasured local failure"
@@ -3600,21 +3600,21 @@ if [ ! -s "$REFFAIL_LOG" ]; then
   fail "fixture setup: the eligibility read was never attempted, so case 44f asserts nothing"
   echo "$OUT_REFFAIL" >&2
 fi
-if [ "$RC_REFFAIL" -eq 3 ] && echo "$OUT_REFFAIL" | grep -Fq -- "NOT MEASURED"; then
+if [ "$RC_REFFAIL" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_REFFAIL"; then
   pass "#1105 an unreadable ref database is an incomplete audit"
 else
   fail "#1105 an unreadable ref database exited $RC_REFFAIL without reporting NOT MEASURED"
   echo "$OUT_REFFAIL" >&2
 fi
 # The claim under test: the remedy names the REPOSITORY, not TMPDIR.
-if echo "$OUT_REFFAIL" | grep -Fq -- "refs could"; then
+if grep -Fq -- "refs could" <<<"$OUT_REFFAIL"; then
   pass "#1105 a ref-read failure directs the operator at the repository"
 else
   fail "#1105 a ref-read failure did not name the repository as the cause"
   echo "$OUT_REFFAIL" >&2
 fi
 # And must NOT send them to TMPDIR, which is demonstrably fine here.
-if ! echo "$OUT_REFFAIL" | grep -Fq -- "is writable and has free"; then
+if ! grep -Fq -- "is writable and has free" <<<"$OUT_REFFAIL"; then
   pass "#1105 a ref-read failure is not misattributed to temporary storage"
 else
   fail "#1105 a healthy TMPDIR was blamed for a ref-read failure"
@@ -3785,7 +3785,7 @@ for BM in "-o BatchMode=no" "-o BatchMode=no -o BatchMode=yes" ""; do
     bash "$HELPER" --no-color --dry-run 2>&1 )
   RC_BM=$?
   set -e
-  if [ "$RC_BM" -eq 3 ] && echo "$OUT_BM" | grep -Fq -- "NOT MEASURED"; then
+  if [ "$RC_BM" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_BM"; then
     pass "#1120 the audit completes and reports with GIT_SSH_COMMAND [${BM:-none}]"
   else
     fail "#1120 the audit did not complete with GIT_SSH_COMMAND [${BM:-none}] (rc=$RC_BM)"
@@ -3801,7 +3801,7 @@ OUT_GITSSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
   bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_GITSSH=$?
 set -e
-if [ "$RC_GITSSH" -eq 3 ] && echo "$OUT_GITSSH" | grep -Fq -- "NOT MEASURED"; then
+if [ "$RC_GITSSH" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_GITSSH"; then
   pass "#1120 a GIT_SSH-only transport completes and reports rather than hanging"
 else
   fail "#1120 a GIT_SSH-only transport did not complete (rc=$RC_GITSSH)"
@@ -3843,7 +3843,7 @@ OUT_NONSSH=$( cd "$NONSSH_MAIN" && PATH="$STUB_DIR:$PATH" \
   bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_NONSSH=$?
 set -e
-if [ "$RC_NONSSH" -ne 3 ] && ! echo "$OUT_NONSSH" | grep -Fq -- "NOT MEASURED"; then
+if [ "$RC_NONSSH" -ne 3 ] && ! grep -Fq -- "NOT MEASURED" <<<"$OUT_NONSSH"; then
   pass "#1120 an ssh setting does not make a reachable non-ssh remote incomplete"
 else
   fail "#1120 GIT_SSH turned a reachable local remote into an incomplete audit (rc=$RC_NONSSH)"
@@ -3901,7 +3901,7 @@ else
     echo "$OUT_WD" >&2
   fi
   # And it must still REPORT rather than merely return.
-  if [ "$RC_WD" -eq 3 ] && echo "$OUT_WD" | grep -Fq -- "NOT MEASURED"; then
+  if [ "$RC_WD" -eq 3 ] && grep -Fq -- "NOT MEASURED" <<<"$OUT_WD"; then
     pass "#1120 a watchdog-bounded probe reports an incomplete audit"
   else
     fail "#1120 a watchdog-bounded probe did not report NOT MEASURED (rc=$RC_WD)"

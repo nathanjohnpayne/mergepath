@@ -381,7 +381,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=graphql as_reviewer -- gh pr comment 5 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'MERGEPATH_GH_TRANSPORT must be auto, gh or rest' && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'MERGEPATH_GH_TRANSPORT must be auto, gh or rest' <<<"$err" && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
   pass "unknown transport value: refused, nothing written"
 else
   fail "unknown transport: rc=$rc err=$err"
@@ -421,7 +421,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_WRITE_LOGIN='claude[bot]' as_reviewer -- gh pr comment 123 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]', expected 'nathanpayne-claude'" && printf '%s' "$err" | grep -q '#241'; then
+if [ "$rc" -eq 5 ] && grep -q "landed under 'claude\[bot\]', expected 'nathanpayne-claude'" <<<"$err" && grep -q '#241' <<<"$err"; then
   pass "comment readback: a bot byline exits 5 with the #241 recovery"
 else
   fail "comment readback mutation: rc=$rc err=$err"
@@ -431,7 +431,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_MISSING=1 as_reviewer -- gh pr comment 404 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'could not read pull request o/r#404' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'could not read pull request o/r#404' <<<"$err" && log_lacks 'POST'; then
   pass "pr comment on a missing PR: refused before the write"
 else
   fail "pr comment missing PR: rc=$rc err=$err"
@@ -441,7 +441,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_COMMENT_FAIL=1 as_reviewer -- gh pr comment 1 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'HTTP 403'; then
+if [ "$rc" -eq 1 ] && grep -q 'HTTP 403' <<<"$err"; then
   pass "comment POST failure: gh's error and exit status propagate"
 else
   fail "comment POST failure: rc=$rc err=$err"
@@ -480,7 +480,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_WRITE_LOGIN='claude[bot]' as_reviewer -- gh pr review 9 --repo o/r --approve 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "review https://github.com/o/r/pull/9#pullrequestreview-77 landed under 'claude\[bot\]'"; then
+if [ "$rc" -eq 5 ] && grep -q "review https://github.com/o/r/pull/9#pullrequestreview-77 landed under 'claude\[bot\]'" <<<"$err"; then
   pass "review readback: a bot byline exits 5"
 else
   fail "review readback mutation: rc=$rc err=$err"
@@ -595,7 +595,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'has no push remote on GitHub' <<<"$err" && log_lacks 'POST'; then
   pass "pr create outside Claude cloud: a loopback remote is refused, not taken for GitHub"
 else
   fail "pr create local loopback: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -604,7 +604,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" CLAUDE_CODE_REMOTE=true MERGEPATH_AGENT_SURFACE=codex-cloud as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub'; then
+if [ "$rc" -eq 1 ] && grep -q 'has no push remote on GitHub' <<<"$err"; then
   pass "pr create: the surface variable wins, so a Codex cloud surface does not accept a loopback remote"
 else
   fail "pr create surface wins: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -614,7 +614,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'has no push remote on GitHub' <<<"$err" && log_lacks 'POST'; then
   pass "pr create: a push remote that is not on GitHub is refused, even when its path matches --repo"
 else
   fail "pr create gitlab remote: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -625,7 +625,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'branch topic/z has no push remote' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'branch topic/z has no push remote' <<<"$err" && log_lacks 'POST'; then
   pass "pr create: a branch with no push remote is refused, as gh refuses an unpushed branch"
 else
   fail "pr create no push remote: rc=$rc err=$err"
@@ -639,7 +639,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'branch topic/z is not fully pushed: origin/topic/z differs from HEAD' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'branch topic/z is not fully pushed: origin/topic/z differs from HEAD' <<<"$err" && log_lacks 'POST'; then
   pass "pr create: an inferred head behind the local HEAD is refused"
 else
   fail "pr create not fully pushed: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -649,7 +649,7 @@ new_case
 set +e
 err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no pushed ref on origin' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'has no pushed ref on origin' <<<"$err" && log_lacks 'POST'; then
   pass "pr create: a branch never pushed to its push remote is refused"
 else
   fail "pr create never pushed: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -673,7 +673,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$INVALID_BODY" --head h 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'Authoring-Agent' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q 'Authoring-Agent' <<<"$err" && log_lacks 'POST'; then
   pass "pr create: the PR-body contract still refuses an invalid body before any REST call"
 else
   fail "pr create invalid body: rc=$rc err=$err"
@@ -700,7 +700,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'a' landed under 'claude\[bot\]'"; then
+if [ "$rc" -eq 5 ] && grep -q "the label 'a' landed under 'claude\[bot\]'" <<<"$err"; then
   pass "pr create follow-ups: a label applied by another login exits 5"
 else
   fail "pr create label actor mutation: rc=$rc err=$err"
@@ -710,7 +710,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_CREATE_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'HTTP 422' && log_lacks 'repos/o/r/pulls/42'; then
+if [ "$rc" -eq 1 ] && grep -q 'HTTP 422' <<<"$err" && log_lacks 'repos/o/r/pulls/42'; then
   pass "pr create POST failure: propagates, no readback attempted"
 else
   fail "pr create POST failure: rc=$rc err=$err"
@@ -784,7 +784,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'x' landed under 'claude\[bot\]', expected 'nathanjohnpayne'"; then
+if [ "$rc" -eq 5 ] && grep -q "the label 'x' landed under 'claude\[bot\]', expected 'nathanjohnpayne'" <<<"$err"; then
   pass "pr edit readback: a label event by another login exits 5"
 else
   fail "pr edit actor mutation: rc=$rc err=$err"
@@ -794,7 +794,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_DUPLICATE_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'x' landed under 'claude\[bot\],nathanjohnpayne'"; then
+if [ "$rc" -eq 5 ] && grep -q "the label 'x' landed under 'claude\[bot\],nathanjohnpayne'" <<<"$err"; then
   pass "pr edit readback: a concurrent bot event beside the expected one is not told apart; exits 5"
 else
   fail "pr edit concurrent mutation: rc=$rc err=$err"
@@ -804,7 +804,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'refusing a write that could not be attributed' && log_lacks 'POST'; then
+if [ "$rc" -eq 5 ] && grep -q 'refusing a write that could not be attributed' <<<"$err" && log_lacks 'POST'; then
   pass "pr edit: an unreadable event log before the write refuses the write"
 else
   fail "pr edit events pre-read failure: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -814,7 +814,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PATCH_FAIL=1 as_author -- gh pr edit 42 --repo o/r --title New --add-label x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'later edits were not attempted' && log_lacks $'POST\trepos/o/r/issues/42/labels'; then
+if [ "$rc" -eq 1 ] && grep -q 'later edits were not attempted' <<<"$err" && log_lacks $'POST\trepos/o/r/issues/42/labels'; then
   pass "pr edit: a failed PATCH stops before the later label write and says so"
 else
   fail "pr edit PATCH failure: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -908,7 +908,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REF_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r --delete-branch 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'verified close of PR #42' && printf '%s' "$err" | grep -q 'restore branch feature' && ! printf '%s' "$err" | grep -q 'verified delete of branch'; then
+if [ "$rc" -eq 5 ] && grep -q 'verified close of PR #42' <<<"$err" && grep -q 'restore branch feature' <<<"$err" && ! grep -q 'verified delete of branch' <<<"$err"; then
   pass "pr close --delete-branch: a head_ref_deleted event by another login exits 5"
 else
   fail "pr close foreign ref delete: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -917,7 +917,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_NO_REF_EVENT=1 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr close 42 --repo o/r --delete-branch 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'head_ref_deleted' && printf '%s' "$err" | grep -q 'restore branch feature'; then
+if [ "$rc" -eq 5 ] && grep -q 'head_ref_deleted' <<<"$err" && grep -q 'restore branch feature' <<<"$err"; then
   pass "pr close --delete-branch: no head_ref_deleted event leaves the delete unattributed (5)"
 else
   fail "pr close missing ref event: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -926,7 +926,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr close 42 --repo o/r --comment bye 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'Nothing was written' && log_lacks 'POST' && log_lacks 'PATCH'; then
+if [ "$rc" -eq 5 ] && grep -q 'Nothing was written' <<<"$err" && log_lacks 'POST' && log_lacks 'PATCH'; then
   pass "pr close: an unreadable event log refuses before the closing comment is posted"
 else
   fail "pr close events-first: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -935,7 +935,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PATCH_FAIL=1 as_author -- gh pr close 42 --repo o/r --comment bye 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'the closing comment was posted (https://github.com/o/r/pull/42#issuecomment-900), but closing PR #42 failed'; then
+if [ "$rc" -eq 1 ] && grep -q 'the closing comment was posted (https://github.com/o/r/pull/42#issuecomment-900), but closing PR #42 failed' <<<"$err"; then
   pass "pr close: a close that fails after the comment says the comment was posted"
 else
   fail "pr close partial: rc=$rc err=$err"
@@ -953,7 +953,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r --comment bye --delete-branch 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'already closed; nothing was written (no comment was posted and no branch was deleted' \
+if [ "$rc" -eq 0 ] && grep -q 'already closed; nothing was written (no comment was posted and no branch was deleted' <<<"$err" \
    && log_lacks 'PATCH' && log_lacks 'issues/42/comments' && log_lacks 'git/refs' && log_lacks 'events?per_page'; then
   pass "pr close on an already-closed PR: succeeds as gh does, writing nothing (no comment, no branch delete) (#2207)"
 else
@@ -963,7 +963,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed STUB_PR_MERGED=true as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already merged; nothing was written' && log_lacks 'PATCH'; then
+if [ "$rc" -eq 1 ] && grep -q 'already merged; nothing was written' <<<"$err" && log_lacks 'PATCH'; then
   pass "pr close on a merged PR: still refused (1), nothing written (#2207)"
 else
   fail "pr close merged: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -997,7 +997,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 'claude\[bot\]'"; then
+if [ "$rc" -eq 5 ] && grep -q "closing PR #42 landed under 'claude\[bot\]'" <<<"$err"; then
   pass "pr close readback: a closed event by another login exits 5"
 else
   fail "pr close actor mutation: rc=$rc err=$err"
@@ -1014,7 +1014,7 @@ slurp_refused() { # <label> <args...>
   set +e
   err="$(MERGEPATH_GH_TRANSPORT=rest STUB_NO_SLURP=1 as_author -- "$@" 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'install gh 2.48 or later. Nothing was written.' \
+  if [ "$rc" -eq 1 ] && grep -q 'install gh 2.48 or later. Nothing was written.' <<<"$err" \
      && log_lacks $'POST\t' && log_lacks $'PATCH\t' && log_lacks $'DELETE\t' && log_lacks 'events?per_page'; then
     pass "no --slurp: $label is refused before any write"
   else
@@ -1060,7 +1060,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'its reviewers could not be requested' && printf '%s' "$err" | grep -q "the label 'a' landed under 'claude\\[bot\\]'" && printf '%s' "$err" | grep -q 'not attributed to'; then
+if [ "$rc" -eq 5 ] && grep -q 'its reviewers could not be requested' <<<"$err" && grep -q "the label 'a' landed under 'claude\\[bot\\]'" <<<"$err" && grep -q 'not attributed to' <<<"$err"; then
   pass "create: a label that landed under another login before a failed reviewer request is caught (5)"
 else
   fail "create partial foreign: rc=$rc err=$err"
@@ -1069,7 +1069,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'are attributed to nathanjohnpayne, and no event by another login appeared'; then
+if [ "$rc" -eq 1 ] && grep -q 'are attributed to nathanjohnpayne, and no event by another login appeared' <<<"$err"; then
   pass "create: a failed reviewer request after a correctly attributed label is reported as a failure (1)"
 else
   fail "create partial clean: rc=$rc err=$err"
@@ -1078,7 +1078,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'requesting reviewers on PR #42 failed' && printf '%s' "$err" | grep -q 'not attributed to'; then
+if [ "$rc" -eq 5 ] && grep -q 'requesting reviewers on PR #42 failed' <<<"$err" && grep -q 'not attributed to' <<<"$err"; then
   pass "edit: a label that landed under another login before a failed reviewer request is caught (5)"
 else
   fail "edit partial foreign: rc=$rc err=$err"
@@ -1090,9 +1090,9 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=1 as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure and is not attributable over REST' \
-   && printf '%s' "$err" | grep -q 'no write that GitHub records as an event landed before the failure' \
-   && ! printf '%s' "$err" | grep -q 'are attributed to nathanjohnpayne'; then
+if [ "$rc" -eq 1 ] && grep -q 'note: the body edit of PR #42 landed before the failure and is not attributable over REST' <<<"$err" \
+   && grep -q 'no write that GitHub records as an event landed before the failure' <<<"$err" \
+   && ! grep -q 'are attributed to nathanjohnpayne' <<<"$err"; then
   pass "edit: a body-only PATCH before a failed reviewer request is reported as unattributed, not verified"
 else
   fail "edit partial body-only: rc=$rc err=$err"
@@ -1101,8 +1101,8 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=1 as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure' \
-   && printf '%s' "$err" | grep -q 'the other writes that succeeded before the failure are attributed to nathanjohnpayne'; then
+if [ "$rc" -eq 1 ] && grep -q 'note: the body edit of PR #42 landed before the failure' <<<"$err" \
+   && grep -q 'the other writes that succeeded before the failure are attributed to nathanjohnpayne' <<<"$err"; then
   pass "edit: a body PATCH and a label before a failed reviewer request report the body unattributed and the label attributed"
 else
   fail "edit partial body and label: rc=$rc err=$err"
@@ -1111,7 +1111,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure' && printf '%s' "$err" | grep -q 'not attributed to'; then
+if [ "$rc" -eq 5 ] && grep -q 'note: the body edit of PR #42 landed before the failure' <<<"$err" && grep -q 'not attributed to' <<<"$err"; then
   pass "edit: the unattributed body is still named when a foreign label event fails the partial readback (5)"
 else
   fail "edit partial body foreign: rc=$rc err=$err"
@@ -1123,7 +1123,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENTS_HIDE_READS=99 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "no labeled event appeared" && printf '%s' "$err" | grep -q 'not attributed to'; then
+if [ "$rc" -eq 5 ] && grep -q "no labeled event appeared" <<<"$err" && grep -q 'not attributed to' <<<"$err"; then
   pass "create: a label that succeeded but never shows its event before a failed reviewer request is unattributed (5)"
 else
   fail "create partial missing event: rc=$rc err=$err"
@@ -1134,7 +1134,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && ! printf '%s' "$err" | grep -q 'no review_requested event appeared'; then
+if [ "$rc" -eq 1 ] && ! grep -q 'no review_requested event appeared' <<<"$err"; then
   pass "create: the failed reviewer request itself is not demanded as an event"
 else
   fail "create partial only-done: rc=$rc err=$err"
@@ -1241,7 +1241,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label b 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'were not attempted' && log_lacks 'issues/42/labels'; then
+if [ "$rc" -eq 5 ] && grep -q 'were not attempted' <<<"$err" && log_lacks 'issues/42/labels'; then
   pass "create follow-ups: an unreadable event snapshot stops before the follow-up writes"
 else
   fail "create follow-up snapshot failure: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1306,8 +1306,8 @@ new_case
 set +e
 err="$(CLAUDE_CODE_REMOTE=true as_author -- gh pr merge 42 --repo o/r --squash --delete-branch --match-head-commit 0123456789012345678901234567890123456789 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 6 ] && printf '%s' "$err" | grep -q 'CEILING: gh pr merge does not run on the REST transport' \
-   && printf '%s' "$err" | grep -q 'post-local-agent-handback.sh <PR#> --blocked graphql' \
+if [ "$rc" -eq 6 ] && grep -q 'CEILING: gh pr merge does not run on the REST transport' <<<"$err" \
+   && grep -q 'post-local-agent-handback.sh <PR#> --blocked graphql' <<<"$err" \
    && log_lacks $'pr\tmerge' && log_lacks 'POST' && log_lacks 'PUT'; then
   pass "pr merge on a cloud surface: refused with the ceiling code (6) and the handback command; nothing written"
 else
@@ -1320,7 +1320,7 @@ for spelling in "gh --repo o/r pr merge 42 --squash" "gh -R o/r pr merge 42" "gh
   # shellcheck disable=SC2086  # the spelling is split into argv on purpose
   err="$(CLAUDE_CODE_REMOTE=true as_author -- $spelling 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 6 ] && printf '%s' "$err" | grep -q 'CEILING: gh pr merge' && log_lacks $'merge\t'; then
+  if [ "$rc" -eq 6 ] && grep -q 'CEILING: gh pr merge' <<<"$err" && log_lacks $'merge\t'; then
     pass "pr merge spelled '$spelling' on a cloud surface: the same ceiling refusal"
   else
     fail "merge spelling '$spelling': rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1332,7 +1332,7 @@ for api_merge in "gh api -X PUT repos/o/r/pulls/42/merge" "gh api --method=PUT r
   # shellcheck disable=SC2086  # the spelling is split into argv on purpose
   err="$(CLAUDE_CODE_REMOTE=true as_author -- $api_merge 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'PUT'; then
+  if [ "$rc" -eq 2 ] && grep -q 'merge API mutations are forbidden' <<<"$err" && log_lacks 'PUT'; then
     pass "REST merge endpoint through gh api ('$api_merge') on a cloud surface: refused, never passed through"
   else
     fail "api merge '$api_merge': rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1342,7 +1342,7 @@ new_case
 set +e
 err="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh api graphql -f 'query=mutation { mergePullRequest(input: {pullRequestId: "x"}) { clientMutationId } }' 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'graphql'; then
+if [ "$rc" -eq 2 ] && grep -q 'merge API mutations are forbidden' <<<"$err" && log_lacks 'graphql'; then
   pass "GraphQL merge mutation through gh api on a cloud surface: refused for the reviewer wrapper too"
 else
   fail "graphql merge: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1356,7 +1356,7 @@ for mutation in enablePullRequestAutoMerge disablePullRequestAutoMerge addPullRe
     set +e
     err="$(MERGEPATH_GH_TRANSPORT=$t as_author -- gh api graphql -f "query=mutation { $mutation(input: {pullRequestId: \"x\"}) { clientMutationId } }" 2>&1 >/dev/null)"; rc=$?
     set -e
-    if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'graphql'; then
+    if [ "$rc" -eq 2 ] && grep -q 'merge API mutations are forbidden' <<<"$err" && log_lacks 'graphql'; then
       pass "$mutation through gh api ($t transport): refused before the call"
     else
       fail "$mutation ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1367,7 +1367,7 @@ new_case
 set +e
 err="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh --repo o/r pr comment 1 --body x 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q "option '--repo' before the command group" && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
+if [ "$rc" -eq 1 ] && grep -q "option '--repo' before the command group" <<<"$err" && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
   pass "an option before the command group on the REST transport: refused, not passed to native gh"
 else
   fail "leading option: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1417,7 +1417,7 @@ override_refused() { # <label> <wrapper fn> <args...>
     set +e
     err="$(MERGEPATH_GH_TRANSPORT=$t "$fn" -- "$@" 2>&1 >/dev/null)"; rc=$?
     set -e
-    if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q '#1542' && [ ! -s "$LOGF" ]; then
+    if [ "$rc" -eq 1 ] && grep -q '#1542' <<<"$err" && [ ! -s "$LOGF" ]; then
       pass "$label ($t transport): refused before any gh call"
     else
       fail "$label ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1466,7 +1466,7 @@ for gr in git@tenant.ghe.com:o/r https://tenant.ghe.com/o/r; do
     set +e
     err="$(GH_REPO=$gr MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh run list 2>&1 >/dev/null)"; rc=$?
     set -e
-    if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'not a plain OWNER/REPO' && [ ! -s "$LOGF" ]; then
+    if [ "$rc" -eq 1 ] && grep -q 'not a plain OWNER/REPO' <<<"$err" && [ ! -s "$LOGF" ]; then
       pass "inherited GH_REPO $gr ($t transport): refused before any gh call"
     else
       fail "inherited GH_REPO $gr ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1500,7 +1500,7 @@ for t in gh rest; do
   set +e
   err="$(GH_REPO=tenant.ghe.com/o/r MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh pr comment 1 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'inherited GH_REPO (.tenant.ghe.com/o/r.) that is not a plain OWNER/REPO' && [ ! -s "$LOGF" ]; then
+  if [ "$rc" -eq 1 ] && grep -q 'inherited GH_REPO (.tenant.ghe.com/o/r.) that is not a plain OWNER/REPO' <<<"$err" && [ ! -s "$LOGF" ]; then
     pass "inherited host-qualified GH_REPO ($t transport): refused before any gh call"
   else
     fail "inherited GH_REPO ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1598,7 +1598,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://example.com/a/b 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q -- '--body-file' && log_lacks 'issues/1/comments'; then
+if [ "$rc" -eq 1 ] && grep -q -- '--body-file' <<<"$err" && log_lacks 'issues/1/comments'; then
   pass "a body that is only a foreign URL is refused with the --body-file route"
 else
   fail "foreign URL body: rc=$rc err=$err"; cat "$LOGF" >&2

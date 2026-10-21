@@ -681,12 +681,12 @@ if pr_body_validate "$VALID_BODY" "/nonexistent/review-policy.yml" >/dev/null 2>
 else
   ok "an unreadable policy file still fails closed"
 fi
-if printf '%s\n' "$unreadable_out" | grep -qF 'unknown Authoring-Agent'; then
+if grep -qF 'unknown Authoring-Agent' <<<"$unreadable_out"; then
   bad "an unreadable policy is still reported as 'unknown Authoring-Agent' (blames the author)"
 else
   ok "an unreadable policy is not misreported as an unknown agent"
 fi
-if printf '%s\n' "$unreadable_out" | grep -qiE 'configuration problem|could be derived'; then
+if grep -qiE 'configuration problem|could be derived' <<<"$unreadable_out"; then
   ok "an unreadable policy names itself as the cause"
 else
   bad "an unreadable policy gives no actionable diagnostic: $unreadable_out"
@@ -721,12 +721,12 @@ prp_job=$(awk '/^  self-review-check:/{f=1;next} /^  [a-z-]+:$/{f=0} f' "$ROOT/$
 # documenting the pattern it forbids.
 prp_live=$(printf '%s\n' "$prp_job" | grep -vE '^[[:space:]]*#')
 
-if printf '%s\n' "$prp_live" | grep -qE "grep -q[A-Za-z]*[[:space:]]+.\^## Self-Review"; then
+if grep -qE "grep -q[A-Za-z]*[[:space:]]+.\^## Self-Review" <<<"$prp_live"; then
   bad "$PRP still gates Self-Review with a line grep (a fenced heading defeats it)"
 else
   ok "the Self-Review gate no longer relies on a line grep"
 fi
-if printf '%s\n' "$prp_live" | grep -qF 'scripts/validate-pr-body.sh'; then
+if grep -qF 'scripts/validate-pr-body.sh' <<<"$prp_live"; then
   ok "the Self-Review gate routes through the shared validate-pr-body entrypoint"
 else
   bad "$PRP does not call scripts/validate-pr-body.sh; the contract would have two implementations"
@@ -734,7 +734,7 @@ fi
 # Scope guard: this gate checks the HEADING only. Enforcing the identity
 # contract here is a POLICY change (#1137) and must be a deliberate edit to
 # this assertion, not a silent widening.
-if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
+if grep -qF -- '--self-review-only' <<<"$prp_live"; then
   ok "the gate asks only the heading question; the identity contract is not bundled in"
 else
   bad "$PRP no longer passes --self-review-only; widening this required check is a policy change"
@@ -744,13 +744,13 @@ fi
 # revision of this PR and got carried out with it when that guard was split to
 # #1154. Restored: removing code around assertions is exactly when they stop
 # asserting, and nothing else in the suite covers these.
-if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
-  if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
+if grep -qF 'uses: actions/checkout@' <<<"$prp_live"; then
+  if grep -qF 'ref: ${{ github.event.repository.default_branch }}' <<<"$prp_live"; then
     ok "the gate checks the validator out from the TRUSTED default branch"
   else
     bad "$PRP checks out without pinning ref to default_branch — a PR could edit its own validator"
   fi
-  if printf '%s\n' "$prp_live" | grep -qF 'persist-credentials: false'; then
+  if grep -qF 'persist-credentials: false' <<<"$prp_live"; then
     ok "the trusted validator checkout does not persist credentials"
   else
     bad "$PRP trusted checkout must set persist-credentials: false (#548)"
@@ -758,7 +758,7 @@ if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
 else
   bad "$PRP self-review-check has no checkout, so it cannot run the trusted validator"
 fi
-if printf '%s\n' "$prp_live" | grep -qF 'node-version-file'; then
+if grep -qF 'node-version-file' <<<"$prp_live"; then
   bad "$PRP uses node-version-file; canonical workflows must not depend on a consumer-owned .nvmrc"
 else
   ok "the gate pins Node by literal version, not a consumer-owned .nvmrc"
@@ -1226,7 +1226,7 @@ prod_validate_out="$(printf '' | run_with_timeout 90 bash -c '
 
 if [ "$prod_validate_rc" -eq 0 ]; then
   bad "#1281: pr_body_validate ACCEPTED a body whose parse timed out -- fail-open"
-elif printf '%s' "$prod_validate_out" | grep -q "did not complete"; then
+elif grep -q "did not complete" <<<"$prod_validate_out"; then
   ok "#1281: pr_body_validate fails closed on a timed-out parse and names the cause"
 else
   bad "#1281: pr_body_validate failed closed but misattributed the cause: $prod_validate_out"
@@ -1235,7 +1235,7 @@ fi
 # The other half of that guarantee: the diagnosis must not be the author-blaming
 # one. Without this, rewording the timeout branch back into "missing a valid
 # Authoring-Agent" would still pass the check above.
-if printf '%s' "$prod_validate_out" | grep -q "missing a valid 'Authoring-Agent:' line"; then
+if grep -q "missing a valid 'Authoring-Agent:' line" <<<"$prod_validate_out"; then
   bad "#1281: pr_body_validate blamed the PR author for a parser timeout"
 else
   ok "#1281: pr_body_validate does not report a timeout as a missing declaration"
