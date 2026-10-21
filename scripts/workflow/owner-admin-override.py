@@ -318,6 +318,53 @@ def substantive_review(review, inline, bot):
                        for comment in replies))
 
 
+def unanchored_terminal_summary(comment):
+    """Recognize only the observed automatic idle UI shape, never a response."""
+    body = comment.get('body', '')
+    records = re.findall(r'(?m)^<!-- codex-review-state:v1 (.+) -->$', body)
+    if len(records) != 1 or body.count('<!-- codex-review-state:') != 1:
+        return False
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate state field')
+            result[key] = value
+        return result
+
+    try:
+        state = json.loads(records[0], object_pairs_hook=unique_object)
+        expected = {'commit_sha', 'has_any_findings', 'has_unresolved_findings', 'status'}
+        if (set(state) != {'code_review', 'security_review'}
+                or set(state['code_review']) != expected or set(state['security_review']) != expected):
+            return False
+        code, security = state['code_review'], state['security_review']
+        flags = ((code['has_any_findings'] is False and code['has_unresolved_findings'] is False)
+                 or (code['has_any_findings'] is None and code['has_unresolved_findings'] is None))
+        if (code['commit_sha'] is not None or code['status'] != 'completed'
+                or not flags or any(value is not None for value in security.values())):
+            return False
+        rows = re.findall(r'(?m)^\|[^\n]*(?:Code Review|Security Review)[^\n]*\|\s*$', body, re.I)
+        if len(rows) != 1:
+            return False
+        row = re.fullmatch(r'\|\s*📝\s*\*\*Code Review\*\*\s*\|\s*✅\s*\*\*Completed\*\*\s*'
+                           r'<relative-time datetime="([^"<>]+)">([^<>]+)</relative-time>\s*'
+                           r'\|\s*—\s*\|\s*PR opened\s*\|\s*', rows[0])
+        if not row:
+            return False
+        if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z', row[1]):
+            return False
+        completed = dt.datetime.fromisoformat(row[1].replace('Z', '+00:00'))
+        created = timestamp(comment['created_at'])
+        updated = timestamp(comment.get('updated_at', comment['created_at']))
+        # GitHub comment timestamps have whole-second precision; UI times may
+        # include fractions. Compare in that same finite observation bucket.
+        return row[1] == row[2] and created <= completed.replace(microsecond=0) <= updated
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT, *, ledger=None, repository=None):
     """Observe unanswered requests without granting response clearance."""
     # Edited author/bot comments no longer prove their pre-merge request/status.
@@ -361,6 +408,8 @@ def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT, *,
             continue
         row = re.search(r'(?m)^\|\s*📝\s*\*\*Code Review\*\*\s*\|([^|\n]+)\|\s*`([0-9a-f]{7,40})`\s*\|[^|\n]+\|\s*$', body, re.I)
         if not row:
+            if unanchored_terminal_summary(comment):
+                continue  # No head association or response-time credit.
             return True  # Unreadable provider status cannot prove idleness.
         if row:
             status = 'completed' if re.search(r'\*\*Completed\*\*', row[1], re.I) else 'running' if re.search(r'\*\*Running\*\*', row[1], re.I) else 'unknown'

@@ -45,14 +45,18 @@ function classify(diff, files) {
   return { decision: tripwires.length ? 'human-review' : 'model-review', tripwires };
 }
 
-// Only an ordinary wave qualifies: its base on the verified head's first-parent
-// history (a merged hub state) and no historical chunk boundary, which wave
-// code checks by plain ancestry and could fall on a never-merged commit.
+// Only an ordinary wave qualifies: its audited head on the first-parent history
+// of the trusted hub default branch (it merged), its base on that head's
+// first-parent history (a merged hub state), and no historical chunk boundary,
+// which wave code checks by plain ancestry and could fall on a never-merged
+// commit. The live verifier proves byte equality with the source SHA, not that
+// the source SHA merged; head_on_hub_default is what proves that.
 function verifiedWave(metadata) {
   const scope = metadata.wave_audit;
   return scope !== null && typeof scope === 'object' && !Array.isArray(scope)
     && /^[0-9a-f]{40}$/.test(scope.canonical_base_sha) && /^[0-9a-f]{40}$/.test(scope.canonical_head_sha)
     && scope.base_on_first_parent === true
+    && scope.head_on_hub_default === true
     && scope.historical_end_sha === '' && scope.finalize_historical === false;
 }
 

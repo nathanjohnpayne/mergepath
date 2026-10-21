@@ -1201,6 +1201,21 @@ run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$SIDE" --head-sha "
 if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.json" >/dev/null 2>&1; then
   pass "capture records a second-parent base as off the first-parent history"
 else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
+# The audited head must have merged: it is on the first-parent history of the
+# trusted checkout's default-branch ref, not merely byte-equal to some commit.
+saved_default=$(git -C "$CANON" rev-parse --verify --quiet refs/remotes/origin/main || true)
+FEATURE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'unmerged feature commit on the watermark')"
+git -C "$CANON" update-ref refs/remotes/origin/main "$MERGED"
+for hcase in "$C2:true:a merged head on the default branch" "$FEATURE:false:an unmerged feature commit sitting on the watermark" "$SIDE:false:a commit reachable only through a merge's second parent"; do
+  h=${hcase%%:*}; rest=${hcase#*:}; want=${rest%%:*}; label=${rest#*:}
+  rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
+  run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$h" \
+    --capture-input-dir "$WORK/capture-default" >/dev/null 2>"$WORK/capture-default.err" || true
+  if jq -e --argjson want "$want" '.head_on_hub_default == $want' "$WORK/capture-default/scope.json" >/dev/null 2>&1; then
+    pass "capture records head_on_hub_default=$want for $label"
+  else fail "head_on_hub_default for $label: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
+done
+if [ -n "$saved_default" ]; then git -C "$CANON" update-ref refs/remotes/origin/main "$saved_default"; else git -C "$CANON" update-ref -d refs/remotes/origin/main; fi
 # A recent base with more than a pipe buffer of older history behind it
 # (2,500 commits of 41 bytes is ~100 KiB) is the real watermark shape. rev-list
 # prints newest first, so an early `grep -q` exit on the base SIGPIPEs it
