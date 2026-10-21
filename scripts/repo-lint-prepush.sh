@@ -526,7 +526,7 @@ undeclared_notice() {
   [ -n "$UNDECLARED" ] || return 0
   local list
   list=$(printf '%s' "$UNDECLARED" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g')
-  echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; this hook runs only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps not run here; MERGEPATH_PREPUSH_LIVE=all runs them)."
+  echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; this hook runs only the live assertions for it ($FB_N fallback wrappers and $DEEPFB_N deep steps not run here; MERGEPATH_PREPUSH_LIVE=all runs the wrappers, and with MERGEPATH_PREPUSH_DEEP=1 as well the deep steps)."
 }
 
 if [ "$PLAN" -eq 1 ]; then

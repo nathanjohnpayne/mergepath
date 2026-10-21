@@ -736,6 +736,9 @@ case "$out" in
   *) bad "undeclared path notice missing: $out" ;;
 esac
 case "$out" in *"selection: 0 wrappers selected by path, 1 by undeclared-path fallback"*) ok "undeclared path: the selection reason is printed" ;; *) bad "selection reason missing: $out" ;; esac
+# The recovery hint names both opt-ins: the deep_fallback lane runs only
+# with MERGEPATH_PREPUSH_LIVE=all and MERGEPATH_PREPUSH_DEEP=1 together.
+case "$out" in *"MERGEPATH_PREPUSH_LIVE=all runs the wrappers, and with MERGEPATH_PREPUSH_DEEP=1 as well the deep steps"*) ok "undeclared path: the hint names both opt-ins for the deep fallback" ;; *) bad "undeclared path hint omits the deep opt-in: $out" ;; esac
 reset_probe
 git -C "$FIX" commit -q --allow-empty -m undeclared-all-live
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LIVE=all git push origin feat/undeclared 2>&1) || rc=$?
