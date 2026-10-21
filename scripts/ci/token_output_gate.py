@@ -17498,6 +17498,14 @@ def self_test():
     import hashlib
     import json
 
+    # The parent owns the end-to-end probes; only its guarded child runs the
+    # corpus. Delegating before any oracle work avoids measuring it twice.
+    residue_failures = _residue_and_quoted_tmpdir_case()
+    if residue_failures is not None:
+        for failure in residue_failures:
+            print("check_no_token_in_output: FAIL: %s" % failure, file=sys.stderr)
+        return int(bool(residue_failures))
+
     failures = []
     # Evidence is additive to the existing outcomes; no cell is run twice.
     tilde_evidence_seen = set()
@@ -17537,6 +17545,9 @@ def self_test():
     failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
+        # Report the actual allocation, not merely the requested environment.
+        print("check_no_token_in_output: oracle TMPDIR: "
+              + json.dumps(os.path.dirname(tmp)))
 
         def _one(cell):
             entry, sample = cell
@@ -17705,8 +17716,6 @@ def self_test():
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_shell_file_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
-
-    failures.extend(_residue_and_quoted_tmpdir_case())
 
     failures.extend(_sentinel_window_cases())
 
@@ -18845,7 +18854,10 @@ def _path_independence_case(tmp):
 
 
 def _residue_and_quoted_tmpdir_case():
-    """Two successive runs leave nothing behind, and a quoted TMPDIR is inert.
+    """Run the corpus once under a quoted TMPDIR and check all temp cleanup.
+
+    Return None only in the child, suppressing recursive residue setup while
+    leaving the complete corpus and its auxiliary axes enabled.
 
     #1012 installed two `trap ... RETURN` handlers where the second replaced
     the first, so one temp file survived every `--scan`, and a `'` in TMPDIR
@@ -18853,9 +18865,11 @@ def _residue_and_quoted_tmpdir_case():
     scan path at all and drives its fixtures from a Python context manager, so
     the property is asserted directly rather than argued.
     """
-    failures = []
+    import json
+
     if os.environ.get("_TOKEN_OUTPUT_SELFTEST_INNER") == "1":
-        return failures
+        return None
+    failures = []
 
     # The #1012 reproduction, asserted END TO END on the process exit code:
     # a tree whose ONLY file is an extensionless `#!/usr/bin/env -S bash -e`
@@ -18912,6 +18926,23 @@ def _residue_and_quoted_tmpdir_case():
             env=env,
             capture_output=True,
         )
+        # Keep the child's full oracle diagnostics visible and count a
+        # completed corpus independently of its PASS/FAIL verdict.
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        summaries = [line for line in stdout.splitlines()
+                     if line.startswith("check_no_token_in_output: oracle samples: ")]
+        root_prefix = "check_no_token_in_output: oracle TMPDIR: "
+        roots = [line[len(root_prefix):] for line in stdout.splitlines()
+                 if line.startswith(root_prefix)]
+        if len(summaries) != 1:
+            failures.append("residue: expected exactly one full oracle corpus, observed %d"
+                            % len(summaries))
+        if roots != [json.dumps(quoted)]:
+            failures.append("residue: full oracle corpus did not allocate exactly once "
+                            "under the quoted TMPDIR: %r" % roots)
         if proc.returncode != 0:
             failures.append(
                 "residue: --self-test under a quoted TMPDIR exited %d: %s"
@@ -18920,9 +18951,12 @@ def _residue_and_quoted_tmpdir_case():
         leftover = sorted(os.listdir(quoted))
         if leftover:
             failures.append(
-                "residue: %d file(s) left under TMPDIR after two runs: %s"
+                "residue: %d file(s) left under TMPDIR after two scans and the self-test: %s"
                 % (len(leftover), leftover)
             )
+        if not failures:
+            print("check_no_token_in_output: PASS (one full oracle corpus under "
+                  "quoted TMPDIR; two scans and self-test left no residue)")
     return failures
 
 
