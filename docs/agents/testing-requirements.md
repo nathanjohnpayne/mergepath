@@ -34,6 +34,8 @@ For token-output leading here-string resolution, retain separate lexer operator/
 
 Retain attached-command ordering, substitution-only operand width and preexisting opaque classification of unresolved leading operands when changing here-string resolution (#1462 review repair). Measure exact diagnostic examples per sample rather than assuming every value errors; keep all-shape diagnostic controls, quoted/quiet/capture boundaries, the original literal controls and PID controls. Independently remove ordering, placeholder and opacity protections before one final full self-test and actual hub scan. The finite scope and numeric-sample distinction live in `specs/repo_lint_execution.md`.
 
+Here-string descriptor normalization must reuse the existing finite `_FD_PREFIX` syntax and update all five semantic word consumers plus the substitution-only operand placeholder (#1462 descriptor preservation). Retain literal-empty operand proof separately from command proof, paired 0/00/12/{fd} controls and the inherited helper-hd fd0/00/3 corpus. Mutate each consumer independently; preserve inherited entries/declarations and run one final full self-test and actual hub scan. Descriptor-value/dataflow and general redirection grammar remain outside the owning spec's boundary.
+
 ## Phase 4b automation suite
 
 Run `tests/test_phase_4b_automation.sh` with stdin closed (`bash tests/test_phase_4b_automation.sh < /dev/null`). Its tripwire case (#1757) drives `phase-4b-review.sh` against a fake handoff that reads stdin, so a session that leaves stdin open, such as an agent's backgrounded shell, blocks that case forever at 0% CPU instead of failing. A run that sits on one case for minutes is this hang, not a slow suite: kill it and rerun with `< /dev/null`.
