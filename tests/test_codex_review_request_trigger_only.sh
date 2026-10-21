@@ -223,6 +223,14 @@ case "$endpoint" in
     esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
+  # #2591: the GraphQL force-push timeline, for heads a force-push replaced.
+  graphql)
+    case "${CODEX_TEST_FORCE_PUSH:-none}" in
+      fail) echo 'simulated GraphQL failure' >&2; exit 1 ;;
+      none) printf '%s\n' '{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
+      *) jq -cn --arg b "$CODEX_TEST_FORCE_PUSH" '{data:{repository:{pullRequest:{timelineItems:{pageInfo:{hasNextPage:false,endCursor:null},
+           nodes:[{beforeCommit:{oid:$b},afterCommit:{oid:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}}}}' ;;
+    esac ;;
   # #2553: the PR's commits, for failover markers' heads.
   repos/owner/repo/pulls/999/commits)
     if [ "${CODEX_TEST_COMMITS_FAIL:-0}" = 1 ]; then echo 'simulated commits read failure' >&2; exit 1; fi
@@ -271,6 +279,10 @@ case "$endpoint" in
       cap_failover_foreign) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8400 + (. * 2)),user:{login:$who},created_at:$t,body:"@codex review"}]
                           + [{id:8401,user:{login:$who},created_at:$t,updated_at:$t,
                               body:"<!-- mergepath-codex-failover:v1 head=1111111111111111111111111111111111111111 trigger_comment_id=8400 -->"}]' ;;
+      # #2591: the marker names a head a force-push replaced; only GraphQL has it.
+      cap_failover_forced) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8400 + (. * 2)),user:{login:$who},created_at:$t,body:"@codex review"}]
+                          + [{id:8401,user:{login:$who},created_at:$t,updated_at:$t,
+                              body:"<!-- mergepath-codex-failover:v1 head=9999999999999999999999999999999999999999 trigger_comment_id=8400 -->"}]' ;;
       # #2534: what the failover stub has posted so far.
       live)             if [ -f "$CODEX_TEST_STATE_DIR/live-comments.json" ]; then cat "$CODEX_TEST_STATE_DIR/live-comments.json"; else printf '[]\n'; fi ;;
       *)                printf '[]\n' ;;
@@ -2012,6 +2024,20 @@ test_failover_marker() {
   [ "$rc" = 7 ] && [ "$(trig_count "$dir")" = 0 ] \
     && grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
     || fail "#2553: a marker naming a foreign head must not exempt its trigger (rc=$rc posts=$(trig_count "$dir"))"
+  # #2591: a head a force-push replaced counts when GraphQL names it, and a
+  # failed GraphQL read leaves only that head out.
+  dir=$(make_case failover-ceiling-forced)
+  rc=$(CODEX_TEST_HEAD=$fo_head CODEX_TEST_FORCE_PUSH=9999999999999999999999999999999999999999 run_trigger_only "$dir" cap_failover_forced)
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && grep -q 'request attempts 9/10' "$dir/err.log" \
+    || fail "#2591: a marker on a force-pushed-away head must exempt its trigger when GraphQL names it (rc=$rc posts=$(trig_count "$dir"))"
+  dir=$(make_case failover-ceiling-forced-unreadable)
+  rc=$(CODEX_TEST_HEAD=$fo_head CODEX_TEST_FORCE_PUSH=fail run_trigger_only "$dir" cap_failover_forced)
+  [ "$rc" = 7 ] && [ "$(trig_count "$dir")" = 0 ] \
+    || fail "#2591: without the GraphQL heads that marker must not exempt its trigger (rc=$rc posts=$(trig_count "$dir"))"
+  dir=$(make_case failover-ceiling-forced-ok-without-graphql)
+  rc=$(CODEX_TEST_HEAD=$fo_head CODEX_TEST_FORCE_PUSH=fail run_trigger_only "$dir" cap_failover)
+  [ "$rc" = 0 ] && grep -q 'request attempts 9/10' "$dir/err.log" \
+    || fail "#2591: a failed GraphQL read must not drop the REST heads (rc=$rc)"
   dir=$(make_case failover-ceiling-unreadable)
   rc=$(CODEX_TEST_HEAD=$fo_head CODEX_TEST_COMMITS_FAIL=1 run_trigger_only "$dir" cap_failover)
   [ "$rc" = 7 ] && [ "$(trig_count "$dir")" = 0 ] && grep -q "head set is unreadable" "$dir/err.log" \

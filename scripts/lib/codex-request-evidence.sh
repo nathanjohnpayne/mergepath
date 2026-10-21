@@ -113,24 +113,56 @@ crqe_failover_markers_present() { # comments-json author
 }
 
 # The heads this PR has had (#2553): <current-head>, every commit in the PR's
-# commit list, and the commits the timeline records (`committed` events and a
-# `head_ref_force_pushed` event's commit_id when REST fills it). REST does not
-# name the head a force-push replaced, so a marker on a head that was later
-# force-pushed away no longer exempts its trigger: it counts, the safe side.
-# Prints a sorted array of lowercase full SHAs. Fails on input that is not two arrays and a full SHA; callers
-# then use [] so that nothing is exempt.
-crqe_pr_head_set() { # commits-json timeline-json current-head
-  jq -nce --argjson c "$1" --argjson t "$2" --arg h "$3" '
+# commit list, the commits the timeline records (`committed` events and a
+# `head_ref_force_pushed` event's commit_id when REST fills it), and the before
+# and after commits of every force-push (<force-push-heads>, from
+# crqe_force_push_heads; #2591). REST does not name the head a force-push
+# replaced, so without that read a marker on a head that was later
+# force-pushed away stops exempting its trigger: it counts, the safe side.
+# Prints a sorted array of lowercase full SHAs. Fails on input that is not
+# arrays and a full SHA; callers then use [] so that nothing is exempt.
+crqe_pr_head_set() { # commits-json timeline-json current-head [force-push-heads-json]
+  jq -nce --argjson c "$1" --argjson t "$2" --arg h "$3" --argjson f "${4:-[]}" '
     def sha: select(type == "string") | ascii_downcase | select(test("^([0-9a-f]{40}|[0-9a-f]{64})$"));
-    if ($c | type) != "array" or ($t | type) != "array" or (($h | ascii_downcase) | test("^([0-9a-f]{40}|[0-9a-f]{64})$") | not)
+    if ($c | type) != "array" or ($t | type) != "array" or ($f | type) != "array"
+       or (($h | ascii_downcase) | test("^([0-9a-f]{40}|[0-9a-f]{64})$") | not)
     then error("head set") else . end
     | [ ($h | sha),
         ($c[] | objects | .sha | sha),
         ($t[] | objects | select(.event == "committed") | .sha | sha),
         ($t[] | objects | select(.event == "head_ref_force_pushed")
-             | .commit_id | sha) ]
+             | .commit_id | sha),
+        ($f[] | sha) ]
     | unique' 2>/dev/null
 }
+
+# The before and after commits of every force-push on <repo>#<pr>, from the
+# GraphQL timeline (#2591): the REST event names neither. Prints a sorted array
+# of lowercase SHAs. Fails when the read fails or a page has no timeline;
+# callers then pass [], which only drops force-pushed heads from the set.
+crqe_force_push_heads() { # repo pr
+  local out
+  out=$(gh api graphql --paginate -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f query='
+    query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ... on HeadRefForcePushedEvent { beforeCommit { oid } afterCommit { oid } } }
+          }
+        }
+      }
+    }' 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -sce '
+    if length == 0 or any(.[]; (.data.repository.pullRequest.timelineItems.nodes | type) != "array")
+    then error("force-push timeline") else . end
+    | [ .[].data.repository.pullRequest.timelineItems.nodes[]
+        | (.beforeCommit.oid, .afterCommit.oid)
+        | select(type == "string") | ascii_downcase
+        | select(test("^([0-9a-f]{40}|[0-9a-f]{64})$")) ]
+    | unique' 2>/dev/null
+}
+
 
 # Prints the sorted ids of the exempt failover triggers. <heads-json> is
 # crqe_pr_head_set's output; absent or [] exempts nothing.
