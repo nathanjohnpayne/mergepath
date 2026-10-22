@@ -70,8 +70,9 @@ reset_state() {
   printf '%s' '[{"name":"needs-external-review","color":"BF0606","description":"External review required before merge"},{"name":"human-hold","color":"000000","description":"Hard merge freeze - human-remove-only; supersedes all gates"},{"name":"size:S","color":"c2e0c6","description":"Small: one file or a narrow change"},{"name":"local-only","color":"123456","description":"not canonical"}]' >"$STATE/mergepath.json"
   # alpha: drifted colour + description, missing human-hold, has deprecated phase-4 drifted
   printf '%s' '[{"name":"needs-external-review","color":"B60205","description":"Blocks merge"},{"name":"size:S","color":"c2e0c6","description":"Small: one file or a narrow change"},{"name":"phase-4","color":"1D76DB","description":"Phase 4"},{"name":"local-only","color":"abcdef","description":"keep me"}]' >"$STATE/alpha.json"
-  # beta: lacks everything, including the deprecated label
-  printf '%s' '[]' >"$STATE/beta.json"
+  # beta: lacks most labels; has size:S and the deprecated phase-4 under
+  # other spellings (GitHub matches names without regard to case)
+  printf '%s' '[{"name":"Size:S","color":"ffffff","description":"old"},{"name":"Phase-4","color":"ffffff","description":"old"}]' >"$STATE/beta.json"
 }
 run() { RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/manifest.yml" \
   SYNC_LABELS_INFRA="$WORK/infra.sh" SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" "$@" 2>&1) || RC=$?; }
@@ -86,9 +87,15 @@ if [ "$RC" = 1 ] && [ ! -f "$STATE/author.log" ] && ! grep -qE '^(POST|PATCH)' "
    && printf '%s' "$OUT" | grep -q 'update phase-4: color 1D76DB -> bfd4f2, description'; then
   pass "dry run: plans creates and updates, treats colour case as equal, writes nothing, exits 1"
 else fail "dry run rc=$RC: $OUT"; fi
-if printf '%s' "$OUT" | grep -q 'beta' && ! printf '%s' "$OUT" | grep -A6 'beta' | grep -q 'create phase-4'; then
+if printf '%s' "$OUT" | grep -q 'beta' && ! printf '%s' "$OUT" | grep -q 'create phase-4'; then
   pass "dry run: a deprecated label is never created where it is missing"
 else fail "deprecated create: $OUT"; fi
+beta_plan=$(printf '%s\n' "$OUT" | sed -n '/nathanjohnpayne\/beta/,$p')
+if printf '%s' "$beta_plan" | grep -q 'update Size:S: color ffffff -> c2e0c6' \
+   && printf '%s' "$beta_plan" | grep -q 'update Phase-4: color ffffff -> bfd4f2' \
+   && ! printf '%s' "$beta_plan" | grep -qi 'create size:S'; then
+  pass "dry run: a label spelled with other case is updated under its live spelling, never duplicated"
+else fail "case-insensitive match: $beta_plan"; fi
 
 # Apply converges every repository and touches nothing outside the canonical list.
 reset_state; run --apply
@@ -97,7 +104,9 @@ if [ "$RC" = 0 ] \
    && [ "$(label alpha human-hold)" = '["000000","Hard merge freeze - human-remove-only; supersedes all gates"]' ] \
    && [ "$(label alpha phase-4)" = '["bfd4f2","Superseded by area:phase-4b."]' ] \
    && [ "$(label alpha local-only)" = '["abcdef","keep me"]' ] \
-   && [ -z "$(label beta phase-4)" ] && [ -n "$(label beta size:S)" ] \
+   && [ "$(label beta Phase-4)" = '["bfd4f2","Superseded by area:phase-4b."]' ] \
+   && [ "$(label beta Size:S)" = '["c2e0c6","Small: one file or a narrow change"]' ] \
+   && [ "$(jq length "$STATE/beta.json")" = 4 ] \
    && [ "$(label mergepath needs-external-review)" = '["BF0606","External review required before merge"]' ]; then
   pass "apply: creates missing active labels, fixes drift, corrects deprecated only where present, leaves non-canonical labels and case-only colours alone"
 else fail "apply rc=$RC: $OUT $(cat "$STATE/alpha.json")"; fi
@@ -121,6 +130,13 @@ RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/ma
   SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" 2>&1) || RC=$?
 [ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a malformed canonical label fails closed before any read" || fail "bad canon rc=$RC: $OUT"
 
+# A description over GitHub's 100-character limit fails closed before any read.
+reset_state; { printf 'BOOTSTRAP_LABELS=(\n  "long|bf0606|%s"\n)\nBOOTSTRAP_DEPRECATED_LABELS=()\n' "$(printf 'x%.0s' $(seq 101))"; } >"$WORK/long.sh"
+RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/manifest.yml" SYNC_LABELS_INFRA="$WORK/long.sh" \
+  SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" 2>&1) || RC=$?
+[ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && printf '%s' "$OUT" | grep -q '100-character' \
+  && pass "a canonical description over 100 characters fails closed before any read" || fail "long desc rc=$RC: $OUT"
+
 # A missing, broken or non-canonical deprecated list fails closed before any
 # read: otherwise --apply would create every deprecated label fleetwide.
 for variant in missing broken foreign; do
@@ -143,6 +159,8 @@ reset_state; run --repos alpha,typo
 # The real canonical source parses, and its deprecated set is a subset of it.
 RC=0; canon_ok=$(bash -c 'eval "$(sed -n "/^BOOTSTRAP_LABELS=(/,/^)/p" "$1")"; eval "$(grep -E "^BOOTSTRAP_DEPRECATED_LABELS=\(" "$1")"; for d in "${BOOTSTRAP_DEPRECATED_LABELS[@]}"; do printf "%s\n" "${BOOTSTRAP_LABELS[@]}" | grep -q "^$d|" || { echo "missing:$d"; exit 1; }; done; echo ok' _ "$ROOT/scripts/bootstrap/github-infra.sh") || RC=$?
 [ "$canon_ok" = ok ] && pass "every deprecated label in github-infra.sh is a canonical label" || fail "deprecated subset: $canon_ok"
+long=$(bash -c 'eval "$(sed -n "/^BOOTSTRAP_LABELS=(/,/^)/p" "$1")"; for l in "${BOOTSTRAP_LABELS[@]}"; do d=${l#*|}; d=${d#*|}; [ ${#d} -le 100 ] || echo "${l%%|*}"; done' _ "$ROOT/scripts/bootstrap/github-infra.sh")
+[ -z "$long" ] && pass "every real canonical description is within GitHub's 100-character limit" || fail "over 100 characters: $long"
 
 echo
 echo "test_sync_labels: $PASS passed, $FAIL failed"

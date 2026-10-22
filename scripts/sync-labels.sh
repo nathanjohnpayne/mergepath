@@ -14,6 +14,8 @@
 #                         (deprecated labels are corrected, never created)
 #   colour or desc off -> update the label in place (colour compared without
 #                         regard to case)
+# Names match without regard to case, as GitHub matches them; an update keeps
+# the live spelling.
 #   identical          -> nothing
 # Labels outside the canonical list are never touched. Nothing is deleted or
 # renamed, and a label is never recreated, so its issue history stays intact.
@@ -79,6 +81,10 @@ CANON_JSON=$(printf '%s\n' "$CANON" | jq -Rnc '
 [ "$(jq length <<<"$CANON_JSON")" -gt 0 ] || die "the canonical label list is empty"
 jq -e 'all(.[]; (.name | length) > 0 and (.color | test("^[0-9a-f]{6}$")) and (.description | length) > 0)' \
   <<<"$CANON_JSON" >/dev/null || die "a canonical label has an empty name, a non-hex colour or an empty description"
+# GitHub rejects a label description over 100 characters (HTTP 422), so a
+# longer one would fail every write for that label and never converge.
+jq -e 'all(.[]; (.description | length) <= 100)' <<<"$CANON_JSON" >/dev/null \
+  || die "a canonical label description is over GitHub's 100-character limit"
 jq -e --argjson c "$CANON_JSON" 'all(.[]; . as $d | ($c | map(.name) | index($d)) != null)' <<<"$DEPRECATED_JSON" >/dev/null \
   || die "BOOTSTRAP_DEPRECATED_LABELS names a label that is not canonical"
 
@@ -105,20 +111,22 @@ while IFS= read -r repo; do
   live=$(gh api --paginate "repos/$repo/labels?per_page=100" 2>/dev/null | jq -sc 'add // []') \
     || { echo "  ! $repo: labels unreadable"; failures=$((failures + 1)); continue; }
   plan=$(jq -c --argjson canon "$CANON_JSON" --argjson deprecated "$DEPRECATED_JSON" '
-    (map({key: .name, value: .}) | from_entries) as $have
+    (map({key: (.name | ascii_downcase), value: .}) | from_entries) as $have
     | [ $canon[] as $c
-        | ($have[$c.name]) as $h
+        | ($have[$c.name | ascii_downcase]) as $h
         | if $h == null then
             (if ($deprecated | index($c.name)) != null then empty else {action: "create", label: $c} end)
           elif (($h.color // "") | ascii_downcase) != $c.color or ($h.description // "") != $c.description
-            then {action: "update", label: $c, from: {color: $h.color, description: ($h.description // "")}}
+            then {action: "update", label: $c, live_name: $h.name, from: {color: $h.color, description: ($h.description // "")}}
           else empty end ]' <<<"$live")
   n=$(jq length <<<"$plan")
   if [ "$n" = 0 ]; then echo "= $repo: in sync"; continue; fi
   changes=$((changes + n))
   echo "~ $repo: $n change(s)"
   while IFS= read -r step; do
-    action=$(jq -r .action <<<"$step"); name=$(jq -r .label.name <<<"$step")
+    # GitHub matches label names without regard to case, so an update goes
+    # to the live spelling, which is kept (a label is never renamed).
+    action=$(jq -r .action <<<"$step"); name=$(jq -r '.live_name // .label.name' <<<"$step")
     color=$(jq -r .label.color <<<"$step"); desc=$(jq -r .label.description <<<"$step")
     if [ "$action" = create ]; then
       echo "    create $name ($color)"

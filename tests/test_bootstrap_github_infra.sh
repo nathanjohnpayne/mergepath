@@ -273,7 +273,7 @@ echo "$out" | grep "push bootstrap commit to nathanjohnpayne/test-repo" >/dev/nu
   && pass "the bootstrap commit landed on the remote's main" \
   || fail "remote has no main after the push: $(git -C "$WORKDIR/remotes/test-repo.git" branch -a 2>&1)"
 
-# --- assertion 2: all 21 labels seeded with --force ---
+# --- assertion 2: all 15 active labels seeded with --force ---
 # Hard-coded on purpose: this is an INDEPENDENT assertion of the intended
 # set, not a mirror of BOOTSTRAP_LABELS. Deriving it from the array would
 # make the test pass trivially if the array were emptied or mis-parsed.

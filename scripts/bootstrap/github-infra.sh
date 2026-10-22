@@ -100,13 +100,13 @@ BOOTSTRAP_LABELS=(
   "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
   "needs-local-agent|fbca04|A cloud/limited session parked this step; a session with the named capability resumes it"
   "human-action|0e8a16|Requires human attention"
-  "decision-needed|e99695|Deprecated: superseded by status:blocked + type:decision. Kept for history; not created on repositories that lack it."
+  "decision-needed|e99695|Deprecated: use status:blocked + type:decision. Kept for history; never newly created."
   "agent-action|1d76db|Agent task — not blocked on human"
   "phase-0|c5def5|Phase 0: foundations"
   "phase-1|bfd4f2|Phase 1: core"
   "phase-2|bfd4f2|Phase 2"
   "phase-3|bfd4f2|Phase 3"
-  "phase-4|bfd4f2|Deprecated: superseded by area:phase-4b. Kept for history; not created on repositories that lack it."
+  "phase-4|bfd4f2|Deprecated: use area:phase-4b. Kept for history; never newly created."
   "size:S|c2e0c6|Small: one or a few files, straightforward verification. Calibrated to nathanpaynedotcom#942/#849."
   "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
   "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
@@ -124,6 +124,8 @@ BOOTSTRAP_LABELS=(
 # lacks them: their replacements (area:phase-4b, status:blocked,
 # type:decision) are hub taxonomy, so their descriptions would point at
 # labels most consumers do not have. Owner decision, 2026-10-21.
+# Descriptions stay within GitHub's 100-character limit: a longer one is
+# rejected with HTTP 422, so scripts/sync-labels.sh refuses the list.
 BOOTSTRAP_DEPRECATED_LABELS=(phase-0 phase-1 phase-2 phase-3 phase-4 decision-needed)
 
 # bootstrap::label_is_deprecated <name> -> 0 when <name> is deprecated.

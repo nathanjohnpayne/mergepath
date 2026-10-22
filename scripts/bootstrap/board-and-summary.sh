@@ -295,7 +295,7 @@ set -euo pipefail
 # Example shape:
 #   gh issue create --repo nathanjohnpayne/<repo> \
 #     --title "Phase 0: scaffold" \
-#     --label phase-0,agent-action \
+#     --label agent-action,size:S \
 #     --body "..."
 '
   bootstrap::run "write scripts/gh-projects/examples/$repo_name/create-issues.sh (placeholder)" \
@@ -387,7 +387,7 @@ bootstrap::_print_summary() {
         ;;
       github-infra)
         if [ "$in_state" = "1" ]; then
-          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 21 labels attempted + reviewer invites + secrets
+          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 15 canonical labels attempted + reviewer invites + secrets
 "
         else
           skipped_lines="$skipped_lines  [skip] GitHub repo + labels + invites + secrets (not in state file)
