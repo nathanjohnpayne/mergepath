@@ -81,24 +81,31 @@ cp "$ROOT/.github/review-policy.yml" "$W/.github/review-policy.yml"
 # existing stanza under codex: with one that is enabled.
 grep -Eq '^codex:' "$W/.github/review-policy.yml" \
   || { echo "ERROR: the trusted policy has no codex: block; update this test" >&2; exit 1; }
-awk '
-  /^codex:/ { print; print "  p1_gate:"; print "    enabled: true"; in_codex = 1; next }
+# The stanza takes the codex block's own child indentation (two spaces in
+# every consumer today, but any width is valid YAML), and its key twice that.
+ind=$(awk '/^codex:/ { c = 1; next } c && /^[^[:space:]#]/ { exit }
+  c && /^[[:space:]]+[^[:space:]#]/ { match($0, /^ +/); print RLENGTH; exit }' "$W/.github/review-policy.yml")
+[ -n "$ind" ] || ind=2
+awk -v ind="$ind" '
+  BEGIN { pad = sprintf("%" ind "s", ""); kid = sprintf("%" (2 * ind) "s", "") }
+  /^codex:/ { print; print pad "p1_gate:"; print kid "enabled: true"; in_codex = 1; next }
   in_codex && /^[^[:space:]#]/ { in_codex = 0; skip = 0 }
-  in_codex && /^  p1_gate:/ { skip = 1; next }
+  in_codex && index($0, pad "p1_gate:") == 1 { skip = 1; next }
   # The old stanza runs to the next sibling key: blank lines, comments and
   # deeper lines inside it all go with it.
-  skip && /^  [^[:space:]#]/ { skip = 0 }
+  skip && index($0, pad) == 1 && substr($0, ind + 1, 1) ~ /[^[:space:]#]/ { skip = 0 }
   skip { next }
   { print }
 ' "$W/.github/review-policy.yml" >"$W/.github/review-policy.yml.new" \
   && mv "$W/.github/review-policy.yml.new" "$W/.github/review-policy.yml"
 # Exactly one enabled key under codex.p1_gate, and it is true.
-p1_enabled=$(awk '
+p1_enabled=$(awk -v ind="$ind" '
+  BEGIN { pad = sprintf("%" ind "s", ""); kid = sprintf("%" (2 * ind) "s", "") }
   /^codex:/ { c = 1; next }
   c && /^[^[:space:]#]/ { c = 0 }
-  c && /^  p1_gate:/ { g = 1; next }
-  g && /^  [^[:space:]#]/ { g = 0 }
-  g && /^    enabled:/ { sub(/^    enabled:[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, ""); print }
+  c && index($0, pad "p1_gate:") == 1 { g = 1; next }
+  g && index($0, pad) == 1 && substr($0, ind + 1, 1) ~ /[^[:space:]#]/ { g = 0 }
+  g && index($0, kid "enabled:") == 1 { v = substr($0, length(kid) + 9); sub(/^[[:space:]]*/, "", v); sub(/[[:space:]]*(#.*)?$/, "", v); print v }
 ' "$W/.github/review-policy.yml")
 [ "$p1_enabled" = true ] \
   || { echo "ERROR: could not enable codex.p1_gate in the fixture policy (got '$p1_enabled'); update this test" >&2; exit 1; }
