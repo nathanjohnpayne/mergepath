@@ -1308,6 +1308,17 @@ test_processing_error_with_actual_head_review_clears() {
   [ "$FAIL" -ne "$before" ] || pass "PE2: #2657 — a body-bearing review run pinned to HEAD releases the processing-error refusal"
 }
 
+# --- #2657: a current-HEAD run whose body IS the notice cannot release it -----
+test_processing_error_review_body_does_not_release() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "processing-error-run" "$PROCESSING_ERROR_BODY" "2026-06-04T02:00:00Z" "Review completed")
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" '[{"id":8803,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":$b}]')
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE3: a review run whose body is the processing-error notice released the refusal; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE3: status=cleared from a processing-error review body"
+  [ "$FAIL" -ne "$before" ] || pass "PE3: #2657 — a current-HEAD run whose body is the processing-error notice cannot release it (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
+
 test_completed_description_still_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "desc-completed" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review completed")
@@ -2628,6 +2639,7 @@ test_unknown_description_does_not_clear
 test_completed_description_still_clears
 test_processing_error_with_success_status_does_not_clear
 test_processing_error_with_actual_head_review_clears
+test_processing_error_review_body_does_not_release
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error

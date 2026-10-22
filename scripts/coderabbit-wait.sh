@@ -3032,6 +3032,12 @@ status_context_fast_path_blocked_by_comment() {
             STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
             log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries provider-owned $run_class state (#956)"
             return 1
+          elif crw_is_processing_error_notice "$run_body"; then
+            # #2657: a review run whose body is the processing-error notice is
+            # no review either, so it cannot release the refusal.
+            STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+            log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id is CodeRabbit's processing-error notice, not a review (#2657)"
+            return 1
           fi
           summary_blocking_marker_present "$run_body" || marker_rc=$?
           case "$marker_rc" in
