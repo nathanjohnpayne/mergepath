@@ -408,7 +408,7 @@ case "$endpoint" in
     fi
     # #2664: the resumed request's run fails a minute after it was posted.
     if [ "$scenario" = "retry-concurrent" ] && [ ! -f "$state_dir/run-failed" ] \
-       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + 60 ))" ]; then
+       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + ${CODEX_TEST_FAIL_AT:-60} ))" ]; then
       touch "$state_dir/run-failed"
       body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ❌ **Failed** | `aaaaaaa` | Manual request |\n')
       jq -cn --arg body "$body" '{id:3003,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:01:00Z",updated_at:"2026-06-04T00:01:00Z"}' >>"$state_dir/comments.jsonl"
@@ -434,7 +434,7 @@ case "$endpoint" in
     printf '%s\n' "$endpoint" >>"$state_dir/ack-endpoints"
     comment_id=${endpoint#repos/owner/repo/issues/comments/}
     comment_id=${comment_id%/reactions}
-    if [ "$scenario" = "eyes_present" ]; then
+    if [ "$scenario" = "eyes_present" ] || [ "${CODEX_TEST_EYES:-0}" = 1 ]; then
       printf '[{"user":{"login":"%s"},"content":"eyes","created_at":"%s","id":55}]\n' "$bot" "$now"
     else
       printf '[]\n'
@@ -1599,6 +1599,13 @@ if [ "${1:-}" = api ] && [ "$#" -eq 2 ] && [[ "$2" =~ ^repos/owner/repo/issues/c
     "$CODEX_TEST_STATE_DIR/comments.jsonl" | head -1 | grep .
   exit
 fi
+# #2664: optionally land a web-UI request during the wrapper's claimed
+# recount, once, so that authorization refuses the write it was decided for.
+if [ "${CODEX_TEST_WEB_REQUEST_AT_RECOUNT:-0}" = 1 ] && [ -n "${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" ] \
+   && [ -f "$CODEX_TEST_STATE_DIR/trigger-count" ] && [ ! -f "$CODEX_TEST_STATE_DIR/web-request" ] && printf '%s\n' "$@" | grep -qx 'repos/owner/repo/issues/999/comments'; then
+  touch "$CODEX_TEST_STATE_DIR/web-request"
+  jq -cn '{id:5000,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:03:00Z"}' >>"$CODEX_TEST_STATE_DIR/comments.jsonl"
+fi
 # Optionally hold the wrapper's authorization recount (the only reads made
 # with an observed request generation) until the gate file exists.
 if [ -n "${CODEX_TEST_RECOUNT_GATE:-}" ] && [ -n "${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" ] \
@@ -1803,8 +1810,8 @@ run_retry_case() { # <fixture-dir> <scenario> [VAR=value ...]
   (
     cd "$dir"
     unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
-    env "$@" PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
-      CODEX_TEST_FAKE_CLOCK=1 CODEX_TEST_SCENARIO="$scenario" \
+    env CODEX_TEST_EYES=1 PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_FAKE_CLOCK=1 CODEX_TEST_SCENARIO="$scenario" "$@" \
       ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.json" 2>"$dir/err.log"
   ) || rc=$?
   printf '%s\n' "$rc"
@@ -1916,6 +1923,23 @@ test_resumed_retry_is_not_replaced() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a resumed retry that fails is reported, not replaced by a fresh request"
 }
 
+# A resumed request fails less than a backoff before its own deadline: the
+# retry is still scheduled at the deadline, so it is reported, and the #1550
+# fresh replacement does not run ahead of the backoff.
+test_scheduled_retry_at_deadline_is_reported() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-scheduled-at-deadline" 0 0 400)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_retry_case "$dir" retry-concurrent CODEX_TEST_FAIL_AT=360)
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#2664 scheduled at deadline: $(trigger_count "$dir") requests posted, expected none"
+  ! grep -q 're-running as a fresh request' "$dir/err.log" || fail "#2664 scheduled at deadline: the fresh-request replacement ran"
+  [ "$rc" = 4 ] && jq -e '.retry.state == "escalated" and (.retry.reason | startswith("retry-not-due"))' "$dir/out.json" >/dev/null \
+    || fail "#2664 scheduled at deadline: exit $rc, $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a retry still scheduled at the deadline is reported, not replaced"
+}
+
 # The binding names the retry that actually posted, so a losing handler's
 # intent marker cannot mark a later ordinary request as a retry.
 test_retry_marker_binding() {
@@ -1936,6 +1960,74 @@ test_retry_marker_binding() {
   got="$(crqe_request_is_retry "$comments" a 12) $(crqe_request_is_retry "$comments" a 15)"
   [ "$got" = "true false" ] || fail "#2664 binding: an unbound intent classified '$got', expected 'true false'"
   [ "$FAIL" -ne "$before" ] || pass "#2664: a retry is bound to the request that posted; a loser's intent marks nothing"
+}
+
+# A failure this run never saw Codex acknowledge may belong to an earlier,
+# overlapping run: the row names no request. No retry.
+test_retry_needs_codex_acknowledgement() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-unacknowledged" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_TEST_EYES=0)
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 unacknowledged: $(trigger_count "$dir") triggers, expected no retry"
+  [ -z "$(retry_markers "$dir")" ] || fail "#2664 unacknowledged: a retry marker was recorded"
+  jq -e '.retry.state == "escalated" and .retry.reason == "unknown"' "$dir/out.json" >/dev/null \
+    || fail "#2664 unacknowledged: exit $rc, $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a failure is attributed to a request only after Codex acknowledged that request"
+}
+
+# A restarted session finds the latest request already failed. It resumes it
+# instead of posting at once: an original waits out its own deadline before
+# the #1550 replacement, and a retry is reported and never replaced.
+test_restarted_session_resumes_failed_request() {
+  local label dir rc before epoch first
+  for label in original retry; do
+    before=$FAIL
+    dir=$(make_case "retry-restart-$label" 0 0 400)
+    if [ "$label" = retry ]; then
+      seed_author_trigger "$dir" 880 "2026-06-03T23:50:00Z"
+      jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 retry=900 -->\nBound.",created_at:"2026-06-04T00:00:01Z"}' \
+        >>"$dir/state/comments.jsonl"
+    fi
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 30
+    rc=$(run_retry_case "$dir" absent CODEX_TEST_EYES=0)
+    grep -q 'resuming it under the bounded retry rules' "$dir/err.log" || fail "#2664 restart $label: the failed request was not resumed; $(tail -3 "$dir/err.log")"
+    epoch=$(jq -rn --arg t "$RESUME_TRIGGER_AT" '$t | fromdateiso8601')
+    case "$label" in
+      original)
+        first=$(head -1 "$dir/state/trigger-times" 2>/dev/null || echo 0)
+        [ "$(trigger_count "$dir")" = 1 ] && [ "$first" -ge $((epoch + 400)) ] \
+          || fail "#2664 restart original: $(trigger_count "$dir") requests, first at +$((first - epoch))s, expected one after the 400 s deadline" ;;
+      retry)
+        [ "$(trigger_count "$dir")" = 0 ] && [ "$rc" = 4 ] && ! grep -q 're-running as a fresh request' "$dir/err.log" \
+          && jq -e '.retry.state == "refused" and .retry.reason == "retry-of-retry"' "$dir/out.json" >/dev/null \
+          || fail "#2664 restart retry: exit $rc, $(trigger_count "$dir") requests, $(jq -c .retry "$dir/out.json" 2>/dev/null)" ;;
+    esac
+    [ "$FAIL" -ne "$before" ] || pass "#2664: a restarted session resumes a failed $label request instead of posting at once"
+  done
+}
+
+# The intent was recorded but the claimed authorization refused the retry (a
+# web request landed during the recount). The intent is withdrawn by its id,
+# so it never marks that web request as a retry.
+test_refused_retry_withdraws_its_intent() {
+  local dir rc before=$FAIL intent
+  dir=$(make_case "retry-withdraw" 0 0 400)
+  make_real_wrapper_case "$dir"
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_TEST_WEB_REQUEST_AT_RECOUNT=1 MERGEPATH_GH_TRANSPORT=gh GH_TOKEN=ghp_fixture_author)
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 withdraw: $(trigger_count "$dir") requests posted by the requester, expected only the original"
+  grep -q 'not posted: concurrent-request' "$dir/err.log" || fail "#2664 withdraw: $(grep '2664' "$dir/err.log" | tail -3)"
+  intent=$(jq -r 'select(.body | startswith("<!-- mergepath-codex-retry:v1 ") and (test("retry=|withdrawn=") | not)) | .id' "$dir/state/comments.jsonl" | head -1)
+  retry_markers "$dir" | grep -q "withdrawn=$intent -->" || fail "#2664 withdraw: no withdrawal for intent $intent; $(retry_markers "$dir")"
+  (
+    # shellcheck source=/dev/null
+    . "$ROOT/scripts/lib/codex-request-evidence.sh"
+    [ "$(crqe_request_is_retry "$(jq -sc . "$dir/state/comments.jsonl")" nathanjohnpayne 5000)" = false ]
+  ) || fail "#2664 withdraw: the web request was classified as a retry"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a refused retry withdraws its intent, which then marks nothing"
 }
 
 test_retry_refused_by_late_result_or_moved_head() {
@@ -2053,7 +2145,7 @@ test_concurrent_handlers_post_one_retry() {
       cd "$dir"
       unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
       PATH="$dir/bin:$PATH" GH_TOKEN=ghp_fixture_author CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_FAKE_CLOCK=1 \
-        CODEX_TEST_SCENARIO=retry-concurrent MERGEPATH_GH_TRANSPORT=gh \
+        CODEX_TEST_SCENARIO=retry-concurrent MERGEPATH_GH_TRANSPORT=gh CODEX_TEST_EYES=1 \
         ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.$n.json" 2>"$dir/err.$n.log"
     ) &
     if [ "$n" = a ]; then pid_a=$!; else pid_b=$!; fi
@@ -2079,6 +2171,10 @@ test_retry_honors_longer_provider_window
 test_retry_window_lengthened_while_scheduled
 test_resumed_retry_is_not_replaced
 test_retry_marker_binding
+test_scheduled_retry_at_deadline_is_reported
+test_retry_needs_codex_acknowledgement
+test_restarted_session_resumes_failed_request
+test_refused_retry_withdraws_its_intent
 test_retry_refused_by_late_result_or_moved_head
 test_retry_never_chains
 test_retry_withheld_from_a_retry_request

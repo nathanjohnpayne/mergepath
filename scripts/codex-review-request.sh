@@ -2865,6 +2865,7 @@ wait_for_trigger_ack() {
   while :; do
     if trigger_ack_present; then
       log "Codex eyes acknowledgment received on trigger comment $TRIGGER_COMMENT_ID"
+      RETRY_ACKED_ID=$TRIGGER_COMMENT_ID
       return 0
     fi
 
@@ -2971,6 +2972,34 @@ codex_retry_json() {
       diagnostic: $diagnostic }'
 }
 
+# The Review Summary row names no request, so a terminal row is attributed
+# to the request this run waits on only after this run saw Codex acknowledge
+# that request with its eyes reaction (Codex shows it while the request's
+# review runs and removes it when the run ends). "completed" additionally
+# needs the run to have been seen active. Anything else reads as unknown.
+retry_attributed_state() { # <row state>
+  case "$1" in
+    failed|canceled)
+      if [ -n "$RETRY_ACKED_ID" ] && [ "$RETRY_ACKED_ID" = "$RETRY_ORIGINAL_ID" ]; then printf '%s' "$1"; else printf unknown; fi ;;
+    completed)
+      if [ -n "$RETRY_ACKED_ID" ] && [ "$RETRY_ACKED_ID" = "$RETRY_ORIGINAL_ID" ] && [ "$RETRY_SAW_RUNNING" = true ]; then printf completed; else printf unknown; fi ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Record Codex's eyes acknowledgement of the waited-on request when it shows.
+retry_observe_ack() {
+  local created reactions
+  [ -n "$RETRY_ORIGINAL_ID" ] && [ "$RETRY_ACKED_ID" != "$RETRY_ORIGINAL_ID" ] || return 0
+  created=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.created_at // empty' 2>/dev/null) || created=""
+  [ -n "$created" ] || return 0
+  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$RETRY_ORIGINAL_ID/reactions" "retry acknowledgement evidence") || return 0
+  if [ "$(crqe_ack_present "$reactions" "$BOT_LOGIN" "$created" 2>/dev/null)" = true ]; then
+    RETRY_ACKED_ID=$RETRY_ORIGINAL_ID
+    log "Codex acknowledged request $RETRY_ORIGINAL_ID; its run's outcome can now be attributed to it (#2664)"
+  fi
+}
+
 # One poll-loop step. Returns 10 after it rescanned, so the loop re-reads the
 # signal before sleeping; otherwise 0.
 codex_retry_tick() {
@@ -2988,11 +3017,9 @@ codex_retry_tick() {
   if [ "$scan_request" != "$RETRY_ORIGINAL_ID" ] && [ "$scan_request" != "$RETRY_COMMENT_ID" ]; then
     run_state=none
   fi
-  # The row names no request, so "completed" may describe an earlier run
-  # that finished after this request was posted. It proves this request's
-  # run ended only after this run saw that run active.
+  case "$run_state" in running|failed|canceled|completed) retry_observe_ack ;; esac
   [ "$run_state" != running ] || RETRY_SAW_RUNNING=true
-  [ "$run_state" != completed ] || [ "$RETRY_SAW_RUNNING" = true ] || run_state=unknown
+  run_state=$(retry_attributed_state "$run_state")
   if [ "$RETRY_DIAGNOSTIC_JSON" = null ] && [ "$ELAPSED" -ge "$CODEX_RETRY_DIAGNOSTIC_SECONDS" ]; then
     RETRY_DIAGNOSTIC_JSON=$(jq -nc --argjson at "$ELAPSED" --arg state "$run_state" '{after_seconds: $at, run_state: $state}')
     case "$run_state" in
@@ -3029,6 +3056,18 @@ codex_retry_tick() {
   return 10
 }
 
+# The intent posted but no retry did: withdraw that intent by its id, so it
+# can never mark a request this handler did not post. A failed withdrawal only
+# warns; the intent then withholds a retry, never grants one.
+retry_withdraw_intent() {
+  local body
+  [ -n "$RETRY_INTENT_ID" ] || { log "WARN: the automatic Codex retry intent has no confirmed id to withdraw (#2664)"; return 0; }
+  body="$CODEX_RETRY_MARKER_PREFIX head=$HEAD_SHA original=$RETRY_ORIGINAL_ID withdrawn=$RETRY_INTENT_ID -->
+**Automatic Codex retry withdrawn (nathanjohnpayne/mergepath#2664):** no retry was posted for request $RETRY_ORIGINAL_ID ($RETRY_REASON)."
+  ( post_author_pr_comment "$body" "automatic Codex retry withdrawal" body-file ) >/dev/null 2>&1 \
+    || log "WARN: the automatic Codex retry intent $RETRY_INTENT_ID could not be withdrawn (#2664)"
+}
+
 retry_extend_backoff() {
   local retry_after
   retry_after=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.retry_after_seconds // 0' 2>/dev/null) || retry_after=0
@@ -3053,7 +3092,7 @@ post_codex_retry() {
   if [ -n "$block" ]; then retry_refuse "provider-blocked:$block"; return 0; fi
   run_state=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.state // "none"')
   [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty')" = "$RETRY_ORIGINAL_ID" ] || run_state=superseded
-  [ "$run_state" != completed ] || [ "$RETRY_SAW_RUNNING" = true ] || run_state=unknown
+  [ "$run_state" = superseded ] || run_state=$(retry_attributed_state "$run_state")
   case "$run_state" in
     failed|canceled|completed) ;;
     running) RETRY_STATE=none RETRY_REASON="" RETRY_DUE=0 RETRY_BACKOFF=0
@@ -3083,9 +3122,12 @@ post_codex_retry() {
   if [ "$request_count" -ge "$GOVERNING_REQUEST_ATTEMPT_CAP" ]; then retry_refuse request-ceiling; return 0; fi
   body="$CODEX_RETRY_MARKER_PREFIX head=$HEAD_SHA original=$RETRY_ORIGINAL_ID -->
 **Automatic Codex retry (nathanjohnpayne/mergepath#2664).** The Codex run for request $RETRY_ORIGINAL_ID on \`${HEAD_SHA:0:12}\` is \`$RETRY_REASON\` with no result, so it is requested once more after ${RETRY_BACKOFF}s. A retry is never retried, and it counts against the request budget like any other request."
-  if ! ( post_author_pr_comment "$body" "automatic Codex retry marker" body-file ) >/dev/null 2>&1; then
+  local intent_out
+  if ! intent_out=$( ( post_author_pr_comment "$body" "automatic Codex retry marker" body-file >/dev/null 2>&1 \
+       && printf '%s' "$AUTHOR_COMMENT_OUTPUT" ) ); then
     retry_refuse marker-not-recorded; return 0
   fi
+  RETRY_INTENT_ID=$(printf '%s\n' "$intent_out" | grep -oE 'issuecomment-[0-9]+' | tail -1 | sed 's/issuecomment-//') || RETRY_INTENT_ID=""
   CODEX_RETRY_WRITE=true
   post_codex_trigger || rc=$?
   CODEX_RETRY_WRITE=false
@@ -3108,8 +3150,10 @@ post_codex_retry() {
     log "automatic Codex retry posted as request ${TRIGGER_COMMENT_ID:-<unconfirmed>} for request $RETRY_ORIGINAL_ID (#2664)"
   elif [ -n "$RETRY_AUTHORIZATION_REFUSAL" ]; then
     retry_refuse "$RETRY_AUTHORIZATION_REFUSAL"
+    retry_withdraw_intent
   elif [ "$ACK_RETRY_REFUSED_BY_CAP" = true ]; then
     retry_refuse request-ceiling
+    retry_withdraw_intent
   else
     die 3 "automatic Codex retry did not post a request"
   fi
@@ -3374,7 +3418,18 @@ resume_pending_codex_request() {
     || die 3 "cannot read the Codex Review Summary for the resume check"
   observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') \
     || die 3 "cannot read the Codex Review Summary for the resume check"
-  if [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; then
+  # #2664: a pending request whose run has since failed or been cancelled is
+  # resumed too, outside the wrapper's authorization pass, so a restarted
+  # session never posts a fresh request past the bounded retry rules: a
+  # request that is itself a retry is reported, never replaced, and one this
+  # session did not watch waits out its own deadline.
+  local resumed_terminal=false terminal_state
+  if [ "$AUTHORIZE_TRIGGER_WRITE" != true ]; then
+    terminal_state=$(crqe_select_codex_run_state "$comments" "$BOT_LOGIN" "$HEAD_SHA" "$created" | jq -r '.state') \
+      || die 3 "cannot read the Codex run state for the resume check"
+    case "$terminal_state" in failed|canceled) resumed_terminal=true ;; esac
+  fi
+  if [ "$resumed_terminal" != true ] && { [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; }; then
     log "pending request $(printf '%s' "$pending" | jq -r .id) has no Codex Running summary on HEAD since it was posted (status '${status:-none}') — not resuming"
     return 1
   fi
@@ -3389,6 +3444,16 @@ resume_pending_codex_request() {
   RESUMED_TRIGGER=true
   RESUMED_EVER=true
   RESUMED_TRIGGER_ID=$(printf '%s' "$pending" | jq -r .id)
+  RETRY_ORIGINAL_ID=$RESUMED_TRIGGER_ID
+  if [ "$resumed_terminal" = true ]; then
+    log "pending request $RESUMED_TRIGGER_ID: Codex reports its run '$terminal_state' since it was posted — resuming it under the bounded retry rules, not posting a fresh request (#2664)"
+  fi
+  # A resumed request that is itself an automatic retry gets no retry and,
+  # if it expires, no fresh replacement either: it is reported (#2664).
+  if [ "$(crqe_request_is_retry "$comments" "$AUTHOR_IDENTITY" "$RESUMED_TRIGGER_ID")" != false ]; then
+    RETRY_STATE=refused RETRY_REASON=retry-of-retry
+    log "automatic Codex retry for request $RESUMED_TRIGGER_ID not posted: retry-of-retry (#2664)"
+  fi
   REQUEST_BLOCK_TRIGGER_JSON=$pending
   TRIGGER_SIGNAL_THRESHOLD=$created
   START_TS=$created_epoch
@@ -3439,6 +3504,8 @@ RETRY_COMMENT_ID=""
 RETRY_DIAGNOSTIC_JSON=null
 RETRY_SAW_RUNNING=false
 RETRY_SEEN_AT=0
+RETRY_ACKED_ID=""
+RETRY_INTENT_ID=""
 
 # The no-write decisions below belong to a request mode. A requester applies
 # its own. The wrapper's authorization pass runs as --trigger-only, so it
@@ -3622,10 +3689,11 @@ run_review_poll
 # result.
 RESUMED_BLOCK_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the resumed provider refusal"
 # #2664: a resumed request whose run was confirmed failed or inactive, and
-# whose automatic retry was then refused, is reported instead: a fresh
-# replacement would retry it after all (a retry of a retry, or past a budget).
+# whose automatic retry was then refused or is not yet due, is reported
+# instead: a fresh replacement would retry it after all (a retry of a retry,
+# past a budget, or ahead of its backoff).
 if [ "$RESUMED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN" \
-   && [ -z "$RESUMED_BLOCK_REASON" ] && [ "$RETRY_STATE" != refused ]; then
+   && [ -z "$RESUMED_BLOCK_REASON" ] && [ "$RETRY_STATE" != refused ] && [ "$RETRY_STATE" != scheduled ]; then
   log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — re-running as a fresh request with resume disabled (#1550)"
   export MERGEPATH_CODEX_RESUME_EXPIRED=1
   exec bash "$0" ${__CRR_ORIGINAL_ARGS[@]+"${__CRR_ORIGINAL_ARGS[@]}"}
@@ -3649,8 +3717,8 @@ if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && ! has_p
    && [ -z "$(current_blocked_reason "$FINAL_SCAN")" ]; then
   case "$RETRY_STATE" in
     none|scheduled)
-      RETRY_REASON=$(printf '%s' "$FINAL_SCAN" | jq -r --arg saw "$RETRY_SAW_RUNNING" '.run.state // "none"
-        | if . == "running" then "active" elif . == "none" or (. == "completed" and $saw != "true") then "unknown" else . end')
+      RETRY_REASON=$(retry_attributed_state "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.state // "none"')")
+      case "$RETRY_REASON" in running) RETRY_REASON=active ;; none) RETRY_REASON=unknown ;; esac
       [ "$RETRY_STATE" != scheduled ] || RETRY_REASON="retry-not-due:$RETRY_REASON"
       RETRY_STATE=escalated
       log "request ${RETRY_ORIGINAL_ID:-?} unanswered at the ${TIMEOUT_SECONDS}s limit with the run '$RETRY_REASON' — reporting it; no retry or cancel (#2664)" ;;
