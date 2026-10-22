@@ -13,6 +13,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 BIN="$WORK/bin"; STATE="$WORK/state"; mkdir -p "$BIN" "$STATE"
 cat >"$WORK/manifest.yml" <<'YML'
+version: 1
 consumers:
   - name: alpha
     repo: nathanjohnpayne/alpha
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --method) method=$2; shift 2 ;;
     --input) input=$2; shift 2 ;;
+    --hostname) echo "$2" >>"$S/hosts.log"; shift 2 ;;
     --paginate) shift ;;
     *) endpoint=$1; shift ;;
   esac
@@ -150,6 +152,23 @@ for variant in missing broken foreign; do
     SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" --apply 2>&1) || RC=$?
   [ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a $variant deprecated list fails closed before any read or write" || fail "$variant deprecated rc=$RC: $OUT"
 done
+
+# A manifest without a usable consumers list fails closed before any read:
+# yq answers such a document with no output, which would otherwise shrink the
+# run to the hub and report every repository as matching.
+for variant in "version: 1" $'version: 1\nconsumers:\n  - name: alpha' $'version: 2\nconsumers:\n  - name: alpha\n    repo: nathanjohnpayne/alpha' $'version: 1\nconsumers:\n  - name: alpha\n    repo: alpha'; do
+  reset_state; printf '%s\n' "$variant" >"$WORK/bad-manifest.yml"
+  RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/bad-manifest.yml" SYNC_LABELS_INFRA="$WORK/infra.sh" \
+    SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" 2>&1) || RC=$?
+  [ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a malformed manifest ($(printf '%s' "$variant" | tr '\n' ' ')) fails closed before any read" \
+    || fail "malformed manifest rc=$RC: $OUT"
+done
+
+# Every read and write is pinned to github.com.
+reset_state; run --apply
+calls=$(grep -c . "$STATE/calls.log"); hosts=$(grep -cx github.com "$STATE/hosts.log" 2>/dev/null || true)
+[ "$RC" = 0 ] && [ "$calls" -gt 0 ] && [ "$calls" = "$hosts" ] && [ "$(sort -u "$STATE/hosts.log")" = github.com ] \
+  && pass "every label read and write is pinned to github.com" || fail "host pinning: calls=$calls hosts=$hosts"
 
 # A typo next to a valid name must not silently shrink the run.
 reset_state; run --repos alpha,typo

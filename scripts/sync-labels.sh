@@ -90,7 +90,16 @@ jq -e --argjson c "$CANON_JSON" 'all(.[]; . as $d | ($c | map(.name) | index($d)
 
 # The fleet: the hub plus every manifest consumer.
 command -v yq >/dev/null 2>&1 || die "yq is required to read $MANIFEST"
-CONSUMERS=$(yq -r '.consumers[].repo | select(. != null)' "$MANIFEST" 2>/dev/null | sort -u) \
+# The manifest shape is checked before any consumer is read: yq succeeds with
+# no output on a document without a consumers list (or with entries lacking
+# a repo), which would otherwise shrink the run to the hub alone and report
+# every repository as matching.
+yq -e '.version == 1 and (.consumers | type) == "!!seq" and (.consumers | length) > 0
+       and ([.consumers[] | select((.repo | type) != "!!str"
+              or ((.repo // "") | test("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$") | not))] | length) == 0' \
+  "$MANIFEST" >/dev/null 2>&1 \
+  || die "$MANIFEST is not a version-1 manifest whose every consumer names an owner/name repo"
+CONSUMERS=$(yq -r '.consumers[].repo' "$MANIFEST" 2>/dev/null | sort -u) \
   || die "could not read consumers from $MANIFEST"
 REPOS=$(printf '%s\n%s\n' "$HUB" "$CONSUMERS" | awk 'NF && !seen[$0]++')
 if [ -n "$REPO_FILTER" ]; then
@@ -108,7 +117,9 @@ urlencode() { jq -rn --arg v "$1" '$v | @uri'; }
 changes=0 failures=0
 while IFS= read -r repo; do
   [ -n "$repo" ] || continue
-  live=$(gh api --paginate "repos/$repo/labels?per_page=100" 2>/dev/null | jq -sc 'add // []') \
+  # Pinned to github.com like the author wrapper's writes, so a GH_HOST
+  # pointing elsewhere cannot plan github.com writes from another host.
+  live=$(gh api --hostname github.com --paginate "repos/$repo/labels?per_page=100" 2>/dev/null | jq -sc 'add // []') \
     || { echo "  ! $repo: labels unreadable"; failures=$((failures + 1)); continue; }
   plan=$(jq -c --argjson canon "$CANON_JSON" --argjson deprecated "$DEPRECATED_JSON" '
     (map({key: (.name | ascii_downcase), value: .}) | from_entries) as $have
@@ -140,11 +151,11 @@ while IFS= read -r repo; do
     body_file=$(mktemp "${TMPDIR:-/tmp}/sync-labels.XXXXXX") || { failures=$((failures + 1)); continue; }
     if [ "$action" = create ]; then
       jq -nc --arg n "$name" --arg c "$color" --arg d "$desc" '{name:$n,color:$c,description:$d}' >"$body_file"
-      "$AS_AUTHOR" -- gh api "repos/$repo/labels" --method POST --input "$body_file" >/dev/null 2>&1 \
+      "$AS_AUTHOR" -- gh api --hostname github.com "repos/$repo/labels" --method POST --input "$body_file" >/dev/null 2>&1 \
         || { echo "      ! create failed"; failures=$((failures + 1)); }
     else
       jq -nc --arg c "$color" --arg d "$desc" '{color:$c,description:$d}' >"$body_file"
-      "$AS_AUTHOR" -- gh api "repos/$repo/labels/$(urlencode "$name")" --method PATCH --input "$body_file" >/dev/null 2>&1 \
+      "$AS_AUTHOR" -- gh api --hostname github.com "repos/$repo/labels/$(urlencode "$name")" --method PATCH --input "$body_file" >/dev/null 2>&1 \
         || { echo "      ! update failed"; failures=$((failures + 1)); }
     fi
     rm -f "$body_file"
