@@ -353,6 +353,19 @@ test_unknown_prose_no_failover() {
   [ "$FAIL" -ne "$before" ] || pass "H: CodeRabbit's processing-error notice neither fires the failover nor clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
 }
 
+# --- Test H2: a review that merely mentions the phrase stays a review (#2657) --
+# Only the provider-owned stanza is a processing error. Prose, a quote or a
+# fenced copy of the notice inside a genuine review must still clear.
+test_review_mentioning_processing_error_still_clears() {
+  local dir rc before=$FAIL body
+  body=$'Review completed. The new classifier handles CodeRabbit\'s "Something unexpected happened" notice, and we could not process this pull request is quoted below.\n\n```\n> [!WARNING]\n> ## Something unexpected happened\n>\n> We could not process this pull request right now.\n```\n\n> We could not process this pull request right now.'
+  dir=$(make_case "mentions-processing-error" 300 0 true "$body")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "0" ] || fail "H2: a review mentioning the notice did not clear, rc=$rc; err=$(tail -3 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" = "cleared" ] || fail "H2: status=$(jqf "$dir" '.status' 2>/dev/null), expected cleared"
+  [ "$FAIL" -ne "$before" ] || pass "H2: a review quoting or fencing the processing-error text is still a review"
+}
+
 # #2139: drive the actual full clearance checker, then the fixture approval
 # step. CI is scoped out here; its production enforcement is covered separately.
 test_exact_head_substitution_approval() {
@@ -609,6 +622,7 @@ test_newformat_window_parsed
 test_exact_head_substitution_approval
 test_spending_cap_fires
 test_unknown_prose_no_failover
+test_review_mentioning_processing_error_still_clears
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"

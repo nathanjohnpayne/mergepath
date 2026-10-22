@@ -1424,11 +1424,19 @@ parse_rate_limit_window() {
 # mid-review CodeRabbit reads as a completed clean report. `summary_names_head`
 # and `summary_names_only_other_head` below carry the same correction; this
 # block is the rest of the #1005 sweep.
-# #2657: CodeRabbit's processing-error notice ("Something unexpected happened
-# ... We could not process this pull request right now") is not a review. The
-# persistent summary is excluded, since its content may quote the phrase.
+# #2657: CodeRabbit's processing-error notice is not a review. Only the
+# provider-owned stanza counts: outside fences, its first two nonempty lines
+# are the `> [!WARNING]` / `> ## Something unexpected happened` heading, and
+# a quoted line carries the processing-error sentence. A review or comment
+# that merely mentions either phrase (in prose, a quote or a fenced example)
+# stays review content. The persistent summary is excluded.
 crw_is_processing_error_notice() {
-  [[ "$1" != "$SUMMARY_MARKER"* ]] && grep -qiE 'Something unexpected happened|could not process this pull request' <<<"$1"
+  local unfenced lead
+  [[ "$1" != "$SUMMARY_MARKER"* ]] || return 1
+  unfenced=$(crw_unfenced_body "$1") || return 1
+  lead=$(awk 'NF { sub(/[[:space:]]+$/, ""); print tolower($0); if (++n == 2) exit }' <<<"$unfenced") || return 1
+  [ "$lead" = $'> [!warning]\n> ## something unexpected happened' ] || return 1
+  grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$unfenced"
 }
 
 classify_comment() {
