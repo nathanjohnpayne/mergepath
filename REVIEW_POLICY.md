@@ -1011,7 +1011,7 @@ In Phase 4a, the agent escalates to the human when any of the following fires:
 
 **Timeout is NOT a disagreement signal.** A Codex response timeout (`codex-review-request.sh` exit code `4` = `FALLBACK_REQUIRED`) routes the PR directly to Phase 4b per step 15a above. It is a fallback trigger, not a tiebreaker trigger. Phase 4b itself mediates via the human through the manual handoff, so there is nothing for the disagreement detector to add on top.
 
-Phase 4b escalation (the traditional cross-agent CLI flow) uses the human's judgment directly — there is no automated detection loop to fire, so this subsection does not apply there.
+Phase 4b escalation (the traditional cross-agent CLI flow) uses the human's judgment directly — there is no automated detection loop to fire, so this subsection does not apply there. Automated Phase 4b rounds are bounded separately by `phase_4b_automation.max_review_rounds`, enforced through a per-PR Git-ref round ledger (#2663, [the round-cap spec](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_round_cap.md)); a spent round cap stops for an owner decision and never grants a further round.
 
 ### Escalation procedure
 

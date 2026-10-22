@@ -559,6 +559,9 @@ fi
 _p4b_on_exit() {
   local rc="$1"
   if declare -F _p4b_cleanup_tmp >/dev/null 2>&1; then _p4b_cleanup_tmp || true; fi
+  # #2663: give back an unspent round reservation. Never after a POST was
+  # attempted: an uncertain publication keeps its slot until reconciled.
+  if declare -F release_round_reservation >/dev/null 2>&1; then release_round_reservation "exit-$rc" || true; fi
   p4b_heartbeat_finish "$rc" || true
   return "$rc"
 }
@@ -801,6 +804,8 @@ stop_for_human_tiebreaker() {
   local payload="$1"
   if printf '%s' "$payload" | jq -e '.tripwire' >/dev/null 2>&1; then
     p4b_warn "Deterministic Phase 4b tripwire requires human-mediated review; no adapter or approval dispatched"
+  elif printf '%s' "$payload" | jq -e '.round_cap' >/dev/null 2>&1; then
+    p4b_warn "$(printf '%s' "$payload" | jq -r '.reason')"
   else
     p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
   fi
@@ -811,9 +816,250 @@ stop_for_human_tiebreaker() {
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      human_tiebreaker_required:true,barrier:$b,reason:$b.reason,
-     automation_enabled:true,enabled_via:$enabled_via}'
+     automation_enabled:true,enabled_via:$enabled_via}
+    # #2663: a spent round cap reports round_cap at the top level, as every
+    # other round-cap stop does.
+    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end)'
   exit 8
 }
+
+# BEGIN p4b_round_cap
+# #2663: enforce phase_4b_automation.max_review_rounds as a hard cap. The
+# governing base policy supplies the cap. Occupied slots come from the per-PR
+# git-ref round ledger (p4b/lib.sh) plus any completed round it does not
+# account for. A run reserves a slot with a fast-forward-only ledger update
+# before any adapter run; a conflict means a fresh read and a full
+# re-evaluation, never a blind retry. The reserving run id travels in the
+# posted review, the only key an uncertain POST is reconciled against.
+#
+# Only the writer frees its slot, and only before it attempted a review POST,
+# after which it exits. Every other outcome keeps the slot occupied: a
+# completed round, an uncertain POST (it may still land), a crash, or an
+# entry edited by anyone else. A crashed run therefore spends one slot; the
+# owner's remedy is a higher governing cap, never reuse, because no client
+# check can prove an in-flight POST will not land later. Nothing resets the
+# count, and no tiebreak, retry or fallback grants a further round. It runs
+# after the provider barrier, so the blocking budget and every Codex human
+# stop keep precedence. Enforcement holds only where every automated
+# publisher reserves through this ledger; an older orchestrator that does not
+# is outside it.
+P4B_ROUND_CAP_JSON=null
+P4B_ROUND_CAP=none
+P4B_ROUND_AUTHOR=""
+P4B_ROUND_RESERVED=false
+P4B_ROUND_POST_ATTEMPTED=false
+P4B_ROUND_LEDGER_REF=""
+P4B_ROUND_TREE=""
+P4B_ROUND_WHERE=""
+round_cap_evidence_error() {
+  local reason="$1"
+  # At the writer boundary the loop already says posted and approval
+  # follow-ups may be filed; undo them as every pre-POST refusal does.
+  [ "$P4B_ROUND_WHERE" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
+  p4b_warn "$reason; stopping without review publication or Phase 4b handoff"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     infrastructure_error:true,round_cap:{state:"unreadable"},reason:$reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 10
+}
+round_cap_stop() { # <exit> <state> <reason> <where>
+  local code="$1" state="$2" reason="$3" where="$4"
+  [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
+  release_round_reservation "$state"
+  if [ "$code" = 8 ]; then
+    stop_for_human_tiebreaker "$(jq -nc --arg r "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" --arg s "$state" \
+      '{decision:"human-tiebreaker",reason:$r,round_cap:($rc + {state:$s})}')"
+  fi
+  p4b_warn "$reason"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --arg reason "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" \
+        --arg s "$state" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:true,retry_after:60,
+     round_cap:($rc + {state:$s}),reason:$reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 6
+}
+round_api() { # <method> <endpoint> [<payload-json>] -> response on stdout, rc
+  local payload="" rc=0
+  if [ -n "${3:-}" ]; then
+    payload=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger.XXXXXX") || return 2
+    printf '%s' "$3" >"$payload"
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+      gh api "$2" --method "$1" --input "$payload" || rc=$?
+    rm -f "$payload"
+  else
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+      gh api "$2" --method "$1" || rc=$?
+  fi
+  return "$rc"
+}
+# round_rounds_read -> ROUND_STATE (completed rounds from the PR's reviews).
+# The paginated read is taken twice and must agree: a consistency check
+# against a page shifting mid-read, not a guaranteed snapshot. Rounds are not
+# what the cap's atomicity rests on; the ledger is.
+round_rounds_read() {
+  command -v gh_api_array >/dev/null 2>&1 \
+    || round_cap_evidence_error "Phase 4b round cap: the paginated reader is unavailable"
+  local attempt reviews first second
+  for attempt in 1 2 3; do
+    reviews=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "Phase 4b round evidence") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's reviews are unreadable"
+    first=$(p4b_completed_rounds_from_reviews "$reviews" "$P4B_ROUND_AUTHOR") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+    reviews=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "Phase 4b round evidence") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's reviews are unreadable"
+    second=$(p4b_completed_rounds_from_reviews "$reviews" "$P4B_ROUND_AUTHOR") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+    if [ "$(printf '%s' "$first" | jq -c '[.rounds[].id]')" = "$(printf '%s' "$second" | jq -c '[.rounds[].id]')" ]; then
+      ROUND_STATE="$second"; return 0
+    fi
+    p4b_log "round cap: consecutive review reads disagreed (attempt $attempt); re-reading (#2663)"
+  done
+  round_cap_evidence_error "Phase 4b round cap: consecutive review reads never agreed"
+}
+# round_ledger_load -> LEDGER_TIP ("" when the ref is absent), LEDGER_ENTRIES;
+# rc 1 with ROUND_LEDGER_ERR set when the ledger is unreadable or malformed.
+# It never exits, so the release path in the EXIT trap can use it without
+# emitting a second result or replacing the run's exit status.
+round_ledger_load() {
+  local ref_json err rc=0 commit_json
+  ROUND_LEDGER_ERR=""
+  err=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger-err.XXXXXX") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: no scratch space"; return 1; }
+  ref_json=$(gh api "repos/$REPO/git/ref/${P4B_ROUND_LEDGER_REF#refs/}" 2>"$err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if grep -Eq 'HTTP 404|Not Found' "$err" 2>/dev/null; then
+      rm -f "$err"; LEDGER_TIP=""; LEDGER_ENTRIES='[]'; return 0
+    fi
+    rm -f "$err"; ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is unreadable"; return 1
+  fi
+  rm -f "$err"
+  LEDGER_TIP=$(printf '%s' "$ref_json" | jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' 2>/dev/null) \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is malformed"; return 1; }
+  commit_json=$(gh api "repos/$REPO/git/commits/$LEDGER_TIP") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger commit is unreadable"; return 1; }
+  LEDGER_ENTRIES=$(p4b_round_ledger_parse "$(printf '%s' "$commit_json" | jq -r '.message // ""')") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger is malformed"; return 1; }
+}
+# round_ledger_read: round_ledger_load, failing closed with exit 10.
+round_ledger_read() {
+  round_ledger_load || round_cap_evidence_error "$ROUND_LEDGER_ERR"
+}
+# round_ledger_write <entries-json> -> 0 published, 1 conflict (re-read and
+# re-evaluate), 2 unknown. A lost response is resolved by reading the tip:
+# the update applied exactly when the tip now holds this run's intended state.
+# It never exits; callers decide whether an unknown outcome is fatal.
+round_ledger_write() {
+  local entries="$1" message commit rc=0 out
+  if [ -z "$P4B_ROUND_TREE" ]; then
+    # GitHub refuses an empty tree (`{"tree":[]}` is HTTP 422 "Invalid tree
+    # info") and a repository need not hold git's well-known empty tree, so
+    # the ledger commits carry one constant file. The message is the ledger.
+    P4B_ROUND_TREE=$(round_api POST "repos/$REPO/git/trees" "$(jq -nc '{tree:[{path:"README",mode:"100644",type:"blob",
+        content:"mergepath Phase 4b round ledger (#2663). The tip commit message carries the ledger; see specs/phase_4b_round_cap.md.\n"}]}')" \
+      | jq -er '.sha' 2>/dev/null) || return 2
+  fi
+  message=$(p4b_round_ledger_message "$PR" "$entries") || return 2
+  commit=$(round_api POST "repos/$REPO/git/commits" "$(jq -nc --arg m "$message" --arg t "$P4B_ROUND_TREE" --arg p "$LEDGER_TIP" \
+      '{message:$m,tree:$t,parents:(if $p == "" then [] else [$p] end)}')" | jq -er '.sha' 2>/dev/null) || return 2
+  if [ -z "$LEDGER_TIP" ]; then
+    out=$(round_api POST "repos/$REPO/git/refs" "$(jq -nc --arg r "$P4B_ROUND_LEDGER_REF" --arg s "$commit" '{ref:$r,sha:$s}')" 2>&1) || rc=$?
+  else
+    out=$(round_api PATCH "repos/$REPO/git/refs/${P4B_ROUND_LEDGER_REF#refs/}" "$(jq -nc --arg s "$commit" '{sha:$s,force:false}')" 2>&1) || rc=$?
+  fi
+  [ "$rc" -ne 0 ] || return 0
+  if printf '%s' "$out" | grep -Eq 'HTTP 422|HTTP 409|Reference already exists|not a fast forward|Update is not a fast forward'; then
+    return 1
+  fi
+  # Unknown outcome: the tip decides.
+  round_ledger_load || return 2
+  [ "$LEDGER_TIP" = "$commit" ] && return 0
+  return 1
+}
+round_my_entries() { printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" '[.[] | select(.run == $run)]'; }
+release_round_reservation() { # <why>; writer-only, never after a POST attempt
+  [ "$P4B_ROUND_RESERVED" = true ] || return 0
+  [ "$P4B_ROUND_POST_ATTEMPTED" != true ] || return 0
+  # Runs from the EXIT trap after the result is out, so it must never exit or
+  # print a result: every failure leaves the slot occupied and only warns.
+  local attempt entries mine
+  for attempt in 1 2 3 4 5; do
+    round_ledger_load || break
+    mine=$(round_my_entries)
+    [ "$(printf '%s' "$mine" | jq 'length')" = 1 ] || break
+    if [ "$(printf '%s' "$mine" | jq -r '.[0].state')" = released ]; then P4B_ROUND_RESERVED=false; return 0; fi
+    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" 'map(if .run == $run then .state = "released" else . end)')
+    if round_ledger_write "$entries"; then P4B_ROUND_RESERVED=false; return 0; fi
+  done
+  p4b_warn "could not release this run's Phase 4b round slot (${1:-done}); it stays occupied"
+  P4B_ROUND_RESERVED=false
+}
+enforce_phase4b_round_cap() {
+  local where="$1" policy attempt occ occupied in_flight entries mine
+  if [ "$where" = pre-dispatch ]; then
+    policy=$(p4b_governing_policy_json "$REPO" "$PR") \
+      || round_cap_evidence_error "Phase 4b round cap: the governing review policy is unreadable"
+    P4B_ROUND_CAP=$(p4b_governing_round_cap "$policy") \
+      || round_cap_evidence_error "Phase 4b round cap: phase_4b_automation.max_review_rounds is not a positive integer"
+    P4B_ROUND_AUTHOR=$(printf '%s' "$policy" | jq -r '.author_identity // "nathanjohnpayne"' 2>/dev/null) \
+      || round_cap_evidence_error "Phase 4b round cap: author_identity is unreadable"
+    P4B_ROUND_LEDGER_REF="refs/mergepath/p4b-rounds/pr-$PR"
+  fi
+  [ "$P4B_ROUND_CAP" != none ] || return 0
+  if [ "$where" = pre-post ]; then
+    P4B_ROUND_WHERE=pre-post
+    # Binding check: this run's slot must still be its own, exactly once.
+    round_ledger_read
+    mine=$(round_my_entries)
+    if [ "$(printf '%s' "$mine" | jq 'length')" != 1 ] || [ "$(printf '%s' "$mine" | jq -r '.[0].state')" != reserved ]; then
+      P4B_ROUND_RESERVED=false
+      round_cap_evidence_error "Phase 4b round cap: this run's ledger slot is missing, duplicated or no longer reserved; not publishing"
+    fi
+    return 0
+  fi
+  for attempt in 1 2 3 4 5; do
+    # Fresh reads and a full re-evaluation on every attempt.
+    round_ledger_read
+    round_rounds_read
+    occ=$(p4b_round_occupancy "$LEDGER_ENTRIES" "$ROUND_STATE" "$P4B_ROUND_CAP") \
+      || round_cap_evidence_error "Phase 4b round cap: occupancy could not be computed"
+    occupied=$(printf '%s' "$occ" | jq -r '.occupied'); in_flight=$(printf '%s' "$occ" | jq -r '.in_flight')
+    P4B_ROUND_CAP_JSON=$(printf '%s' "$occ" | jq -c --arg tip "$LEDGER_TIP" --arg ref "$P4B_ROUND_LEDGER_REF" '. + {ledger_ref:$ref,ledger_tip:$tip}')
+    if [ "$(round_my_entries | jq 'length')" != 0 ]; then
+      round_cap_evidence_error "Phase 4b round cap: the ledger already holds this run id; refusing an ambiguous reservation"
+    fi
+    if [ "$occupied" -ge "$P4B_ROUND_CAP" ]; then
+      if [ "$in_flight" -gt 0 ]; then
+        round_cap_stop 6 held "Phase 4b round slots on ${REPO}#${PR} are occupied (${occupied}/${P4B_ROUND_CAP}, ${in_flight} in flight); not dispatching a competing round. An in-flight slot frees only if its writer releases it before publishing (#2663)" pre-dispatch
+      fi
+      round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR} (${occupied}/${P4B_ROUND_CAP} occupied); an owner decision or a reduced scope is required, and no further automated round runs (#2663)" pre-dispatch
+    fi
+    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" --arg head "$HEAD" '. + [{run:$run,head:$head,state:"reserved"}]')
+    # Called directly, never in $( ): an unknown outcome re-reads the ledger
+    # into this shell. An unknown outcome may have applied, so it reserves
+    # nothing this run could release; the slot stays occupied.
+    local wrc=0
+    round_ledger_write "$entries" || wrc=$?
+    case "$wrc" in
+      0) P4B_ROUND_RESERVED=true; return 0 ;;
+      1) p4b_log "round ledger moved under this run (attempt $attempt); re-reading and re-evaluating (#2663)" ;;
+      *) round_cap_evidence_error "Phase 4b round cap: the round ledger could not be updated" ;;
+    esac
+  done
+  round_cap_evidence_error "Phase 4b round cap: the round ledger kept moving; no slot reserved"
+}
+
+# END p4b_round_cap
 
 stop_for_barrier_error() {
   local payload="$1"
@@ -1249,6 +1495,9 @@ fi
 # gate stays the last read before dispatch.
 if [ "$DRY_RUN" != true ] && [ "$ADAPTER_MISSING" != true ]; then
   revalidate_request_ceiling_authority pre-dispatch
+  # #2663: after the barrier (its Codex stops take precedence) and before the
+  # accounting gate and the adapter, so a refused round spends no review.
+  enforce_phase4b_round_cap pre-dispatch
 fi
 
 # Do not spend an external reviewer round while an earlier finding remains
@@ -1712,6 +1961,9 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   if [ "$VERDICT" = "APPROVED" ] && [ -n "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
     printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$P4B_AUTHORIZED_REQUEST_GENERATION"
   fi
+  # #2663: a per-run nonce lets an uncertain POST be reconciled against THIS
+  # run's review, never another caller's identical body on the same head.
+  printf '\n<!-- mergepath-p4b-run: %s -->\n' "$P4B_ACCT_RUN_ID"
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
 } > "$BODY_FILE"
 
@@ -1959,6 +2211,8 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
+  # #2663: a competing caller may have completed a round during this run.
+  enforce_phase4b_round_cap pre-post
   # Preserve the early generation fence before the immutable-input and final
   # feedback reads; snapshot routes were just re-proved by the budget fence.
   [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved
@@ -1977,6 +2231,7 @@ post_review() {
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
+  P4B_ROUND_POST_ATTEMPTED=true
   set +e
   review_response="$(
     env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
@@ -1985,7 +2240,27 @@ post_review() {
   review_rc=$?
   set -e
   rm -f "$payload_file"
-  [ "$review_rc" -eq 0 ] || { p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"; return "$review_rc"; }
+  if [ "$review_rc" -ne 0 ]; then
+    # #2663: a POST can fail after GitHub created the review (a timeout or a
+    # lost response). Reconcile before reporting failure: adopt exactly one
+    # review by the actual reviewer, on this head, carrying this run's unique
+    # nonce (the same id its ledger entry persisted). Zero or several
+    # adopt nothing, and the ledger slot stays occupied, so no later run
+    # reposts an ambiguous publication.
+    local landed=""
+    if command -v gh_api_array >/dev/null 2>&1 \
+       && landed=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "review POST reconciliation" 2>/dev/null); then
+      landed=$(p4b_reconcile_posted_review "$landed" "$REVIEWER" "$HEAD" "$P4B_ACCT_RUN_ID") || landed=""
+    else
+      landed=""
+    fi
+    if [ -z "$landed" ]; then
+      p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"
+      return "$review_rc"
+    fi
+    p4b_warn "review POST exited $review_rc, but the review landed on GitHub (id $(printf '%s' "$landed" | jq -r '.id')); adopting it instead of reporting a failure (#2663)"
+    review_response="$landed"
+  fi
   POSTED_REVIEW_ID="$(printf '%s' "$review_response" | jq -r '.id // empty' 2>/dev/null || true)"
   created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
   printf '%s' "$review_response" | jq -e --rawfile body "$BODY_FILE" '.body == $body' >/dev/null \
@@ -2140,6 +2415,7 @@ jq -n \
   --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
   --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" \
+  --argjson round_cap "$P4B_ROUND_CAP_JSON" \
   --arg enabled_via "$ENABLED_VIA" '
   {
     pr_number: $pr,
@@ -2158,6 +2434,7 @@ jq -n \
     token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
     usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,
+    round_cap: $round_cap,
     automation_enabled: true,
     enabled_via: $enabled_via
   }
