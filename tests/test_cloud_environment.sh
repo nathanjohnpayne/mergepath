@@ -688,7 +688,7 @@ chmod +x "$PYYQ/yq"
 
 # The release tag is validated before dry-run success. A checksum-shaped
 # override cannot make an older or malformed version look installable.
-for spec in "y-dry-old:v4.52.0:stable version at least v4.53.6" "y-dry-invalid:v4.bad.0:stable version at least v4.53.6" "y-dry-leading-zero-major:v04.54.0:stable version at least v4.53.6" "y-dry-leading-zero-minor:v4.054.0:stable version at least v4.53.6" "y-dry-leading-zero-patch:v4.54.00:stable version at least v4.53.6"; do
+for spec in "y-dry-old:v4.52.0:stable version at least v4.53.6" "y-dry-invalid:v4.bad.0:stable version at least v4.53.6" "y-dry-leading-zero-major:v04.54.0:stable version at least v4.53.6" "y-dry-leading-zero-minor:v4.054.0:stable version at least v4.53.6" "y-dry-leading-zero-patch:v4.54.00:stable version at least v4.53.6" "y-dry-unsupported-major:v5.0.0:stable version at least v4.53.6"; do
   dir="${spec%%:*}"; rest="${spec#*:}"; version="${rest%%:*}"; want="${rest#*:}"
   : >"$WORKDIR/curl.log"
   set +e
@@ -702,7 +702,7 @@ for spec in "y-dry-old:v4.52.0:stable version at least v4.53.6" "y-dry-invalid:v
 done
 
 # Zero is valid in a numeric SemVer component when it is the entire component.
-for version in v4.54.0 v5.0.0; do
+for version in v4.54.0 v4.9223372036854775808.0; do
   : >"$WORKDIR/curl.log"
   set +e
   run_setup_dry "$WORKDIR/y-dry-zero-${version//./-}" MERGEPATH_YQ_VERSION="$version" MERGEPATH_YQ_SHA256="$(printf 'a%.0s' {1..64})" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
@@ -786,7 +786,7 @@ if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/y-rc/bin/yq" ] && grep -q "installed yq $YQ
 else
   fail "setup prerelease yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
 fi
-for keep in v4.53.6 v4.100.0; do
+for keep in v4.53.6 v4.100.0 v4.9223372036854775808.0; do
   yq_stub_dir "$WORKDIR/yq-keep-$keep" "$keep"
   : >"$WORKDIR/curl.log"
   set +e

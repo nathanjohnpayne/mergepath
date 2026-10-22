@@ -225,10 +225,19 @@ is_mikefarah_yq() { # <path>
 # PATH is replaced, not kept: it breaks the checks named at the top of this script.
 YQ_MIN_VERSION="v4.53.6"
 
-# Succeeds when <have> is at least <want>; both are [v]MAJOR.MINOR.PATCH,
-# compared field by field as numbers (v4.100.0 is newer than v4.53.6). Each
-# numeric component follows SemVer grammar: zero or a nonzero digit followed
-# by digits, with no leading zeroes.
+# Returns true when the decimal component <left> is greater than <right>.
+# Length comparison handles arbitrary-size SemVer components; equal-length
+# digit strings are compared lexically in the C locale.
+decimal_component_greater() { # <left> <right>
+  local left="$1" right="$2" LC_ALL=C
+  if [ "${#left}" -gt "${#right}" ]; then return 0; fi
+  if [ "${#left}" -lt "${#right}" ]; then return 1; fi
+  [[ "$left" > "$right" ]]
+}
+
+# Succeeds when <have> is at least <want>; both are [v]MAJOR.MINOR.PATCH.
+# Each numeric component follows SemVer grammar: zero or a nonzero digit
+# followed by digits, with no leading zeroes.
 version_at_least() { # <have> <want>
   local h1 h2 h3 w1 w2 w3 v
   for v in "${1#v}" "${2#v}"; do
@@ -236,9 +245,16 @@ version_at_least() { # <have> <want>
   done
   v="${1#v}"; h1="${v%%.*}"; v="${v#*.}"; h2="${v%%.*}"; h3="${v#*.}"
   v="${2#v}"; w1="${v%%.*}"; v="${v#*.}"; w2="${v%%.*}"; w3="${v#*.}"
-  if [ "$h1" -ne "$w1" ]; then [ "$h1" -gt "$w1" ]; return; fi
-  if [ "$h2" -ne "$w2" ]; then [ "$h2" -gt "$w2" ]; return; fi
-  [ "$h3" -ge "$w3" ]
+  if [ "$h1" != "$w1" ]; then decimal_component_greater "$h1" "$w1"; return; fi
+  if [ "$h2" != "$w2" ]; then decimal_component_greater "$h2" "$w2"; return; fi
+  [ "$h3" = "$w3" ] || decimal_component_greater "$h3" "$w3"
+}
+
+# The downloaded binary predicate below supports mikefarah/yq v4 only. Reject
+# other major versions before dry-run can claim an install is viable.
+is_supported_yq_release_version() { # <version>
+  local v="${1#v}"
+  [[ "$v" =~ ^4\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 }
 
 # mikefarah/yq v4 at YQ_MIN_VERSION or later.
@@ -271,8 +287,8 @@ install_yq() {
     esac
     [ "${#expected}" -eq 64 ] || { log "MERGEPATH_YQ_SHA256 must be a 64-hex SHA-256 digest"; return 1; }
   fi
-  if ! version_at_least "$YQ_VERSION" "$YQ_MIN_VERSION"; then
-    log "yq release $YQ_VERSION must be a stable version at least $YQ_MIN_VERSION"
+  if ! is_supported_yq_release_version "$YQ_VERSION" || ! version_at_least "$YQ_VERSION" "$YQ_MIN_VERSION"; then
+    log "yq release $YQ_VERSION must be a stable version at least $YQ_MIN_VERSION on supported major version 4"
     return 1
   fi
   if $DRY_RUN; then
