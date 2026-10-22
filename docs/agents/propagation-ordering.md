@@ -91,6 +91,8 @@ If a clean receipt is created locally but its push fails, rerun the identical pa
 
 A byte-verified canary of a merged hub head, audited from its watermark base (an ordinary, non-historical wave), does not trip the deterministic Phase 4b tripwires (#2633): every line in it already merged on the hub through its own review, so an ordinary wave posts the automated verdict under the reviewer identity with no human step.
 
+**Labels travel with the wave.** The sync mirrors files, not repository settings, so issue labels drift unless something keeps them in step. After the fan-out PRs merge, run `scripts/sync-labels.sh` from the hub. It reconciles the canonical labels in `scripts/bootstrap/github-infra.sh` (name, colour and description) across the hub and every manifest consumer: missing active labels are created, drifted colours and descriptions are updated, deprecated labels are corrected only where they already exist, and nothing is deleted, renamed or touched outside the canonical list. Review the dry-run plan, then run it with `--apply`; a second dry run must report every repository in sync.
+
 Verdict contract — same golden rule as below, fix at the SOURCE:
 
 - **APPROVED (exit 0):** the watermark advances (tag pushed to origin). Fan out with `sync-to-downstream.sh --sync-all --coderabbit-ignore` and post **no** `@codex review` on the mirrors — fan-out PRs merge on consumer CI + the lane byte-verification + the required reviewer approval only.

@@ -283,6 +283,8 @@ echo "canonical-mirror audit test (hub-only)" >"$FAKE_MP/tests/test_audit_canoni
 # admin-scoped fleet secret a new repo does not have, so a bootstrapped
 # consumer that carried it would fail the run every Monday forever. The
 # scripts/ci wrapper deliberately stays (asserted in 1c below).
+echo "label sync (hub-only)" >"$FAKE_MP/scripts/sync-labels.sh"
+echo "label sync test (hub-only)" >"$FAKE_MP/tests/test_sync_labels.sh"
 echo "protection audit (hub-only)" >"$FAKE_MP/scripts/audit-branch-protection.sh"
 echo "protection audit test (hub-only)" >"$FAKE_MP/tests/test_audit_branch_protection.sh"
 echo "protection audit workflow test (hub-only)" >"$FAKE_MP/tests/test_audit_branch_protection_workflow.sh"
@@ -480,6 +482,8 @@ for excluded in \
   'scripts/audit-branch-protection.sh' \
   'tests/test_audit_branch_protection.sh' \
   'tests/test_audit_branch_protection_workflow.sh' \
+  'scripts/sync-labels.sh' \
+  'tests/test_sync_labels.sh' \
   '.mergepath-sync.yml' \
   'scripts/sync-to-downstream.sh' \
   'tests/test_sync_to_downstream.sh' \

@@ -22,6 +22,12 @@
 # Already-executed on 2026-04-18: produced parent issues #210, #215, #220, #225.
 # Re-running will create a duplicate set — the script is not idempotent. Use
 # only against a fresh project or after wiping the existing issues.
+#
+# Its phase-1..4 labels are the record of what that run applied. They are
+# deprecated fleet labels now (BOOTSTRAP_DEPRECATED_LABELS); scripts/sync-labels.sh
+# keeps them in step where they exist but never creates them. Copy the
+# structure, not the labels: a new driver uses active or repo-local labels,
+# as the README quick reference does.
 
 set -euo pipefail
 

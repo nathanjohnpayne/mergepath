@@ -241,6 +241,13 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'tests/test_credential_isolation.py'
   'specs/credential_isolation.md'
 
+  # Fleet label sync - hub-only, excluded as a pair for the same reason:
+  # the driver reconciles labels across .mergepath-sync.yml's consumers,
+  # which a new repo does not carry. scripts/ci/check_sync_labels stays and
+  # takes its consumer-SKIP path on the absent sync-to-downstream marker.
+  'scripts/sync-labels.sh'
+  'tests/test_sync_labels.sh'
+
   # Hub identity docs — do NOT duplicate mergepath's self-referential
   # hub identity into a consumer (#744).
   #
