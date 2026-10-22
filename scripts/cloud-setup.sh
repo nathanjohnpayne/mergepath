@@ -274,6 +274,10 @@ install_yq() {
     esac
     [ "${#expected}" -eq 64 ] || { log "MERGEPATH_YQ_SHA256 must be a 64-hex SHA-256 digest"; return 1; }
   fi
+  if ! version_at_least "$YQ_VERSION" "$YQ_MIN_VERSION"; then
+    log "yq release $YQ_VERSION must be a stable version at least $YQ_MIN_VERSION"
+    return 1
+  fi
   if $DRY_RUN; then
     log "would install yq $YQ_VERSION ($asset) from $base into $prefix/bin after verifying SHA-256 $expected"
     return 0
@@ -290,6 +294,11 @@ install_yq() {
   actual="$(sha256_of "$tmp/$asset")" || { log "no SHA-256 tool (sha256sum or shasum); refusing to install unverified"; return 1; }
   if [ "$actual" != "$expected" ]; then
     log "checksum mismatch for yq $YQ_VERSION $asset (expected $expected, got $actual); refusing to install"
+    return 1
+  fi
+  chmod 755 "$tmp/$asset" || { log "could not make verified yq download executable"; return 1; }
+  if ! yq_meets_minimum "$tmp/$asset"; then
+    log "verified download for yq $YQ_VERSION does not run as mikefarah/yq v4 at $YQ_MIN_VERSION or later; refusing to install"
     return 1
   fi
   mkdir -p "$prefix/bin" || { log "could not create $prefix/bin"; return 1; }
