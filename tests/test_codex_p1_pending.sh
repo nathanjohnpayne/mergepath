@@ -76,19 +76,23 @@ for lib in feedback-policy-helpers.sh gh-api-array.sh gh-api-scalar.sh; do
 done
 cp "$ROOT/.github/review-policy.yml" "$W/.github/review-policy.yml"
 # This suite exercises the legacy scan, so its fixture enables it. A consumer's
-# own policy is per-repo config the sync does not carry and may leave
-# codex.p1_gate out; the hub's enables it. Insert the stanza only when absent.
-if ! grep -Eq '^  p1_gate:' "$W/.github/review-policy.yml"; then
-  grep -Eq '^codex:' "$W/.github/review-policy.yml" \
-    || { echo "ERROR: the trusted policy has no codex: block; update this test" >&2; exit 1; }
-  awk '{ print } /^codex:/ && !done { print "  p1_gate:"; print "    enabled: true"; done = 1 }' \
-    "$W/.github/review-policy.yml" >"$W/.github/review-policy.yml.new" \
-    && mv "$W/.github/review-policy.yml.new" "$W/.github/review-policy.yml"
-fi
+# own policy is per-repo config the sync does not carry: it may leave
+# codex.p1_gate out or set it false, while the hub's enables it. Replace any
+# existing stanza under codex: with one that is enabled.
+grep -Eq '^codex:' "$W/.github/review-policy.yml" \
+  || { echo "ERROR: the trusted policy has no codex: block; update this test" >&2; exit 1; }
+awk '
+  /^codex:/ { print; print "  p1_gate:"; print "    enabled: true"; in_codex = 1; next }
+  in_codex && /^[^[:space:]#]/ { in_codex = 0 }
+  in_codex && /^  p1_gate:/ { skip = 1; next }
+  skip && /^    / { next }
+  { skip = 0; print }
+' "$W/.github/review-policy.yml" >"$W/.github/review-policy.yml.new" \
+  && mv "$W/.github/review-policy.yml.new" "$W/.github/review-policy.yml"
+grep -Eq '^  p1_gate:' "$W/.github/review-policy.yml" \
+  || { echo "ERROR: could not enable codex.p1_gate in the fixture policy; update this test" >&2; exit 1; }
 chmod +x "$W/scripts/codex-p1-gate.sh" "$W/scripts/workflow/codex-p1-snapshot-retry.py" \
   "$W/scripts/gate-api-lineage-blocking.sh"
-grep -Eq '^  p1_gate:' "$W/.github/review-policy.yml" \
-  || { echo "ERROR: the trusted policy no longer enables the legacy scan; update this test" >&2; exit 1; }
 
 # Accounting stub: answers from $STATE/accounting (first line: rc, rest: the
 # JSON answer). ACCOUNTING_SEQ: one answer file per call, consumed in order,
