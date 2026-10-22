@@ -380,6 +380,7 @@ paths:
     requires:
       - "scripts/lib/codex-review-ledger.sh"
       - "scripts/lib/codex-request-evidence.sh"   # trigger grammar, eyes, verdicts, summary
+      - "scripts/workflow/resolve-codex-verdict-anchors.py" # #2686, normalize ledger verdict anchors
       - "scripts/lib/codex-failure-markers.sh"    # provider block notices
       - "scripts/lib/feedback-policy-helpers.sh"  # tiers, policy parsing
       - "scripts/lib/gh-api-array.sh"             # fail-closed paginated reads
@@ -1621,6 +1622,7 @@ paths:
       - "scripts/codex-review-ledger.sh"
       - "scripts/lib/codex-review-ledger.sh"
       - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/workflow/resolve-codex-verdict-anchors.py" # #2686, production CLI fixture
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"

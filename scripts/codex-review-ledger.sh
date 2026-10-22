@@ -393,8 +393,25 @@ while IFS= read -r root; do
 done <<<"$(jqx "review comments" -c '.[] | select(.in_reply_to_id == null)' <<<"$BOT_REVIEW_COMMENTS")"
 
 # ---- verdicts, reactions, provider blocks, summary ------------------------------
+ISSUE_COMMENTS=$(crqe_resolve_verdict_anchors "$ISSUE_COMMENTS" "$REPO" "$BOT") || die "cannot resolve Codex verdict anchors"
 VERDICTS=$(crqe_verdicts "$ISSUE_COMMENTS" "$BOT") || die "cannot parse Codex verdict comments"
-VERDICTS=$(jqx "verdicts" -c 'unique_by(.comment_id)' <<<"$VERDICTS")
+VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
+# The resolver preserves unresolved raw prefixes. Unlike the checker's exact
+# head selector, the attribution engine accepts prefixes, so exclude their
+# entire verdict rather than turning it into an attributable anchorless one.
+# crqe_verdicts collapses a tuple with any malformed field to an empty
+# reviewed_shas, which is indistinguishable from a genuinely anchorless
+# verdict (#2742). Only a comment with no raw anchor field at all may be
+# anchorless; one whose raw fields parsed to nothing is excluded too.
+RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
+  [ .[] | select((.user.login // "") == $bot)
+    | select([(.body // "") | ascii_downcase | scan("reviewed commit")] | length > 0)
+    | .id ]' <<<"$ISSUE_COMMENTS")
+VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" '
+  map(select(if (.reviewed_shas | length) == 0
+             then (.comment_id as $id | $raw | any(.[]; . == $id) | not)
+             else all(.reviewed_shas[]; length == 40) end))
+  | unique_by(.comment_id)' <<<"$VERDICTS")
 # PR-level reactions cannot establish a response or test a rebuttal. Keep the
 # legacy input field empty; request eyes and finding feedback are independent.
 REACTIONS='[]'
@@ -405,7 +422,7 @@ while IFS= read -r c; do
   [ -n "$m" ] || continue
   BLOCKS=$(jqx "blocks" -c --argjson c "$c" --arg m "$m" \
     '. + [{comment_id: $c.id, created_at: $c.created_at, reason: $m}]' <<<"$BLOCKS")
-done <<<"$(jqx "bot comments" -c --arg bot "$BOT" --argjson verdict_ids "$(jqx "verdicts" -c 'map(.comment_id)' <<<"$VERDICTS")" '
+done <<<"$(jqx "bot comments" -c --arg bot "$BOT" --argjson verdict_ids "$VERDICT_COMMENT_IDS" '
   unique_by(.id) | .[] | select(.user.login == $bot)
       # A verdict is never a block notice (codex-review-request.sh precedence),
       # and the mutable Review Summary is current state, not history.
