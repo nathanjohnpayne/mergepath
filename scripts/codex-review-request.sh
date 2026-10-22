@@ -3509,10 +3509,12 @@ resume_pending_codex_request() {
     log "pending request $RESUMED_TRIGGER_ID: Codex reports its run '$terminal_state' since it was posted — resuming it under the bounded retry rules, not posting a fresh request (#2664)"
   fi
   # A resumed request that is itself an automatic retry gets no retry and,
-  # if it expires, no fresh replacement either: it is reported (#2664).
+  # if it expires, no fresh replacement either (#2664). The markers are
+  # re-read where each of those is decided, not latched here: an intent that
+  # marks it now may be withdrawn while this run waits.
   if [ "$(crqe_request_is_retry "$comments" "$AUTHOR_IDENTITY" "$RESUMED_TRIGGER_ID")" != false ]; then
-    RETRY_STATE=refused RETRY_REASON=retry-of-retry
-    log "automatic Codex retry for request $RESUMED_TRIGGER_ID not posted: retry-of-retry (#2664)"
+    RESUMED_IS_RETRY=true
+    log "pending request $RESUMED_TRIGGER_ID is itself an automatic retry: no retry, and no replacement if it expires, unless the markers change (#2664)"
   fi
   REQUEST_BLOCK_TRIGGER_JSON=$pending
   TRIGGER_SIGNAL_THRESHOLD=$created
@@ -3568,6 +3570,7 @@ RETRY_ACKED_ID=""
 RETRY_INTENT_ID=""
 RETRY_INTENT_PENDING=false
 RETRY_PINNED_GENERATION=""
+RESUMED_IS_RETRY=false
 
 # The no-write decisions below belong to a request mode. A requester applies
 # its own. The wrapper's authorization pass runs as --trigger-only, so it
@@ -3750,6 +3753,17 @@ run_review_poll
 # Nothing has been written to stdout yet, so the fresh run's JSON is the only
 # result.
 RESUMED_BLOCK_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the resumed provider refusal"
+# #2664: a resumed request that looked like an automatic retry is re-checked
+# against fresh markers before its replacement is withheld.
+if [ "$RESUMED_TRIGGER" = true ] && [ "$RESUMED_IS_RETRY" = true ] && { [ "$RETRY_STATE" = none ] || [ "$RETRY_STATE" = scheduled ]; }; then
+  resumed_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "resumed retry evidence") \
+    || die 3 "cannot re-read the retry markers for the resumed request"
+  if [ "$(crqe_request_is_retry "$resumed_comments" "$AUTHOR_IDENTITY" "$RESUMED_TRIGGER_ID")" != false ]; then
+    retry_refuse retry-of-retry
+  else
+    log "pending request $RESUMED_TRIGGER_ID is no longer marked as an automatic retry (its intent was withdrawn) (#2664)"
+  fi
+fi
 # #2664: a resumed request whose run was confirmed failed or inactive, and
 # whose automatic retry was then refused or is not yet due, is reported
 # instead: a fresh replacement would retry it after all (a retry of a retry,

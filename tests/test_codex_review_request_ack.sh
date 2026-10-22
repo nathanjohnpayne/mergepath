@@ -426,6 +426,13 @@ case "$endpoint" in
         jq -cn --arg body "$body" '{id:3005,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:00:20Z",updated_at:"2026-06-04T00:00:20Z"}' >>"$state_dir/comments.jsonl"
       fi
     fi
+    # #2664: the intent that marks the resumed request is withdrawn while the
+    # request is being polled (fake time 100 s after it was posted).
+    if [ "$scenario" = "retry-intent-withdrawn" ] && [ ! -f "$state_dir/intent-withdrawn" ] \
+       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + 100 ))" ]; then
+      touch "$state_dir/intent-withdrawn"
+      jq -cn '{id:910,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 withdrawn=899 -->\nWithdrawn.",created_at:"2026-06-04T00:01:40Z"}' >>"$state_dir/comments.jsonl"
+    fi
     # #2664: the resumed request's run fails a minute after it was posted.
     if [ "$scenario" = "retry-concurrent" ] && [ ! -f "$state_dir/run-failed" ] \
        && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + ${CODEX_TEST_FAIL_AT:-60} ))" ]; then
@@ -2018,6 +2025,26 @@ test_scheduled_retry_at_deadline_is_reported() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a retry still scheduled at the deadline is reported, not replaced"
 }
 
+# A resumed request first looks like a retry because a live intent precedes
+# it; that intent is withdrawn while the request waits. At the deadline the
+# fresh markers say it is an ordinary request, so the #1550 replacement runs.
+test_withdrawn_intent_unlatches_resumed_request() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-intent-withdrawn" 0 0 400)
+  seed_author_trigger "$dir" 880 "2026-06-03T23:50:00Z"
+  jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 -->\nIntent.",created_at:"2026-06-03T23:59:59Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_retry_case "$dir" retry-intent-withdrawn CODEX_TEST_EYES=0)
+  grep -q 'is itself an automatic retry' "$dir/err.log" || fail "#2664 unlatch: the intent did not mark the resumed request at first"
+  grep -q 'no longer marked as an automatic retry' "$dir/err.log" && grep -q 're-running as a fresh request' "$dir/err.log" \
+    || fail "#2664 unlatch: the withdrawal was not re-read before the replacement; exit $rc; $(grep 2664 "$dir/err.log" | tail -3)"
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 unlatch: $(trigger_count "$dir") requests, expected the replacement"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a resumed request whose marking intent is withdrawn gets its replacement"
+}
+
 # The binding names the retry that actually posted, so a losing handler's
 # intent marker cannot mark a later ordinary request as a retry.
 test_retry_marker_binding() {
@@ -2285,6 +2312,7 @@ test_retry_honors_longer_provider_window
 test_retry_window_lengthened_while_scheduled
 test_resumed_retry_is_not_replaced
 test_retry_marker_binding
+test_withdrawn_intent_unlatches_resumed_request
 test_scheduled_retry_at_deadline_is_reported
 test_retry_needs_codex_acknowledgement
 test_restarted_session_resumes_failed_request
