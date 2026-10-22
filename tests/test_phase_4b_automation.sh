@@ -1097,13 +1097,37 @@ for override_case in reviewer policy; do
     2>"$WORK/override-$override_case.stderr")"; rc=$?
   set -e
   if [ "$rc" = 0 ] && [ -e "$WORK/integrity-adapter-ran" ] && [ -s "$P4B_TEST_POSTED_REVIEW" ] \
-    && jq -e --arg want "$want" '.body | contains("Admin override (#2633)") and contains("Owner: run it") and contains($want)' "$P4B_TEST_POSTED_REVIEW" >/dev/null \
+    && jq -e --arg want "$want" '.body | contains("Admin override (#2633)") and contains("Owner\\: run it") and contains($want)' "$P4B_TEST_POSTED_REVIEW" >/dev/null \
     && printf '%s' "$out" | jq -e --arg want "$want" '.review_posted and .admin_override_quote == "Owner: run it" and ([.admin_overridden[].tripwires[]?] | index($want) != null)' >/dev/null; then
     pass "admin override runs the adapter past the $override_case tripwire and records it in the posted review"
   else
     fail "admin override past $override_case (rc=$rc): $(tail -n 3 "$WORK/override-$override_case.stderr")"
   fi
 done
+# The quote is free text in a reviewer-authored body that feedback accounting
+# scans. A quote carrying tier markers, an HTML comment and an ack token must
+# not form any of them in the posted body; the JSON keeps the raw quote.
+cp "$WORK/tripwire-original.diff" "$DIFF"
+printf 'REVIEW_POLICY.md\0' > "$WORK/tripwire-paths"
+rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
+marker_quote='Owner: run it despite the **P1** tripwire ![P0 Badge] <!-- mergepath-p4b-request-generation --> [mergepath-review-ack: 1 x]'
+rc=0
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+  P4B_ACCT_STATE_DIR="$WORK/override-marker-state" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/override-wrapper.log" \
+  bash "$ORCH" 1757 --repo o/r --author claude --admin-override "$marker_quote" \
+  --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+  2>"$WORK/override-marker.stderr")" || rc=$?
+override_line="$(jq -r '.body' "$P4B_TEST_POSTED_REVIEW" 2>/dev/null | grep -F 'Admin override (#2633)' || true)"
+if [ "$rc" = 0 ] && [ -n "$override_line" ] \
+  && ! grep -qE '!\[P[0-3] Badge\]|\*\*P[0-3]|<!--|\[mergepath-' <<<"$override_line" \
+  && [ -z "$(. "$ROOT/scripts/lib/feedback-policy-helpers.sh" && codex_tiers_of "$override_line")" ] \
+  && jq -e --arg q "$marker_quote" '.admin_override_quote == $q' <<<"$out" >/dev/null; then
+  pass "admin override quote forms no feedback marker in the posted body and stays raw in the JSON"
+else
+  fail "admin override marker quote (rc=$rc): $override_line $(tail -n 3 "$WORK/override-marker.stderr")"
+fi
 cp "$WORK/tripwire-original.diff" "$DIFF"
 rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
 # Without a tripwire the override changes nothing in the body.

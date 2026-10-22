@@ -719,8 +719,14 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   PREFIX_TAG_RESULT="$tag"
 }
 
+# #2633: the override fields every wave summary carries. They start from this
+# run's flag and take the orchestrator's own record once it has run, so a
+# wave whose review absorbed a tripwire reports the quote and reason codes.
+WAVE_ADMIN_OVERRIDE="$(jq -nc --arg q "$ADMIN_OVERRIDE_QUOTE" --argjson set "$ADMIN_OVERRIDE_SET" \
+  '{admin_overridden:[],admin_override_quote:(if $set then $q else null end)}')"
+
 emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
-  jq -n \
+  jq -n --argjson ao "$WAVE_ADMIN_OVERRIDE" \
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
     --argjson pr "$PR" --argjson files "$REPORT_FILES" --argjson bytes "$REPORT_BYTES" \
     --argjson limit "$DIFF_MAX" \
@@ -731,7 +737,7 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
     '{base:$base, base_watermark:$watermark, head:$head, repo:$repo, pr:$pr, scope_files:$files,
       scope_bytes:$bytes, diff_max_bytes:$limit, effort:$effort, timeout_seconds:$timeout,
       orchestrator_exit:$orch, watermark_advanced:$tagged, skipped:$skipped,
-      dry_run:$dry}'
+      dry_run:$dry} + $ao'
 }
 
 if [ "$FINALIZE_HISTORICAL" = true ]; then
@@ -965,12 +971,19 @@ if [ -n "$HISTORICAL_END" ]; then
   exit 9
 else
   set +e
+  ORCH_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/wave-audit-orchestrator.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$ORCH_OUTPUT"
   P4B_CODEX_EFFORT="$EFFORT" \
   P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
   P4B_DIFF_MAX_BYTES="$DIFF_MAX" \
-    "$ORCH" "${orch_args[@]}"
+    "$ORCH" "${orch_args[@]}" > "$ORCH_OUTPUT"
   orc=$?
   set -e
+  cat "$ORCH_OUTPUT"
+  # The orchestrator's last record that carries override fields wins.
+  orch_override="$(jq -sc 'map(select(type == "object" and has("admin_overridden"))) | last
+    | if . == null then empty else {admin_overridden, admin_override_quote} end' "$ORCH_OUTPUT" 2>/dev/null || true)"
+  [ -z "$orch_override" ] || WAVE_ADMIN_OVERRIDE="$orch_override"
 fi
 
 if [ "$FINALIZE_HISTORICAL" = true ] && [ "$orc" -ne 0 ]; then

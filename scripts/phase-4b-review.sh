@@ -2024,10 +2024,15 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
       printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
       ;;
   esac
-  # #2633: say which human stops the owner's admin override ran past.
+  # #2633: say which human stops the owner's admin override ran past. The
+  # quote is free text inside a reviewer-authored body, which feedback
+  # accounting scans for tier markers (`**P1`, `![P1 Badge]`), ack tokens and
+  # HTML-comment records. Backslash-escape every ASCII punctuation character:
+  # GitHub renders the same text, and no marker can form. The JSON summary
+  # keeps the raw quote.
   if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
     printf -- '- Admin override (#2633): owner authorization "%s"; this automated review ran past: %s\n' \
-      "$ADMIN_OVERRIDE_QUOTE" \
+      "$(jq -rn --arg q "$ADMIN_OVERRIDE_QUOTE" '$q | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')" \
       "$(jq -r 'map(if .tripwires then "tripwire (" + (.tripwires | join(", ")) + ")" else (.reason // .decision) end) | join("; ")' <<<"$ADMIN_OVERRIDDEN")"
   fi
   # #1335: likewise for a CodeRabbit review carried from identical content.

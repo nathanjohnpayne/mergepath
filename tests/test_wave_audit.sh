@@ -628,6 +628,21 @@ git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | gr
   && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
 git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+# The wave's own final summary carries the orchestrator's override record, so
+# a caller reading the last record keeps the quote and the reason codes.
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" \
+  --head-sha "$LARGE_HEAD" --dry-run --admin-override 'Owner: run it' > "$WORK/override-summary.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && jq -se 'last | .orchestrator_exit == 0 and .admin_override_quote == "Owner: run it"
+    and .admin_overridden[0].tripwires == ["reviewer-address"]' "$WORK/override-summary.json" >/dev/null \
+  && pass "the final wave summary carries the orchestrator's override record" \
+  || fail "final wave summary dropped the override record (rc=$rc): $(tail -c 400 "$WORK/override-summary.json")"
+rc=0
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run \
+  > "$WORK/no-override-summary.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && jq -se 'last | .admin_overridden == [] and .admin_override_quote == null' "$WORK/no-override-summary.json" >/dev/null \
+  && pass "a wave without the override reports empty override fields" \
+  || fail "wave without the override reported override fields (rc=$rc)"
 # A missing quote never consumes the next option as authorization text.
 for option_quote in --dry-run -n; do
   rc=0
