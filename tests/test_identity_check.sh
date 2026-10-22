@@ -643,19 +643,54 @@ if grep -q "available_reviewers" <<<"$APP_OUT"; then
 else
   fail "--expect-thread-resolution-app reviewer listing: diagnostic: $APP_OUT"
 fi
-app_policy 'thread_resolution_ci_app_identity: nathanpayne-claude' nathanpayne-claude
-app_case "configured value is a user login, not an app" 3 ghs_x STUB_VIEWER_LOGIN=nathanpayne-claude
+# The shape check is the ONLY refusal in these two cases: each value is
+# declared in non_reviewer_identities and absent from available_reviewers, so a
+# dropped or weakened <app-slug>[bot] check would accept it.
+app_policy 'thread_resolution_ci_app_identity: nathanpayne-robot'
+app_case "configured value is a user login, not an app" 3 ghs_x STUB_VIEWER_LOGIN=nathanpayne-robot
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a declared non-reviewer user login is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app user login: diagnostic: $APP_OUT"
+fi
 for bot in 'github-actions[bot]' 'coderabbitai[bot]' 'chatgpt-codex-connector[bot]' 'dependabot[bot]' 'github-advanced-security[bot]'; do
   app_policy "thread_resolution_ci_app_identity: \"$bot\"" "$bot"
   app_case "configured value is the shared or reviewing bot $bot" 3 ghs_x STUB_VIEWER_LOGIN="$bot"
 done
-app_policy 'thread_resolution_ci_app_identity: [mergepath-ci[bot]]' "$APP"
+app_policy 'thread_resolution_ci_app_identity: [mergepath-ci[bot]]' '"[mergepath-ci[bot]]"'
 app_case "configured value is a flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a flow-list value is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app flow-list value: diagnostic: $APP_OUT"
+fi
 app_policy "$APP_OK_LINE" ""
 printf 'non_reviewer_identities: [%s]\n' "$APP" >"$APP_POLICY.tmp"
 grep -v -e '^non_reviewer_identities:' -e '^  - nathanpayne-robot' "$APP_POLICY" >>"$APP_POLICY.tmp"
 mv "$APP_POLICY.tmp" "$APP_POLICY"
 app_case "non_reviewer_identities as an unparseable flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+# available_reviewers as a flow list naming the app: the bash reader sees an
+# empty list, but the workflows' YAML readers give the app reviewer standing,
+# so the validator refuses what it cannot parse.
+{
+  printf 'available_reviewers: [nathanpayne-claude, "%s"]\n' "$APP"
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as a flow list naming the app" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+no_api_call "available_reviewers as a flow list"
+if grep -q "available_reviewers in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable available_reviewers list"
+else
+  fail "--expect-thread-resolution-app flow available_reviewers: diagnostic: $APP_OUT"
+fi
+# The empty flow list is the documented inert form and parses: still accepted.
+{
+  printf 'available_reviewers: []\n'
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as an empty flow list" 0 ghs_x STUB_VIEWER_LOGIN="$APP"
 
 # The mode takes no login argument: the identity comes only from the policy.
 app_policy "$APP_OK_LINE" "$APP"

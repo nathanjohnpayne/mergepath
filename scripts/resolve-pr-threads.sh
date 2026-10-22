@@ -911,7 +911,9 @@ QUERY='
               totalCount
               pageInfo { hasPreviousPage }
               nodes {
-                author { login }
+                # __typename: GraphQL reports a bot by its bare slug, and Bot
+                # proves it is the app, not a same-named user (#2726).
+                author { login __typename }
                 body
                 databaseId
                 # createdAt powers the addressed-elsewhere staleness guard
@@ -1216,6 +1218,60 @@ is_agent_author_local() {
   return 1
 }
 
+# #2726: the CI app's own marker replies. In --ci-app-identity mode the app
+# posts the `[mergepath-resolve: <class>]` reply itself, so that marker is this
+# script's OUTPUT, not reviewer feedback. Counted as non-agent, it would move
+# the staleness floor past the fix commit, and a resolve that did not stick
+# (rejected mutation, failed readback, reopened thread) could then never be
+# resolved again, by the app or by the reviewer PAT.
+#
+# Bounded: only a comment that BOTH starts with the generated marker AND is
+# authored by the ONE app .github/review-policy.yml names in
+# thread_resolution_ci_app_identity (validated exactly as identity-check.sh
+# --expect-thread-resolution-app validates it) is treated as own output. The
+# app is NOT added to MERGEPATH_AGENT_AUTHORS: any other reply it posts still
+# counts as non-agent and can never be a rebuttal or a disposition. REST
+# reports the app as `<slug>[bot]`; GraphQL reports the bare `<slug>`, which
+# is accepted only with `__typename: Bot`, so a user account with that login
+# is never mistaken for the app. Unconfigured, invalid, or without the policy
+# reader, CI_APP_LOGIN is empty and nothing changes (fail closed: the marker
+# stays non-agent feedback, the pre-#2726 reading).
+CI_APP_LOGIN=""
+if [ -r "$__RESOLVE_THREADS_DIR/lib/reviewers-helpers.sh" ]; then
+  # shellcheck source=lib/reviewers-helpers.sh
+  . "$__RESOLVE_THREADS_DIR/lib/reviewers-helpers.sh"
+  CI_APP_LOGIN=$(validate_thread_resolution_ci_app_identity \
+    "$__RESOLVE_THREADS_DIR/../.github/review-policy.yml" 2>/dev/null) || CI_APP_LOGIN=""
+fi
+
+# is_ci_app_marker_local <login> <typename> <body> → exit 0 iff the comment
+# is the configured CI app's own generated marker reply.
+is_ci_app_marker_local() {
+  [ -n "$CI_APP_LOGIN" ] || return 1
+  local login="$1" typename="$2" body="$3" trimmed
+  trimmed="${body#"${body%%[![:space:]]*}"}"
+  case "$trimmed" in
+    "[mergepath-resolve:"*) ;;
+    *) return 1 ;;
+  esac
+  [ "$login" = "$CI_APP_LOGIN" ] && return 0
+  [ "$typename" = Bot ] && [ "${login}[bot]" = "$CI_APP_LOGIN" ] && return 0
+  return 1
+}
+
+# is_self_comment_local <thread_json> <index> → exit 0 when all_comments[i]
+# is agent-side: an agent author's comment, or the CI app's own marker. Every
+# "latest non-agent comment" scan uses this, so they stay in step.
+is_self_comment_local() {
+  local tj="$1" i="$2" login
+  login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
+  is_agent_author_local "$login" && return 0
+  [ -n "$CI_APP_LOGIN" ] || return 1
+  is_ci_app_marker_local "$login" \
+    "$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.__typename // \"\"")" \
+    "$(printf '%s' "$tj" | jq -r ".all_comments[$i].body // \"\"")"
+}
+
 # latest_nonagent_created <thread_json> → ISO timestamp on stdout.
 #
 # THE STALENESS FLOOR. The createdAt of the most recent NON-agent (bot /
@@ -1242,13 +1298,12 @@ is_agent_author_local() {
 # resolution) builds on this floor — keep the complete-thread invariant.
 latest_nonagent_created() {
   local tj="$1"
-  local latest cnt i login created
+  local latest cnt i created
   latest=$(printf '%s' "$tj" | jq -r '.created // ""')
   cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
   i=0
   while [ "$i" -lt "$cnt" ]; do
-    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
-    if ! is_agent_author_local "$login"; then
+    if ! is_self_comment_local "$tj" "$i"; then
       created=$(printf '%s' "$tj" | jq -r ".all_comments[$i].createdAt // \"\"")
       if [ -n "$created" ] && { [ -z "$latest" ] || [ "$created" \> "$latest" ]; }; then
         latest="$created"
@@ -1290,7 +1345,7 @@ fetch_all_thread_comments() {
             totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
-              author { login }
+              author { login __typename }
               body
               databaseId
               createdAt
@@ -2724,13 +2779,12 @@ derive_tag_class() {
   # because it only ever causes a skip — the fail-closed/safe outcome — even
   # if later replies exist. Most-recent valid marker wins; an unrecognized
   # class is ignored. `last_nonagent_idx` is reused by step 3.
-  local recorded_class="" rc_count rc_i rc_login rc_body rc_tag
+  local recorded_class="" rc_count rc_i rc_body rc_tag
   local last_marker_idx=-1 last_nonagent_idx=-1
   rc_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
   rc_i=0
   while [ "$rc_i" -lt "$rc_count" ]; do
-    rc_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].author.login // \"\"")
-    if is_agent_author_local "$rc_login"; then
+    if is_self_comment_local "$thread_json" "$rc_i"; then
       rc_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].body // \"\"")
       rc_tag=$(printf '%s' "$rc_body" \
         | sed -n 's/.*\[mergepath-resolve:[[:space:]]*\([a-z][a-z-]*\)[[:space:]]*\].*/\1/p' | head -1)
@@ -3095,8 +3149,7 @@ thread_reply_disposition() {
   case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
   i=0
   while [ "$i" -lt "$cnt" ]; do
-    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
-    is_agent_author_local "$login" || last_nonagent_idx=$i
+    is_self_comment_local "$tj" "$i" || last_nonagent_idx=$i
     i=$((i + 1))
   done
   local k=$((last_nonagent_idx + 1))
@@ -3123,10 +3176,18 @@ thread_reply_disposition() {
 # earlier finding even within one second. Use the same selector for
 # deferrals and fixed/rebutted verdicts.
 current_round_finding_ids() {
-  printf '%s' "$1" | jq --arg floor "$2" --arg agents "$MERGEPATH_AGENT_AUTHORS" '
+  # The CI app's own marker is agent-side here too (#2726), by the same
+  # predicate as is_ci_app_marker_local.
+  printf '%s' "$1" | jq --arg floor "$2" --arg agents "$MERGEPATH_AGENT_AUTHORS" \
+    --arg app "$CI_APP_LOGIN" '
     ($agents | split(":")) as $authors
     | [.all_comments[] | select((.createdAt // "") >= $floor)
        | select(.author.login as $login | ($authors | index($login)) == null)
+       | select(($app != ""
+                 and ((.body // "") | sub("^[[:space:]]+"; "") | startswith("[mergepath-resolve:"))
+                 and ((.author.login // "") == $app
+                      or ((.author.__typename // "") == "Bot"
+                          and ((.author.login // "") + "[bot]") == $app))) | not)
       ] | [last | select(. != null) | .databaseId]
   '
 }

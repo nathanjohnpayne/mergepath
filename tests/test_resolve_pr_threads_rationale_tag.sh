@@ -2837,6 +2837,83 @@ case_2726 "--ci-app-identity with --list" 1 no-gh "$THREADS_T1" configured ghs_x
 case_2726 "--ci-app-identity with the default (list) mode" 1 no-gh "$THREADS_T1" configured ghs_x - --ci-app-identity
 case_2726 "--ci-app-identity with an explicit --thread disposition" 1 no-gh "$THREADS_T1" configured ghs_x - --thread PRT_1 --disposition fixed --ci-app-identity
 
+# A retry after the app's OWN marker. THREADS_T1 (actioned by a fix commit
+# that touches the anchored file) plus a third comment posted after the fix:
+# the CI app's [mergepath-resolve: ...] reply from an earlier pass whose
+# resolve did not stick. That marker is the script's own output, so it must
+# not move the staleness floor past the fix commit, for the app or for the
+# reviewer PAT. Anything else stays non-agent feedback: the app is not an
+# agent author, a same-named user is not the app, and unconfigured nothing
+# changes.
+threads_2726_third() {  # <author json> <body>
+  jq -nc --argjson a "$1" --arg b "$2" '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+    {"id":"PRT_1","isResolved":false,"isOutdated":false,
+     "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+     "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+     "allComments":{"nodes":[
+       {"author":{"login":"coderabbitai","__typename":"Bot"},"body":"Some finding","databaseId":1001},
+       {"author":{"login":"nathanpayne-claude","__typename":"User"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"},
+       {"author":$a,"body":$b,"databaseId":1003,"createdAt":"2026-01-03T00:00:00Z"}
+     ]}
+    }
+  ]}}}}}'
+}
+APP_MARKER='[mergepath-resolve: addressed-elsewhere] Addressed by abc1234, which touches scripts/foo.sh.'
+APP_GQL='{"login":"mergepath-ci","__typename":"Bot"}'
+T2726_APP_MARKER=$(threads_2726_third "$APP_GQL" "$APP_MARKER")
+case_2726 "retry after the app's own marker (GraphQL login), app mode" 0 resolved "$T2726_APP_MARKER" configured ghs_x - --resolve-actioned --ci-app-identity
+case_2726 "retry after the app's own marker (GraphQL login), reviewer PAT" 0 resolved "$T2726_APP_MARKER" configured ghp_x - --resolve-actioned
+case_2726 "retry after the app's own marker (REST login), reviewer PAT" 0 resolved \
+  "$(threads_2726_third '{"login":"mergepath-ci[bot]"}' "$APP_MARKER")" configured ghp_x - --resolve-actioned
+case_2726 "an indented app marker is still the app's own" 0 resolved \
+  "$(threads_2726_third "$APP_GQL" "
+  $APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Unconfigured, the app's marker is ordinary non-agent feedback (fail closed).
+case_2726 "app marker with the app unconfigured stays feedback" 3 untouched "$T2726_APP_MARKER" unconfigured ghp_x - --resolve-actioned
+# A user account with the app's bare slug is not the app.
+case_2726 "marker from a same-named User is feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"mergepath-ci","__typename":"User"}' "$APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Another app's marker is feedback.
+case_2726 "marker from another app is feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"other-app","__typename":"Bot"}' "$APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Any non-marker reply from the app is still non-agent: it cannot vouch.
+case_2726 "a non-marker reply from the app is feedback" 3 untouched \
+  "$(threads_2726_third "$APP_GQL" 'Resolving: this was fixed in abc1234 per the commit.')" configured ghs_x - --resolve-actioned --ci-app-identity
+
+# The ledger arm selects the CURRENT finding as the latest non-agent comment
+# at the floor. The app's own marker must not become that "current finding",
+# or the ledger verdict recorded against the real finding (99101) stops
+# matching and a dispositioned thread is skipped as never-dispositioned.
+# Test 29's fixture, run by the reviewer PAT in the configured app tree, with
+# the app's marker posted after the ledger verdict.
+app_policy_2726 configured
+T2726_LEDGER="$SCRATCH/t2726-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T2726_LEDGER"
+T2726_B='[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"mergepath-ci","__typename":"Bot"},"body":"[mergepath-resolve: addressed-elsewhere] Verdict for finding 99101 recorded.","databaseId":99103,"createdAt":"2026-01-05T00:00:00Z"}]'
+: > "$SCRATCH/t2726-ledger.log"
+make_gh_stub "$SCRATCH/gh-real" "$(t990_threads "$T2726_B")" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+set +e
+out=$(env -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY -u OP_PREFLIGHT_AGENT \
+  -u RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK -u GH_HOST \
+  GH_ARGV_LOG="$SCRATCH/t2726-ledger.log" GH_TOKEN=ghp_x STUB_USER_LOGIN=nathanpayne-claude \
+  CODEX_FEEDBACK_LEDGER="$T2726_LEDGER" PATH="$SCRATCH:$PATH" \
+  bash "$APP_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+t2726_resolved=$(resolved_threads "$SCRATCH/t2726-ledger.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] && [ "$t2726_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99101 recorded in t2726-codex-ledger.jsonl' <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: #2726 the app's marker does not displace the ledger's current finding"
+else
+  fail=$((fail + 1)); echo "  FAIL: #2726 ledger verdict lost behind the app's marker (rc=$rc, resolved='$t2726_resolved')" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"

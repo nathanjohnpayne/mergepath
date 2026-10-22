@@ -262,7 +262,8 @@
     ],
     "check_daily_feedback_rollup": [
       "tests/test_daily_feedback_rollup.sh",
-      "scripts/daily-feedback-rollup.sh"
+      "scripts/daily-feedback-rollup.sh",
+      "scripts/lib/reviewers-helpers.sh"
     ],
     "check_dependabot_coupled_groups": [
       ".github/dependabot.yml",

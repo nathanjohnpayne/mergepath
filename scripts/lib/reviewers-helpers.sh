@@ -152,7 +152,8 @@ read_thread_resolution_ci_app_identity() {  # [config_path]
 #   - declared in non_reviewer_identities (so the #1080 assertion in
 #     scripts/merge-clearance-gate.sh refuses any approval it posts), with that
 #     list in a form this reader can parse
-#   - never in available_reviewers: it holds no reviewer standing
+#   - never in available_reviewers: it holds no reviewer standing, with that
+#     list in a form this reader can parse
 validate_thread_resolution_ci_app_identity() {  # [config_path]
   local cfg="${1:-${CONFIG:-.github/review-policy.yml}}" login re
   login=$(read_thread_resolution_ci_app_identity "$cfg")
@@ -175,6 +176,15 @@ validate_thread_resolution_ci_app_identity() {  # [config_path]
   fi
   if ! login_is_non_reviewer_identity "$login" "$cfg"; then
     echo "thread_resolution_ci_app_identity '$login' is not declared in non_reviewer_identities in $cfg; declare it there so it can never count as an approval." >&2
+    return 2
+  fi
+  # The same guard for available_reviewers: a flow list (`[a, b]`) reads as
+  # EMPTY here, so the membership test below would pass the app while the
+  # workflows' YAML readers (pr-audit.yml, agent-review.yml) parse the list in
+  # full and give the app reviewer standing. Unparseable here means refused.
+  if [ -z "$(read_available_reviewers "$cfg")" ] \
+     && policy_list_has_unconsumed_inline_value available_reviewers "$cfg"; then
+    echo "available_reviewers in $cfg carries an inline value this reader cannot parse, so '$login' cannot be shown to be absent from it." >&2
     return 2
   fi
   if login_is_available_reviewer "$login" "$cfg"; then
