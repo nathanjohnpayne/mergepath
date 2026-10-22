@@ -134,6 +134,7 @@ done
 case "$body" in
   '@codex review') kind=trigger ;;
   '<!-- mergepath-phase-4a-terminal:'*) kind=terminal ;;
+  '<!-- mergepath-codex-request-checkpoint:v1 '*) kind=checkpoint ;;
   *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
 esac
 
@@ -1605,13 +1606,16 @@ test_real_wrapper_duplicate_ack_retry_keeps_polling
 # #1362: two requesters for the same PR both decide to post against an empty
 # timeline. The first wrapper is held at its authorization recount; the second
 # must wait for the per-PR claim instead of recounting the same timeline, and
-# then refuse. Exactly one trigger is posted, in either request mode.
+# then refuse. Exactly one trigger is posted, in either request mode. The PR
+# already counts five requests, so the five-request checkpoint (#2657) is
+# recorded too, and only by the requester whose trigger posted.
 test_real_wrapper_claim_lets_one_of_two_requesters_post() {
-  local mode flag dir before n rc_a rc_b pid_a pid_b
+  local mode flag dir before n rc_a rc_b pid_a pid_b i
   for mode in trigger-only poll; do
     before=$FAIL
     dir=$(make_case "wrapper-claim-$mode" 0 0 0)
     make_real_wrapper_case "$dir"
+    for i in 1 2 3 4 5; do seed_author_trigger "$dir" "$((700 + i))" "2026-06-03T00:00:0${i}Z"; done
     flag=""; [ "$mode" = poll ] || flag=--trigger-only
     for n in a b; do
       (
@@ -1639,6 +1643,8 @@ test_real_wrapper_claim_lets_one_of_two_requesters_post() {
     rc_a=0; wait "$pid_a" || rc_a=$?
     rc_b=0; wait "$pid_b" || rc_b=$?
     [ "$(trigger_count "$dir")" = 1 ] || fail "#1362 $mode: $(trigger_count "$dir") triggers posted, expected exactly one"
+    [ "$(cat "$dir/state/checkpoint-count" 2>/dev/null || echo 0)" = 1 ] \
+      || fail "#1362 $mode: $(cat "$dir/state/checkpoint-count" 2>/dev/null || echo 0) checkpoints recorded, expected exactly one"
     if [ "$rc_a" != 3 ] && [ "$rc_b" != 3 ]; then
       fail "#1362 $mode: one requester must refuse (rc a=$rc_a b=$rc_b)"
     elif ! grep -q 'posted first (#1362)' "$dir/err.a.log" "$dir/err.b.log"; then
