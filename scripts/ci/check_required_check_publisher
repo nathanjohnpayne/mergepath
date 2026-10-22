@@ -767,9 +767,12 @@ if isinstance(triggers, dict):
 # observing the publisher sits at C: inside the cap, and it runs. The
 # blanket rejection and the spec sentence attributing it to truncation
 # both over-claimed, which a cross-agent P2 on #974 caught and this
-# measurement confirms. Whether the publisher should have observers at all
-# is a design question, not a cap consequence; it goes to #977 with the
-# publisher-name requirement that existed only to keep this scan armed.
+# measurement confirms. Whether the publisher should have observers was
+# then decided on its own merits (owner decision on #1670, 2026-10-21): it
+# stays unobserved, an architectural choice rather than a cap consequence,
+# and publisher success is never PR clearance (spec § Trigger model). That
+# decision does not restore this scan, nor the publisher-name requirement
+# that existed only to keep it armed.
 
 # ── A10 — the open job stays GROUPLESS ─────────────────────────────────
 #
