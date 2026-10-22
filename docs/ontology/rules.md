@@ -875,6 +875,16 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-188.** When in doubt, paginate — a no-op on short lists, the only safe default on long ones. ○ — docs/agents/shared-operating-rules.md
 
+### GitHub REST and GraphQL rate limits
+
+**G-385.** When a GraphQL call fails on the primary rate limit, the work switches to the equivalent paginated REST endpoints instead of waiting for the GraphQL window to reset. ○ — docs/agents/shared-operating-rules.md
+
+**G-386.** Projects (v2) work has no REST fallback: on an exhausted GraphQL budget a board move is deferred until the reset and is never reported as done. ○ — docs/agents/shared-operating-rules.md
+
+**G-387.** A rate-limit failure is classified by its message, not its HTTP status; a GraphQL error can arrive as HTTP 200. ○ — docs/agents/shared-operating-rules.md
+
+**G-388.** On a secondary rate limit the agent backs off for `Retry-After` (or at least one minute, lengthening on repeats) rather than switching APIs, and never treats a healthy `rate_limit` reading as clearance. ○ — docs/agents/shared-operating-rules.md
+
 ### Background jobs and expected duration
 
 **G-378.** A backgrounded command carries an expected duration stated at launch, and is checked against that expectation. ○ — docs/agents/shared-operating-rules.md

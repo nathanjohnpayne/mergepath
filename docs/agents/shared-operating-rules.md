@@ -25,11 +25,18 @@ The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh ap
 
 ## GitHub REST and GraphQL rate limits are separate budgets
 
-GitHub meters REST and GraphQL separately. A user token gets 5,000 REST requests per hour and, independently, 5,000 GraphQL points per hour; exhausting one leaves the other intact. When a GraphQL call fails on the primary rate limit (`API rate limit exceeded` from the GraphQL API, or `gh api rate_limit` showing `resources.graphql.remaining` at 0), switch that work to the equivalent REST endpoints and keep going, rather than waiting for the GraphQL window to reset.
+GitHub meters REST and GraphQL separately. A user token gets 5,000 REST requests per hour and, independently, 5,000 GraphQL points per hour; exhausting one leaves the other intact. When a GraphQL call fails on the primary rate limit, switch that work to the equivalent REST endpoints and keep going, rather than waiting for the GraphQL window to reset. Check both budgets with `gh api rate_limit --jq '.resources | {core, graphql}'`.
 
-Several `gh` commands are GraphQL under the hood and spend that budget: `gh pr view --json`, `gh pr list`, `gh issue view --json`, `gh issue list`, `gh project ...` and `gh api graphql`. Their REST equivalents are plain `gh api` paths, for example `repos/OWNER/REPO/pulls/N`, `.../pulls/N/reviews`, `.../pulls/N/comments`, `.../issues/N`, `.../issues/N/comments` and `.../commits/SHA/check-runs`, each with `--paginate` under the rule above. Check both budgets with `gh api rate_limit --jq '.resources | {core, graphql}'`.
+Several `gh` commands are GraphQL under the hood and spend that budget: `gh pr view --json`, `gh pr list`, `gh issue view --json`, `gh issue list`, `gh project ...` and `gh api graphql`. Their REST equivalents are plain `gh api` paths, for example `repos/OWNER/REPO/pulls/N`, `.../pulls/N/reviews`, `.../pulls/N/comments`, `.../issues/N`, `.../issues/N/comments` and `.../commits/SHA/check-runs`, each with `--paginate` under the rule above.
 
-This applies only to the primary quota. A secondary (abuse) rate limit, a 403 or 429 that mentions a secondary rate limit or carries `Retry-After`, applies across both APIs: switching to REST just hits it again. Back off for the stated interval instead. During a secondary limit `gh api rate_limit` can still read as healthy, so do not treat its answer as clearance. GitHub App installation tokens (CI workflows) have their own separate budget.
+Projects (v2) are the exception: they exist only in GraphQL, so `gh project ...` and the board helpers have no REST fallback. When GraphQL is exhausted, defer the board move until `resources.graphql.reset` and carry on with the REST-able work meanwhile; never report a board move as done if it has not happened.
+
+Classify the failure by its message, not by its HTTP status. A GraphQL error can arrive as HTTP 200 with an `errors` entry as well as a 403 or 429.
+
+- **Primary limit:** the message says `API rate limit exceeded`, or `gh api rate_limit` shows that API's `remaining` at 0. Switching APIs works.
+- **Secondary (abuse) limit:** the message mentions a secondary rate limit, or the response carries `Retry-After`. It applies across both APIs, so switching to REST just hits it again. Back off instead: wait for `Retry-After` when present, otherwise at least one minute, and lengthen the wait on each repeat. During a secondary limit `gh api rate_limit` can still read as healthy, so do not treat its answer as clearance.
+
+GitHub App installation tokens (CI workflows) have their own separate budget.
 
 ## Background jobs and expected duration
 
