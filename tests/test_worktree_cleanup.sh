@@ -3909,6 +3909,193 @@ else
   fi
 fi
 
+# ── Case 46: one refused removal does not end the --apply run ─────────────
+# try_remove() used to return non-zero from a bare call under `set -e`, so the
+# first removal git refused ended the run: the candidates after it, the
+# summary and the prune never ran. The refusal here is a clean worktree whose
+# tracked file sits in a read-only directory, so git cannot delete it. Two
+# candidates, one refused, so whichever order git lists them in, the summary
+# must count the failure. Root ignores the mode bits, so the case is skipped
+# there.
+#
+# A third, non-slug gone-upstream worktree holds only a gitignored `.env`. It
+# used to bypass the content gate and lose the file; it must now be kept.
+CONT_ROOT="$WORKDIR/continue"
+CONT_MAIN="$CONT_ROOT/main"
+mkdir -p "$CONT_ROOT"
+git init --bare -q "$CONT_ROOT/remote.git"
+git init -q -b main "$CONT_MAIN"
+git -C "$CONT_MAIN" config user.email "test@example.com"
+git -C "$CONT_MAIN" config user.name "Test"
+git -C "$CONT_MAIN" config commit.gpgsign false
+git -C "$CONT_MAIN" config tag.gpgsign false
+git -C "$CONT_MAIN" remote add origin "$CONT_ROOT/remote.git"
+mkdir -p "$CONT_MAIN/locked-dir"
+echo "tracked" > "$CONT_MAIN/locked-dir/file.txt"
+echo ".env" > "$CONT_MAIN/.gitignore"
+git -C "$CONT_MAIN" add locked-dir .gitignore
+git -C "$CONT_MAIN" commit -q -m "initial"
+git -C "$CONT_MAIN" push -q -u origin main
+for name in refused-gone removable-gone ignored-gone; do
+  git -C "$CONT_MAIN" branch "$name"
+  git -C "$CONT_MAIN" push -q -u origin "$name"
+  git -C "$CONT_MAIN" worktree add -q "$CONT_ROOT/$name" "$name"
+  git -C "$CONT_MAIN" push -q origin --delete "$name"
+done
+git -C "$CONT_MAIN" fetch -q --prune
+echo "SECRET=1" > "$CONT_ROOT/ignored-gone/.env"
+chmod 555 "$CONT_ROOT/refused-gone/locked-dir"
+
+if [ "$(id -u)" -eq 0 ]; then
+  pass "a refused removal is reported (skipped: root ignores directory modes)"
+else
+  set +e
+  OUT_CONT=$( cd "$CONT_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+  RC_CONT=$?
+  set -e
+  if [ "$RC_CONT" -eq 1 ] && grep -Fq -- "failed:           1" <<<"$OUT_CONT" \
+     && grep -Fq -- "-> FAILED: " <<<"$OUT_CONT" && grep -Fq -- "    $CONT_ROOT/refused-gone" <<<"$OUT_CONT"; then
+    pass "a refused removal is reported in the summary and exits 1"
+  else
+    fail "a refused removal did not reach the summary (rc=$RC_CONT)"
+    echo "$OUT_CONT" >&2
+  fi
+  if [ ! -e "$CONT_ROOT/removable-gone" ] && [ -f "$CONT_ROOT/refused-gone/locked-dir/file.txt" ]; then
+    pass "the clean candidate is removed after the refused one"
+  else
+    fail "after a refusal: removable-gone exists=$([ -e "$CONT_ROOT/removable-gone" ] && echo yes || echo no)"
+  fi
+  if [ -f "$CONT_ROOT/ignored-gone/.env" ] \
+     && grep -Fq -- "gone-upstream but working tree is ignored — review manually, keeping" <<<"$OUT_CONT"; then
+    pass "a non-slug gone-upstream worktree with only gitignored content is kept"
+  else
+    fail "the gitignored .env in a non-slug gone-upstream worktree was not kept"
+  fi
+fi
+chmod 755 "$CONT_ROOT/refused-gone/locked-dir"
+
+# ── Case 47: --min-age keeps a recently active candidate ──────────────────
+# An unattended --apply must not pull a worktree out from under a session that
+# is still working in it after its PR merged. Two gone-upstream candidates: one
+# backdated (worktree and git admin dir), one just created.
+AGE_ROOT="$WORKDIR/min-age"
+AGE_MAIN="$AGE_ROOT/main"
+mkdir -p "$AGE_ROOT"
+git init --bare -q "$AGE_ROOT/remote.git"
+git init -q -b main "$AGE_MAIN"
+git -C "$AGE_MAIN" config user.email "test@example.com"
+git -C "$AGE_MAIN" config user.name "Test"
+git -C "$AGE_MAIN" config commit.gpgsign false
+git -C "$AGE_MAIN" config tag.gpgsign false
+git -C "$AGE_MAIN" remote add origin "$AGE_ROOT/remote.git"
+git -C "$AGE_MAIN" commit -q --allow-empty -m "initial"
+git -C "$AGE_MAIN" push -q -u origin main
+for name in idle-gone active-gone; do
+  git -C "$AGE_MAIN" branch "$name"
+  git -C "$AGE_MAIN" push -q -u origin "$name"
+  git -C "$AGE_MAIN" worktree add -q "$AGE_ROOT/$name" "$name"
+  git -C "$AGE_MAIN" push -q origin --delete "$name"
+done
+git -C "$AGE_MAIN" fetch -q --prune
+IDLE_ADMIN=$(git -C "$AGE_ROOT/idle-gone" rev-parse --absolute-git-dir)
+find "$AGE_ROOT/idle-gone" "$IDLE_ADMIN" -exec touch -t 202001010000 {} +
+
+set +e
+OUT_AGE=$( cd "$AGE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --min-age 1h 2>&1 )
+RC_AGE=$?
+set -e
+if [ "$RC_AGE" -eq 0 ] && [ ! -e "$AGE_ROOT/idle-gone" ] && [ -d "$AGE_ROOT/active-gone" ] \
+   && grep -Fq -- "-> kept instead: activity within --min-age 1h" <<<"$OUT_AGE" \
+   && grep -Fq -- "skipped:          1" <<<"$OUT_AGE"; then
+  pass "--min-age removes the idle candidate and keeps the recently active one"
+else
+  fail "--min-age: rc=$RC_AGE idle exists=$([ -e "$AGE_ROOT/idle-gone" ] && echo yes || echo no) active exists=$([ -d "$AGE_ROOT/active-gone" ] && echo yes || echo no)"
+  echo "$OUT_AGE" >&2
+fi
+for bad in "" 24 1w -1h; do
+  set +e
+  OUT_BAD=$( cd "$AGE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --min-age "$bad" 2>&1 )
+  RC_BAD=$?
+  set -e
+  if [ "$RC_BAD" -eq 1 ] && grep -Fq -- "--min-age needs" <<<"$OUT_BAD" && [ -d "$AGE_ROOT/active-gone" ]; then
+    pass "--min-age '$bad' is refused before any removal"
+  else
+    fail "--min-age '$bad' was not refused (rc=$RC_BAD)"
+  fi
+done
+
+# ── Case 48: no removal path skips the content gate ───────────────────────
+# A detached worktree for a closed PR reached try_remove() without
+# worktree_content_state(), so a gitignored `.env` in it was deleted. And under
+# --min-age, a scan that cannot read part of a candidate must keep it rather
+# than read as "no recent activity". Own fixture and stub: the stub answers
+# CLOSED for one PR number.
+GATE_ROOT="$WORKDIR/gate"
+GATE_MAIN="$GATE_ROOT/main"
+GATE_PR_NUM=77777
+mkdir -p "$GATE_ROOT/.mergepath-worktrees" "$GATE_ROOT/stub"
+git init --bare -q "$GATE_ROOT/remote.git"
+git init -q -b main "$GATE_MAIN"
+git -C "$GATE_MAIN" config user.email "test@example.com"
+git -C "$GATE_MAIN" config user.name "Test"
+git -C "$GATE_MAIN" config commit.gpgsign false
+git -C "$GATE_MAIN" config tag.gpgsign false
+git -C "$GATE_MAIN" remote add origin "$GATE_ROOT/remote.git"
+echo ".env" > "$GATE_MAIN/.gitignore"
+git -C "$GATE_MAIN" add .gitignore
+git -C "$GATE_MAIN" commit -q -m "initial"
+git -C "$GATE_MAIN" push -q -u origin main
+DETACHED_WT="$GATE_ROOT/.mergepath-worktrees/pr-${GATE_PR_NUM}-detached"
+git -C "$GATE_MAIN" worktree add -q --detach "$DETACHED_WT"
+echo "SECRET=1" > "$DETACHED_WT/.env"
+git -C "$GATE_MAIN" branch unreadable-gone
+git -C "$GATE_MAIN" push -q -u origin unreadable-gone
+UNREADABLE_WT="$GATE_ROOT/unreadable-gone"
+git -C "$GATE_MAIN" worktree add -q "$UNREADABLE_WT" unreadable-gone
+git -C "$GATE_MAIN" push -q origin --delete unreadable-gone
+git -C "$GATE_MAIN" fetch -q --prune
+UNREADABLE_ADMIN=$(git -C "$UNREADABLE_WT" rev-parse --absolute-git-dir)
+find "$UNREADABLE_WT" "$UNREADABLE_ADMIN" -exec touch -t 202001010000 {} +
+cat >"$GATE_ROOT/stub/gh" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "pr" ] && [ "\$2" = "view" ] && [ "\$3" = "$GATE_PR_NUM" ]; then echo CLOSED; exit 0; fi
+exit 1
+STUB
+chmod +x "$GATE_ROOT/stub/gh"
+
+if [ "$(id -u)" -eq 0 ]; then
+  pass "an unmeasurable --min-age scan keeps the candidate (skipped: root reads every directory)"
+else
+  # Two levels down, so the gone-upstream gate's own status walk still sees a
+  # clean tree while find(1) at -maxdepth 3 hits the unreadable directory.
+  mkdir -p "$UNREADABLE_WT/a/sealed"
+  touch -t 202001010000 "$UNREADABLE_WT/a" "$UNREADABLE_WT"
+  chmod 000 "$UNREADABLE_WT/a/sealed"
+  set +e
+  OUT_UNREAD=$( cd "$GATE_MAIN" && PATH="$GATE_ROOT/stub:$PATH" bash "$HELPER" --no-color --apply --min-age 1h 2>&1 )
+  set -e
+  # Absent when a regression removed the candidate; the assertion below reports it.
+  chmod 755 "$UNREADABLE_WT/a/sealed" 2>/dev/null || true
+  if [ -d "$UNREADABLE_WT" ] && grep -Fq -- "-> kept instead: activity could not be measured for --min-age 1h" <<<"$OUT_UNREAD"; then
+    pass "an unmeasurable --min-age scan keeps the candidate"
+  else
+    fail "an unreadable subtree let --min-age remove the candidate"
+    echo "$OUT_UNREAD" >&2
+  fi
+fi
+
+set +e
+OUT_GATE=$( cd "$GATE_MAIN" && PATH="$GATE_ROOT/stub:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+set -e
+if [ -f "$DETACHED_WT/.env" ] \
+   && grep -Fq -- "detached PR #${GATE_PR_NUM} (CLOSED) but the working tree is ignored — review manually, keeping" <<<"$OUT_GATE"; then
+  pass "a detached closed-PR worktree with only gitignored content is kept"
+else
+  fail "the gitignored .env in a detached closed-PR worktree was not kept"
+  echo "$OUT_GATE" >&2
+fi
+
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
