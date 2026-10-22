@@ -1240,6 +1240,56 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 18v (#2734): the same summary behind CodeRabbit's invisible vendor
+# header. CodeRabbit now opens every comment with
+# `<!-- coderabbit-ai-generated:v1 -->`, so the byte-zero selection found no
+# summary, and this finding fell out of scope: exit 0, a false clear. Two
+# controls pin the rule to the FIRST line only: a header after content, and a
+# header followed by content on its own line, are not framing, so neither body
+# is selected and nothing is graded.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 18v (#2734): vendor-headered summary-only blocking finding → exit 1"
+VENDOR_HEADER='<!-- coderabbit-ai-generated:v1 -->'
+for shape in first-line after-content same-line; do
+  case "$shape" in
+    first-line)    prefix="$VENDOR_HEADER"$'\n\n' ;;
+    after-content) prefix=$'Analysis chain\n'"$VENDOR_HEADER"$'\n\n' ;;
+    same-line)     prefix="$VENDOR_HEADER"$' quoted\n\n' ;;
+  esac
+  SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+  FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+  FIXTURE_THREADS=$(make_threads_fixture '[]')
+  FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+    "$prefix$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")")
+  set +e
+  OUT=$(
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+    FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1
+  )
+  RC=$?
+  set -e
+  if [ "$shape" = first-line ]; then
+    if [ "$RC" = 1 ] && grep -q "CodeRabbit blocking-tier unresolved: 1" <<<"$OUT" \
+        && grep -q "\[P1\] (PR-level summary comment)" <<<"$OUT"; then
+      pass "#2734: a summary behind the vendor header is in scope and its blocking finding gates"
+    else
+      fail "#2734 headered summary: expected rc=1 + 'unresolved: 1' + summary path; got rc=$RC"
+      echo "$OUT" | sed 's/^/      /' >&2
+    fi
+  elif [ "$RC" = 0 ] && grep -q "CodeRabbit blocking-tier unresolved: 0" <<<"$OUT"; then
+    pass "#2734 control ($shape): a header that is not the whole first line is not framing, so the body is not the summary"
+  else
+    fail "#2734 control ($shape): expected rc=0 + 'unresolved: 0'; got rc=$RC"
+    echo "$OUT" | sed 's/^/      /' >&2
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # Test 19 (#832): a summary-only NON-blocking finding (🧹 Nitpick, discretionary
 # under the default policy) does NOT gate. The blocking set is the resolved
 # tier set, not "any marker" — the same rule the inline path follows.
