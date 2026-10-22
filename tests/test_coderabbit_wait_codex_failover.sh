@@ -73,10 +73,17 @@ SPENDING_CAP_BODY='<!-- coderabbit-ai-generated:v1 -->
 
 # Unknown warning prose with no rate-limit marker or recognized header. It
 # must never be read as a confirmed rate limit.
-UNKNOWN_WARNING_BODY='> [!WARNING]
+PROCESSING_ERROR_BODY='> [!WARNING]
 > ## Something unexpected happened
 >
 > We could not process this pull request right now. Please try again later.'
+
+# Warning prose the waiter recognizes as neither a provider marker nor the
+# processing-error stanza (#2657 review): it must never fire the failover.
+UNKNOWN_WARNING_BODY='> [!WARNING]
+> ## Review could not be completed
+>
+> The provider returned an unexpected response. Please try again later.'
 
 # make_case <name> <max_wait> <max_retries> <failover> [rate_limit_body]
 #   rate_limit_body defaults to the OLD format; pass NEW_RATE_LIMIT_BODY to
@@ -342,15 +349,25 @@ test_spending_cap_fires() {
 # --- Test H: unknown warning prose is not a confirmed rate limit (#2657) -----
 test_unknown_prose_no_failover() {
   local dir rc before=$FAIL
-  dir=$(make_case "unknown-prose" 300 0 true "$UNKNOWN_WARNING_BODY")
+  dir=$(make_case "unknown-prose" 300 0 true "$PROCESSING_ERROR_BODY")
   rc=$(run_case "$dir" 0)
   [ "$(stub_calls "$dir")" = "0" ] || fail "H: unknown prose invoked the Codex failover $(stub_calls "$dir") time(s)"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H: unknown prose classified as rate_limit_stalled"
   [ "$(jqf "$dir" '.codex_failover_requested' 2>/dev/null)" != "true" ] || fail "H: unknown prose reported a failover"
   # It is not a review either: an unprocessed head must never clear.
-  [ "$rc" != "0" ] || fail "H: the processing-error notice exited 0"
+  [ "$rc" = "4" ] || fail "H: expected the processing-error notice to time out with exit 4, got $rc"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H: the processing-error notice cleared an unreviewed head"
   [ "$FAIL" -ne "$before" ] || pass "H: CodeRabbit's processing-error notice neither fires the failover nor clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
+
+# --- Test H0: genuinely unknown warning prose never fires the failover -------
+test_unrecognized_warning_no_failover() {
+  local dir rc before=$FAIL
+  dir=$(make_case "unrecognized-warning" 300 0 true "$UNKNOWN_WARNING_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H0: unrecognized warning prose invoked the Codex failover $(stub_calls "$dir") time(s)"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H0: unrecognized warning prose classified as rate_limit_stalled"
+  [ "$FAIL" -ne "$before" ] || pass "H0: unrecognized warning prose never fires the Codex failover (rc=$rc)"
 }
 
 # --- Test H2: a review that merely mentions the phrase stays a review (#2657) --
@@ -371,9 +388,9 @@ test_review_mentioning_processing_error_still_clears() {
 # line. The processing-error notice behind it must still never clear.
 test_headered_processing_error_never_clears() {
   local dir rc before=$FAIL
-  dir=$(make_case "headered-processing-error" 300 0 true $'<!-- coderabbit-ai-generated:v1 -->\n\n'"$UNKNOWN_WARNING_BODY")
+  dir=$(make_case "headered-processing-error" 300 0 true $'<!-- coderabbit-ai-generated:v1 -->\n\n'"$PROCESSING_ERROR_BODY")
   rc=$(run_case "$dir" 0)
-  [ "$rc" != "0" ] || fail "H3: the headered processing-error notice exited 0"
+  [ "$rc" = "4" ] || fail "H3: expected the headered processing-error notice to time out with exit 4, got $rc"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H3: the headered processing-error notice cleared an unreviewed head"
   [ "$(stub_calls "$dir")" = "0" ] || fail "H3: the headered notice fired the failover"
   [ "$FAIL" -ne "$before" ] || pass "H3: the processing-error notice behind the vendor header never clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
@@ -635,6 +652,7 @@ test_newformat_window_parsed
 test_exact_head_substitution_approval
 test_spending_cap_fires
 test_unknown_prose_no_failover
+test_unrecognized_warning_no_failover
 test_review_mentioning_processing_error_still_clears
 test_headered_processing_error_never_clears
 

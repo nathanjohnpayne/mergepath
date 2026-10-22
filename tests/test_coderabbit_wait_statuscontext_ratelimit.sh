@@ -1319,6 +1319,43 @@ test_processing_error_review_body_does_not_release() {
   [ "$FAIL" -ne "$before" ] || pass "PE3: #2657 — a current-HEAD run whose body is the processing-error notice cannot release it (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
 }
 
+# --- #2657: an older clean run cannot release a NEWER processing-error notice --
+test_processing_error_older_run_does_not_release() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "processing-error-older-run" "$PROCESSING_ERROR_BODY" "2026-06-04T02:01:00Z" "Review completed" "2026-06-04T02:00:30Z")
+  reviews='[{"id":8804,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE4: a clean run older than the processing-error notice released it; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE4: status=cleared from a run that predates the notice"
+  grep -q 'is not newer than CodeRabbit' "$dir/err.log" || fail "PE4: expected the run-ordering refusal log"
+  [ "$FAIL" -ne "$before" ] || pass "PE4: #2657 — a current-HEAD run older than the processing-error notice cannot release it"
+}
+
+# --- #2657: a processing-error notice published only as the review object -----
+test_processing_error_review_object_only_does_not_clear() {
+  local dir rc before=$FAIL reviews
+  # No CodeRabbit issue comment at all: the notice exists only as the review.
+  dir=$(make_case "processing-error-review-only" "" "$STATUS_TIME" "Review completed")
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" '[{"id":8805,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":$b}]')
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE5: a processing-error review object beside a completed status cleared; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE5: status=cleared from a processing-error review object"
+  [ "$FAIL" -ne "$before" ] || pass "PE5: #2657 — a processing-error notice published only as the review object never clears (rc=$rc)"
+}
+
+# --- #2657: an unreadable processing-error notice fails closed ----------------
+# Structural-read call 4 is the predicate's read of the notice on the fast
+# path. Collapsing that failure to "not a notice" (the earlier behaviour)
+# cleared the head; it must fail closed instead.
+test_processing_error_unreadable_fails_closed() {
+  local dir rc before=$FAIL
+  dir=$(make_case "processing-error-unreadable" "$PROCESSING_ERROR_BODY" "$STATUS_TIME" "Review completed")
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=4 run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE6: an unreadable processing-error notice cleared; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE6: status=cleared from an unreadable processing-error notice"
+  [ "$FAIL" -ne "$before" ] || pass "PE6: #2657 — an unreadable processing-error notice fails closed (rc=$rc)"
+}
+
 test_completed_description_still_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "desc-completed" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review completed")
@@ -2640,6 +2677,9 @@ test_completed_description_still_clears
 test_processing_error_with_success_status_does_not_clear
 test_processing_error_with_actual_head_review_clears
 test_processing_error_review_body_does_not_release
+test_processing_error_older_run_does_not_release
+test_processing_error_review_object_only_does_not_clear
+test_processing_error_unreadable_fails_closed
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error
