@@ -57,6 +57,21 @@
 #     `app-installed` or `empty`: those are positively known not to write
 #     as <login>.
 #
+#   --expect-thread-resolution-app
+#     The bounded CI-app mode (#2726), and the ONLY mode that accepts a
+#     GitHub App installation token. It takes no login: the one identity it
+#     accepts is `thread_resolution_ci_app_identity` in the
+#     .github/review-policy.yml of the checkout this script lives in, which
+#     must be a valid `<app-slug>[bot]` login declared in
+#     non_reviewer_identities and absent from available_reviewers
+#     (scripts/lib/reviewers-helpers.sh validates it). Absent or invalid, the
+#     mode accepts nothing (exit 3). $GH_TOKEN must classify as
+#     `app-installed` from its own form, and the GraphQL viewer it reads as
+#     must be that login. Its one caller is scripts/resolve-pr-threads.sh
+#     --resolve-actioned --ci-app-identity: configuring the app widens no
+#     other mode, so every other write path, which uses
+#     --expect-write-identity, still refuses the app's token.
+#
 # Exit codes:
 #   0  match (proceed)
 #   1  bad invocation (no mode, conflicting modes, missing argument)
@@ -94,6 +109,8 @@ Modes (exactly one required):
   --expect-external <agent>         stored gh account == nathanpayne-<agent>
   --expect-token-identity <login>   gh api user .login (under $GH_TOKEN) == <login>
   --expect-write-identity <login>   as above, AND $GH_TOKEN is a user-held credential
+  --expect-thread-resolution-app    $GH_TOKEN is an installation token of the ONE CI app
+                                    the policy names (thread_resolution_ci_app_identity)
 
 Exit codes: 0 match | 1 bad args | 2 mismatch | 3 read failure (fail-closed).
 USAGE
@@ -148,6 +165,13 @@ while [ "$#" -gt 0 ]; do
       ARG="$2"
       shift 2
       ;;
+    --expect-thread-resolution-app)
+      # No argument, deliberately: the accepted app comes from the policy
+      # only, so a caller cannot name a different one (#2726).
+      [ -n "$MODE" ] && { echo "identity-check: conflicting modes ($MODE and $1)" >&2; usage; exit 1; }
+      MODE="ci-app"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -170,6 +194,75 @@ if ! command -v gh >/dev/null 2>&1; then
   echo "identity-check: gh CLI not on PATH; cannot verify identity." >&2
   echo "identity-check:   Install gh and run 'gh auth login' for the required identity." >&2
   exit 3
+fi
+
+# --- the bounded CI-app mode (#2726) ------------------------------------
+#
+# Self-contained, and it exits here: nothing below runs for it, and nothing
+# in it is reachable from another mode. Every refusal is exit 3 (cannot
+# establish) except a viewer that reads as another identity (exit 2).
+
+if [ "$MODE" = "ci-app" ]; then
+  LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+  # The policy of the checkout this script lives in: in the thread
+  # resolution lane, the default-branch checkout the scripts run from. Not
+  # the working directory, and no override: the accepted app is never
+  # chosen by the caller.
+  APP_POLICY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.github/review-policy.yml"
+  for lib in credential-class.sh reviewers-helpers.sh; do
+    if [ ! -r "$LIB_DIR/$lib" ]; then
+      echo "identity-check: $lib missing: $LIB_DIR/$lib" >&2
+      echo "identity-check:   Refusing to accept a CI app identity without it." >&2
+      exit 3
+    fi
+  done
+  # shellcheck source=lib/credential-class.sh
+  . "$LIB_DIR/credential-class.sh"
+  # shellcheck source=lib/reviewers-helpers.sh
+  . "$LIB_DIR/reviewers-helpers.sh"
+
+  app_rc=0
+  EXPECTED="$(validate_thread_resolution_ci_app_identity "$APP_POLICY")" || app_rc=$?
+  if [ "$app_rc" -eq 1 ]; then
+    echo "identity-check: BLOCKED thread_resolution_ci_app_identity is not configured in $APP_POLICY; no CI app identity is accepted." >&2
+    exit 3
+  elif [ "$app_rc" -ne 0 ] || [ -z "$EXPECTED" ]; then
+    echo "identity-check: BLOCKED the configured CI app identity is invalid (above); no CI app identity is accepted." >&2
+    exit 3
+  fi
+  WRITE_HOST="$(printf '%s' "${GH_HOST:-github.com}" | tr '[:upper:]' '[:lower:]')"
+  if [ "$WRITE_HOST" != "github.com" ]; then
+    echo "identity-check: BLOCKED GH_HOST is '$GH_HOST'; write identity is established for github.com only." >&2
+    exit 3
+  fi
+  # Decided from the token's own form, before any API call, exactly as the
+  # write mode does. Only an installation token qualifies: a user-held token
+  # is the reviewer-PAT path, which keeps --expect-write-identity.
+  APP_CLASS="$(credential_class "${GH_TOKEN:-}")"
+  if [ "$APP_CLASS" != "app-installed" ]; then
+    echo "identity-check: BLOCKED GH_TOKEN is not a GitHub App installation token (its credential class is '$APP_CLASS'); the CI app mode accepts only '$EXPECTED''s installation token." >&2
+    echo "identity-check:   A reviewer PAT resolves threads through --expect-write-identity, not this mode." >&2
+    exit 3
+  fi
+  # An installation token has no `GET /user` (it is a bot, not a user), so
+  # the identity it acts as is the GraphQL viewer, pinned to github.com.
+  SIGNAL="gh api graphql viewer.login (with GH_TOKEN)"
+  if ! ACTUAL=$(gh api graphql --hostname github.com -f query='query { viewer { login } }' \
+       --jq .data.viewer.login 2>/dev/null) || [ -z "$ACTUAL" ]; then
+    echo "identity-check: '$SIGNAL' failed or returned nothing; cannot verify the CI app identity." >&2
+    exit 3
+  fi
+  # GraphQL can report a bot's login without the `[bot]` suffix that REST
+  # (and so the policy) carries. Both spellings name the same app: the token
+  # is already proven to be an installation token, so the viewer is an app,
+  # and app slugs are unique.
+  if [ "$ACTUAL" = "$EXPECTED" ] || [ "${ACTUAL}[bot]" = "$EXPECTED" ]; then
+    exit 0
+  fi
+  echo "identity-check: BLOCKED GH_TOKEN acts as '$ACTUAL', not the configured CI app '$EXPECTED'." >&2
+  echo "identity-check:   Signal: $SIGNAL" >&2
+  echo "identity-check:   Only the app named by thread_resolution_ci_app_identity is accepted, and only for thread resolution (#2726)." >&2
+  exit 2
 fi
 
 # --- compute expected identity ----------------------------------------

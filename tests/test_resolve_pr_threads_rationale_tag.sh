@@ -144,7 +144,11 @@ case "\$1" in
       graphql)
         # Pull out the query body from argv (already logged above);
         # branch on substring matches.
-        if grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
+        if grep -q "viewer { login }" "\$GH_ARGV_LOG.lastcall"; then
+          # #2726: the CI-app identity read (identity-check.sh
+          # --expect-thread-resolution-app); --jq is not applied here.
+          echo "\${STUB_VIEWER_LOGIN:-}"
+        elif grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
           # A failed marker write must not resolve an explicit selection.
           [ "\${GH_STUB_TAG_FAIL:-}" = tag-failure ] && exit 1
           if [ "\${GH_STUB_TAG_FAIL:-}" = tag-stdout-failure ]; then echo 'marker write refused'; exit 1; fi
@@ -174,6 +178,11 @@ JSON_READBACK
 ${threads_json}
 JSON_THREADS
         fi
+        ;;
+      user)
+        # #2726: the reviewer-PAT identity read (identity-check.sh
+        # --expect-write-identity); --jq is not applied here.
+        echo "\${STUB_USER_LOGIN:-}"
         ;;
       "repos/"*"/pulls/"*"/files"*)
         # The script calls this with --jq '[.[].filename]' which
@@ -2725,6 +2734,108 @@ for scenario in writer-codex-fixed writer-codex-real writer-codex-useful writer-
   else fail=$((fail+1)); echo "  FAIL: #1001 $scenario (rc=$rc expected=$expected_rc tag=$expected_tag)" >&2; printf '%s\n' "$out" >&2; tail -15 "$GH_ARGV_LOG" >&2
   fi
 done
+
+# ─────────────────────────────────────────────────────────────────────
+# #2726: the bounded CI-app identity mode. Runs the REAL identity checker
+# (not the always-pass stub above) in its own fixture tree, so each case
+# proves what the resolver and the checker decide together: the reviewer
+# PAT path is unchanged, the ONE configured app resolves actioned threads
+# under --resolve-actioned --ci-app-identity, and nothing else reaches a
+# mutation with an app token.
+# ─────────────────────────────────────────────────────────────────────
+echo "Test #2726: CI-app identity mode for thread resolution"
+
+APP_ROOT="$SCRATCH/app-repo"
+mkdir -p "$APP_ROOT/scripts/lib" "$APP_ROOT/.github"
+cp "$SCRIPT" "$APP_ROOT/scripts/resolve-pr-threads.sh"
+cp "$ROOT/scripts/identity-check.sh" "$APP_ROOT/scripts/identity-check.sh"
+cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_ROOT/scripts/lib/"
+cp "$FIXTURE_ROOT/scripts/lib/preflight-helpers.sh" "$APP_ROOT/scripts/lib/"
+cp "$FIXTURE_ROOT/.mergepath-sync.yml" "$APP_ROOT/.mergepath-sync.yml"
+CI_APP='mergepath-ci[bot]'
+app_policy_2726() {  # configured | unconfigured
+  {
+    printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n'
+    printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$CI_APP"
+    [ "$1" != configured ] || printf 'thread_resolution_ci_app_identity: "%s"\n' "$CI_APP"
+  } >"$APP_ROOT/.github/review-policy.yml"
+}
+
+# Not actioned: a bot finding with no agent reply and no fix commit.
+THREADS_2726_OPEN='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001}
+   ]}
+  }
+]}}}}}'
+
+# case_2726 <label> <expected rc> <expect: resolved|untouched|no-gh> <threads>
+#           <policy> <token> <extra env, space-free KEY=VALUE or -> <resolver args...>
+case_2726() {
+  local label="$1" want="$2" expect="$3" threads="$4" policy="$5" token="$6" extra="$7" out rc okay=true
+  shift 7
+  app_policy_2726 "$policy"
+  GH_ARGV_LOG="$SCRATCH/t2726.log"; : > "$GH_ARGV_LOG"
+  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T1" "$COMMITS_T1" '{"abc1234567":["scripts/foo.sh"]}'
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  [ "$extra" != - ] || extra=
+  set +e
+  # shellcheck disable=SC2086  # $extra is one space-free KEY=VALUE or empty
+  out=$(env -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY -u OP_PREFLIGHT_AGENT \
+    -u RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK -u GH_HOST \
+    GH_ARGV_LOG="$GH_ARGV_LOG" GH_TOKEN="$token" STUB_VIEWER_LOGIN="${STUB_VIEWER_LOGIN_2726:-$CI_APP}" \
+    STUB_USER_LOGIN=nathanpayne-claude $extra PATH="$SCRATCH:$PATH" \
+    bash "$APP_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "$@" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq "$want" ] || okay=false
+  case "$expect" in
+    resolved)
+      grep -q 'resolveReviewThread' "$GH_ARGV_LOG" || okay=false
+      tag_before_resolve "$GH_ARGV_LOG" || okay=false ;;
+    untouched)
+      ! grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG" || okay=false ;;
+    no-gh)
+      [ ! -s "$GH_ARGV_LOG" ] || okay=false ;;
+  esac
+  if $okay; then
+    pass=$((pass + 1)); echo "  PASS: #2726 $label"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2726 $label (rc=$rc, expected $want, $expect)" >&2
+    echo "$out" | sed 's/^/      /' >&2; tail -10 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+  fi
+}
+
+# The reviewer-PAT path is unchanged, with or without the app configured.
+case_2726 "reviewer PAT resolves an actioned thread (app unconfigured)" 0 resolved "$THREADS_T1" unconfigured ghp_x - --resolve-actioned
+case_2726 "reviewer PAT resolves an actioned thread (app configured)" 0 resolved "$THREADS_T1" configured ghp_x - --resolve-actioned
+# The configured app resolves an actioned thread, in the one bounded mode.
+case_2726 "configured CI app resolves an actioned thread" 0 resolved "$THREADS_T1" configured ghs_x - --resolve-actioned --ci-app-identity
+# The actioned-evidence checks are untouched: an unactioned thread stays open.
+case_2726 "configured CI app leaves an unactioned thread open" 3 untouched "$THREADS_2726_OPEN" configured ghs_x - --resolve-actioned --ci-app-identity
+# Unconfigured, the mode is inert and fails closed before any mutation.
+case_2726 "CI app with no configured identity is refused" 2 untouched "$THREADS_T1" unconfigured ghs_x - --resolve-actioned --ci-app-identity
+# Any other app is refused, configured or not.
+STUB_VIEWER_LOGIN_2726='other-app[bot]' \
+  case_2726 "another app's installation token is refused" 2 untouched "$THREADS_T1" configured ghs_x - --resolve-actioned --ci-app-identity
+# The dev opt-out does not reach the app mode: its check is mandatory.
+case_2726 "SKIP_IDENTITY_CHECK does not bypass the app mode" 2 untouched "$THREADS_T1" unconfigured ghs_x RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 --resolve-actioned --ci-app-identity
+# Without the explicit mode, an app token takes the reviewer path, which
+# refuses every installation token: configuring the app widens nothing.
+case_2726 "app token without --ci-app-identity is refused" 2 untouched "$THREADS_T1" configured ghs_x - --resolve-actioned
+case_2726 "app token in deferral mode is refused" 2 untouched "$THREADS_T1" configured ghs_x - --auto-resolve-bots
+# A reviewer PAT cannot claim the app mode either.
+case_2726 "reviewer PAT with --ci-app-identity is refused" 2 untouched "$THREADS_T1" configured ghp_x - --resolve-actioned --ci-app-identity
+# The mode exists only for --resolve-actioned; every other operation is a
+# usage error before any gh call.
+case_2726 "--ci-app-identity with --auto-resolve-bots" 1 no-gh "$THREADS_T1" configured ghs_x - --auto-resolve-bots --ci-app-identity
+case_2726 "--ci-app-identity with --resolve-verified-propagation" 1 no-gh "$THREADS_T1" configured ghs_x - --resolve-verified-propagation --ci-app-identity
+case_2726 "--ci-app-identity with --list" 1 no-gh "$THREADS_T1" configured ghs_x - --list --ci-app-identity
+case_2726 "--ci-app-identity with the default (list) mode" 1 no-gh "$THREADS_T1" configured ghs_x - --ci-app-identity
+case_2726 "--ci-app-identity with an explicit --thread disposition" 1 no-gh "$THREADS_T1" configured ghs_x - --thread PRT_1 --disposition fixed --ci-app-identity
 
 echo
 if [ "$fail" -eq 0 ]; then

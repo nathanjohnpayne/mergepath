@@ -1068,6 +1068,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/credential-class.sh"   # --expect-write-identity sources it; fails closed (exit 3) without it
+      - "scripts/lib/reviewers-helpers.sh"  # --expect-thread-resolution-app reads the CI app login with it (#2726); fails closed (exit 3) without it
   # The guard sources scripts/lib/pr-body-contract.sh, which in turn shells out
   # to scripts/lib/pr-body-contract.mjs. Both are declared below and named in
   # `requires:` here, because the coupling is lockstep and fails LOUDLY but
@@ -1349,6 +1350,7 @@ paths:
     requires:
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      - "scripts/lib/reviewers-helpers.sh"  # --expect-thread-resolution-app fixture tree (#2726)
   # Pairs with scripts/coderabbit-wait.sh + scripts/ci/check_coderabbit_wait.
   # The test locks the timeout status-probe contract from #417: exit 4
   # stays advisory, the status reply is surfaced in JSON, and the reply
@@ -1951,6 +1953,8 @@ paths:
     requires:
       - "scripts/resolve-pr-threads.sh"
       - "scripts/lib/reviewers-helpers.sh"   # available_reviewers membership of the lane token
+      - "scripts/lib/credential-class.sh"    # an installation token takes --ci-app-identity (#2726)
+      - "scripts/identity-check.sh"          # --expect-thread-resolution-app, the resolver's CI app check (#2726)
   # Claude Code SessionStart hook: in a cloud session only
   # (CLAUDE_CODE_REMOTE=true), runs the setup script, then the capability
   # probe, and prints the tier.
@@ -1992,6 +1996,14 @@ paths:
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all
+    # The #2726 cases copy the REAL identity checker and its two libs into a
+    # fixture tree, so a commit-path sync without them reds the consumer's
+    # check_resolve_pr_threads.
+    requires:
+      - "scripts/resolve-pr-threads.sh"
+      - "scripts/identity-check.sh"         # --expect-thread-resolution-app (#2726)
+      - "scripts/lib/credential-class.sh"
+      - "scripts/lib/reviewers-helpers.sh"
   # Pairs with scripts/resolve-pr-threads.sh +
   # scripts/ci/check_resolve_pr_threads (second delegated test file,
   # after the rationale-tag test above). Exercises the #573-item-2

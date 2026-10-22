@@ -17,6 +17,9 @@
 #                                  | --resolve-verified-propagation]
 #                                 [--dry-run] [--rationale <text>]
 #                                 [--no-tag-reply]
+#   scripts/resolve-pr-threads.sh <PR#> --resolve-actioned --ci-app-identity
+#     (CI only, #2726: the token is the installation token of the ONE app
+#     .github/review-policy.yml names in thread_resolution_ci_app_identity)
 #   scripts/resolve-pr-threads.sh <PR#> --thread <node-id|comment-id>
 #     --disposition fixed|rebuttal|deferred-to-followup|addressed-elsewhere
 #     [--issue <number>] [--commit <SHA>] [--rationale <text>] [--dry-run]
@@ -494,6 +497,12 @@ daily rollup / weekly sweep as the disposition of record):
   --no-tag-reply        With bulk resolve modes, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
+  --ci-app-identity     With --resolve-actioned only: the token is the CI
+                        app's installation token, verified by
+                        identity-check.sh --expect-thread-resolution-app
+                        against thread_resolution_ci_app_identity in this
+                        checkout's .github/review-policy.yml (#2726). The
+                        check is mandatory in this mode.
 EOF
   exit 1
 }
@@ -510,6 +519,7 @@ EXPLICIT_DISPOSITION=""
 TARGET_ISSUE=""
 TARGET_COMMIT=""
 BULK_MODE_USED=false
+CI_APP_IDENTITY=false
 # Match both REST and GraphQL bot-login formats. The REST API returns
 # `coderabbitai[bot]`; GraphQL `author{login}` returns `coderabbitai`
 # (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
@@ -565,6 +575,7 @@ while [ $# -gt 0 ]; do
       RATIONALE_FLAG_USED=true
       shift 2 ;;
     --no-tag-reply) NO_TAG_REPLY=true; shift ;;
+    --ci-app-identity) CI_APP_IDENTITY=true; shift ;;
     -h|--help) usage ;;
     -*) echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -639,6 +650,16 @@ if [ -n "$TARGET_THREAD" ]; then
   [ -z "$RATIONALE_OVERRIDE" ] || TARGET_RATIONALE+=" $RATIONALE_OVERRIDE"
 elif [ -n "$EXPLICIT_DISPOSITION$TARGET_ISSUE$TARGET_COMMIT" ]; then
   echo "Error: --disposition, --issue and --commit require --thread" >&2
+  exit 1
+fi
+
+# #2726: the bounded CI-app identity mode exists for --resolve-actioned ONLY,
+# the mode whose every resolve rests on fail-closed, finding-bound action
+# evidence. Deferral, propagation verification and explicit dispositions are
+# operator decisions and stay on the reviewer PAT. Refused here, before any
+# gh call.
+if $CI_APP_IDENTITY && [ "$MODE" != "resolve-actioned" ]; then
+  echo "Error: --ci-app-identity is valid only with --resolve-actioned (#2726)" >&2
   exit 1
 fi
 
@@ -1117,7 +1138,13 @@ fi
 # Phase 4b r2 reproduced this. The fix: the helper-presence test
 # becomes a hard error inside the opt-out branch rather than a
 # precondition for entering it.
-if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
+#
+# #2726: --ci-app-identity selects the bounded CI-app mode instead, and it is
+# never skippable: RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK is a dev opt-out for
+# the reviewer path, not a way to resolve as an unverified app. Without the
+# flag an installation token reaches --expect-write-identity, which refuses
+# it whatever the policy configures.
+if { [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] || $CI_APP_IDENTITY; } && ! $DRY_RUN; then
   CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
   if [ ! -x "$CHECKER" ]; then
     echo "ERROR: identity-check helper missing or non-executable: $CHECKER" >&2
@@ -1126,18 +1153,28 @@ if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
     echo "       RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
     exit 2
   fi
-  if command -v gh_default_reviewer_identity >/dev/null 2>&1; then
-    expected_login="$(gh_default_reviewer_identity)"
+  if $CI_APP_IDENTITY; then
+    if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" --expect-thread-resolution-app; then
+      echo "ERROR: CI app identity check failed before any mutation. Refusing" >&2
+      echo "       to resolve threads. --ci-app-identity accepts only the" >&2
+      echo "       installation token of the app .github/review-policy.yml" >&2
+      echo "       names in thread_resolution_ci_app_identity (#2726)." >&2
+      exit 2
+    fi
   else
-    expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
-  fi
-  if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" \
-       --expect-write-identity "$expected_login"; then
-    echo "ERROR: identity-check failed before any mutation. Refusing to" >&2
-    echo "       resolve threads. Confirm GH_TOKEN / OP_PREFLIGHT_REVIEWER_PAT" >&2
-    echo "       resolves to $expected_login, then re-run." >&2
-    echo "       Opt-out (dev only): RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1." >&2
-    exit 2
+    if command -v gh_default_reviewer_identity >/dev/null 2>&1; then
+      expected_login="$(gh_default_reviewer_identity)"
+    else
+      expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
+    fi
+    if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" \
+         --expect-write-identity "$expected_login"; then
+      echo "ERROR: identity-check failed before any mutation. Refusing to" >&2
+      echo "       resolve threads. Confirm GH_TOKEN / OP_PREFLIGHT_REVIEWER_PAT" >&2
+      echo "       resolves to $expected_login, then re-run." >&2
+      echo "       Opt-out (dev only): RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1." >&2
+      exit 2
+    fi
   fi
 fi
 
