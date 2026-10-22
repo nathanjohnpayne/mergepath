@@ -384,7 +384,7 @@ if [ "$TRANSPORT" = "rest" ]; then
   # shellcheck disable=SC2034  # read by gh_rest_run (scripts/lib/gh-rest-transport.sh)
   GH_REST_TRACE_MARKER="$TRACE_MARKER"
   set +e
-  gh_rest_run gh-as-author "$AUTHOR" "$TOKEN" "$@"
+  gh_comment_guard_run_write gh_rest_run gh-as-author "$AUTHOR" "$TOKEN" "$@"
   WRAPPED_RC=$?
   set -e
   exit "$WRAPPED_RC"
@@ -475,7 +475,8 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
 fi
 
 set +e
-run_with_author_token "$@"
+# A claimed Codex trigger write (#1362) confirms its comment id before exit.
+gh_comment_guard_run_write run_with_author_token "$@"
 WRAPPED_RC=$?
 set -e
 exit "$WRAPPED_RC"

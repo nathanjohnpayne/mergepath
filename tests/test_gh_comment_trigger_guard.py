@@ -5,9 +5,11 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -16,6 +18,70 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("guard", ROOT / "scripts/workflow/gh-comment-trigger-guard.py")
 guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
+
+
+# The fake gh records every write in WRITE_LOG, appends each PR comment to a
+# per-PR timeline, prints the comment URL gh would print, and answers the
+# wrapper's readback of one comment by id (#1362).
+FAKE_GH = r"""#!/usr/bin/env python3
+import json, os, re, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+timeline = Path(os.environ["TIMELINE_DIR"])
+def hold(name):
+    # Optional gates let a test hold the claimed POST or its readback.
+    gate = os.environ.get(f"{name}_GATE")
+    if gate:
+        Path(gate + ".reached").touch()
+        while not Path(gate).exists():
+            time.sleep(0.05)
+read = re.fullmatch(r"repos/[^/]+/[^/]+/issues/comments/([0-9]+)", args[1]) if args[:1] == ["api"] and len(args) == 2 else None
+if read:
+    hold("READBACK")
+    for path in timeline.glob("*.jsonl"):
+        for line in path.read_text().splitlines():
+            comment = json.loads(line)
+            if str(comment["id"]) == read.group(1):
+                print(json.dumps(comment))
+                sys.exit(0)
+    sys.exit(1)
+pull = re.fullmatch(r"repos/o/r/pulls/([0-9]+)", args[1]) if args[:1] == ["api"] and len(args) == 2 else None
+if pull:  # the REST transport's pre-write PR read
+    print(json.dumps({"number": int(pull.group(1)), "html_url": f"https://github.com/o/r/pull/{pull.group(1)}", "head": {"sha": "a" * 40}}))
+    sys.exit(0)
+with open(os.environ["WRITE_LOG"], "a") as log:
+    log.write(" ".join(args) + "\n")
+def post(pr, body):
+    hold("POST")
+    existing = sum(len(p.read_text().splitlines()) for p in timeline.glob("*.jsonl"))
+    comment = {"id": 1000 + existing + 1, "user": {"login": os.environ.get("FAKE_POSTED_AS", "nathanjohnpayne")},
+               "body": body, "issue_url": f"https://api.github.com/repos/o/r/issues/{pr}",
+               "html_url": f"https://github.com/o/r/pull/{pr}#issuecomment-{1000 + existing + 1}"}
+    with open(timeline / f"{pr}.jsonl", "a") as out:
+        out.write(json.dumps(comment) + "\n")
+    return comment
+if args[:2] == ["pr", "comment"] and "--body" in args:
+    comment = post(args[2], args[args.index("--body") + 1])
+    if os.environ.get("FAKE_OMIT_URL") != "1":
+        print(comment["html_url"])
+rest = re.fullmatch(r"repos/o/r/issues/([0-9]+)/comments", args[3]) if args[:3] == ["api", "--method", "POST"] and len(args) == 6 else None
+if rest:
+    print(json.dumps(post(rest.group(1), json.loads(Path(args[5]).read_text())["body"])))
+"""
+
+# The authorization stand-in for the claim tests: it records its arrival at
+# the recount, waits until RELEASE exists, then authorizes only while the PR's
+# timeline has no trigger, the way the real recount refuses an existing one.
+HELD_RECOUNT = r"""#!/bin/sh
+: > "$ARRIVED/$$.$3"
+while [ ! -e "$RELEASE" ]; do sleep 0.05; done
+if [ -s "$TIMELINE_DIR/$3.jsonl" ]; then
+  echo '[codex-review-request] ERROR: trigger not authorized: existing-trigger' >&2
+  printf '{"authorized":false,"reason":"existing-trigger"}\n'
+  exit 3
+fi
+printf '{"authorized":true,"repo":"o/r","pr_number":%s,"head_sha":"%s","author_identity":"nathanjohnpayne"}\n' "$3" "$MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD"
+"""
 
 
 class TriggerGuardTests(unittest.TestCase):
@@ -352,7 +418,7 @@ class TriggerGuardTests(unittest.TestCase):
         checker.write_text("#!/bin/sh\nexit 0\n")
         checker.chmod(0o755)
         gh = fixture / "bin/gh"
-        gh.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$WRITE_LOG\"\n")
+        gh.write_text(FAKE_GH)
         gh.chmod(0o755)
         authorize = fixture / "scripts/codex-review-request.sh"
         authorize.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AUTH_LOG\"\nexit 7\n")
@@ -361,7 +427,10 @@ class TriggerGuardTests(unittest.TestCase):
         body.write_text("The guard missed `@codex review` in prose.")
         env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "OP_PREFLIGHT_AUTHOR_PAT", "OP_PREFLIGHT_REVIEWER_PAT")}
         # This fixture asserts native gh argv. REST transport has its own suite.
-        env.update(PATH=str(fixture / "bin") + os.pathsep + env["PATH"], OP_PREFLIGHT_CACHE_DIR=str(fixture / "empty-cache"), OP_PREFLIGHT_AUTHOR_PAT="ghp_fixture_author", OP_PREFLIGHT_REVIEWER_PAT="ghp_fixture_reviewer", WRITE_LOG=str(fixture / "writes"), AUTH_LOG=str(fixture / "auth"), MERGEPATH_AGENT="codex", MERGEPATH_GH_TRANSPORT="gh")
+        env.update(PATH=str(fixture / "bin") + os.pathsep + env["PATH"], OP_PREFLIGHT_CACHE_DIR=str(fixture / "empty-cache"), OP_PREFLIGHT_AUTHOR_PAT="ghp_fixture_author", OP_PREFLIGHT_REVIEWER_PAT="ghp_fixture_reviewer", WRITE_LOG=str(fixture / "writes"), AUTH_LOG=str(fixture / "auth"), MERGEPATH_AGENT="codex", MERGEPATH_GH_TRANSPORT="gh",
+                   TIMELINE_DIR=str(fixture / "timeline"), MERGEPATH_CODEX_REQUEST_CLAIM_DIR=str(fixture / "claims"))
+        env.pop("MERGEPATH_CODEX_REQUEST_CLAIM_HELD", None)
+        (fixture / "timeline").mkdir()
         return fixture, env
 
     def test_real_wrappers_refuse_accidental_trigger_before_gh_write(self):
@@ -385,6 +454,251 @@ class TriggerGuardTests(unittest.TestCase):
         result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "  @CoDeX  review\n"], env=env, capture_output=True, timeout=10)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["pr comment 123 --repo o/r --body @codex review"], (fixture / "writes").read_text().splitlines())
+
+    def claim_fixture(self):
+        fixture, env = self.wrapper_fixture()
+        requester = fixture / "scripts/codex-review-request.sh"
+        requester.write_text(HELD_RECOUNT)
+        requester.chmod(0o755)
+        (fixture / "arrived").mkdir()
+        env.update(MERGEPATH_CODEX_TRIGGER_WRITE="1", MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="a" * 40,
+                   ARRIVED=str(fixture / "arrived"), RELEASE=str(fixture / "release"))
+        return fixture, env
+
+    def start_trigger(self, fixture, env, pr="123"):
+        command = ["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", pr, "--repo", "o/r", "--body", "@codex review"]
+        return subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+
+    def stop(self, proc):
+        # The held recount outlives a killed wrapper; end its whole group.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.communicate(timeout=10)
+
+    def wait_for(self, predicate, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def writes(self, fixture):
+        log = fixture / "writes"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_claim_lets_exactly_one_of_two_held_wrappers_post(self):
+        # #1362: both wrappers are started against the same below-cap PR and
+        # the recount holds whoever reaches it. Without the claim both reach
+        # the recount, both see an empty timeline and both post.
+        # The holder is then also held at its POST and at the readback of its
+        # comment id, so a claim released any earlier lets the second recount
+        # in while the first is still there.
+        fixture, env = self.claim_fixture()
+        arrived = fixture / "arrived"
+        post_gate, readback_gate = fixture / "post-gate", fixture / "readback-gate"
+        env.update(POST_GATE=str(post_gate), READBACK_GATE=str(readback_gate))
+        first, second = self.start_trigger(fixture, env), self.start_trigger(fixture, env)
+        try:
+            self.assertTrue(self.wait_for(lambda: len(list(arrived.iterdir())) >= 1), "neither wrapper reached the recount")
+            time.sleep(1.5)
+            self.assertEqual(1, len(list(arrived.iterdir())), "the second wrapper reached the recount while the first held the claim")
+            self.assertEqual([], self.writes(fixture))
+            (fixture / "release").touch()
+            for gate, stage in ((post_gate, "POST"), (readback_gate, "comment-id readback")):
+                self.assertTrue(self.wait_for(lambda: Path(str(gate) + ".reached").exists()), f"the holder never reached its {stage}")
+                time.sleep(1.0)
+                self.assertEqual(1, len(list(arrived.iterdir())), f"the second wrapper recounted during the holder's {stage}")
+                gate.touch()
+            results = [proc.communicate(timeout=30) + (proc.returncode,) for proc in (first, second)]
+        finally:
+            for proc in (first, second):
+                self.stop(proc)
+        self.assertEqual(["pr comment 123 --repo o/r --body @codex review"], self.writes(fixture))
+        self.assertEqual([0], [rc for _, _, rc in results if rc == 0], results)
+        loser = next(err for _, err, rc in results if rc != 0)
+        self.assertIn(b"existing-trigger", loser)
+        self.assertEqual(2, len(list(arrived.iterdir())), "the second wrapper must recount after the first posted")
+
+    def assert_claim_free_while_orphan_lives(self, fixture, env, arrived, want_arrivals):
+        # The killed wrapper's child (held at the recount or the POST) is still
+        # alive; a new wrapper must still take the claim and reach the recount.
+        nxt = self.start_trigger(fixture, dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="3"))
+        try:
+            reached = self.wait_for(lambda: len(list(arrived.iterdir())) >= want_arrivals, seconds=8)
+            if not reached:
+                nxt.wait(timeout=10)
+            self.assertTrue(reached, "a killed wrapper's orphaned child still holds the claim: " + (nxt.stderr.read().decode() if nxt.poll() is not None else "next wrapper still waiting"))
+        finally:
+            self.stop(nxt)
+
+    def check_claim_held_by_surviving_writer(self, transport, stage="POST"):
+        # A's wrapper is killed while its POST (or readback) child is held.
+        # That child can still write, so it must keep the claim: B waits, and
+        # once A's child finishes B recounts, sees A's request and refuses.
+        fixture, env = self.claim_fixture()
+        env["MERGEPATH_GH_TRANSPORT"] = transport
+        arrived = fixture / "arrived"
+        (fixture / "release").touch()
+        gate = fixture / "stage-gate"
+        held = self.start_trigger(fixture, dict(env, **{f"{stage}_GATE": str(gate)}))
+        nxt = None
+        try:
+            self.assertTrue(self.wait_for(lambda: Path(str(gate) + ".reached").exists()), f"the wrapper never reached its {stage}")
+            held.kill()
+            held.wait(timeout=10)
+            nxt = self.start_trigger(fixture, dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="20"))
+            time.sleep(1.5)
+            self.assertEqual(1, len(list(arrived.iterdir())), f"B recounted while A's {stage} child still held the claim")
+            gate.touch()
+            out, err = nxt.communicate(timeout=30)
+            self.assertNotEqual(0, nxt.returncode, err)
+            self.assertIn(b"existing-trigger", err)
+        finally:
+            if nxt is not None:
+                self.stop(nxt)
+            self.stop(held)
+        self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()), "at most one request may land")
+
+    def test_surviving_post_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("gh")
+
+    def test_surviving_rest_post_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("rest")
+
+    def test_surviving_readback_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("gh", stage="READBACK")
+
+    def test_claim_ends_with_its_wrapper_and_is_per_pr(self):
+        fixture, env = self.claim_fixture()
+        arrived = fixture / "arrived"
+        held = self.start_trigger(fixture, env)
+        try:
+            self.assertTrue(self.wait_for(lambda: len(list(arrived.iterdir())) == 1))
+            # Another PR's request is not serialized behind this one.
+            env_other = dict(env, RELEASE=str(fixture / "arrived"))
+            other = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "124", "--repo", "o/r", "--body", "@codex review"],
+                                   env=env_other, capture_output=True, timeout=20)
+            self.assertEqual(0, other.returncode, other.stderr)
+            # A wrapper killed while holding the claim leaves no claim behind,
+            # even while its recount child lives on, so it cannot suppress a
+            # trigger it never sent. Reacquire before that child ends
+            # (PR 124's request already arrived at its own recount).
+            held.kill()
+            held.wait(timeout=10)
+            self.assert_claim_free_while_orphan_lives(fixture, env, arrived, 3)
+        finally:
+            self.stop(held)
+        self.assertEqual(["pr comment 124 --repo o/r --body @codex review"], self.writes(fixture))
+        (fixture / "release").touch()
+        result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                env=dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="2"), capture_output=True, timeout=20)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn(b"waiting for another", result.stderr)
+        # A refused authorization releases the claim too.
+        result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                env=dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="2"), capture_output=True, timeout=20)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"existing-trigger", result.stderr)
+        self.assertNotIn(b"waiting for another", result.stderr)
+        self.assertEqual(2, len(self.writes(fixture)))
+
+    def test_claim_fails_closed_before_the_recount(self):
+        fixture, env = self.claim_fixture()
+        arrived = fixture / "arrived"
+        (fixture / "release").touch()
+        blocker = fixture / "not-a-directory"
+        blocker.write_text("")
+        cases = {
+            "unopenable claim directory": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_DIR=str(blocker)),
+            "invalid wait": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="soon"),
+            # A relative directory names a different lock file per checkout.
+            "relative claim directory": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_DIR="claims"),
+            "no absolute root": {k: v for k, v in env.items() if k not in ("MERGEPATH_CODEX_REQUEST_CLAIM_DIR", "HOME", "XDG_STATE_HOME")},
+            "nested trigger write": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_HELD=str(fixture / "claims/o__r#123.lock")),
+        }
+        for label, case_env in cases.items():
+            with self.subTest(label):
+                result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                        env=case_env, capture_output=True, timeout=20)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(b"#1362", result.stderr)
+                self.assertEqual([], list(arrived.iterdir()), "authorization must not run without a confirmed claim")
+                self.assertEqual([], self.writes(fixture))
+        # A holder that outlasts the wait refuses, without recounting.
+        (fixture / "release").unlink()
+        held = self.start_trigger(fixture, env)
+        try:
+            self.assertTrue(self.wait_for(lambda: len(list(arrived.iterdir())) == 1))
+            result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                    env=dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="1"), capture_output=True, timeout=20)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn(b"still holds the per-PR claim", result.stderr)
+            self.assertEqual(1, len(list(arrived.iterdir())))
+        finally:
+            self.stop(held)
+        self.assertEqual([], self.writes(fixture))
+
+    def test_claim_covers_the_rest_transport(self):
+        # The cloud surface posts through the REST transport; the same claim
+        # and comment-id readback apply, and a second request is refused.
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        env["MERGEPATH_GH_TRANSPORT"] = "rest"
+        command = ["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"]
+        result = subprocess.run(command, env=env, capture_output=True, timeout=20)
+        self.assertEqual(0, result.returncode, result.stderr)
+        result = subprocess.run(command, env=env, capture_output=True, timeout=20)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"existing-trigger", result.stderr)
+        writes = self.writes(fixture)
+        self.assertEqual(1, len(writes), writes)
+        self.assertTrue(writes[0].startswith("api --method POST repos/o/r/issues/123/comments --input "), writes)
+        self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()))
+
+    def test_claim_directory_is_absolute_and_shared(self):
+        # A relative XDG_STATE_HOME is ignored, so two checkouts (different
+        # working directories) still share one lock under $HOME.
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        home = fixture / "home"
+        home.mkdir()
+        env = {k: v for k, v in env.items() if k != "MERGEPATH_CODEX_REQUEST_CLAIM_DIR"}
+        env.update(HOME=str(home), XDG_STATE_HOME="state")
+        results = [subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                  env=env, cwd=cwd, capture_output=True, timeout=20)
+                   for cwd in (fixture, fixture / "scripts")]
+        self.assertEqual([0], [r.returncode for r in results if r.returncode == 0], [r.stderr for r in results])
+        self.assertTrue((home / ".local/state/mergepath/codex-request-claims/o__r#123.lock").exists())
+        self.assertFalse((fixture / "state").exists() or (fixture / "scripts/state").exists())
+        self.assertEqual(1, len(self.writes(fixture)), "the second checkout must recount against the same lock and refuse")
+
+    def test_claimed_write_requires_its_confirmed_comment_id(self):
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        for label, extra in (("no comment id", {"FAKE_OMIT_URL": "1"}), ("foreign author", {"FAKE_POSTED_AS": "nathanpayne-codex"})):
+            with self.subTest(label):
+                for path in (fixture / "timeline").iterdir():
+                    path.unlink()
+                result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                        env=dict(env, **extra), capture_output=True, timeout=20)
+                self.assertEqual(5, result.returncode, result.stderr)
+                self.assertIn(b"without a confirmed comment id", result.stderr)
+
+    def test_out_of_band_request_is_counted_never_blocked(self):
+        # The claim governs guarded writes only. A request typed in the GitHub
+        # web UI takes no part in it and cannot be prevented; it lands on the
+        # timeline, which is the budget store, so the next guarded recount
+        # counts it. Here it stands as an existing trigger on the head.
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        (fixture / "timeline/123.jsonl").write_text(json.dumps({"id": 1, "user": {"login": "nathanjohnpayne"}, "body": "@codex review", "issue_url": "https://api.github.com/repos/o/r/issues/123"}) + "\n")
+        result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                env=env, capture_output=True, timeout=20)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self.writes(fixture))
 
     def test_real_wrappers_execute_frozen_read_inputs_and_clean_snapshots(self):
         fixture, env = self.wrapper_fixture()
