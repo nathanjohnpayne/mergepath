@@ -226,16 +226,13 @@ is_mikefarah_yq() { # <path>
 YQ_MIN_VERSION="v4.53.6"
 
 # Succeeds when <have> is at least <want>; both are [v]MAJOR.MINOR.PATCH,
-# compared field by field as numbers (v4.100.0 is newer than v4.53.6). A
-# version of any other shape fails.
+# compared field by field as numbers (v4.100.0 is newer than v4.53.6). Each
+# numeric component follows SemVer grammar: zero or a nonzero digit followed
+# by digits, with no leading zeroes.
 version_at_least() { # <have> <want>
   local h1 h2 h3 w1 w2 w3 v
   for v in "${1#v}" "${2#v}"; do
-    case "$v" in
-      *[!0-9.]*|.*|*.|*..*|*.*.*.*) return 1 ;;
-      *.*.*) ;;
-      *) return 1 ;;
-    esac
+    [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
   done
   v="${1#v}"; h1="${v%%.*}"; v="${v#*.}"; h2="${v%%.*}"; h3="${v#*.}"
   v="${2#v}"; w1="${v%%.*}"; v="${v#*.}"; w2="${v%%.*}"; w3="${v#*.}"
