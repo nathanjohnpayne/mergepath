@@ -57,6 +57,20 @@ class HistoryTests(unittest.TestCase):
     def sample(self, **kwargs):
         return self.provider(**kwargs).fetch(time.monotonic() + 20).data
 
+    def test_omitted_checkouts_mark_history_incomplete_and_keep_rows(self):
+        write_loop(self.a, loop())
+        complete = self.sample()
+        self.assertTrue(complete["history_complete"])
+        self.assertEqual(complete["coverage"]["omitted_checkouts"], 0)
+        partial = self.sample(omitted_checkouts=2)
+        self.assertFalse(partial["history_complete"])
+        self.assertIn("Checkout limit reached; coverage is incomplete.", partial["diagnostics"])
+        self.assertEqual(partial["coverage"]["omitted_checkouts"], 2)
+        self.assertEqual(len(partial["history"]), 1)
+        for value in (-1, 1.0, True, "2", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.provider(omitted_checkouts=value)
+
     def test_nonapproval_history_dedup_genuine_id_across_roots_and_archives(self):
         row = loop()
         write_loop(self.a, row)
