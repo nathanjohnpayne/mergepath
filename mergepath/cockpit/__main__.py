@@ -110,7 +110,7 @@ def shared_ci_snapshot(app, repo, _fetch_now):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
-    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
+    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="cursor",
                         help="agent whose existing credential cache is used for author telemetry and confirmed sync")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
     parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")
@@ -157,7 +157,11 @@ def main(argv=None):
         app.scheduler.register("ci", ci_provider, hot_interval=CI_HOT_INTERVAL, idle_interval=CI_IDLE_INTERVAL, timeout=CI_TIMEOUT)
         app.register_panel("ci", "ci")
         app.ci_excerpts = LogExcerptCache(inventory, lambda repo, job, deadline: github.read_job_log(repo, job, deadline=deadline))
-        pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
+        # Each repository read costs 2 to 5 GraphQL points, about 25 per cycle across eight
+        # repositories (measured 2026-10-22). A repository whose free ETag-cached REST change
+        # evidence is unchanged reuses its last read for up to five minutes instead.
+        pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT},
+                                 reuse_window=300)
         app.scheduler.register("prs", pr_provider, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("prs", "prs")
         try:

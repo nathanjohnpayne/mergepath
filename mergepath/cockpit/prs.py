@@ -605,14 +605,62 @@ class PRProvider:
     """Scheduler callback; browser filters reuse this one full cached observation."""
     def __init__(self, client, inventory, root, *, helper=None, checkout_roots=None,
                  clock=time.time, monotonic=time.monotonic, slow_interval=120,
-                 max_enrichments=1, max_pages=20, settings_path=None):
+                 max_enrichments=1, max_pages=20, settings_path=None, reuse_window=None):
         self.client, self.inventory, self.root = client, tuple(inventory), Path(root)
         self.clock, self.monotonic, self.slow_interval = clock, monotonic, slow_interval
         self.max_enrichments, self.max_pages = max_enrichments, max_pages
         self.settings_path = settings_path
+        # Seconds an unchanged repository's GraphQL observation may be reused; None reads every cycle.
+        self.reuse_window = reuse_window
         self.helper = helper or HelperReader(client, root, checkout_roots=checkout_roots, monotonic=monotonic)
-        self.previous, self.enrichment, self.queue = {}, {}, []
+        self.previous, self.enrichment, self.queue, self.observed = {}, {}, [], {}
         self.repository_offset = 0
+
+    def _evidence(self, repo, deadline):
+        """REST change evidence for one repository, or None when any part is unreadable.
+
+        Every GraphQL read costs points, while an ETag-cached REST page that answers 304
+        costs nothing, so a quiet repository is checked for free. The evidence covers the
+        open PR set and each head's check suites and commit statuses. A completed job
+        inside a still-running suite, a branch-protection change or a base-branch push
+        with no PR change can escape it; reuse_window bounds how long they can.
+        """
+        try:
+            pulls = self.client.pages(f"/repos/{repo}/pulls?state=open&per_page=100", deadline=deadline)
+            evidence = []
+            for pull in sorted(pulls, key=lambda pull: pull["number"]):
+                head = pull["head"]["sha"]
+                if type(head) is not str or not re.fullmatch(r"[0-9a-f]{40}", head):
+                    raise ClientError("invalid_upstream_json")
+                suites = self.client.pages(f"/repos/{repo}/commits/{head}/check-suites?per_page=100",
+                                           collection="check_suites", deadline=deadline)
+                status = self.client.get(f"/repos/{repo}/commits/{head}/status?per_page=100", deadline=deadline)
+                evidence.append([
+                    pull["number"], head, pull["updated_at"], pull["draft"], pull["base"]["ref"],
+                    sorted(label["name"] for label in pull["labels"]),
+                    sorted([suite["id"], suite["status"], suite["conclusion"], suite["updated_at"],
+                            suite["latest_check_runs_count"]] for suite in suites),
+                    status["state"], status["total_count"],
+                    sorted([item["context"], item["state"], item["updated_at"]] for item in status["statuses"]),
+                ])
+            return json.dumps(evidence, sort_keys=True, allow_nan=False)
+        except (ClientError, KeyError, TypeError, ValueError):
+            # Unreadable evidence never justifies reuse: the full GraphQL read decides.
+            return None
+
+    def _observe(self, repo, deadline, now):
+        """Raw rows and their observation time, reusing an unchanged repository's last read."""
+        evidence = self._evidence(repo, deadline) if self.reuse_window is not None else None
+        cached = self.observed.get(repo)
+        if (evidence is not None and cached is not None and cached["evidence"] == evidence
+                and self.monotonic() - cached["read_at"] < self.reuse_window):
+            # A MERGED/CLOSED transition row is published once, as a fresh read publishes it.
+            return [raw for raw in copy.deepcopy(cached["rows"]) if raw.get("state", "OPEN") == "OPEN"], cached["observed_at"]
+        rows = self._repository(repo, deadline)
+        if self.reuse_window is not None:
+            self.observed[repo] = {"evidence": evidence, "rows": copy.deepcopy(rows),
+                                   "observed_at": now, "read_at": self.monotonic()}
+        return rows, now
 
     def _connection(self, connection):
         if type(connection) is not dict or type(connection.get("nodes")) is not list:
@@ -730,8 +778,8 @@ class PRProvider:
             try:
                 if self.monotonic() >= request_deadline:
                     raise ClientError("deadline_exceeded")
-                raw_rows = self._repository(repo, request_deadline)
-                entry = {"repo": repo, "rows": [], "observed_at": now, "stale": False, "error": None}
+                raw_rows, observed_at = self._observe(repo, request_deadline, now)
+                entry = {"repo": repo, "rows": [], "observed_at": observed_at, "stale": False, "error": None}
                 for raw in raw_rows:
                     key = repo + "#" + str(raw["number"])
                     raw_by_id[key] = (repo, raw)
@@ -741,7 +789,7 @@ class PRProvider:
                     due = not cache or cache["due"] <= self.monotonic() or cache["updated_at"] != raw.get("updatedAt")
                     if due and key not in self.queue and raw.get("state", "OPEN") == "OPEN":
                         self.queue.append(key)
-                    entry["rows"].append(build_row(repo, raw, cache["receipts"] if cache else None, settings, now))
+                    entry["rows"].append(build_row(repo, raw, cache["receipts"] if cache else None, settings, observed_at))
                 observations.append(entry)
             except (ClientError, KeyError, TypeError, ValueError) as error:
                 entry = copy.deepcopy(self.previous.get(repo, {"repo": repo, "rows": [], "observed_at": None}))

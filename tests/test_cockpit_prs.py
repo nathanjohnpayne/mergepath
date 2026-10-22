@@ -643,6 +643,86 @@ class PRTests(unittest.TestCase):
         client.failed=False;recovered=provider(time.monotonic()+5).data['repositories'][0]
         self.assertFalse(recovered['rows'][0]['stale']);self.assertFalse(recovered['rows'][0]['hazards'][0]['stale'])
 
+    def test_unchanged_rest_evidence_reuses_the_graphql_read_within_the_window(self):
+        class Evidence(Client):
+            def __init__(self):
+                super().__init__();self.rest=[];self.rest_failure=None
+                self.pulls=[{'number':1,'head':{'sha':HEAD},'updated_at':'2026-10-03T01:00:00Z','draft':False,'base':{'ref':'main'},'labels':[]}]
+                self.suites=[{'id':7,'status':'in_progress','conclusion':None,'updated_at':'2026-10-03T01:00:00Z','latest_check_runs_count':3}]
+                self.status={'state':'pending','total_count':1,'statuses':[{'context':'CodeRabbit','state':'pending','updated_at':'2026-10-03T01:00:00Z'}]}
+            def pages(self,path,*,collection=None,deadline):
+                self.rest.append(path)
+                if self.rest_failure:raise self.rest_failure
+                return copy.deepcopy(self.suites if collection=='check_suites' else self.pulls)
+            def get(self,path,*,deadline):
+                self.rest.append(path);return copy.deepcopy(self.status)
+        def reads(client):return sum('CockpitPRs(' in document for document,_,_ in client.calls)
+        def run(mutate=None,advance=60,window=300,setup=None):
+            clock=[0];client=Evidence()
+            if setup:setup(client)
+            provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Helpers(),reuse_window=window,
+                                monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+            first=provider(100).data['repositories'][0]
+            if mutate:mutate(client)
+            clock[0]=advance;second=provider(100+advance).data['repositories'][0]
+            return client,first,second
+        client,first,second=run()
+        self.assertEqual(reads(client),1)
+        self.assertEqual(second['observed_at'],first['observed_at']);self.assertEqual(second['rows'][0]['observed_at'],first['rows'][0]['observed_at'])
+        self.assertFalse(second['stale']);self.assertEqual(second['rows'][0]['checks'],first['rows'][0]['checks'])
+        self.assertIn(f'/repos/{REPO}/commits/{HEAD}/check-suites?per_page=100',client.rest)
+        self.assertIn(f'/repos/{REPO}/commits/{HEAD}/status?per_page=100',client.rest)
+        changes={'pushed head':lambda c:c.pulls[0]['head'].update(sha='b'*40),
+                 'updated PR':lambda c:c.pulls[0].update(updated_at='2026-10-03T02:00:00Z'),
+                 'label':lambda c:c.pulls[0]['labels'].append({'name':'needs-human-review'}),
+                 'draft':lambda c:c.pulls[0].update(draft=True),
+                 'new PR':lambda c:c.pulls.append({**copy.deepcopy(c.pulls[0]),'number':2}),
+                 'closed PR':lambda c:c.pulls.clear(),
+                 'suite status':lambda c:c.suites[0].update(status='completed',conclusion='success'),
+                 'suite updated':lambda c:c.suites[0].update(updated_at='2026-10-03T01:05:00Z'),
+                 'suite runs':lambda c:c.suites[0].update(latest_check_runs_count=4),
+                 'new suite':lambda c:c.suites.append({**c.suites[0],'id':8}),
+                 'status state':lambda c:c.status['statuses'][0].update(state='success'),
+                 'status context':lambda c:c.status['statuses'].append({'context':'other','state':'pending','updated_at':'x'}),
+                 'combined state':lambda c:c.status.update(state='success')}
+        for name,mutate in changes.items():
+            with self.subTest(change=name):
+                client,first,second=run(mutate)
+                self.assertEqual(reads(client),2);self.assertEqual(second['observed_at'],1060)
+        with self.subTest(change='window elapsed'):
+            client,first,second=run(advance=300)
+            self.assertEqual(reads(client),2);self.assertEqual(second['observed_at'],1300)
+        # Unreadable on both reads: an identical failure must not pass for unchanged evidence.
+        for failure in [ClientError('primary_exhausted'),KeyError('head')]:
+            with self.subTest(failure=type(failure).__name__):
+                client,first,second=run(setup=lambda c:setattr(c,'rest_failure',failure))
+                self.assertEqual(reads(client),2);self.assertEqual(second['observed_at'],1060)
+        for name,setup in {'malformed head':lambda c:c.pulls[0]['head'].update(sha=None),
+                           'missing suite field':lambda c:c.suites[0].pop('updated_at')}.items():
+            with self.subTest(failure=name):
+                client,first,second=run(setup=setup)
+                self.assertEqual(reads(client),2)
+        with self.subTest(window=None):
+            client=Evidence();provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Helpers())
+            provider(time.monotonic()+5);provider(time.monotonic()+5)
+            self.assertEqual(reads(client),2);self.assertEqual(client.rest,[])
+
+    def test_reused_read_publishes_a_merge_transition_once(self):
+        class Evidence(Client):
+            pulls=[]
+            def pages(self,path,*,collection=None,deadline):return copy.deepcopy([] if collection else self.pulls)
+            def get(self,path,*,deadline):return {'state':'success','total_count':0,'statuses':[]}
+        client=Evidence();client.pulls=[{'number':1,'head':{'sha':HEAD},'updated_at':'u','draft':False,'base':{'ref':'main'},'labels':[]}]
+        clock=[0]
+        provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Helpers(),reuse_window=300,
+                            monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+        provider(100);client.rows=[];client.pulls=[]
+        clock[0]=30;merged=provider(130).data['repositories'][0]['rows']
+        self.assertEqual([row['lifecycle'] for row in merged],['MERGED'])
+        clock[0]=60;after=provider(160).data['repositories'][0]
+        self.assertEqual(after['rows'],[]);self.assertEqual(after['observed_at'],1030)
+        self.assertEqual(sum('CockpitPRTransitions' in document for document,_,_ in client.calls),1)
+
     def test_consumer_code_rabbit_and_accounting_use_governing_target_config(self):
         policy=(ROOT/'.github/review-policy.yml').read_text().replace('  - nathanpayne-claude','  - consumer-reviewer').replace('  - nathanpayne-cursor\n','').replace('  - nathanpayne-codex\n','')
         cr='reviews:\n  auto_review:\n    drafts: true\n    base_branches:\n      - main\n'
