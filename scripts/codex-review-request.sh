@@ -605,7 +605,10 @@ __cra_retire_base_cfg() { # <new-path-or-empty>
   fi
   __CRA_BASE_CFG_TMP="${1:-}"
 }
-trap '__cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
+# #2664: a retry intent recorded but not yet resolved (posted, or refused
+# and withdrawn) when the process exits, for example through an accounting or
+# blocking-budget stop inside the write path, is withdrawn on the way out.
+trap '[ "${RETRY_INTENT_PENDING:-false}" != true ] || retry_withdraw_intent; __cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
@@ -2782,6 +2785,9 @@ post_codex_trigger() {
   local observed_generation
   observed_generation=$(crqe_trigger_generation "$request_comments" "$AUTHOR_IDENTITY") \
     || die 3 "cannot read the Codex request generation; refusing a new '@codex review' trigger"
+  if [ "$CODEX_RETRY_WRITE" = true ] && [ -n "$RETRY_PINNED_GENERATION" ]; then
+    observed_generation=$RETRY_PINNED_GENERATION
+  fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
@@ -3086,6 +3092,7 @@ codex_retry_tick() {
 # warns; the intent then withholds a retry, never grants one.
 retry_withdraw_intent() {
   local body
+  RETRY_INTENT_PENDING=false
   [ -n "$RETRY_INTENT_ID" ] || { log "WARN: the automatic Codex retry intent has no confirmed id to withdraw (#2664)"; return 0; }
   body="$CODEX_RETRY_MARKER_PREFIX head=$HEAD_SHA original=$RETRY_ORIGINAL_ID withdrawn=$RETRY_INTENT_ID -->
 **Automatic Codex retry withdrawn (nathanjohnpayne/mergepath#2664):** no retry was posted for request $RETRY_ORIGINAL_ID ($RETRY_REASON)."
@@ -3134,6 +3141,10 @@ post_codex_retry() {
   latest=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "" | jq -r '.id // empty') \
     || die 3 "cannot select the latest Codex request before the automatic retry"
   if [ "$latest" != "$RETRY_ORIGINAL_ID" ]; then retry_refuse superseded; return 0; fi
+  # The claimed authorization checks the generation this decision was made
+  # on, not a later read: a rival retry landing after this check refuses it.
+  RETRY_PINNED_GENERATION=$(crqe_trigger_generation "$comments" "$AUTHOR_IDENTITY") \
+    || die 3 "cannot read the Codex request generation before the automatic retry"
   if [ "$(crqe_request_is_retry "$comments" "$AUTHOR_IDENTITY" "$RETRY_ORIGINAL_ID")" != false ]; then
     retry_refuse retry-of-retry; return 0
   fi
@@ -3153,10 +3164,12 @@ post_codex_retry() {
     retry_refuse marker-not-recorded; return 0
   fi
   RETRY_INTENT_ID=$(printf '%s\n' "$intent_out" | grep -oE 'issuecomment-[0-9]+' | tail -1 | sed 's/issuecomment-//') || RETRY_INTENT_ID=""
+  RETRY_INTENT_PENDING=true
   CODEX_RETRY_WRITE=true
   post_codex_trigger || rc=$?
   CODEX_RETRY_WRITE=false
   if [ "$rc" -eq 0 ]; then
+    RETRY_INTENT_PENDING=false
     AUTOMATIC_RETRY_USED=true
     RETRY_STATE=posted
     RETRY_COMMENT_ID=$TRIGGER_COMMENT_ID
@@ -3443,8 +3456,8 @@ resume_pending_codex_request() {
     || die 3 "cannot read the Codex Review Summary for the resume check"
   observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') \
     || die 3 "cannot read the Codex Review Summary for the resume check"
-  # #2664: a pending request whose run has since failed or been cancelled is
-  # resumed too, outside the wrapper's authorization pass, so a restarted
+  # #2664: a pending request whose run has since failed, been cancelled, or
+  # completed with no result is resumed too, outside the wrapper's authorization pass, so a restarted
   # session never posts a fresh request past the bounded retry rules: a
   # request that is itself a retry is reported, never replaced, and one this
   # session did not watch waits out its own deadline.
@@ -3452,7 +3465,7 @@ resume_pending_codex_request() {
   if [ "$AUTHORIZE_TRIGGER_WRITE" != true ]; then
     terminal_state=$(crqe_select_codex_run_state "$comments" "$BOT_LOGIN" "$HEAD_SHA" "$created" | jq -r '.state') \
       || die 3 "cannot read the Codex run state for the resume check"
-    case "$terminal_state" in failed|canceled) resumed_terminal=true ;; esac
+    case "$terminal_state" in failed|canceled|completed) resumed_terminal=true ;; esac
   fi
   if [ "$resumed_terminal" != true ] && { [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; }; then
     log "pending request $(printf '%s' "$pending" | jq -r .id) has no Codex Running summary on HEAD since it was posted (status '${status:-none}') — not resuming"
@@ -3531,6 +3544,8 @@ RETRY_SAW_RUNNING=false
 RETRY_SEEN_AT=0
 RETRY_ACKED_ID=""
 RETRY_INTENT_ID=""
+RETRY_INTENT_PENDING=false
+RETRY_PINNED_GENERATION=""
 
 # The no-write decisions below belong to a request mode. A requester applies
 # its own. The wrapper's authorization pass runs as --trigger-only, so it

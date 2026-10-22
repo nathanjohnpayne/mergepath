@@ -28,6 +28,16 @@ cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 # Simulates the governed blocking-review budget being spent after the first
 # request (#2664): later reads govern, and report, a budget of zero.
 budget=10
+# Or spend it after the Nth ledger read: that read still reports 10.
+if [ -n "${CODEX_LEDGER_STUB_SPEND_AT_CALL:-}" ] && [ -n "${CODEX_LEDGER_STUB_POLICY:-}" ]; then
+  calls=$(( $(cat "$CODEX_LEDGER_STUB_POLICY.calls" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$calls" >"$CODEX_LEDGER_STUB_POLICY.calls"
+  if grep -q 'max_blocking_reviews' "$CODEX_LEDGER_STUB_POLICY"; then
+    budget=0
+  elif [ "$calls" -ge "$CODEX_LEDGER_STUB_SPEND_AT_CALL" ]; then
+    printf '  max_blocking_reviews: 0\n' >>"$CODEX_LEDGER_STUB_POLICY"
+  fi
+fi
 if [ -n "${CODEX_LEDGER_STUB_SPEND_POLICY:-}" ]; then
   if grep -q 'max_blocking_reviews' "$CODEX_LEDGER_STUB_SPEND_POLICY"; then
     budget=0
@@ -147,6 +157,15 @@ case "$body" in
   '<!-- mergepath-codex-retry:v1 '*) kind=retry-marker ;;
   '<!-- mergepath-codex-request-checkpoint:v1 '*) kind=checkpoint ;;
   *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
+esac
+# #2664: a rival handler's retry lands just after this handler's intent.
+case "$body" in
+  '<!-- mergepath-codex-retry:v1 '*)
+    if [ "${CODEX_TEST_RIVAL_RETRY_AT_INTENT:-0}" = 1 ] && [ ! -f "$state_dir/rival-retry" ] \
+       && ! printf '%s' "$body" | grep -Eq 'retry=|withdrawn='; then
+      touch "$state_dir/rival-retry"
+      jq -cn '{id:6000,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:01:30Z"}' >>"$state_dir/comments.jsonl"
+    fi ;;
 esac
 # #2664: the fake time of every trigger, for the retry backoff assertions.
 if [ "$kind" = trigger ] && [ -f "$state_dir/fake-time" ]; then
@@ -1987,16 +2006,20 @@ test_retry_needs_codex_acknowledgement() {
 # the #1550 replacement, and a retry is reported and never replaced.
 test_restarted_session_resumes_failed_request() {
   local label dir rc before epoch first
-  for label in original retry; do
+  for label in original retry completed-retry; do
     before=$FAIL
     dir=$(make_case "retry-restart-$label" 0 0 400)
-    if [ "$label" = retry ]; then
+    if [ "$label" != original ]; then
       seed_author_trigger "$dir" 880 "2026-06-03T23:50:00Z"
       jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 retry=900 -->\nBound.",created_at:"2026-06-04T00:00:01Z"}' \
         >>"$dir/state/comments.jsonl"
     fi
     seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
-    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    if [ "$label" = completed-retry ]; then
+      seed_codex_summary "$dir" '✅ **Completed**' aaaaaaa "2026-06-04T00:00:10Z"
+    else
+      seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    fi
     set_clock_after_request "$dir" 30
     rc=$(run_retry_case "$dir" absent CODEX_TEST_EYES=0)
     grep -q 'resuming it under the bounded retry rules' "$dir/err.log" || fail "#2664 restart $label: the failed request was not resumed; $(tail -3 "$dir/err.log")"
@@ -2006,7 +2029,7 @@ test_restarted_session_resumes_failed_request() {
         first=$(head -1 "$dir/state/trigger-times" 2>/dev/null || echo 0)
         [ "$(trigger_count "$dir")" = 1 ] && [ "$first" -ge $((epoch + 400)) ] \
           || fail "#2664 restart original: $(trigger_count "$dir") requests, first at +$((first - epoch))s, expected one after the 400 s deadline" ;;
-      retry)
+      retry|completed-retry)
         [ "$(trigger_count "$dir")" = 0 ] && [ "$rc" = 4 ] && ! grep -q 're-running as a fresh request' "$dir/err.log" \
           && jq -e '.retry.state == "refused" and .retry.reason == "retry-of-retry"' "$dir/out.json" >/dev/null \
           || fail "#2664 restart retry: exit $rc, $(trigger_count "$dir") requests, $(jq -c .retry "$dir/out.json" 2>/dev/null)" ;;
@@ -2034,6 +2057,38 @@ test_refused_retry_withdraws_its_intent() {
     [ "$(crqe_request_is_retry "$(jq -sc . "$dir/state/comments.jsonl")" nathanjohnpayne 5000)" = false ]
   ) || fail "#2664 withdraw: the web request was classified as a retry"
   [ "$FAIL" -ne "$before" ] || pass "#2664: a refused retry withdraws its intent, which then marks nothing"
+}
+
+# A stop inside the write path (here a blocking budget spent between the
+# retry's pre-check and its write) exits 7 after the intent posted; the exit
+# path withdraws that intent.
+test_stop_after_intent_withdraws_it() {
+  local dir rc before=$FAIL intent
+  dir=$(make_case "retry-stop-after-intent" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_LEDGER_STUB_SPEND_AT_CALL=2 CODEX_LEDGER_STUB_POLICY="$dir/state/base-review-policy.yml")
+  [ "$rc" = 7 ] && jq -e '.cap_exhausted.kind == "blocking-reviews"' "$dir/out.json" >/dev/null \
+    || fail "#2664 stop after intent: exit $rc, $(jq -c .cap_exhausted "$dir/out.json" 2>/dev/null); $(tail -3 "$dir/err.log")"
+  intent=$(jq -r 'select(.body | startswith("<!-- mergepath-codex-retry:v1 ") and (test("retry=|withdrawn=") | not)) | .id' "$dir/state/comments.jsonl" | head -1)
+  [ -n "$intent" ] && retry_markers "$dir" | grep -q "withdrawn=$intent -->" \
+    || fail "#2664 stop after intent: intent '$intent' not withdrawn; $(retry_markers "$dir")"
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 stop after intent: $(trigger_count "$dir") triggers"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a stop inside the write path withdraws the retry intent on exit"
+}
+
+# A rival handler's retry lands after this handler checked that the original
+# was still latest. The claimed authorization checks the pinned generation,
+# so this handler refuses instead of posting a second retry.
+test_rival_retry_after_check_is_refused() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-rival" 0 0 400)
+  make_real_wrapper_case "$dir"
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_TEST_RIVAL_RETRY_AT_INTENT=1 MERGEPATH_GH_TRANSPORT=gh GH_TOKEN=ghp_fixture_author)
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 rival: $(trigger_count "$dir") requests posted by this handler, expected only the original"
+  grep -q 'not posted: concurrent-request' "$dir/err.log" || fail "#2664 rival: $(grep 2664 "$dir/err.log" | tail -3)"
+  retry_markers "$dir" | grep -q 'withdrawn=' || fail "#2664 rival: the intent was not withdrawn"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a rival retry after the latest-request check refuses this handler's retry"
 }
 
 test_retry_refused_by_late_result_or_moved_head() {
@@ -2181,6 +2236,8 @@ test_scheduled_retry_at_deadline_is_reported
 test_retry_needs_codex_acknowledgement
 test_restarted_session_resumes_failed_request
 test_refused_retry_withdraws_its_intent
+test_stop_after_intent_withdraws_it
+test_rival_retry_after_check_is_refused
 test_retry_refused_by_late_result_or_moved_head
 test_retry_never_chains
 test_retry_withheld_from_a_retry_request
