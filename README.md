@@ -69,19 +69,13 @@ scripts/install-worktree-cleanup-agent.sh --uninstall
 
 The job runs the main checkout's `scripts/worktree-cleanup.sh --apply --min-age 24h` and appends to `~/.cache/mergepath/worktree-cleanup.log`. It never passes `--force-locked` or `--orphan-clean`. Details are in `docs/agents/operating-rules.md` and `specs/worktree_cleanup_audit.md`.
 
-## Firebase Auth Template
+## Firebase and Google Cloud Tooling
 
-This template includes the canonical Google Cloud and Firebase helper scripts for this account:
+The template retains the approved 1Password-backed Firebase credential-custody model: each project's deployer service-account key belongs in the Firebase vault, with shared 1Password ADC retained as a legacy resolver fallback. Do not revert to deploy keys on disk or routine `firebase login` guidance without explicit human approval. Existing `op-firebase-setup` and `op-firebase-deploy` helpers describe legacy account setup and credential resolution; do not run them to enable production deployment while the production block remains.
 
-- `scripts/gcloud/gcloud` installs a local wrapper so ordinary `gcloud` commands can use 1Password-backed or explicit source credentials without a routine interactive `gcloud auth login`, while attributing quota to the resolved target project from explicit flags, the repo's `.firebaserc`, or the active `gcloud` config.
-- `scripts/firebase/op-firebase-setup` creates a per-project `firebase-deployer@{project-id}.iam.gserviceaccount.com`, grants deploy roles, and configures impersonation.
-- `scripts/firebase/op-firebase-deploy` resolves a source credential per the canonical precedence (project Firebase-vault SA key first, with shared 1Password ADC and impersonation as fallbacks) and runs `firebase deploy` with the target project stamped in as the quota project.
+Production deployment is blocked until separately reviewed tooling ensures repository build code and dependencies have neither deploy credentials nor author/reviewer PATs and cannot reach credential-manager files or preflight caches; publishes an immutable artifact with a digest and attestation bound to the intended repository and full source revision; and has trusted post-build tooling verify that binding and artifact integrity before acquiring deploy credentials, then deploy the verified artifact without rebuilding or executing the candidate checkout and inject each credential only into its consuming subprocess. The current helper scripts do not provide these guarantees. Do not use deploy/all preflight or legacy helper commands to bypass the block; see [DEPLOYMENT.md](DEPLOYMENT.md) and [Build and deploy isolation](docs/agents/shared-operating-rules.md#build-and-deploy-isolation).
 
-The canonical source-credential precedence is documented in `DEPLOYMENT.md` § [Deploy credential precedence (canonical)](DEPLOYMENT.md#deploy-credential-precedence-canonical). The default day-to-day credential — interactive and CI — is the per-project Firebase-vault SA key (`op://Firebase/{project-id} — Firebase Deployer SA Key`), with the shared 1Password ADC as a fallback and an explicit `GOOGLE_APPLICATION_CREDENTIALS` as the highest-priority override.
-
-This 1Password-first deploy-auth model is intentional. Do not revert template-derived repos to deploy-key-on-disk or routine `firebase login`-based guidance unless a human explicitly requests that change.
-
-See `DEPLOYMENT.md` for the full bootstrap and deploy flow.
+The `scripts/gcloud/gcloud` wrapper remains available for ordinary non-deployment `gcloud` commands. Routine replacement of a Firebase deploy key remains incomplete until separately reviewed, non-deploying validation proves the replacement usable; suspected-compromise containment is a separate owner-led incident decision. See [key rotation guidance](DEPLOYMENT.md#rotating-a-firebase-deploy-sa-key).
 
 ## Directory Structure
 

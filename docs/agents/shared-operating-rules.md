@@ -65,7 +65,7 @@ Then follow this procedure:
 2. **Check if preflight was run.** If `OP_PREFLIGHT_DONE` is not set, suggest running the preflight script:
    > "1Password auth failed. Would you like to run credential preflight to cache all credentials at once? `eval \"$(scripts/op-preflight.sh --agent {your-agent} --mode review)\"`"
    >
-   > (Use `--mode deploy` or `--mode all` instead if a deploy is in scope; the default is now `review` per nathanjohnpayne/mergepath#282.)
+   > (`--mode deploy` is not an approved deployment setup: a cache hit can export review PATs, and evaluating its output exposes credentials to the caller's whole shell. Do not use `--mode all` for builds or deployment. Wait for separately reviewed post-build tooling that selects only deploy credentials and scopes them to one consuming subprocess after artifact verification. See [Build and deploy isolation](#build-and-deploy-isolation). The default is `review` per nathanjohnpayne/mergepath#282.)
 3. **If preflight was already run** but credentials expired (rare — only after 1Password locks or the 12-hour hard limit), prompt the human and suggest re-running preflight:
    > "Preflight credentials appear to have expired. Could you re-run preflight when you're back? I need to resume the review."
 4. **Wait for the human to confirm** they are present and ready before re-running preflight (not individual `op read` commands).
