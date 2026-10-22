@@ -473,7 +473,7 @@ class TriggerGuardTests(unittest.TestCase):
         # The held recount outlives a killed wrapper; end its whole group.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         proc.communicate(timeout=10)
 
@@ -534,31 +534,42 @@ class TriggerGuardTests(unittest.TestCase):
         finally:
             self.stop(nxt)
 
-    def check_claim_released_at_post(self, transport, stage="POST"):
+    def check_claim_held_by_surviving_writer(self, transport, stage="POST"):
+        # A's wrapper is killed while its POST (or readback) child is held.
+        # That child can still write, so it must keep the claim: B waits, and
+        # once A's child finishes B recounts, sees A's request and refuses.
         fixture, env = self.claim_fixture()
         env["MERGEPATH_GH_TRANSPORT"] = transport
         arrived = fixture / "arrived"
         (fixture / "release").touch()
-        post_gate = fixture / "post-gate"
-        held = self.start_trigger(fixture, dict(env, **{f"{stage}_GATE": str(post_gate)}))
+        gate = fixture / "stage-gate"
+        held = self.start_trigger(fixture, dict(env, **{f"{stage}_GATE": str(gate)}))
+        nxt = None
         try:
-            self.assertTrue(self.wait_for(lambda: Path(str(post_gate) + ".reached").exists()), f"the wrapper never reached its {stage}")
+            self.assertTrue(self.wait_for(lambda: Path(str(gate) + ".reached").exists()), f"the wrapper never reached its {stage}")
             held.kill()
             held.wait(timeout=10)
-            self.assert_claim_free_while_orphan_lives(fixture, env, arrived, 2)
+            nxt = self.start_trigger(fixture, dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="20"))
+            time.sleep(1.5)
+            self.assertEqual(1, len(list(arrived.iterdir())), f"B recounted while A's {stage} child still held the claim")
+            gate.touch()
+            out, err = nxt.communicate(timeout=30)
+            self.assertNotEqual(0, nxt.returncode, err)
+            self.assertIn(b"existing-trigger", err)
         finally:
+            if nxt is not None:
+                self.stop(nxt)
             self.stop(held)
+        self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()), "at most one request may land")
 
-    def test_claim_released_when_a_wrapper_dies_at_its_post(self):
-        self.check_claim_released_at_post("gh")
+    def test_surviving_post_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("gh")
 
-    def test_claim_released_when_a_wrapper_dies_at_its_readback(self):
-        self.check_claim_released_at_post("gh", stage="READBACK")
+    def test_surviving_rest_post_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("rest")
 
-    def test_claim_released_when_a_wrapper_dies_at_its_rest_post(self):
-        # The REST transport's write runs in subshells, which would inherit
-        # bash's saved copy of fd 9 under a bare `9>&-` redirection.
-        self.check_claim_released_at_post("rest")
+    def test_surviving_readback_child_keeps_the_claim(self):
+        self.check_claim_held_by_surviving_writer("gh", stage="READBACK")
 
     def test_claim_ends_with_its_wrapper_and_is_per_pr(self):
         fixture, env = self.claim_fixture()
