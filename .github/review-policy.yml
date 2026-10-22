@@ -632,10 +632,13 @@ codex:
   # Phase 4b handoff. Must be a member of `available_reviewers` above.
   cli_login: nathanpayne-codex
 
-  # The per-PR Codex request ceiling: the 21st request is refused (exit 7,
+  # The per-PR Codex request ceiling: the 11th request is refused (exit 7,
   # kind "request-ceiling"). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
-  # Raised 10 -> 20 by the owner on 2026-09-28 after #1474 exhausted 10 requests.
+  # Set back to 10 fleetwide by #2665 (epic #2657), alongside the blocking-review
+  # budget below and the 3-round Phase 4b cap; a verified CodeRabbit failover
+  # trigger spends no slot (#2534). Raised 10 -> 20 by the owner on 2026-09-28
+  # after #1474 exhausted 10 requests.
   # Previously raised 2 -> 10 (#1084). Codex is the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two
   # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
@@ -647,7 +650,7 @@ codex:
   # max_blocking_reviews), which is non-convergence and must never reach an
   # automated APPROVED. The others are the blocking budget, an untested
   # rebuttal and a disagreement (REVIEW_POLICY.md, Disagreements signal 4).
-  max_review_rounds: 20
+  max_review_rounds: 10
 
   # Blocking-review budget (#1560 slice 3). Before every new request the
   # requester counts the PR's SOLICITED Codex responses that are blocking (a
@@ -1037,7 +1040,9 @@ phase_4b_automation:
   # Enforced cap on completed automated Phase 4b rounds per PR (#2663). Read
   # from the governing base policy; slots are reserved in the per-PR Git-ref
   # round ledger before any adapter run (specs/phase_4b_round_cap.md).
-  max_review_rounds: 20
+  # Lowered 20 -> 3 by #2665 (epic #2657): a 4th completed round is refused
+  # for an owner decision.
+  max_review_rounds: 3
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must
   # NEVER become an APPROVED. The orchestrator falls back to the manual
