@@ -179,13 +179,13 @@ For the legacy `scripts/deploy.sh` and underlying `op-firebase-deploy`, the sour
 
 1. **Genuine human-supplied override** — `GOOGLE_APPLICATION_CREDENTIALS` set by the human OUTSIDE preflight (no `OP_PREFLIGHT_FIREBASE_SA_TMPFILE` or `OP_PREFLIGHT_ADC_TMPFILE` marker matching the same path). This is a legacy resolver path for one-off debugging or alternate-account use; it is not production deployment authorization and must never be present during candidate builds.
 2. **Project Firebase-vault SA key** — `op://Firebase/{project-id} — Firebase Deployer SA Key`, when present. This remains the legacy wrapper's configured source and has historically been used in interactive and CI flows. In a repo with a `.firebaserc` default project, `scripts/op-preflight.sh --mode deploy` caches this key first and exports `OP_PREFLIGHT_FIREBASE_SA_TMPFILE` / `OP_PREFLIGHT_FIREBASE_PROJECT`.
-3. **Preflight-injected shared ADC** — when no project SA key is provisioned or detectable, `scripts/op-preflight.sh --mode deploy` materializes the shared 1Password ADC into a tempfile and exports its path as `OP_PREFLIGHT_ADC_TMPFILE`. This is subject to the same RAPT-expiry surface as the shared ADC. Preflight caches deploy credentials (and the Cloudflare purge token) per Firebase-project context. The runtime still supports legacy `--mode all` behavior, including exporting PATs when deploy credentials are unavailable; do not use `--mode all` for builds or deployment. Use `--mode deploy` only in trusted post-build tooling after artifact verification; if no deploy credential loads, it fails closed.
+3. **Preflight-injected shared ADC** — legacy `scripts/op-preflight.sh --mode deploy` materializes the shared 1Password ADC into a tempfile and exports its path as `OP_PREFLIGHT_ADC_TMPFILE` when no project key is found. A deploy-mode cache hit can also export both review PATs from the shared session file, and evaluation exposes exports to the caller's whole shell; this mode is not approved for deployment. The legacy runtime still supports `--mode all`, including exporting PATs when deploy credentials are unavailable; do not use `--mode all` for builds or deployment. No current preflight mode is approved for deployment; production remains blocked until separately reviewed tooling verifies an immutable artifact and scopes only deploy credentials to the consuming subprocess.
 4. **Shared 1Password ADC read directly** — `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`, read by the script when neither preflight nor an SA key are available. Same RAPT-expiry surface.
 5. **Local ADC file** — `~/.config/gcloud/application_default_credentials.json` from a prior `gcloud auth application-default login`. Last resort.
 
 `op-firebase-deploy` logs the selected source on stderr: `[op-firebase-deploy] source credential: ...`. Deploy auth debugging is no longer opaque — read the line to know which step won.
 
-This precedence applies to deploy flows ONLY. General `gcloud` commands go through the local `gcloud` wrapper at `scripts/gcloud/gcloud`, which uses a narrower 3-step chain — `GOOGLE_APPLICATION_CREDENTIALS` if set, else the shared 1Password ADC (`op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`), else the local ADC file. The `gcloud` wrapper does NOT consult the per-project Firebase-vault SA key from step 2 above; that step is specific to `op-firebase-deploy`. Quota attribution for `gcloud` commands is resolved separately from explicit flags / `.firebaserc` / active config rather than from the deploy script's project pin.
+This precedence documents the legacy `op-firebase-deploy` runtime ONLY and does not authorize production deploys. The legacy preflight's credential preference is narrower: project Firebase-vault SA key, then shared ADC. General `gcloud` commands go through the local `gcloud` wrapper at `scripts/gcloud/gcloud`, which uses a narrower 3-step chain — `GOOGLE_APPLICATION_CREDENTIALS` if set, else the shared 1Password ADC (`op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`), else the local ADC file. The full legacy deploy-wrapper precedence above additionally includes the genuine human-supplied override before its project SA key, preflight-injected shared ADC, direct shared ADC, and local ADC fallbacks. The `gcloud` wrapper does NOT consult the per-project Firebase-vault SA key; that step is specific to `op-firebase-deploy`. Quota attribution for `gcloud` commands is resolved separately from explicit flags / `.firebaserc` / active config rather than from the deploy script's project pin.
 
 ### Trade-off
 
@@ -193,7 +193,7 @@ The following bullets record the historical rationale for the legacy resolver, n
 
 - **Historical rationale.** The per-project SA key was chosen for bounded project scope, 1Password storage, rotation, and reduced shared-ADC reauth friction; the choice does not establish build/deploy isolation or authorize production deployment.
 - **Historical trade-off.** The legacy resolver stores the SA key in 1Password rather than relying only on ephemeral impersonated credentials; this remains an auth implementation detail, not production-deployment approval.
-- **Rotation.** The SA key is rotated by re-issuing via the Firebase console or `op-firebase-setup`'s key-issuance flow, updating the 1Password item, and invalidating the prior key. The next deploy's source-credential lookup picks up the new key automatically. Detailed rotation steps land alongside [#154 sub-C](https://github.com/nathanjohnpayne/mergepath/issues/210) in `docs/agents/deployment-process.md`.
+- **Rotation.** Legacy resolution picks up a replacement SA key from the 1Password item, but routine rotation is incomplete until a separately reviewed non-deploying validator proves the replacement usable; see [Rotating a Firebase deploy SA key](#rotating-a-firebase-deploy-sa-key). Suspected-compromise containment is a separate owner incident decision.
 
 ## Script Installation
 
@@ -556,13 +556,13 @@ DEPLOY_ALLOW_DIRTY=1 scripts/deploy.sh
 
 When the override is used, the script logs the dirty paths to stderr under a `⚠️  DEPLOY_ALLOW_DIRTY=1` banner so the deviation is visible in the deploy transcript. Never use `--force` or `DEPLOY_ALLOW_DIRTY=1` during routine deploys.
 
-In the legacy wrapper, Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment. `CF_API_TOKEN` is sourced by `scripts/op-preflight.sh --mode deploy` from the shared "All Domains — Cache Purge API token" 1Password item. Do not load it before or during a candidate build; `--mode all` is not a deployment setup. `CF_ZONE_ID` is per-repo, and without both variables the purge step no-ops with a clear log line.
+In the legacy wrapper, Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment. Historically, `CF_API_TOKEN` was sourced by `scripts/op-preflight.sh --mode deploy` from the shared "All Domains — Cache Purge API token" 1Password item; this mode is not an approved deployment setup because cache hits can also export review PATs. Do not load it before or during a candidate build; `--mode all` is not a deployment setup. `CF_ZONE_ID` is per-repo, and without both variables the purge step no-ops with a clear log line.
 
-The legacy deploy-preflight implementation reads credentials in the same order as `op-firebase-deploy`: first the project Firebase-vault SA key identified by `.firebaserc`, then shared GCP ADC. Do not run it in a session or process that builds candidate code; deploy credential acquisition belongs in trusted post-build tooling after artifact verification.
+The legacy deploy-preflight implementation prefers the project Firebase-vault SA key identified by `.firebaserc`, then shared GCP ADC. This is not the full `op-firebase-deploy` credential precedence: the wrapper first honors a genuine human-supplied `GOOGLE_APPLICATION_CREDENTIALS` override, then the project SA key, preflight-injected shared ADC, direct shared ADC, and local ADC. These are runtime facts only. Do not run deploy preflight in a session or process that builds candidate code; current preflight also exports review PATs on cache hits and exports into the caller's whole shell.
 
 Because deploy preflight exports the selected credential through `GOOGLE_APPLICATION_CREDENTIALS`, ordinary `gcloud` commands in that same shell may also see the project SA key. For broad, non-deploy `gcloud` work, use review preflight only or unset `GOOGLE_APPLICATION_CREDENTIALS` and let the `scripts/gcloud/gcloud` wrapper resolve its normal ADC chain.
 
-Do not run `op-firebase-deploy` or `firebase deploy` for production. They lack the required credential-free build and trusted artifact verification/deploy boundary; the branch/freshness guards and cache purge do not provide that boundary.
+Do not run `op-firebase-deploy` or `firebase deploy` for production. They lack the required credential-free build and trusted artifact verification/deploy boundary; the branch/freshness guards and cache purge do not provide that boundary. The commands below describe legacy wrapper behavior only; they are not approved deployment or validation procedures.
 
 Under the hood, `scripts/deploy.sh` delegates to `op-firebase-deploy` with any arguments after `--`:
 
@@ -615,7 +615,7 @@ FIREBASE_IMPERSONATION_MEMBER=email@example.com op-firebase-setup {project-id}
 4. Grants your user `roles/iam.serviceAccountTokenCreator` on the deployer service account
 5. Creates or updates a dedicated `gcloud` configuration named `{project-id}` with project, impersonation, and `billing/quota_project` defaults
 
-`op-firebase-setup` can still print Google Cloud's generic ADC quota warning if the source credential was originally stamped for another project. That warning is expected here: the wrapper and `op-firebase-deploy` both override quota attribution to the target project for actual commands and deploys.
+`op-firebase-setup` can still print Google Cloud's generic ADC quota warning if the source credential was originally stamped for another project. That warning is expected here: the legacy wrapper and `op-firebase-deploy` override quota attribution to the target project for their runtime commands; this does not authorize production deployment.
 
 Optional after setup:
 
@@ -627,17 +627,9 @@ That makes `gcloud` default to the project-specific impersonated configuration f
 
 ## Rollback Procedure
 
-Firebase Hosting supports instant rollback:
+**Production rollback is blocked.** Do not use the Firebase CLI or Console to roll back the live Hosting release. This repository has no approved path to verify and deploy a prior immutable artifact with scoped post-build credentials; the production deployment block applies to rollback too.
 
-```bash
-# List recent releases
-firebase hosting:releases:list
-
-# Roll back via CLI
-firebase hosting:channel:deploy live --release-id <VERSION_ID>
-```
-
-Or use Firebase Console → Hosting → Release History → Roll back.
+Do not treat a release ID, console history, or a direct `firebase hosting:channel:deploy live --release-id ...` command as artifact verification or authorization. Rollback can be documented and enabled only after separately reviewed tooling verifies the prior artifact's digest and repository/revision attestation, then deploys it without rebuilding candidate code.
 
 ## Post-Deployment Verification
 
@@ -758,77 +750,14 @@ rm -f "$KEY_PATH"
 
 ### Rotating a Firebase deploy SA key
 
-The SA key remains the legacy resolver's configured source per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical); this does not authorize production deployment. Rotate it on a calendar cadence and on demand for any of these triggers:
+The SA key remains the legacy resolver's configured source per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical); this does not authorize production deployment. Review its age on a 90-day cadence and after any of these triggers; routine replacement remains incomplete until the non-deploying validator below is available:
 
-- **Calendar rotation** — target every 90 days. Track the last-rotation timestamp in the 1Password item's notes field so the next rotation is auditable.
-- **Compromise indicator** — key leaked in logs/screenshots, exposed by a misconfigured CI runner, or invalidated by org policy. Rotate immediately and audit downstream usage.
+- **Calendar review** — review key age every 90 days and track the last completed rotation in the 1Password item's notes field.
+- **Compromise indicator** — key leaked in logs/screenshots, exposed by a misconfigured CI runner, or invalidated by org policy. Treat this as an urgent owner-led incident decision; this routine-rotation guide neither authorizes revocation nor requires a production deployment to validate or contain the incident.
 - **Personnel change affecting key custody** — a maintainer with 1Password vault access leaves, or vault membership changes.
 
-Procedure (assumes `op-firebase-setup` already ran, the `firebase-deployer` SA exists, and your principal has `iam.serviceAccountKeyAdmin` on the project):
+**Routine replacement rotation cannot be completed with this runbook today.** Do not replace the canonical 1Password key, declare routine rotation complete, or revoke the prior working key until separately reviewed, non-deploying validation proves the replacement credential usable. Do not use a production or low-risk deploy for routine validation; item metadata, key IDs, and resolver logs do not establish usability. Suspected-compromise containment is a separate owner incident decision: this guide neither authorizes revocation nor requires a production deployment to validate or contain the incident.
 
-```bash
-PROJECT_ID="{project-id}"
-SA_EMAIL="firebase-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
-KEY_PATH="$(mktemp -t firebase-sa-key.json)"
-
-# 1. Mint a new JSON key for the deployer SA.
-gcloud iam service-accounts keys create "$KEY_PATH" \
-  --iam-account="$SA_EMAIL" \
-  --project="$PROJECT_ID"
-
-# 2. Capture the old key's id BEFORE replacing the 1Password item, so
-#    we can revoke it cleanly after verification. The old key's
-#    private_key_id is also stored inside the 1Password item.
-OLD_KEY_ID=$(op document get "${PROJECT_ID} — Firebase Deployer SA Key" \
-  --vault Firebase 2>/dev/null \
-  | jq -r '.private_key_id')
-
-# 3. Replace the 1Password item with the new key. Use the SAME title
-#    "{project-id} — Firebase Deployer SA Key" so op-firebase-deploy's
-#    item-title lookup keeps working without a per-rotation script edit.
-#    Update the item's notes to record the rotation date.
-op document edit "${PROJECT_ID} — Firebase Deployer SA Key" \
-  "$KEY_PATH" \
-  --vault Firebase \
-  --notes "Rotated $(date -u +%Y-%m-%d) (see DEPLOYMENT.md § Rotating a Firebase deploy SA key)"
-
-# 4. Wipe the local copy.
-rm -f "$KEY_PATH"
-
-# 5. Verify with a non-prod deploy. The source-credential log line
-#    must still show "project Firebase-vault SA key" — if it falls
-#    through to a different source, the new key isn't being read
-#    (mistyped item title, vault permissions, etc.) and rolling
-#    forward could leave the project on stale auth.
-op-firebase-deploy --only hosting   # or any low-risk target
-
-# 6. Once the new-key deploy succeeds, revoke the old key in GCP.
-#    Doing this AFTER step 5 ensures we never leave the project
-#    without a valid key.
-if [ -n "$OLD_KEY_ID" ]; then
-  gcloud iam service-accounts keys delete "$OLD_KEY_ID" \
-    --iam-account="$SA_EMAIL" \
-    --project="$PROJECT_ID" --quiet
-fi
-
-# 7. (Optional) Record the rotation in the repo's CHANGELOG.md or
-#    deploy log if the repo tracks security events. The 1Password
-#    notes field from step 3 is the primary record.
-```
-
-This procedure is intentionally human-only — the bootstrap wizard (#156) does NOT automate rotation. Rotation cadence is low enough (quarterly) that the manual path is fine, and the cost of a botched automation (silently invalidating production deploy auth across multiple consumers) exceeds the benefit. If a maintainer wants to rotate keys for several projects in a single sitting, run the procedure above once per project — `PROJECT_ID` is the only thing that changes between iterations.
-
-If step 5 fails (deploy doesn't pick up the new key), the most common causes are:
-- **Mistyped item title.** The script reads `op://Firebase/{project-id} — Firebase Deployer SA Key` exactly. Confirm with `op item get "${PROJECT_ID} — Firebase Deployer SA Key" --vault Firebase`.
-- **Stale `op` session.** Run `op signin` and re-try.
-- **Source credential precedence override.** A `GOOGLE_APPLICATION_CREDENTIALS` env var set outside preflight wins over the SA key. Unset it and re-run.
-
-**Roll back / recovery.** GCP does NOT let you re-download a previous key's private JSON — only `private_key_id` (which step 2 captures) is recoverable, and that's just the public identifier, not the key material. So the rollback path depends on what you retained:
-
-- **If you saved a backup of the old deployer SA key JSON BEFORE step 3** (e.g., the JSON file `gcloud iam service-accounts keys create` wrote in step 1 of the prior rotation, copied to a separate secure tempfile or `op document create -old` item), restore that backup into the 1Password item with the same canonical title and re-run step 5. This is the only true rollback.
-- **If no backup exists** (the common case, since step 3 overwrites the only canonical copy), the recovery is roll-FORWARD, not roll-back: mint a fresh key with step 1, replace the 1Password item with it (step 3), verify with step 5, then revoke any keys still attached to the SA that aren't the new one. Only step 6 (revoking the prior key) is destructive — if you haven't reached step 6 yet, the prior key is still valid in GCP and the most reliable recovery is to delete the failed-verification 1Password item entry, re-fetch the prior key from a secure backup if available, or mint-and-rotate again.
-
-The takeaway: if you want a recoverable rollback, retain a copy of the old JSON before step 3 and store it temporarily in a secure location (e.g., another `op document create`-ed item with `-old` in the title, then delete after the new key is verified).
 
 ## Auth Maintenance
 
@@ -870,7 +799,7 @@ A closely-related but distinct failure can fire immediately after the reauth abo
 Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: /var/folders/.../op-preflight-adc-*
 ```
 
-Starting with the #137 fix, `op-preflight.sh` validates the materialized ADC against the OAuth2 `/token` endpoint before exporting `GOOGLE_APPLICATION_CREDENTIALS`. In Firebase repos, deploy preflight tries the project Firebase-vault SA key before this shared ADC path, so a provisioned project key avoids the RAPT-prone credential entirely. When the shared ADC is still needed and is stale, preflight prints an actionable warning and skips the export — downstream callers (`op-firebase-deploy`, `gcloud` wrappers) then fall back to the next available credential.
+Starting with the #137 fix, `op-preflight.sh` validates the materialized ADC against the OAuth2 `/token` endpoint before exporting `GOOGLE_APPLICATION_CREDENTIALS`. In Firebase repos, legacy deploy preflight tries the project Firebase-vault SA key before this shared ADC path, so a provisioned project key avoids the RAPT-prone credential in that runtime path. When the shared ADC is still needed and is stale, preflight prints an actionable warning and skips the export — legacy downstream callers (`op-firebase-deploy`, `gcloud` wrappers) then fall back to the next available credential. These resolver facts do not authorize production deployment.
 
 **Fix permanently** by refreshing the 1Password item:
 

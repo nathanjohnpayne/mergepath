@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# op-preflight.sh — Resolve 1Password credentials for review or trusted deployment.
+# op-preflight.sh — Resolve 1Password credentials for review and legacy deploy flows.
 #
 # Deployment credentials belong only in trusted post-build tooling, after a
 # successful build and verification of its immutable artifact. Repository build
@@ -12,8 +12,12 @@
 # session and write resolved secrets to a chmod-600 session file under
 # $XDG_CACHE_HOME/mergepath/ (default $HOME/.cache/mergepath/). Subsequent
 # invocations within the TTL window read the session file and emit the same
-# export statements WITHOUT triggering biometric. Deploy mode is separate:
-# only trusted post-build tooling may invoke it, after artifact verification.
+# export statements WITHOUT triggering biometric. Deploy mode is legacy and
+# is not an approved deployment setup: cache hits can emit review PATs too,
+# and evaluating exports places credentials in the caller's whole shell.
+# Do not use deploy-mode output until separately reviewed tooling selects only
+# deploy credentials and scopes them to one consuming subprocess after
+# verified-artifact checks.
 #
 # This is what makes review-mode use work from agent drivers (Claude Code,
 # Cursor, Codex CLI) where each tool call spawns a fresh subshell and cannot
@@ -33,17 +37,15 @@
 #   # Force a fresh fetch even if the session file is still warm:
 #   eval "$(scripts/op-preflight.sh --agent claude --refresh)"
 #
-#   # Trusted post-build tooling only, after artifact verification:
-#   eval "$(scripts/op-preflight.sh --agent claude --mode deploy)"
+#   # No approved deploy-mode invocation exists; do not eval deploy exports.
 #
 #   # Delete the session file + ADC tempfile (end-of-session cleanup):
 #   scripts/op-preflight.sh --agent claude --purge
 #
 # Modes:
 #   review  — reviewer PAT + author PAT + SSH key warming for review work (DEFAULT)
-#   deploy  — deploy credentials for trusted post-build tooling after artifact
-#             verification; Firebase project SA key when .firebaserc is present,
-#             else GCP ADC credential + Cloudflare cache-purge token
+#   deploy  — legacy deploy credential export; not approved for deployment
+#             because a cache hit can also export review PATs into the caller
 #   all     — review and deploy credentials together; do not use for repository
 #             builds or as a deployment setup because it combines both contexts
 #
