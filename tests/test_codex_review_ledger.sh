@@ -1027,19 +1027,26 @@ if [ "$RC" = 0 ] && cmp -s "$D_FULL/out" "$D/out" && grep -q '^graphql$' "$D/cal
 else
   fail "CLI anchors unique: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
-for unresolved in ambiguous absent mixed provider; do
+# #2742: malformed raw fields collapse the parsed tuple to reviewed_shas [],
+# the anchorless shape. The default fixture resolves aaaaaaa uniquely, so the
+# malformed cases isolate the raw-field check from prefix resolution.
+for unresolved in ambiguous absent mixed provider malformed malformed-only; do
   fields='Reviewed commit: aaaaaaa'
   [ "$unresolved" != mixed ] || fields=$(printf 'Reviewed commit: %s\nReviewed commit: aaaaaaa' "$HEAD_A")
   [ "$unresolved" != provider ] || fields=$(printf '%s\nYou have reached your Codex usage limits for code reviews.' "$fields")
+  [ "$unresolved" != malformed ] || fields=$(printf 'Reviewed commit: aaaaaaa\nReviewed commit: not-a-sha')
+  [ "$unresolved" != malformed-only ] || fields='Reviewed commit: not-a-sha'
   D="$WORK/anchor-$unresolved"; anchor_case "$D" "$fields"
-  if [ "$unresolved" = absent ]; then
+  if [ "$unresolved" = malformed ] || [ "$unresolved" = malformed-only ]; then
+    :
+  elif [ "$unresolved" = absent ]; then
     printf '%s\n' '{"data":{"repository":{"b0":null,"t0":null,"c0":null}}}' >"$D/anchor-resolution.json"
   else
     printf '%s\n' '{"errors":[{"message":"ambiguous commit prefix","path":["repository","c0"]}],"data":{"repository":{"b0":null,"t0":null,"c0":null}}}' >"$D/anchor-resolution.json"
   fi
   RC=$(run_cli "$D")
   if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet" and .requests[0].responses == []' "$D/out" >/dev/null; then
-    pass "CLI anchors: $unresolved abbreviation cannot answer a pending request or gain head authority"
+    pass "CLI anchors: $unresolved anchor fields cannot answer a pending request or gain head authority"
   else
     fail "CLI anchors $unresolved: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
   fi

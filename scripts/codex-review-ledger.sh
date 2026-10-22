@@ -399,7 +399,19 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # The resolver preserves unresolved raw prefixes. Unlike the checker's exact
 # head selector, the attribution engine accepts prefixes, so exclude their
 # entire verdict rather than turning it into an attributable anchorless one.
-VERDICTS=$(jqx "verdicts" -c 'map(select(all(.reviewed_shas[]; length == 40))) | unique_by(.comment_id)' <<<"$VERDICTS")
+# crqe_verdicts collapses a tuple with any malformed field to an empty
+# reviewed_shas, which is indistinguishable from a genuinely anchorless
+# verdict (#2742). Only a comment with no raw anchor field at all may be
+# anchorless; one whose raw fields parsed to nothing is excluded too.
+RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
+  [ .[] | select((.user.login // "") == $bot)
+    | select([(.body // "") | ascii_downcase | scan("reviewed commit")] | length > 0)
+    | .id ]' <<<"$ISSUE_COMMENTS")
+VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" '
+  map(select(if (.reviewed_shas | length) == 0
+             then (.comment_id as $id | $raw | any(.[]; . == $id) | not)
+             else all(.reviewed_shas[]; length == 40) end))
+  | unique_by(.comment_id)' <<<"$VERDICTS")
 # PR-level reactions cannot establish a response or test a rebuttal. Keep the
 # legacy input field empty; request eyes and finding feedback are independent.
 REACTIONS='[]'
