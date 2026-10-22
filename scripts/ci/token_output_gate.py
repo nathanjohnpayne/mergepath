@@ -2236,11 +2236,11 @@ class Lexer:
                     # This child still occupies the here-string operand word.
                     # A width-only marker must not look like output redirection.
                     cur_level()["word"].append("<()")
-                elif (resolve_command(probe)[0] == "tee" and redirection
-                        and redirection.end() == len(previous)
+                elif (redirection and redirection.end() == len(previous)
                         and not cur_level()["word"]):
-                    # Consume this tee redirection's target word, so a later
-                    # standalone process operand is not mistaken for its target.
+                    # The consumed target occupies a word even before the
+                    # command appears. Resolving later must not consume the
+                    # command word as this redirection's target instead.
                     cur_level()["word"].append("<()")
                 seg = self._new_segment(parent_seg, False, line)
                 cur_ll.segments.append(seg)
@@ -16047,7 +16047,60 @@ def _tee_process_substitution_cases():
                   if seg.parent is None and resolve_command(seg)[0] == "tee"]
         if [len(seg.tee_output_processes) for seg in owners] != [0, 1]:
             failures.append("tee delimiter lifetime: later-command ownership " + cid)
+    for text, command, index, links, sidewrite in [
+        ('3> >(cat >/dev/null) tee >(cat >&2) >/dev/null\n', "tee", 2, 1, True),
+        ('3> >(cat >/dev/null) tee >(cat >/dev/null) >/dev/null\n', "tee", 2, 1, False),
+        ('tee 3> >(cat >/dev/null) >(cat >&2)\n', "tee", 0, 1, True),
+        ('tee 3> >(cat >/dev/null) >(cat >/dev/null)\n', "tee", 0, 1, False),
+        ('3> >(cat >&2) tee >(cat >/dev/null)\n', "tee", 2, 1, False),
+        ('3> >(cat >/dev/null) tee\n', "tee", 2, 0, False),
+        ('3> >(cat >/dev/null) printf %s safe\n', "printf", 2, 0, False),
+        ('3> >(cat >/dev/null) 4> >(cat >/dev/null) tee >(cat >&2)\n', "tee", 4, 1, True),
+    ]:
+        segments = [seg for ll in Lexer(text).logical for seg in ll.segments
+                    if seg.parent is None and seg.words]
+        if len(segments) != 1:
+            failures.append("tee leading target: segment count " + repr(text))
+            continue
+        owner = segments[0]
+        if resolve_command(owner)[0] != command or owner._cmd_index != index:
+            failures.append("tee leading target: command/index " + repr(text))
+        if len(owner.tee_output_processes) != links:
+            failures.append("tee leading target: operand ownership " + repr(text))
+        if _tee_process_substitution_sidewrite(owner) != sidewrite:
+            failures.append("tee leading target: consumer boundary " + repr(text))
+    for cid, expected, body in _tee_leading_target_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee leading target: " + cid)
+        if findings and [finding.line for finding in findings] != [1]:
+            failures.append("tee leading target: physical reference line " + cid)
+        lx = Lexer(body)
+        ref = next(ref for ll in lx.logical for ref in ll.refs if ref.name == "GH_TOKEN")
+        owner = ref.seg.pipe_to
+        child_stderr = cid == "tee-leading-target-stderr"
+        reached, reason = reaches_output(ref, set())
+        if (owner is None or resolve_command(owner)[0] != "tee"
+                or _tee_process_substitution_sidewrite(owner) != child_stderr):
+            failures.append("tee leading target: child sink distinction " + cid)
+        # Null child output stays quiet; the existing terminal tee route
+        # still flags independently, without grading >/dev/null destinations.
+        expected_reason = ("tee, whose output process substitution writes to stderr"
+                           if child_stderr else "tee")
+        if not reached or reason != _why("piped standard input", expected_reason):
+            failures.append("tee leading target: inherited terminal route " + cid)
     return failures
+
+
+def _tee_leading_target_cases():
+    """Inert leading-target declarations for parent-only native checks."""
+    prefix = 'printf %s "$GH_TOKEN" | 3> >(cat >/dev/null) tee '
+    return [
+        ("tee-leading-target-stderr", MUST_FLAG,
+         prefix + '>(cat >&2) >/dev/null\n'),
+        ("tee-leading-target-null", MUST_FLAG,
+         prefix + '>(cat >/dev/null) >/dev/null\n'),
+    ]
 
 
 def _tee_delimiter_lifetime_cases():
@@ -17259,6 +17312,15 @@ CORPUS += _tee_continuation_cases()
 CORPUS += _tee_identity_cases()
 CORPUS += _tee_routing_cases()
 CORPUS += _tee_delimiter_lifetime_cases()
+CORPUS += _tee_leading_target_cases()
+KNOWN_BROADER["tee-leading-target-null"] = (
+    "The measured leading-target/null-child fixture is quiet in all three "
+    "shapes on host/GNU profiles. Its child sidewrite predicate is false, but "
+    "the existing terminal tee emission route does not grade the trailing "
+    ">/dev/null destination. Correct target width restores that retained "
+    "conservative route; the matched post-command fixture already flags. "
+    "No descriptor-flow relaxation is claimed."
+)
 # The same reviewed case/body now records the approved conservative reduction.
 KNOWN_BROADER.update({cid: (
     "This unchanged own help/version fixture is quiet for the measured tee "
@@ -17387,6 +17449,7 @@ KNOWN_MISS_SHAPES = {
 }
 
 KNOWN_BROADER_SHAPES = {
+    'tee-leading-target-null': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-review-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-review-version': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-review-quoted-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
