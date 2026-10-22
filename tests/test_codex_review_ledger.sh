@@ -912,6 +912,7 @@ make_cli_case() {
              feedback-policy-helpers.sh codex-review-ledger.sh; do
     cp "$ROOT/scripts/lib/$lib" "$dir/scripts/lib/"
   done
+  cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/"
   cat >"$dir/scripts/workflow/resolve_base_policy.sh" <<'EOF'
 #!/usr/bin/env bash
 [ "${LEDGER_TEST_RESOLVER_FAIL:-0}" = 1 ] && exit 3
@@ -965,7 +966,12 @@ case "$1" in
   repos/o/r/issues/7/timeline) printf '[]\n' ;;
   # #2591: the GraphQL force-push timeline.
   graphql)
-    if [ -f "$LEDGER_TEST_DIR/graphql.json" ]; then cat "$LEDGER_TEST_DIR/graphql.json"; else echo "no graphql fixture" >&2; exit 1; fi ;;
+    case "$*" in
+      *'object(expression:'*)
+        case " $* " in *' owner=o '*' name=r '*) ;; *) echo 'wrong anchor repository' >&2; exit 99 ;; esac
+        cat "$LEDGER_TEST_DIR/anchor-resolution.json" ;;
+      *) if [ -f "$LEDGER_TEST_DIR/graphql.json" ]; then cat "$LEDGER_TEST_DIR/graphql.json"; else echo "no graphql fixture" >&2; exit 1; fi ;;
+    esac ;;
   # #2534: a head-to-head compare, filtered by the caller's --jq like gh does.
   repos/o/r/compare/*)
     [ -f "$LEDGER_TEST_DIR/compare.json" ] || { echo "no compare fixture" >&2; exit 1; }
@@ -993,11 +999,79 @@ run_cli() { # <dir> [args...]
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/codex-review-ledger.XXXXXX")
 trap 'rm -rf "$WORK" "$TB_DIR"' EXIT
 
+# #2686: run the production CLI, shared parser and real anchor resolver.
+# Only GitHub's disambiguation response is stubbed. A first pending request
+# makes an accidental anchorless fallback observable as false attribution.
+anchor_case() { # directory anchor fields [bot]
+  local dir=$1 fields=$2 bot=${3:-chatgpt-codex-connector[bot]}
+  make_cli_case "$dir"
+  printf 'author_identity: nathanjohnpayne\ncodex:\n  bot_login: "%s"\n' "$bot" >"$dir/policy.yml"
+  jq -n --arg bot "$bot" --arg fields "$fields" '
+    [{id:101,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-09-25T00:00:00Z"},
+     {id:103,user:{login:$bot},created_at:"2026-09-25T00:05:00Z",
+      body:("Codex Review: Didn\u0027t find any major issues.\n" + $fields)}]' >"$dir/issue_comments.json"
+  printf '%s\n' '{"data":{"repository":{"b0":null,"t0":null,"c0":{"__typename":"Commit","oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}' >"$dir/anchor-resolution.json"
+}
+D="$WORK/anchor-full"; anchor_case "$D" "Reviewed commit: $HEAD_A" ledger-codex-bot
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e --arg head "$HEAD_A" '.summary.responses == 1 and .responses[0].anchor == $head and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+  pass "CLI anchors: a full SHA answers the current pending request"
+else
+  fail "CLI anchors full: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+D_FULL=$D
+D="$WORK/anchor-unique"; anchor_case "$D" 'Reviewed commit: aaaaaaa' ledger-codex-bot
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && cmp -s "$D_FULL/out" "$D/out" && grep -q '^graphql$' "$D/calls"; then
+  pass "CLI anchors: a unique abbreviation with the governing bot is equivalent to the full SHA"
+else
+  fail "CLI anchors unique: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# #2742: malformed raw fields collapse the parsed tuple to reviewed_shas [],
+# the anchorless shape. The default fixture resolves aaaaaaa uniquely, so the
+# malformed cases isolate the raw-field check from prefix resolution.
+for unresolved in ambiguous absent mixed provider malformed malformed-only; do
+  fields='Reviewed commit: aaaaaaa'
+  [ "$unresolved" != mixed ] || fields=$(printf 'Reviewed commit: %s\nReviewed commit: aaaaaaa' "$HEAD_A")
+  [ "$unresolved" != provider ] || fields=$(printf '%s\nYou have reached your Codex usage limits for code reviews.' "$fields")
+  [ "$unresolved" != malformed ] || fields=$(printf 'Reviewed commit: aaaaaaa\nReviewed commit: not-a-sha')
+  [ "$unresolved" != malformed-only ] || fields='Reviewed commit: not-a-sha'
+  D="$WORK/anchor-$unresolved"; anchor_case "$D" "$fields"
+  if [ "$unresolved" = malformed ] || [ "$unresolved" = malformed-only ]; then
+    :
+  elif [ "$unresolved" = absent ]; then
+    printf '%s\n' '{"data":{"repository":{"b0":null,"t0":null,"c0":null}}}' >"$D/anchor-resolution.json"
+  else
+    printf '%s\n' '{"errors":[{"message":"ambiguous commit prefix","path":["repository","c0"]}],"data":{"repository":{"b0":null,"t0":null,"c0":null}}}' >"$D/anchor-resolution.json"
+  fi
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet" and .requests[0].responses == []' "$D/out" >/dev/null; then
+    pass "CLI anchors: $unresolved anchor fields cannot answer a pending request or gain head authority"
+  else
+    fail "CLI anchors $unresolved: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+D="$WORK/anchor-error"; anchor_case "$D" 'Reviewed commit: aaaaaaa'
+printf 'raise RuntimeError("fixture resolver failure")\n' >"$D/scripts/workflow/resolve-codex-verdict-anchors.py"
+RC=$(run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'cannot resolve Codex verdict anchors' "$D/err"; then
+  pass "CLI anchors: resolver execution failure exits 3 without a ledger"
+else
+  fail "CLI anchors error: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+D="$WORK/anchor-legacy"; anchor_case "$D" ''
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.summary.responses == 1 and .responses[0].anchor == null and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+  pass "CLI anchors: genuinely anchorless verdicts retain their existing attribution"
+else
+  fail "CLI anchors legacy: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
 D="$WORK/ok"; make_cli_case "$D"
 jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
         {id: 102, user: {login: "nathanpayne-claude"}, body: "@codex review", created_at: "2026-09-25T00:01:00Z"},
         {id: 103, user: {login: "chatgpt-codex-connector[bot]"}, created_at: "2026-09-25T00:05:00Z",
-         body: "Codex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `aaaaaaa`"}]' >"$D/issue_comments.json"
+         body: "Codex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D")
 if [ "$RC" = 0 ] && jq -e '.summary.requests == 1 and .summary.foreign_requests == 1
      and ([.requests[] | select(.counted) | .id] == [101]) and .responses[0].class == "clean"
@@ -1384,7 +1458,7 @@ codex:
 EOF
 jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
         {id: 103, user: {login: "chatgpt-codex-connector[bot]"}, created_at: "2026-09-25T00:05:00Z",
-         body: "Codex Review: No major issues.\n**Reviewed commit:** `aaaaaaa`"}]' >"$D/issue_comments.json"
+         body: "Codex Review: No major issues.\n**Reviewed commit:** `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D")
 if [ "$RC" = 0 ] && jq -e '.bot == "chatgpt-codex-connector[bot]" and .summary.responses == 1' "$D/out" >/dev/null; then
   pass "CLI: an empty codex.bot_login falls back to the default bot, as the gate does"
@@ -1398,7 +1472,7 @@ D="$WORK/botquote"; make_cli_case "$D"
 jq -n '[{id: 101, user: {login: "nathanjohnpayne", type: "User"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
         {id: 102, user: {login: "coderabbitai[bot]", type: "Bot"}, body: "> @codex review\nQuoted for context.", created_at: "2026-09-25T00:01:00Z"},
         {id: 103, user: {login: "chatgpt-codex-connector[bot]", type: "Bot"}, created_at: "2026-09-25T00:05:00Z",
-         body: "Codex Review: No major issues.\n**Reviewed commit:** `aaaaaaa`"}]' >"$D/issue_comments.json"
+         body: "Codex Review: No major issues.\n**Reviewed commit:** `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D" --summary)
 if [ "$RC" = 0 ] && grep -q '^requests: 1 counted, 0 foreign' "$D/out" && grep -q '^counted outcomes: attributed 1,' "$D/out" \
    && grep -q '^foreign outcomes: attributed 0, ambiguous 0' "$D/out"; then
