@@ -699,18 +699,23 @@ p4b_governing_policy_json() {
 # liveness risk), never lets one past the cap. Holds, polls and attempts that
 # published nothing leave no review and are never counted. Each round reports
 # the run nonce it carries, which marks its reservation consumed. Prints
-# {completed, rounds:[{id,head,state,run}]}; returns 1 on a non-array or a
-# qualifying review without a numeric id (fail closed).
+# {completed, rounds:[{id,head,state,run}]}; returns 1 on a non-array or on
+# any record that is not a review object with a numeric id and a string state
+# (fail closed: malformed history never reads as empty history).
 p4b_completed_rounds_from_reviews() {
   printf '%s' "${1:-}" | jq -ce --arg author "${2:-}" '
     if type != "array" then error("reviews are not an array") else . end
+    # Every record must look like a GitHub review before any is filtered out:
+    # silently skipping junk would read malformed history as empty history.
+    | if all(.[]; type == "object" and (.id | type) == "number" and (.state | type) == "string"
+                  and ((.body | type) as $t | $t == "string" or $t == "null")
+                  and ((.user | type) as $t | $t == "object" or $t == "null"))
+      then . else error("malformed review record") end
     | [ .[]
-        | select(type == "object")
         | select(((.user.login // "") | ascii_downcase) != ($author | ascii_downcase))
-        | select((.state // "") as $s | ["APPROVED","CHANGES_REQUESTED","DISMISSED"] | index($s) != null)
+        | select(.state as $s | ["APPROVED","CHANGES_REQUESTED","DISMISSED"] | index($s) != null)
         | select((.body // "") | startswith("**Automated Phase 4b review**"))
         | select((.body // "") | contains("_Posted by scripts/phase-4b-review.sh"))
-        | if (.id | type) == "number" then . else error("qualifying review without an id") end
         | {id, head:(.commit_id // null), state,
            run:(((.body // "") | capture("<!-- mergepath-p4b-run: (?<r>[A-Za-z0-9._-]+) -->") | .r)? // null)} ]
     | unique_by(.id)
@@ -755,16 +760,24 @@ p4b_round_ledger_message() {
 # by every completed round no reserved entry accounts for: a legacy review, a
 # review with no run id, or a review by a run whose entry reads released (a
 # writer that published anyway is counted, never dropped). Released entries
-# free their slot only while no review carries their run id. Duplicate runs
-# count once per entry. Prints {occupied, in_flight, completed, legacy, cap}.
+# free their slot only while no review carries their run id. A reserved run
+# occupies max(its entries, its reviews): duplicate entries each keep a slot,
+# and several reviews carrying one run id each count, so one reservation
+# never absorbs a surplus publication. Prints {occupied, in_flight,
+# completed, legacy, cap}.
 p4b_round_occupancy() {
   local rounds_default='{"rounds":[]}'
   jq -nce --argjson e "${1:-[]}" --argjson r "${2:-$rounds_default}" --argjson cap "${3:-0}" '
     ([$e[] | select(.state == "reserved")]) as $res
-    | ([$res[].run]) as $ledger_runs
+    | ([$res[].run] | unique) as $ledger_runs
     | ([$r.rounds[] | .run as $rr | select($rr == null or (($ledger_runs | index($rr)) == null))]) as $legacy
     | ([$r.rounds[].run | strings]) as $done
-    | {occupied: (($res | length) + ($legacy | length)),
+    # A reserved run occupies one slot per entry or per review carrying its
+    # id, whichever is more: one reservation never absorbs a second review.
+    | ([$ledger_runs[] as $u
+          | [([$res[] | select(.run == $u)] | length), ([$done[] | select(. == $u)] | length)] | max]
+       | add // 0) as $reserved_slots
+    | {occupied: ($reserved_slots + ($legacy | length)),
        in_flight: ([$res[] | .run as $rr | select(($done | index($rr)) == null)] | length),
        completed: ($r.rounds | length), legacy: ($legacy | length), cap: $cap}' 2>/dev/null
 }

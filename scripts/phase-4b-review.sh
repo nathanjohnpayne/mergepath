@@ -846,9 +846,14 @@ P4B_ROUND_AUTHOR=""
 P4B_ROUND_RESERVED=false
 P4B_ROUND_POST_ATTEMPTED=false
 P4B_ROUND_LEDGER_REF=""
-P4B_ROUND_EMPTY_TREE=""
+P4B_ROUND_TREE=""
+P4B_ROUND_WHERE=""
 round_cap_evidence_error() {
   local reason="$1"
+  # At the writer boundary the loop already says posted and approval
+  # follow-ups may be filed; undo them as every pre-POST refusal does.
+  [ "$P4B_ROUND_WHERE" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
   p4b_warn "$reason; stopping without review publication or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
@@ -919,35 +924,50 @@ round_rounds_read() {
   done
   round_cap_evidence_error "Phase 4b round cap: consecutive review reads never agreed"
 }
-# round_ledger_read -> LEDGER_TIP ("" when the ref is absent), LEDGER_ENTRIES.
-round_ledger_read() {
+# round_ledger_load -> LEDGER_TIP ("" when the ref is absent), LEDGER_ENTRIES;
+# rc 1 with ROUND_LEDGER_ERR set when the ledger is unreadable or malformed.
+# It never exits, so the release path in the EXIT trap can use it without
+# emitting a second result or replacing the run's exit status.
+round_ledger_load() {
   local ref_json err rc=0 commit_json
-  err=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger-err.XXXXXX") || round_cap_evidence_error "Phase 4b round cap: no scratch space"
+  ROUND_LEDGER_ERR=""
+  err=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger-err.XXXXXX") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: no scratch space"; return 1; }
   ref_json=$(gh api "repos/$REPO/git/ref/${P4B_ROUND_LEDGER_REF#refs/}" 2>"$err") || rc=$?
   if [ "$rc" -ne 0 ]; then
     if grep -Eq 'HTTP 404|Not Found' "$err" 2>/dev/null; then
       rm -f "$err"; LEDGER_TIP=""; LEDGER_ENTRIES='[]'; return 0
     fi
-    rm -f "$err"; round_cap_evidence_error "Phase 4b round cap: the round ledger ref is unreadable"
+    rm -f "$err"; ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is unreadable"; return 1
   fi
   rm -f "$err"
   LEDGER_TIP=$(printf '%s' "$ref_json" | jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' 2>/dev/null) \
-    || round_cap_evidence_error "Phase 4b round cap: the round ledger ref is malformed"
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is malformed"; return 1; }
   commit_json=$(gh api "repos/$REPO/git/commits/$LEDGER_TIP") \
-    || round_cap_evidence_error "Phase 4b round cap: the round ledger commit is unreadable"
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger commit is unreadable"; return 1; }
   LEDGER_ENTRIES=$(p4b_round_ledger_parse "$(printf '%s' "$commit_json" | jq -r '.message // ""')") \
-    || round_cap_evidence_error "Phase 4b round cap: the round ledger is malformed"
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger is malformed"; return 1; }
+}
+# round_ledger_read: round_ledger_load, failing closed with exit 10.
+round_ledger_read() {
+  round_ledger_load || round_cap_evidence_error "$ROUND_LEDGER_ERR"
 }
 # round_ledger_write <entries-json> -> 0 published, 1 conflict (re-read and
 # re-evaluate), 2 unknown. A lost response is resolved by reading the tip:
 # the update applied exactly when the tip now holds this run's intended state.
+# It never exits; callers decide whether an unknown outcome is fatal.
 round_ledger_write() {
   local entries="$1" message commit rc=0 out
-  if [ -z "$P4B_ROUND_EMPTY_TREE" ]; then
-    P4B_ROUND_EMPTY_TREE=$(round_api POST "repos/$REPO/git/trees" '{"tree":[]}' | jq -er '.sha' 2>/dev/null) || return 2
+  if [ -z "$P4B_ROUND_TREE" ]; then
+    # GitHub refuses an empty tree (`{"tree":[]}` is HTTP 422 "Invalid tree
+    # info") and a repository need not hold git's well-known empty tree, so
+    # the ledger commits carry one constant file. The message is the ledger.
+    P4B_ROUND_TREE=$(round_api POST "repos/$REPO/git/trees" "$(jq -nc '{tree:[{path:"README",mode:"100644",type:"blob",
+        content:"mergepath Phase 4b round ledger (#2663). The tip commit message carries the ledger; see specs/phase_4b_round_cap.md.\n"}]}')" \
+      | jq -er '.sha' 2>/dev/null) || return 2
   fi
   message=$(p4b_round_ledger_message "$PR" "$entries") || return 2
-  commit=$(round_api POST "repos/$REPO/git/commits" "$(jq -nc --arg m "$message" --arg t "$P4B_ROUND_EMPTY_TREE" --arg p "$LEDGER_TIP" \
+  commit=$(round_api POST "repos/$REPO/git/commits" "$(jq -nc --arg m "$message" --arg t "$P4B_ROUND_TREE" --arg p "$LEDGER_TIP" \
       '{message:$m,tree:$t,parents:(if $p == "" then [] else [$p] end)}')" | jq -er '.sha' 2>/dev/null) || return 2
   if [ -z "$LEDGER_TIP" ]; then
     out=$(round_api POST "repos/$REPO/git/refs" "$(jq -nc --arg r "$P4B_ROUND_LEDGER_REF" --arg s "$commit" '{ref:$r,sha:$s}')" 2>&1) || rc=$?
@@ -959,7 +979,7 @@ round_ledger_write() {
     return 1
   fi
   # Unknown outcome: the tip decides.
-  round_ledger_read
+  round_ledger_load || return 2
   [ "$LEDGER_TIP" = "$commit" ] && return 0
   return 1
 }
@@ -967,10 +987,14 @@ round_my_entries() { printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_
 release_round_reservation() { # <why>; writer-only, never after a POST attempt
   [ "$P4B_ROUND_RESERVED" = true ] || return 0
   [ "$P4B_ROUND_POST_ATTEMPTED" != true ] || return 0
-  local attempt entries
+  # Runs from the EXIT trap after the result is out, so it must never exit or
+  # print a result: every failure leaves the slot occupied and only warns.
+  local attempt entries mine
   for attempt in 1 2 3 4 5; do
-    round_ledger_read
-    [ "$(round_my_entries | jq 'length')" = 1 ] || break
+    round_ledger_load || break
+    mine=$(round_my_entries)
+    [ "$(printf '%s' "$mine" | jq 'length')" = 1 ] || break
+    if [ "$(printf '%s' "$mine" | jq -r '.[0].state')" = released ]; then P4B_ROUND_RESERVED=false; return 0; fi
     entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" 'map(if .run == $run then .state = "released" else . end)')
     if round_ledger_write "$entries"; then P4B_ROUND_RESERVED=false; return 0; fi
   done
@@ -990,6 +1014,7 @@ enforce_phase4b_round_cap() {
   fi
   [ "$P4B_ROUND_CAP" != none ] || return 0
   if [ "$where" = pre-post ]; then
+    P4B_ROUND_WHERE=pre-post
     # Binding check: this run's slot must still be its own, exactly once.
     round_ledger_read
     mine=$(round_my_entries)
@@ -1017,8 +1042,9 @@ enforce_phase4b_round_cap() {
       round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR} (${occupied}/${P4B_ROUND_CAP} occupied); an owner decision or a reduced scope is required, and no further automated round runs (#2663)" pre-dispatch
     fi
     entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" --arg head "$HEAD" '. + [{run:$run,head:$head,state:"reserved"}]')
-    # Called directly, never in $( ): it re-reads the ledger into this shell
-    # and its fail-closed stops must exit the run, not a subshell.
+    # Called directly, never in $( ): an unknown outcome re-reads the ledger
+    # into this shell. An unknown outcome may have applied, so it reserves
+    # nothing this run could release; the slot stays occupied.
     local wrc=0
     round_ledger_write "$entries" || wrc=$?
     case "$wrc" in

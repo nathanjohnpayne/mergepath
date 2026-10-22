@@ -55,6 +55,13 @@ else fail "rounds: $out"; fi
 p4b_completed_rounds_from_reviews '{"not":"array"}' x >/dev/null && fail "rounds: a non-array was accepted" || pass "rounds: a non-array review list fails closed"
 bad=$(jq -nc --arg b "**Automated Phase 4b review** x"$'\n'"_Posted by scripts/phase-4b-review.sh" '[{user:{login:"nathanpayne-codex"},state:"APPROVED",body:$b}]')
 p4b_completed_rounds_from_reviews "$bad" x >/dev/null && fail "rounds: a qualifying review without an id was accepted" || pass "rounds: a qualifying review without an id fails closed"
+for junk in '[null]' '[42]' '[{"message":"bad"}]' '[{"id":1,"state":7,"body":""}]' '[{"id":1,"state":"APPROVED","body":{}}]'; do
+  p4b_completed_rounds_from_reviews "$junk" x >/dev/null && fail "rounds: malformed record accepted: $junk" \
+    || pass "rounds: a malformed review record fails closed instead of reading as empty history ($junk)"
+done
+ghost=$(jq -nc --arg b "**Automated Phase 4b review** x"$'\n'"_Posted by scripts/phase-4b-review.sh" '[{id:9,user:null,state:"APPROVED",commit_id:"c",body:$b}]')
+[ "$(p4b_completed_rounds_from_reviews "$ghost" nathanjohnpayne | jq -r .completed)" = 1 ] \
+  && pass "rounds: a review by a deleted (ghost) user is a well-formed record and still counts" || fail "rounds: ghost user"
 
 # ===========================================================================
 # Pure: governing cap
@@ -92,6 +99,10 @@ R='{"rounds":[{"id":1,"run":null},{"id":2,"run":"a"}]}'
 # Duplicate run entries each occupy.
 [ "$(occ '[{"run":"d","state":"reserved"},{"run":"d","state":"reserved"}]' '{"rounds":[]}')" = '[2,2,0]' ] \
   && pass "occupancy: duplicate run entries each keep a slot occupied" || fail "occupancy: duplicates"
+# Several reviews carrying one reserved run id each count; one reservation never absorbs them.
+[ "$(occ '[{"run":"a","state":"reserved"}]' '{"rounds":[{"id":1,"run":"a"},{"id":2,"run":"a"}]}')" = '[2,0,0]' ] \
+  && [ "$(occ '[{"run":"a","state":"reserved"}]' '{"rounds":[{"id":1,"run":"a"},{"id":2,"run":"a"},{"id":3,"run":null}]}')" = '[3,0,1]' ] \
+  && pass "occupancy: surplus reviews carrying one reserved run id each occupy a slot" || fail "occupancy: surplus $(occ '[{"run":"a","state":"reserved"}]' '{"rounds":[{"id":1,"run":"a"},{"id":2,"run":"a"}]}')"
 
 # ===========================================================================
 # Pure: reconciliation of an uncertain POST
@@ -159,8 +170,17 @@ case "$method:$endpoint" in
   GET:repos/owner/repo/git/commits/*)
     sha=${endpoint##*/}; [ -f "$S/commits/$sha" ] || { echo "HTTP 404" >&2; exit 1; }
     jq -nc --rawfile m "$S/commits/$sha" --arg sha "$sha" '{sha:$sha,message:$m}' ;;
-  POST:repos/owner/repo/git/trees) printf '{"sha":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"}\n' ;;
+  POST:repos/owner/repo/git/trees)
+    # Like GitHub: an empty tree is HTTP 422 "Invalid tree info".
+    jq -e '(.tree | type) == "array" and (.tree | length) > 0
+           and all(.tree[]; (.path | type) == "string" and .mode == "100644" and .type == "blob"
+                            and (.content | type) == "string")' "$input" >/dev/null 2>&1 \
+      || { echo "gh: Invalid tree info (HTTP 422)" >&2; exit 1; }
+    sha=$(jq -cS . "$input" | shasum | cut -c1-40); mkdir -p "$S/trees"; : >"$S/trees/$sha"
+    printf '{"sha":"%s"}\n' "$sha" ;;
   POST:repos/owner/repo/git/commits)
+    tree=$(jq -r '.tree // ""' "$input")
+    [ -n "$tree" ] && [ -f "$S/trees/$tree" ] || { echo "gh: Tree SHA does not exist (HTTP 422)" >&2; exit 1; }
     msg=$(jq -r .message "$input"); parent=$(jq -r '.parents[0] // ""' "$input")
     sha=$(printf '%s|%s' "$parent" "$msg" | shasum | cut -c1-40)
     mkdir -p "$S/commits"; printf '%s' "$msg" >"$S/commits/$sha"; printf '%s' "$parent" >"$S/parents.$sha"
@@ -323,8 +343,15 @@ T
 for variant in released duplicated removed; do
   fresh "p10-$variant" 3
   TAMPER=$variant H_HOOK="$WORK/tamper.sh" run me reserve hook prepost
-  [ "$RC" = 10 ] && pass "P10: pre-POST refuses a slot that was $variant by someone else mid-run (exit 10, nothing published)" || fail "P10 $variant rc=$RC $OUT"
+  [ "$RC" = 10 ] && grep -q '^\[cleanup\] Phase 4b round cap' "$S/err.me" \
+    && pass "P10: pre-POST refuses a slot that was $variant by someone else mid-run (exit 10, nothing published, pre-POST side effects undone)" || fail "P10 $variant rc=$RC $OUT"
 done
+# An unreadable ledger at the writer boundary also undoes the pre-POST side effects.
+printf '#!/usr/bin/env bash\necho 1 >"$FAKE_GH_STATE/knob.ref_fail"\n' >"$WORK/ref-fail.sh"
+fresh p10-unreadable 3
+H_HOOK="$WORK/ref-fail.sh" run me reserve hook prepost
+[ "$RC" = 10 ] && grep -q '^\[cleanup\] Phase 4b round cap: the round ledger ref is unreadable' "$S/err.me" \
+  && pass "P10: an unreadable ledger at the pre-POST check exits 10 and undoes the pre-POST side effects" || fail "P10 unreadable rc=$RC $(cat "$S/err.me")"
 
 # P11: the writer's own release before any POST frees its slot for the next caller.
 fresh p11 1
@@ -372,6 +399,26 @@ run me reserve
 fresh p17 2; review 1 x APPROVED "$HEAD_A" | arr >"$S/reviews.json"
 run a reserve; H_HEAD=$HEAD_B run b reserve
 [ "$RC" = 6 ] || [ "$RC" = 8 ] && pass "P17: rounds on an earlier head still count after the head changes (no reset)" || fail "P17 rc=$RC $OUT"
+
+# P18: a release whose ledger read fails (it runs from the EXIT trap after the
+# result is out) only warns: no second result, no exit 10, and the slot stays.
+fresh p18 3
+H_HOOK="$WORK/ref-fail.sh" run me reserve hook release
+rm -f "$S/knob.ref_fail"
+[ "$RC" = 0 ] && [ "$(jq -r .exit <<<"$OUT")" = 0 ] && ! grep -q 'stopping without review publication' "$S/err.me" \
+  && grep -q 'stays occupied' "$S/err.me" && [ "$(reserved_runs)" = '["me"]' ] \
+  && pass "P18: a release that cannot read the ledger warns and returns; it never emits a second result or replaces the exit status" \
+  || fail "P18 rc=$RC $OUT $(cat "$S/err.me")"
+
+# P19: two reviews carrying one reserved run id (a surplus publication) occupy
+# two slots: with one legacy round the cap of 3 is spent, never a fourth round.
+fresh p19 3
+run a reserve
+{ review 1 x APPROVED "$HEAD_A" a; review 2 x APPROVED "$HEAD_A" a; review 3 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
+run b reserve
+[ "$RC" = 8 ] && [ "$(jq -c '[.round_cap.occupied, .round_cap.in_flight]' <<<"$OUT")" = '[3,0]' ] && [ "$(reserved_runs)" = '["a"]' ] \
+  && pass "P19: a surplus review under one reserved run id counts; the cap is spent and b is refused (exit 8)" \
+  || fail "P19 rc=$RC $OUT $(reserved_runs)"
 
 echo
 echo "test_phase_4b_round_cap: $PASS passed, $FAIL failed"
