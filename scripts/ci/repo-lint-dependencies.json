@@ -85,19 +85,23 @@
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh",
       "scripts/bootstrap-new-repo.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_bootstrap_firebase_and_codereview": [
       "tests/test_bootstrap_firebase_and_codereview.sh",
       "scripts/bootstrap-new-repo.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_bootstrap_github_infra": [
       "tests/test_bootstrap_github_infra.sh",
       "scripts/bootstrap-new-repo.sh",
       "scripts/gh-as-author.sh",
       "scripts/op-preflight.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh",
+      "scripts/sync-labels.sh"
     ],
     "check_bootstrap_sh": [
       "tests/test_bootstrap_sh.sh",
@@ -114,7 +118,9 @@
       "scripts/gh-as-author.sh",
       "scripts/policy-sim.sh",
       "scripts/project-doc-sync.sh",
-      "scripts/wave-audit.sh"
+      "scripts/wave-audit.sh",
+      "scripts/bootstrap/github-infra.sh",
+      "scripts/sync-labels.sh"
     ],
     "check_bootstrap_wizard": [
       "tests/test_bootstrap_wizard.sh",
@@ -446,6 +452,7 @@
       "tests/fixtures/coderabbit_status_refusal.json",
       "tests/fixtures/coderabbit_quota_refusal.json",
       "tests/test_phase_4b_immutable_input.sh",
+      "tests/test_phase_4b_round_cap.sh",
       "scripts/coderabbit-automerge-rate-limit-gate.sh",
       "scripts/coderabbit-record-feedback.sh",
       "scripts/coderabbit-severity-gate.sh",
@@ -619,6 +626,11 @@
     "check_verify_propagation_pr": [
       "tests/test_match_protected_paths.sh",
       "tests/test_verify_propagation_pr.sh"
+    ],
+    "check_sync_labels": [
+      "tests/test_sync_labels.sh",
+      "scripts/sync-labels.sh",
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_wave_audit": [
       "tests/test_wave_audit.sh",

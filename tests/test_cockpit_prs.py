@@ -494,7 +494,10 @@ class PRTests(unittest.TestCase):
         # response, releases it: the row is not a human stop and the receipt names the tiebreak.
         # One reader pass, ledger helper only (the other sources degrade): the whole Cockpit
         # suite shares one 60-second process bound in tests/test_cockpit.sh.
-        policy=(ROOT/'.github/review-policy.yml').read_text().replace('max_review_rounds: 20','max_review_rounds: 2',1)
+        # The first `max_review_rounds:` is codex's request ceiling; match any value so a policy
+        # retune cannot turn this substitution into a silent no-op (#2665).
+        policy,n=re.subn(r'^  max_review_rounds: \d+$','  max_review_rounds: 2',(ROOT/'.github/review-policy.yml').read_text(),count=1,flags=re.M)
+        self.assertEqual(n,1)
         bot='chatgpt-codex-connector[bot]'
         marker={'id':103,'user':{'login':'nathanjohnpayne'},'body':f'TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/{REPO}/pull/1@{HEAD}','created_at':'2026-10-01T05:00:00Z','updated_at':'2026-10-01T05:00:00Z'}
         def badge(text):return '**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** '+text

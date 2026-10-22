@@ -126,7 +126,8 @@ if [ "${FAKE_ORCH_JSON:-}" = retained-tripwire ]; then
   fi
   FAKE_ORCH_JSON=clean
 fi
-case "${FAKE_ORCH_JSON:-}" in
+# FAKE_ORCH_OVERRIDE adds the orchestrator's admin override fields (#2633).
+{ case "${FAKE_ORCH_JSON:-}" in
   clean)
     jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
       '{dry_run:true,review_posted:false,head_sha:$head,direction:"codex-reviews-claude",
@@ -147,7 +148,10 @@ case "${FAKE_ORCH_JSON:-}" in
         reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",
         validated_verdict:{verdict:"CHANGES_REQUESTED",findings:[{priority:"P1",body:"fix"}],summary:"findings"}}'
     ;;
-esac
+esac; } | if [ -n "${FAKE_ORCH_OVERRIDE:-}" ]; then
+  jq -c '. + {admin_overridden:[{decision:"human-tiebreaker",tripwires:["reviewer-address"]}],
+    admin_override_quote:"Owner: run it"}'
+else cat; fi
 exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
@@ -172,9 +176,18 @@ propagation_audit:
   effort: turbo
 YAML
 
+# The capture reads the hub's live default branch from GitHub with a
+# commit-only clone. Every run rewrites that URL to a local fixture, so no
+# test touches the network; the fixture is filled in by the #2694 cases.
+HUB_FIXTURE="$WORK/hub-fixture.git"
+git init -q --bare "$HUB_FIXTURE"
+HUB_FIXTURE_URL="file://$HUB_FIXTURE"
+
 run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   local policy="$1" reset="$2"; shift 2
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${HUB_FIXTURE_URL}.insteadOf" \
+  GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
@@ -186,6 +199,8 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
 run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   local repo_dir="$1" policy="$2" reset="$3"; shift 3
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${HUB_FIXTURE_URL}.insteadOf" \
+  GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
@@ -594,6 +609,72 @@ for mode in operational dry-run; do
   remote_has_tag "$LARGE_HEAD" && fail "$mode over-budget pushed watermark" || pass "$mode over-budget leaves remote watermark untouched"
 done
 
+# #2633: the admin override never overrides the byte budget: an oversized
+# range keeps its deterministic exit 8 and dispatches nothing.
+rc=0
+run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+  --admin-override 'Owner: run it' >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 8 ] && [ ! -e "$CAPTURE/args" ] \
+  && pass "admin override does not bypass the byte budget" || fail "admin override over-budget returned $rc or dispatched"
+# Within budget it forwards the quote and marks the watermark it advances.
+rc=0
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+  --admin-override 'Owner: run it' > "$WORK/override.json" 2> "$WORK/override.err" || rc=$?
+[ "$rc" -eq 0 ] && pass "admin override dispatches a within-budget range" || fail "admin override returned $rc: $(tail -n 2 "$WORK/override.err")"
+grep -A1 -Fx -- '--admin-override' "$CAPTURE/args" 2>/dev/null | tail -n 1 | grep -Fxq 'Owner: run it' \
+  && pass "admin override quote is forwarded to the orchestrator" || fail "admin override quote not forwarded"
+git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-pass/$LARGE_HEAD:refs/tags/wave-audit-pass/$LARGE_HEAD" 2>/dev/null || true
+git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | grep -q 'admin-override=true' \
+  && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
+git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+# The wave's own final summary carries the orchestrator's override record, so
+# a caller reading the last record keeps the quote and the reason codes.
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" \
+  --head-sha "$LARGE_HEAD" --dry-run --admin-override 'Owner: run it' > "$WORK/override-summary.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && jq -se 'last | .orchestrator_exit == 0 and .admin_override_quote == "Owner: run it"
+    and .admin_overridden[0].tripwires == ["reviewer-address"]' "$WORK/override-summary.json" >/dev/null \
+  && pass "the final wave summary carries the orchestrator's override record" \
+  || fail "final wave summary dropped the override record (rc=$rc): $(tail -c 400 "$WORK/override-summary.json")"
+rc=0
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run \
+  > "$WORK/no-override-summary.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && jq -se 'last | .admin_overridden == [] and .admin_override_quote == null' "$WORK/no-override-summary.json" >/dev/null \
+  && pass "a wave without the override reports empty override fields" \
+  || fail "wave without the override reported override fields (rc=$rc)"
+# A missing quote never consumes the next option as authorization text.
+for option_quote in --dry-run -n; do
+  rc=0
+  run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --admin-override "$option_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+    && pass "admin override refuses option token $option_quote as its quote" \
+    || fail "admin override consumed option token $option_quote (rc=$rc)"
+done
+# The orchestrator's quote checks apply before the budget exit (POLICY_SMALL
+# would exit 8 here) and before a capture writes its scope.
+for bad_quote in '  ' $'two\nlines' $'carriage\rreturn' "$(printf 'q%.0s' $(seq 1 501))"; do
+  rc=0
+  run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --admin-override "$bad_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+    && pass "admin override refuses an unusable quote (${#bad_quote} chars) before the budget exit" \
+    || fail "unusable admin override quote (${#bad_quote} chars) returned $rc"
+  rm -rf "$WORK/override-capture"; mkdir "$WORK/override-capture"
+  rc=0
+  run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --capture-input-dir "$WORK/override-capture" --admin-override "$bad_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ -z "$(ls -A "$WORK/override-capture")" ] \
+    && pass "admin override refuses an unusable quote (${#bad_quote} chars) before capture" \
+    || fail "capture accepted an unusable admin override quote (${#bad_quote} chars): rc=$rc"
+done
+rc=0
+run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run \
+  --admin-override "$(printf 'q%.0s' $(seq 1 500))" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && grep -Fxq -- '--admin-override' "$CAPTURE/args" \
+  && pass "admin override accepts a 500-character quote" || fail "500-character admin override quote returned $rc"
+
 # Equality remains eligible: mutate > to >= and this control fails.
 POLICY_EXACT="$WORK/policy-exact.yml"
 sed "s/diff_max_bytes: 800000/diff_max_bytes: $LARGE_BYTES/" "$POLICY_GOOD" > "$POLICY_EXACT"
@@ -760,6 +841,42 @@ FAKE_ORCH_JSON=retained-tripwire run_wa "$POLICY_GOOD" reset 81 --repo owner/con
   && jq -e '.dry_run and .receipt_written == false' "$WORK/historical-tripwire-preview.json" >/dev/null \
   && pass "top-level historical preview retains non-persisting model validation" \
   || fail "historical preview acquired retained-evidence enforcement or receipt authority"
+
+# #2633: a chunk validated past an overridden tripwire keeps the override in
+# its exit-9 summary and its persisted receipt, and in an exit-1 summary.
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --admin-override 'Owner: run it' \
+  > "$WORK/historical-override.json" 2> "$WORK/historical-override.err" || rc=$?
+git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2:refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2" 2>/dev/null || true
+[ "$rc" -eq 9 ] && jq -e '.admin_override_quote == "Owner: run it" and .admin_overridden[0].tripwires == ["reviewer-address"]' \
+    "$WORK/historical-override.json" >/dev/null \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C2" \
+    | jq -e '.review_provenance.admin_override_quote == "Owner: run it"
+      and .review_provenance.admin_overridden[0].tripwires == ["reviewer-address"]' >/dev/null \
+  && pass "historical override keeps the override in its summary and prefix receipt" \
+  || fail "historical override dropped the override fields (rc=$rc): $(tail -n 2 "$WORK/historical-override.err")"
+# The exact-receipt retry reuses that receipt without another review; its
+# exit-9 summary still reports the override the receipt records.
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/historical-override-reuse.json" 2> "$WORK/historical-override-reuse.err" || rc=$?
+[ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] \
+  && jq -e '.receipt_reused and .admin_override_quote == "Owner: run it"
+    and .admin_overridden[0].tripwires == ["reviewer-address"]' "$WORK/historical-override-reuse.json" >/dev/null \
+  && pass "reused overridden prefix receipt keeps the override in its summary" \
+  || fail "reused overridden prefix receipt dropped the override fields (rc=$rc)"
+git -C "$CANON" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
+git -C "$REMOTE" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
+rc=0
+FAKE_ORCH_JSON=advisory FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --admin-override 'Owner: run it' \
+  > "$WORK/historical-override-advisory.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 1 ] && jq -e '.admin_override_quote == "Owner: run it" and (.admin_overridden | length) == 1' \
+    "$WORK/historical-override-advisory.json" >/dev/null && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && pass "historical override keeps the override in a findings summary" \
+  || fail "historical override findings summary dropped the override fields (rc=$rc)"
 
 # Retain the first chunk while its first tag push fails. The local exact
 # receipt must make the identical retry a publish-only operation, with no
@@ -1032,6 +1149,28 @@ jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and
   || fail "final cumulative receipt package is mislabeled or incomplete"
 remote_has_tag "$LARGE_HEAD" && pass "only explicit successful finalization advances full watermark" \
   || fail "successful finalization did not advance full watermark"
+# #2633: with no overridden receipt and no override flag, finalization's
+# watermark carries no override marker (control for the case below).
+git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" | grep -q 'admin-override=true' \
+  && fail "finalization without an overridden receipt marked admin-override" \
+  || pass "finalization without an overridden receipt is not marked admin-override"
+# A finalization whose retained receipt was validated past an overridden
+# tripwire needs no override of its own, yet its watermark is marked.
+OVR_HEAD="$(git -C "$CANON" commit-tree "$LARGE_HEAD^{tree}" -p "$LARGE_HEAD" -m 'override finalization head')"
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
+  --base "$C1" --head-sha "$OVR_HEAD" --historical-end "$OVR_HEAD" --admin-override 'Owner: run it' \
+  > "$WORK/override-chunk.json" 2> "$WORK/override-chunk.err" || rc=$?
+[ "$rc" -eq 9 ] && pass "overridden historical chunk retained for the finalization case" \
+  || fail "overridden historical chunk returned $rc: $(tail -n 2 "$WORK/override-chunk.err")"
+rc=0
+run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer --base "$C1" --head-sha "$OVR_HEAD" \
+  --finalize-historical > "$WORK/override-final.json" 2> "$WORK/override-final.err" || rc=$?
+git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-pass/$OVR_HEAD:refs/tags/wave-audit-pass/$OVR_HEAD" 2>/dev/null || true
+[ "$rc" -eq 0 ] && ! grep -Fxq -- '--admin-override' "$CAPTURE/args" \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$OVR_HEAD" | grep -q 'admin-override=true' \
+  && pass "finalization over an overridden receipt marks the watermark admin-override=true" \
+  || fail "finalization over an overridden receipt (rc=$rc) left the watermark unmarked: $(tail -n 2 "$WORK/override-final.err")"
 jq -e --argjson files "$HIST_SCOPE_FILES" --argjson bytes "$HIST_SCOPE_BYTES" \
   '.scope_files == $files and .scope_bytes == $bytes' "$WORK/historical-final.json" >/dev/null \
   && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" \
@@ -1131,20 +1270,44 @@ if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.jso
   pass "capture records a second-parent base as off the first-parent history"
 else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
 # The audited head must have merged: it is on the first-parent history of the
-# trusted checkout's default-branch ref, not merely byte-equal to some commit.
-saved_default=$(git -C "$CANON" rev-parse --verify --quiet refs/remotes/origin/main || true)
+# hub's default branch as GitHub serves it (#2694), not merely byte-equal to
+# some commit, and not judged by any local branch, symref or checkout HEAD.
+# The hub fixture serves `trunk` as its default; its `main` holds an unmerged
+# feature, so the default is read from what the server serves, not a name.
 FEATURE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'unmerged feature commit on the watermark')"
-git -C "$CANON" update-ref refs/remotes/origin/main "$MERGED"
-for hcase in "$C2:true:a merged head on the default branch" "$FEATURE:false:an unmerged feature commit sitting on the watermark" "$SIDE:false:a commit reachable only through a merge's second parent"; do
+LOCAL_ONLY="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$MERGED" -m 'local commit never pushed to the hub')"
+git -C "$CANON" push -q "$HUB_FIXTURE" "$MERGED:refs/heads/trunk" "$FEATURE:refs/heads/main" "$SIDE:refs/heads/side-anchor"
+git -C "$HUB_FIXTURE" symbolic-ref HEAD refs/heads/trunk
+git -C "$CANON" push -q origin "$LOCAL_ONLY:refs/heads/local-anchor" "$FEATURE:refs/heads/feature-anchor"
+TRUSTED="$WORK/trusted-checkout"; rm -rf "$TRUSTED"
+# The trusted checkout sits on a local commit the hub never received, with a
+# stale origin/HEAD naming the feature branch: neither may matter.
+git clone -q "$REMOTE" "$TRUSTED" && git -C "$TRUSTED" checkout -q --detach "$LOCAL_ONLY"
+git -C "$TRUSTED" update-ref refs/remotes/origin/feature-anchor "$FEATURE"
+git -C "$TRUSTED" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feature-anchor
+for hcase in "$C2:true:a merged head on the hub default branch's first-parent history" \
+             "$MERGED:true:the hub default branch tip itself" \
+             "$LOCAL_ONLY:false:an unpushed commit on the trusted checkout's own HEAD" \
+             "$FEATURE:false:an unmerged feature commit, even on the hub's main and the local origin/HEAD" \
+             "$SIDE:false:a commit reachable only through a merge's second parent"; do
   h=${hcase%%:*}; rest=${hcase#*:}; want=${rest%%:*}; label=${rest#*:}
   rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
-  run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$h" \
+  run_wa_repo "$TRUSTED" "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$h" \
     --capture-input-dir "$WORK/capture-default" >/dev/null 2>"$WORK/capture-default.err" || true
   if jq -e --argjson want "$want" '.head_on_hub_default == $want' "$WORK/capture-default/scope.json" >/dev/null 2>&1; then
     pass "capture records head_on_hub_default=$want for $label"
   else fail "head_on_hub_default for $label: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
 done
-if [ -n "$saved_default" ]; then git -C "$CANON" update-ref refs/remotes/origin/main "$saved_default"; else git -C "$CANON" update-ref -d refs/remotes/origin/main; fi
+# An unreachable hub withholds the exemption rather than granting it.
+rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
+HUB_FIXTURE_URL_SAVED="$HUB_FIXTURE_URL"; HUB_FIXTURE_URL="file://$WORK/no-such-hub.git"
+run_wa_repo "$TRUSTED" "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$C2" \
+  --capture-input-dir "$WORK/capture-default" >/dev/null 2>"$WORK/capture-default.err" || true
+HUB_FIXTURE_URL="$HUB_FIXTURE_URL_SAVED"
+if jq -e '.head_on_hub_default == false' "$WORK/capture-default/scope.json" >/dev/null 2>&1; then
+  pass "an unreachable hub records head_on_hub_default=false (withheld, never granted)"
+else fail "unreachable hub: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
+git -C "$REMOTE" update-ref -d refs/heads/local-anchor; git -C "$REMOTE" update-ref -d refs/heads/feature-anchor
 # A recent base with more than a pipe buffer of older history behind it
 # (2,500 commits of 41 bytes is ~100 KiB) is the real watermark shape. rev-list
 # prints newest first, so an early `grep -q` exit on the base SIGPIPEs it

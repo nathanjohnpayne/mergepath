@@ -56,6 +56,7 @@ spec_test_map:
     - tests/test_sync_overrides.sh
     - tests/test_sync_to_downstream.sh
   phase_4b_immutable_input: tests/test_phase_4b_immutable_input.sh
+  phase_4b_round_cap: tests/test_phase_4b_round_cap.sh
   phase_4b_escalation:
     - tests/test_phase_4b_escalation.cjs
     - tests/test_phase_4b_automation.sh

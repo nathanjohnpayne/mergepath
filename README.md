@@ -28,10 +28,46 @@ Every change in this repository goes through the policy in `REVIEW_POLICY.md`, i
 | `BRAND.md` | Mergepath umbrella vocabulary (surfaces, reserved names, naming history) |
 | `mergepath/playground/index.html` | Mergepath Playground — tune the review policy and replay recent PRs against the draft |
 | `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath Playground for local replay |
+| `scripts/cockpit.sh` | Launches the Mergepath Cockpit, a local browser dashboard over the fleet's PRs, CI and agent runs |
+| `scripts/worktree-cleanup.sh` | Audits stale git worktrees and, with `--apply`, removes the safe ones |
+| `scripts/install-worktree-cleanup-agent.sh` | Installs the daily launchd job that runs the worktree cleanup unattended |
 | `.mergepath-sync.yml` | Propagation manifest for synced canonical, kit, and templated surfaces |
 | `.github/ISSUE_TEMPLATE/` | Synced issue-template kit; consumers may add product-specific templates |
 | `.github/pull_request_template.md` | Synced canonical pull-request template |
 | `ai_agent_tooling_standard.md` | Full repository standard (reference) |
+
+## Local Tools: Cockpit and Worktree Cleanup
+
+These run on your own machine and never in CI.
+
+**Mergepath Cockpit** is a local browser dashboard. Warm the credential cache, then launch it:
+
+```bash
+eval "$(scripts/op-preflight.sh --agent codex --mode review)"
+scripts/cockpit.sh
+```
+
+Agent history reads at most 64 checkouts: the hub and any configured roots first, then the newest worktrees. When there are more, Cockpit says so on startup (`Agent history reads 64 of N checkouts…`) and the history panel shows coverage as incomplete. If launch fails, the message names the step that failed, for example `Cockpit cannot start: failed while discovering checkouts and worktrees.` Behavior is specified in `specs/cockpit_foundation.md` and `specs/cockpit_agents.md`.
+
+**Worktree cleanup** removes worktrees left behind by agent sessions. A dry run lists what it would do; `--apply` removes only safe candidates, meaning the upstream branch is gone or the PR is closed or merged, and nothing in the working tree would be lost (uncommitted, untracked or gitignored files such as `.env`):
+
+```bash
+scripts/worktree-cleanup.sh                        # dry run: report only
+scripts/worktree-cleanup.sh --apply --min-age 24h  # remove safe candidates untouched for a day
+```
+
+Locked worktrees and orphan directories are left alone unless you pass `--force-locked` or `--orphan-clean`. A worktree git refuses to remove is reported under `failed:` and the run carries on. Commits on a branch survive, because removing a worktree keeps its branch. A detached worktree has no branch: for a closed or merged PR, a commit that exists only at that worktree's `HEAD` (on no branch, tag or remote) is lost when the worktree is removed, so branch or push such work first.
+
+**Daily cleanup.** To run that cleanup automatically, install the per-user launchd job from a clone whose main checkout is on an up-to-date `main`:
+
+```bash
+scripts/install-worktree-cleanup-agent.sh          # install; runs daily at 04:17
+scripts/install-worktree-cleanup-agent.sh --check  # installed, loaded and current?
+scripts/install-worktree-cleanup-agent.sh --run-now
+scripts/install-worktree-cleanup-agent.sh --uninstall
+```
+
+The job runs the main checkout's `scripts/worktree-cleanup.sh --apply --min-age 24h` and appends to `~/.cache/mergepath/worktree-cleanup.log`. It never passes `--force-locked` or `--orphan-clean`. Details are in `docs/agents/operating-rules.md` and `specs/worktree_cleanup_audit.md`.
 
 ## Firebase Auth Template
 

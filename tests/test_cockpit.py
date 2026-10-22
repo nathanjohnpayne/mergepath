@@ -2001,6 +2001,28 @@ class InventoryAndLauncherTests(unittest.TestCase):
         self.assertEqual(output.getvalue(),
                          "Cockpit cannot start: failed while reading the settings JSON (--actions-settings, --agents-settings).\n")
 
+    def test_launcher_passes_omitted_checkout_count_to_history(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        output = io.StringIO()
+        client = GitHubClient(TOKEN, transport=HTTPFixture())
+        def resolve(settings, inventory, root, *, report):
+            report(64, 66)
+            return (), {}
+        with patch.object(main.GitHubClient, "from_environment", return_value=client), \
+             patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "AuthorBudgetProvider", return_value=author_fixture()), \
+             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
+             patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
+             patch.object(main, "resolve_history_settings", side_effect=resolve), \
+             patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
+             patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))) as agents, \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "open_browser", return_value=False), \
+             patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(main.main([]), 1)
+        self.assertEqual(agents.call_args.kwargs["omitted_checkouts"], 2)
+        self.assertIn("Agent history reads 64 of 66 checkouts", output.getvalue())
+
     def test_browser_opener_detaches_and_distinguishes_failure_from_running(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         url = "http://127.0.0.1:1234/bootstrap#launch=fixture-only"

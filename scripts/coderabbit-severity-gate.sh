@@ -980,11 +980,16 @@ esac
 # anchored to this exact PR head, and only when the comment is fresh at-or-after
 # that run; otherwise an older markerless body can inherit a later exact-head
 # object and briefly publish a stale verdict.
+#
+# The marker is read after CodeRabbit's leading vendor header, with the same
+# shared definition the waiter's selector uses (#2734). A headered summary was
+# otherwise out of scope altogether, so a finding carried only by it was never
+# graded — a false clear of this gate.
 MARKER_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
-  --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
+  --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" "$CR_STRIP_VENDOR_HEADER_JQ"'
   [ .[]
     | select(.user.login == $bot)
-    | select((.body // "") | startswith($m))
+    | select((.body // "") | cr_strip_vendor_header | startswith($m))
     | . + { fresh_at: ([.created_at, (.updated_at // .created_at)]
                         | map(select(type == "string" and . != "")) | max // "") }
   ]
@@ -1567,10 +1572,10 @@ log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
 #
 # The channel: a PR comment whose FIRST LINE is exactly the token
 #   [mergepath-summary-ack: <HEAD sha> <finding-set fingerprint>]
-# written by a human collaborator (author_association OWNER / MEMBER /
-# COLLABORATOR — a GitHub-computed field, not something the commenter sets)
-# and, per the same reasoning that keeps bots out of the reviewer set, not by
-# a `[bot]` account. Rationale for the rebuttal or deferral goes on the lines
+# written by an eligible non-bot collaborator (author_association OWNER /
+# MEMBER / COLLABORATOR — a GitHub-computed field, not something the commenter
+# sets), consistent with the bot exclusion in the reviewer set. Rationale for
+# the rebuttal or deferral goes on the lines
 # BELOW the token.
 #
 # Head-pinned by construction, not by clock: the token names the current head

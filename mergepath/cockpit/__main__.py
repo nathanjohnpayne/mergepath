@@ -138,11 +138,12 @@ def main(argv=None):
         stage = "loading the repository inventory"
         inventory = load_inventory(ROOT)
         stage = "discovering checkouts and worktrees"
-        checkouts, price_keys = resolve_history_settings(
-            agents_settings, inventory, ROOT,
-            report=lambda kept, found: print(
-                f"Agent history reads {kept} of {found} checkouts; the oldest worktrees are skipped. "
-                "scripts/worktree-cleanup.sh removes stale ones.", file=sys.stderr))
+        omitted = []
+        def report_omitted(kept, found):
+            omitted.append(found - kept)
+            print(f"Agent history reads {kept} of {found} checkouts; the oldest worktrees are skipped. "
+                  "scripts/worktree-cleanup.sh removes stale ones.", file=sys.stderr)
+        checkouts, price_keys = resolve_history_settings(agents_settings, inventory, ROOT, report=report_omitted)
         stage = "reading registered reviewers with the installed hub yq"
         reviewers = load_reviewers(ROOT)
         stage = "initializing panel sources"
@@ -179,7 +180,8 @@ def main(argv=None):
                                            ci_max_gap=CI_OBSERVATION_GAP, installation_scan=True)
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
-        agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
+        agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers,
+                                         omitted_checkouts=sum(omitted))
         app.scheduler.register("agents", agents_provider.fetch, hot_interval=30, idle_interval=120, timeout=30)
         app.register_panel("history", "agents")
         live_agents = LiveAgentsProvider(inventory, resolve_live_directory(os.environ.get("P4B_HEARTBEAT_DIR") or None), ROOT)

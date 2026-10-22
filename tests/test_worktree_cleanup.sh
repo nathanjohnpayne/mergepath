@@ -4096,6 +4096,32 @@ else
 fi
 
 
+# ── Case 49: an orphan's age is its own, not the main checkout's ──────────
+# An orphan under .claude/worktrees has no .git, so `git -C <orphan>
+# rev-parse --absolute-git-dir` walks up to the main checkout and the age scan
+# counted the main repository's fresh fetches and objects as the orphan's
+# activity: --orphan-clean --min-age never removed it. The main checkout here
+# is brand new, so its admin directory is recent; the orphan is backdated.
+ORPHAN_AGE_MAIN="$WORKDIR/orphan-age/main"
+git init -q -b main "$ORPHAN_AGE_MAIN"
+git -C "$ORPHAN_AGE_MAIN" config user.email "test@example.com"
+git -C "$ORPHAN_AGE_MAIN" config user.name "Test"
+git -C "$ORPHAN_AGE_MAIN" config commit.gpgsign false
+git -C "$ORPHAN_AGE_MAIN" commit -q --allow-empty -m "initial"
+STALE_ORPHAN="$ORPHAN_AGE_MAIN/.claude/worktrees/stale-orphan"
+mkdir -p "$STALE_ORPHAN/sub"
+echo "leftover" > "$STALE_ORPHAN/sub/notes.txt"
+find "$STALE_ORPHAN" -exec touch -t 202001010000 {} +
+set +e
+OUT_ORPHAN_AGE=$( cd "$ORPHAN_AGE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --orphan-clean --min-age 1h 2>&1 )
+set -e
+if [ ! -e "$STALE_ORPHAN" ] && ! grep -Fq -- "orphan; activity within --min-age" <<<"$OUT_ORPHAN_AGE"; then
+  pass "an idle orphan is removed even though the main checkout is active"
+else
+  fail "the main checkout's activity kept an idle orphan under --min-age"
+  echo "$OUT_ORPHAN_AGE" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
