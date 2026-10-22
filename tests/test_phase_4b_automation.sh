@@ -1563,7 +1563,14 @@ if [ "${P4B_ACK_NOT_VISIBLE:-}" = true ]; then
 fi
 body_json=$(jq -c '.body' "$P4B_ACK_REVIEW")
 [ "${P4B_ACK_EDIT_BODY:-}" != true ] || body_json=$(printf '%s' "$body_json" | jq -c '. + "\nEdited finding"')
-fp=$(printf '%s' "$body_json" | shasum -a 256 | cut -c1-12)
+if command -v sha256sum >/dev/null 2>&1; then
+  fp=$(printf '%s' "$body_json" | sha256sum | cut -c1-12)
+elif command -v shasum >/dev/null 2>&1; then
+  fp=$(printf '%s' "$body_json" | shasum -a 256 | cut -c1-12)
+else
+  printf 'approval-accounting: neither sha256sum nor shasum is available for acknowledgement fingerprints\n' >&2
+  exit 2
+fi
 token="[mergepath-review-ack: 1 $fp]"
 accounted=false
 if [ -s "$P4B_ACK_COMMENT" ]; then
