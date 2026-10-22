@@ -262,7 +262,8 @@
     ],
     "check_daily_feedback_rollup": [
       "tests/test_daily_feedback_rollup.sh",
-      "scripts/daily-feedback-rollup.sh"
+      "scripts/daily-feedback-rollup.sh",
+      "scripts/lib/reviewers-helpers.sh"
     ],
     "check_dependabot_coupled_groups": [
       ".github/dependabot.yml",
@@ -328,6 +329,7 @@
       "tests/test_gh_rest_transport.sh",
       "tests/test_gh_wrapper_parallel.sh",
       "tests/test_identity_check_fail_closed.sh",
+      "tests/test_identity_check.sh",
       "tests/test_owner_admin_override.py",
       "scripts/lib/gh-comment-trigger-guard.sh",
       "scripts/workflow/gh-comment-trigger-guard.py",
@@ -546,7 +548,8 @@
       "tests/test_resolve_pr_threads_verified_propagation.sh",
       "scripts/identity-check.sh",
       "scripts/resolve-pr-threads.sh",
-      "scripts/lib/template-substitution.sh"
+      "scripts/lib/template-substitution.sh",
+      "scripts/lib/reviewers-helpers.sh"
     ],
     "check_review_feedback_accounting": [
       "tests/test_feedback_archive_identities.sh",

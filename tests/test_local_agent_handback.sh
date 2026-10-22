@@ -314,7 +314,7 @@ if [ -r "$LANE" ] && yq --version 2>/dev/null | grep -q 'mikefarah/yq'; then
   # step against a gh stub and a resolver stub that records what it was given.
   LFIX="$WORKDIR/lane"
   mkdir -p "$LFIX/scripts/lib" "$LFIX/bin" "$LFIX/.github"
-  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$LFIX/scripts/lib/"
+  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$ROOT/scripts/lib/credential-class.sh" "$LFIX/scripts/lib/"
   printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n' >"$LFIX/.github/review-policy.yml"
   printf '%s\n' "$run_step" >"$LFIX/step.sh"
   cat >"$LFIX/scripts/resolve-pr-threads.sh" <<'R'
@@ -327,10 +327,10 @@ R
 exit 9
 G
   chmod +x "$LFIX/scripts/resolve-pr-threads.sh" "$LFIX/bin/gh"
-  lane_run() { # <login>
+  lane_run() { # <login> [token] [GH_TOKEN, when it differs from the token]
     : >"$LFIX/lane.log"
     ( cd "$LFIX" && env -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY PATH="$LFIX/bin:$PATH" LANE_LOG="$LFIX/lane.log" LANE_LOGIN="$1" \
-        GH_TOKEN=x OP_PREFLIGHT_REVIEWER_PAT=x PR_NUMBER=12 REPO=o/r GITHUB_STEP_SUMMARY="$LFIX/summary" bash step.sh ) >/dev/null 2>&1
+        GH_TOKEN="${3:-${2:-x}}" OP_PREFLIGHT_REVIEWER_PAT="${2:-x}" PR_NUMBER=12 REPO=o/r GITHUB_STEP_SUMMARY="$LFIX/summary" bash -eo pipefail step.sh ) >/dev/null 2>&1
   }
   set +e
   lane_run nathanpayne-codex; c1=$?; l1="$(cat "$LFIX/lane.log")"
@@ -343,6 +343,26 @@ G
     pass "lane resolves as the listed reviewer its token reads as, and refuses an author, unlisted reviewer-shaped or unreadable token before resolving"
   else
     fail "lane identity: codex rc=$c1 '$l1'; author rc=$c2 '$l2'; empty rc=$c3 '$l3'; unlisted rc=$c4 '$l4'"
+  fi
+  # #2726: an installation token takes the bounded CI-app mode: the resolver
+  # gets --resolve-actioned --ci-app-identity and no reviewer identity, and its
+  # identity check (not the lane) decides whether the policy names this app.
+  # Whatever `GET /user` would say is irrelevant, and a user PAT never gets
+  # the flag. The lane classifies the token the resolver authenticates with,
+  # ${OP_PREFLIGHT_REVIEWER_PAT:-$GH_TOKEN}, not GH_TOKEN alone.
+  set +e
+  lane_run "" ghs_installation; c5=$?; l5="$(cat "$LFIX/lane.log")"
+  lane_run nathanpayne-codex ghs_installation; c6=$?; l6="$(cat "$LFIX/lane.log")"
+  lane_run nathanpayne-codex ghp_reviewer; c7=$?; l7="$(cat "$LFIX/lane.log")"
+  lane_run "" ghs_installation ghp_other; c8=$?; l8="$(cat "$LFIX/lane.log")"
+  set -e
+  if [ "$c5" -eq 0 ] && [ "$l5" = "agent= identity= args=12 --repo o/r --resolve-actioned --ci-app-identity" ] \
+     && [ "$c6" -eq 0 ] && [ "$l6" = "$l5" ] \
+     && [ "$c7" -eq 0 ] && [ "$l7" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ] \
+     && [ "$c8" -eq 0 ] && [ "$l8" = "$l5" ]; then
+    pass "lane runs an installation token only in the bounded --ci-app-identity mode, with no reviewer identity (#2726)"
+  else
+    fail "lane CI-app routing: app rc=$c5 '$l5'; app reading as reviewer rc=$c6 '$l6'; PAT rc=$c7 '$l7'; app as the resolver's token only rc=$c8 '$l8'"
   fi
 else
   fail "thread-resolution-lane.yml missing, or no mikefarah/yq v4 to check it (yq on PATH: $(yq --version 2>&1 | head -1 || echo none); bash scripts/cloud-setup.sh installs it)"

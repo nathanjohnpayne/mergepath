@@ -71,6 +71,17 @@ mkdir -p "$FIXTURES"
 #   login form ("github-advanced-security", not "...[bot]") deliberately
 #   (Codex on PR #1106): this query is GraphQL, and the allowlist's
 #   suffixed-only entry never matched it.
+# Thread G (#2726): chatgpt-codex-connector P1, no agent fix or reply, but a
+#   `[mergepath-resolve: addressed-elsewhere]` marker posted by the CONFIGURED
+#   CI app (bare GraphQL slug + __typename Bot) → tagged, skip. Before #2726
+#   only agent-authored tags counted, so the app's disposition of record was
+#   ignored and the thread re-surfaced as deferred-untagged.
+# Thread H (#2726): the same marker from ANOTHER app → not a tag of record,
+#   so the thread surfaces (deferred-untagged, substantive).
+#
+# The run uses a copy of the script in a fixture tree whose
+# .github/review-policy.yml configures the CI app, since the script reads the
+# app from its own checkout's policy only.
 
 cat >"$FIXTURES/prs.json" <<'JSON'
 [
@@ -234,6 +245,62 @@ cat >"$FIXTURES/threads.json" <<'JSON'
                   }
                 ]
               }
+            },
+            {
+              "id": "PRT_thread_g",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/g.sh",
+              "line": 70,
+              "originalLine": 70,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 9,
+                    "author": { "login": "chatgpt-codex-connector[bot]", "__typename": "Bot" },
+                    "body": "**![P1 Badge]** Unchecked return value on the write path.",
+                    "createdAt": "2026-05-15T08:50:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r9"
+                  },
+                  {
+                    "databaseId": 10,
+                    "author": { "login": "mergepath-ci", "__typename": "Bot" },
+                    "body": "[mergepath-resolve: addressed-elsewhere] Fixed.",
+                    "createdAt": "2026-05-15T10:00:00Z",
+                    "originalCommit": null,
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r10"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_h",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/h.sh",
+              "line": 80,
+              "originalLine": 80,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 11,
+                    "author": { "login": "chatgpt-codex-connector[bot]", "__typename": "Bot" },
+                    "body": "**![P1 Badge]** Missing bounds check before indexing.",
+                    "createdAt": "2026-05-15T08:55:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r11"
+                  },
+                  {
+                    "databaseId": 12,
+                    "author": { "login": "other-app", "__typename": "Bot" },
+                    "body": "[mergepath-resolve: addressed-elsewhere] Fixed.",
+                    "createdAt": "2026-05-15T10:05:00Z",
+                    "originalCommit": null,
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r12"
+                  }
+                ]
+              }
             }
           ]
         }
@@ -358,6 +425,21 @@ if [ "$PYTHON3_DIR" != "/usr/bin" ]; then
 fi
 STUB_PATH="$STUB_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Fixture tree (#2726): the script, its helpers, and the policy reader, with
+# a policy that configures the CI app whose marker Thread G carries.
+APP_REPO="$WORKDIR/repo"
+mkdir -p "$APP_REPO/scripts/lib" "$APP_REPO/.github"
+cp "$SCRIPT" "$APP_REPO/scripts/daily-feedback-rollup.sh"
+cp "$ROOT/scripts/lib/daily-feedback-rollup-helpers.sh" "$ROOT/scripts/lib/reviewers-helpers.sh" \
+  "$APP_REPO/scripts/lib/"
+cat >"$APP_REPO/.github/review-policy.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+non_reviewer_identities:
+  - mergepath-ci[bot]
+thread_resolution_ci_app_identity: "mergepath-ci[bot]"
+YAML
+
 echo "check_daily_feedback_rollup: running --dry-run against fixture"
 
 OUT_FILE="$WORKDIR/dry-run.ndjson"
@@ -371,7 +453,7 @@ env -i \
   GH_TOKEN="stub-token" \
   REPO="owner/repo" \
   ROLLUP_AGENT_AUTHORS="nathanjohnpayne:nathanpayne-claude" \
-  "$SCRIPT" --dry-run --since 2026-05-15 --until 2026-05-16 \
+  "$APP_REPO/scripts/daily-feedback-rollup.sh" --dry-run --since 2026-05-15 --until 2026-05-16 \
   >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 set -e
@@ -392,11 +474,13 @@ fi
 # BOTH should now be dedupe-skipped. Thread F (#1101) is a
 # github-advanced-security[bot] finding with no prior-rollup mp-id, no
 # agent reply, and no post-comment agent fix-commit, so nothing filters
-# it — it is the one surviving line, proving the bot-author allowlist
-# now recognizes GHAS instead of silently excluding it pre-classification.
+# it — it surfaces, proving the bot-author allowlist now recognizes GHAS
+# instead of silently excluding it pre-classification. Thread H (#2726)
+# surfaces too: another app's marker is not a tag of record. Thread G is
+# tag-skipped on the configured CI app's marker.
 LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
-if [ "$LINES" -ne 1 ]; then
-  echo "FAIL: expected 1 NDJSON line (Thread F, GHAS, unfiltered) after #304 dedupe pass, got $LINES" >&2
+if [ "$LINES" -ne 2 ]; then
+  echo "FAIL: expected 2 NDJSON lines (Thread F, GHAS; Thread H, another app's marker) after #304 dedupe pass, got $LINES" >&2
   cat "$OUT_FILE" >&2
   echo "  stderr:" >&2
   sed 's/^/    /' "$ERR_FILE" >&2
@@ -414,6 +498,25 @@ if ! grep -q '"thread_id":"PRT_thread_f"' "$OUT_FILE"; then
 fi
 if ! grep -q '"author":"github-advanced-security"' "$OUT_FILE"; then
   echo "FAIL: thread F's rollup item should record its GHAS author login (un-suffixed GraphQL form)" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+
+# Thread G (#2726) must be FILTERED: the configured CI app's own marker is
+# the disposition of record, as an agent author's tag is.
+if grep -q '"thread_id":"PRT_thread_g"' "$OUT_FILE"; then
+  echo "FAIL: thread G should be tag-skipped on the configured CI app's [mergepath-resolve: addressed-elsewhere] marker (#2726)" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+if ! grep -q 'tagged-skip=1' "$ERR_FILE"; then
+  echo "FAIL: expected stderr summary to report tagged-skip=1 (Thread G, the CI app's marker, #2726)" >&2
+  sed 's/^/    /' "$ERR_FILE" >&2
+  exit 1
+fi
+# Thread H (#2726) must SURVIVE: another app's marker is not honored.
+if ! grep -q '"thread_id":"PRT_thread_h"' "$OUT_FILE"; then
+  echo "FAIL: thread H should surface; a marker from an app other than the configured one is not a tag of record (#2726)" >&2
   cat "$OUT_FILE" >&2
   exit 1
 fi
@@ -479,5 +582,41 @@ if ! grep -qE 'dedupe: [0-9]+ prior-triaged mp-id' "$ERR_FILE"; then
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 6-case --dry-run smoke + #304 dedupe)"
+# #2726: a configured but INVALID app (here, missing from
+# non_reviewer_identities) reads as unconfigured. The script takes the login
+# from the validated read, so Thread G's marker is not a tag of record and the
+# thread surfaces alongside F and H.
+cat >"$APP_REPO/.github/review-policy.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+non_reviewer_identities:
+  - nathanpayne-robot
+thread_resolution_ci_app_identity: "mergepath-ci[bot]"
+YAML
+INVALID_OUT="$WORKDIR/dry-run-invalid.ndjson"
+INVALID_ERR="$WORKDIR/dry-run-invalid.err"
+set +e
+env -i \
+  PATH="$STUB_PATH" \
+  HOME="$WORKDIR" \
+  TMPDIR="$WORKDIR" \
+  GH_TOKEN="stub-token" \
+  REPO="owner/repo" \
+  ROLLUP_AGENT_AUTHORS="nathanjohnpayne:nathanpayne-claude" \
+  "$APP_REPO/scripts/daily-feedback-rollup.sh" --dry-run --since 2026-05-15 --until 2026-05-16 \
+  >"$INVALID_OUT" 2>"$INVALID_ERR"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: --dry-run with an invalid CI app policy exited rc=$RC" >&2
+  sed 's/^/    /' "$INVALID_ERR" >&2 || true
+  exit 1
+fi
+if ! grep -q '"thread_id":"PRT_thread_g"' "$INVALID_OUT"; then
+  echo "FAIL: thread G should surface when thread_resolution_ci_app_identity is invalid (undeclared in non_reviewer_identities); an invalid app's marker is not a tag of record (#2726)" >&2
+  cat "$INVALID_OUT" >&2
+  exit 1
+fi
+
+echo "check_daily_feedback_rollup: PASS (unit tests + 8-case --dry-run smoke + #304 dedupe + invalid CI app policy)"
 exit 0

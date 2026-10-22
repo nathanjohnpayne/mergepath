@@ -37,6 +37,11 @@ TESTS=(
   # CI entrypoint, so it went red on main unnoticed after #1085 reshaped the
   # trigger write.
   "tests/test_identity_check_fail_closed.sh"
+  # The checker every wrapper above runs before a write: its user-held
+  # write-identity contract (#1057) and the bounded CI-app mode for thread
+  # resolution, which must accept exactly one configured app and widen no
+  # other mode (#2726). Propagated since #284 but never run in CI until then.
+  "tests/test_identity_check.sh"
 )
 
 if ! command -v jq >/dev/null 2>&1; then

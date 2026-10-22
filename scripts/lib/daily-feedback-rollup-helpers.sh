@@ -132,6 +132,32 @@ is_agent_author() {
   return 1
 }
 
+# is_tag_author <login> <typename> <body> → exit 0 when this reply's
+# `[mergepath-resolve:<class>]` tag is the disposition of record.
+#
+# An agent author's tag, as before, OR (#2726) the CI app's own generated
+# marker: in resolve-pr-threads.sh --resolve-actioned --ci-app-identity the
+# app posts the marker itself, and ignoring it would re-surface every thread
+# the app resolved as deferred-untagged. Bounded exactly as the resolver's
+# is_ci_app_marker_local: ROLLUP_CI_APP_LOGIN is the validated
+# thread_resolution_ci_app_identity (empty: nothing extra is honored), the
+# body must START with the marker, and the bare GraphQL slug counts only with
+# `__typename: Bot`. Used for the tag heuristic ONLY: the substantive-reply
+# heuristic keeps is_agent_author, so no other app reply counts.
+is_tag_author() {
+  is_agent_author "$1" && return 0
+  [ -n "${ROLLUP_CI_APP_LOGIN:-}" ] || return 1
+  local login="$1" typename="$2" body="$3" trimmed
+  trimmed="${body#"${body%%[![:space:]]*}"}"
+  case "$trimmed" in
+    "[mergepath-resolve:"*) ;;
+    *) return 1 ;;
+  esac
+  [ "$login" = "$ROLLUP_CI_APP_LOGIN" ] && return 0
+  [ "$typename" = Bot ] && [ "${login}[bot]" = "$ROLLUP_CI_APP_LOGIN" ] && return 0
+  return 1
+}
+
 # body_excerpt <body> [max_chars]
 #
 # Single-line, trimmed excerpt suitable for the rollup checklist

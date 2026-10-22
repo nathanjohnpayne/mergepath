@@ -141,6 +141,28 @@ non_reviewer_identities:
   - nathanpayne-robot
 
 # ---------------------------------------------------------------------------
+# CI App Thread-Resolution Identity (#2726)
+# ---------------------------------------------------------------------------
+# The ONE GitHub App bot login that may resolve demonstrably-actioned review
+# threads from CI, as `<app-slug>[bot]`. It is accepted only by
+# scripts/identity-check.sh --expect-thread-resolution-app, which only
+# scripts/resolve-pr-threads.sh --resolve-actioned --ci-app-identity calls
+# (the thread resolution lane runs it when its token is an installation
+# token). Every other write path keeps --expect-write-identity, which refuses
+# installation tokens whatever this key says, and every actioned-evidence
+# check still applies.
+#
+# Absent by default, and absent, empty, `~` or `null` make the mode inert: no
+# app is accepted. A configured value must be listed in
+# non_reviewer_identities above and must never appear in available_reviewers;
+# otherwise the mode refuses to run. github-actions[bot] and the review bots
+# are refused. scripts/merge-clearance-gate.sh treats the configured login as
+# a non-reviewer even if it is missing above. The app itself is specified in
+# #2727; leave this unset until it exists. Example:
+#
+#   thread_resolution_ci_app_identity: "<app-slug>[bot]"
+
+# ---------------------------------------------------------------------------
 # Default External Reviewer
 # ---------------------------------------------------------------------------
 # When the agent needs to suggest an external reviewer in a handoff message,

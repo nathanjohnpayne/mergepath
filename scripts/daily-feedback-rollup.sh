@@ -119,6 +119,20 @@ SUBSTANTIVE_THROTTLE="${ROLLUP_SUBSTANTIVE_THROTTLE:-5}"
 POLISH_THROTTLE="${ROLLUP_POLISH_THROTTLE:-20}"
 MAX_PRS_PER_DAY="${ROLLUP_MAX_PRS_PER_DAY:-100}"
 AGENT_AUTHORS="${ROLLUP_AGENT_AUTHORS:-nathanjohnpayne:nathanpayne-claude:nathanpayne-cursor:nathanpayne-codex}"
+# #2726: the CI app whose own [mergepath-resolve:] markers are honored (see
+# is_tag_author). Read ONLY from this checkout's .github/review-policy.yml and
+# validated as identity-check.sh --expect-thread-resolution-app validates it;
+# deliberately not an environment knob. Unconfigured, invalid, or without the
+# policy reader: empty, and only agent-authored tags count (the pre-#2726
+# reading).
+# shellcheck disable=SC2034  # read by is_tag_author in the sourced helpers
+ROLLUP_CI_APP_LOGIN=""
+if [ -r "$SCRIPT_DIR/lib/reviewers-helpers.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/lib/reviewers-helpers.sh"
+  ROLLUP_CI_APP_LOGIN=$(validate_thread_resolution_ci_app_identity \
+    "$SCRIPT_DIR/../.github/review-policy.yml" 2>/dev/null) || ROLLUP_CI_APP_LOGIN=""
+fi
 # Dedupe window (in days): prior rollups closed more than N days ago
 # are presumed stale and their items re-list per #304 spec. Open
 # rollups always contribute regardless of age.
@@ -268,7 +282,7 @@ while [ "$i" -lt "$pr_count" ]; do
               comments(first: 50) {
                 nodes {
                   databaseId
-                  author { login }
+                  author { login __typename }
                   body
                   createdAt
                   originalCommit { oid }
@@ -361,7 +375,8 @@ while [ "$i" -lt "$pr_count" ]; do
       reply=$(printf '%s' "$t" | jq -c ".comments.nodes[$k]")
       reply_login=$(printf '%s' "$reply" | jq -r '.author.login // "unknown"')
       reply_body=$(printf '%s' "$reply" | jq -r '.body // ""')
-      if is_agent_author "$reply_login"; then
+      reply_typename=$(printf '%s' "$reply" | jq -r '.author.__typename // ""')
+      if is_tag_author "$reply_login" "$reply_typename" "$reply_body"; then
         candidate=$(extract_tag_class "$reply_body")
         if [ -n "$candidate" ]; then
           tag_class="$candidate"

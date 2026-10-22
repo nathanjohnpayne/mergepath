@@ -1053,6 +1053,15 @@ if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$R
      && policy_list_has_unconsumed_inline_value non_reviewer_identities "$POLICY_CONFIG"; then
     die 2 "non_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line). Refusing to run a gate that would silently pass."
   fi
+  # #2726: the CI app that may resolve review threads is a non-reviewer by
+  # construction. Its identity mode refuses to run unless the app is declared
+  # above, and this union keeps its approval from counting even in a policy
+  # that names the app but omits that declaration. Taken as written, without
+  # validation: deny-listing a malformed value costs nothing.
+  CI_APP_IDENTITY=$(read_thread_resolution_ci_app_identity "$POLICY_CONFIG")
+  if [ -n "$CI_APP_IDENTITY" ] && ! login_is_non_reviewer_identity "$CI_APP_IDENTITY" "$POLICY_CONFIG"; then
+    NON_REVIEWERS=$(printf '%s\n%s\n' "$NON_REVIEWERS" "$CI_APP_IDENTITY" | sed '/^$/d')
+  fi
   if [ -n "$NON_REVIEWERS" ]; then
     NON_REVIEWERS_JSON=$(echo "$NON_REVIEWERS" | jq -R . | jq -s .)
     NR_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")

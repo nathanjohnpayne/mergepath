@@ -68,6 +68,15 @@ case "$1 $2" in
     printf '%s\n' gho_diagnostic_fallback
     exit 0
     ;;
+  "api graphql")
+    # The viewer read --expect-thread-resolution-app makes (#2726): an
+    # installation token has no `GET /user`, so its identity is the viewer.
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
+    rc="${STUB_VIEWER_RC:-0}"
+    if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    echo "${STUB_VIEWER_LOGIN:-}"
+    exit 0
+    ;;
   "api -i")
     # `gh api -i user`: the headers --expect-write-identity reads for a
     # legacy unprefixed token (#1057).
@@ -514,6 +523,222 @@ for header_rc in 0 1; do
     fi
   done
 done
+
+# -----------------------------------------------------------------------
+# #2726: --expect-thread-resolution-app, the bounded CI-app mode. It accepts
+# exactly ONE GitHub App identity, the login the checker's own checkout
+# declares as thread_resolution_ci_app_identity, and only from a token whose
+# FORM proves it is an installation token. The checker reads the policy next
+# to itself, so each case runs a copy of the real checker in a fixture tree.
+# -----------------------------------------------------------------------
+APP='mergepath-ci[bot]'
+APP_TREE="$WORKDIR/app-tree"
+mkdir -p "$APP_TREE/scripts/lib" "$APP_TREE/.github"
+cp "$SCRIPT" "$APP_TREE/scripts/identity-check.sh"
+cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_TREE/scripts/lib/"
+APP_POLICY="$APP_TREE/.github/review-policy.yml"
+
+# app_policy <thread_resolution_ci_app_identity line, or empty for absent>
+#            [extra non_reviewer_identities item] [extra available_reviewers item]
+app_policy() {
+  {
+    printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n'
+    [ -z "${3:-}" ] || printf '  - %s\n' "$3"
+    printf 'non_reviewer_identities:\n  - nathanpayne-robot\n'
+    [ -z "${2:-}" ] || printf '  - %s\n' "$2"
+    [ -z "$1" ] || printf '%s\n' "$1"
+  } >"$APP_POLICY"
+}
+APP_OK_LINE="thread_resolution_ci_app_identity: \"$APP\"  # the CI app (#2727)"
+
+app_case() { # <label> <expected rc> <token> [env assignments...]
+  local label="$1" want="$2" token="$3" out rc
+  shift 3
+  : >"$WORKDIR/api.log"
+  set +e
+  out=$(env "$@" STUB_API_LOG="$WORKDIR/api.log" GH_TOKEN="$token" \
+    PATH="$STUB_DIR:$PATH" "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 2>&1)
+  rc=$?
+  set -e
+  APP_OUT="$out"
+  if [ "$rc" -eq "$want" ]; then
+    pass "--expect-thread-resolution-app $label: exit $rc"
+  else
+    fail "--expect-thread-resolution-app $label: exit $rc, expected $want; output: $out"
+  fi
+}
+no_api_call() { # <label>
+  if [ -s "$WORKDIR/api.log" ]; then
+    fail "--expect-thread-resolution-app $1: an API call was made before the refusal: $(cat "$WORKDIR/api.log")"
+  else
+    pass "--expect-thread-resolution-app $1: refused before any API call"
+  fi
+}
+
+# The configured app is accepted, silently, and its one read is pinned to
+# github.com. GraphQL may report a bot's login without the [bot] suffix; the
+# token class already proves the actor is an app, whose slug is unique.
+app_policy "$APP_OK_LINE" "$APP"
+app_case "configured app, viewer reads as its login" 0 ghs_x STUB_VIEWER_LOGIN="$APP"
+if [ -z "$APP_OUT" ] && grep -q -- '--hostname github.com' "$WORKDIR/api.log"; then
+  pass "--expect-thread-resolution-app: silent on success, viewer read pinned to github.com"
+else
+  fail "--expect-thread-resolution-app success: output '$APP_OUT', calls: $(cat "$WORKDIR/api.log")"
+fi
+app_case "configured app, viewer reads as the bare slug" 0 ghs_x STUB_VIEWER_LOGIN=mergepath-ci
+
+# Any other app or bot identity is rejected, including one whose name merely
+# contains the configured slug.
+app_case "another app's installation token" 2 ghs_x STUB_VIEWER_LOGIN='other-app[bot]'
+app_case "a suffix-extended app login" 2 ghs_x STUB_VIEWER_LOGIN='mergepath-ci-evil[bot]'
+app_case "the shared Actions bot" 2 ghs_x STUB_VIEWER_LOGIN='github-actions[bot]'
+app_case "viewer read fails" 3 ghs_x STUB_VIEWER_LOGIN="$APP" STUB_VIEWER_RC=1
+app_case "viewer read returns nothing" 3 ghs_x STUB_VIEWER_LOGIN=
+
+# Only an installation token qualifies. A user-held token is the reviewer-PAT
+# path and keeps --expect-write-identity; the cloud placeholder and opaque
+# tokens prove nothing. All refused on form, before any call.
+app_case "user PAT reading as the app" 3 ghp_x STUB_VIEWER_LOGIN="$APP"
+no_api_call "user PAT"
+app_case "app user-to-server token (user-held, not installed)" 3 ghu_x STUB_VIEWER_LOGIN="$APP"
+app_case "cloud placeholder" 3 proxy-injected STUB_VIEWER_LOGIN="$APP"
+app_case "opaque token, even with the unidentifiable opt-in" 3 some-token STUB_VIEWER_LOGIN="$APP" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+app_case "GH_HOST on an Enterprise Server" 3 ghs_x STUB_VIEWER_LOGIN="$APP" GH_HOST=ghe.example.com
+no_api_call "GH_HOST elsewhere"
+set +e
+out=$(env -u GH_TOKEN PATH="$STUB_DIR:$PATH" "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 3 ]; then
+  pass "--expect-thread-resolution-app with no GH_TOKEN: exit 3"
+else
+  fail "--expect-thread-resolution-app with no GH_TOKEN: exit $rc; output: $out"
+fi
+
+# Unconfigured is inert: absent, empty or null keys accept no app at all.
+for line in "" 'thread_resolution_ci_app_identity:' 'thread_resolution_ci_app_identity: ""' 'thread_resolution_ci_app_identity: ~'; do
+  app_policy "$line" "$APP"
+  app_case "unconfigured (${line:-key absent})" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+  no_api_call "unconfigured (${line:-key absent})"
+done
+if grep -q "thread_resolution_ci_app_identity is not configured" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app unconfigured: diagnostic names the key"
+else
+  fail "--expect-thread-resolution-app unconfigured: diagnostic does not name the key; output: $APP_OUT"
+fi
+
+# A configured value is validated where it is read, and an invalid one fails
+# closed rather than falling back to any other identity.
+app_policy "$APP_OK_LINE"
+app_case "configured app missing from non_reviewer_identities" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "non_reviewer_identities" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the missing non_reviewer_identities declaration"
+else
+  fail "--expect-thread-resolution-app missing declaration: diagnostic: $APP_OUT"
+fi
+app_policy "$APP_OK_LINE" "$APP" "$APP"
+app_case "configured app also listed in available_reviewers" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "available_reviewers" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the forbidden available_reviewers listing"
+else
+  fail "--expect-thread-resolution-app reviewer listing: diagnostic: $APP_OUT"
+fi
+# The shape check is the ONLY refusal in these two cases: each value is
+# declared in non_reviewer_identities and absent from available_reviewers, so a
+# dropped or weakened <app-slug>[bot] check would accept it.
+app_policy 'thread_resolution_ci_app_identity: nathanpayne-robot'
+app_case "configured value is a user login, not an app" 3 ghs_x STUB_VIEWER_LOGIN=nathanpayne-robot
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a declared non-reviewer user login is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app user login: diagnostic: $APP_OUT"
+fi
+for bot in 'github-actions[bot]' 'coderabbitai[bot]' 'chatgpt-codex-connector[bot]' 'dependabot[bot]' 'github-advanced-security[bot]'; do
+  app_policy "thread_resolution_ci_app_identity: \"$bot\"" "$bot"
+  app_case "configured value is the shared or reviewing bot $bot" 3 ghs_x STUB_VIEWER_LOGIN="$bot"
+done
+app_policy 'thread_resolution_ci_app_identity: [mergepath-ci[bot]]' '"[mergepath-ci[bot]]"'
+app_case "configured value is a flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a flow-list value is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app flow-list value: diagnostic: $APP_OUT"
+fi
+app_policy "$APP_OK_LINE" ""
+printf 'non_reviewer_identities: [%s]\n' "$APP" >"$APP_POLICY.tmp"
+grep -v -e '^non_reviewer_identities:' -e '^  - nathanpayne-robot' "$APP_POLICY" >>"$APP_POLICY.tmp"
+mv "$APP_POLICY.tmp" "$APP_POLICY"
+app_case "non_reviewer_identities as an unparseable flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+# The membership test alone would also refuse here, as "not declared"; the
+# guard's job is to say the list cannot be parsed, not that it is missing.
+if grep -q "non_reviewer_identities in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable non_reviewer_identities list"
+else
+  fail "--expect-thread-resolution-app flow non_reviewer_identities: diagnostic: $APP_OUT"
+fi
+# available_reviewers as a flow list naming the app: the bash reader sees an
+# empty list, but the workflows' YAML readers give the app reviewer standing,
+# so the validator refuses what it cannot parse.
+{
+  printf 'available_reviewers: [nathanpayne-claude, "%s"]\n' "$APP"
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as a flow list naming the app" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+no_api_call "available_reviewers as a flow list"
+if grep -q "available_reviewers in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable available_reviewers list"
+else
+  fail "--expect-thread-resolution-app flow available_reviewers: diagnostic: $APP_OUT"
+fi
+# The empty flow list is the documented inert form and parses: still accepted.
+{
+  printf 'available_reviewers: []\n'
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as an empty flow list" 0 ghs_x STUB_VIEWER_LOGIN="$APP"
+
+# The mode takes no login argument: the identity comes only from the policy.
+app_policy "$APP_OK_LINE" "$APP"
+set +e
+out=$(GH_TOKEN=ghs_x STUB_VIEWER_LOGIN='other-app[bot]' PATH="$STUB_DIR:$PATH" \
+  "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 'other-app[bot]' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 1 ]; then
+  pass "--expect-thread-resolution-app refuses a caller-supplied login (exit 1)"
+else
+  fail "--expect-thread-resolution-app with a login argument: exit $rc; output: $out"
+fi
+
+# Configuring the app widens nothing else. --expect-write-identity, which every
+# other write path (the gh-as-* wrappers, the token resolver) uses, still
+# refuses the app's installation token, and the reviewer-PAT path is unchanged.
+tree_write() { # <expected rc> <login> <token> [env...]
+  local want="$1" login="$2" token="$3" out rc
+  shift 3
+  set +e
+  out=$(env "$@" GH_TOKEN="$token" PATH="$STUB_DIR:$PATH" \
+    "$APP_TREE/scripts/identity-check.sh" --expect-write-identity "$login" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq "$want" ]; then
+    pass "configured app tree: --expect-write-identity $login with ${token%%_*}_ token: exit $rc"
+  else
+    fail "configured app tree: --expect-write-identity $login: exit $rc, expected $want; output: $out"
+  fi
+}
+tree_write 3 "$APP" ghs_x STUB_TOKEN_LOGIN="$APP" STUB_VIEWER_LOGIN="$APP"
+tree_write 3 "$APP" ghs_x STUB_TOKEN_LOGIN="$APP" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+tree_write 0 nathanpayne-claude ghp_x STUB_TOKEN_LOGIN=nathanpayne-claude
+tree_write 2 nathanpayne-claude ghp_x STUB_TOKEN_LOGIN=nathanpayne-codex
+
+# Fail closed without the policy reader: the mode cannot establish which app
+# is configured, so it accepts none.
+rm "$APP_TREE/scripts/lib/reviewers-helpers.sh"
+app_case "policy reader missing" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_TREE/scripts/lib/"
 
 # -----------------------------------------------------------------------
 # Summary

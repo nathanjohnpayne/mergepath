@@ -19,6 +19,8 @@
 #   source scripts/lib/reviewers-helpers.sh
 #   read_available_reviewers [config_path]            # one login per line
 #   login_is_available_reviewer <login> [config_path] # 0 if listed, else 1
+#   validate_thread_resolution_ci_app_identity [config_path]
+#                                  # the CI app login (#2726): 0 valid, 1 unset, 2 invalid
 #
 # config_path defaults to $CONFIG (the global the helper scripts set) and
 # then to .github/review-policy.yml, so existing call sites that pass no
@@ -112,4 +114,82 @@ login_is_non_reviewer_identity() {
     [ "$denied" = "$login" ] && return 0
   done <<< "$(read_non_reviewer_identities "$cfg")"
   return 1
+}
+
+# --- The CI app thread-resolution identity (#2726) --------------------------
+#
+# `thread_resolution_ci_app_identity` names the ONE GitHub App bot login that
+# may resolve demonstrably-actioned review threads from CI
+# (scripts/identity-check.sh --expect-thread-resolution-app, reached only from
+# scripts/resolve-pr-threads.sh --resolve-actioned --ci-app-identity). It is a
+# top-level scalar, absent by default; absent, empty, `~` and `null` all mean
+# "no CI app", and the mode is then inert.
+
+# Print the key's raw scalar value, or nothing when it is absent or one of the
+# empty forms. No validation: a reader that only needs "which login could this
+# be?" (the clearance gate's deny-list) takes it as written.
+read_thread_resolution_ci_app_identity() {  # [config_path]
+  local cfg="${1:-${CONFIG:-.github/review-policy.yml}}" value
+  [ -f "$cfg" ] || return 0
+  value=$(awk 'index($0, "thread_resolution_ci_app_identity:") == 1 {
+      sub(/^thread_resolution_ci_app_identity:[[:space:]]*/, ""); print; exit
+    }' "$cfg" | sed -E "s/[[:space:]]+#.*\$//; s/[[:space:]]+\$//; s/^[\"']//; s/[\"']\$//")
+  case "$value" in
+    ''|'~'|null) return 0 ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+# Print the configured CI app login when it is configured AND valid.
+#   0  configured and valid; the login is on stdout
+#   1  not configured; the mode is inert (nothing printed)
+#   2  configured but invalid; the reason is on stderr (nothing on stdout)
+# Valid means all of:
+#   - the exact form of a GitHub App bot login, `<app-slug>[bot]`
+#   - not a bot that is shared or that reviews: github-actions[bot] is every
+#     workflow run's GITHUB_TOKEN, so it would not name one app, and a review
+#     bot must never resolve review threads, its own included
+#   - declared in non_reviewer_identities (so the #1080 assertion in
+#     scripts/merge-clearance-gate.sh refuses any approval it posts), with that
+#     list in a form this reader can parse
+#   - never in available_reviewers: it holds no reviewer standing, with that
+#     list in a form this reader can parse
+validate_thread_resolution_ci_app_identity() {  # [config_path]
+  local cfg="${1:-${CONFIG:-.github/review-policy.yml}}" login re
+  login=$(read_thread_resolution_ci_app_identity "$cfg")
+  [ -n "$login" ] || return 1
+  re='^[a-z0-9][a-z0-9-]{0,38}\[bot\]$'
+  if ! [[ "$login" =~ $re ]]; then
+    echo "thread_resolution_ci_app_identity in $cfg is not a GitHub App bot login of the form <app-slug>[bot]." >&2
+    return 2
+  fi
+  case "$login" in
+    'github-actions[bot]'|'dependabot[bot]'|'coderabbitai[bot]'|'chatgpt-codex-connector[bot]'|'github-advanced-security[bot]')
+      echo "thread_resolution_ci_app_identity in $cfg is '$login', a shared or reviewing bot; it must name the repository's own CI app." >&2
+      return 2
+      ;;
+  esac
+  if [ -z "$(read_non_reviewer_identities "$cfg")" ] \
+     && policy_list_has_unconsumed_inline_value non_reviewer_identities "$cfg"; then
+    echo "non_reviewer_identities in $cfg carries an inline value this reader cannot parse, so '$login' cannot be shown to be declared a non-reviewer." >&2
+    return 2
+  fi
+  if ! login_is_non_reviewer_identity "$login" "$cfg"; then
+    echo "thread_resolution_ci_app_identity '$login' is not declared in non_reviewer_identities in $cfg; declare it there so it can never count as an approval." >&2
+    return 2
+  fi
+  # The same guard for available_reviewers: a flow list (`[a, b]`) reads as
+  # EMPTY here, so the membership test below would pass the app while the
+  # workflows' YAML readers (pr-audit.yml, agent-review.yml) parse the list in
+  # full and give the app reviewer standing. Unparseable here means refused.
+  if [ -z "$(read_available_reviewers "$cfg")" ] \
+     && policy_list_has_unconsumed_inline_value available_reviewers "$cfg"; then
+    echo "available_reviewers in $cfg carries an inline value this reader cannot parse, so '$login' cannot be shown to be absent from it." >&2
+    return 2
+  fi
+  if login_is_available_reviewer "$login" "$cfg"; then
+    echo "thread_resolution_ci_app_identity '$login' is listed in available_reviewers in $cfg; a CI app holds no reviewer standing." >&2
+    return 2
+  fi
+  printf '%s\n' "$login"
 }

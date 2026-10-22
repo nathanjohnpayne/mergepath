@@ -68,6 +68,18 @@ An absent or empty key is a legitimate configuration meaning "no such identity h
 
 The current CI service account is `nathanpayne-robot`. It holds no reviewer standing and must never post a review — review state is what the no-self-approve and same-agent gates read. It is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT.
 
+### CI app thread-resolution identity (#2726)
+
+One GitHub App identity may resolve demonstrably-actioned review threads from CI, and do nothing else. A repo names it in `thread_resolution_ci_app_identity` in `.github/review-policy.yml`, as the app's `<app-slug>[bot]` login. The key is absent by default, and absent, empty, `~` or `null` make the mode inert: no app is accepted.
+
+The mode is bounded at each layer:
+
+- **Identity.** `scripts/identity-check.sh --expect-thread-resolution-app` is the only mode that accepts a GitHub App installation token. It takes no login argument. It reads the key from the policy of its own checkout, validates it, requires `GH_TOKEN` to classify as an installation token from its own form (`scripts/lib/credential-class.sh`), and requires the GraphQL viewer to be that app. Every other write path, including the `gh-as-*` wrappers and the token resolver, keeps `--expect-write-identity`, which refuses installation tokens whatever the policy configures.
+- **Operation.** Its one caller is `scripts/resolve-pr-threads.sh --resolve-actioned --ci-app-identity`. The flag is a usage error with any other mode, so deferral, propagation verification and explicit dispositions stay on the reviewer PAT. Every actioned-evidence check still applies. `RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK` does not skip the app check. The thread resolution lane passes the flag only when its token is an installation token; a reviewer PAT runs exactly as before. The app's own `[mergepath-resolve: <class>]` marker reply is the script's output, not reviewer feedback: the resolver does not let it move a thread's staleness floor, and `scripts/daily-feedback-rollup.sh` honors it as the disposition of record. Only a reply that starts with the marker and is authored by the configured app gets this reading (its bare GraphQL slug counts only as a `Bot`); any other reply from the app is still non-agent feedback.
+- **Standing.** A configured value must be listed in `non_reviewer_identities` and must not be in `available_reviewers`, or the mode refuses to run. `github-actions[bot]` and the review bots are refused. `scripts/merge-clearance-gate.sh` adds the configured login to its non-reviewer deny-list even if the declaration is missing, so the app's approval never satisfies the gate.
+
+The app and its token issuance are specified in #2727. Until it exists, leave the key unset.
+
 ### Identity Rules
 
 - An agent **never** reviews its own code under the same identity that authored it.
@@ -231,7 +243,7 @@ The current contract is token-attributed for the guarded core `gh` write surface
 | `gh issue comment` | reviewer wrapper | reviewer identity verified from the token |
 | `gh issue close` | not hook-gated by #411 | token selected by caller |
 | `gh api GET ...` | direct read with `GH_TOKEN=<read PAT>` | no write byline |
-| `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-write-identity <reviewer>` before mutation | reviewer token |
+| `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-write-identity <reviewer>` before mutation; from CI only, `resolve-pr-threads.sh --resolve-actioned --ci-app-identity` with `identity-check.sh --expect-thread-resolution-app` | reviewer token, or the one configured CI app's installation token ([#2726](#ci-app-thread-resolution-identity-2726)) |
 | `gh workflow run` | direct with an author or reviewer PAT that has `workflow` scope | no comment/review byline |
 | `gh api .../dispatches` (`repository_dispatch`) | author wrapper (`scripts/dispatch-thread-resolution-lane.sh` for the lane) | Contents: write (fine-grained) or `repo` (classic). Repository policy, not a GitHub limit: GitHub does start a `repository_dispatch` run from a suitably permitted `GITHUB_TOKEN`, but sessions dispatch as the author through the wrapper |
 

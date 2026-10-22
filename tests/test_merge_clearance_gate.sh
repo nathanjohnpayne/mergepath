@@ -4334,10 +4334,11 @@ EOF
   echo "$dir"
 }
 
-nonrev_case() {  # <name> <denied_block> <reviews_json> <expect: block|pass>
-  local name=$1 denied=$2 reviews=$3 expect=$4
+nonrev_case() {  # <name> <denied_block> <reviews_json> <expect: block|pass> [extra policy line]
+  local name=$1 denied=$2 reviews=$3 expect=$4 extra=${5:-}
   local scratch fpr frev out rc
   scratch=$(make_scratch_nonrev "$denied")
+  [ -z "$extra" ] || printf '\n%s\n' "$extra" >>"$scratch/.github/review-policy.yml"
   fpr=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
   frev=$(make_reviews_fixture "$reviews")
   set +e
@@ -4485,6 +4486,31 @@ done
 nonrev_case "block-list key parses and gates normally" "$DENY" \
   "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
     [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# 26k-26n (#2726) — the CI app that may resolve threads is never counted as an
+# approval. REST review payloads carry the `[bot]` login, the form the policy
+# declares. Declared in non_reviewer_identities (the configuration the
+# identity mode requires), its approval blocks like any service account's.
+CI_APP='mergepath-ci[bot]'
+CI_APP_LINE="thread_resolution_ci_app_identity: \"$CI_APP\""
+nonrev_case "configured CI app, declared a non-reviewer, APPROVED on HEAD" "$DENY
+  - $CI_APP" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$CI_APP" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block "$CI_APP_LINE"
+# Defense in depth: even a policy that names the app but forgot to declare it
+# (which the identity mode refuses to run with) never lets its approval count,
+# with the deny-list present but missing it, or absent altogether.
+nonrev_case "configured CI app NOT declared a non-reviewer, APPROVED on HEAD" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$CI_APP" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block "$CI_APP_LINE"
+nonrev_case "configured CI app, no non_reviewer_identities key, APPROVED on an OLD sha" "" \
+  "$(jq -n --arg old "$OLD_SHA" --arg who "$CI_APP" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" block "$CI_APP_LINE"
+# Its thread-resolution marker replies are review comments, never an approval.
+nonrev_case "configured CI app with only a COMMENTED review" "$DENY
+  - $CI_APP" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$CI_APP" '
+    [{user:{login:$who},state:"COMMENTED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" pass "$CI_APP_LINE"
 
 # ---------------------------------------------------------------------------
 # Test 27 (#2167): event-driven lint fan-in and no runner-held waiting.
