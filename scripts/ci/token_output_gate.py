@@ -1730,6 +1730,8 @@ class Lexer:
         def start_segment(pipe=False, xtrace_boundary=True):
             finish_word()
             lv = cur_level()
+            # Delimiter ownership cannot carry into another command segment.
+            lv.pop("tee_heredoc_delimiter_pending", None)
             if xtrace_boundary:
                 lv["xtrace_keyword_prefix"] = True
             prev = lv["seg"]
@@ -1751,6 +1753,7 @@ class Lexer:
             cur_ll = LogicalLine(next_line)
             self.logical.append(cur_ll)
             lv = levels[0]
+            lv.pop("tee_heredoc_delimiter_pending", None)
             lv["xtrace_keyword_prefix"] = True
             seg = self._new_segment(None, False, next_line)
             lv["seg"] = seg
@@ -2201,6 +2204,10 @@ class Lexer:
                 # process substitution: a NON-capturing level, so the emitter
                 # inside is judged on its own merits
                 parent_seg = cur_level()["seg"]
+                # This substitution consumes the pending delimiter target,
+                # but must not itself become a tee output operand. Later
+                # standalone operands belong to their own argument positions.
+                delimiter_target = cur_level().pop("tee_heredoc_delimiter_pending", False)
                 previous = parent_seg.words[-1] if parent_seg.words else ""
                 redirection = _REDIR_RE.match(previous)
                 probe = Segment(-1, None, False, line)
@@ -2220,7 +2227,7 @@ class Lexer:
                     c == ">" and not cur_level()["word"]
                     and text[operand_start - 1:operand_start] in (" ", "\t", "\n")
                     and resolve_command(probe)[0] == "tee"
-                    and not cur_level().get("tee_heredoc_delimiter_pending", False)
+                    and not delimiter_target
                     and not _HERESTRING_RE.fullmatch(previous)
                     and not (redirection and redirection.end() == len(previous))
                 )
@@ -16014,7 +16021,45 @@ def _tee_process_substitution_cases():
     findings, errors = scan_text(body)
     if errors or [finding.line for finding in findings] != [2]:
         failures.append("tee stderr routing: physical reference line changed")
+    # Metadata-only incomplete syntax isolates lifetime resets without an
+    # oracle claim about how Bash executes a missing delimiter.
+    for label, text, expected_links in [
+        ("unconsumed", 'tee << >(cat >&2)\n', [0]),
+        ("same-command", 'tee << >(cat >/dev/null) >(cat >&2)\n', [1]),
+        ("same-command-null", 'tee << >(cat >/dev/null) >(cat >/dev/null)\n', [1]),
+        ("next-segment", 'tee << ; tee >(cat >&2)\n', [0, 1]),
+        ("next-logical-line", 'tee <<\ntee >(cat >&2)\n', [0, 1]),
+    ]:
+        owners = [seg for ll in Lexer(text).logical for seg in ll.segments
+                  if seg.parent is None and resolve_command(seg)[0] == "tee"]
+        if [len(seg.tee_output_processes) for seg in owners] != expected_links:
+            failures.append("tee delimiter ownership: " + label)
+        expected_sidewrite = label in ("same-command", "next-segment", "next-logical-line")
+        if any(_tee_process_substitution_sidewrite(seg) for seg in owners) != expected_sidewrite:
+            failures.append("tee delimiter consumer boundary: " + label)
+    for cid, expected, body in _tee_delimiter_lifetime_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee delimiter lifetime: " + cid)
+        if findings and [finding.line for finding in findings] != [1]:
+            failures.append("tee delimiter lifetime: physical reference line " + cid)
+        owners = [seg for ll in Lexer(body).logical for seg in ll.segments
+                  if seg.parent is None and resolve_command(seg)[0] == "tee"]
+        if [len(seg.tee_output_processes) for seg in owners] != [0, 1]:
+            failures.append("tee delimiter lifetime: later-command ownership " + cid)
     return failures
+
+
+def _tee_delimiter_lifetime_cases():
+    """Inert later-command pairs; native acceptance belongs to the parent."""
+    prefix = 'tee << >(cat >/dev/null); printf %s "$GH_TOKEN" | tee '
+    suffix = ' | grep -qF zz\nsafe\n>(cat > /dev/null)\n'
+    return [
+        ("tee-delimiter-later-command-stderr", MUST_FLAG,
+         prefix + '>(cat >&2)' + suffix),
+        ("tee-delimiter-later-command-null", MUST_NOT_FLAG,
+         prefix + '>(cat >/dev/null)' + suffix),
+    ]
 
 
 def _tee_routing_cases():
@@ -17213,6 +17258,7 @@ CORPUS += _tee_namespace_cases()
 CORPUS += _tee_continuation_cases()
 CORPUS += _tee_identity_cases()
 CORPUS += _tee_routing_cases()
+CORPUS += _tee_delimiter_lifetime_cases()
 # The same reviewed case/body now records the approved conservative reduction.
 KNOWN_BROADER.update({cid: (
     "This unchanged own help/version fixture is quiet for the measured tee "
