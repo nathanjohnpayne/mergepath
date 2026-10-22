@@ -14,7 +14,7 @@
 # up the unhardened copy in a fail-OPEN direction, which is the defect this
 # extraction closes rather than papers over.
 #
-# Sourcing contract: no top-level side effects beyond the constant below, and
+# Sourcing contract: no top-level side effects beyond the constants below, and
 # Bash 3.2 portable. The severity gate and the waiter both source this; neither
 # may redefine it.
 
@@ -71,3 +71,57 @@ function fence_update(l,   inf) {
   return 1
 }
 '
+
+# --- CodeRabbit's vendor header (#2734) -------------------------------------
+#
+# CodeRabbit now opens its comments with an invisible
+# `<!-- coderabbit-ai-generated:v1 -->` line, so the summarize comment no longer
+# starts with its marker at byte zero. Every "is this the summarize comment"
+# test was a byte-zero `startswith`, so a headered summary read as no summary:
+# the probe reported `summary-without-head-review` on a head CodeRabbit had
+# finished (#2702), the structural refusal reader missed a headered
+# heading-only refusal (#956), and the severity gate dropped a headered
+# summary-only finding out of scope.
+#
+# The header is vendor framing only as the body's FIRST line, alone on it
+# apart from trailing whitespace, once; the blank lines after it go with it.
+# That is the rule feedback accounting already applies (#2568). A header
+# anywhere else, or content on its line, is left as written, so a chat reply
+# QUOTING the summarize marker below its own header still does not open with
+# the marker (#794, #886).
+#
+# Two spellings of ONE rule — jq for the selectors, shell for the
+# classifiers — kept byte-for-byte equivalent on their output, which
+# tests/test_coderabbit_wait_status_probe.sh asserts.
+CR_VENDOR_HEADER='<!-- coderabbit-ai-generated:v1 -->'
+
+# A jq `def` to prefix a program with: `.body | cr_strip_vendor_header`.
+CR_STRIP_VENDOR_HEADER_JQ='def cr_strip_vendor_header:
+  sub("\\A<!-- coderabbit-ai-generated:v1 -->[ \\t\\r]*\\n(?:[ \\t\\r]*\\n)*"; "");'
+
+# cr_strip_vendor_header <body> — the body without its leading vendor header
+# line and the blank lines after it; any other body unchanged. Prints with no
+# trailing newline added.
+cr_strip_vendor_header() {
+  local body=$1 first rest line
+  first=${body%%$'\n'*}
+  # No newline: the header, if that is what this is, frames nothing.
+  if [ "$first" = "$body" ]; then printf '%s' "$body"; return 0; fi
+  case "$first" in
+    "$CR_VENDOR_HEADER"*) ;;
+    *) printf '%s' "$body"; return 0 ;;
+  esac
+  case "${first#"$CR_VENDOR_HEADER"}" in
+    *[!$' \t\r']*) printf '%s' "$body"; return 0 ;;
+  esac
+  rest=${body#*$'\n'}
+  while :; do
+    line=${rest%%$'\n'*}
+    # A whitespace-only LAST line has no newline to consume; jq's `\n`-bound
+    # repetition keeps it too.
+    [ "$line" = "$rest" ] && break
+    case "$line" in *[!$' \t\r']*) break ;; esac
+    rest=${rest#*$'\n'}
+  done
+  printf '%s' "$rest"
+}

@@ -1683,10 +1683,14 @@ scan_codex_state() {
   request=$(crqe_select_trigger "$issue_comments" "$AUTHOR_IDENTITY" "") || return 3
   summary=$(crqe_select_codex_review_summary "$issue_comments" "$BOT_LOGIN" "$HEAD_SHA") || return 3
   blocked=$(crqe_filter_provider_block "$blocked" "$request" "$summary") || return 3
+  # #1362: the request generation this scan saw. The pre-flight scan's copy is
+  # the evidence a new request is decided on; null when it cannot be read.
+  local generation
+  generation=$(crqe_trigger_generation "$issue_comments" "$AUTHOR_IDENTITY" 2>/dev/null) || generation=null
 
-  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" "$request" | jq -s --arg approval_time "$approval_time" '
-    if length != 6 then error("incomplete Codex scan components") else
-      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4], request: .[5], review_approval_eligible: ($approval_time != "") }
+  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" "$request" "$generation" | jq -s --arg approval_time "$approval_time" '
+    if length != 7 then error("incomplete Codex scan components") else
+      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4], request: .[5], generation: .[6], review_approval_eligible: ($approval_time != "") }
     end
   '
 }
@@ -2166,6 +2170,10 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
       log "existing trigger $TRIGGER_COMMENT_ID refused the acknowledgement retry — continuing normal review poll"
       return 1
     fi
+  fi
+  if [ "$rc" -ne 0 ] && [ "$mode" = inline ] && [ "$body" = '@codex review' ] && [ "$TRIGGER_POSTED" != true ] \
+     && grep -Eqx '\[codex-review-request\] ERROR: trigger not authorized: (concurrent-request|existing-trigger)' <<< "$output"; then
+    die 3 "another guarded Codex request for $REPO#$PR_NUMBER posted first (#1362); this run posted nothing. Wait for that request's result before rerunning: a polling rerun resumes it only once Codex reports it Running on HEAD, and until then a rerun posts another request and spends a slot: $output"
   fi
   [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
   AUTHOR_COMMENT_OUTPUT="$output"
@@ -2697,6 +2705,19 @@ post_codex_trigger() {
     live=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha) \
       || die 3 "cannot fence the authorized trigger head"
     [ "$live" = "$expected" ] || die 3 "trigger head moved during authorization"
+    # #1362: this pass runs inside the wrapper's per-PR claim. The canonical
+    # requester names the request generation it decided to post against; a
+    # request that landed since (a concurrent requester that won the claim,
+    # or one typed in the web UI) refuses this one rather than adding a
+    # second. An absent or unreadable generation fails closed.
+    local observed="${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" current
+    current=$(crqe_trigger_generation "$request_comments" "$AUTHOR_IDENTITY") \
+      || die 3 "cannot read the Codex request generation for authorization"
+    if ! jq -en --argjson observed "${observed:-null}" --argjson current "$current" \
+         '($observed | type) == "array" and $observed == $current' >/dev/null 2>&1; then
+      jq -n '{authorized:false,reason:"concurrent-request"}'
+      die 3 "trigger not authorized: concurrent-request"
+    fi
     jq -n --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" \
       '{authorized:true,repo:$repo,pr_number:$pr,head_sha:$head,author_identity:$author}'
     exit 0
@@ -2726,9 +2747,25 @@ post_codex_trigger() {
   # never records (and so never uses up) the checkpoint.
   local record_checkpoint=false
   if [ "$TRIGGER_POSTED" != true ] && [ "$FAILOVER" != true ]; then record_checkpoint=true; fi
+  # #1362: the wrapper's claimed recount refuses this write if the request
+  # generation it was decided against has changed. A new request is decided
+  # on the pre-flight scan, so it names that scan's generation: a request
+  # another caller posted after it, even one this run's later reads already
+  # include, refuses this write. An acknowledgement retry names this read,
+  # which holds the run's own confirmed trigger.
+  local observed_generation
+  if [ "$TRIGGER_POSTED" != true ]; then
+    observed_generation=$(printf '%s' "$INITIAL_SCAN" | jq -c '.generation // null' 2>/dev/null) || observed_generation=null
+    [ "$observed_generation" != null ] \
+      || die 3 "cannot read the Codex request generation the request was decided on; refusing a new '@codex review' trigger"
+  else
+    observed_generation=$(crqe_trigger_generation "$request_comments" "$AUTHOR_IDENTITY") \
+      || die 3 "cannot read the Codex request generation; refusing a new '@codex review' trigger"
+  fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
+    MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$observed_generation" \
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true

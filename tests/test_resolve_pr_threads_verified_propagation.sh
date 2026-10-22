@@ -933,6 +933,8 @@ done
 YQBOOT_SHA256=$(printf '%s\n%s\n' '#!/bin/sh' \
   'echo "yq (https://github.com/mikefarah/yq/) version v4.53.6"' | shasum -a 256)
 YQBOOT_SHA256=${YQBOOT_SHA256%% *}
+YQBOOT_PINNED_AMD64=c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385
+YQBOOT_PINNED_ARM64=88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09
 YQBOOT_PYTHON=$(command -v python3)
 cat > "$YQBOOT_BIN/sudo" <<SUDO_STUB
 #!/bin/sh
@@ -971,6 +973,27 @@ printf '%s\n%s\n' '#!/bin/sh' \
 chmod +x "\$dest"
 WGET_STUB
 chmod +x "$YQBOOT_BIN/wget"
+cat > "$YQBOOT_BIN/uname" <<'UNAME_STUB'
+#!/bin/sh
+if [ "${1:-}" = -m ]; then
+  printf '%s\n' "${YQBOOT_ARCH:-x86_64}"
+else
+  exec /usr/bin/uname "$@"
+fi
+UNAME_STUB
+chmod +x "$YQBOOT_BIN/uname"
+cat > "$YQBOOT_BIN/sha256sum" <<CHECKSUM_STUB
+#!/bin/sh
+if [ -n "\${YQBOOT_EXPECTED_DIGEST:-}" ]; then
+  digest=\$YQBOOT_EXPECTED_DIGEST
+else
+  digest=\$(shasum -a 256 "\$1")
+  digest=\${digest%% *}
+fi
+echo "CHECKSUM: \$digest \$1" >> "$YQBOOT_LOG"
+printf '%s  %s\\n' "\$digest" "\$1"
+CHECKSUM_STUB
+chmod +x "$YQBOOT_BIN/sha256sum"
 
 # Shim bin for the "mikefarah yq present" run: fake yq + the grep the
 # short-circuit's version sniff needs; same sudo/wget stubs so any
@@ -1041,6 +1064,7 @@ mkdir -p "$YQWRONG_BIN" "$SCRATCH/yqboot-dest-c"
 ln -s "$(command -v grep)" "$YQWRONG_BIN/grep"
 ln -s "$YQBOOT_BIN/sudo" "$YQWRONG_BIN/sudo"
 ln -s "$YQBOOT_BIN/wget" "$YQWRONG_BIN/wget"
+ln -s "$YQBOOT_BIN/uname" "$YQWRONG_BIN/uname"
 for tool in chmod mktemp rm install shasum; do
   ln -s "$(command -v "$tool")" "$YQWRONG_BIN/$tool"
 done
@@ -1077,6 +1101,153 @@ else
   echo "    CI output:" >&2; echo "$out_b" | sed 's/^/      /' >&2
   echo "    wrong-impl output:" >&2; echo "$out_c" | sed 's/^/      /' >&2
   echo "    installer log:" >&2; sed 's/^/      /' "$YQBOOT_LOG" >&2 || true
+fi
+
+# Architecture selection uses the matching official release asset and
+# accepts the same fixture digest override for either selected asset.
+for arch_case in x86_64:amd64 aarch64:arm64 arm64:arm64; do
+  arch=${arch_case%%:*}
+  asset_arch=${arch_case#*:}
+  : > "$YQBOOT_LOG"
+  mkdir -p "$SCRATCH/yqboot-dest/arch-$arch"
+  set +e
+  arch_out=$(env GITHUB_ACTIONS=true YQBOOT_ARCH="$arch" PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_SHA256="$YQBOOT_SHA256" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/arch-$arch/yq" \
+    "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+  arch_rc=$?
+  set -e
+  if [ "$arch_rc" -eq 0 ] \
+     && grep -q "WGET: https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_$asset_arch" "$YQBOOT_LOG" \
+     && grep -q 'SUDO: install ' "$YQBOOT_LOG" \
+     && grep -q 'version v4.53.6' <<<"$arch_out"; then
+    pass=$((pass + 1)); echo "  PASS: #2685 $arch selects and verifies yq_linux_$asset_arch"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2685 $arch did not select and verify yq_linux_$asset_arch (rc=$arch_rc)" >&2
+    echo "$arch_out" >&2; cat "$YQBOOT_LOG" >&2
+  fi
+done
+
+# The default pins are tested without ENSURE_YQ_SHA256. The fake checksum
+# command reports the independently recorded official release digest and
+# logs the value the production script compares before privileged install.
+for arch_case in "x86_64:amd64:$YQBOOT_PINNED_AMD64" \
+                 "aarch64:arm64:$YQBOOT_PINNED_ARM64" \
+                 "arm64:arm64:$YQBOOT_PINNED_ARM64"; do
+  IFS=: read -r arch asset_arch expected_digest <<<"$arch_case"
+  : > "$YQBOOT_LOG"
+  mkdir -p "$SCRATCH/yqboot-dest/default-$arch"
+  set +e
+  default_pin_out=$(env -u ENSURE_YQ_SHA256 GITHUB_ACTIONS=true YQBOOT_ARCH="$arch" \
+    YQBOOT_EXPECTED_DIGEST="$expected_digest" PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/default-$arch/yq" \
+    "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+  default_pin_rc=$?
+  set -e
+  if [ "$default_pin_rc" -eq 0 ] \
+     && grep -q "WGET: https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_$asset_arch" "$YQBOOT_LOG" \
+     && grep -q "CHECKSUM: $expected_digest .*ensure-yq\." "$YQBOOT_LOG" \
+     && grep -q 'SUDO: install ' "$YQBOOT_LOG" \
+     && ! grep -q 'ENSURE_YQ_SHA256=' "$YQBOOT_LOG"; then
+    pass=$((pass + 1)); echo "  PASS: #2685 default $arch pin compares official yq_linux_$asset_arch digest without override"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2685 default $arch pin was not independently verified (rc=$default_pin_rc)" >&2
+    echo "$default_pin_out" >&2; cat "$YQBOOT_LOG" >&2
+  fi
+done
+
+# Wrong-pin inverse: keep the fake checksum at the official digest while a
+# disposable script copy carries an incorrect per-architecture pin. The
+# default (no override) path must report mismatch before sudo.
+for arch_case in "x86_64:amd64:$YQBOOT_PINNED_AMD64" \
+                 "aarch64:arm64:$YQBOOT_PINNED_ARM64"; do
+  IFS=: read -r arch asset_arch expected_digest <<<"$arch_case"
+  mutated_script="$SCRATCH/ensure-yq-wrong-pin-$arch.sh"
+  wrong_digest=$(printf '%064d' 0)
+  sed "s/$expected_digest/$wrong_digest/" "$ENSURE_YQ" > "$mutated_script"
+  : > "$YQBOOT_LOG"
+  mkdir -p "$SCRATCH/yqboot-dest/wrong-pin-$arch"
+  set +e
+  wrong_pin_out=$(env -u ENSURE_YQ_SHA256 GITHUB_ACTIONS=true YQBOOT_ARCH="$arch" \
+    YQBOOT_EXPECTED_DIGEST="$expected_digest" PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/wrong-pin-$arch/yq" \
+    "$BASH" "$mutated_script" --ci-only 2>&1)
+  wrong_pin_rc=$?
+  set -e
+  if [ "$wrong_pin_rc" -ne 0 ] \
+     && grep -q "CHECKSUM: $expected_digest .*ensure-yq\." "$YQBOOT_LOG" \
+     && grep -q "SHA-256 mismatch for v4.53.6/yq_linux_$asset_arch" <<<"$wrong_pin_out" \
+     && ! grep -q 'SUDO:' "$YQBOOT_LOG"; then
+    pass=$((pass + 1)); echo "  PASS: #2685 wrong default $arch pin mutation is rejected before sudo"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2685 wrong default $arch pin mutation was not rejected (rc=$wrong_pin_rc)" >&2
+    echo "$wrong_pin_out" >&2; cat "$YQBOOT_LOG" >&2
+  fi
+done
+
+# Mutation controls: independently remove each supported machine-name arm
+# from a disposable copy and prove the corresponding positive architecture
+# case is caught before download or sudo.
+for omission in x86_64 aarch64; do
+  mutated_script="$SCRATCH/ensure-yq-omit-$omission.sh"
+  if [ "$omission" = x86_64 ]; then
+    sed 's/^  x86_64)$/  __omitted_x86_64)/' "$ENSURE_YQ" > "$mutated_script"
+    mutation_arch=x86_64
+  else
+    sed 's/^  aarch64|arm64)$/  __omitted_aarch64|arm64)/' "$ENSURE_YQ" > "$mutated_script"
+    mutation_arch=aarch64
+  fi
+  : > "$YQBOOT_LOG"
+  set +e
+  mutation_out=$(env GITHUB_ACTIONS=true YQBOOT_ARCH="$mutation_arch" PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/mutated-$omission/yq" \
+    "$BASH" "$mutated_script" --ci-only 2>&1)
+  mutation_rc=$?
+  set -e
+  if [ "$mutation_rc" -ne 0 ] \
+     && grep -q "unsupported Linux architecture: $mutation_arch" <<<"$mutation_out" \
+     && ! grep -q 'WGET:' "$YQBOOT_LOG" \
+     && ! grep -q 'SUDO:' "$YQBOOT_LOG"; then
+    pass=$((pass + 1)); echo "  PASS: #2685 omission mutation for $omission is detected before side effects"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2685 omission mutation for $omission was not detected safely (rc=$mutation_rc)" >&2
+    echo "$mutation_out" >&2; cat "$YQBOOT_LOG" >&2
+  fi
+done
+
+: > "$YQBOOT_LOG"
+set +e
+unsupported_out=$(env GITHUB_ACTIONS=true YQBOOT_ARCH=riscv64 PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/unsupported/yq" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+unsupported_rc=$?
+set -e
+if [ "$unsupported_rc" -ne 0 ] \
+   && grep -q 'unsupported Linux architecture: riscv64' <<<"$unsupported_out" \
+   && ! grep -q 'WGET:' "$YQBOOT_LOG" \
+   && ! grep -q 'SUDO:' "$YQBOOT_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: #2685 unsupported architecture refuses before download or sudo"
+else
+  fail=$((fail + 1)); echo "  FAIL: #2685 unsupported architecture reached an installer step (rc=$unsupported_rc)" >&2
+  echo "$unsupported_out" >&2; cat "$YQBOOT_LOG" >&2
+fi
+
+: > "$YQBOOT_LOG"
+set +e
+arm_mismatch_out=$(env GITHUB_ACTIONS=true YQBOOT_ARCH=aarch64 PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_SHA256="$(printf '%064d' 0)" \
+  ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/arm-mismatch/yq" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+arm_mismatch_rc=$?
+set -e
+if [ "$arm_mismatch_rc" -ne 0 ] \
+   && grep -q 'SHA-256 mismatch for v4.53.6/yq_linux_arm64' <<<"$arm_mismatch_out" \
+   && grep -q 'WGET: https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_arm64' "$YQBOOT_LOG" \
+   && ! grep -q 'SUDO:' "$YQBOOT_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: #2685 override digest applies to the selected arm64 asset"
+else
+  fail=$((fail + 1)); echo "  FAIL: #2685 arm64 mismatch was not asset-specific or reached sudo (rc=$arm_mismatch_rc)" >&2
+  echo "$arm_mismatch_out" >&2; cat "$YQBOOT_LOG" >&2
 fi
 
 # Rejected downloads must leave an existing destination untouched and

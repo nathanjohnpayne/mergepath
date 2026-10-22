@@ -134,6 +134,7 @@ done
 case "$body" in
   '@codex review') kind=trigger ;;
   '<!-- mergepath-phase-4a-terminal:'*) kind=terminal ;;
+  '<!-- mergepath-codex-request-checkpoint:v1 '*) kind=checkpoint ;;
   *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
 esac
 
@@ -1535,11 +1536,37 @@ here=$(cd "$(dirname "$0")" && pwd)
 if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
   exec "$here/../scripts/fixture-author-transport.sh" -- gh "$@"
 fi
+# #1362: the wrapper reads its posted comment back by id, inside its claim.
+if [ "${1:-}" = api ] && [ "$#" -eq 2 ] && [[ "$2" =~ ^repos/owner/repo/issues/comments/([0-9]+)$ ]]; then
+  jq -ce --argjson id "${BASH_REMATCH[1]}" 'select(.id == $id) + {issue_url: "https://api.github.com/repos/owner/repo/issues/999"}' \
+    "$CODEX_TEST_STATE_DIR/comments.jsonl" | head -1 | grep .
+  exit
+fi
+# Optionally hold one requester (CODEX_TEST_HANDLER) at its Nth issue-comments
+# read outside the wrapper, until the hold gate exists, recording each read.
+if [ -n "${CODEX_TEST_HOLD_AT_READ:-}" ] && [ -z "${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" ] \
+   && printf '%s\n' "$@" | grep -qx 'repos/owner/repo/issues/999/comments'; then
+  reads=$(( $(cat "$CODEX_TEST_STATE_DIR/reads.${CODEX_TEST_HANDLER:-x}" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$reads" >"$CODEX_TEST_STATE_DIR/reads.${CODEX_TEST_HANDLER:-x}"
+  if [ "${CODEX_TEST_HANDLER:-}" = "${CODEX_TEST_HOLD_HANDLER:-}" ] && [ "$reads" -eq "$CODEX_TEST_HOLD_AT_READ" ]; then
+    : >"$CODEX_TEST_STATE_DIR/held"
+    while [ ! -e "$CODEX_TEST_STATE_DIR/hold-gate" ]; do sleep 0.05; done
+  fi
+fi
+# Optionally hold the wrapper's authorization recount (the only reads made
+# with an observed request generation) until the gate file exists.
+if [ -n "${CODEX_TEST_RECOUNT_GATE:-}" ] && [ -n "${MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION:-}" ] \
+   && printf '%s\n' "$@" | grep -qx 'repos/owner/repo/issues/999/comments'; then
+  : > "$CODEX_TEST_STATE_DIR/recount.${CODEX_TEST_WRAPPER_ID:-x}"
+  while [ ! -e "$CODEX_TEST_RECOUNT_GATE" ]; do sleep 0.05; done
+fi
 exec "$here/fixture-read-gh" "$@"
 SH
   cat > "$dir/scripts/gh-as-author.sh" <<'SH'
 #!/usr/bin/env bash
 rc=0
+export MERGEPATH_CODEX_REQUEST_CLAIM_DIR="$CODEX_TEST_STATE_DIR/claims" CODEX_TEST_WRAPPER_ID=$$
+: > "$CODEX_TEST_STATE_DIR/wrapper-entered.$$"
 if [ "${CODEX_TEST_SCENARIO:-}" = wrapper-other-failure ] && [ -f "$CODEX_TEST_STATE_DIR/trigger-count" ]; then
   echo 'unrelated wrapper transport failure' >&2
   exit 42
@@ -1586,6 +1613,101 @@ test_real_wrapper_duplicate_ack_retry_keeps_polling() {
 }
 
 test_real_wrapper_duplicate_ack_retry_keeps_polling
+
+# #1362: two requesters for the same PR both decide to post against an empty
+# timeline. The first wrapper is held at its authorization recount; the second
+# must wait for the per-PR claim instead of recounting the same timeline, and
+# then refuse. Exactly one trigger is posted, in either request mode. The PR
+# already counts five requests, so the five-request checkpoint (#2657) is
+# recorded too, and only by the requester whose trigger posted.
+test_real_wrapper_claim_lets_one_of_two_requesters_post() {
+  local mode flag dir before n rc_a rc_b pid_a pid_b i
+  for mode in trigger-only poll; do
+    before=$FAIL
+    dir=$(make_case "wrapper-claim-$mode" 0 0 0)
+    make_real_wrapper_case "$dir"
+    for i in 1 2 3 4 5; do seed_author_trigger "$dir" "$((700 + i))" "2026-06-03T00:00:0${i}Z"; done
+    flag=""; [ "$mode" = poll ] || flag=--trigger-only
+    for n in a b; do
+      (
+        cd "$dir"
+        unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+        # shellcheck disable=SC2086 # flag is empty or one word
+        PATH="$dir/bin:$PATH" GH_TOKEN=ghp_fixture_author CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_FAKE_CLOCK=0 \
+          CODEX_TEST_SCENARIO=absent CODEX_TEST_RECOUNT_GATE="$dir/state/recount-gate" MERGEPATH_GH_TRANSPORT=gh \
+          ./scripts/codex-review-request.sh $flag 999 owner/repo >"$dir/out.$n.json" 2>"$dir/err.$n.log"
+      ) &
+      if [ "$n" = a ]; then pid_a=$!; else pid_b=$!; fi
+    done
+    wait_for_count() { # <glob-prefix> <count>
+      local i=0
+      while [ "$(find "$dir/state" -name "$1*" | wc -l | tr -d ' ')" -lt "$2" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+    }
+    wait_for_count recount. 1
+    wait_for_count wrapper-entered. 2
+    sleep 1.5
+    [ "$(find "$dir/state" -name 'recount.*' | wc -l | tr -d ' ')" = 1 ] \
+      || fail "#1362 $mode: the second wrapper recounted while the first held the claim"
+    [ "$(find "$dir/state" -name 'wrapper-entered.*' | wc -l | tr -d ' ')" = 2 ] \
+      || fail "#1362 $mode: both requesters must reach the wrapper for the race to be real"
+    touch "$dir/state/recount-gate"
+    rc_a=0; wait "$pid_a" || rc_a=$?
+    rc_b=0; wait "$pid_b" || rc_b=$?
+    [ "$(trigger_count "$dir")" = 1 ] || fail "#1362 $mode: $(trigger_count "$dir") triggers posted, expected exactly one"
+    [ "$(cat "$dir/state/checkpoint-count" 2>/dev/null || echo 0)" = 1 ] \
+      || fail "#1362 $mode: $(cat "$dir/state/checkpoint-count" 2>/dev/null || echo 0) checkpoints recorded, expected exactly one"
+    if [ "$rc_a" != 3 ] && [ "$rc_b" != 3 ]; then
+      fail "#1362 $mode: one requester must refuse (rc a=$rc_a b=$rc_b)"
+    elif ! grep -q 'posted first (#1362)' "$dir/err.a.log" "$dir/err.b.log"; then
+      fail "#1362 $mode: the refused requester must name the concurrent request; $(cat "$dir/err.a.log" "$dir/err.b.log")"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#1362 real wrapper ($mode): two requesters held at the recount post exactly one trigger"
+  done
+}
+
+test_real_wrapper_claim_lets_one_of_two_requesters_post
+
+# #1362 staggered interleaving (direct Codex review on #2715): B completes its
+# pre-flight scan and resume check while the PR has no request, A then posts,
+# and only then does B take its write-boundary read, which already includes
+# A's request. B must still refuse: the generation it names is the one its
+# request was decided on, not that later read.
+test_real_wrapper_staggered_requester_refuses() {
+  local dir before rc_a=0 rc_b=0 pid_b i
+  before=$FAIL
+  dir=$(make_case "wrapper-claim-staggered" 0 0 0)
+  make_real_wrapper_case "$dir"
+  run_handler() { # <name>
+    (
+      cd "$dir"
+      unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+      PATH="$dir/bin:$PATH" GH_TOKEN=ghp_fixture_author CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_FAKE_CLOCK=0 \
+        CODEX_TEST_SCENARIO=absent MERGEPATH_GH_TRANSPORT=gh CODEX_TEST_HANDLER="$1" \
+        CODEX_TEST_HOLD_HANDLER=b CODEX_TEST_HOLD_AT_READ=3 \
+        ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.$1.json" 2>"$dir/err.$1.log"
+    )
+  }
+  run_handler b & pid_b=$!
+  i=0; while [ ! -f "$dir/state/held" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+  [ -f "$dir/state/held" ] || fail "#1362 staggered: B never reached its write-boundary read"
+  # Held at its third comments read: after the pre-flight scan and the resume
+  # check (which found nothing to resume), at the write-boundary read, before
+  # the moving-head guard and the post that follow that read.
+  [ "$(cat "$dir/state/reads.b")" = 3 ] && grep -q 'checking for existing Codex signal' "$dir/err.b.log" \
+    && ! grep -q "moving-head guard\|posting '@codex review'" "$dir/err.b.log" \
+    || fail "#1362 staggered: B was not held between its decision and its write; $(tail -3 "$dir/err.b.log")"
+  run_handler a || rc_a=$?
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#1362 staggered: A did not post its request"
+  touch "$dir/state/hold-gate"
+  wait "$pid_b" || rc_b=$?
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#1362 staggered: $(trigger_count "$dir") triggers posted, expected exactly one"
+  [ "$rc_b" = 3 ] && grep -q 'posted first (#1362)' "$dir/err.b.log" \
+    || fail "#1362 staggered: B must refuse naming the earlier request (rc b=$rc_b); $(tail -3 "$dir/err.b.log")"
+  grep -q 'spends a slot' "$dir/err.b.log" || fail "#1362 staggered: the refusal must say a rerun can spend a slot"
+  [ "$FAIL" -ne "$before" ] || pass "#1362 real wrapper: a requester decided before another posted refuses, even after its later reads see that request"
+}
+
+test_real_wrapper_staggered_requester_refuses
 
 # #2582: polling mode posts a new request while an earlier trigger is on HEAD
 # by design. The real wrapper's authorization must apply that mode, not refuse
