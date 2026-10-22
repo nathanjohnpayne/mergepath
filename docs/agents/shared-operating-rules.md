@@ -29,12 +29,12 @@ GitHub meters REST and GraphQL separately. A user token gets 5,000 REST requests
 
 Several `gh` commands are GraphQL under the hood and spend that budget: `gh pr view --json`, `gh pr list`, `gh issue view --json`, `gh issue list`, `gh project ...` and `gh api graphql`. Their REST equivalents are plain `gh api` paths, for example `repos/OWNER/REPO/pulls/N`, `.../pulls/N/reviews`, `.../pulls/N/comments`, `.../issues/N`, `.../issues/N/comments` and `.../commits/SHA/check-runs`, each with `--paginate` under the rule above.
 
-Projects (v2) are the exception: they exist only in GraphQL, so `gh project ...` and the board helpers have no REST fallback. When GraphQL is exhausted, defer the board move until `resources.graphql.reset` and carry on with the REST-able work meanwhile; never report a board move as done if it has not happened.
+Projects (v2) have REST endpoints too, metered on the REST budget: `users/OWNER/projectsV2/N/items` and `.../fields` to read, and `PATCH users/OWNER/projectsV2/N/items/ITEM_ID` to set a field such as `Status` (`orgs/ORG/...` for an organization's board). `gh project ...` and the board helpers under `scripts/gh-projects/` are GraphQL-only, so when GraphQL is exhausted make the board move through those REST endpoints, or defer it until `resources.graphql.reset`. Never report a board move as done if it has not happened.
 
 Classify the failure by its message, not by its HTTP status. A GraphQL error can arrive as HTTP 200 with an `errors` entry as well as a 403 or 429.
 
 - **Primary limit:** the message says `API rate limit exceeded`, or `gh api rate_limit` shows that API's `remaining` at 0. Switching APIs works.
-- **Secondary (abuse) limit:** the message mentions a secondary rate limit, or the response carries `Retry-After`. It applies across both APIs, so switching to REST just hits it again. Back off instead: wait for `Retry-After` when present, otherwise at least one minute, and lengthen the wait on each repeat. During a secondary limit `gh api rate_limit` can still read as healthy, so do not treat its answer as clearance.
+- **Secondary (abuse) limit:** the message mentions a secondary rate limit, or the response carries `Retry-After`. It applies across both APIs, so switching to REST just hits it again. Back off instead: wait for `Retry-After` when present; otherwise, if `x-ratelimit-remaining` is 0, wait until `x-ratelimit-reset`; otherwise wait at least one minute. Lengthen the wait on each repeat. During a secondary limit `gh api rate_limit` can still read as healthy, so do not treat its answer as clearance.
 
 GitHub App installation tokens (CI workflows) have their own separate budget.
 
