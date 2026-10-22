@@ -100,13 +100,13 @@ BOOTSTRAP_LABELS=(
   "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
   "needs-local-agent|fbca04|A cloud/limited session parked this step; a session with the named capability resumes it"
   "human-action|0e8a16|Requires human attention"
-  "decision-needed|e99695|Superseded by status:blocked + type:decision. Kept: seeded by bootstrap/github-infra.sh."
+  "decision-needed|e99695|Deprecated: superseded by status:blocked + type:decision. Kept for history; not created on repositories that lack it."
   "agent-action|1d76db|Agent task — not blocked on human"
   "phase-0|c5def5|Phase 0: foundations"
   "phase-1|bfd4f2|Phase 1: core"
   "phase-2|bfd4f2|Phase 2"
   "phase-3|bfd4f2|Phase 3"
-  "phase-4|bfd4f2|Superseded by area:phase-4b. Kept for history and the bootstrap label seed."
+  "phase-4|bfd4f2|Deprecated: superseded by area:phase-4b. Kept for history; not created on repositories that lack it."
   "size:S|c2e0c6|Small: one or a few files, straightforward verification. Calibrated to nathanpaynedotcom#942/#849."
   "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
   "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
@@ -500,10 +500,6 @@ bootstrap::_seed_labels() {
     color=${rest%%|*}
     desc=${rest#*|}
 
-    # A deprecated label is kept in step where it exists but never seeded.
-    if bootstrap::label_is_deprecated "$name"; then
-      continue
-    fi
 
     # Reject a malformed entry rather than creating a mis-parsed label.
     # A separator typo used to be silently survivable: the old ':'
@@ -513,6 +509,13 @@ bootstrap::_seed_labels() {
     # must not take the other 18 labels down with it.
     if [ -z "$name" ] || [ -z "$desc" ] || ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
       bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description with a 6-digit hex colour) — skipped, label NOT created"
+      continue
+    fi
+
+    # A deprecated label is kept in step where it exists but never seeded.
+    # Checked only after the entry passed validation, so a malformed
+    # deprecated entry still warns.
+    if bootstrap::label_is_deprecated "$name"; then
       continue
     fi
 

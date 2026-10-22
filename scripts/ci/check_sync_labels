@@ -8,21 +8,23 @@
 # outside the canonical list are never touched, and unreadable or malformed
 # input fails closed. Both the script and the suite are HUB-ONLY
 # (deliberately not in .mergepath-sync.yml), so a consumer checkout SKIPs
-# through the same marker check as check_wave_audit: wrapped test absent and
-# scripts/sync-to-downstream.sh absent means a consumer checkout, so SKIP;
-# test absent but the hub marker present means the hub lost the suite, a
-# hard error; test present means run it regardless of the marker.
+# on the hub marker FIRST: no scripts/sync-to-downstream.sh means a consumer
+# checkout, so SKIP even if a stale copy of the test is present; the marker
+# without the test means the hub lost the suite, a hard error.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_sync_labels.sh"
 
+# Marker FIRST: a consumer checkout (no scripts/sync-to-downstream.sh) SKIPs
+# even when it carries a stale copy of the hub-only test, whose driver it
+# lacks. Only the hub, which has the marker, requires and runs the suite.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_sync_labels: SKIP (consumer checkout: no scripts/sync-to-downstream.sh; hub-only sync-labels suite)"
+  exit 0
+fi
 if [ ! -f "$TEST_SCRIPT" ]; then
-  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-    echo "check_sync_labels: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only sync-labels suite)"
-    exit 0
-  fi
-  echo "check_sync_labels: ERROR (missing $TEST_SCRIPT)" >&2
+  echo "check_sync_labels: ERROR (hub checkout is missing $TEST_SCRIPT)" >&2
   exit 1
 fi
 

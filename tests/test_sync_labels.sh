@@ -121,6 +121,25 @@ RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/ma
   SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" 2>&1) || RC=$?
 [ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a malformed canonical label fails closed before any read" || fail "bad canon rc=$RC: $OUT"
 
+# A missing, broken or non-canonical deprecated list fails closed before any
+# read: otherwise --apply would create every deprecated label fleetwide.
+for variant in missing broken foreign; do
+  reset_state
+  case "$variant" in
+    missing) grep -v '^BOOTSTRAP_DEPRECATED_LABELS' "$WORK/infra.sh" >"$WORK/dep.sh" ;;
+    broken)  sed 's/^BOOTSTRAP_DEPRECATED_LABELS=(phase-4)$/BOOTSTRAP_DEPRECATED_LABELS=(phase-4/' "$WORK/infra.sh" >"$WORK/dep.sh" ;;
+    foreign) sed 's/^BOOTSTRAP_DEPRECATED_LABELS=(phase-4)$/BOOTSTRAP_DEPRECATED_LABELS=(phase-4 not-a-label)/' "$WORK/infra.sh" >"$WORK/dep.sh" ;;
+  esac
+  RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/manifest.yml" SYNC_LABELS_INFRA="$WORK/dep.sh" \
+    SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" --apply 2>&1) || RC=$?
+  [ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a $variant deprecated list fails closed before any read or write" || fail "$variant deprecated rc=$RC: $OUT"
+done
+
+# A typo next to a valid name must not silently shrink the run.
+reset_state; run --repos alpha,typo
+[ "$RC" = 3 ] && printf '%s' "$OUT" | grep -q 'outside the fleet' && [ ! -f "$STATE/calls.log" ] \
+  && pass "--repos with one unknown name fails closed even beside a valid one" || fail "--repos mixed rc=$RC: $OUT"
+
 # The real canonical source parses, and its deprecated set is a subset of it.
 RC=0; canon_ok=$(bash -c 'eval "$(sed -n "/^BOOTSTRAP_LABELS=(/,/^)/p" "$1")"; eval "$(grep -E "^BOOTSTRAP_DEPRECATED_LABELS=\(" "$1")"; for d in "${BOOTSTRAP_DEPRECATED_LABELS[@]}"; do printf "%s\n" "${BOOTSTRAP_LABELS[@]}" | grep -q "^$d|" || { echo "missing:$d"; exit 1; }; done; echo ok' _ "$ROOT/scripts/bootstrap/github-infra.sh") || RC=$?
 [ "$canon_ok" = ok ] && pass "every deprecated label in github-infra.sh is a canonical label" || fail "deprecated subset: $canon_ok"

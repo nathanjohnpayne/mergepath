@@ -63,8 +63,13 @@ command -v gh >/dev/null 2>&1 || die "gh is required"
 CANON=$(bash -c 'eval "$(sed -n "/^BOOTSTRAP_LABELS=(/,/^)/p" "$1")"; printf "%s\n" "${BOOTSTRAP_LABELS[@]}"' _ "$INFRA") \
   || die "could not read BOOTSTRAP_LABELS from $INFRA"
 # Deprecated canonical labels are kept in step where present, never created.
-DEPRECATED_JSON=$(bash -c 'eval "$(grep -E "^BOOTSTRAP_DEPRECATED_LABELS=\(" "$1")"; printf "%s\n" "${BOOTSTRAP_DEPRECATED_LABELS[@]}"' _ "$INFRA" \
-  | jq -Rnc '[inputs | select(length > 0)]') || die "could not read BOOTSTRAP_DEPRECATED_LABELS from $INFRA"
+# The declaration must exist and evaluate: a missing or broken list would
+# otherwise read as "nothing deprecated", and --apply would create every
+# deprecated label across the fleet.
+grep -qE '^BOOTSTRAP_DEPRECATED_LABELS=\(' "$INFRA" || die "BOOTSTRAP_DEPRECATED_LABELS is not declared in $INFRA"
+DEPRECATED=$(bash -c 'set -e; eval "$(grep -E "^BOOTSTRAP_DEPRECATED_LABELS=\(" "$1")"; declare -p BOOTSTRAP_DEPRECATED_LABELS >/dev/null; printf "%s\n" "${BOOTSTRAP_DEPRECATED_LABELS[@]}"' _ "$INFRA") \
+  || die "BOOTSTRAP_DEPRECATED_LABELS in $INFRA does not evaluate"
+DEPRECATED_JSON=$(printf '%s\n' "$DEPRECATED" | jq -Rnc '[inputs | select(length > 0)]') || die "could not read BOOTSTRAP_DEPRECATED_LABELS"
 CANON_JSON=$(printf '%s\n' "$CANON" | jq -Rnc '
   [inputs | select(length > 0)
    | (index("|")) as $a | (.[$a+1:] | index("|")) as $b
@@ -74,6 +79,8 @@ CANON_JSON=$(printf '%s\n' "$CANON" | jq -Rnc '
 [ "$(jq length <<<"$CANON_JSON")" -gt 0 ] || die "the canonical label list is empty"
 jq -e 'all(.[]; (.name | length) > 0 and (.color | test("^[0-9a-f]{6}$")) and (.description | length) > 0)' \
   <<<"$CANON_JSON" >/dev/null || die "a canonical label has an empty name, a non-hex colour or an empty description"
+jq -e --argjson c "$CANON_JSON" 'all(.[]; . as $d | ($c | map(.name) | index($d)) != null)' <<<"$DEPRECATED_JSON" >/dev/null \
+  || die "BOOTSTRAP_DEPRECATED_LABELS names a label that is not canonical"
 
 # The fleet: the hub plus every manifest consumer.
 command -v yq >/dev/null 2>&1 || die "yq is required to read $MANIFEST"
@@ -82,6 +89,10 @@ CONSUMERS=$(yq -r '.consumers[].repo | select(. != null)' "$MANIFEST" 2>/dev/nul
 REPOS=$(printf '%s\n%s\n' "$HUB" "$CONSUMERS" | awk 'NF && !seen[$0]++')
 if [ -n "$REPO_FILTER" ]; then
   wanted=$(printf '%s' "$REPO_FILTER" | tr ',' '\n' | awk -v o="$OWNER" 'NF { print (index($0, "/") ? $0 : o "/" $0) }')
+  # Every requested name must be a fleet repository: a typo next to a valid
+  # name must not silently shrink the run.
+  unknown=$(printf '%s\n' "$wanted" | grep -Fxv -f <(printf '%s\n' "$REPOS") || true)
+  [ -z "$unknown" ] || die "--repos names repositories outside the fleet: $(printf '%s' "$unknown" | tr '\n' ' ')"
   REPOS=$(printf '%s\n' "$REPOS" | grep -Fx -f <(printf '%s\n' "$wanted") || true)
   [ -n "$REPOS" ] || die "--repos matched no fleet repository"
 fi
