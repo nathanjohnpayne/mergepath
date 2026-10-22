@@ -127,10 +127,11 @@ reset_state; FAKE_FAIL_REPO=alpha run
 [ "$RC" = 3 ] && printf '%s' "$OUT" | grep -q 'alpha: labels unreadable' && pass "an unreadable repository fails the run (exit 3), never reads as in sync" || fail "unreadable rc=$RC: $OUT"
 
 # A malformed canonical source fails closed before any read.
-reset_state; printf 'BOOTSTRAP_LABELS=(\n  "broken|nothex|x"\n)\n' >"$WORK/bad.sh"
+reset_state; printf 'BOOTSTRAP_LABELS=(\n  "broken|nothex|x"\n)\nBOOTSTRAP_DEPRECATED_LABELS=()\n' >"$WORK/bad.sh"
 RC=0; OUT=$(PATH="$BIN:$PATH" FAKE_STATE="$STATE" SYNC_LABELS_MANIFEST="$WORK/manifest.yml" SYNC_LABELS_INFRA="$WORK/bad.sh" \
   SYNC_LABELS_AS_AUTHOR="$BIN/as-author" bash "$ROOT/scripts/sync-labels.sh" 2>&1) || RC=$?
-[ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && pass "a malformed canonical label fails closed before any read" || fail "bad canon rc=$RC: $OUT"
+[ "$RC" = 3 ] && [ ! -f "$STATE/calls.log" ] && printf '%s' "$OUT" | grep -q 'non-hex colour' \
+  && pass "a malformed canonical label fails closed before any read" || fail "bad canon rc=$RC: $OUT"
 
 # A description over GitHub's 100-character limit fails closed before any read.
 reset_state; { printf 'BOOTSTRAP_LABELS=(\n  "long|bf0606|%s"\n)\nBOOTSTRAP_DEPRECATED_LABELS=()\n' "$(printf 'x%.0s' $(seq 101))"; } >"$WORK/long.sh"
