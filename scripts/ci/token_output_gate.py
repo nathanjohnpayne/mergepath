@@ -1029,7 +1029,6 @@ class Segment:
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
         "_function_binding", "eval_pattern_uncertain", "tee_output_processes",
-        "tee_process_word_limit",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -1064,9 +1063,8 @@ class Segment:
         self._function_binding = None
         self.eval_pattern_uncertain = False
         # Standalone output-process operands retain their already-lexed child
-        # commands for the finite mid-pipeline tee side-write check (#1497).
+        # commands for the finite tee stderr side-write check (#1497).
         self.tee_output_processes = []
-        self.tee_process_word_limit = None
 
 
 class Ref:
@@ -2207,11 +2205,6 @@ class Lexer:
                 redirection = _REDIR_RE.match(previous)
                 probe = Segment(-1, None, False, line)
                 probe.words = list(parent_seg.words)
-                if (resolve_command(probe)[0] == "tee"
-                        and parent_seg.tee_process_word_limit is None):
-                    # A substitution is an argument even without a word marker;
-                    # exit-mode proof cannot skip it to reach a later option.
-                    parent_seg.tee_process_word_limit = len(parent_seg.words)
                 # Test the logical preceding character without rewriting
                 # source offsets. An escaped backslash leaves LF as a boundary.
                 operand_start = i
@@ -3390,28 +3383,9 @@ def tee_file_operands(seg):
     return files
 
 
-def _tee_exits_without_input(seg):
-    """Only literal exit modes before uncertain or non-option arguments."""
-    resolve_command(seg)
-    if seg._cmd_index is None:
-        return False
-    words = seg.words[:seg.tee_process_word_limit]
-    for _raw, literal in _command_arguments(words, seg._cmd_index + 1):
-        if literal in ("--help", "--version"):
-            return True
-        if (literal is not None and literal.startswith("-")
-                and len(literal) > 1 and set(literal[1:]) <= {"a", "i"}):
-            continue
-        return False  # Includes --, opaque arguments and unsupported options.
-    return False
-
-
-def _tee_process_substitution_sidewrite(seg, shadowed_stdin=frozenset()):
+def _tee_process_substitution_sidewrite(seg):
     """The measured single-cat stderr operand, not general stdin dataflow."""
     if resolve_command(seg)[0] != "tee":
-        return False
-    if (seg._cmd_literal == "tee" and "tee" not in shadowed_stdin
-            and _tee_exits_without_input(seg)):
         return False
     for children in seg.tee_output_processes:
         if len(children) != 1:
@@ -3639,8 +3613,7 @@ def _test_numeric_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers, helper_routing=None,
-                   shadowed_stdin=frozenset()):
+def reaches_output(ref, emitter_helpers, helper_routing=None):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -3797,6 +3770,12 @@ def reaches_output(ref, emitter_helpers, helper_routing=None,
             return False, ""
         else:
             emitter = cmd or emitter
+        # The emitted value has reached this tee. Its recorded stderr side
+        # write is independent of stdout pipeline/capture/subshell routing.
+        if _tee_process_substitution_sidewrite(seg):
+            return True, _why(
+                note, "tee, whose output process substitution writes to stderr"
+            )
         if seg.pipe_to is not None:
             # The value goes into the next segment's stdin rather than to a
             # terminal -- unless a redirection moves fd 1 somewhere the pipe
@@ -3810,10 +3789,6 @@ def reaches_output(ref, emitter_helpers, helper_routing=None,
                     % (cmd or emitter or "output command"),
                 )
             tee_files = tee_file_operands(seg)
-            if _tee_process_substitution_sidewrite(seg, shadowed_stdin):
-                return True, _why(
-                    note, "tee, whose output process substitution writes to stderr"
-                )
             if tee_files:
                 # `tee FILE` is a fork, not a hop: the pipe carries the value
                 # onward AND the file receives it.  Following only the pipe
@@ -5252,16 +5227,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
     # Preserve lone CR as shell data; only CRLF has established normalization.
     text = text.replace("\r\n", "\n")
     helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
-    shadowed_stdin = frozenset(
-        name for _match, name, _body in _iter_function_definitions(text)
-        if name in STDIN_ECHOERS
-    )
     lx = Lexer(text)
-    if any(resolve_command(seg)[0] in ("alias", "unalias", "eval", "source", ".")
-           for ll in lx.logical for seg in ll.segments):
-        # Namespace setup may replace the unqualified tee command or its options.
-        # Withhold only the new exit-mode proof; do not infer setup execution.
-        shadowed_stdin = shadowed_stdin | {"tee"}
     findings = []
     pragma_errors = []
     for offset in lx.unsupported_ansi_aliases:
@@ -5406,7 +5372,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False,
             if ref.line in exempt_lines or ref.seg in exempt_segments:
                 continue
             hit, why = reaches_output(
-                ref, helpers, (routed_any, routed_fd1), shadowed_stdin
+                ref, helpers, (routed_any, routed_fd1)
             )
             if not hit and _uncertain_eval_output:
                 hit, why = True, (
@@ -15981,14 +15947,6 @@ def _tee_process_substitution_cases():
         findings, errors = scan_text(body)
         if bool(findings) != (expected == MUST_FLAG) or errors:
             failures.append("tee review boundary: " + cid)
-    for text in [
-        'tee -- --help >(cat >&2)\n', 'tee "$option" --help >(cat >&2)\n',
-        'tee >(cat >&2) --help\n',
-    ]:
-        tee = next(seg for ll in Lexer(text).logical for seg in ll.segments
-                   if seg.parent is None and resolve_command(seg)[0] == "tee")
-        if _tee_exits_without_input(tee):
-            failures.append("tee exit mode: skipped an earlier argument " + repr(text))
     for cid, expected, body in _tee_round2_cases() + _tee_namespace_cases():
         findings, errors = scan_text(body)
         if bool(findings) != (expected == MUST_FLAG) or errors:
@@ -16036,7 +15994,49 @@ def _tee_process_substitution_cases():
                    if seg.parent is None and resolve_command(seg)[0] == "tee")
         if _tee_process_substitution_sidewrite(tee):
             failures.append("tee scalar prefix boundary: " + consumer)
+    for cid, expected, body in _tee_routing_cases():
+        findings, errors = scan_text(body)
+        if bool(findings) != (expected == MUST_FLAG) or errors:
+            failures.append("tee stderr routing boundary: " + cid)
+    for option in ("--help", "--version"):
+        text = ('PATH="$PWD/bin:$PATH"\n'
+                'printf %s "$GH_TOKEN" | tee ' + option + ' >(cat >&2) | grep -qF zz\n')
+        findings, errors = scan_text(text)
+        if not findings or errors:
+            failures.append("tee implementation uncertainty: " + option)
+    # This is an existing routing-role assertion, not an oracle claim about
+    # filename diagnostics: an argument alone is not admitted as tee stdin.
+    lx = Lexer('tee "$GH_TOKEN" >(cat >&2)\n')
+    ref = next(ref for ll in lx.logical for ref in ll.refs if ref.name == "GH_TOKEN")
+    if reaches_output(ref, set())[0]:
+        failures.append("tee stderr routing: value never admitted as emitted stdin")
+    body = 'out=$(\n  printf %s "$GH_TOKEN" | tee >(cat >&2)\n)\n'
+    findings, errors = scan_text(body)
+    if errors or [finding.line for finding in findings] != [2]:
+        failures.append("tee stderr routing: physical reference line changed")
     return failures
+
+
+def _tee_routing_cases():
+    """Inert source declarations for the parent's dummy-profile oracle."""
+    pipe = 'printf %s "$GH_TOKEN" | tee >(cat >&2)'
+    null_pipe = pipe.replace('cat >&2', 'cat >/dev/null')
+    return [
+        ("tee-routing-capture-stderr", MUST_FLAG, 'out=$(' + pipe + ')\n'),
+        ("tee-routing-capture-null-child", MUST_NOT_FLAG, 'out=$(' + null_pipe + ')\n'),
+        ("tee-routing-subshell-capture-stderr", MUST_FLAG, 'out=$( (' + pipe + ') )\n'),
+        ("tee-routing-subshell-capture-null-child", MUST_NOT_FLAG, 'out=$( (' + null_pipe + ') )\n'),
+        ("tee-routing-null-stdout", MUST_FLAG, pipe + ' >/dev/null\n'),
+        ("tee-routing-capture-null-stdout", MUST_FLAG, 'out=$(' + pipe + ' >/dev/null)\n'),
+        ("tee-routing-capture-quiet-hop", MUST_NOT_FLAG,
+         'out=$(printf %s "$GH_TOKEN" | grep -qF zz | tee >(cat >&2))\n'),
+        ("tee-routing-capture-safe-input", MUST_NOT_FLAG,
+         'out=$(printf %s safe | tee >(cat >&2))\n'),
+        ("tee-routing-capture-concatenated-first", MUST_NOT_FLAG,
+         'out=$(printf %s "$GH_TOKEN" | tee >(cat >&2)>(cat >/dev/null))\n'),
+        ("tee-routing-capture-concatenated-last", MUST_NOT_FLAG,
+         'out=$(printf %s "$GH_TOKEN" | tee >(cat >/dev/null)>(cat >&2))\n'),
+    ]
 
 
 def _tee_identity_cases():
@@ -16153,17 +16153,17 @@ def _tee_review_cases():
          'tee <<EOF >(cat >/dev/null) | grep -qF zz\n$GH_TOKEN\nEOF\n'),
         ("tee-review-heredoc-quoted", MUST_NOT_FLAG,
          'tee <<\'EOF\' >(cat >&2) | grep -qF zz\n$GH_TOKEN\nEOF\n'),
-        ("tee-review-help", MUST_NOT_FLAG,
+        ("tee-review-help", MUST_FLAG,
          'printf \'%s\' "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'),
-        ("tee-review-version", MUST_NOT_FLAG,
+        ("tee-review-version", MUST_FLAG,
          'printf \'%s\' "$GH_TOKEN" | tee --version >(cat >&2) | grep -qF zz\n'),
         ("tee-review-end-options", MUST_FLAG,
          'printf \'%s\' "$GH_TOKEN" | tee -- --help >(cat >&2) | grep -qF zz\n'),
         ("tee-review-opaque-option", MUST_FLAG,
          'option=--\nprintf \'%s\' "$GH_TOKEN" | tee "$option" --help >(cat >&2) | grep -qF zz\n'),
-        ("tee-review-quoted-help", MUST_NOT_FLAG,
+        ("tee-review-quoted-help", MUST_FLAG,
          'printf \'%s\' "$GH_TOKEN" | tee \'--help\' >(cat >&2) | grep -qF zz\n'),
-        ("tee-review-append-help", MUST_NOT_FLAG,
+        ("tee-review-append-help", MUST_FLAG,
          'printf \'%s\' "$GH_TOKEN" | tee -a --help >(cat >&2) | grep -qF zz\n'),
         ("tee-review-tee-shadow", MUST_FLAG,
          'tee(){ /bin/cat >&2; }\nprintf \'%s\' "$GH_TOKEN" | tee --help >(cat >&2) | grep -qF zz\n'),
@@ -17212,7 +17212,17 @@ CORPUS += _tee_round2_cases()
 CORPUS += _tee_namespace_cases()
 CORPUS += _tee_continuation_cases()
 CORPUS += _tee_identity_cases()
+CORPUS += _tee_routing_cases()
 # The same reviewed case/body now records the approved conservative reduction.
+KNOWN_BROADER.update({cid: (
+    "This unchanged own help/version fixture is quiet for the measured tee "
+    "implementation, but command spelling does not prove implementation identity. "
+    "The optional exit proof is removed, so all three shapes remain conservative. "
+    "Precision is deferred to https://github.com/nathanjohnpayne/mergepath/issues/2670"
+) for cid in (
+    "tee-review-help", "tee-review-version", "tee-review-quoted-help",
+    "tee-review-append-help",
+)})
 KNOWN_BROADER.update({cid: (
     "Qualified tee paths do not prove implementation identity: Bash can invoke "
     "a literal function even named /usr/bin/tee or /bin/tee. This unchanged "
@@ -17245,14 +17255,16 @@ KNOWN_BROADER.update({
         "is outside the finite process-operand boundary."
     ),
     "tee-deferred-target-options": (
-        "A consumed redirection process target bounds the optional tee exit "
-        "proof, conservatively flagging this quiet help invocation in all "
-        "three shapes. Deferred to https://github.com/nathanjohnpayne/mergepath/issues/2670"
+        "The optional tee exit proof is removed because command spelling does "
+        "not prove implementation identity. This unchanged consumed redirection "
+        "target/help case remains conservative in all three shapes. Deferred "
+        "to https://github.com/nathanjohnpayne/mergepath/issues/2670"
     ),
     "tee-deferred-herestring-options": (
-        "A consumed here-string process target bounds the optional tee exit "
-        "proof, conservatively flagging this quiet help invocation in all "
-        "three shapes. Deferred to https://github.com/nathanjohnpayne/mergepath/issues/2670"
+        "The optional tee exit proof is removed because command spelling does "
+        "not prove implementation identity. This unchanged consumed here-string "
+        "target/help case remains conservative in all three shapes. Deferred "
+        "to https://github.com/nathanjohnpayne/mergepath/issues/2670"
     ),
     "tee-deferred-stdin-null": (
         "The tee side-write route conservatively retains upstream input despite "
@@ -17329,6 +17341,10 @@ KNOWN_MISS_SHAPES = {
 }
 
 KNOWN_BROADER_SHAPES = {
+    'tee-review-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-review-version': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-review-quoted-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
+    'tee-review-append-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-review-qualified-tee-help': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-round2-alias-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
     'tee-round2-setup-eval-qualified': ('all-digit', 'digit-leading-non-numeric', 'letter-leading'),
