@@ -563,6 +563,9 @@ class TriggerGuardTests(unittest.TestCase):
         cases = {
             "unopenable claim directory": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_DIR=str(blocker)),
             "invalid wait": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="soon"),
+            # A relative directory names a different lock file per checkout.
+            "relative claim directory": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_DIR="claims"),
+            "no absolute root": {k: v for k, v in env.items() if k not in ("MERGEPATH_CODEX_REQUEST_CLAIM_DIR", "HOME", "XDG_STATE_HOME")},
             "nested trigger write": dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_HELD=str(fixture / "claims/o__r#123.lock")),
         }
         for label, case_env in cases.items():
@@ -603,6 +606,23 @@ class TriggerGuardTests(unittest.TestCase):
         self.assertEqual(1, len(writes), writes)
         self.assertTrue(writes[0].startswith("api --method POST repos/o/r/issues/123/comments --input "), writes)
         self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()))
+
+    def test_claim_directory_is_absolute_and_shared(self):
+        # A relative XDG_STATE_HOME is ignored, so two checkouts (different
+        # working directories) still share one lock under $HOME.
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        home = fixture / "home"
+        home.mkdir()
+        env = {k: v for k, v in env.items() if k != "MERGEPATH_CODEX_REQUEST_CLAIM_DIR"}
+        env.update(HOME=str(home), XDG_STATE_HOME="state")
+        results = [subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"],
+                                  env=env, cwd=cwd, capture_output=True, timeout=20)
+                   for cwd in (fixture, fixture / "scripts")]
+        self.assertEqual([0], [r.returncode for r in results if r.returncode == 0], [r.stderr for r in results])
+        self.assertTrue((home / ".local/state/mergepath/codex-request-claims/o__r#123.lock").exists())
+        self.assertFalse((fixture / "state").exists() or (fixture / "scripts/state").exists())
+        self.assertEqual(1, len(self.writes(fixture)), "the second checkout must recount against the same lock and refuse")
 
     def test_claimed_write_requires_its_confirmed_comment_id(self):
         fixture, env = self.claim_fixture()
