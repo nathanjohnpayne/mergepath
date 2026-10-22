@@ -322,8 +322,13 @@ def cost_for(loop, prices, keys):
 
 
 class AgentsProvider:
-    def __init__(self, inventory, checkouts, trusted_root, *, price_keys=None, github=None, reviewers=("nathanpayne-codex", "nathanpayne-claude"), clock=time.time):
+    def __init__(self, inventory, checkouts, trusted_root, *, price_keys=None, github=None, reviewers=("nathanpayne-codex", "nathanpayne-claude"), clock=time.time,
+                 omitted_checkouts=0):
         self.repositories = {item.repo for item in inventory}
+        # Worktrees the launcher left out past the 64-root cap: their history is never read.
+        if type(omitted_checkouts) is not int or omitted_checkouts < 0:
+            raise ValueError("invalid_checkouts")
+        self.omitted_checkouts = omitted_checkouts
         self.checkouts = tuple(dict.fromkeys(Checkout(item.repo, Path(item.path).resolve()) for item in checkouts))
         if not self.checkouts or len(self.checkouts) > 64 or any(item.repo not in self.repositories for item in self.checkouts):
             raise ValueError("invalid_checkouts")
@@ -337,6 +342,8 @@ class AgentsProvider:
     def fetch(self, deadline):
         reader = LocalReader(deadline)
         rows, approvals, diagnostics = [], [], []
+        if self.omitted_checkouts:
+            diagnostics.append("Checkout limit reached; coverage is incomplete.")
         observed_checkouts = 0
         for root_no, checkout in enumerate(self.checkouts):
             log_rows, ledger_rows = [], []
@@ -524,7 +531,7 @@ class AgentsProvider:
         rows.sort(key=lambda row: (row["started_at_epoch"] or 0, row["id"]), reverse=True)
         crosscheck = self._review_crosscheck(rows, deadline)
         return Sample({"schema": "cockpit-agents/v1", "history": rows, "canonical_totals": totals[0], "per_pr": per_pr,
-                       "coverage": {"checkouts": len(self.checkouts), "legacy_runs": sum(row["run_id"] is None for row in rows),
+                       "coverage": {"checkouts": len(self.checkouts), "omitted_checkouts": self.omitted_checkouts, "legacy_runs": sum(row["run_id"] is None for row in rows),
                                     "tokens_measured": sum(row["tokens"]["total"] is not None for row in rows), "runs": len(rows), "unattributed_runs": sum(row["repo"] is None for row in rows)},
                        "diagnostics": list(dict.fromkeys(diagnostics)), "history_complete": not diagnostics,
                        "hasObservations": observed_checkouts > 0, "observed_checkouts": observed_checkouts,
