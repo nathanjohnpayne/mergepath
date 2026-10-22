@@ -317,6 +317,50 @@ gh_pr_state() {
   echo "unknown"
 }
 
+# Print the PR's head commit (40 hex) and exit 0, or exit 1 when gh is
+# missing, the call fails, or the answer is not a full commit id. Callers
+# treat a failure as "not proven safe", never as permission.
+gh_pr_head_oid() {
+  local num="$1" oid
+  command -v gh >/dev/null 2>&1 || return 1
+  oid=$(gh pr view "$num" --repo nathanjohnpayne/mergepath --json headRefOid --jq .headRefOid 2>/dev/null) || return 1
+  [[ "$oid" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$oid"
+}
+
+# Whether removing a detached closed/merged-PR worktree keeps its commit.
+# `git worktree remove` deletes the per-worktree HEAD, a detached worktree's
+# only reference to work committed there, so a commit nothing else holds
+# becomes unreachable and is eventually garbage-collected (#2738). The commit
+# survives when some local branch, tag or remote-tracking ref contains it, or
+# when GitHub still holds it as the PR's head (HEAD equals the PR head, or is
+# an ancestor of it once that object is local). A merged PR's review worktree
+# sits at a head no local ref contains after its branch is deleted, so the
+# GitHub head is what keeps this from retaining every such worktree. Prints
+# the reason when it is NOT safe; exits 0 only when it is.
+detached_commit_survives() {
+  local head="$1" pr="$2" pr_head
+  if [ -z "$head" ]; then
+    echo "its HEAD is unreadable, so nothing proves its commit survives"
+    return 1
+  fi
+  if [ -n "$(git -C "$MAIN_WORKTREE" for-each-ref --contains "$head" --count=1 \
+      --format='%(refname)' refs/heads refs/tags refs/remotes 2>/dev/null)" ]; then
+    return 0
+  fi
+  if ! pr_head=$(gh_pr_head_oid "$pr"); then
+    echo "no local ref contains $head and the PR #$pr head lookup failed, so nothing proves the commit survives"
+    return 1
+  fi
+  [ "$head" = "$pr_head" ] && return 0
+  if git -C "$MAIN_WORKTREE" cat-file -e "${pr_head}^{commit}" 2>/dev/null \
+     && git -C "$MAIN_WORKTREE" merge-base --is-ancestor "$head" "$pr_head" 2>/dev/null; then
+    return 0
+  fi
+  echo "$head is on no local branch, tag or remote ref and is not PR #$pr's head ($pr_head) or an ancestor of it"
+  return 1
+}
+
 # Print the PR number carried by a worktree PATH, or nothing when the path
 # carries none. Recognizes both shapes named in Detection rule 2: the legacy
 # `<root>/mergepath-pr-<n>` sibling/temp shape, and the hidden-folder
@@ -1407,6 +1451,16 @@ while IFS= read -r -d '' WT_PATH \
               "$WT_PATH" "" "$WT_HEAD" "[detached]" "$pr_state" "$WT_LOCK_REASON"
             print_unclean_reason "$wt_state"
             SUMMARY_UNCLEAN_KEPT+=("$WT_PATH (detached, PR #${pr_num} ${pr_state}, ${wt_state})")
+            continue
+          fi
+          # A clean tree is not enough when detached: the commit must survive
+          # the removal too. A missing directory keeps its recorded HEAD, so
+          # the same proof applies. Also before the locked check.
+          if ! unsafe_reason=$(detached_commit_survives "$WT_HEAD" "$pr_num"); then
+            print_record "[detached PR #${pr_num} (${pr_state}) but its commit would not survive removal — review manually, keeping]" "$C_YELLOW" \
+              "$WT_PATH" "" "$WT_HEAD" "[detached]" "$pr_state" "$WT_LOCK_REASON"
+            echo "    reason:   $unsafe_reason; save it first (git branch <name> ${WT_HEAD:-<commit>}) or remove the worktree by hand"
+            SUMMARY_UNCLEAN_KEPT+=("$WT_PATH (detached, PR #${pr_num} ${pr_state}, commit not preserved)")
             continue
           fi
           if [ "$WT_LOCKED" = "1" ]; then
