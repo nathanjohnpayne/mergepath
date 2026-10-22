@@ -45,10 +45,19 @@ gh_comment_guard_claim() { # <repo> <pr>
     echo "comment-trigger-guard: a Codex request write is already inside the request claim for ${MERGEPATH_CODEX_REQUEST_CLAIM_HELD##*/}; refusing a nested trigger write (#1362)." >&2
     return 1
   fi
-  dir="${MERGEPATH_CODEX_REQUEST_CLAIM_DIR:-${XDG_STATE_HOME:-${HOME:-}/.local/state}/mergepath/codex-request-claims}"
+  # Every checkout on the machine must resolve the same lock file, so the
+  # directory is absolute: a relative XDG_STATE_HOME is ignored (as the XDG
+  # spec says), and a relative MERGEPATH_CODEX_REQUEST_CLAIM_DIR, or no
+  # usable root at all, fails closed.
+  local state_root="${XDG_STATE_HOME:-}"
+  case "$state_root" in
+    /*) ;;
+    *) state_root=""; [ -z "${HOME:-}" ] || state_root="$HOME/.local/state" ;;
+  esac
+  dir="${MERGEPATH_CODEX_REQUEST_CLAIM_DIR:-${state_root:+$state_root/mergepath/codex-request-claims}}"
   timeout="${MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS:-900}"
-  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ -z "${HOME:-}${MERGEPATH_CODEX_REQUEST_CLAIM_DIR:-}${XDG_STATE_HOME:-}" ]; then
-    echo "comment-trigger-guard: cannot establish the per-PR Codex request claim (invalid timeout or no claim directory); refusing the trigger write (#1362)." >&2
+  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [[ "$dir" != /* ]]; then
+    echo "comment-trigger-guard: cannot establish the per-PR Codex request claim (invalid timeout, or no absolute claim directory); refusing the trigger write (#1362)." >&2
     return 1
   fi
   key=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]' | sed 's|/|__|')
