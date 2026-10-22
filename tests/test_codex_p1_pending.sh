@@ -83,14 +83,25 @@ grep -Eq '^codex:' "$W/.github/review-policy.yml" \
   || { echo "ERROR: the trusted policy has no codex: block; update this test" >&2; exit 1; }
 awk '
   /^codex:/ { print; print "  p1_gate:"; print "    enabled: true"; in_codex = 1; next }
-  in_codex && /^[^[:space:]#]/ { in_codex = 0 }
+  in_codex && /^[^[:space:]#]/ { in_codex = 0; skip = 0 }
   in_codex && /^  p1_gate:/ { skip = 1; next }
-  skip && /^    / { next }
-  { skip = 0; print }
+  # The old stanza runs to the next sibling key: blank lines, comments and
+  # deeper lines inside it all go with it.
+  skip && /^  [^[:space:]#]/ { skip = 0 }
+  skip { next }
+  { print }
 ' "$W/.github/review-policy.yml" >"$W/.github/review-policy.yml.new" \
   && mv "$W/.github/review-policy.yml.new" "$W/.github/review-policy.yml"
-grep -Eq '^  p1_gate:' "$W/.github/review-policy.yml" \
-  || { echo "ERROR: could not enable codex.p1_gate in the fixture policy; update this test" >&2; exit 1; }
+# Exactly one enabled key under codex.p1_gate, and it is true.
+p1_enabled=$(awk '
+  /^codex:/ { c = 1; next }
+  c && /^[^[:space:]#]/ { c = 0 }
+  c && /^  p1_gate:/ { g = 1; next }
+  g && /^  [^[:space:]#]/ { g = 0 }
+  g && /^    enabled:/ { sub(/^    enabled:[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, ""); print }
+' "$W/.github/review-policy.yml")
+[ "$p1_enabled" = true ] \
+  || { echo "ERROR: could not enable codex.p1_gate in the fixture policy (got '$p1_enabled'); update this test" >&2; exit 1; }
 chmod +x "$W/scripts/codex-p1-gate.sh" "$W/scripts/workflow/codex-p1-snapshot-retry.py" \
   "$W/scripts/gate-api-lineage-blocking.sh"
 
