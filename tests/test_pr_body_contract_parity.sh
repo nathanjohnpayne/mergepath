@@ -24,6 +24,202 @@ pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL: $1" >&2; }
 
+# Focused process-boundary regressions also run inside the full parity suite.
+parser_failure_tests() {
+  python3 - "$ROOT" "$@" <<'PY_PARSER_FAILURES'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(sys.argv.pop(1))
+VALID = "Authoring-Agent: codex\n\n## Self-Review\nok\n"
+MISSING = "Authoring-Agent: codex\n\nordinary prose\n"
+
+
+class ParserFailures(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.preload = Path(cls.temp.name) / "child-boundary.cjs"
+        cls.preload.write_text(r"""
+const cp = require('node:child_process');
+const original = cp.spawnSync;
+cp.spawnSync = (command, args, options) => {
+  const kind = process.env.PR_BODY_FIXTURE_KIND;
+  if (!kind) return original(command, args, options);
+  if (kind === 'actual-start') return original('/nonexistent-pr-body-parser-1309', args, options);
+  const mode = args[args.length - 1];
+  if (process.env.PR_BODY_FIXTURE_REVIEW_ONLY && mode !== '--has-self-review') {
+    return {pid: 42, status: 0, stdout: mode === '--author-count' ? '1\n' : 'codex\n'};
+  }
+  const result = {pid: 42, status: null, stdout: 'UNTRUSTED PARTIAL ANSWER\n', stderr: 'fixture child stderr\n'};
+  if (kind === 'start') { result.pid = 0; result.error = {code: 'ENOENT'}; }
+  if (kind === 'execution') result.error = {code: 'ENOBUFS'};
+  if (kind === 'timeout') result.error = {code: 'ETIMEDOUT'};
+  if (kind === 'signal') result.signal = 'SIGTERM';
+  if (kind === 'exit') result.status = 2;
+  if (kind === 'exit-one') result.status = 1;
+  return result;
+};
+// Fault the actual generated CLI entry, not a substitute implementation.
+if (process.env.PR_BODY_FIXTURE_THROW && process.argv[1] === process.env.PR_BODY_FIXTURE_RUNTIME) {
+  const fs = require('node:fs');
+  const read = fs.readFileSync;
+  fs.readFileSync = (fd, ...args) => {
+    if (fd === 0) throw new Error('fixture parser exception');
+    return read(fd, ...args);
+  };
+  require('node:module').syncBuiltinESMExports();
+}
+""")
+
+    def run_process(self, command, body=VALID, **extra):
+        env = dict(os.environ, NODE_OPTIONS="--require=" + json.dumps(str(self.preload)))
+        env.update(extra)
+        return subprocess.run(command, input=body, text=True, capture_output=True,
+                              cwd=ROOT, env=env, timeout=15)
+
+    def helper(self, helper, body=VALID, parser=None, **extra):
+        program = '. "$1/scripts/lib/pr-body-contract.sh"; PR_BODY_CONTRACT_TIMEOUT_SECONDS=2; '
+        if parser is not None:
+            program += 'PR_BODY_CONTRACT_PARSER="$3"; '
+        program += '"$2" "$(cat)"'
+        return self.run_process(['bash', '-c', program, 'fixture', str(ROOT), helper,
+                                 str(parser or '')], body, **extra)
+
+    def test_real_generated_valid_and_absent_answers(self):
+        for body, present in ((VALID, True), (MISSING, False)):
+            with self.subTest(present=present):
+                result = self.helper('pr_body_has_self_review', body)
+                self.assertEqual(result.returncode, 0 if present else 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                direct = self.run_process(['node', str(ROOT/'scripts/lib/pr-body-contract.mjs'), '--json'], body)
+                self.assertEqual(direct.returncode, 0, direct.stderr)
+                self.assertEqual(json.loads(direct.stdout),
+                                 dict(author='codex', authorCount=1, hasSelfReview=present))
+
+    def test_helper_process_failures_suppress_partial_answers(self):
+        for kind, expected in (('start', 125), ('actual-start', 125), ('execution', 126), ('signal', 126),
+                               ('exit', 126), ('timeout', 124)):
+            for helper in ('pr_body_authoring_agent', 'pr_body_authoring_agent_count', 'pr_body_has_self_review'):
+                with self.subTest(kind=kind, helper=helper):
+                    result = self.helper(helper, PR_BODY_FIXTURE_KIND=kind)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    if kind != 'actual-start':
+                        self.assertIn('fixture child stderr', result.stderr)
+
+    def test_status_one_is_semantic_only_for_self_review(self):
+        for helper, expected in (('pr_body_authoring_agent', 126),
+                                 ('pr_body_authoring_agent_count', 126), ('pr_body_has_self_review', 1)):
+            with self.subTest(helper=helper):
+                result = self.helper(helper, PR_BODY_FIXTURE_KIND='exit-one')
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    def test_public_valid_missing_and_infrastructure_diagnostics(self):
+        for flags in ([], ['--self-review-only']):
+            command = ['bash', str(ROOT/'scripts/validate-pr-body.sh'), *flags]
+            with self.subTest(flags=flags, kind='valid'):
+                self.assertEqual(self.run_process(command).returncode, 0)
+            with self.subTest(flags=flags, kind='missing'):
+                result = self.run_process(command, MISSING)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('Self-Review', result.stderr)
+                self.assertNotIn('parser', result.stderr)
+            for kind, expected in (('start', 'could not start'), ('execution', 'execution failed'),
+                                   ('signal', 'execution failed'), ('exit', 'execution failed'),
+                                   ('timeout', 'wall-clock bound')):
+                with self.subTest(flags=flags, kind=kind):
+                    result = self.run_process(command, PR_BODY_FIXTURE_KIND=kind,
+                                              PR_BODY_FIXTURE_REVIEW_ONLY='1')
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn(expected, result.stderr)
+                    self.assertNotIn('missing', result.stderr)
+                    self.assertNotIn('must contain', result.stderr)
+
+    def test_actual_cli_exception_is_not_semantic_absence(self):
+        runtime = str(ROOT/'scripts/lib/pr-body-contract.mjs')
+        extra = dict(PR_BODY_FIXTURE_THROW='1', PR_BODY_FIXTURE_RUNTIME=runtime)
+        direct = self.run_process(['node', runtime, '--has-self-review'], **extra)
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertEqual(direct.stdout, '')
+        self.assertIn('parser execution failed', direct.stderr)
+        result = self.helper('pr_body_has_self_review', **extra)
+        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_import_time_primitive_rejections_are_infrastructure(self):
+        for primitive in ('null', 'undefined'):
+            with self.subTest(primitive=primitive):
+                parser = Path(self.temp.name)/(primitive + '.mjs')
+                parser.write_text('throw ' + primitive + ';' + chr(10))
+                result = self.helper('pr_body_has_self_review', parser=parser)
+                self.assertEqual(result.returncode, 126, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('PR-body parser execution failed: ' + primitive, result.stderr)
+                result = self.run_process(['bash', '-c',
+                    '. "$1/scripts/lib/pr-body-contract.sh"; PR_BODY_CONTRACT_PARSER="$2"; '
+                    'pr_body_validate "$(cat)" "$1/.github/review-policy.yml"',
+                    'fixture', str(ROOT), str(parser)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('parser execution failed', result.stderr)
+                self.assertNotIn('must contain', result.stderr)
+                self.assertNotIn('missing a', result.stderr)
+
+    def test_actual_missing_canonical_module_is_not_absence(self):
+        stage = Path(self.temp.name)/'standalone'
+        for relative in ('scripts/lib/pr-body-contract.sh', 'scripts/lib/reviewers-helpers.sh',
+                         'scripts/lib/pr-body-contract.mjs', 'scripts/validate-pr-body.sh',
+                         '.github/review-policy.yml'):
+            target = stage/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT/relative, target)
+        commands = [['bash', str(stage/'scripts/validate-pr-body.sh'), *flags]
+                    for flags in ([], ['--self-review-only'])]
+        for command in commands:
+            self.assertEqual(self.run_process(command).returncode, 0)
+        (stage/'scripts/lib/pr-body-contract.mjs').unlink()
+        for command in commands:
+            with self.subTest(flags=command[2:]):
+                result = self.run_process(command)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('parser execution failed', result.stderr)
+                self.assertNotIn('missing a', result.stderr)
+                self.assertNotIn('must contain', result.stderr)
+
+    def test_real_child_signal_exit_and_watchdog(self):
+        for label, program, expected in (
+            ('signal', 'process.kill(process.pid, "SIGTERM");', 126),
+            ('exit', 'process.exit(2);', 126),
+            ('timeout', 'setInterval(() => {}, 1000);', 124),
+        ):
+            with self.subTest(kind=label):
+                parser = Path(self.temp.name)/(label + '.cjs')
+                parser.write_text('process.stdout.write(' + json.dumps('partial answer\n') + ');' + chr(10) + program)
+                result = self.helper('pr_body_has_self_review', parser=parser)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+
+unittest.main(verbosity=2)
+PY_PARSER_FAILURES
+}
+
+if [ "${1:-}" = --parser-failures-only ]; then
+  parser_failure_tests "${@:2}"
+  exit $?
+fi
+
 TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # ONE exit handler for every temp this suite creates. A second `trap ... EXIT`
 # later REPLACES this one rather than extending it, which leaked the detector
@@ -1167,6 +1363,9 @@ TMP_PROD_STALL="$(mktemp "${TMPDIR:-/tmp}/parity-prod-stall.XXXXXX")"
 PROD_STALL_FIXTURE="$TMP_PROD_STALL"
 printf '%s\n' 'Authoring-Agent: codex' '' '## Self-Review' > "$PROD_STALL_FIXTURE"
 TMP_STALL_PARSER="$(mktemp "${TMPDIR:-/tmp}/parity-stall-parser.XXXXXX")"
+# Match the canonical ESM module format so this fixture reaches the watchdog.
+mv "$TMP_STALL_PARSER" "${TMP_STALL_PARSER}.mjs"
+TMP_STALL_PARSER="${TMP_STALL_PARSER}.mjs"
 printf '%s\n' 'setInterval(() => {}, 1000);' > "$TMP_STALL_PARSER"
 
 # All three helpers, because each has a different output contract: two answer on
@@ -1254,6 +1453,12 @@ if pr_body_validate "$prod_valid_body" "$ROOT/.github/review-policy.yml" 2>/dev/
   ok "#1281: a valid body still validates through the bounded invocation path"
 else
   bad "#1281: the production bound rejected a valid body"
+fi
+
+if parser_failure_tests; then
+  ok "#1309: parser outcomes remain distinct and infrastructure emits no partial answer"
+else
+  bad "#1309: parser start/execution/timeout diagnostic boundary regressed"
 fi
 
 # --- 17. the hook timeout must outlast the parser bound (#1281) --------------

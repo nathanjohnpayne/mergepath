@@ -145,24 +145,30 @@ export function parsePrBodyContract(body) {
   return { author, authorCount: authorValues.length, hasSelfReview };
 }
 
-const mode = process.argv[2];
-const contract = parsePrBodyContract(readFileSync(0, 'utf8'));
-switch (mode) {
-  case '--author':
-    if (contract.author !== '') process.stdout.write(`${contract.author}\n`);
-    break;
-  case '--author-count':
-    process.stdout.write(`${contract.authorCount}\n`);
-    break;
-  case '--has-self-review':
-    process.exitCode = contract.hasSelfReview ? 0 : 1;
-    break;
-  case '--json':
-    process.stdout.write(`${JSON.stringify(contract)}\n`);
-    break;
-  default:
-    process.stderr.write(
-      'usage: pr-body-contract.mjs (--author|--author-count|--has-self-review|--json) < pr-body.md\n',
-    );
-    process.exitCode = 2;
+try {
+  const mode = process.argv[2];
+  const contract = parsePrBodyContract(readFileSync(0, 'utf8'));
+  switch (mode) {
+    case '--author':
+      if (contract.author !== '') process.stdout.write(`${contract.author}\n`);
+      break;
+    case '--author-count':
+      process.stdout.write(`${contract.authorCount}\n`);
+      break;
+    case '--has-self-review':
+      process.exitCode = contract.hasSelfReview ? 0 : 1;
+      break;
+    case '--json':
+      process.stdout.write(`${JSON.stringify(contract)}\n`);
+      break;
+    default:
+      process.stderr.write(
+        'usage: pr-body-contract.mjs (--author|--author-count|--has-self-review|--json) < pr-body.md\n',
+      );
+      process.exitCode = 2;
+  }
+} catch (error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`PR-body parser execution failed: ${detail}\n`);
+  process.exitCode = 2;
 }

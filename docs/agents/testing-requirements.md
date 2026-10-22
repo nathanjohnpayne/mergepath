@@ -10,6 +10,8 @@ Captured-output assertions must retain both the expected exit and diagnostic wit
 
 The workflow-parser and Firebase parser-parity guards require successful positive controls before accepting rejection evidence. The D11 runtime keeps the absent-workflow skip used by propagated consumers; extraction failure or empty extraction in a present workflow fails. See `specs/repo_lint_execution.md` and the native guards in `tests/test_465_fail_closed.sh` and `tests/test_op_preflight_check.sh` (#1527).
 
+For PR-body parser diagnostics, run `tests/test_pr_body_contract_parity.sh --parser-failures-only` and the full parity suite. Keep genuine missing-heading, child-start failure, abnormal execution and timeout distinct in full and self-review-only validation, with infrastructure stdout suppressed and valid/absent controls. Exercise the actual generated CLI exception boundary, import-time null/undefined rejection, and real child signal/exit/watchdog paths; fake process results must reach the production `spawnSync` boundary. Independently omit failure classification, partial-output suppression and the caller's infrastructure branch to prove the tests discriminate them. Rebuild and verify the standalone generated runtime from its canonical source, retaining the existing timeout and canonical-guidance checks (#1309).
+
 ## Repo-lint execution
 
 Lint-fast supplies active npm Dependabot alternate-target refs through its bounded depth-one setup step before checking coupled families. It retains `persist-credentials: false`, fetches no unrelated branch history and fails on unavailable declared targets. The workflow-step fixtures in `tests/test_dependabot_coupled_groups.sh` and `specs/repo_lint_execution.md` own this checkout contract (#2464).
