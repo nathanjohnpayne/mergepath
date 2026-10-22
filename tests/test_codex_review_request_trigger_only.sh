@@ -1911,42 +1911,63 @@ test_guard_unknown_suite_branch() {
   [ "$FAIL" -ne "$before" ] || pass "#2200: unknown fork attribution is unavailable; known branch and age signals retain behavior"
 }
 
+# The request generation the canonical requester observed before its write
+# (#1362): the configured author's exact request ids on the fixture timeline.
+observed_generation() { # <case-dir> <scenario>
+  CODEX_TEST_SCENARIO="$2" CODEX_TEST_STATE_DIR="$1/state" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    "$1/bin/gh" api --paginate repos/owner/repo/issues/999/comments \
+    | jq -sc '[.[][] | select(.user.login == "nathanjohnpayne" and ((.body // "") | test("\\A@codex review\\z"; "i"))) | .id] | unique | sort'
+}
+
 # #2158: fresh write-boundary authorization shares the production budgets,
-# performs no POST, and cannot authorize a different expected head.
+# performs no POST, and cannot authorize a different expected head. #1362: it
+# also refuses when the request generation the requester observed has changed
+# (a concurrent request landed first) or was not supplied.
 test_write_boundary_authorization() {
-  local scenario dir rc expected auto gate reason before=$FAIL
-  for scenario in fresh cap_at_limit stale_head body-P2 dup_author content-free; do
-    dir=$(make_case "authorize-$scenario")
+  local label scenario dir rc expected auto gate reason generation mode before=$FAIL
+  for label in fresh cap_at_limit stale_head body-P2 dup_author content-free concurrent no-generation; do
+    scenario=$label mode=""
+    # concurrent: a request landed after the polling-mode requester read the
+    # timeline, so the generation it names is one request short.
+    case "$label" in concurrent) scenario=dup_author mode=poll ;; no-generation) scenario=fresh ;; esac
+    dir=$(make_case "authorize-$label")
     auto=false
     gate=$(write_gate_stub "$dir" false)
     [ "$scenario" != content-free ] || auto=true
     expected=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     [ "$scenario" != stale_head ] || expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    generation=$(observed_generation "$dir" "$scenario")
+    case "$label" in
+      concurrent) [ "$generation" = '[7001]' ] || fail "authorization: fixture generation helper read $generation"; generation='[]' ;;
+      no-generation) generation='' ;;
+    esac
     rc=0
     (
       cd "$dir"
       PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$expected" \
+        MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$generation" MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$mode" \
         MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"
     ) || rc=$?
-    case "$scenario" in
+    case "$label" in
       fresh)
         [ "$rc" = 0 ] && jq -e '.authorized == true and .head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .author_identity == "nathanjohnpayne"' "$dir/out.json" >/dev/null \
           || fail "authorization: fresh governing budget should authorize (rc=$rc; $(cat "$dir/err.log"))" ;;
       cap_at_limit) [ "$rc" = 7 ] || fail "authorization: spent request ceiling must refuse (rc=$rc)" ;;
       stale_head) [ "$rc" = 3 ] || fail "authorization: stale expected head must refuse (rc=$rc)" ;;
-      body-P2|dup_author|content-free)
-        case "$scenario" in
+      body-P2|dup_author|content-free|concurrent|no-generation)
+        case "$label" in
           body-P2) reason=already-cleared ;;
           dup_author) reason=existing-trigger ;;
           content-free) reason=content-free-auto-trigger ;;
+          concurrent|no-generation) reason=concurrent-request ;;
         esac
         [ "$rc" = 3 ] && jq -e --arg reason "$reason" \
           '.authorized == false and .reason == $reason' "$dir/out.json" >/dev/null \
-          || fail "authorization: $scenario must explicitly refuse (rc=$rc; $(cat "$dir/err.log"))" ;;
+          || fail "authorization: $label must explicitly refuse (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "authorization must never post ($scenario)"
   done
@@ -1972,6 +1993,7 @@ test_write_boundary_authorization_caller_mode() {
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$mode" \
+        MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$(observed_generation "$dir" "$scenario")" \
         MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"

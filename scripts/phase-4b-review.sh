@@ -44,6 +44,22 @@
 #                     the caller will retain (historical prefix receipts).
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
+#   --admin-override "<owner authorization quote>"
+#                    admin automated 4b override (#2633). A deterministic
+#                    tripwire is recorded and the run continues to the real
+#                    adapter, whose verdict posts under the reviewer identity
+#                    as usual. Barrier and Codex human stops are not
+#                    overridden here: they keep the owner tiebreak (#2544).
+#                    The quote must be one non-empty line of at most 500
+#                    characters; it and every overridden stop are written
+#                    into the posted review body and every terminal JSON
+#                    summary (`admin_overridden`). Correctness stops are never
+#                    overridden: holds (6), feedback accounting (7), input
+#                    integrity and drift (3), request-budget evidence (10),
+#                    and every provider-barrier result. Once a tripwire is
+#                    overridden, an adapter that yields no usable verdict
+#                    exits 8 (the tripwire still holds), never the exit-4
+#                    manual fallback that wave fan-out may proceed on.
 #   --force-enabled  run this one invocation even when
 #                    phase_4b_automation.enabled is false/absent in
 #                    .github/review-policy.yml (#1046). Overrides ONLY
@@ -238,12 +254,17 @@ PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXP
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
+# #2633: owner-authorized admin automated 4b override. Its value is the
+# owner's quoted authorization, recorded in the posted review body.
+ADMIN_OVERRIDE_SET=false
+ADMIN_OVERRIDE_QUOTE=""
+ADMIN_OVERRIDDEN='[]'
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
   exit 3
 }
 
@@ -262,6 +283,11 @@ while [ $# -gt 0 ]; do
     --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
+    --admin-override)
+      # A quote that starts with "-" is a mistyped option (`--admin-override
+      # --dry-run`), never authorization text: refuse rather than consume it.
+      case "${2:-}" in ''|-*) p4b_die 3 "--admin-override requires the owner's quoted authorization" ;; esac
+      ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
     *)
@@ -269,6 +295,17 @@ while [ $# -gt 0 ]; do
       shift ;;
   esac
 done
+
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *[![:space:]]*) ;;
+    *) p4b_die 3 "--admin-override requires a non-empty owner authorization quote" ;;
+  esac
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
+  esac
+  [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
+fi
 
 if [ "$RETAIN_EVIDENCE" = true ]; then
   [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
@@ -695,6 +732,14 @@ refuse_approval_if_request_generation_moved() {
   stop_for_barrier_error "$payload"
 }
 
+# #2633: the admin override fields every terminal summary carries, so a run
+# that absorbed a tripwire reports it however it ends.
+admin_override_summary() {
+  jq -nc --argjson overridden "$ADMIN_OVERRIDDEN" --arg quote "$ADMIN_OVERRIDE_QUOTE" \
+    --argjson set "$ADMIN_OVERRIDE_SET" \
+    '{admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)}'
+}
+
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
@@ -725,7 +770,11 @@ fall_back_to_manual() {
   # The handoff helper is stdout-only, but it performs its own feedback and PR
   # metadata reads before returning the rendered block. Capture that read-only
   # output first; none of it becomes authority until the parent prints it.
-  if [ -x "$HANDOFF" ]; then
+  # #2633: once the admin override absorbed a tripwire, that tripwire still
+  # holds when the adapter produced no usable verdict. Exit 4 reads as
+  # "reviewer unavailable, may proceed" to wave-audit.sh, so keep the
+  # tripwire's terminal no-fan-out exit 8 and render no handoff for it.
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -eq 0 ] && [ -x "$HANDOFF" ]; then
     handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
       || handoff_rc=$?
     handoff_rendered=true
@@ -743,6 +792,19 @@ fall_back_to_manual() {
     hold_for_external_review "$(jq -nc \
       '{decision:"pending",retry_after:30,codex:"not-yet",codex_evidence:"manual-handoff-review-in-flight",reason:"manual handoff renderer observed an active review"}')"
   fi
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
+    p4b_warn "admin override (#2633): the adapter produced no usable verdict ($why); the overridden tripwire still requires human-mediated review"
+    jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+          --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+          --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
+          --argjson ao "$(admin_override_summary)" '
+      {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
+       reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
+       review_posted:false, fell_back_to_manual:false, barrier_pending:false,
+       human_tiebreaker_required:true, reason:$why,
+       automation_enabled:true, enabled_via:$enabled_via} + $ao'
+    exit 8
+  fi
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   if [ "$handoff_rendered" = true ]; then
     case "$handoff_rc" in
@@ -756,11 +818,12 @@ fall_back_to_manual() {
   fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
+        --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
      reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
      review_posted:false, fell_back_to_manual:true, reason:$why,
-     automation_enabled:true, enabled_via:$enabled_via}'
+     automation_enabled:true, enabled_via:$enabled_via} + $ao'
   exit 4
 }
 
@@ -790,14 +853,41 @@ hold_for_external_review() {
   p4b_warn "external review has not reached the current head; holding without posting (retry_after=$(printf '%s' "$payload" | jq -r '.retry_after // 0')s)"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
+        --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
      reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
      review_posted:false, fell_back_to_manual:false, barrier_pending:true,
      retry_after:($b.retry_after // 0), barrier:$b,
      reason:"external review has not reached the current head",
-     automation_enabled:true, enabled_via:$enabled_via}'
+     automation_enabled:true, enabled_via:$enabled_via} + $ao'
   exit 6
+}
+
+# #2633: under --admin-override, a deterministic tripwire is recorded and the
+# run continues to the real adapter, whose verdict posts as usual. Only the
+# tripwire site calls this: it runs after every provider barrier and before
+# the body renders, so no provider hold, request-budget snapshot or writer-
+# boundary recheck is skipped. Barrier and Codex human stops keep their own
+# owner exits (#2544) because absorbing them would skip the barrier's
+# CodeRabbit arm and its budget evidence.
+#
+# Only a well-formed tripwire match is absorbed: decision human-review and a
+# non-empty, duplicate-free list of the fixed reason codes escalation.cjs
+# emits. Any other classifier result (version skew, `{}`, a non-array) is an
+# input-integrity failure, never a stop the owner's quote can run past.
+admin_override_absorbs() {
+  [ "$ADMIN_OVERRIDE_SET" = true ] || return 1
+  local payload="$1" entry
+  jq -e '.tripwire | type == "object" and .decision == "human-review"
+    and (.tripwires | type == "array" and length > 0 and length == (unique | length))
+    and all(.tripwires[]; . == "reviewer-address" or . == "verdict-instruction"
+      or . == "authorization-policy-publisher-or-credentials")' <<<"$payload" >/dev/null 2>&1 \
+    || p4b_die 3 "admin override (#2633): the escalation result is not a well-formed tripwire match; refusing to run past it"
+  entry="$(jq -c '{decision,reason,tripwires:.tripwire.tripwires}' <<<"$payload")"
+  ADMIN_OVERRIDDEN="$(jq -c --argjson e "$entry" '. + [$e] | unique' <<<"$ADMIN_OVERRIDDEN")"
+  p4b_warn "admin override (#2633): continuing past a deterministic tripwire ($(jq -r '.tripwires | join(", ")' <<<"$entry")) to the real adapter"
+  return 0
 }
 
 stop_for_human_tiebreaker() {
@@ -811,7 +901,8 @@ stop_for_human_tiebreaker() {
   fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
+        --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
@@ -819,7 +910,7 @@ stop_for_human_tiebreaker() {
      automation_enabled:true,enabled_via:$enabled_via}
     # #2663: a spent round cap reports round_cap at the top level, as every
     # other round-cap stop does.
-    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end)'
+    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end) + $ao'
   exit 8
 }
 
@@ -860,12 +951,13 @@ round_cap_evidence_error() {
   p4b_warn "$reason; stopping without review publication or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" \
+        --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      infrastructure_error:true,round_cap:{state:"unreadable"},reason:$reason,
-     automation_enabled:true,enabled_via:$enabled_via}'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao'
   exit 10
 }
 round_cap_stop() { # <exit> <state> <reason> <where>
@@ -881,12 +973,12 @@ round_cap_stop() { # <exit> <state> <reason> <where>
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --arg reason "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" \
-        --arg s "$state" --arg enabled_via "$ENABLED_VIA" '
+        --arg s "$state" --arg enabled_via "$ENABLED_VIA" --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:true,retry_after:60,
      round_cap:($rc + {state:$s}),reason:$reason,
-     automation_enabled:true,enabled_via:$enabled_via}'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao'
   exit 6
 }
 round_api() { # <method> <endpoint> [<payload-json>] -> response on stdout, rc
@@ -1066,12 +1158,13 @@ stop_for_barrier_error() {
   p4b_warn "request-budget authority failed; stopping without review publication or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
+        --argjson ao "$(admin_override_summary)" '
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      infrastructure_error:true,barrier:$b,reason:$b.reason,
-     automation_enabled:true,enabled_via:$enabled_via}'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao'
   exit 10
 }
 
@@ -1564,8 +1657,9 @@ if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENC
     p4b_warn "byte-verified propagation canary: tripwires do not re-gate canonical content that already merged on the hub (#2633)"
   fi
   if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
-    stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
+    tripwire_payload="$(jq -nc --argjson escalation "$escalation" \
       '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
+    admin_override_absorbs "$tripwire_payload" || stop_for_human_tiebreaker "$tripwire_payload"
   fi
 fi
 
@@ -1930,6 +2024,17 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
       printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
       ;;
   esac
+  # #2633: say which human stops the owner's admin override ran past. The
+  # quote is free text inside a reviewer-authored body, which feedback
+  # accounting scans for tier markers (`**P1`, `![P1 Badge]`), ack tokens and
+  # HTML-comment records. Backslash-escape every ASCII punctuation character:
+  # GitHub renders the same text, and no marker can form. The JSON summary
+  # keeps the raw quote.
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
+    printf -- '- Admin override (#2633): owner authorization "%s"; this automated review ran past: %s\n' \
+      "$(jq -rn --arg q "$ADMIN_OVERRIDE_QUOTE" '$q | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')" \
+      "$(jq -r 'map(if .tripwires then "tripwire (" + (.tripwires | join(", ")) + ")" else (.reason // .decision) end) | join("; ")' <<<"$ADMIN_OVERRIDDEN")"
+  fi
   # #1335: likewise for a CodeRabbit review carried from identical content.
   if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
     printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \
@@ -2415,6 +2520,7 @@ jq -n \
   --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
   --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" \
+  --argjson ao "$(admin_override_summary)" \
   --argjson round_cap "$P4B_ROUND_CAP_JSON" \
   --arg enabled_via "$ENABLED_VIA" '
   {
@@ -2437,7 +2543,7 @@ jq -n \
     round_cap: $round_cap,
     automation_enabled: true,
     enabled_via: $enabled_via
-  }
+  } + $ao
   | if $dry_run then . + {validated_verdict: $validated_verdict} else . end'
 
 # Read by the optional sourced heartbeat module during the composed EXIT.

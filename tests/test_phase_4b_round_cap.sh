@@ -137,6 +137,10 @@ grep -q '^enforce_phase4b_round_cap()' "$BLOCK" || { echo "FAIL: could not extra
 TIEBREAK="$WORK/tiebreak.sh"
 awk '/^stop_for_human_tiebreaker\(\) \{$/{f=1} f{print} f && /^}$/{exit}' "$ROOT/scripts/phase-4b-review.sh" >"$TIEBREAK"
 grep -q '^stop_for_human_tiebreaker()' "$TIEBREAK" || { echo "FAIL: could not extract stop_for_human_tiebreaker" >&2; exit 1; }
+# And the production #2633 override-fields helper every terminal summary uses.
+OVERRIDE_SUMMARY="$WORK/override-summary.sh"
+awk '/^admin_override_summary\(\) \{$/{f=1} f{print} f && /^}$/{exit}' "$ROOT/scripts/phase-4b-review.sh" >"$OVERRIDE_SUMMARY"
+grep -q '^admin_override_summary()' "$OVERRIDE_SUMMARY" || { echo "FAIL: could not extract admin_override_summary" >&2; exit 1; }
 
 FAKE_BIN="$WORK/bin"; mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/gh" <<'GH'
@@ -242,6 +246,8 @@ p4b_warn() { echo "[warn] $*" >&2; }
 p4b_governing_policy_json() { cat "$FAKE_GH_STATE/policy.json"; }
 gh_api_array() { gh api --paginate "$1"; }
 cleanup_pre_post_refusal_side_effects() { echo "[cleanup] $1" >&2; }
+ADMIN_OVERRIDE_SET=${H_ADMIN_SET:-false} ADMIN_OVERRIDE_QUOTE=${H_ADMIN_QUOTE:-} ADMIN_OVERRIDDEN=${H_ADMIN_OVERRIDDEN:-[]}
+. "$H_OVERRIDE_SUMMARY"
 . "$H_TIEBREAK"
 . "$H_BLOCK"
 for step in "$@"; do
@@ -266,6 +272,8 @@ fresh() { # <name> <cap-or-none> -> sets S
 run() { # <run-id> <steps...> -> the last JSON document in OUT; RC set
   RC=0
   OUT=$(PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
+        H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" H_ADMIN_SET="${H_ADMIN_SET:-false}" H_ADMIN_QUOTE="${H_ADMIN_QUOTE:-}" \
+        H_ADMIN_OVERRIDDEN="${H_ADMIN_OVERRIDDEN:-[]}" \
         H_HOOK="${H_HOOK:-/dev/null}" TAMPER="${TAMPER:-}" \
         bash "$WORK/harness.sh" "$@" 2>"$S/err.$1") || RC=$?
   OUT=$(printf '%s\n' "$OUT" | jq -sc 'last // {}' 2>/dev/null || printf '{}')
@@ -323,6 +331,7 @@ run me reserve
 fresh p8 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
 for i in 1 2 3 4 5; do
   ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
+    H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
       bash "$WORK/harness.sh" "racer$i" reserve >"$S/out.racer$i" 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait
@@ -335,6 +344,7 @@ for i in 1 2 3 4 5; do case "$(cat "$S/rc.racer$i")" in 0) zeros=$((zeros+1)) ;;
 fresh p9 3
 for i in $(seq 1 10); do
   ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
+    H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
       bash "$WORK/harness.sh" "racer$i" reserve >/dev/null 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait
@@ -403,6 +413,20 @@ fresh p15c 3; printf 'junk' >"$S/commits/dead"; printf 'dead' >"$S/tip"; run me 
 [ "$RC" = 10 ] && pass "P15: a malformed ledger commit fails closed (exit 10)" || fail "P15c rc=$RC"
 fresh p15d 3; printf '{"author_identity":"nathanjohnpayne","phase_4b_automation":{"max_review_rounds":0}}' >"$S/policy.json"; run me reserve
 [ "$RC" = 10 ] && pass "P15: an invalid governing cap fails closed (exit 10)" || fail "P15d rc=$RC"
+
+# #2633: a run that absorbed a tripwire under the admin override keeps the
+# override fields in every round-cap stop: spent (8), held (6), unreadable (10).
+OVR='[{"decision":"human-tiebreaker","reason":"tripwire","tripwires":["reviewer-address"]}]'
+ovr_ok() { jq -e '.admin_override_quote == "Owner: run it" and .admin_overridden[0].tripwires == ["reviewer-address"]' <<<"$OUT" >/dev/null; }
+fresh o8 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; review 3 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
+H_ADMIN_SET=true H_ADMIN_QUOTE='Owner: run it' H_ADMIN_OVERRIDDEN="$OVR" run me reserve
+[ "$RC" = 8 ] && ovr_ok && pass "#2633: the spent round-cap stop keeps the admin override fields" || fail "#2633 spent rc=$RC $OUT"
+fresh o6 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
+run other reserve; H_ADMIN_SET=true H_ADMIN_QUOTE='Owner: run it' H_ADMIN_OVERRIDDEN="$OVR" run me reserve
+[ "$RC" = 6 ] && ovr_ok && pass "#2633: the held round-cap stop keeps the admin override fields" || fail "#2633 held rc=$RC $OUT"
+fresh o10 3; echo 1 >"$S/knob.ref_fail"
+H_ADMIN_SET=true H_ADMIN_QUOTE='Owner: run it' H_ADMIN_OVERRIDDEN="$OVR" run me reserve
+[ "$RC" = 10 ] && ovr_ok && pass "#2633: the unreadable round-cap stop keeps the admin override fields" || fail "#2633 unreadable rc=$RC $OUT"
 
 # P16: no governing cap -> nothing is read or written (backward compatible).
 fresh p16 none; { for i in 1 2 3 4 5; do review "$i" x APPROVED "$HEAD_A"; done; } | arr >"$S/reviews.json"

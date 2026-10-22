@@ -7,7 +7,8 @@
 #      "Authoring-Agent:" and "## Self-Review". The wrapper verifies
 #      an author token before the write and verifies the created PR
 #      author afterward with the same token.
-#   2. gh pr merge --admin — blocks unless BREAK_GLASS_ADMIN=1
+#   2. gh pr merge --admin — blocks unless BREAK_GLASS_ADMIN names
+#      the exact resolved <PR-URL>@<full-head>
 #      (human must explicitly authorize in chat)
 #   3. gh pr merge (any flavor) — blocks when the target PR's
 #      `mergeStateStatus` is BLOCKED / DIRTY / UNSTABLE / BEHIND /
@@ -182,7 +183,7 @@
 #   documented happy paths use exactly this form:
 #
 #     CODEX_CLEARED=1 gh pr merge 65 --squash --delete-branch
-#     BREAK_GLASS_ADMIN=1 gh pr merge --admin 65 ...
+#     BREAK_GLASS_ADMIN=<PR-URL>@<full-head> gh pr merge --admin 65 ...
 #
 #   So the hook must parse env assignments out of the command string
 #   before the `gh` token and treat them as if they were exported.
@@ -3844,11 +3845,12 @@ esac
 # a failing merge state. Requiring both for the worst-case merge
 # (admin AND failing CI) is intentional.
 if [ "$ADMIN_REQUESTED" -eq 1 ]; then
-  if [[ "$EFFECTIVE_BREAK_GLASS_ADMIN" =~ ^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*@[0-9a-f]{40}$ ]]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_ADMIN" = "$PR_URL@$PR_HEAD_SHA" ]; then
     echo "BREAK-GLASS: --admin merge authorized by human." >&2
     exit 0
   fi
   echo "BLOCKED: --admin merge requires explicit human authorization." >&2
+  echo "  Expected BREAK_GLASS_ADMIN=$PR_URL@$PR_HEAD_SHA." >&2
   echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=<full-PR-URL>@<full-head> and MERGEPATH_OWNER_ADMIN_AUTHORIZATION (version-1 JSON)." >&2
   exit 2
 fi
