@@ -686,6 +686,14 @@ p4b_governing_policy_json() {
   printf '%s' "$base_json" | jq -ce 'select(type == "object")' 2>/dev/null || return 2
 }
 
+# The run id a Phase 4b review carries (#2663): the marker the orchestrator
+# writes on its own line directly before its footer. A marker-shaped example
+# quoted earlier in the review text (a finding about this very ledger, say)
+# is not it. Prints null when the body has no such marker.
+P4B_RUN_MARKER_JQ='def p4b_run_marker:
+  [(. // "") | capture("<!-- mergepath-p4b-run: (?<r>[A-Za-z0-9._-]+) -->\\s+_Posted by scripts/phase-4b-review\\.sh"; "g") | .r]
+  | last;'
+
 # p4b_completed_rounds_from_reviews <reviews-json> <author-login>
 # Pure (#2663). Count the completed automated Phase 4b rounds on a PR from its
 # GitHub reviews, the only store every machine, session and restart shares. A
@@ -703,7 +711,7 @@ p4b_governing_policy_json() {
 # any record that is not a review object with a numeric id and a string state
 # (fail closed: malformed history never reads as empty history).
 p4b_completed_rounds_from_reviews() {
-  printf '%s' "${1:-}" | jq -ce --arg author "${2:-}" '
+  printf '%s' "${1:-}" | jq -ce --arg author "${2:-}" "$P4B_RUN_MARKER_JQ"'
     if type != "array" then error("reviews are not an array") else . end
     # Every record must look like a GitHub review before any is filtered out:
     # silently skipping junk would read malformed history as empty history.
@@ -717,7 +725,7 @@ p4b_completed_rounds_from_reviews() {
         | select((.body // "") | startswith("**Automated Phase 4b review**"))
         | select((.body // "") | contains("_Posted by scripts/phase-4b-review.sh"))
         | {id, head:(.commit_id // null), state,
-           run:(((.body // "") | capture("<!-- mergepath-p4b-run: (?<r>[A-Za-z0-9._-]+) -->") | .r)? // null)} ]
+           run:(.body | p4b_run_marker)} ]
     | unique_by(.id)
     | {completed: length, rounds: .}' 2>/dev/null
 }
@@ -784,17 +792,19 @@ p4b_round_occupancy() {
 
 # p4b_reconcile_posted_review <reviews-json> <reviewer-login> <head-sha> <run-id>
 # Pure (#2663). After a review POST with an uncertain outcome, find THIS run's
-# publication: a review by the actual reviewer, on this head, carrying this
-# run's unique `<!-- mergepath-p4b-run: <id> -->` nonce. Prints it only when
-# exactly one matches; zero (not landed, or not yet visible) or several
-# (ambiguous) print nothing, and the caller then neither adopts nor reposts.
+# publication: a review by the actual reviewer, on this head, whose run
+# marker (p4b_run_marker, the one before the footer) is this run's unique id.
+# A quoted example of the marker elsewhere in a body never matches. Prints it
+# only when exactly one matches; zero (not landed, or not yet visible) or
+# several (ambiguous) print nothing, and the caller then neither adopts nor
+# reposts.
 p4b_reconcile_posted_review() {
-  printf '%s' "${1:-[]}" | jq -c --arg who "${2:-}" --arg head "${3:-}" \
-    --arg nonce "<!-- mergepath-p4b-run: ${4:-} -->" '
+  [ -n "${4:-}" ] || return 0
+  printf '%s' "${1:-[]}" | jq -c --arg who "${2:-}" --arg head "${3:-}" --arg run "${4:-}" "$P4B_RUN_MARKER_JQ"'
     if type != "array" then empty else
     [ .[] | select(type == "object")
       | select(((.user.login // "") | ascii_downcase) == ($who | ascii_downcase))
-      | select(.commit_id == $head and ((.body // "") | contains($nonce))) ]
+      | select(.commit_id == $head and ((.body | p4b_run_marker) == $run)) ]
     | if length == 1 then .[0] else empty end end' 2>/dev/null
 }
 

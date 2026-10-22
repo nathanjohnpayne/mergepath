@@ -63,6 +63,16 @@ ghost=$(jq -nc --arg b "**Automated Phase 4b review** x"$'\n'"_Posted by scripts
 [ "$(p4b_completed_rounds_from_reviews "$ghost" nathanjohnpayne | jq -r .completed)" = 1 ] \
   && pass "rounds: a review by a deleted (ghost) user is a well-formed record and still counts" || fail "rounds: ghost user"
 
+# The run id is the marker before the footer; a marker-shaped example quoted in
+# the review text (as a finding about this ledger would) is not it.
+quoted=$(jq -nc --arg b "**Automated Phase 4b review** x"$'\n'"Finding: a body quoting <!-- mergepath-p4b-run: sample-run --> is ambiguous."$'\n\n'"<!-- mergepath-p4b-run: real-run -->"$'\n\n\n'"_Posted by scripts/phase-4b-review.sh under the reviewer identity._" \
+  '[{id:11,user:{login:"nathanpayne-codex"},state:"APPROVED",commit_id:"'"$HEAD_A"'",body:$b}]')
+[ "$(p4b_completed_rounds_from_reviews "$quoted" nathanjohnpayne | jq -c '[.rounds[].run]')" = '["real-run"]' ] \
+  && pass "rounds: a quoted marker-shaped example never displaces the run marker before the footer" || fail "rounds: quoted marker $(p4b_completed_rounds_from_reviews "$quoted" nathanjohnpayne)"
+[ "$(p4b_reconcile_posted_review "$quoted" nathanpayne-codex "$HEAD_A" real-run | jq -r '.id // empty')" = 11 ] \
+  && [ -z "$(p4b_reconcile_posted_review "$quoted" nathanpayne-codex "$HEAD_A" sample-run)" ] \
+  && pass "reconcile: only the marker before the footer identifies the run; a quoted id is never adopted" || fail "reconcile: quoted marker"
+
 # ===========================================================================
 # Pure: governing cap
 # ===========================================================================
@@ -123,6 +133,10 @@ recon() { p4b_reconcile_posted_review "$1" nathanpayne-codex "$HEAD_A" run-me | 
 BLOCK="$WORK/round-cap-block.sh"
 awk '/^# BEGIN p4b_round_cap$/{f=1;next} /^# END p4b_round_cap$/{f=0} f' "$ROOT/scripts/phase-4b-review.sh" >"$BLOCK"
 grep -q '^enforce_phase4b_round_cap()' "$BLOCK" || { echo "FAIL: could not extract the production round-cap block" >&2; exit 1; }
+# The production exit-8 helper too, so the spent stop's real output shape is tested.
+TIEBREAK="$WORK/tiebreak.sh"
+awk '/^stop_for_human_tiebreaker\(\) \{$/{f=1} f{print} f && /^}$/{exit}' "$ROOT/scripts/phase-4b-review.sh" >"$TIEBREAK"
+grep -q '^stop_for_human_tiebreaker()' "$TIEBREAK" || { echo "FAIL: could not extract stop_for_human_tiebreaker" >&2; exit 1; }
 
 FAKE_BIN="$WORK/bin"; mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/gh" <<'GH'
@@ -228,7 +242,7 @@ p4b_warn() { echo "[warn] $*" >&2; }
 p4b_governing_policy_json() { cat "$FAKE_GH_STATE/policy.json"; }
 gh_api_array() { gh api --paginate "$1"; }
 cleanup_pre_post_refusal_side_effects() { echo "[cleanup] $1" >&2; }
-stop_for_human_tiebreaker() { printf '%s\n' "$1" | jq -c '{exit:8} + .'; exit 8; }
+. "$H_TIEBREAK"
 . "$H_BLOCK"
 for step in "$@"; do
   case "$step" in
@@ -251,7 +265,7 @@ fresh() { # <name> <cap-or-none> -> sets S
 }
 run() { # <run-id> <steps...> -> the last JSON document in OUT; RC set
   RC=0
-  OUT=$(PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" \
+  OUT=$(PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
         H_HOOK="${H_HOOK:-/dev/null}" TAMPER="${TAMPER:-}" \
         bash "$WORK/harness.sh" "$@" 2>"$S/err.$1") || RC=$?
   OUT=$(printf '%s\n' "$OUT" | jq -sc 'last // {}' 2>/dev/null || printf '{}')
@@ -269,8 +283,8 @@ run me reserve
 # P2: at the cap with nothing in flight -> exit 8, no ledger write.
 fresh p2 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; review 3 x DISMISSED "$HEAD_A"; } | arr >"$S/reviews.json"
 run me reserve
-[ "$RC" = 8 ] && [ "$(jq -r .round_cap.state <<<"$OUT")" = spent ] && [ ! -f "$S/tip" ] \
-  && pass "P2: 3/3 completed -> the fourth round is refused (exit 8, round_cap spent) and nothing is written" || fail "P2 rc=$RC $OUT"
+[ "$RC" = 8 ] && [ "$(jq -c '[.round_cap.state, .human_tiebreaker_required, .barrier.round_cap.state]' <<<"$OUT")" = '["spent",true,"spent"]' ] && [ ! -f "$S/tip" ] \
+  && pass "P2: 3/3 completed -> the fourth round is refused (exit 8 from the production tiebreaker stop, top-level round_cap spent) and nothing is written" || fail "P2 rc=$RC $OUT"
 
 # P3: at the cap with a round in flight -> hold (exit 6), the slot is not reused.
 fresh p3 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
@@ -308,7 +322,7 @@ run me reserve
 # P8: real concurrency — five callers race for one remaining slot; exactly one wins.
 fresh p8 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
 for i in 1 2 3 4 5; do
-  ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" \
+  ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
       bash "$WORK/harness.sh" "racer$i" reserve >"$S/out.racer$i" 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait
@@ -320,7 +334,7 @@ for i in 1 2 3 4 5; do case "$(cat "$S/rc.racer$i")" in 0) zeros=$((zeros+1)) ;;
 # P9: ten concurrent callers on an empty PR with cap 3 -> exactly three reserve.
 fresh p9 3
 for i in $(seq 1 10); do
-  ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" \
+  ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
       bash "$WORK/harness.sh" "racer$i" reserve >/dev/null 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait

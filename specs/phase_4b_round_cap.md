@@ -14,7 +14,7 @@ Every transition creates a commit whose sole parent is the observed tip and then
 
 ## Counting
 
-`p4b_completed_rounds_from_reviews` first requires every record to be a review object with a numeric id and a string state, so malformed history fails closed instead of reading as empty history. It then counts completed rounds from the PR's reviews: a non-author review whose body opens with `**Automated Phase 4b review**`, carries the `_Posted by scripts/phase-4b-review.sh` footer, and has a verdict state (`APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`). The login is not checked against the current `available_reviewers`, so rotating or removing a reviewer never erases its history. A forged review can only inflate the count, which stops rounds early (a liveness risk), never lets one past the cap. Each round reports the run id it carries.
+`p4b_completed_rounds_from_reviews` first requires every record to be a review object with a numeric id and a string state, so malformed history fails closed instead of reading as empty history. It then counts completed rounds from the PR's reviews: a non-author review whose body opens with `**Automated Phase 4b review**`, carries the `_Posted by scripts/phase-4b-review.sh` footer, and has a verdict state (`APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`). The login is not checked against the current `available_reviewers`, so rotating or removing a reviewer never erases its history. A forged review can only inflate the count, which stops rounds early (a liveness risk), never lets one past the cap. Each round reports the run id it carries: the `<!-- mergepath-p4b-run: <id> -->` marker that sits directly before the footer, where the orchestrator writes it (`p4b_run_marker`). A marker-shaped example quoted earlier in the review text, such as a finding about this ledger, is not the run id.
 
 `p4b_round_occupancy` combines the ledger and the rounds. A slot is occupied by every `reserved` entry, whether consumed or still in flight, and by every completed round that no reserved entry accounts for. That covers legacy reviews from before the ledger, reviews with no run id, and a review by a run whose entry reads `released`. Initializing from existing history therefore grants no fresh budget. A `released` entry frees its slot only while no review carries its run id. A reserved run occupies the larger of its entry count and the number of reviews carrying its id, so duplicate entries each keep a slot and one reservation never absorbs a surplus publication. Completed rounds and in-flight slots are reported separately (`completed`, `in_flight`, `legacy`).
 
@@ -23,12 +23,12 @@ The review read is taken twice and must agree. That is a consistency check again
 ## Lifecycle of a round
 
 1. **Reserve before dispatch.** After the provider barrier and the pre-dispatch ceiling check, the run reads the ledger and the rounds. If occupancy has reached the cap, it stops before any adapter run:
-   - with exit `8` (`human_tiebreaker_required`, `round_cap.state: "spent"`) when nothing is in flight;
+   - with exit `8` (`human_tiebreaker_required`, top-level `round_cap.state: "spent"`) when nothing is in flight;
    - with exit `6` (`round_cap.state: "held"`, `retry_after`) when a reserved round is still in flight.
 
    Otherwise it appends `{run: <invocation id>, head, state: "reserved"}`. The invocation id is the run's `P4B_ACCT_RUN_ID`, and the run refuses with exit `10` if that id is already in the ledger.
 2. **Binding check before the POST.** At the writer boundary, the run's entry must still be present exactly once and still `reserved`. A missing, duplicated or edited entry, or an unreadable ledger, stops with exit `10`, and nothing is published. Like every other pre-POST refusal, that stop first undoes the pre-POST side effects: the provisional loop accounting and any approval follow-up issues.
-3. **Publish.** The posted review carries `<!-- mergepath-p4b-run: <invocation id> -->`. From the moment the POST is attempted, the slot stays occupied whatever the outcome.
+3. **Publish.** The posted review carries `<!-- mergepath-p4b-run: <invocation id> -->` on its own line directly before the footer. From the moment the POST is attempted, the slot stays occupied whatever the outcome.
 4. **Reconcile an uncertain POST.** If the POST call fails, `p4b_reconcile_posted_review` adopts a landed review only when exactly one review by the actual reviewer, on the exact head, carries this run's id. If none or several match, nothing is adopted and nothing is reposted, and the slot stays occupied.
 
 ## Release
@@ -64,9 +64,11 @@ The protocol: the extracted production block runs against a stateful fake GitHub
 - duplicate invocation ids;
 - unreadable or malformed evidence, including malformed review records;
 - a surplus review carrying a reserved run id;
+- a marker-shaped example quoted in a review body;
+- the production exit-`8` helper's output shape;
 - a release that cannot read the ledger;
 - a fake that refuses an empty tree, as GitHub does;
 - the absent cap;
 - head changes.
 
-Mutation checks confirm that each of these fails the suite: forcing the update, releasing after a POST attempt, skipping the binding check, treating a conflict as success, dropping the parent, posting an empty tree, letting one reservation absorb surplus reviews, skipping the pre-POST cleanup, an exiting release and skipping review-record validation.
+Mutation checks confirm that each of these fails the suite: forcing the update, releasing after a POST attempt, skipping the binding check, treating a conflict as success, dropping the parent, posting an empty tree, letting one reservation absorb surplus reviews, skipping the pre-POST cleanup, an exiting release, skipping review-record validation, parsing an unanchored marker and nesting the spent `round_cap` under `barrier` only.

@@ -816,7 +816,10 @@ stop_for_human_tiebreaker() {
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      human_tiebreaker_required:true,barrier:$b,reason:$b.reason,
-     automation_enabled:true,enabled_via:$enabled_via}'
+     automation_enabled:true,enabled_via:$enabled_via}
+    # #2663: a spent round cap reports round_cap at the top level, as every
+    # other round-cap stop does.
+    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end)'
   exit 8
 }
 
