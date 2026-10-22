@@ -14,11 +14,11 @@
 #      both run under the SAME verified author credential, the create
 #      via bootstrap::run_author_gh and the push via
 #      bootstrap::run_author_git.
-#   2. Seed the 15 active canonical labels (needs-external-review,
+#   2. Seed the 16 active canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
-#      needs-local-agent, human-action, agent-action, size:S/M/L,
-#      priority:critical/high/normal/low, status:blocked). The deprecated
-#      phase-0..4 and decision-needed stay canonical but are not seeded;
+#      needs-local-agent, human-action, decision-needed, agent-action,
+#      size:S/M/L, priority:critical/high/normal/low, status:blocked). The
+#      deprecated phase-0..4 stay canonical but are not seeded;
 #      scripts/sync-labels.sh keeps the fleet in step.
 #      Eliminates the first-PR "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
@@ -100,7 +100,7 @@ BOOTSTRAP_LABELS=(
   "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
   "needs-local-agent|fbca04|A cloud/limited session parked this step; a session with the named capability resumes it"
   "human-action|0e8a16|Requires human attention"
-  "decision-needed|e99695|Deprecated: use status:blocked + type:decision. Kept for history; never newly created."
+  "decision-needed|e99695|Needs a human decision before work proceeds (issue triage, not a PR merge gate)"
   "agent-action|1d76db|Agent task — not blocked on human"
   "phase-0|c5def5|Phase 0: foundations"
   "phase-1|bfd4f2|Phase 1: core"
@@ -121,12 +121,14 @@ BOOTSTRAP_LABELS=(
 # their colour and description in step wherever a repository already has
 # them, so their history stays legible) but never created. A new repository
 # is not seeded with them, and the fleet sync does not add them to one that
-# lacks them: their replacements (area:phase-4b, status:blocked,
-# type:decision) are hub taxonomy, so their descriptions would point at
-# labels most consumers do not have. Owner decision, 2026-10-21.
+# lacks them: their replacement (area:phase-4b) is hub taxonomy, so their
+# descriptions would point at a label most consumers do not have. Owner
+# decision, 2026-10-21. decision-needed stays active (owner decision,
+# 2026-10-22): every repository carries it, and it is the one label that
+# marks an issue as waiting on a human decision.
 # Descriptions stay within GitHub's 100-character limit: a longer one is
 # rejected with HTTP 422, so scripts/sync-labels.sh refuses the list.
-BOOTSTRAP_DEPRECATED_LABELS=(phase-0 phase-1 phase-2 phase-3 phase-4 decision-needed)
+BOOTSTRAP_DEPRECATED_LABELS=(phase-0 phase-1 phase-2 phase-3 phase-4)
 
 # bootstrap::label_is_deprecated <name> -> 0 when <name> is deprecated.
 bootstrap::label_is_deprecated() {
