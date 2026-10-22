@@ -1618,14 +1618,14 @@ class InventoryAndLauncherTests(unittest.TestCase):
             env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls), "GH_TOKEN": "fixture-ambient", "GITHUB_TOKEN": "fixture-ambient"}
             result = subprocess.run(["bash", "-x", str(launcher), "--port", "0"], env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
+            self.assertEqual(calls.read_text().strip(), "--agent cursor --check --print-exports")
             self.assertNotIn(TOKEN, result.stdout + result.stderr)
             self.assertNotIn("fixture-author-credential", result.stdout + result.stderr)
             # Stock macOS /bin/bash is 3.2 and treats empty arrays under nounset differently.
             result = subprocess.run(["/bin/bash", str(launcher), "--port", "0"], env=env,
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
+            self.assertEqual(calls.read_text().strip(), "--agent cursor --check --print-exports")
             env["COCKPIT_TEST_CACHE_FAIL"] = "1"
             result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 1)
@@ -1782,7 +1782,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
             calls, cache = root / "calls", root / "cache"
             env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls), "OP_PREFLIGHT_CACHE_DIR": str(cache),
                    "OP_PREFLIGHT_AGENT": "cursor"}
-            for agent, arguments in [("codex", []), ("codex", ["--agent", "codex"]),
+            for agent, arguments in [("cursor", []), ("codex", ["--agent", "codex"]),
                                      ("claude", ["--agent", "claude"]), ("cursor", ["--agent", "cursor"])]:
                 with self.subTest(agent=agent, arguments=arguments):
                     result = subprocess.run(["bash", str(launcher), *arguments], env=env,

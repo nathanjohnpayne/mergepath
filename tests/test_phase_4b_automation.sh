@@ -303,6 +303,24 @@ if [ "${1:-}" = --heartbeat-only ]; then
   exec bash "$ROOT/tests/test_phase_4b_heartbeat.sh"
 fi
 
+# The full automation suite captures the real Node executable for parser
+# controls below. Fail here, before the default focused test or optional jq
+# skip can hide a missing host prerequisite. The focused modes above remain
+# usable without Node where their own work does not need it.
+NODE_BIN="$(type -P node 2>/dev/null)" || NODE_BIN=''
+if [ -z "$NODE_BIN" ]; then
+  echo 'ERROR: node is required for the Phase 4b automation test suite' >&2
+  exit 1
+fi
+case "$NODE_BIN" in
+  /*) ;;
+  *) NODE_BIN="$PWD/$NODE_BIN" ;;
+esac
+if ! "$NODE_BIN" --version >/dev/null 2>&1; then
+  echo 'ERROR: node is required for the Phase 4b automation test suite' >&2
+  exit 1
+fi
+
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
@@ -3104,7 +3122,7 @@ P4B1143_NODE_DIR="$WORK/p4b1143-node-bin"
 P4B1143_AUTHOR_PARSE_COUNT="$WORK/p4b1143-author-parse-count"
 P4B1143_PARSER_PATH="$ROOT/scripts/lib/pr-body-contract.mjs"
 mkdir -p "$P4B1143_NODE_DIR"
-P4B1143_REAL_NODE="$(command -v node)"
+P4B1143_REAL_NODE="$NODE_BIN"
 cat > "$P4B1143_NODE_DIR/node" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = -e ] && [ "${3:-}" = "$P4B1143_PARSER_PATH" ] && [ "${4:-}" = --author ]; then
