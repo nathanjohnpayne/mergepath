@@ -3456,8 +3456,8 @@ resume_pending_codex_request() {
     || die 3 "cannot read the Codex Review Summary for the resume check"
   observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') \
     || die 3 "cannot read the Codex Review Summary for the resume check"
-  # #2664: a pending request whose run has since failed, been cancelled, or
-  # completed with no result is resumed too, outside the wrapper's authorization pass, so a restarted
+  # #2664: a pending request whose run has since failed or been cancelled, or
+  # an automatic retry whose run completed with no result, is resumed too, outside the wrapper's authorization pass, so a restarted
   # session never posts a fresh request past the bounded retry rules: a
   # request that is itself a retry is reported, never replaced, and one this
   # session did not watch waits out its own deadline.
@@ -3465,7 +3465,15 @@ resume_pending_codex_request() {
   if [ "$AUTHORIZE_TRIGGER_WRITE" != true ]; then
     terminal_state=$(crqe_select_codex_run_state "$comments" "$BOT_LOGIN" "$HEAD_SHA" "$created" | jq -r '.state') \
       || die 3 "cannot read the Codex run state for the resume check"
-    case "$terminal_state" in failed|canceled|completed) resumed_terminal=true ;; esac
+    case "$terminal_state" in
+      failed|canceled) resumed_terminal=true ;;
+      # A completed original keeps the #1550 contract (a new request); only a
+      # completed automatic retry is resumed, so it is reported, not chained.
+      completed)
+        if [ "$(crqe_request_is_retry "$comments" "$AUTHOR_IDENTITY" "$(printf '%s' "$pending" | jq -r .id)")" != false ]; then
+          resumed_terminal=true
+        fi ;;
+    esac
   fi
   if [ "$resumed_terminal" != true ] && { [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; }; then
     log "pending request $(printf '%s' "$pending" | jq -r .id) has no Codex Running summary on HEAD since it was posted (status '${status:-none}') — not resuming"
