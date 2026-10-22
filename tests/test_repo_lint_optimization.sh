@@ -32,6 +32,15 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
+# Derive this test-only inventory from raw wrapper text. A shell comment
+# stripper can erase a later source command when a quoted `#` occurs first on
+# the same physical line; raw inspection is conservative and cannot miss it.
+mode_helper_source_inventory_entry() {
+  local wrapper="$1"
+  grep -q 'ci-check-modes\.sh' "$wrapper" || return 1
+  basename "$wrapper"
+}
+
 # True when $1 matches one of the newline-separated case globs in $2, the
 # way the classifier matches graph entries.
 matches_any_glob() {
@@ -418,13 +427,22 @@ else
   # the test-reference completeness check above (#2227): a wrapper that
   # names the helper only in prose counts as sourcing it, which can only
   # demand a graph entry, never hide one.
+  quoted_hash_wrapper="$SCOPE_FIXTURES/quoted-hash-before-source.sh"
+  printf '%s\n' "message='# is quoted data' && . \"\$ROOT/scripts/lib/ci-check-modes.sh\"" >"$quoted_hash_wrapper"
+  quoted_hash_source=$(mode_helper_source_inventory_entry "$quoted_hash_wrapper" || true)
+  if [ "$quoted_hash_source" = "quoted-hash-before-source.sh" ]; then
+    pass "a quoted hash before a source command remains in the sourcing-wrapper inventory"
+  else
+    fail "quoted-hash-before-source.sh disappeared from the sourcing-wrapper inventory"
+  fi
+
   sourcing=$(for f in "$ROOT"/scripts/ci/check_*; do
       # No pipeline, so a quiet grep cannot SIGPIPE a reader under this
       # suite's `set -o pipefail` (the earlier `sed | grep -q` form silently
       # dropped check_doc_ownership and check_merge_clearance_gate). `|| true`
       # because a non-matching wrapper is the common case and its exit 1
       # would abort the suite under `set -e`.
-      grep -q 'ci-check-modes\.sh' "$f" && basename "$f" || true
+      mode_helper_source_inventory_entry "$f" || true
     done | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
   # A SUBSET check, matching the assertion's own words: every sourcing wrapper
   # must be selected. Equality would be wrong — the graph also declares this

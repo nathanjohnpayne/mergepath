@@ -2029,7 +2029,8 @@ run_feedback_accounting_gate() {
 # #2657: five-request checkpoint. Once a PR already counts
 # CODEX_REQUEST_CHECKPOINT_AFTER counted requests (the same crqe_count_triggers
 # count the ceiling uses; failover triggers excluded), record ONE author-owned
-# marker comment before the next new request, so a restarted session sees it.
+# marker comment once the next new request has posted, so a restarted session
+# sees it.
 # It asks the agent to reassess scope and recurring findings, batch the
 # remaining fixes and strengthen tests before continuing. It is informational:
 # it never blocks, never spends or refunds a request, and a failed write only
@@ -2038,23 +2039,36 @@ CODEX_REQUEST_CHECKPOINT_AFTER=5
 CODEX_REQUEST_CHECKPOINT_MARKER='<!-- mergepath-codex-request-checkpoint:v1'
 REQUEST_CHECKPOINT_JSON=null
 record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
-  local comments="$1" counted="$2" ceiling="$3" existing body_file
+  local comments="$1" counted="$2" ceiling="$3" existing body body_file
   [ "$counted" -ge "$CODEX_REQUEST_CHECKPOINT_AFTER" ] || return 0
-  existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" --arg marker "$CODEX_REQUEST_CHECKPOINT_MARKER" \
+  # Only a generated marker line opening the comment counts, never a quote
+  # of the marker text in an ordinary comment.
+  existing=$(printf '%s' "$comments" | jq -r --arg who "$AUTHOR_IDENTITY" \
     '[.[] | select((.user.login // "" | ascii_downcase) == ($who | ascii_downcase))
-          | select((.body // "") | contains($marker)) | .id] | first // empty' 2>/dev/null) || existing=""
+          | select((.body // "") | test("\\A<!-- mergepath-codex-request-checkpoint:v1 counted=[0-9]+ head=[0-9a-f]{40,64} -->(\\n|\\z)")) | .id] | first // empty' 2>/dev/null) || existing=""
   if [ -n "$existing" ]; then
     REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" --arg id "$existing" \
       '{after:5,counted_requests:$n,recorded:"existing",comment_id:($id|tonumber? // null)}')
     return 0
   fi
-  body_file=$(mktemp "${TMPDIR:-/tmp}/codex-request-checkpoint.XXXXXX") || { log "WARN: request checkpoint body could not be staged; continuing"; return 0; }
-  {
+  # Every staging failure is nonblocking too: under `set -e` an unguarded
+  # write error would end the request before it posts.
+  # The comment is posted to whichever repository runs this propagated
+  # script, so the hub issue is fully qualified. The body is one simple
+  # command's write: a redirect failure on a `{ }` group is not reliably seen.
+  body=$(
     printf '%s counted=%s head=%s -->\n' "$CODEX_REQUEST_CHECKPOINT_MARKER" "$counted" "$HEAD_SHA"
-    printf '**Codex request checkpoint (#2657).** This PR already counts %s Codex requests (request ceiling %s, blocking-review budget %s).\n\n' \
+    printf '**Codex request checkpoint (nathanjohnpayne/mergepath#2657).** This PR already counts %s Codex requests (request ceiling %s, blocking-review budget %s).\n\n' \
       "$counted" "$ceiling" "${GOVERNING_BLOCKING_REVIEW_BUDGET:-default}"
-    printf 'Before the next round: reassess the scope and any recurring findings, batch the remaining fixes into one push, and strengthen the tests or shared fixtures that let those findings through. This note is informational. It blocks nothing and changes no budget.\n'
-  } >"$body_file"
+    printf 'Before the next round: reassess the scope and any recurring findings, batch the remaining fixes into one push, and strengthen the tests or shared fixtures that let those findings through. This note is informational. It blocks nothing and changes no budget.'
+  )
+  body_file=$(mktemp "${TMPDIR:-/tmp}/codex-request-checkpoint.XXXXXX") || body_file=""
+  if [ -z "$body_file" ] || ! printf '%s\n' "$body" 2>/dev/null >"$body_file"; then
+    log "WARN: request checkpoint (#2657) body could not be staged; continuing (the checkpoint is informational)"
+    REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"failed",comment_id:null}')
+    [ -z "$body_file" ] || rm -rf "$body_file" 2>/dev/null || :
+    return 0
+  fi
   # A subshell contains post_author_pr_comment's `die`: the checkpoint must
   # never abort the request it precedes.
   if ( post_author_pr_comment "$(cat "$body_file")" "Codex request checkpoint" body-file ) >/dev/null 2>&1; then
@@ -2064,7 +2078,7 @@ record_request_checkpoint() { # <request-comments-json> <counted> <ceiling>
     log "WARN: request checkpoint (#2657) comment could not be posted; continuing (the checkpoint is informational)"
     REQUEST_CHECKPOINT_JSON=$(jq -nc --argjson n "$counted" '{after:5,counted_requests:$n,recorded:"failed",comment_id:null}')
   fi
-  rm -f "$body_file"
+  rm -f "$body_file" 2>/dev/null || :
   return 0
 }
 
@@ -2721,9 +2735,14 @@ post_codex_trigger() {
   # confirmed without spending another (#2631).
   local caller_mode="$REQUEST_MODE"
   [ "$TRIGGER_POSTED" != true ] || caller_mode=""
-  if [ "$TRIGGER_POSTED" != true ]; then
-    record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
-  fi
+  # The checkpoint belongs to a new deliberate request, and is recorded only
+  # once that request has actually posted: a requester that loses the
+  # trigger write records nothing, so concurrent requesters at the threshold
+  # cannot each add one (#1362 serializes the write itself). A CodeRabbit
+  # failover stands in for a lost review, not a deliberate round, so it
+  # never records (and so never uses up) the checkpoint.
+  local record_checkpoint=false
+  if [ "$TRIGGER_POSTED" != true ] && [ "$FAILOVER" != true ]; then record_checkpoint=true; fi
   # #1362: the wrapper's claimed recount refuses this write if the request
   # generation it was decided against has changed since this read.
   local observed_generation
@@ -2736,6 +2755,9 @@ post_codex_trigger() {
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
+  if [ "$record_checkpoint" = true ]; then
+    record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
+  fi
 
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,

@@ -273,6 +273,10 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([item.path for item in discovered], [self.a, self.b])
         self.assertNotIn("GH_TOKEN", calls[0][1]["env"])
         self.assertLessEqual(calls[0][1]["timeout"], 5)
+        # The 64-root cap belongs to the resolver, which omits the excess; discovery returns every worktree.
+        many = "".join(f"worktree {self.a / f'tree-{i}'}\nHEAD abc\n\n" for i in range(123))
+        discovered = discover_checkouts(self.a, REPO, run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, many, ""))
+        self.assertEqual(len(discovered), 123)
 
     def test_orphan_ledger_target_unavailable_and_consumer_log_establishes_target(self):
         row = loop()
@@ -464,13 +468,39 @@ class SettingsTests(unittest.TestCase):
                 resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer)]}}, INVENTORY, self.hub)
 
     def test_global_checkout_cap_includes_all_discovered_roots(self):
-        found = tuple(Checkout(REPO, self.root / f"tree-{i}") for i in range(64))
-        with patch("mergepath.cockpit.agents.discover_checkouts", return_value=found), self.assertRaises(ValueError):
-            resolve_history_settings({}, INVENTORY, self.hub)
-        found = (Checkout(REPO, self.hub), *found[:63])
+        found = (Checkout(REPO, self.hub), *(Checkout(REPO, self.root / f"tree-{i}") for i in range(63)))
+        reports = []
         with patch("mergepath.cockpit.agents.discover_checkouts", return_value=found):
-            checkouts, _ = resolve_history_settings({}, INVENTORY, self.hub)
+            checkouts, _ = resolve_history_settings({}, INVENTORY, self.hub, report=lambda *args: reports.append(args))
         self.assertEqual(len(checkouts), 64)
+        self.assertEqual(reports, [])
+
+    def test_worktrees_past_the_cap_are_omitted_oldest_first_and_reported(self):
+        trees = []
+        for i in range(70):
+            tree = self.root / f"tree-{i}"; tree.mkdir()
+            (tree / ".git").write_text("gitdir: fixture\n")
+            os.utime(tree / ".git", (1_000_000 + i, 1_000_000 + i))
+            trees.append(Checkout(REPO, tree))
+        reports = []
+        with patch("mergepath.cockpit.agents.discover_checkouts",
+                   side_effect=lambda path, repo, **kwargs: (Checkout(REPO, self.hub), *trees) if repo == REPO else ()):
+            checkouts, _ = resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer)]}}, INVENTORY,
+                                                    self.hub, report=lambda *args: reports.append(args))
+        self.assertEqual(len(checkouts), 64)
+        self.assertEqual(reports, [(64, 72)])
+        kept = {item.path for item in checkouts}
+        # Both configured roots survive; the 62 newest worktrees fill the rest.
+        self.assertTrue({self.hub.resolve(), self.consumer.resolve()} <= kept)
+        self.assertEqual(kept - {self.hub.resolve(), self.consumer.resolve()},
+                         {item.path.resolve() for item in trees[8:]})
+
+    def test_attribution_conflict_is_refused_even_past_the_cap(self):
+        trees = tuple(Checkout(REPO, self.root / f"tree-{i}") for i in range(64))
+        def discovery(path, repo, **kwargs):
+            return trees if repo == REPO else (Checkout(repo, trees[-1].path),)
+        with patch("mergepath.cockpit.agents.discover_checkouts", side_effect=discovery), self.assertRaises(ValueError):
+            resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer)]}}, INVENTORY, self.hub)
 
     def test_only_explicit_existing_matching_provider_model_tier_prices(self):
         keys = {"codex": "openai.gpt-5.5.standard_short_context", "claude": "anthropic.claude-sonnet-4.6.standard"}
