@@ -522,6 +522,44 @@ class TriggerGuardTests(unittest.TestCase):
         self.assertIn(b"existing-trigger", loser)
         self.assertEqual(2, len(list(arrived.iterdir())), "the second wrapper must recount after the first posted")
 
+    def assert_claim_free_while_orphan_lives(self, fixture, env, arrived, want_arrivals):
+        # The killed wrapper's child (held at the recount or the POST) is still
+        # alive; a new wrapper must still take the claim and reach the recount.
+        nxt = self.start_trigger(fixture, dict(env, MERGEPATH_CODEX_REQUEST_CLAIM_TIMEOUT_SECONDS="3"))
+        try:
+            reached = self.wait_for(lambda: len(list(arrived.iterdir())) >= want_arrivals, seconds=8)
+            if not reached:
+                nxt.wait(timeout=10)
+            self.assertTrue(reached, "a killed wrapper's orphaned child still holds the claim: " + (nxt.stderr.read().decode() if nxt.poll() is not None else "next wrapper still waiting"))
+        finally:
+            self.stop(nxt)
+
+    def check_claim_released_at_post(self, transport, stage="POST"):
+        fixture, env = self.claim_fixture()
+        env["MERGEPATH_GH_TRANSPORT"] = transport
+        arrived = fixture / "arrived"
+        (fixture / "release").touch()
+        post_gate = fixture / "post-gate"
+        held = self.start_trigger(fixture, dict(env, **{f"{stage}_GATE": str(post_gate)}))
+        try:
+            self.assertTrue(self.wait_for(lambda: Path(str(post_gate) + ".reached").exists()), f"the wrapper never reached its {stage}")
+            held.kill()
+            held.wait(timeout=10)
+            self.assert_claim_free_while_orphan_lives(fixture, env, arrived, 2)
+        finally:
+            self.stop(held)
+
+    def test_claim_released_when_a_wrapper_dies_at_its_post(self):
+        self.check_claim_released_at_post("gh")
+
+    def test_claim_released_when_a_wrapper_dies_at_its_readback(self):
+        self.check_claim_released_at_post("gh", stage="READBACK")
+
+    def test_claim_released_when_a_wrapper_dies_at_its_rest_post(self):
+        # The REST transport's write runs in subshells, which would inherit
+        # bash's saved copy of fd 9 under a bare `9>&-` redirection.
+        self.check_claim_released_at_post("rest")
+
     def test_claim_ends_with_its_wrapper_and_is_per_pr(self):
         fixture, env = self.claim_fixture()
         arrived = fixture / "arrived"
@@ -535,9 +573,11 @@ class TriggerGuardTests(unittest.TestCase):
             self.assertEqual(0, other.returncode, other.stderr)
             # A wrapper killed while holding the claim leaves no claim behind,
             # even while its recount child lives on, so it cannot suppress a
-            # trigger it never sent.
+            # trigger it never sent. Reacquire before that child ends
+            # (PR 124's request already arrived at its own recount).
             held.kill()
             held.wait(timeout=10)
+            self.assert_claim_free_while_orphan_lives(fixture, env, arrived, 3)
         finally:
             self.stop(held)
         self.assertEqual(["pr comment 124 --repo o/r --body @codex review"], self.writes(fixture))

@@ -126,15 +126,19 @@ gh_comment_guard_run_write() { # <command...>
     return $?
   fi
   out="$GH_COMMENT_GUARD_STATE/claimed-write.out"
-  "$@" 9>&- >"$out" || rc=$?
+  # Only this shell may hold the claim. Each child step runs in a subshell
+  # that closes fd 9 first: a `cmd 9>&-` redirection alone leaves the fd in a
+  # command substitution, and bash's saved copy of it in subshells a function
+  # forks, so a killed wrapper's orphan could keep the claim (#1362).
+  ( exec 9>&-; trap 'gh_rest_cleanup 2>/dev/null || :' EXIT; "$@" ) >"$out" || rc=$?
   cat "$out"
   [ "$rc" -eq 0 ] || return "$rc"
   repo="${GH_COMMENT_GUARD_CLAIM%#*}" pr="${GH_COMMENT_GUARD_CLAIM##*#}"
   id=$(grep -oE 'issuecomment-[0-9]+' "$out" | tail -1 | sed 's/issuecomment-//') || id=""
   if [ -n "$id" ]; then
-    comment=$(unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
+    comment=$(exec 9>&-; unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
       GH_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" GITHUB_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" \
-      gh api "repos/$repo/issues/comments/$id" 9>&- 2>/dev/null) || comment=""
+      gh api "repos/$repo/issues/comments/$id" 2>/dev/null) || comment=""
   fi
   if [ -z "$id" ] || ! printf '%s' "$comment" | jq -e --arg author "$AUTHOR" --arg pr "$pr" --arg id "$id" \
        '(.id | tostring) == $id and ((.user.login // "") | ascii_downcase) == ($author | ascii_downcase)
@@ -153,9 +157,11 @@ gh_comment_guard_authorize() {
   if [ "$trigger" = false ]; then return 0; fi
   repo=$(jq -er .repo "$metadata") && pr=$(jq -er .pr "$metadata") && head=$(jq -er .head "$metadata") || return 1
   gh_comment_guard_claim "$repo" "$pr" || return 1
-  result=$(MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$head" \
+  # The substitution's own shell closes fd 9 before the recount runs, so a
+  # killed wrapper cannot leave the claim held by an orphaned recount.
+  result=$(exec 9>&-; MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$head" \
     GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-$TOKEN}" \
-    "$ROOT/scripts/codex-review-request.sh" --authorize-trigger-write --allow-moving-head "$pr" "$repo" 9>&-) || return 1
+    "$ROOT/scripts/codex-review-request.sh" --authorize-trigger-write --allow-moving-head "$pr" "$repo") || return 1
   printf '%s' "$result" | jq -e --arg repo "$repo" --argjson pr "$pr" --arg head "$head" --arg author "$AUTHOR" \
     '.authorized == true and .repo == $repo and .pr_number == $pr and .head_sha == $head and .author_identity == $author' >/dev/null
 }
