@@ -308,6 +308,8 @@ case "$endpoint" in
       printf '[{"id":79,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:05:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the retry"}]\n' "$bot"
     elif [ "$scenario" = "retry-completes" ] && [ "$(cat "$state_dir/trigger-count" 2>/dev/null || echo 0)" -ge 2 ]; then
       printf '[{"id":80,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:05:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the retry"}]\n' "$bot"
+    elif [ "$scenario" = "retry-window-late" ] && [ "$(cat "$state_dir/trigger-count" 2>/dev/null || echo 0)" -ge 2 ]; then
+      printf '[{"id":81,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:05:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the retry"}]\n' "$bot"
     elif [ "$scenario" = "review_after_retry" ]; then
       count=0
       if [ -f "$state_dir/trigger-count" ]; then
@@ -392,6 +394,16 @@ case "$endpoint" in
       if [ "$pt" -eq 3 ]; then
         body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | Manual request |\n')
         jq -cn --arg body "$body" '{id:3004,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:00:30Z",updated_at:"2026-06-04T00:00:30Z"}' >>"$state_dir/comments.jsonl"
+      fi
+    fi
+    # #2664: the provider adds a three-minute window to the failed run while
+    # the retry waits (the second comments read after the trigger).
+    if [ "$scenario" = "retry-window-late" ] && [ -f "$state_dir/trigger-count" ]; then
+      pt=0; [ ! -f "$state_dir/post-trigger-reads" ] || pt=$(cat "$state_dir/post-trigger-reads")
+      pt=$((pt + 1)); printf '%s\n' "$pt" >"$state_dir/post-trigger-reads"
+      if [ "$pt" -eq 2 ]; then
+        body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ❌ **Failed** | `aaaaaaa` | Manual request |\n\nPlease try again in 3 minutes.\n')
+        jq -cn --arg body "$body" '{id:3005,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:00:20Z",updated_at:"2026-06-04T00:00:20Z"}' >>"$state_dir/comments.jsonl"
       fi
     fi
     # #2664: the resumed request's run fails a minute after it was posted.
@@ -1830,8 +1842,9 @@ test_retry_after_confirmed_failure() {
     jq -e --arg reason "$label" '.retry.state == "posted" and .retry.reason == $reason and .retry.backoff_seconds == 60
         and .retry.original_comment_id == 1001 and .retry.retry_comment_id == 1003' "$dir/out.json" >/dev/null \
       || fail "#2664 $label: retry JSON $(jq -c .retry "$dir/out.json" 2>/dev/null)"
-    [ "$(retry_markers "$dir")" = "<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=1001 -->" ] \
-      || fail "#2664 $label: expected one marker for request 1001 before the retry; got $(retry_markers "$dir")"
+    [ "$(retry_markers "$dir")" = "<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=1001 -->
+<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=1001 retry=1003 -->" ] \
+      || fail "#2664 $label: expected the intent marker for 1001, then its binding to retry 1003; got $(retry_markers "$dir")"
     # Seen failed by the scan right after the post (completed: two polls
     # later), then 60 s of backoff.
     [ "$(trigger_gap "$dir")" -ge 60 ] && [ "$(trigger_gap "$dir")" -le 105 ] \
@@ -1870,6 +1883,61 @@ test_retry_honors_longer_provider_window() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a provider retry window longer than 60 s sets the backoff"
 }
 
+# The provider states a longer window while the retry is already scheduled.
+test_retry_window_lengthened_while_scheduled() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-window-late" 0 0 600)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" retry-window-late)
+  [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 late window: exit $rc, $(trigger_count "$dir") triggers"
+  jq -e '.retry.backoff_seconds == 180' "$dir/out.json" >/dev/null || fail "#2664 late window: $(jq -c .retry "$dir/out.json")"
+  [ "$(trigger_gap "$dir")" -ge 180 ] && [ "$(trigger_gap "$dir")" -le 195 ] \
+    || fail "#2664 late window: retry posted $(trigger_gap "$dir")s after the original, expected 180-195"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a provider window stated during the backoff moves the scheduled retry out"
+}
+
+# A resumed request that is itself a retry and then fails is reported, never
+# replaced by the resumed-expiry fresh request (which would retry the retry).
+test_resumed_retry_is_not_replaced() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-resumed-retry" 0 0 400)
+  seed_author_trigger "$dir" 880 "2026-06-03T23:50:00Z"
+  jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 retry=900 -->\nBound.",created_at:"2026-06-04T00:00:01Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_retry_case "$dir" retry-concurrent)
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#2664 resumed retry: $(trigger_count "$dir") requests posted, expected none"
+  grep -q 'not posted: retry-of-retry' "$dir/err.log" || fail "#2664 resumed retry: $(tail -5 "$dir/err.log")"
+  ! grep -q 're-running as a fresh request' "$dir/err.log" || fail "#2664 resumed retry: the fresh-request replacement ran"
+  [ "$rc" = 4 ] && jq -e '.retry.state == "refused" and .retry.reason == "retry-of-retry"' "$dir/out.json" >/dev/null \
+    || fail "#2664 resumed retry: exit $rc, $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a resumed retry that fails is reported, not replaced by a fresh request"
+}
+
+# The binding names the retry that actually posted, so a losing handler's
+# intent marker cannot mark a later ordinary request as a retry.
+test_retry_marker_binding() {
+  local before=$FAIL h=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa comments got
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/lib/codex-request-evidence.sh"
+  comments=$(jq -nc --arg h "$h" '[
+    {id:10,user:{login:"a"},created_at:"2026-01-01T00:00:00Z",body:"@codex review"},
+    {id:11,user:{login:"a"},created_at:"2026-01-01T00:05:00Z",body:("<!-- mergepath-codex-retry:v1 head=" + $h + " original=10 -->\nintent")},
+    {id:12,user:{login:"a"},created_at:"2026-01-01T00:05:01Z",body:"@codex review"},
+    {id:13,user:{login:"a"},created_at:"2026-01-01T00:05:02Z",body:("<!-- mergepath-codex-retry:v1 head=" + $h + " original=10 -->\nloser")},
+    {id:14,user:{login:"a"},created_at:"2026-01-01T00:05:03Z",body:("<!-- mergepath-codex-retry:v1 head=" + $h + " original=10 retry=12 -->\nbound")},
+    {id:15,user:{login:"a"},created_at:"2026-01-01T00:06:00Z",body:"@codex review"}]')
+  got="$(crqe_request_is_retry "$comments" a 10) $(crqe_request_is_retry "$comments" a 12) $(crqe_request_is_retry "$comments" a 15)"
+  [ "$got" = "false true false" ] || fail "#2664 binding: original/retry/next-round classified '$got', expected 'false true false'"
+  # The handler stopped before binding: the intent still marks its retry.
+  comments=$(printf '%s' "$comments" | jq -c '[.[] | select(.id != 13 and .id != 14)]')
+  got="$(crqe_request_is_retry "$comments" a 12) $(crqe_request_is_retry "$comments" a 15)"
+  [ "$got" = "true false" ] || fail "#2664 binding: an unbound intent classified '$got', expected 'true false'"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a retry is bound to the request that posted; a loser's intent marks nothing"
+}
+
 test_retry_refused_by_late_result_or_moved_head() {
   local scenario dir rc want before
   for scenario in retry-late-at-fence retry-head-changed; do
@@ -1896,7 +1964,7 @@ test_retry_never_chains() {
   rc=$(run_retry_case "$dir" absent)
   [ "$rc" = 4 ] || fail "#2664 chain: exit $rc, expected the retry's own timeout"
   [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 chain: $(trigger_count "$dir") triggers, expected exactly one retry"
-  [ "$(retry_markers "$dir" | wc -l | tr -d ' ')" = 1 ] || fail "#2664 chain: $(retry_markers "$dir" | wc -l) markers"
+  [ "$(retry_markers "$dir" | wc -l | tr -d ' ')" = 2 ] || fail "#2664 chain: $(retry_markers "$dir" | wc -l) markers, expected one intent and one binding"
   jq -e '.retry.state == "posted"' "$dir/out.json" >/dev/null || fail "#2664 chain: $(jq -c .retry "$dir/out.json")"
   [ "$FAIL" -ne "$before" ] || pass "#2664: a failed retry is never retried"
 }
@@ -1999,12 +2067,18 @@ test_concurrent_handlers_post_one_retry() {
   # latest-request check, the claimed generation fence, or the result.
   jq -s -e '[.[] | select(.retry.state == "refused") | .retry.reason] | length == 1 and (.[0] | IN("superseded", "concurrent-request", "existing-trigger", "already-cleared"))' \
     "$dir/out.a.json" "$dir/out.b.json" >/dev/null || fail "#2664 concurrent: the other handler must stand down; $(jq -c .retry "$dir/out.a.json" "$dir/out.b.json" 2>/dev/null)"
+  [ "$(retry_markers "$dir" | grep -c 'retry=')" = 1 ] \
+    && retry_markers "$dir" | grep -q "original=900 retry=$(jq -r 'select(.body == "@codex review" and .id > 1000) | .id' "$dir/state/comments.jsonl" | head -1) -->" \
+    || fail "#2664 concurrent: expected one binding naming the posted retry; $(retry_markers "$dir")"
   [ "$FAIL" -ne "$before" ] || pass "#2664: two concurrent handlers post exactly one retry for the same request"
 }
 
 test_retry_after_confirmed_failure
 test_retry_withheld_for_unproven_completion
 test_retry_honors_longer_provider_window
+test_retry_window_lengthened_while_scheduled
+test_resumed_retry_is_not_replaced
+test_retry_marker_binding
 test_retry_refused_by_late_result_or_moved_head
 test_retry_never_chains
 test_retry_withheld_from_a_retry_request

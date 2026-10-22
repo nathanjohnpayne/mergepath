@@ -3015,18 +3015,29 @@ codex_retry_tick() {
   now=$(date +%s)
   if [ "$RETRY_STATE" = none ]; then
     if [ "$AUTOMATIC_RETRY_USED" = true ]; then retry_refuse retry-used; return 0; fi
-    retry_after=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.retry_after_seconds // 0' 2>/dev/null) || retry_after=0
-    [[ "$retry_after" =~ ^[0-9]+$ ]] || retry_after=0
+    RETRY_SEEN_AT=$now
     RETRY_BACKOFF=$CODEX_RETRY_BACKOFF_SECONDS
-    [ "$retry_after" -le "$RETRY_BACKOFF" ] || RETRY_BACKOFF=$retry_after
     RETRY_DUE=$((now + RETRY_BACKOFF))
     RETRY_STATE=scheduled
     RETRY_REASON=$run_state
     log "Codex run for request $RETRY_ORIGINAL_ID is '$run_state' with no result — one automatic retry after ${RETRY_BACKOFF}s (#2664)"
   fi
+  # A provider window stated or lengthened while the retry waits moves it out.
+  retry_extend_backoff
   [ "$now" -ge "$RETRY_DUE" ] || return 0
   post_codex_retry
   return 10
+}
+
+retry_extend_backoff() {
+  local retry_after
+  retry_after=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.retry_after_seconds // 0' 2>/dev/null) || retry_after=0
+  [[ "$retry_after" =~ ^[0-9]+$ ]] || retry_after=0
+  if [ "$retry_after" -gt "$RETRY_BACKOFF" ]; then
+    RETRY_BACKOFF=$retry_after
+    RETRY_DUE=$((RETRY_SEEN_AT + RETRY_BACKOFF))
+    log "Codex states a retry window of ${retry_after}s — the automatic retry for request $RETRY_ORIGINAL_ID waits until then (#2664)"
+  fi
 }
 
 post_codex_retry() {
@@ -3050,6 +3061,8 @@ post_codex_retry() {
     superseded) retry_refuse superseded; return 0 ;;
     *) retry_refuse "run-$run_state"; return 0 ;;
   esac
+  retry_extend_backoff
+  if [ "$(date +%s)" -lt "$RETRY_DUE" ]; then return 0; fi
   # Persisted relationship: the request must still be the latest one, and
   # must not itself be a retry.
   comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "automatic retry evidence") \
@@ -3080,6 +3093,15 @@ post_codex_retry() {
     AUTOMATIC_RETRY_USED=true
     RETRY_STATE=posted
     RETRY_COMMENT_ID=$TRIGGER_COMMENT_ID
+    # Bind the marker to the request that actually posted, so a concurrent
+    # loser's intent marker can never mark a later request. A failed binding
+    # only warns: the intent marker still marks this retry.
+    if [ -n "$TRIGGER_COMMENT_ID" ]; then
+      body="$CODEX_RETRY_MARKER_PREFIX head=$HEAD_SHA original=$RETRY_ORIGINAL_ID retry=$TRIGGER_COMMENT_ID -->
+**Automatic Codex retry (nathanjohnpayne/mergepath#2664)** posted as request $TRIGGER_COMMENT_ID for request $RETRY_ORIGINAL_ID."
+      ( post_author_pr_comment "$body" "automatic Codex retry binding" body-file ) >/dev/null 2>&1 \
+        || log "WARN: the automatic Codex retry binding could not be recorded; the intent marker still marks request $TRIGGER_COMMENT_ID as a retry (#2664)"
+    fi
     # This run now owns the retry's own bounded wait, and only it may mint
     # that request's timeout determination.
     RESUMED_TRIGGER=false
@@ -3416,6 +3438,7 @@ RETRY_BACKOFF=0
 RETRY_COMMENT_ID=""
 RETRY_DIAGNOSTIC_JSON=null
 RETRY_SAW_RUNNING=false
+RETRY_SEEN_AT=0
 
 # The no-write decisions below belong to a request mode. A requester applies
 # its own. The wrapper's authorization pass runs as --trigger-only, so it
@@ -3598,8 +3621,11 @@ run_review_poll
 # Nothing has been written to stdout yet, so the fresh run's JSON is the only
 # result.
 RESUMED_BLOCK_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the resumed provider refusal"
+# #2664: a resumed request whose run was confirmed failed or inactive, and
+# whose automatic retry was then refused, is reported instead: a fresh
+# replacement would retry it after all (a retry of a retry, or past a budget).
 if [ "$RESUMED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN" \
-   && [ -z "$RESUMED_BLOCK_REASON" ]; then
+   && [ -z "$RESUMED_BLOCK_REASON" ] && [ "$RETRY_STATE" != refused ]; then
   log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — re-running as a fresh request with resume disabled (#1550)"
   export MERGEPATH_CODEX_RESUME_EXPIRED=1
   exec bash "$0" ${__CRR_ORIGINAL_ARGS[@]+"${__CRR_ORIGINAL_ARGS[@]}"}

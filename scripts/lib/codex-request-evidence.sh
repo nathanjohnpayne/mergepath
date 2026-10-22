@@ -495,20 +495,29 @@ crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request
   '
 }
 
-# #2664: whether request <id> is itself an automatic retry. The requester
-# records `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> -->` as an
-# author comment immediately before a retry, and the retry is the first
-# configured-author request after that marker, within 300 seconds by
-# GitHub's timestamps. A marker no request followed is not a retry. Any such
-# marker counts, whatever head it names, so the predicate can only withhold
-# a retry, never grant one. Prints true or false.
+# #2664: whether request <id> is itself an automatic retry. Before a retry
+# the requester records an intent marker
+# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> -->`, and once the
+# retry has posted it records the binding
+# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> retry=<id> -->`.
+# A request is a retry when a binding names it. Without a binding for its
+# original (the handler stopped between posting and binding), an intent
+# marker still marks the first configured-author request after it, within
+# 300 seconds by GitHub's timestamps. An intent whose original already has a
+# binding is a losing handler's leftover and marks nothing, so it can never
+# turn a later ordinary request into a "retry". Any head counts, so the
+# predicate can only withhold a retry, never grant one. Prints true or false.
 crqe_request_is_retry() { # issue-comments-json author request-id
   printf '%s\n' "${1:-[]}" | jq -r --arg author "$2" --argjson id "$3" '
     def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+    def marker: (.body // "") | capture("\\A<!-- mergepath-codex-retry:v1 head=[0-9a-f]{40} original=(?<original>[1-9][0-9]*)( retry=(?<retry>[1-9][0-9]*))? -->")?;
     [ .[] | select((.user.login // "") == $author) ] as $own
     | [ $own[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] | sort_by(.id) as $requests
-    | [ $own[] | select((.body // "") | test("\\A<!-- mergepath-codex-retry:v1 head=[0-9a-f]{40} original=[1-9][0-9]* -->")) ] as $markers
-    | any($markers[]; . as $m
+    | [ $own[] | (marker // empty) as $m | . + {original: ($m.original | tonumber), retry: ($m.retry // null | if . == null then null else tonumber end)} ] as $markers
+    | [ $markers[] | select(.retry != null) ] as $bound
+    | any($bound[]; .retry == $id)
+      or any($markers[] | select(.retry == null) | . as $m | select(any($bound[]; .original == $m.original) | not);
+        . as $m
         | ([ $requests[] | select(.id > $m.id) ] | first) as $next
         | $next != null and $next.id == $id and (($next.created_at | epoch) - ($m.created_at | epoch)) <= 300)
   '
