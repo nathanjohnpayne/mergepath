@@ -156,10 +156,10 @@ test('captured Git objects determine both rename sides and complete wave scope',
   const variants = [null, [], {}, { canonical_base_sha: base },
     { ...ordinary(), canonical_base_sha: 'x' },
     { ...ordinary(), base_on_first_parent: false }, { ...ordinary(), base_on_first_parent: 'true' },
-    { ...ordinary(), head_on_hub_default: false }, (({ head_on_hub_default, ...rest }) => rest)(ordinary()),
-    (({ base_on_first_parent, ...rest }) => rest)(ordinary()),
+    { ...ordinary(), head_on_hub_default: false }, (({ head_on_hub_default: _omitted, ...rest }) => rest)(ordinary()),
+    (({ base_on_first_parent: _omitted, ...rest }) => rest)(ordinary()),
     { ...ordinary(), historical_end_sha: head }, { ...ordinary(), finalize_historical: true },
-    (({ historical_end_sha, ...rest }) => rest)(ordinary())];
+    (({ historical_end_sha: _omitted, ...rest }) => rest)(ordinary())];
   for (const scope of variants) {
     metadata.wave_audit = scope; writeMetadata();
     assert.equal(capturedInput(directory).decision, 'human-review', JSON.stringify(scope));
