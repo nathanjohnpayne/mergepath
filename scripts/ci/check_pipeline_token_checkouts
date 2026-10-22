@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# check_pipeline_token_checkouts
+#
+# Fails when a job that holds one of the three pipeline tokens
+# (AUTHOR_MERGE_TOKEN, REVIEWER_ASSIGNMENT_TOKEN, CI_ACTOR_TOKEN) checks out a
+# candidate-controlled tree on a pull_request / pull_request_review /
+# pull_request_review_comment event (or an explicit candidate ref on
+# pull_request_target). #2775 found agent-review.yml's detect-disagreement job
+# require()ing the PR's own scripts/disagreement-detector.cjs, and a run-time
+# npm package, inside the process that held the CI-actor PAT.
+#
+# THIS FILE IS A LAUNCHER. The rule, the trusted-ref allow-list, the reviewed
+# data-only jobs, the "does NOT catch" list and the embedded self-test all live
+# in scripts/ci/pipeline_token_checkouts.py; read its header first.
+#
+# Usage:
+#   check_pipeline_token_checkouts              # self-test, then scan this repo
+#   check_pipeline_token_checkouts --self-test  # embedded cases only
+#   check_pipeline_token_checkouts --check [DIR]
+
+set -euo pipefail
+
+CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$CI_DIR/pipeline_token_checkouts.py"
+
+if [ ! -f "$GATE" ]; then
+  echo "check_pipeline_token_checkouts: ERROR (missing $GATE) — the launcher and its module travel together in the scripts/ci kit; a tree with one and not the other is a broken sync." >&2
+  exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "check_pipeline_token_checkouts: ERROR — python3 is required and was not found on PATH. A credential gate that silently does not run is the shape it exists to stop." >&2
+  exit 2
+fi
+
+exec python3 "$GATE" "$@"

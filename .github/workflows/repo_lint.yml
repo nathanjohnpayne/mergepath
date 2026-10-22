@@ -862,6 +862,15 @@ jobs:
         if: matrix.shard == 1
         run: ./scripts/ci/check_disagreement_detector || { rc=$?; if [ ! -f scripts/ci/check_disagreement_detector ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_disagreement_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_pipeline_token_checkouts
+        if: matrix.shard == 1
+        # #2775: a job holding AUTHOR_MERGE_TOKEN, REVIEWER_ASSIGNMENT_TOKEN or
+        # CI_ACTOR_TOKEN must not check out the candidate tree on a
+        # pull_request / pull_request_review(_comment) event. Embedded
+        # self-test, then a scan of .github/workflows/. PyYAML comes from the
+        # provisioned venv above; yq is the fallback.
+        run: ./scripts/ci/check_pipeline_token_checkouts || { rc=$?; if [ ! -f scripts/ci/check_pipeline_token_checkouts ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pipeline_token_checkouts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_self_approval_detector
         if: matrix.shard == 4
         run: ./scripts/ci/check_self_approval_detector || { rc=$?; if [ ! -f scripts/ci/check_self_approval_detector ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_self_approval_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }

@@ -1618,17 +1618,28 @@ else
 fi
 
 echo "Workflow js-yaml install tests"
-for workflow in .github/workflows/agent-review.yml .github/workflows/pr-audit.yml; do
-  install_count=$(grep -Ec 'run: npm install .*js-yaml' "$workflow" || true)
-  safe_install_count=$(grep -Ec 'run: npm install .*--no-save .*--ignore-scripts .*--legacy-peer-deps .*js-yaml' "$workflow" || true)
-  if [ "$install_count" -gt 0 ] && [ "$install_count" = "$safe_install_count" ]; then
-    pass=$((pass + 1))
-    echo "  PASS: $workflow installs js-yaml without mutating package metadata or resolving peer deps"
-  else
-    fail=$((fail + 1))
-    echo "  FAIL: $workflow must install js-yaml with --no-save --ignore-scripts --legacy-peer-deps (safe=$safe_install_count total=$install_count)" >&2
-  fi
-done
+# #2775: agent-review.yml installs nothing at run time. Its one js-yaml
+# consumer, detect-disagreement, held the CI-actor PAT while it require()d a
+# registry-resolved package; it now reads the reviewer list through the
+# trusted shell loader instead.
+agent_review_installs=$(grep -Ec '(npm|npx|yarn|pnpm) (install|ci|add|exec)' .github/workflows/agent-review.yml || true)
+if [ "$agent_review_installs" = "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review.yml resolves no package at run time"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review.yml must not install packages at run time (#2775; got $agent_review_installs)" >&2
+fi
+workflow=.github/workflows/pr-audit.yml
+install_count=$(grep -Ec 'run: npm install .*js-yaml' "$workflow" || true)
+safe_install_count=$(grep -Ec 'run: npm install .*--no-save .*--ignore-scripts .*--legacy-peer-deps .*js-yaml' "$workflow" || true)
+if [ "$install_count" -gt 0 ] && [ "$install_count" = "$safe_install_count" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: $workflow installs js-yaml without mutating package metadata or resolving peer deps"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $workflow must install js-yaml with --no-save --ignore-scripts --legacy-peer-deps (safe=$safe_install_count total=$install_count)" >&2
+fi
 
 echo
 echo "agent-review.yml whole-file YAML parse (#754)"
