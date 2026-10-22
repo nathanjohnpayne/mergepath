@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# op-preflight.sh — Front-load all 1Password credential reads for a session.
+# op-preflight.sh — Resolve 1Password credentials for review or trusted deployment.
 #
-# Triggers biometric prompts once at the start, then writes resolved secrets
-# to a chmod-600 session file under $XDG_CACHE_HOME/mergepath/ (default
-# $HOME/.cache/mergepath/). Subsequent invocations within the TTL window
-# read the session file and emit the same export statements WITHOUT
-# triggering biometric.
+# Deployment credentials belong only in trusted post-build tooling, after a
+# successful build and verification of its immutable artifact. Repository build
+# code must have no deploy credentials, author/reviewer PATs, or access to the
+# operator's credential-manager files and preflight caches. Unsetting variables
+# in a same-user shell or restricting cache-file permissions does not establish
+# this isolation. See docs/agents/shared-operating-rules.md#build-and-deploy-isolation.
 #
-# This is what makes the script usable from agent drivers (Claude Code,
-# Cursor, Codex CLI) where each tool call spawns a fresh subshell and
-# cannot see env vars exported by a prior call. The first tool call in a
-# session warms the cache (one biometric prompt); every subsequent tool
-# call reuses the session file until it rotates. See
-# nathanjohnpayne/mergepath#139 for the observed failure mode that
-# motivated this design.
+# In review mode, this may trigger biometric prompts at the start of a review
+# session and write resolved secrets to a chmod-600 session file under
+# $XDG_CACHE_HOME/mergepath/ (default $HOME/.cache/mergepath/). Subsequent
+# invocations within the TTL window read the session file and emit the same
+# export statements WITHOUT triggering biometric. Deploy mode is separate:
+# only trusted post-build tooling may invoke it, after artifact verification.
+#
+# This is what makes review-mode use work from agent drivers (Claude Code,
+# Cursor, Codex CLI) where each tool call spawns a fresh subshell and cannot
+# see env vars exported by a prior call. The first review tool call warms the
+# cache (one biometric prompt); every subsequent review call reuses the session
+# file until it rotates. See nathanjohnpayne/mergepath#139 for the observed
+# failure mode that motivated this design.
 #
 # Usage:
 #   # Session start (one biometric burst) — review mode is the default:
@@ -26,17 +33,19 @@
 #   # Force a fresh fetch even if the session file is still warm:
 #   eval "$(scripts/op-preflight.sh --agent claude --refresh)"
 #
-#   # Deploy scripts that genuinely need deploy credentials:
+#   # Trusted post-build tooling only, after artifact verification:
 #   eval "$(scripts/op-preflight.sh --agent claude --mode deploy)"
 #
 #   # Delete the session file + ADC tempfile (end-of-session cleanup):
 #   scripts/op-preflight.sh --agent claude --purge
 #
 # Modes:
-#   review  — reviewer PAT + author PAT + SSH key warming (DEFAULT)
-#   deploy  — Firebase project SA key (when .firebaserc is present),
+#   review  — reviewer PAT + author PAT + SSH key warming for review work (DEFAULT)
+#   deploy  — deploy credentials for trusted post-build tooling after artifact
+#             verification; Firebase project SA key when .firebaserc is present,
 #             else GCP ADC credential + Cloudflare cache-purge token
-#   all     — everything
+#   all     — review and deploy credentials together; do not use for repository
+#             builds or as a deployment setup because it combines both contexts
 #
 # Flags:
 #   --agent <name>   Agent name: claude, cursor, or codex (required except --purge-all)

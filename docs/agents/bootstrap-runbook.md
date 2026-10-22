@@ -22,7 +22,7 @@ Install `gh`, `op`, `git`, mikefarah `yq`, `rsync` and Python 3 before running t
 
 ```bash
 # From mergepath's worktree root, on main, clean.
-eval "$(scripts/op-preflight.sh --agent claude --mode all)"   # cache PATs
+eval "$(scripts/op-preflight.sh --agent claude --mode review)"   # cache review PATs
 scripts/bootstrap-new-repo.sh my-new-repo \
   --description "A short one-line description." \
   --visibility private \
