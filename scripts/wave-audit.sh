@@ -423,7 +423,7 @@ SCOPE_FINGERPRINT="$(printf 'version=1\nbase=%s\nhead=%s\nmanifest=%s\nexcludes<
 TMP_FILES=()
 cleanup() {
   local cleanup_file
-  for cleanup_file in "${TMP_FILES[@]}"; do rm -f "$cleanup_file"; done
+  for cleanup_file in "${TMP_FILES[@]}"; do rm -rf "$cleanup_file"; done
 }
 trap cleanup EXIT
 DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-diff.XXXXXX")"
@@ -774,17 +774,24 @@ if [ -n "$CAPTURE_INPUT_DIR" ]; then
   # that SHA merged, so without this an unmerged commit sitting on the
   # watermark would pass the base test above.
   #
-  # The trust anchor is the commit this trusted checkout is running from: the
-  # orchestrator must run from a trusted main checkout (#628), and the capture
-  # child runs this script from that same checkout. No branch name or remote
-  # symref is consulted (#2694): a stale `refs/remotes/origin/HEAD` could name
-  # an old, since-unprotected branch, and a fresh fetch cannot authenticate in
-  # the capture child's isolated environment. An older checkout can only
-  # withhold the exemption (a human is asked), never grant it.
+  # The trust anchor is GitHub's own default branch of the hub, read live: a
+  # commit-only clone (no trees or blobs, about 1 s) of the public hub, whose
+  # HEAD is the default branch GitHub serves. No local state is consulted
+  # (#2694): a stale `refs/remotes/origin/HEAD` could name an old,
+  # since-unprotected branch, and the trusted checkout's own HEAD could carry
+  # a local, unpushed commit (#628 is an operational rule, not a check). The
+  # hub is public, so the clone needs no credentials in the capture child's
+  # isolated environment. First-parent, because the hub allows merge commits:
+  # a commit reachable only through a merged branch never was a merged head.
+  # Any failure withholds the exemption (a human is asked), never grants it.
   head_on_hub_default=false
-  if hub_tip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "HEAD^{commit}") \
-     && git -C "$REPO_DIR" rev-list --first-parent "$hub_tip" | grep -Fx -- "$HEAD_FULL" >/dev/null; then
-    head_on_hub_default=true
+  if hub_history=$(mktemp -d "${TMPDIR:-/tmp}/wave-audit-hub.XXXXXX"); then
+    TMP_FILES[${#TMP_FILES[@]}]="$hub_history"
+    if GIT_TERMINAL_PROMPT=0 git clone --quiet --bare --single-branch --no-tags --filter=tree:0 \
+         https://github.com/nathanjohnpayne/mergepath.git "$hub_history/hub.git" >/dev/null 2>&1 \
+       && git -C "$hub_history/hub.git" rev-list --first-parent HEAD | grep -Fx -- "$HEAD_FULL" >/dev/null; then
+      head_on_hub_default=true
+    fi
   fi
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
     --argjson first_parent "$base_on_first_parent" --argjson on_default "$head_on_hub_default" \

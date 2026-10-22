@@ -46,7 +46,7 @@ function classify(diff, files) {
 }
 
 // Only an ordinary wave qualifies: its audited head on the first-parent history
-// of the trusted checkout's own HEAD (it merged; #2694), its base on that head's
+// of the hub's live default branch on GitHub (it merged; #2694), its base on that head's
 // first-parent history (a merged hub state), and no historical chunk boundary,
 // which wave code checks by plain ancestry and could fall on a never-merged
 // commit. The live verifier proves byte equality with the source SHA, not that

@@ -172,9 +172,18 @@ propagation_audit:
   effort: turbo
 YAML
 
+# The capture reads the hub's live default branch from GitHub with a
+# commit-only clone. Every run rewrites that URL to a local fixture, so no
+# test touches the network; the fixture is filled in by the #2694 cases.
+HUB_FIXTURE="$WORK/hub-fixture.git"
+git init -q --bare "$HUB_FIXTURE"
+HUB_FIXTURE_URL="file://$HUB_FIXTURE"
+
 run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   local policy="$1" reset="$2"; shift 2
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${HUB_FIXTURE_URL}.insteadOf" \
+  GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
@@ -186,6 +195,8 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
 run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   local repo_dir="$1" policy="$2" reset="$3"; shift 3
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${HUB_FIXTURE_URL}.insteadOf" \
+  GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
@@ -1131,17 +1142,25 @@ if jq -e '.base_on_first_parent == false' "$WORK/capture-second-parent/scope.jso
   pass "capture records a second-parent base as off the first-parent history"
 else fail "second-parent base provenance: $(tail -n 2 "$WORK/capture-second-parent.err")"; fi
 # The audited head must have merged: it is on the first-parent history of the
-# trusted checkout's own HEAD (#2694), not merely byte-equal to some commit and
-# not judged by any branch name or remote symref.
+# hub's default branch as GitHub serves it (#2694), not merely byte-equal to
+# some commit, and not judged by any local branch, symref or checkout HEAD.
+# The hub fixture serves `trunk` as its default; its `main` holds an unmerged
+# feature, so the default is read from what the server serves, not a name.
 FEATURE="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$C1" -m 'unmerged feature commit on the watermark')"
-git -C "$CANON" push -q origin "$MERGED:refs/heads/trusted-anchor" "$FEATURE:refs/heads/feature-anchor" "$SIDE:refs/heads/side-anchor"
+LOCAL_ONLY="$(git -C "$CANON" commit-tree "$C2^{tree}" -p "$MERGED" -m 'local commit never pushed to the hub')"
+git -C "$CANON" push -q "$HUB_FIXTURE" "$MERGED:refs/heads/trunk" "$FEATURE:refs/heads/main" "$SIDE:refs/heads/side-anchor"
+git -C "$HUB_FIXTURE" symbolic-ref HEAD refs/heads/trunk
+git -C "$CANON" push -q origin "$LOCAL_ONLY:refs/heads/local-anchor" "$FEATURE:refs/heads/feature-anchor"
 TRUSTED="$WORK/trusted-checkout"; rm -rf "$TRUSTED"
-git clone -q "$REMOTE" "$TRUSTED" && git -C "$TRUSTED" checkout -q --detach "$MERGED"
-# A stale symref naming another branch must not matter: point it at the feature.
+# The trusted checkout sits on a local commit the hub never received, with a
+# stale origin/HEAD naming the feature branch: neither may matter.
+git clone -q "$REMOTE" "$TRUSTED" && git -C "$TRUSTED" checkout -q --detach "$LOCAL_ONLY"
 git -C "$TRUSTED" update-ref refs/remotes/origin/feature-anchor "$FEATURE"
 git -C "$TRUSTED" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feature-anchor
-for hcase in "$C2:true:a merged head on the trusted checkout's first-parent history" \
-             "$FEATURE:false:an unmerged feature commit, even with origin/HEAD pointing at its branch" \
+for hcase in "$C2:true:a merged head on the hub default branch's first-parent history" \
+             "$MERGED:true:the hub default branch tip itself" \
+             "$LOCAL_ONLY:false:an unpushed commit on the trusted checkout's own HEAD" \
+             "$FEATURE:false:an unmerged feature commit, even on the hub's main and the local origin/HEAD" \
              "$SIDE:false:a commit reachable only through a merge's second parent"; do
   h=${hcase%%:*}; rest=${hcase#*:}; want=${rest%%:*}; label=${rest#*:}
   rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
@@ -1151,7 +1170,16 @@ for hcase in "$C2:true:a merged head on the trusted checkout's first-parent hist
     pass "capture records head_on_hub_default=$want for $label"
   else fail "head_on_hub_default for $label: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
 done
-git -C "$REMOTE" update-ref -d refs/heads/trusted-anchor; git -C "$REMOTE" update-ref -d refs/heads/feature-anchor; git -C "$REMOTE" update-ref -d refs/heads/side-anchor
+# An unreachable hub withholds the exemption rather than granting it.
+rm -rf "$WORK/capture-default"; mkdir "$WORK/capture-default"
+HUB_FIXTURE_URL_SAVED="$HUB_FIXTURE_URL"; HUB_FIXTURE_URL="file://$WORK/no-such-hub.git"
+run_wa_repo "$TRUSTED" "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$C2" \
+  --capture-input-dir "$WORK/capture-default" >/dev/null 2>"$WORK/capture-default.err" || true
+HUB_FIXTURE_URL="$HUB_FIXTURE_URL_SAVED"
+if jq -e '.head_on_hub_default == false' "$WORK/capture-default/scope.json" >/dev/null 2>&1; then
+  pass "an unreachable hub records head_on_hub_default=false (withheld, never granted)"
+else fail "unreachable hub: $(cat "$WORK/capture-default/scope.json" 2>/dev/null) $(tail -n 2 "$WORK/capture-default.err")"; fi
+git -C "$REMOTE" update-ref -d refs/heads/local-anchor; git -C "$REMOTE" update-ref -d refs/heads/feature-anchor
 # A recent base with more than a pipe buffer of older history behind it
 # (2,500 commits of 41 bytes is ~100 KiB) is the real watermark shape. rev-list
 # prints newest first, so an early `grep -q` exit on the base SIGPIPEs it
