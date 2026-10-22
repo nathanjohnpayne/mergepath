@@ -67,18 +67,9 @@ projects:
       - source: specs/
         mirror: projects/overridebroadway/specs/
 
-  - slug: device-source-of-truth
-    owner:
-      name: device-source-of-truth
-      repo: nathanjohnpayne/device-source-of-truth
-      path_hint: ../device-source-of-truth
-    prds:
-      - slug: device-source-of-truth
-        source: projects/device-source-of-truth/prds/device-source-of-truth.md
-        mirror: docs/projects/device-source-of-truth/prds/device-source-of-truth.md
-    specs:
-      - source: specs/
-        mirror: projects/device-source-of-truth/specs/
+  # device-source-of-truth: repository archived 2026-10-22 (read-only); removed
+  # from project-doc sync. Its PRD and spec mirrors in the docs vault are left
+  # as the last synced copy.
 
   - slug: friends-and-family-billing
     owner:

@@ -15,7 +15,8 @@
 #
 # device-source-of-truth was removed 2026-09-05 when that repo went
 # dormant: GitHub Actions was disabled on it and it was dropped as a
-# sync consumer, so it accrues no new review feedback either. That is
+# sync consumer, so it accrues no new review feedback either. The repo
+# was archived on 2026-10-22. That is
 # why this list holds 8, not 10.
 #
 # To onboard a new repo: add a line. No code changes required.
