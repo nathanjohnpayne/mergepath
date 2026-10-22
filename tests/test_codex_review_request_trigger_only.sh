@@ -105,6 +105,8 @@ done
 if [ "${9:-}" != "@codex review" ]; then
   echo "trigger body was not exact '@codex review': $*" >&2; exit 98
 fi
+# #2657: a refused trigger write (the loser of a concurrent request).
+[ "${CODEX_TEST_TRIGGER_FAIL:-0}" != 1 ] || { echo "trigger write refused" >&2; exit 1; }
 count=0
 [ -f "$state_dir/trigger-count" ] && count=$(cat "$state_dir/trigger-count")
 count=$((count + 1))
@@ -290,8 +292,9 @@ case "$endpoint" in
       cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_four)          jq -cn --arg who "$author" --arg t "$old" '[range(4) | {id:(8700 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_five)          jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8710 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
-      cp_five_existing) jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8720 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8730,user:{login:$who},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=x -->\nCheckpoint."}]' ;;
-      cp_five_foreign)  jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8740 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8750,user:{login:"someone-else"},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=x -->"}]' ;;
+      cp_five_existing) jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8720 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8730,user:{login:$who},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->\nCheckpoint."}]' ;;
+      cp_five_quoted)   jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8760 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8770,user:{login:$who},created_at:$t,body:"Note: the requester writes <!-- mergepath-codex-request-checkpoint:v1 counted=5 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --> at five requests."}]' ;;
+      cp_five_foreign)  jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8740 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8750,user:{login:"someone-else"},created_at:$t,body:"<!-- mergepath-codex-request-checkpoint:v1 counted=5 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->"}]' ;;
       cap_duplicate_ids) jq -cn --arg who "$author" --arg t "$old" '[range(12) | {id:(8200 + (. % 9)),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_bad_id)       jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8300 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       # #2534: ten prior requests, one of them a marked CodeRabbit failover.
@@ -508,11 +511,11 @@ test_request_attempt_cap() {
 cp_count() { if [ -f "$1/state/checkpoint-count" ]; then cat "$1/state/checkpoint-count"; else printf '0\n'; fi; }
 test_request_checkpoint() {
   local scenario dir rc before want_cp want_rec
-  for scenario in cp_four cp_five cp_five_existing cp_five_foreign cap_below_limit cap_three; do
+  for scenario in cp_four cp_five cp_five_existing cp_five_foreign cp_five_quoted cap_below_limit cap_three; do
     before=$FAIL
     case "$scenario" in
       cp_four|cap_three) want_cp=0; want_rec=null ;;
-      cp_five|cp_five_foreign|cap_below_limit) want_cp=1; want_rec=posted ;;
+      cp_five|cp_five_foreign|cp_five_quoted|cap_below_limit) want_cp=1; want_rec=posted ;;
       cp_five_existing) want_cp=0; want_rec=existing ;;
     esac
     dir=$(make_case "checkpoint-$scenario")
@@ -524,6 +527,7 @@ test_request_checkpoint() {
       || fail "#2657 $scenario: request_checkpoint.recorded=$(jqf "$dir" '.request_checkpoint.recorded // "null"'), expected $want_rec"
     if [ "$want_cp" = 1 ]; then
       grep -Fq 'counted=' "$dir/state/checkpoint-1.md" && grep -Fq 'reassess the scope' "$dir/state/checkpoint-1.md" \
+        && grep -Fq 'nathanjohnpayne/mergepath#2657' "$dir/state/checkpoint-1.md" \
         || fail "#2657 $scenario: checkpoint body lacks its count or guidance"
     fi
     [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: $scenario posts $want_cp checkpoint(s), recorded=$want_rec, request still posts"
@@ -534,6 +538,42 @@ test_request_checkpoint() {
   [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(jqf "$dir" '.request_checkpoint.recorded')" = failed ] \
     || fail "#2657: a failed checkpoint write blocked or hid the request (rc=$rc posts=$(trig_count "$dir"))"
   [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a failed checkpoint write never blocks the request"
+  # Staging: the body file is created but cannot be written (a full disk or
+  # quota); here the "file" is a directory, so the write fails.
+  before=$FAIL
+  dir=$(make_case "checkpoint-staging-fails")
+  cat >"$dir/bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *codex-request-checkpoint*) path=$(/usr/bin/mktemp -d "$1") && printf '%s\n' "$path" ;;
+  *) exec /usr/bin/mktemp "$@" ;;
+esac
+EOF
+  chmod +x "$dir/bin/mktemp"
+  rc=$(run_trigger_only "$dir" cp_five)
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(cp_count "$dir")" = 0 ] \
+    && [ "$(jqf "$dir" '.request_checkpoint.recorded')" = failed ] \
+    || fail "#2657: a checkpoint staging failure blocked or hid the request (rc=$rc posts=$(trig_count "$dir")); $(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a staging failure never blocks the request"
+  # A CodeRabbit failover is not a deliberate round: it records no checkpoint,
+  # so the next ordinary request still gets it.
+  before=$FAIL
+  dir=$(make_case "checkpoint-failover")
+  rc=0
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_SCENARIO=cp_five \
+      ./scripts/codex-review-request.sh --trigger-only --failover 999 owner/repo >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 1 ] && [ "$(cp_count "$dir")" = 0 ] \
+    && [ "$(jqf "$dir" '.request_checkpoint // "null"')" = null ] \
+    || fail "#2657: a failover trigger recorded the checkpoint (rc=$rc posts=$(trig_count "$dir") checkpoints=$(cp_count "$dir")); $(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a failover trigger never records the checkpoint"
+  # A requester whose own trigger write is refused records no checkpoint, so
+  # concurrent requesters at the threshold cannot each add one.
+  before=$FAIL
+  dir=$(make_case "checkpoint-trigger-refused")
+  rc=$(CODEX_TEST_TRIGGER_FAIL=1 run_trigger_only "$dir" cp_five)
+  [ "$rc" = 3 ] && [ "$(trig_count "$dir")" = 0 ] && [ "$(cp_count "$dir")" = 0 ] \
+    || fail "#2657: a refused trigger write still recorded a checkpoint (rc=$rc posts=$(trig_count "$dir") checkpoints=$(cp_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: only a request that posted records the checkpoint"
 }
 
 test_nondefault_request_attempt_cap() {

@@ -50,7 +50,9 @@
 #   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
 #           orchestrator requires human review (deterministic tripwire or
 #           Codex-cap human stop). No reviewer authority
-#           or tag follows. Never fan out on either shape.
+#           or tag follows. Never fan out on either shape. An ordinary wave
+#           whose byte-verified canary is audited from a first-parent base
+#           does not trip the deterministic tripwires (#2633).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
@@ -758,12 +760,35 @@ fi
 # a watermark. The trusted orchestrator independently invokes this mode.
 if [ -n "$CAPTURE_INPUT_DIR" ]; then
   cp "$DIFF_FILE" "$CAPTURE_INPUT_DIR/review.diff"
+  # #2633: a base on the audited head's first-parent history is a merged hub
+  # state, so the curated diff carries no never-merged intermediate bytes.
+  # Only then may escalation treat the verified canary as reviewed content.
+  # grep must drain rev-list: with pipefail, an early `grep -q` exit SIGPIPEs
+  # the producer and reads a long, valid history as "not found".
+  base_on_first_parent=false
+  if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fx -- "$BASE_FULL" >/dev/null; then
+    base_on_first_parent=true
+  fi
+  # The audited head itself must be a merged hub state: on the first-parent
+  # history of the trusted checkout's default-branch ref. The propagation
+  # verifier byte-checks the canary against the source SHA but does not prove
+  # that SHA merged, so without this an unmerged commit sitting on the
+  # watermark would pass the base test above. A stale local ref can only
+  # withhold the exemption (a human is asked), never grant it.
+  head_on_hub_default=false
+  hub_default=$(git -C "$REPO_DIR" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || printf refs/remotes/origin/main)
+  if hub_tip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "${hub_default}^{commit}") \
+     && git -C "$REPO_DIR" rev-list --first-parent "$hub_tip" | grep -Fx -- "$HEAD_FULL" >/dev/null; then
+    head_on_hub_default=true
+  fi
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --argjson first_parent "$base_on_first_parent" --argjson on_default "$head_on_hub_default" \
     --arg end "${HISTORICAL_END:+$RANGE_HEAD}" --argjson final "$FINALIZE_HISTORICAL" \
     --arg manifest "$MANIFEST_BLOB" --arg fingerprint "$SCOPE_FINGERPRINT" \
     '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,
       historical_end_sha:$end,finalize_historical:$final,
-      manifest_blob:$manifest,scope_fingerprint:$fingerprint}' > "$CAPTURE_INPUT_DIR/scope.json"
+      manifest_blob:$manifest,scope_fingerprint:$fingerprint,
+      base_on_first_parent:$first_parent,head_on_hub_default:$on_default}' > "$CAPTURE_INPUT_DIR/scope.json"
   chmod 400 "$CAPTURE_INPUT_DIR/review.diff" "$CAPTURE_INPUT_DIR/scope.json"
   exit 0
 fi

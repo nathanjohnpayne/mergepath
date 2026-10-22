@@ -115,7 +115,7 @@ if endpoint.endswith('/reviews'):
     emit([reviews] if '--slurp' in args else reviews); sys.exit(0)
 if endpoint.endswith('/issues/123/comments'):
     if state.get('comments_fail'): sys.exit(1)
-    emit([dict(id=n,user=dict(login='nathanjohnpayne'),created_at='2026-09-14T00:04:00Z',body='@codex review') for n in state.get('requests',[123,124])]); sys.exit(0)
+    emit([dict(id=n,user=dict(login='nathanjohnpayne'),created_at='2026-09-14T00:04:00Z',body='@codex review') for n in state.get('requests',[123,124])] + state.get('extra_comments',[])); sys.exit(0)
 if endpoint.endswith('/files'): emit([dict(filename='README.md',additions=1,deletions=0,status='modified')]); sys.exit(0)
 if endpoint.endswith('/comments') or endpoint.endswith('/timeline') or endpoint.endswith('/reactions'):
     emit([]); sys.exit(0)
@@ -359,6 +359,26 @@ if pathlib.Path(sys.argv[0]).name in ('owner-admin-override.py', 'merge-writer.p
     def test_caller_python_startup_cannot_clear_stale_generation(self):
         self.assert_blocked(self.run_writer(PYTHONPATH=self.caller_python_startup()))
         self.assertFalse((self.path/'startup-marker').exists())
+
+    def test_unanchored_completed_summary_cannot_replace_current_external_review(self):
+        state = {'code_review': {'commit_sha': None, 'has_any_findings': False,
+                                'has_unresolved_findings': False, 'status': 'completed'},
+                 'security_review': {'commit_sha': None, 'has_any_findings': None,
+                                    'has_unresolved_findings': None, 'status': None}}
+        body = ('<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 '
+                + json.dumps(state) + ' -->\n| 📝 **Code Review** | ✅ **Completed** '
+                '<relative-time datetime="2026-09-14T00:06:00Z">2026-09-14T00:06:00Z</relative-time> '
+                '| — | PR opened |')
+        policy = self.path/'governing-policy.yml'
+        policy.write_text(POLICY.replace('allow_phase_4b_substitute: true', 'allow_phase_4b_substitute: false'))
+        self.state = {'generation': [123, 124], 'extra_comments': [dict(id=9,
+                      user=dict(login='chatgpt-codex-connector[bot]'),body=body,
+                      created_at='2026-09-14T00:06:00Z',updated_at='2026-09-14T00:06:00Z')]}
+        self.assert_blocked(self.run_writer())
+        self.state['fresh_codex'] = True
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len((self.path/'writes.jsonl').read_text().splitlines()), 1)
 
     def test_current_generation_permitted_without_caller_python_startup(self):
         self.state['generation']=[123,124]
