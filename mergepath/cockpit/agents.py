@@ -58,7 +58,7 @@ def discover_checkouts(root, repo, *, run=subprocess.run, deadline=None):
         if len(result.stdout) > 128000:
             raise ValueError()
         paths = [Path(line[9:]) for line in result.stdout.splitlines() if line.startswith("worktree ")]
-        if not paths or len(paths) > 64:
+        if not paths:
             raise ValueError()
         return tuple(Checkout(repo, path) for path in dict.fromkeys(paths))
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -114,8 +114,21 @@ class LocalReader:
             os.close(fd)
 
 
-def resolve_history_settings(settings, inventory, root):
-    """Resolve operator-owned launch JSON once; never accept browser paths."""
+def created_at(checkout):
+    # A linked worktree's .git pointer file is written once, when it is added.
+    try:
+        return os.lstat(checkout.path / ".git").st_mtime
+    except OSError:
+        return 0
+
+
+def resolve_history_settings(settings, inventory, root, *, report=None):
+    """Resolve operator-owned launch JSON once; never accept browser paths.
+
+    Configured roots are always kept. Discovered worktrees past the 64-root cap
+    are omitted newest-first and counted through report(kept, found) instead of
+    refusing launch.
+    """
     if not isinstance(settings, dict) or set(settings) - {"checkouts", "price_keys"}:
         raise ValueError("invalid_history_settings")
     inventory = tuple(inventory)
@@ -161,21 +174,29 @@ def resolve_history_settings(settings, inventory, root):
                        for tier, rates in tiers.items() if isinstance(rates, dict) and number(rates.get("input")) and number(rates.get("output"))}
             if key not in allowed:
                 raise ValueError("invalid_history_settings")
-    checkouts, owners = {}, {}
+    discovered = []
     for repo, path in requested:
         if time.monotonic() >= deadline:
             raise ClientError("deadline_exceeded")
-        found = (Checkout(repo, path), *discover_checkouts(path, repo, deadline=deadline))
-        for checkout in found:
-            if not checkout.path.is_absolute():
-                raise ValueError("invalid_history_settings")
-            resolved = checkout.path.resolve()
-            if resolved in owners and owners[resolved] != repo:
-                raise ValueError("invalid_history_settings")
-            owners[resolved] = repo
-            checkouts[(repo, resolved)] = Checkout(repo, resolved)
-            if len(checkouts) > 64:
-                raise ValueError("invalid_history_settings")
+        discovered.extend(discover_checkouts(path, repo, deadline=deadline))
+    roots = [Checkout(repo, path) for repo, path in requested]
+    checkouts, owners, omitted = {}, {}, set()
+    for checkout in (*roots, *sorted(discovered, key=created_at, reverse=True)):
+        if not checkout.path.is_absolute():
+            raise ValueError("invalid_history_settings")
+        resolved = checkout.path.resolve()
+        # Attribution conflicts are refused even among omitted worktrees.
+        if resolved in owners and owners[resolved] != checkout.repo:
+            raise ValueError("invalid_history_settings")
+        owners[resolved] = checkout.repo
+        if (checkout.repo, resolved) in checkouts:
+            continue
+        if len(checkouts) >= 64:
+            omitted.add((checkout.repo, resolved))
+            continue
+        checkouts[(checkout.repo, resolved)] = Checkout(checkout.repo, resolved)
+    if omitted and report is not None:
+        report(len(checkouts), len(checkouts) + len(omitted))
     return tuple(checkouts.values()), MappingProxyType(dict(keys))
 
 
@@ -301,8 +322,13 @@ def cost_for(loop, prices, keys):
 
 
 class AgentsProvider:
-    def __init__(self, inventory, checkouts, trusted_root, *, price_keys=None, github=None, reviewers=("nathanpayne-codex", "nathanpayne-claude"), clock=time.time):
+    def __init__(self, inventory, checkouts, trusted_root, *, price_keys=None, github=None, reviewers=("nathanpayne-codex", "nathanpayne-claude"), clock=time.time,
+                 omitted_checkouts=0):
         self.repositories = {item.repo for item in inventory}
+        # Worktrees the launcher left out past the 64-root cap: their history is never read.
+        if type(omitted_checkouts) is not int or omitted_checkouts < 0:
+            raise ValueError("invalid_checkouts")
+        self.omitted_checkouts = omitted_checkouts
         self.checkouts = tuple(dict.fromkeys(Checkout(item.repo, Path(item.path).resolve()) for item in checkouts))
         if not self.checkouts or len(self.checkouts) > 64 or any(item.repo not in self.repositories for item in self.checkouts):
             raise ValueError("invalid_checkouts")
@@ -316,6 +342,8 @@ class AgentsProvider:
     def fetch(self, deadline):
         reader = LocalReader(deadline)
         rows, approvals, diagnostics = [], [], []
+        if self.omitted_checkouts:
+            diagnostics.append("Checkout limit reached; coverage is incomplete.")
         observed_checkouts = 0
         for root_no, checkout in enumerate(self.checkouts):
             log_rows, ledger_rows = [], []
@@ -503,7 +531,7 @@ class AgentsProvider:
         rows.sort(key=lambda row: (row["started_at_epoch"] or 0, row["id"]), reverse=True)
         crosscheck = self._review_crosscheck(rows, deadline)
         return Sample({"schema": "cockpit-agents/v1", "history": rows, "canonical_totals": totals[0], "per_pr": per_pr,
-                       "coverage": {"checkouts": len(self.checkouts), "legacy_runs": sum(row["run_id"] is None for row in rows),
+                       "coverage": {"checkouts": len(self.checkouts), "omitted_checkouts": self.omitted_checkouts, "legacy_runs": sum(row["run_id"] is None for row in rows),
                                     "tokens_measured": sum(row["tokens"]["total"] is not None for row in rows), "runs": len(rows), "unattributed_runs": sum(row["repo"] is None for row in rows)},
                        "diagnostics": list(dict.fromkeys(diagnostics)), "history_complete": not diagnostics,
                        "hasObservations": observed_checkouts > 0, "observed_checkouts": observed_checkouts,

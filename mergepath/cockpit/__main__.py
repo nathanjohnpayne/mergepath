@@ -119,9 +119,12 @@ def main(argv=None):
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     app, fleet = None, None
+    # Names the step for the refusal message; stage text never carries paths or errors.
+    stage = "reading the settings JSON (--actions-settings, --agents-settings)"
     try:
         actions_settings = load_settings_json(args.actions_settings)
         agents_settings = load_settings_json(args.agents_settings)
+        stage = "loading the cached reviewer credential"
         # Eight repositories of pulls, runs, status, job and check pages must stay ETag-cached.
         github = GitHubClient.from_environment(os.environ, cache_pages=768)
         # Resolve the canonical cache once before worker HOME/XDG isolation.
@@ -132,9 +135,18 @@ def main(argv=None):
         for name in ("OP_PREFLIGHT_REVIEWER_PAT", "OP_PREFLIGHT_AUTHOR_PAT", "GH_TOKEN",
                      "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
             os.environ.pop(name, None)
+        stage = "loading the repository inventory"
         inventory = load_inventory(ROOT)
-        checkouts, price_keys = resolve_history_settings(agents_settings, inventory, ROOT)
+        stage = "discovering checkouts and worktrees"
+        omitted = []
+        def report_omitted(kept, found):
+            omitted.append(found - kept)
+            print(f"Agent history reads {kept} of {found} checkouts; the oldest worktrees are skipped. "
+                  "scripts/worktree-cleanup.sh removes stale ones.", file=sys.stderr)
+        checkouts, price_keys = resolve_history_settings(agents_settings, inventory, ROOT, report=report_omitted)
+        stage = "reading registered reviewers with the installed hub yq"
         reviewers = load_reviewers(ROOT)
+        stage = "initializing panel sources"
         app = Application(inventory, github, logger=lambda message: print(message, file=sys.stderr))
         app.api_author = AuthorBudgetProvider(ROOT, cache_dir, args.agent)
         app.scheduler.register("api_author", app.api_author.fetch, hot_interval=60, idle_interval=60, timeout=20)
@@ -168,17 +180,18 @@ def main(argv=None):
                                            ci_max_gap=CI_OBSERVATION_GAP, installation_scan=True)
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
-        agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
+        agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers,
+                                         omitted_checkouts=sum(omitted))
         app.scheduler.register("agents", agents_provider.fetch, hot_interval=30, idle_interval=120, timeout=30)
         app.register_panel("history", "agents")
         live_agents = LiveAgentsProvider(inventory, resolve_live_directory(os.environ.get("P4B_HEARTBEAT_DIR") or None), ROOT)
         app.scheduler.register("live_agents", live_agents.fetch, hot_interval=5, idle_interval=5, timeout=10, max_backoff=60)
         app.register_panel("agents", "live_agents")
+        stage = f"binding loopback port {args.port}"
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         close_runtime(app, fleet)
-        print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
-              file=sys.stderr)
+        print(f"Cockpit cannot start: failed while {stage}.", file=sys.stderr)
         return 1
     port = server.server_address[1]
     print(f"Mergepath Cockpit: http://127.0.0.1:{port}/", flush=True)
