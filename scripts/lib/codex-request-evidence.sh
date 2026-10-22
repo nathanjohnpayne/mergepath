@@ -451,6 +451,99 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
   '
 }
 
+# #2664: the provider-run state of the request posted at <request-created-at>
+# on <head>, read from Codex's Review Summary row and nothing else (never a
+# check-run or status publisher). A row last updated before the request is an
+# old placeholder and proves nothing about this request, so it reads as
+# "none". "running" is an active run. "completed" says the run ended; with no
+# qualifying result the caller treats it as inactive. "failed" and
+# "canceled" are confirmed terminal failures. Any other status text is
+# "unknown", which never authorizes a retry. retry_after_seconds is a retry
+# window the provider states in that comment ("retry after N seconds", "try
+# again in N minutes", hours or days, decimals rounded up), else null; a stated
+# window it cannot read is a year, never a shorter guess.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request-created-at
+  printf '%s\n' "${1:-[]}" | jq -c \
+    --arg bot "${2:-}" --arg sha "${3:-}" --arg since "${4:-}" '
+    ($sha | ascii_downcase) as $head
+    | if $since == "" then error("request time required") else . end
+    | [ .[]
+      | select((.user.login // "") == $bot)
+      | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+      | . as $comment
+      | ((.body // "")
+          | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+          // null) as $row
+      | select($row != null)
+      | select($head | startswith($row.commit | ascii_downcase))
+      | ($comment.updated_at // $comment.created_at // "") as $observed
+      | select($observed != "" and $observed >= $since)
+      # A stated window whose length cannot be read (an unknown unit, or
+      # words such as "a few minutes") reads as a year: longer than any
+      # review deadline, so it never lets a retry post early.
+      | ((.body // "")
+          | [match("(?i)(?:retry[- ]after|try again in)[:[:space:]]*(?<rest>[^\\n]{0,40})"; "g")
+             | .captures[0].string
+             | (capture("^(?<n>[0-9]+(?:\\.[0-9]+)?)[[:space:]]*(?<u>[[:alpha:]]*)") // null) as $d
+             | if $d == null then 31536000
+               else ($d.u | ascii_downcase) as $u
+                 | (if $u == "" or ($u | test("^(s|secs?|seconds?)$")) then 1
+                    elif ($u | test("^(m|mins?|minutes?)$")) then 60
+                    elif ($u | test("^(h|hrs?|hours?)$")) then 3600
+                    elif ($u | test("^(d|days?)$")) then 86400
+                    else null end) as $unit
+                 | if $unit == null then 31536000 else ($d.n | tonumber) * $unit | ceil end
+               end]
+          | max // null) as $retry_after
+      | { state:
+            (if ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
+             elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
+             elif ($row.status | test("\\*\\*(Failed|Error|Errored)\\*\\*"; "i")) then "failed"
+             elif ($row.status | test("\\*\\*Cancell?ed\\*\\*"; "i")) then "canceled"
+             else "unknown" end),
+          observed_at: $observed,
+          comment_id: ($comment.id // 0),
+          retry_after_seconds: $retry_after }
+    ]
+    | max_by([.observed_at, .comment_id]) // {state: "none", observed_at: null, comment_id: null, retry_after_seconds: null}
+  '
+}
+
+# #2664: whether request <id> is itself an automatic retry. Before a retry
+# the requester records an intent marker
+# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> -->`, and once the
+# retry has posted it records the binding
+# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> retry=<id> -->`.
+# A request is a retry when a binding names it. Without a binding for its
+# original (the handler stopped between posting and binding), an intent
+# marker still marks the first configured-author request after it, within
+# 300 seconds by GitHub's timestamps. An intent whose original already has a
+# binding is a losing handler's leftover and marks nothing, so it can never
+# turn a later ordinary request into a "retry", and an intent the handler
+# withdrew (`... original=<id> withdrawn=<intent id> -->`, recorded when
+# its retry was not posted) marks nothing. Any head counts, so the
+# predicate can only withhold a retry, never grant one. Prints true or false.
+crqe_request_is_retry() { # issue-comments-json author request-id
+  printf '%s\n' "${1:-[]}" | jq -r --arg author "$2" --argjson id "$3" '
+    def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+    def marker: (.body // "") | capture("\\A<!-- mergepath-codex-retry:v1 head=[0-9a-f]{40} original=(?<original>[1-9][0-9]*)( retry=(?<retry>[1-9][0-9]*))?( withdrawn=(?<withdrawn>[1-9][0-9]*))? -->")?;
+    def num: if . == null then null else tonumber end;
+    [ .[] | select((.user.login // "") == $author) ] as $own
+    | [ $own[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] | sort_by(.id) as $requests
+    | [ $own[] | (marker // empty) as $m | . + {original: ($m.original | tonumber), retry: ($m.retry | num), withdrawn: ($m.withdrawn | num)} ] as $markers
+    | [ $markers[] | select(.retry != null) ] as $bound
+    | [ $markers[] | select(.withdrawn != null) | .withdrawn ] as $withdrawn
+    | any($bound[]; .retry == $id)
+      or any($markers[] | select(.retry == null and .withdrawn == null) | . as $m
+          | select(any($bound[]; .original == $m.original) | not) | select(any($withdrawn[]; . == $m.id) | not);
+        . as $m
+        | ([ $requests[] | select(.id > $m.id) ] | first) as $next
+        | $next != null and $next.id == $id and (($next.created_at | epoch) - ($m.created_at | epoch)) <= 300)
+  '
+}
+
 # Parse every Codex-bot issue comment that is a verdict into
 # {comment_id, created_at, reviewed_shas, affirmative}, oldest first. A
 # verdict is a comment carrying a "Reviewed commit: <sha>" anchor or headed
