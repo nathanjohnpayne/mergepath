@@ -740,9 +740,19 @@ STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/gh" <<STUB
 #!/usr/bin/env bash
-# Minimal stub: respond only to the helper's call shape
+# Minimal stub: respond only to the helper's call shapes
 #   gh pr view <num> --repo <r> --json state --jq .state
-# Return CLOSED for our known PR number; everything else → empty.
+#   gh pr view <num> --repo <r> --json headRefOid --jq .headRefOid
+# Return CLOSED for our known PR number; everything else → empty. The two
+# detached closed-PR fixtures sit at their PR's head, as a review worktree
+# does, so GitHub still holds the commit (#2738); any other number's head
+# lookup fails, which the helper must treat as "not proven safe".
+if [ "\$1" = "pr" ] && [ "\$2" = "view" ] && [[ " \$* " == *" headRefOid "* ]]; then
+  case "\$3" in
+    "$PR_NUM"|"$HIDDEN_PR_NUM") echo "$DETACHED_SHA"; exit 0 ;;
+  esac
+  exit 1
+fi
 if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
   num="\$3"
   if [ "\$num" = "$PR_NUM" ]; then
@@ -4120,6 +4130,79 @@ if [ ! -e "$STALE_ORPHAN" ] && ! grep -Fq -- "orphan; activity within --min-age"
 else
   fail "the main checkout's activity kept an idle orphan under --min-age"
   echo "$OUT_ORPHAN_AGE" >&2
+fi
+
+# ── Case 50 (#2738): a detached worktree's commit must survive removal ───
+# `git worktree remove` deletes the per-worktree HEAD, a detached worktree's
+# only reference to a commit made there. Removal is allowed only when a local
+# ref contains HEAD or GitHub still holds it as (an ancestor of) the PR head;
+# a failed head lookup keeps the worktree. Each worktree below is detached for
+# a merged PR, with the PR's commits on no local ref (its branch is deleted).
+REACH_ROOT="$WORKDIR/reach"
+REACH_MAIN="$REACH_ROOT/main"
+mkdir -p "$REACH_ROOT/.mergepath-worktrees" "$REACH_ROOT/stub"
+git init -q -b main "$REACH_MAIN"
+git -C "$REACH_MAIN" config user.email "test@example.com"
+git -C "$REACH_MAIN" config user.name "Test"
+git -C "$REACH_MAIN" config commit.gpgsign false
+git -C "$REACH_MAIN" commit -q --allow-empty -m "initial"
+MAIN_TIP=$(git -C "$REACH_MAIN" rev-parse HEAD)
+git -C "$REACH_MAIN" switch -q -c pr-work
+git -C "$REACH_MAIN" commit -q --allow-empty -m "PR commit 1"
+PR_FIRST=$(git -C "$REACH_MAIN" rev-parse HEAD)
+git -C "$REACH_MAIN" commit -q --allow-empty -m "PR commit 2 (the PR head)"
+PR_HEAD=$(git -C "$REACH_MAIN" rev-parse HEAD)
+git -C "$REACH_MAIN" switch -q main
+git -C "$REACH_MAIN" branch -q -D pr-work
+reach_wt() { printf '%s' "$REACH_ROOT/.mergepath-worktrees/pr-$1-detached"; }
+git -C "$REACH_MAIN" worktree add -q --detach "$(reach_wt 66601)" "$PR_HEAD"   # at the PR head
+git -C "$REACH_MAIN" worktree add -q --detach "$(reach_wt 66602)" "$PR_FIRST"  # ancestor of the PR head
+git -C "$REACH_MAIN" worktree add -q --detach "$(reach_wt 66603)" "$PR_HEAD"   # extra local commit below
+git -C "$REACH_MAIN" worktree add -q --detach "$(reach_wt 66604)" "$PR_HEAD"   # head lookup fails
+git -C "$REACH_MAIN" worktree add -q --detach "$(reach_wt 66605)" "$MAIN_TIP"  # a local branch contains it
+git -C "$(reach_wt 66603)" -c user.name=Test -c user.email=test@example.com -c commit.gpgsign=false \
+  commit -q --allow-empty -m "only this worktree's HEAD holds me"
+EXTRA_COMMIT=$(git -C "$(reach_wt 66603)" rev-parse HEAD)
+cat >"$REACH_ROOT/stub/gh" <<STUB
+#!/usr/bin/env bash
+[ "\$1" = "pr" ] && [ "\$2" = "view" ] || exit 1
+if [[ " \$* " == *" headRefOid "* ]]; then
+  case "\$3" in
+    66601|66602|66603) echo "$PR_HEAD"; exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+case "\$3" in 6660[1-5]) echo MERGED; exit 0 ;; esac
+exit 1
+STUB
+chmod +x "$REACH_ROOT/stub/gh"
+set +e
+OUT_REACH=$( cd "$REACH_MAIN" && PATH="$REACH_ROOT/stub:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+set -e
+if [ ! -e "$(reach_wt 66601)" ] && [ ! -e "$(reach_wt 66602)" ]; then
+  pass "#2738 detached worktrees at the PR head or one of its ancestors are removed"
+else
+  fail "#2738 a detached worktree GitHub still holds was kept"
+  echo "$OUT_REACH" >&2
+fi
+if [ -d "$(reach_wt 66603)" ] && [ "$(git -C "$(reach_wt 66603)" rev-parse HEAD)" = "$EXTRA_COMMIT" ] \
+   && grep -Fq -- "$EXTRA_COMMIT is on no local branch, tag or remote ref and is not PR #66603's head" <<<"$OUT_REACH"; then
+  pass "#2738 a detached worktree holding a commit beyond the PR head is kept, with the reason"
+else
+  fail "#2738 a commit only a detached worktree held was not protected"
+  echo "$OUT_REACH" >&2
+fi
+if [ -d "$(reach_wt 66604)" ] && grep -Fq -- "PR #66604 head lookup failed" <<<"$OUT_REACH"; then
+  pass "#2738 a failed PR-head lookup keeps the worktree"
+else
+  fail "#2738 a failed PR-head lookup let the worktree be removed"
+  echo "$OUT_REACH" >&2
+fi
+if [ ! -e "$(reach_wt 66605)" ]; then
+  pass "#2738 a detached worktree whose commit a local branch contains is removed without the lookup"
+else
+  fail "#2738 a detached worktree on a branch-reachable commit was kept"
+  echo "$OUT_REACH" >&2
 fi
 
 echo ""

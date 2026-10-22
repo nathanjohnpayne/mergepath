@@ -58,6 +58,8 @@ The wall-clock ceiling applies only where a `timeout` implementation exists. `ti
 
 Every removal path clears `worktree_content_state()` first: every gone-upstream worktree, and every detached closed/merged-PR worktree before its locked check. The gate used to cover branch-attached and gone-upstream PR-slug paths only, leaving the rest to git's own refusal, which protects modified and untracked files but deletes gitignored ones (and, under `--force-locked`, protects nothing).
 
+A detached closed/merged-PR worktree must also keep its commit (#2738). `git worktree remove` deletes the per-worktree `HEAD`, which is a detached worktree's only reference to work committed there, so removal requires that a local branch, tag or remote-tracking ref contains `HEAD`, or that `HEAD` equals the PR's `headRefOid` or is an ancestor of it once that object is local. GitHub keeps a PR's head after its branch is deleted, which is why a merged PR's review worktree stays removable. A failed or malformed head lookup keeps the worktree, and the reason line names the commit and `git branch <name> <commit>`.
+
 A removal git refuses prints `-> FAILED: <git's first line>` and is listed under `failed:`. The run continues to the remaining candidates and the final prune, then exits `1`.
 
 `scripts/install-worktree-cleanup-agent.sh` installs the daily launchd agent that runs `--apply --min-age 24h --no-color` on the main checkout. The installer, and `--check` afterwards, refuse a main checkout whose script lacks `--min-age`, since the agent runs whatever branch that checkout has. Its regression suite is `tests/test_install_worktree_cleanup_agent.sh`, which uses a fixture clone and a stub `launchctl` and never touches the real LaunchAgents directory.
