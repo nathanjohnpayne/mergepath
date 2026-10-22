@@ -61,6 +61,9 @@ chmod +x "$BIN/gh"
 cat >"$BIN/as-author" <<'W'
 #!/usr/bin/env bash
 echo "author-write" >>"${FAKE_STATE:?}/author.log"
+# Like the real wrapper (gh_payload_refuse_credential_overrides), refuse
+# --hostname: guarded writes go to github.com only.
+for a in "$@"; do case "$a" in --hostname|--hostname=*) echo "as-author: refusing --hostname" >&2; exit 1 ;; esac; done
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
 exec "$@"
 W
@@ -165,11 +168,14 @@ for variant in "version: 1" $'version: 1\nconsumers:\n  - name: alpha' $'version
     || fail "malformed manifest rc=$RC: $OUT"
 done
 
-# Every read and write is pinned to github.com.
+# Every read is pinned to github.com; writes carry no --hostname, which the
+# author wrapper refuses (it confines them to github.com itself).
 reset_state; run --apply
-calls=$(grep -c . "$STATE/calls.log"); hosts=$(grep -cx github.com "$STATE/hosts.log" 2>/dev/null || true)
-[ "$RC" = 0 ] && [ "$calls" -gt 0 ] && [ "$calls" = "$hosts" ] && [ "$(sort -u "$STATE/hosts.log")" = github.com ] \
-  && pass "every label read and write is pinned to github.com" || fail "host pinning: calls=$calls hosts=$hosts"
+reads=$(grep -c '^GET ' "$STATE/calls.log"); writes=$(grep -cE '^(POST|PATCH) ' "$STATE/calls.log")
+hosts=$(grep -cx github.com "$STATE/hosts.log" 2>/dev/null || true)
+[ "$RC" = 0 ] && [ "$reads" -gt 0 ] && [ "$writes" -gt 0 ] && [ "$reads" = "$hosts" ] && [ "$(sort -u "$STATE/hosts.log")" = github.com ] \
+  && pass "every label read is pinned to github.com, and writes pass the wrapper's --hostname refusal" \
+  || fail "host pinning: rc=$RC reads=$reads writes=$writes hosts=$hosts $OUT"
 
 # A typo next to a valid name must not silently shrink the run.
 reset_state; run --repos alpha,typo

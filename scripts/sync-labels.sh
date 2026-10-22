@@ -117,8 +117,9 @@ urlencode() { jq -rn --arg v "$1" '$v | @uri'; }
 changes=0 failures=0
 while IFS= read -r repo; do
   [ -n "$repo" ] || continue
-  # Pinned to github.com like the author wrapper's writes, so a GH_HOST
-  # pointing elsewhere cannot plan github.com writes from another host.
+  # Pinned to github.com, where the author wrapper confines the writes (it
+  # refuses --hostname itself), so a GH_HOST pointing elsewhere cannot plan
+  # github.com writes from another host's labels.
   live=$(gh api --hostname github.com --paginate "repos/$repo/labels?per_page=100" 2>/dev/null | jq -sc 'add // []') \
     || { echo "  ! $repo: labels unreadable"; failures=$((failures + 1)); continue; }
   plan=$(jq -c --argjson canon "$CANON_JSON" --argjson deprecated "$DEPRECATED_JSON" '
@@ -151,11 +152,11 @@ while IFS= read -r repo; do
     body_file=$(mktemp "${TMPDIR:-/tmp}/sync-labels.XXXXXX") || { failures=$((failures + 1)); continue; }
     if [ "$action" = create ]; then
       jq -nc --arg n "$name" --arg c "$color" --arg d "$desc" '{name:$n,color:$c,description:$d}' >"$body_file"
-      "$AS_AUTHOR" -- gh api --hostname github.com "repos/$repo/labels" --method POST --input "$body_file" >/dev/null 2>&1 \
+      "$AS_AUTHOR" -- gh api "repos/$repo/labels" --method POST --input "$body_file" >/dev/null 2>&1 \
         || { echo "      ! create failed"; failures=$((failures + 1)); }
     else
       jq -nc --arg c "$color" --arg d "$desc" '{color:$c,description:$d}' >"$body_file"
-      "$AS_AUTHOR" -- gh api --hostname github.com "repos/$repo/labels/$(urlencode "$name")" --method PATCH --input "$body_file" >/dev/null 2>&1 \
+      "$AS_AUTHOR" -- gh api "repos/$repo/labels/$(urlencode "$name")" --method PATCH --input "$body_file" >/dev/null 2>&1 \
         || { echo "      ! update failed"; failures=$((failures + 1)); }
     fi
     rm -f "$body_file"

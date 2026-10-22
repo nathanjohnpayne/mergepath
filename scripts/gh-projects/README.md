@@ -76,15 +76,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../../lib.sh"
 
 ensure_label "myproj" "FF3366" "My multi-phase initiative"
-ensure_label "phase-1" "0E8A16" "Phase 1 of a multi-phase project"
 
 # Parent
-P_URL=$(create_parent "Phase 1: …" "$SCRIPT_DIR/phase-1/parent.md" "myproj,phase-1")
+P_URL=$(create_parent "Phase 1: …" "$SCRIPT_DIR/phase-1/parent.md" "myproj,agent-action")
 P_NUM="${P_URL##*/}"
 
 # Child — substitute __PARENT_NUM__ in the body file first.
 F=$(prep_body "$SCRIPT_DIR/phase-1/c1.md" "$P_NUM")
-read C1_URL C1_NUM _ <<<"$(create_child "Do the first thing" "$F" "myproj,phase-1" "$P_NUM")"
+read C1_URL C1_NUM _ <<<"$(create_child "Do the first thing" "$F" "myproj,agent-action" "$P_NUM")"
 ```
 
 ### Move an issue between swimlanes
