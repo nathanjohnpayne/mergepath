@@ -53,6 +53,9 @@
 #           or tag follows. Never fan out on either shape. An ordinary wave
 #           whose byte-verified canary is audited from a first-parent base
 #           does not trip the deterministic tripwires (#2633).
+#           --admin-override runs the adapter past a tripwire. The budget
+#           refusal is never overridden (use the historical-prefix path), and
+#           a Codex-cap human stop keeps its owner tiebreak (#2544).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
@@ -63,6 +66,7 @@
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
 #       [--base <sha>] [--head-sha <sha>] [--dry-run]
 #       [--historical-end <sha> | --finalize-historical]
+#       [--admin-override "<owner authorization quote>"]
 #   scripts/wave-audit.sh --parse-title-only "<pr title>"   # test/debug hook
 #
 # Config: top-level `propagation_audit:` block in .github/review-policy.yml
@@ -78,6 +82,13 @@
 # (#662): xhigh DNFs the 900s adapter cap on a catch-up-sized wave diff,
 # while high cleared the same 745 KB diff in 231s; steady-state wave ranges
 # are ~70 KB and fit trivially.
+#
+# --admin-override (#2633): the owner's authorization, quoted, for this run to
+# dispatch the real Phase 4b adapter past the orchestrator's deterministic
+# tripwires, and to post its verdict. It is passed through to
+# phase-4b-review.sh, recorded in the posted review body, and marked
+# `admin-override=true` on the watermark annotation. It never skips the byte
+# budget, the canary byte verification, drift checks or feedback accounting.
 #
 # Env (tests / manual runs):
 #   WAVE_AUDIT_REPO_DIR       canonical repo to diff/tag (default: this repo)
@@ -170,6 +181,7 @@ audit_list() {
 # --- args -------------------------------------------------------------------
 PR=""; REPO=""; BASE=""; HEAD_SHA=""; DRY_RUN=false; CAPTURE_INPUT_DIR=""
 HISTORICAL_END=""; FINALIZE_HISTORICAL=false
+ADMIN_OVERRIDE_SET=false; ADMIN_OVERRIDE_QUOTE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)      REPO="${2:-}"; shift 2 ;;
@@ -179,6 +191,11 @@ while [ $# -gt 0 ]; do
     --capture-input-dir) CAPTURE_INPUT_DIR="${2:-}"; DRY_RUN=true; shift 2 ;;
     --historical-end) HISTORICAL_END="${2:-}"; shift 2 ;;
     --finalize-historical) FINALIZE_HISTORICAL=true; shift ;;
+    --admin-override)
+      # A quote that starts with "-" is a mistyped option (`--admin-override
+      # --dry-run`), never authorization text: refuse rather than consume it.
+      case "${2:-}" in ''|-*) die 3 "--admin-override requires the owner's quoted authorization" ;; esac
+      ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     --parse-title-only)
       parse_title "${2:-}" || die 3 "no mergepath@<sha> in title: ${2:-}"
       exit 0 ;;
@@ -197,6 +214,18 @@ case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -z "$CAPTURE_INPUT_DIR" ] || { [ -d "$CAPTURE_INPUT_DIR" ] && [ ! -L "$CAPTURE_INPUT_DIR" ]; } \
   || die 3 "capture directory must already exist and be a real directory"
 [ -x "$ORCH" ] || [ -f "$ORCH" ] || die 3 "orchestrator not found: $ORCH"
+# The orchestrator's quote checks, applied here before any capture, budget or
+# empty-scope exit can act on (or tag the watermark for) an unusable quote.
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *[![:space:]]*) ;;
+    *) die 3 "--admin-override requires a non-empty owner authorization quote" ;;
+  esac
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *$'\n'*|*$'\r'*) die 3 "--admin-override quote must be a single line" ;;
+  esac
+  [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || die 3 "--admin-override quote must be at most 500 characters"
+fi
 
 # --- config (fail-closed validation) ----------------------------------------
 EFFORT="$(audit_field effort)"; EFFORT="${EFFORT:-high}"
@@ -519,11 +548,13 @@ if [ -n "$HISTORICAL_END" ]; then
     jq -n --arg base "$(printf '%s' "$retained_json" | jq -r .chunk_base)" \
       --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" --arg tag "$retained_tag" \
       --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
-      --argjson verdict "$(printf '%s' "$retained_json" | jq -c .validated_verdict)" '
+      --argjson verdict "$(printf '%s' "$retained_json" | jq -c .validated_verdict)" \
+      --argjson ao "$(printf '%s' "$retained_json" | jq -c '.review_provenance |
+        {admin_overridden:(.admin_overridden // []),admin_override_quote:(.admin_override_quote // null)}')" '
         {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
          prefix_receipt:$tag,receipt_written:($dry|not),receipt_reused:true,
          watermark_advanced:false,fanout_authorized:false,dry_run:$dry,
-         validated_verdict:$verdict}'
+         validated_verdict:$verdict} + $ao'
     if [ "$DRY_RUN" = true ]; then
       log "historical chunk receipt already validated — dry-run made no receipt write or push; no full-wave clearance"
     else
@@ -621,6 +652,18 @@ REPORT_FILES="$FILES"
 # as success — the push runs unconditionally, so the documented rerun
 # recovery actually recovers (Codex P2 on #663); pushing an already-present
 # remote tag with the same object is a no-op success.
+# #2633: a watermark is marked when this run carried the owner's override, or
+# when it finalizes historical coverage whose retained receipts record one: a
+# finalization needs no override of its own, yet its clearance rests on them.
+admin_override_marked() {
+  if [ "$ADMIN_OVERRIDE_SET" = true ]; then echo true; return; fi
+  if [ "$FINALIZE_HISTORICAL" = true ] && jq -se \
+    'any(.[]; (.review_provenance.admin_overridden // []) | length > 0)' "$RECEIPT_CHAIN" >/dev/null; then
+    echo true; return
+  fi
+  echo false
+}
+
 advance_watermark() {
   local tag="${TAG_PREFIX}/${HEAD_FULL}"
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
@@ -629,7 +672,7 @@ advance_watermark() {
     revalidate_canary_pair "writing wave watermark"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
-        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}$([ "$(admin_override_marked)" = true ] && printf ' admin-override=true')" \
         "$HEAD_FULL"
   fi
   revalidate_canary_pair "publishing wave watermark"
@@ -648,7 +691,9 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   provenance="$(printf '%s' "$summary" | jq -c '
     {direction, reviewer_identity, adapter, canary_head:.head_sha,
      repo, pr_number, reviewer_effort, adapter_timeout_seconds,
-     usage_source, token_count}')"
+     usage_source, token_count,
+     admin_overridden:(.admin_overridden // []),
+     admin_override_quote:(.admin_override_quote // null)}')"
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
     --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" \
     --arg chunk_base "$RANGE_BASE" --arg prefix_end "$RANGE_HEAD" \
@@ -674,8 +719,14 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   PREFIX_TAG_RESULT="$tag"
 }
 
+# #2633: the override fields every wave summary carries. They start from this
+# run's flag and take the orchestrator's own record once it has run, so a
+# wave whose review absorbed a tripwire reports the quote and reason codes.
+WAVE_ADMIN_OVERRIDE="$(jq -nc --arg q "$ADMIN_OVERRIDE_QUOTE" --argjson set "$ADMIN_OVERRIDE_SET" \
+  '{admin_overridden:[],admin_override_quote:(if $set then $q else null end)}')"
+
 emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
-  jq -n \
+  jq -n --argjson ao "$WAVE_ADMIN_OVERRIDE" \
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
     --argjson pr "$PR" --argjson files "$REPORT_FILES" --argjson bytes "$REPORT_BYTES" \
     --argjson limit "$DIFF_MAX" \
@@ -686,7 +737,7 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
     '{base:$base, base_watermark:$watermark, head:$head, repo:$repo, pr:$pr, scope_files:$files,
       scope_bytes:$bytes, diff_max_bytes:$limit, effort:$effort, timeout_seconds:$timeout,
       orchestrator_exit:$orch, watermark_advanced:$tagged, skipped:$skipped,
-      dry_run:$dry}'
+      dry_run:$dry} + $ao'
 }
 
 if [ "$FINALIZE_HISTORICAL" = true ]; then
@@ -853,6 +904,10 @@ fi
 if [ -n "$HISTORICAL_END" ] && [ "$DRY_RUN" = false ]; then
   orch_args[${#orch_args[@]}]="--retain-evidence"
 fi
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  orch_args[${#orch_args[@]}]="--admin-override"
+  orch_args[${#orch_args[@]}]="$ADMIN_OVERRIDE_QUOTE"
+fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
 fi
@@ -880,6 +935,10 @@ if [ -n "$HISTORICAL_END" ]; then
            (.validated_verdict.findings | type == "array"))' "$ORCH_OUTPUT" 2>/dev/null)" \
     || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run returned no complete validated_verdict"; }
   verdict="$(printf '%s' "$orch_summary" | jq -c .validated_verdict)"
+  # #2633: a chunk validated past an overridden tripwire says so in every
+  # summary and in its retained receipt.
+  admin_override="$(printf '%s' "$orch_summary" | jq -c \
+    '{admin_overridden:(.admin_overridden // []),admin_override_quote:(.admin_override_quote // null)}')"
   if [ -n "$pr_head" ]; then
     [ "$(printf '%s' "$orch_summary" | jq -r '.head_sha // empty')" = "$pr_head" ] \
       || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run verdict is not pinned to lane-verified canary head $pr_head"; }
@@ -888,10 +947,10 @@ if [ -n "$HISTORICAL_END" ]; then
   printf '%s' "$verdict" | jq -e '.verdict == "APPROVED" and (.findings | length == 0)' >/dev/null && clean=true
   if [ "$clean" != true ]; then
     jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
-      --argjson verdict "$verdict" \
+      --argjson verdict "$verdict" --argjson ao "$admin_override" \
       '{historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
         prefix_receipt:null,watermark_advanced:false,fanout_authorized:false,
-        validated_verdict:$verdict}'
+        validated_verdict:$verdict} + $ao'
     log "historical chunk produced findings (including APPROVED advisories) — complete verdict retained for disposition; no receipt or clearance state written"
     exit 1
   fi
@@ -903,21 +962,28 @@ if [ -n "$HISTORICAL_END" ]; then
   fi
   jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
     --arg tag "$prefix_tag" --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
-    --argjson verdict "$verdict" '
+    --argjson verdict "$verdict" --argjson ao "$admin_override" '
       {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
        prefix_receipt:(if $tag == "null" then null else $tag end),
        receipt_written:($dry|not),watermark_advanced:false,fanout_authorized:false,
-       dry_run:$dry,validated_verdict:$verdict}'
+       dry_run:$dry,validated_verdict:$verdict} + $ao'
   log "historical chunk validated clean — retained as non-clearance prefix only; explicit --finalize-historical is still required"
   exit 9
 else
   set +e
+  ORCH_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/wave-audit-orchestrator.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$ORCH_OUTPUT"
   P4B_CODEX_EFFORT="$EFFORT" \
   P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
   P4B_DIFF_MAX_BYTES="$DIFF_MAX" \
-    "$ORCH" "${orch_args[@]}"
+    "$ORCH" "${orch_args[@]}" > "$ORCH_OUTPUT"
   orc=$?
   set -e
+  cat "$ORCH_OUTPUT"
+  # The orchestrator's last record that carries override fields wins.
+  orch_override="$(jq -sc 'map(select(type == "object" and has("admin_overridden"))) | last
+    | if . == null then empty else {admin_overridden, admin_override_quote} end' "$ORCH_OUTPUT" 2>/dev/null || true)"
+  [ -z "$orch_override" ] || WAVE_ADMIN_OVERRIDE="$orch_override"
 fi
 
 if [ "$FINALIZE_HISTORICAL" = true ] && [ "$orc" -ne 0 ]; then
