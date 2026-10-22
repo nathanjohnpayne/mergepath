@@ -1034,9 +1034,9 @@ phase_4b_automation:
   # future follow-up (not implemented in the reference).
   mode: local
 
-  # Declarative cap for callers that loop this one-review-round helper after
-  # CHANGES_REQUESTED. The reference orchestrator performs one adapter pass per
-  # invocation and does not persist round state.
+  # Enforced cap on completed automated Phase 4b rounds per PR (#2663). Read
+  # from the governing base policy; slots are reserved in the per-PR Git-ref
+  # round ledger before any adapter run (specs/phase_4b_round_cap.md).
   max_review_rounds: 20
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must

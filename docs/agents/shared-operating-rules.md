@@ -23,6 +23,21 @@ This applies to every hand-rolled, mid-session investigative query, not just the
 
 The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh api --paginate` for the REST arrays, and the GraphQL reads use cursor loops --- so this rule is aimed at the ad-hoc queries those helpers do not cover. When in doubt, add `--paginate`: it is a no-op on a short list and the only safe default on a long one.
 
+## GitHub REST and GraphQL rate limits are separate budgets
+
+GitHub meters REST and GraphQL separately. A user token gets 5,000 REST requests per hour and, independently, 5,000 GraphQL points per hour; exhausting one leaves the other intact. When a GraphQL call fails on the primary rate limit, switch that work to the equivalent REST endpoints and keep going, rather than waiting for the GraphQL window to reset.
+
+Several `gh` commands are GraphQL under the hood and spend that budget: `gh pr view --json`, `gh pr list`, `gh issue view --json`, `gh issue list`, `gh project ...` and `gh api graphql`. Their REST equivalents are plain `gh api` paths, for example `repos/OWNER/REPO/pulls/N`, `.../pulls/N/reviews`, `.../pulls/N/comments`, `.../issues/N`, `.../issues/N/comments` and `.../commits/SHA/check-runs`, each with `--paginate` under the rule above.
+
+Board moves are the exception: defer them until `resources.graphql.reset` rather than switching. GitHub does publish Projects (v2) REST endpoints, but the board helpers under `scripts/gh-projects/` are GraphQL-only and verify the author identity before every write, which a raw `gh api` call skips. The user-owned board endpoint also rejects fine-grained PATs. Never report a board move as done if it has not happened.
+
+Classify the failure by its message, not by its HTTP status. A GraphQL error can arrive as HTTP 200 with an `errors` entry as well as a 403 or 429. Check for a secondary limit first, because it can arrive with the primary budget also at zero:
+
+1. **Secondary (abuse) limit:** the message mentions a secondary rate limit, or the response carries `Retry-After`. It applies across both APIs, so switching to REST just hits it again. Back off instead: wait for `Retry-After` when present; otherwise, if `x-ratelimit-remaining` is 0, wait until `x-ratelimit-reset`; otherwise wait at least one minute. Lengthen the wait on each repeat. Most `gh` commands hide the response headers (`gh api --include` shows them); when you cannot see them, use the one-minute floor and lengthen it. Do not call `gh api rate_limit` until the wait is over: the probe itself counts against the secondary limit, and it can read healthy during one.
+2. **Primary limit:** otherwise, when the message says `API rate limit exceeded`, or `gh api rate_limit --jq '.resources | {core, graphql}'` shows that API's `remaining` at 0. Switching APIs works.
+
+GitHub App installation tokens (CI workflows) have their own separate budget.
+
 ## Background jobs and expected duration
 
 A backgrounded command must have an expected duration stated when it is launched, and must be checked against that expectation. Never report "still running" as a status without comparing elapsed time to the expectation. A completion notification fires only on completion; a hung job produces no notification and no error — it is indistinguishable from a job legitimately working. Passive waiting has no failure detection by default.

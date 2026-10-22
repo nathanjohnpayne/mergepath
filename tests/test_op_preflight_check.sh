@@ -2017,9 +2017,13 @@ EOF
   # reader must not source a half-written slot): a fresh fetch gives the
   # slot a new inode.
   local slot_path="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.slot" inode_before inode_after
+  local refresh_err="$case_dir/refresh.err" review_refresh_err="$case_dir/review-refresh.err" purge_err="$case_dir/purge.err"
   inode_before=$(stat -c %i "$slot_path" 2>/dev/null || stat -f %i "$slot_path")
-  (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
-    "$SCRIPT" --agent claude --mode all --skip-ssh --refresh >/dev/null 2>&1)
+  if ! (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --skip-ssh --refresh >/dev/null 2>"$refresh_err"); then
+    fail "test_all_mode_alternating_firebase_projects_do_not_evict: --mode all --refresh setup failed; stderr=$(cat "$refresh_err")"
+    return
+  fi
   inode_after=$(stat -c %i "$slot_path" 2>/dev/null || stat -f %i "$slot_path")
   if [ -z "$inode_after" ] || [ "$inode_before" = "$inode_after" ]; then
     fail "all-alternating: a refetch rewrote the deploy slot in place (inode $inode_before -> $inode_after)"
@@ -2043,8 +2047,11 @@ EOF
   # the deploy slot, CF_API_TOKEN included, must survive it intact.
   local injects_before
   injects_before=$(count_lines "$op_log" '^inject')
-  (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
-    "$SCRIPT" --agent claude --mode review --refresh --skip-ssh >/dev/null 2>&1)
+  if ! (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode review --refresh --skip-ssh >/dev/null 2>"$review_refresh_err"); then
+    fail "test_all_mode_alternating_firebase_projects_do_not_evict: --mode review --refresh setup failed; stderr=$(cat "$review_refresh_err")"
+    return
+  fi
   if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-after-review; then
     fail "all-alternating: --mode all after a review refresh failed; stderr=$(cat "$case_dir/proj-alpha/run-after-review.err")"
     return
@@ -2073,7 +2080,11 @@ EOF
   pass "test_all_mode_alternating_firebase_projects_do_not_evict: an expired deploy slot re-fetches"
 
   # --purge removes every slot and per-project key file for the agent.
-  PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" "$SCRIPT" --agent claude --purge 2>/dev/null
+  if ! PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --purge 2>"$purge_err"; then
+    fail "test_all_mode_alternating_firebase_projects_do_not_evict: --purge setup failed; stderr=$(cat "$purge_err")"
+    return
+  fi
   local leftover
   for leftover in "$cache_dir"/op-preflight-claude-deploy-* "$cache_dir"/op-preflight-claude-firebase-sa*; do
     if [ -e "$leftover" ]; then

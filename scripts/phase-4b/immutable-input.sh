@@ -158,7 +158,7 @@ p4b_capture_wave_input() { # repo pr base head request-json input-dir governing-
     MERGEPATH_REVIEW_POLICY_PATH="$scripts_root/../.github/review-policy.yml" \
     bash "$scripts_root/wave-audit.sh" "${args[@]}" || return 1
   jq -e --slurpfile requested "$request" \
-    'del(.manifest_blob,.scope_fingerprint) == $requested[0]' "$dest/wave/scope.json" >/dev/null || return 1
+    'del(.manifest_blob,.scope_fingerprint,.base_on_first_parent,.head_on_hub_default) == $requested[0]' "$dest/wave/scope.json" >/dev/null || return 1
   digest="$(p4b_input_digest "$dest/wave/review.diff")" || return 1
   pr_digest="$(jq -er '.diff_sha256' "$dest/input.json")" || return 1
   mv "$dest/review.diff" "$dest/pr.diff" || return 1
