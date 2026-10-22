@@ -347,7 +347,10 @@ test_unknown_prose_no_failover() {
   [ "$(stub_calls "$dir")" = "0" ] || fail "H: unknown prose invoked the Codex failover $(stub_calls "$dir") time(s)"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H: unknown prose classified as rate_limit_stalled"
   [ "$(jqf "$dir" '.codex_failover_requested' 2>/dev/null)" != "true" ] || fail "H: unknown prose reported a failover"
-  [ "$FAIL" -ne "$before" ] || pass "H: unknown warning prose never fires the Codex failover (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null) disposition=$(jqf "$dir" '.disposition' 2>/dev/null))"
+  # It is not a review either: an unprocessed head must never clear.
+  [ "$rc" != "0" ] || fail "H: the processing-error notice exited 0"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H: the processing-error notice cleared an unreviewed head"
+  [ "$FAIL" -ne "$before" ] || pass "H: CodeRabbit's processing-error notice neither fires the failover nor clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
 }
 
 # #2139: drive the actual full clearance checker, then the fixture approval

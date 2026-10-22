@@ -1478,6 +1478,17 @@ classify_comment() {
     echo "in_progress"
     return
   fi
+  # #2657: CodeRabbit's processing-error notice ("Something unexpected
+  # happened ... We could not process this pull request right now") is not a
+  # review, and grading it `review` let it clear an unreviewed head. It is
+  # graded like narration: the poll loop keeps polling and the review
+  # selector skips it, so the run ends in a timeout, never a clearance. The
+  # persistent summary is excluded as above, since its content may quote
+  # the phrase.
+  if [[ "$body" != "$SUMMARY_MARKER"* ]] && grep -qiE 'Something unexpected happened|could not process this pull request' <<<"$body"; then
+    echo "status_probe"
+    return
+  fi
   # The `review` default is deliberate, and it is only safe because NO CALLER
   # MAY REACH IT WITH AN UNREAD BODY (#957 acceptance criterion 3).
   #
