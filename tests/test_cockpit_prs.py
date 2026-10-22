@@ -710,7 +710,8 @@ class PRTests(unittest.TestCase):
                 client,settled,last,_=run(setup=lambda c:setattr(c,'rest_failure',failure))
                 self.assertEqual(reads(client),3);self.assertEqual(last['observed_at'],1060)
         for name,setup in {'malformed head':lambda c:c.pulls[0]['head'].update(sha=None),
-                           'missing run field':lambda c:c.runs[0].pop('completed_at')}.items():
+                           'missing run field':lambda c:c.runs[0].pop('completed_at'),
+                           'statuses past the first page':lambda c:c.status.update(total_count=101)}.items():
             with self.subTest(failure=name):
                 client,settled,last,_=run(setup=setup)
                 self.assertEqual(reads(client),3)

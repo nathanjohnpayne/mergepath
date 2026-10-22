@@ -637,6 +637,9 @@ class PRProvider:
                 runs = self.client.pages(f"/repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100",
                                          collection="check_runs", deadline=deadline)
                 status = self.client.get(f"/repos/{repo}/commits/{head}/status?per_page=100", deadline=deadline)
+                if type(status["total_count"]) is not int or status["total_count"] > len(status["statuses"]):
+                    # Contexts past the first page could change unseen: a partial page is no evidence.
+                    raise ClientError("invalid_page")
                 evidence.append([
                     pull["number"], head, pull["updated_at"], pull["draft"], pull["base"]["ref"],
                     sorted(label["name"] for label in pull["labels"]),
