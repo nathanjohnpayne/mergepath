@@ -22,14 +22,21 @@ Install `gh`, `op`, `git`, mikefarah `yq`, `rsync` and Python 3 before running t
 
 ```bash
 # From mergepath's worktree root, on main, clean.
-eval "$(scripts/op-preflight.sh --agent claude --mode all)"   # cache PATs
-scripts/bootstrap-new-repo.sh my-new-repo \
-  --description "A short one-line description." \
-  --visibility private \
-  --firebase none \
-  --codex-app n \
-  --project new
+if preflight_exports="$(scripts/op-preflight.sh --agent claude --mode review)" \
+  && eval "$preflight_exports"; then
+  scripts/bootstrap-new-repo.sh my-new-repo \
+    --description "A short one-line description." \
+    --visibility private \
+    --firebase none \
+    --codex-app n \
+    --project new
+else
+  echo "Preflight or export evaluation failed; stop and confirm readiness before retrying." >&2
+  exit 1
+fi
 ```
+
+The wizard runs only after review preflight and evaluation both succeed. If either fails, stop and ask the human to confirm readiness before retrying; do not continue with credential-dependent commands.
 
 The wizard prompts for any input you didn't pass via flag, confirms, then runs four stages: `template-mirror` → `github-infra` → `firebase-and-codereview` → `board-and-summary`. The final stage emits an end-of-run summary block (also appended to `~/GitHub/my-new-repo/.bootstrap-log`) with DONE / SKIPPED / WARNINGS / NEXT STEPS sections.
 
