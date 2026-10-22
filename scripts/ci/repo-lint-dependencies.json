@@ -85,19 +85,23 @@
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh",
       "scripts/bootstrap-new-repo.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_bootstrap_firebase_and_codereview": [
       "tests/test_bootstrap_firebase_and_codereview.sh",
       "scripts/bootstrap-new-repo.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_bootstrap_github_infra": [
       "tests/test_bootstrap_github_infra.sh",
       "scripts/bootstrap-new-repo.sh",
       "scripts/gh-as-author.sh",
       "scripts/op-preflight.sh",
-      "scripts/bootstrap/template-mirror.sh"
+      "scripts/bootstrap/template-mirror.sh",
+      "scripts/bootstrap/github-infra.sh",
+      "scripts/sync-labels.sh"
     ],
     "check_bootstrap_sh": [
       "tests/test_bootstrap_sh.sh",
@@ -114,7 +118,9 @@
       "scripts/gh-as-author.sh",
       "scripts/policy-sim.sh",
       "scripts/project-doc-sync.sh",
-      "scripts/wave-audit.sh"
+      "scripts/wave-audit.sh",
+      "scripts/bootstrap/github-infra.sh",
+      "scripts/sync-labels.sh"
     ],
     "check_bootstrap_wizard": [
       "tests/test_bootstrap_wizard.sh",
@@ -623,8 +629,7 @@
     "check_sync_labels": [
       "tests/test_sync_labels.sh",
       "scripts/sync-labels.sh",
-      "scripts/bootstrap/github-infra.sh",
-      ".mergepath-sync.yml"
+      "scripts/bootstrap/github-infra.sh"
     ],
     "check_wave_audit": [
       "tests/test_wave_audit.sh",
