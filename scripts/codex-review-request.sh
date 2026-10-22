@@ -2029,7 +2029,8 @@ run_feedback_accounting_gate() {
 # #2657: five-request checkpoint. Once a PR already counts
 # CODEX_REQUEST_CHECKPOINT_AFTER counted requests (the same crqe_count_triggers
 # count the ceiling uses; failover triggers excluded), record ONE author-owned
-# marker comment before the next new request, so a restarted session sees it.
+# marker comment once the next new request has posted, so a restarted session
+# sees it.
 # It asks the agent to reassess scope and recurring findings, batch the
 # remaining fixes and strengthen tests before continuing. It is informational:
 # it never blocks, never spends or refunds a request, and a failed write only
@@ -2717,17 +2718,23 @@ post_codex_trigger() {
   # confirmed without spending another (#2631).
   local caller_mode="$REQUEST_MODE"
   [ "$TRIGGER_POSTED" != true ] || caller_mode=""
-  # A CodeRabbit failover stands in for a lost review, not a deliberate
-  # round, so it never records (and so never uses up) the checkpoint.
-  if [ "$TRIGGER_POSTED" != true ] && [ "$FAILOVER" != true ]; then
-    record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
-  fi
+  # The checkpoint belongs to a new deliberate request, and is recorded only
+  # once that request has actually posted: a requester that loses the
+  # trigger write records nothing, so concurrent requesters at the threshold
+  # cannot each add one (#1362 serializes the write itself). A CodeRabbit
+  # failover stands in for a lost review, not a deliberate round, so it
+  # never records (and so never uses up) the checkpoint.
+  local record_checkpoint=false
+  if [ "$TRIGGER_POSTED" != true ] && [ "$FAILOVER" != true ]; then record_checkpoint=true; fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
+  if [ "$record_checkpoint" = true ]; then
+    record_request_checkpoint "$request_comments" "$request_count" "$max_review_rounds"
+  fi
 
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,

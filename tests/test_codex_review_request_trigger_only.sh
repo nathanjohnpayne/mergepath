@@ -105,6 +105,8 @@ done
 if [ "${9:-}" != "@codex review" ]; then
   echo "trigger body was not exact '@codex review': $*" >&2; exit 98
 fi
+# #2657: a refused trigger write (the loser of a concurrent request).
+[ "${CODEX_TEST_TRIGGER_FAIL:-0}" != 1 ] || { echo "trigger write refused" >&2; exit 1; }
 count=0
 [ -f "$state_dir/trigger-count" ] && count=$(cat "$state_dir/trigger-count")
 count=$((count + 1))
@@ -564,6 +566,14 @@ EOF
     && [ "$(jqf "$dir" '.request_checkpoint // "null"')" = null ] \
     || fail "#2657: a failover trigger recorded the checkpoint (rc=$rc posts=$(trig_count "$dir") checkpoints=$(cp_count "$dir")); $(tail -3 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: a failover trigger never records the checkpoint"
+  # A requester whose own trigger write is refused records no checkpoint, so
+  # concurrent requesters at the threshold cannot each add one.
+  before=$FAIL
+  dir=$(make_case "checkpoint-trigger-refused")
+  rc=$(CODEX_TEST_TRIGGER_FAIL=1 run_trigger_only "$dir" cp_five)
+  [ "$rc" = 3 ] && [ "$(trig_count "$dir")" = 0 ] && [ "$(cp_count "$dir")" = 0 ] \
+    || fail "#2657: a refused trigger write still recorded a checkpoint (rc=$rc posts=$(trig_count "$dir") checkpoints=$(cp_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "#2657 checkpoint: only a request that posted records the checkpoint"
 }
 
 test_nondefault_request_attempt_cap() {
