@@ -446,6 +446,7 @@
       "tests/fixtures/coderabbit_status_refusal.json",
       "tests/fixtures/coderabbit_quota_refusal.json",
       "tests/test_phase_4b_immutable_input.sh",
+      "tests/test_phase_4b_round_cap.sh",
       "scripts/coderabbit-automerge-rate-limit-gate.sh",
       "scripts/coderabbit-record-feedback.sh",
       "scripts/coderabbit-severity-gate.sh",

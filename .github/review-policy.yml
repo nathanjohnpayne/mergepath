@@ -1037,13 +1037,11 @@ phase_4b_automation:
   # future follow-up (not implemented in the reference).
   mode: local
 
-  # Completed Phase 4b round cap (#2665, epic #2657). DECLARATIVE ONLY until the
-  # round ledger (#2663) is merged and installed: the reference orchestrator
-  # performs one adapter pass per invocation, does not persist round state and
-  # does not read this value, so 3 has NO enforcement effect yet. Once #2663
-  # lands, refs/mergepath/p4b-rounds/pr-<N> is the sole reservation and cap
-  # authority and a 4th completed round is refused for an owner decision.
-  # Previously 20.
+  # Enforced cap on completed automated Phase 4b rounds per PR (#2663). Read
+  # from the governing base policy; slots are reserved in the per-PR Git-ref
+  # round ledger before any adapter run (specs/phase_4b_round_cap.md).
+  # Lowered 20 -> 3 by #2665 (epic #2657): a 4th completed round is refused
+  # for an owner decision.
   max_review_rounds: 3
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must

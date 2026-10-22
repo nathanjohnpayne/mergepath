@@ -45,6 +45,21 @@ function classify(diff, files) {
   return { decision: tripwires.length ? 'human-review' : 'model-review', tripwires };
 }
 
+// Only an ordinary wave qualifies: its audited head on the first-parent history
+// of the hub's live default branch on GitHub (it merged; #2694), its base on that head's
+// first-parent history (a merged hub state), and no historical chunk boundary,
+// which wave code checks by plain ancestry and could fall on a never-merged
+// commit. The live verifier proves byte equality with the source SHA, not that
+// the source SHA merged; head_on_hub_default is what proves that.
+function verifiedWave(metadata) {
+  const scope = metadata.wave_audit;
+  return scope !== null && typeof scope === 'object' && !Array.isArray(scope)
+    && /^[0-9a-f]{40}$/.test(scope.canonical_base_sha) && /^[0-9a-f]{40}$/.test(scope.canonical_head_sha)
+    && scope.base_on_first_parent === true
+    && scope.head_on_hub_default === true
+    && scope.historical_end_sha === '' && scope.finalize_historical === false;
+}
+
 function capturedInput(directory) {
   const metadata = JSON.parse(fs.readFileSync(path.join(directory, 'input.json'), 'utf8'));
   for (const key of ['merge_base_sha', 'head_sha']) {
@@ -56,6 +71,15 @@ function capturedInput(directory) {
   const expected = wave ? metadata.pr_diff_sha256 : metadata.diff_sha256;
   if (!/^[0-9a-f]{64}$/.test(expected) || crypto.createHash('sha256').update(diff).digest('hex') !== expected) {
     throw new Error('changed capture');
+  }
+  // #2633: a wave canary whose trusted capture byte-verified it against
+  // canonical source (`wave_audit`, written only by p4b_capture_wave_input
+  // after verify-live-propagation.sh binds source, head and base) carries no
+  // PR-authored bytes. Every line already merged on the hub through its own
+  // review and its own tripwire stop, so re-escalating the mirror only
+  // double-gates reviewed content. The digest check above still binds pr.diff.
+  if (wave && verifiedWave(metadata)) {
+    return { decision: 'model-review', tripwires: [], exemption: 'verified-propagation' };
   }
   const env = { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0' };
   const files = execFileSync('git', [

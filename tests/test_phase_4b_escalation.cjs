@@ -146,4 +146,32 @@ test('captured Git objects determine both rename sides and complete wave scope',
   assert.equal(capturedInput(directory).decision, 'human-review');
   fs.appendFileSync(path.join(directory, 'pr.diff'), 'changed');
   assert.throws(() => capturedInput(directory));
+  // #2633: only the verified capture's binding of an ordinary wave from a
+  // first-parent base exempts the mirror, and the pr.diff digest still binds it.
+  fs.writeFileSync(path.join(directory, 'pr.diff'), diff);
+  const ordinary = () => ({ canonical_base_sha: base, canonical_head_sha: head, historical_end_sha: '', finalize_historical: false, base_on_first_parent: true, head_on_hub_default: true });
+  metadata.wave_audit = ordinary();
+  writeMetadata();
+  assert.deepEqual(capturedInput(directory), { decision: 'model-review', tripwires: [], exemption: 'verified-propagation' });
+  const variants = [null, [], {}, { canonical_base_sha: base },
+    { ...ordinary(), canonical_base_sha: 'x' },
+    { ...ordinary(), base_on_first_parent: false }, { ...ordinary(), base_on_first_parent: 'true' },
+    { ...ordinary(), head_on_hub_default: false }, (({ head_on_hub_default, ...rest }) => rest)(ordinary()),
+    (({ base_on_first_parent, ...rest }) => rest)(ordinary()),
+    { ...ordinary(), historical_end_sha: head }, { ...ordinary(), finalize_historical: true },
+    (({ historical_end_sha, ...rest }) => rest)(ordinary())];
+  for (const scope of variants) {
+    metadata.wave_audit = scope; writeMetadata();
+    assert.equal(capturedInput(directory).decision, 'human-review', JSON.stringify(scope));
+  }
+  metadata.wave_audit = ordinary();
+  delete metadata.pr_diff_sha256; metadata.diff_sha256 = hash(diff);
+  fs.writeFileSync(path.join(directory, 'review.diff'), diff);
+  writeMetadata();
+  assert.equal(capturedInput(directory).decision, 'human-review', 'wave_audit without a wave capture does not exempt');
+  metadata.pr_diff_sha256 = hash(diff); metadata.diff_sha256 = hash(Buffer.from('+safe curated text\n'));
+  fs.writeFileSync(path.join(directory, 'review.diff'), '+safe curated text\n');
+  writeMetadata();
+  fs.appendFileSync(path.join(directory, 'pr.diff'), 'changed');
+  assert.throws(() => capturedInput(directory), 'a changed mirror still refuses under the exemption');
 });

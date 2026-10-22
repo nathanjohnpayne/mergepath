@@ -50,7 +50,9 @@
 #   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
 #           orchestrator requires human review (deterministic tripwire or
 #           Codex-cap human stop). No reviewer authority
-#           or tag follows. Never fan out on either shape.
+#           or tag follows. Never fan out on either shape. An ordinary wave
+#           whose byte-verified canary is audited from a first-parent base
+#           does not trip the deterministic tripwires (#2633).
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
@@ -421,7 +423,7 @@ SCOPE_FINGERPRINT="$(printf 'version=1\nbase=%s\nhead=%s\nmanifest=%s\nexcludes<
 TMP_FILES=()
 cleanup() {
   local cleanup_file
-  for cleanup_file in "${TMP_FILES[@]}"; do rm -f "$cleanup_file"; done
+  for cleanup_file in "${TMP_FILES[@]}"; do rm -rf "$cleanup_file"; done
 }
 trap cleanup EXIT
 DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-diff.XXXXXX")"
@@ -758,12 +760,47 @@ fi
 # a watermark. The trusted orchestrator independently invokes this mode.
 if [ -n "$CAPTURE_INPUT_DIR" ]; then
   cp "$DIFF_FILE" "$CAPTURE_INPUT_DIR/review.diff"
+  # #2633: a base on the audited head's first-parent history is a merged hub
+  # state, so the curated diff carries no never-merged intermediate bytes.
+  # Only then may escalation treat the verified canary as reviewed content.
+  # grep must drain rev-list: with pipefail, an early `grep -q` exit SIGPIPEs
+  # the producer and reads a long, valid history as "not found".
+  base_on_first_parent=false
+  if git -C "$REPO_DIR" rev-list --first-parent "$HEAD_FULL" | grep -Fx -- "$BASE_FULL" >/dev/null; then
+    base_on_first_parent=true
+  fi
+  # The audited head itself must be a merged hub state. The propagation
+  # verifier byte-checks the canary against the source SHA but does not prove
+  # that SHA merged, so without this an unmerged commit sitting on the
+  # watermark would pass the base test above.
+  #
+  # The trust anchor is GitHub's own default branch of the hub, read live: a
+  # commit-only clone (no trees or blobs, about 1 s) of the public hub, whose
+  # HEAD is the default branch GitHub serves. No local state is consulted
+  # (#2694): a stale `refs/remotes/origin/HEAD` could name an old,
+  # since-unprotected branch, and the trusted checkout's own HEAD could carry
+  # a local, unpushed commit (#628 is an operational rule, not a check). The
+  # hub is public, so the clone needs no credentials in the capture child's
+  # isolated environment. First-parent, because the hub allows merge commits:
+  # a commit reachable only through a merged branch never was a merged head.
+  # Any failure withholds the exemption (a human is asked), never grants it.
+  head_on_hub_default=false
+  if hub_history=$(mktemp -d "${TMPDIR:-/tmp}/wave-audit-hub.XXXXXX"); then
+    TMP_FILES[${#TMP_FILES[@]}]="$hub_history"
+    if GIT_TERMINAL_PROMPT=0 git clone --quiet --bare --single-branch --no-tags --filter=tree:0 \
+         https://github.com/nathanjohnpayne/mergepath.git "$hub_history/hub.git" >/dev/null 2>&1 \
+       && git -C "$hub_history/hub.git" rev-list --first-parent HEAD | grep -Fx -- "$HEAD_FULL" >/dev/null; then
+      head_on_hub_default=true
+    fi
+  fi
   jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --argjson first_parent "$base_on_first_parent" --argjson on_default "$head_on_hub_default" \
     --arg end "${HISTORICAL_END:+$RANGE_HEAD}" --argjson final "$FINALIZE_HISTORICAL" \
     --arg manifest "$MANIFEST_BLOB" --arg fingerprint "$SCOPE_FINGERPRINT" \
     '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,
       historical_end_sha:$end,finalize_historical:$final,
-      manifest_blob:$manifest,scope_fingerprint:$fingerprint}' > "$CAPTURE_INPUT_DIR/scope.json"
+      manifest_blob:$manifest,scope_fingerprint:$fingerprint,
+      base_on_first_parent:$first_parent,head_on_hub_default:$on_default}' > "$CAPTURE_INPUT_DIR/scope.json"
   chmod 400 "$CAPTURE_INPUT_DIR/review.diff" "$CAPTURE_INPUT_DIR/scope.json"
   exit 0
 fi
