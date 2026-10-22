@@ -148,7 +148,7 @@ pr_body_validate() {
   if [ "$count_rc" -ne 0 ] || [ "$author_rc" -ne 0 ]; then
     echo "Cannot validate the Authoring-Agent: the PR-body parser did not complete (status ${count_rc}/${author_rc})." >&2
     if [ "$count_rc" -eq 124 ] || [ "$author_rc" -eq 124 ]; then
-      echo "Status 124 means it exceeded the ${PR_BODY_CONTRACT_TIMEOUT_SECONDS}s wall-clock bound; see the parsing-cost limitation in specs/pr_body_contract.md." >&2
+      echo "Status 124 means it exceeded the ${PR_BODY_CONTRACT_TIMEOUT_SECONDS}s wall-clock bound; see the parsing-cost limitation at https://github.com/nathanjohnpayne/mergepath/blob/main/specs/pr_body_contract.md." >&2
     fi
     echo "This is an infrastructure or input-complexity problem, not a missing declaration." >&2
     failed=1

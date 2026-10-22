@@ -1232,6 +1232,12 @@ else
   bad "#1281: pr_body_validate failed closed but misattributed the cause: $prod_validate_out"
 fi
 
+if grep -Fq "https://github.com/nathanjohnpayne/mergepath/blob/main/specs/pr_body_contract.md" <<<"$prod_validate_out"; then
+  ok "#1310: parser timeout guidance points to the canonical specification"
+else
+  bad "#1310: parser timeout guidance is not resolvable from a consumer: $prod_validate_out"
+fi
+
 # The other half of that guarantee: the diagnosis must not be the author-blaming
 # one. Without this, rewording the timeout branch back into "missing a valid
 # Authoring-Agent" would still pass the check above.
