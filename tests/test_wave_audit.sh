@@ -617,6 +617,15 @@ git -C "$CANON" tag -l --format='%(contents)' "wave-audit-pass/$LARGE_HEAD" | gr
   && pass "admin override marks the watermark annotation" || fail "watermark annotation lacks admin-override=true"
 git -C "$CANON" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-pass/$LARGE_HEAD" >/dev/null 2>&1 || true
+# A missing quote never consumes the next option as authorization text.
+for option_quote in --dry-run -n; do
+  rc=0
+  run_wa "$POLICY_GOOD" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" \
+    --admin-override "$option_quote" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+    && pass "admin override refuses option token $option_quote as its quote" \
+    || fail "admin override consumed option token $option_quote (rc=$rc)"
+done
 # The orchestrator's quote checks apply before the budget exit (POLICY_SMALL
 # would exit 8 here) and before a capture writes its scope.
 for bad_quote in '  ' $'two\nlines' $'carriage\rreturn' "$(printf 'q%.0s' $(seq 1 501))"; do
@@ -821,6 +830,17 @@ git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-prefix/$LARGE_H
       and .review_provenance.admin_overridden[0].tripwires == ["reviewer-address"]' >/dev/null \
   && pass "historical override keeps the override in its summary and prefix receipt" \
   || fail "historical override dropped the override fields (rc=$rc): $(tail -n 2 "$WORK/historical-override.err")"
+# The exact-receipt retry reuses that receipt without another review; its
+# exit-9 summary still reports the override the receipt records.
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/historical-override-reuse.json" 2> "$WORK/historical-override-reuse.err" || rc=$?
+[ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] \
+  && jq -e '.receipt_reused and .admin_override_quote == "Owner: run it"
+    and .admin_overridden[0].tripwires == ["reviewer-address"]' "$WORK/historical-override-reuse.json" >/dev/null \
+  && pass "reused overridden prefix receipt keeps the override in its summary" \
+  || fail "reused overridden prefix receipt dropped the override fields (rc=$rc)"
 git -C "$CANON" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
 git -C "$REMOTE" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null 2>&1 || true
 rc=0
@@ -1103,6 +1123,28 @@ jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and
   || fail "final cumulative receipt package is mislabeled or incomplete"
 remote_has_tag "$LARGE_HEAD" && pass "only explicit successful finalization advances full watermark" \
   || fail "successful finalization did not advance full watermark"
+# #2633: with no overridden receipt and no override flag, finalization's
+# watermark carries no override marker (control for the case below).
+git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" | grep -q 'admin-override=true' \
+  && fail "finalization without an overridden receipt marked admin-override" \
+  || pass "finalization without an overridden receipt is not marked admin-override"
+# A finalization whose retained receipt was validated past an overridden
+# tripwire needs no override of its own, yet its watermark is marked.
+OVR_HEAD="$(git -C "$CANON" commit-tree "$LARGE_HEAD^{tree}" -p "$LARGE_HEAD" -m 'override finalization head')"
+rc=0
+FAKE_ORCH_JSON=clean FAKE_ORCH_OVERRIDE=1 run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
+  --base "$C1" --head-sha "$OVR_HEAD" --historical-end "$OVR_HEAD" --admin-override 'Owner: run it' \
+  > "$WORK/override-chunk.json" 2> "$WORK/override-chunk.err" || rc=$?
+[ "$rc" -eq 9 ] && pass "overridden historical chunk retained for the finalization case" \
+  || fail "overridden historical chunk returned $rc: $(tail -n 2 "$WORK/override-chunk.err")"
+rc=0
+run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer --base "$C1" --head-sha "$OVR_HEAD" \
+  --finalize-historical > "$WORK/override-final.json" 2> "$WORK/override-final.err" || rc=$?
+git -C "$CANON" fetch -q --force "$REMOTE" "refs/tags/wave-audit-pass/$OVR_HEAD:refs/tags/wave-audit-pass/$OVR_HEAD" 2>/dev/null || true
+[ "$rc" -eq 0 ] && ! grep -Fxq -- '--admin-override' "$CAPTURE/args" \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$OVR_HEAD" | grep -q 'admin-override=true' \
+  && pass "finalization over an overridden receipt marks the watermark admin-override=true" \
+  || fail "finalization over an overridden receipt (rc=$rc) left the watermark unmarked: $(tail -n 2 "$WORK/override-final.err")"
 jq -e --argjson files "$HIST_SCOPE_FILES" --argjson bytes "$HIST_SCOPE_BYTES" \
   '.scope_files == $files and .scope_bytes == $bytes' "$WORK/historical-final.json" >/dev/null \
   && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" \

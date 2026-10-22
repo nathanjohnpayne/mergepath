@@ -192,7 +192,9 @@ while [ $# -gt 0 ]; do
     --historical-end) HISTORICAL_END="${2:-}"; shift 2 ;;
     --finalize-historical) FINALIZE_HISTORICAL=true; shift ;;
     --admin-override)
-      [ $# -ge 2 ] || die 3 "--admin-override requires the owner's quoted authorization"
+      # A quote that starts with "-" is a mistyped option (`--admin-override
+      # --dry-run`), never authorization text: refuse rather than consume it.
+      case "${2:-}" in ''|-*) die 3 "--admin-override requires the owner's quoted authorization" ;; esac
       ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     --parse-title-only)
       parse_title "${2:-}" || die 3 "no mergepath@<sha> in title: ${2:-}"
@@ -546,11 +548,13 @@ if [ -n "$HISTORICAL_END" ]; then
     jq -n --arg base "$(printf '%s' "$retained_json" | jq -r .chunk_base)" \
       --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" --arg tag "$retained_tag" \
       --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
-      --argjson verdict "$(printf '%s' "$retained_json" | jq -c .validated_verdict)" '
+      --argjson verdict "$(printf '%s' "$retained_json" | jq -c .validated_verdict)" \
+      --argjson ao "$(printf '%s' "$retained_json" | jq -c '.review_provenance |
+        {admin_overridden:(.admin_overridden // []),admin_override_quote:(.admin_override_quote // null)}')" '
         {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
          prefix_receipt:$tag,receipt_written:($dry|not),receipt_reused:true,
          watermark_advanced:false,fanout_authorized:false,dry_run:$dry,
-         validated_verdict:$verdict}'
+         validated_verdict:$verdict} + $ao'
     if [ "$DRY_RUN" = true ]; then
       log "historical chunk receipt already validated — dry-run made no receipt write or push; no full-wave clearance"
     else
@@ -648,6 +652,18 @@ REPORT_FILES="$FILES"
 # as success — the push runs unconditionally, so the documented rerun
 # recovery actually recovers (Codex P2 on #663); pushing an already-present
 # remote tag with the same object is a no-op success.
+# #2633: a watermark is marked when this run carried the owner's override, or
+# when it finalizes historical coverage whose retained receipts record one: a
+# finalization needs no override of its own, yet its clearance rests on them.
+admin_override_marked() {
+  if [ "$ADMIN_OVERRIDE_SET" = true ]; then echo true; return; fi
+  if [ "$FINALIZE_HISTORICAL" = true ] && jq -se \
+    'any(.[]; (.review_provenance.admin_overridden // []) | length > 0)' "$RECEIPT_CHAIN" >/dev/null; then
+    echo true; return
+  fi
+  echo false
+}
+
 advance_watermark() {
   local tag="${TAG_PREFIX}/${HEAD_FULL}"
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
@@ -656,7 +672,7 @@ advance_watermark() {
     revalidate_canary_pair "writing wave watermark"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
-        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}$([ "$ADMIN_OVERRIDE_SET" = true ] && printf ' admin-override=true')" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}$([ "$(admin_override_marked)" = true ] && printf ' admin-override=true')" \
         "$HEAD_FULL"
   fi
   revalidate_canary_pair "publishing wave watermark"

@@ -1153,6 +1153,63 @@ if [ "$rc" = 3 ] && [ ! -e "$WORK/integrity-adapter-ran" ] && [ ! -e "$P4B_TEST_
 else
   fail "admin override over a capture refusal (rc=$rc): $(tail -n 3 "$WORK/override-capture.stderr")"
 fi
+# A missing quote never consumes the next option as authorization text: a
+# mistyped `--admin-override --dry-run` must not run a live, posting review.
+for option_quote in --dry-run -n; do
+  cp "$WORK/tripwire-original.diff" "$DIFF"
+  printf 'REVIEW_POLICY.md\0' > "$WORK/tripwire-paths"
+  rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
+  rc=0
+  PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+    P4B_ACCT_STATE_DIR="$WORK/override-option-state" P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    bash "$ORCH" 1757 --repo o/r --author claude --admin-override "$option_quote" \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" >/dev/null 2>"$WORK/override-option.stderr" || rc=$?
+  if [ "$rc" = 3 ] && [ ! -e "$WORK/integrity-adapter-ran" ] && [ ! -e "$P4B_TEST_POSTED_REVIEW" ]; then
+    pass "admin override refuses option token $option_quote as its quote"
+  else
+    fail "admin override consumed option token $option_quote (rc=$rc)"
+  fi
+done
+# Only a well-formed tripwire match is absorbed. A skewed classifier result is
+# an input-integrity stop (exit 3) under the override, and stays the ordinary
+# fail-closed exit 8 without it. A copied tree swaps in a stub escalation.cjs.
+SKEW_ROOT="$WORK/escalation-skew"
+mkdir -p "$SKEW_ROOT"
+cp -R "$ROOT/scripts" "$SKEW_ROOT/scripts"
+printf '%s\n' 'process.stdout.write(process.env.P4B_TEST_ESCALATION);' > "$SKEW_ROOT/scripts/phase-4b/escalation.cjs"
+rm -f "$WORK/tripwire-paths"
+cp "$WORK/tripwire-original.diff" "$DIFF"
+for skew_case in empty:override:3 'non-array:override:3' 'unknown-code:override:3' 'empty-list:override:3' \
+  'duplicate:override:3' 'model-review-code:override:3' empty:none:8 known:override:0; do
+  skew_name=${skew_case%%:*}; skew_rest=${skew_case#*:}; skew_mode=${skew_rest%%:*}; skew_want=${skew_rest#*:}
+  case "$skew_name" in
+    empty) skew_json='{}' ;;
+    non-array) skew_json='{"decision":"human-review","tripwires":"reviewer-address"}' ;;
+    unknown-code) skew_json='{"decision":"human-review","tripwires":["future-code"]}' ;;
+    empty-list) skew_json='{"decision":"human-review","tripwires":[]}' ;;
+    duplicate) skew_json='{"decision":"human-review","tripwires":["reviewer-address","reviewer-address"]}' ;;
+    model-review-code) skew_json='{"decision":"model-review","tripwires":["reviewer-address"]}' ;;
+    known) skew_json='{"decision":"human-review","tripwires":["reviewer-address"]}' ;;
+  esac
+  skew_args=()
+  [ "$skew_mode" = none ] || skew_args=(--admin-override 'Owner: run it')
+  rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
+  rc=0
+  PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_TEST_ESCALATION="$skew_json" \
+    CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+    P4B_ACCT_STATE_DIR="$WORK/override-skew-$skew_name-$skew_mode-state" P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    P4B_WRAPPER_LOG="$WORK/override-skew-wrapper.log" \
+    bash "$SKEW_ROOT/scripts/phase-4b-review.sh" 1757 --repo o/r --author claude ${skew_args[@]+"${skew_args[@]}"} \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" >/dev/null 2>"$WORK/override-skew.stderr" || rc=$?
+  skew_ran=false; [ -e "$WORK/integrity-adapter-ran" ] && skew_ran=true
+  if [ "$rc" = "$skew_want" ] && { [ "$skew_want" = 0 ] || [ "$skew_ran" = false ]; } \
+     && { [ "$skew_want" != 0 ] || [ "$skew_ran" = true ]; }; then
+    pass "escalation result $skew_name with override=$skew_mode exits $skew_want"
+  else
+    fail "escalation result $skew_name with override=$skew_mode (rc=$rc want=$skew_want ran=$skew_ran): $(tail -n 2 "$WORK/override-skew.stderr")"
+  fi
+done
 # Round-5 P1: once the override absorbed a tripwire, an adapter that yields no
 # usable verdict must not reach the exit-4 "reviewer unavailable" fallback that
 # wave-audit.sh may fan out on. The tripwire still holds: exit 8, no handoff,

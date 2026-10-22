@@ -284,7 +284,9 @@ while [ $# -gt 0 ]; do
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
     --admin-override)
-      [ $# -ge 2 ] || p4b_die 3 "--admin-override requires the owner's quoted authorization"
+      # A quote that starts with "-" is a mistyped option (`--admin-override
+      # --dry-run`), never authorization text: refuse rather than consume it.
+      case "${2:-}" in ''|-*) p4b_die 3 "--admin-override requires the owner's quoted authorization" ;; esac
       ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
@@ -866,14 +868,22 @@ hold_for_external_review() {
 # boundary recheck is skipped. Barrier and Codex human stops keep their own
 # owner exits (#2544) because absorbing them would skip the barrier's
 # CodeRabbit arm and its budget evidence.
+#
+# Only a well-formed tripwire match is absorbed: decision human-review and a
+# non-empty, duplicate-free list of the fixed reason codes escalation.cjs
+# emits. Any other classifier result (version skew, `{}`, a non-array) is an
+# input-integrity failure, never a stop the owner's quote can run past.
 admin_override_absorbs() {
   [ "$ADMIN_OVERRIDE_SET" = true ] || return 1
   local payload="$1" entry
-  entry="$(jq -c '{decision:(.decision // null),reason:(.reason // null),
-    tripwires:(.tripwire.tripwires // null),codex_evidence:(.codex_evidence // null)}' \
-    <<<"$payload" 2>/dev/null)" || entry='{"decision":"unreadable"}'
+  jq -e '.tripwire | type == "object" and .decision == "human-review"
+    and (.tripwires | type == "array" and length > 0 and length == (unique | length))
+    and all(.tripwires[]; . == "reviewer-address" or . == "verdict-instruction"
+      or . == "authorization-policy-publisher-or-credentials")' <<<"$payload" >/dev/null 2>&1 \
+    || p4b_die 3 "admin override (#2633): the escalation result is not a well-formed tripwire match; refusing to run past it"
+  entry="$(jq -c '{decision,reason,tripwires:.tripwire.tripwires}' <<<"$payload")"
   ADMIN_OVERRIDDEN="$(jq -c --argjson e "$entry" '. + [$e] | unique' <<<"$ADMIN_OVERRIDDEN")"
-  p4b_warn "admin override (#2633): continuing past a human stop ($(jq -r '.reason // "unreadable"' <<<"$entry")) to the real adapter"
+  p4b_warn "admin override (#2633): continuing past a deterministic tripwire ($(jq -r '.tripwires | join(", ")' <<<"$entry")) to the real adapter"
   return 0
 }
 
