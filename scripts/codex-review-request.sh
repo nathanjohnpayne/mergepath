@@ -608,9 +608,10 @@ __cra_retire_base_cfg() { # <new-path-or-empty>
 # #2664: a retry intent recorded but not yet resolved (posted, or refused
 # and withdrawn) when the process exits, for example through an accounting or
 # blocking-budget stop inside the write path, is withdrawn on the way out.
-# Once the retry's own write is in flight the intent stays live: that write
-# may have landed, and the intent then still marks it.
-trap '[ "${RETRY_INTENT_PENDING:-false}" != true ] || [ "${RETRY_WRITE_IN_FLIGHT:-false}" = true ] || retry_withdraw_intent; __cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
+# Once the retry's own write is in flight (the author wrapper passed every
+# check and created its trace marker just before the gh write) the intent
+# stays live: that write may have landed, and the intent still marks it.
+trap '{ [ -n "${RETRY_WRITE_TRACE:-}" ] && [ -e "$RETRY_WRITE_TRACE" ]; } && RETRY_WRITE_IN_FLIGHT=true; [ "${RETRY_INTENT_PENDING:-false}" != true ] || [ "${RETRY_WRITE_IN_FLIGHT:-false}" = true ] || retry_withdraw_intent; [ -z "${RETRY_WRITE_TRACE:-}" ] || rm -f "$RETRY_WRITE_TRACE"; __cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
@@ -2805,10 +2806,19 @@ post_codex_trigger() {
       || die 3 "cannot read the Codex request generation; refusing a new '@codex review' trigger"
   fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
-  [ "$CODEX_RETRY_WRITE" != true ] || RETRY_WRITE_IN_FLIGHT=true
+  # An automatic retry's write counts as in flight only once the author
+  # wrapper has passed its checks and is about to run the gh write, which it
+  # records by creating its trace marker; a failure before that withdraws the
+  # intent (#2664).
+  RETRY_WRITE_TRACE=""
+  if [ "$CODEX_RETRY_WRITE" = true ]; then
+    RETRY_WRITE_TRACE="${TMPDIR:-/tmp}/codex-retry-write.$$.trace"
+    rm -f "$RETRY_WRITE_TRACE"
+  fi
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
     MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$observed_generation" \
+    GH_AS_AUTHOR_TRACE_MARKER="$RETRY_WRITE_TRACE" \
     post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline || return 1
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
@@ -3594,6 +3604,7 @@ RETRY_ACKED_ID=""
 RETRY_INTENT_ID=""
 RETRY_INTENT_PENDING=false
 RETRY_WRITE_IN_FLIGHT=false
+RETRY_WRITE_TRACE=""
 RETRY_PINNED_GENERATION=""
 RESUMED_IS_RETRY=false
 

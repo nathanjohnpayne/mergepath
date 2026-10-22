@@ -167,6 +167,13 @@ case "$body" in
       jq -cn '{id:6000,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:01:30Z"}' >>"$state_dir/comments.jsonl"
     fi ;;
 esac
+# #2664: the retry's write fails before it starts (no trace marker).
+if [ "$kind" = trigger ] && [ "${CODEX_TEST_PREWRITE_RETRY_FAIL:-0}" = 1 ] && [ -f "$state_dir/trigger-count" ]; then
+  echo "gh-as-author: could not verify the author token" >&2
+  exit 1
+fi
+# The wrapper records that the write is about to run, as the real one does.
+[ -z "${GH_AS_AUTHOR_TRACE_MARKER:-}" ] || : >"$GH_AS_AUTHOR_TRACE_MARKER"
 # #2664: the retry's write lands but reports a transport failure.
 if [ "$kind" = trigger ] && [ "${CODEX_TEST_AMBIGUOUS_RETRY_POST:-0}" = 1 ] && [ -f "$state_dir/trigger-count" ]; then
   jq -cn --argjson id 1999 '{id:$id,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:02:00Z"}' >>"$state_dir/comments.jsonl"
@@ -2222,6 +2229,20 @@ test_ambiguous_retry_write_keeps_its_intent() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a retry write that may have landed keeps its intent live"
 }
 
+# The retry's write fails inside the wrapper before the gh write starts, so
+# nothing can have landed: the intent is withdrawn on the way out.
+test_prewrite_failure_withdraws_the_intent() {
+  local dir rc before=$FAIL intent
+  dir=$(make_case "retry-prewrite-fail" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_TEST_PREWRITE_RETRY_FAIL=1)
+  [ "$rc" = 3 ] || fail "#2664 pre-write failure: exit $rc, expected 3"
+  intent=$(jq -r 'select(.body | startswith("<!-- mergepath-codex-retry:v1 ") and (test("retry=|withdrawn=") | not)) | .id' "$dir/state/comments.jsonl" | head -1)
+  [ -n "$intent" ] && retry_markers "$dir" | grep -q "withdrawn=$intent -->" \
+    || fail "#2664 pre-write failure: intent '$intent' not withdrawn; $(retry_markers "$dir")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a retry write that failed before it started withdraws its intent"
+}
+
 # A resumed request whose retry was refused as a retry-of-retry, because a
 # rival's intent was still live, is re-checked at the deadline: the intent was
 # withdrawn meanwhile, so the #1550 replacement runs.
@@ -2409,6 +2430,7 @@ test_refused_retry_withdraws_its_intent
 test_stop_after_intent_withdraws_it
 test_rival_retry_after_check_is_refused
 test_ambiguous_retry_write_keeps_its_intent
+test_prewrite_failure_withdraws_the_intent
 test_refused_retry_of_retry_rechecked_at_deadline
 test_ack_repost_is_bound_as_the_retry
 test_retry_refused_by_late_result_or_moved_head
