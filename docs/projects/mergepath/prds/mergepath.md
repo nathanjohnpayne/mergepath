@@ -11,7 +11,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: 4d6a0a5
+source_ref: 4d6a0a51aefa3e0953d8bc593938126010bf42f8
 project: mergepath
 document_class: prd
 document_slug: mergepath
