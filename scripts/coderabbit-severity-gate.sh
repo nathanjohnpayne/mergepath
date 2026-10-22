@@ -1567,10 +1567,10 @@ log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
 #
 # The channel: a PR comment whose FIRST LINE is exactly the token
 #   [mergepath-summary-ack: <HEAD sha> <finding-set fingerprint>]
-# written by a human collaborator (author_association OWNER / MEMBER /
-# COLLABORATOR — a GitHub-computed field, not something the commenter sets)
-# and, per the same reasoning that keeps bots out of the reviewer set, not by
-# a `[bot]` account. Rationale for the rebuttal or deferral goes on the lines
+# written by an eligible non-bot collaborator (author_association OWNER /
+# MEMBER / COLLABORATOR — a GitHub-computed field, not something the commenter
+# sets), consistent with the bot exclusion in the reviewer set. Rationale for
+# the rebuttal or deferral goes on the lines
 # BELOW the token.
 #
 # Head-pinned by construction, not by clock: the token names the current head
