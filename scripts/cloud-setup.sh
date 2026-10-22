@@ -253,8 +253,10 @@ version_at_least() { # <have> <want>
 # The downloaded binary predicate below supports mikefarah/yq v4 only. Reject
 # other major versions before dry-run can claim an install is viable.
 is_supported_yq_release_version() { # <version>
-  local v="${1#v}"
-  [[ "$v" =~ ^4\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+  # YQ_VERSION is interpolated directly into the release URL, whose canonical
+  # tags include the literal v prefix. Binary-reported versions are parsed
+  # separately by version_at_least and may omit it.
+  [[ "$1" =~ ^v4\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 }
 
 # mikefarah/yq v4 at YQ_MIN_VERSION or later.
@@ -288,7 +290,7 @@ install_yq() {
     [ "${#expected}" -eq 64 ] || { log "MERGEPATH_YQ_SHA256 must be a 64-hex SHA-256 digest"; return 1; }
   fi
   if ! is_supported_yq_release_version "$YQ_VERSION" || ! version_at_least "$YQ_VERSION" "$YQ_MIN_VERSION"; then
-    log "yq release $YQ_VERSION must be a stable version at least $YQ_MIN_VERSION on supported major version 4"
+    log "yq release $YQ_VERSION must be a stable v-prefixed v4 tag at least $YQ_MIN_VERSION"
     return 1
   fi
   if $DRY_RUN; then
