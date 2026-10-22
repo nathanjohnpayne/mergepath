@@ -67,9 +67,23 @@ projects:
       - source: specs/
         mirror: projects/overridebroadway/specs/
 
-  # device-source-of-truth: repository archived 2026-10-22 (read-only); removed
-  # from project-doc sync. Its PRD and spec mirrors in the docs vault are left
-  # as the last synced copy.
+  # device-source-of-truth: owner repository archived 2026-10-22 (read-only).
+  # Kept listed on purpose: removing the slug would make
+  # prune_unlisted_central_spec_mirrors delete its spec mirrors in the docs
+  # vault on the next full sync. A PRD-mirror write into the owner repo needs
+  # it unarchived first.
+  - slug: device-source-of-truth
+    owner:
+      name: device-source-of-truth
+      repo: nathanjohnpayne/device-source-of-truth
+      path_hint: ../device-source-of-truth
+    prds:
+      - slug: device-source-of-truth
+        source: projects/device-source-of-truth/prds/device-source-of-truth.md
+        mirror: docs/projects/device-source-of-truth/prds/device-source-of-truth.md
+    specs:
+      - source: specs/
+        mirror: projects/device-source-of-truth/specs/
 
   - slug: friends-and-family-billing
     owner:
