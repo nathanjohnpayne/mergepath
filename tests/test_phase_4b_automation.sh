@@ -303,6 +303,15 @@ if [ "${1:-}" = --heartbeat-only ]; then
   exec bash "$ROOT/tests/test_phase_4b_heartbeat.sh"
 fi
 
+# The full automation suite captures the real Node executable for parser
+# controls below. Fail here, before the default focused test or optional jq
+# skip can hide a missing host prerequisite. The focused modes above remain
+# usable without Node where their own work does not need it.
+command -v node >/dev/null 2>&1 || {
+  echo 'ERROR: node is required for the Phase 4b automation test suite' >&2
+  exit 1
+}
+
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
