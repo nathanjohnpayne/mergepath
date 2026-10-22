@@ -419,7 +419,7 @@ SBIN="$WORKDIR/setup-bin"
 mkdir -p "$SBIN"
 # gzip: GNU tar runs it from PATH for -z (bsdtar on macOS does not), so a
 # hermetic PATH without it fails every unpack on Linux (Codex on #1552).
-for tool in bash awk tar gzip mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname; do
+for tool in bash awk tar gzip mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname cmp stat; do
   real="$(command -v "$tool" 2>/dev/null || true)"
   case "$real" in /*) ln -sf "$real" "$SBIN/$tool" ;; esac
 done
@@ -457,6 +457,11 @@ run_setup() { # <prefix> [env...]  (MERGEPATH_GH_VERSION defaults to the unpinne
   local prefix="$1"; shift
   env -i HOME="$WORKDIR" PATH="$SBIN" MERGEPATH_GH_VERSION="$VER" MERGEPATH_TOOL_PREFIX="$prefix" "$@" \
     "$SBIN/bash" "$SETUP"
+}
+run_setup_dry() { # <prefix> [env...]
+  local prefix="$1"; shift
+  env -i HOME="$WORKDIR" PATH="$prefix/bin:$NOYQ" MERGEPATH_GH_VERSION="$VER" MERGEPATH_TOOL_PREFIX="$prefix" "$@" \
+    "$SBIN/bash" "$SETUP" --dry-run
 }
 
 set +e
@@ -681,6 +686,44 @@ mkdir -p "$PYYQ"
 printf '#!/usr/bin/env bash\necho "yq 0.0.0"\n' >"$PYYQ/yq"
 chmod +x "$PYYQ/yq"
 
+# The release tag is validated before dry-run success. A checksum-shaped
+# override cannot make an older, unprefixed or malformed tag look installable.
+for spec in "y-dry-old:v4.52.0:v-prefixed v4 tag at least v4.53.6" "y-dry-invalid:v4.bad.0:v-prefixed v4 tag at least v4.53.6" "y-dry-unprefixed:4.54.1:v-prefixed v4 tag at least v4.53.6" "y-dry-leading-zero-major:v04.54.0:v-prefixed v4 tag at least v4.53.6" "y-dry-leading-zero-minor:v4.054.0:v-prefixed v4 tag at least v4.53.6" "y-dry-leading-zero-patch:v4.54.00:v-prefixed v4 tag at least v4.53.6" "y-dry-unsupported-major:v5.0.0:v-prefixed v4 tag at least v4.53.6"; do
+  dir="${spec%%:*}"; rest="${spec#*:}"; version="${rest%%:*}"; want="${rest#*:}"
+  : >"$WORKDIR/curl.log"
+  set +e
+  run_setup_dry "$WORKDIR/$dir" MERGEPATH_YQ_VERSION="$version" MERGEPATH_YQ_SHA256="$(printf 'a%.0s' {1..64})" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && grep -q "$want" "$WORKDIR/setup.err" && [ ! -s "$WORKDIR/curl.log" ]; then
+    pass "setup dry-run, yq $version: refuses before download"
+  else
+    fail "setup dry-run yq $version: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+  fi
+done
+
+# Canonical v-prefixed release tags, including valid zero components, pass.
+for version in v4.54.0 v4.54.1 v4.9223372036854775808.0; do
+  : >"$WORKDIR/curl.log"
+  set +e
+  run_setup_dry "$WORKDIR/y-dry-tag-${version//./-}" MERGEPATH_YQ_VERSION="$version" MERGEPATH_YQ_SHA256="$(printf 'a%.0s' {1..64})" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && grep -q "would install yq $version" "$WORKDIR/setup.err" && [ ! -s "$WORKDIR/curl.log" ]; then
+    pass "setup dry-run, yq $version: accepts a valid v-prefixed stable release tag"
+  else
+    fail "setup dry-run yq $version: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+  fi
+done
+
+: >"$WORKDIR/curl.log"
+set +e
+run_setup_dry "$WORKDIR/y-dry-default" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q "would install yq v4.53.6" "$WORKDIR/setup.err" && [ ! -s "$WORKDIR/curl.log" ]; then
+  pass "setup dry-run, default yq version: still plans the pinned v4.53.6 install without downloading"
+else
+  fail "setup default yq dry-run: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+fi
+
 : >"$WORKDIR/curl.log"
 set +e
 run_setup "$WORKDIR/y-absent" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-absent/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
@@ -743,7 +786,7 @@ if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/y-rc/bin/yq" ] && grep -q "installed yq $YQ
 else
   fail "setup prerelease yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
 fi
-for keep in v4.53.6 v4.100.0; do
+for keep in v4.53.6 v4.100.0 v4.9223372036854775808.0; do
   yq_stub_dir "$WORKDIR/yq-keep-$keep" "$keep"
   : >"$WORKDIR/curl.log"
   set +e
@@ -768,16 +811,54 @@ else
   fail "setup yq pinned mismatch: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
-# An override that installs an older v4 does not report success with a yq the
-# checks cannot use.
+# Exercise the default release's install path with a fake download and a
+# checksum-tool boundary stub. The stub reports the official pinned digest so
+# the test reaches binary validation; these fixture bytes are not a copy of the
+# official release and this does not claim to verify that release's contents.
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.53.6"\n' >"$REL/yq/yq_linux_amd64"
+DEFAULT_YQ_FIXTURE="$WORKDIR/default-yq-fixture"
+cp "$REL/yq/yq_linux_amd64" "$DEFAULT_YQ_FIXTURE"
+DEFAULT_SUM_BIN="$WORKDIR/default-sum-bin"
+mkdir -p "$DEFAULT_SUM_BIN"
+for f in "$SBIN"/*; do case "$(basename "$f")" in sha256sum|yq) ;; *) ln -sf "$f" "$DEFAULT_SUM_BIN/$(basename "$f")" ;; esac; done
+cat >"$DEFAULT_SUM_BIN/sha256sum" <<'SUM'
+#!/usr/bin/env bash
+printf '%s  %s\n' c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385 "$1"
+printf '%s  %s\n' c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385 "$1" >>"$CHECKSUM_LOG"
+SUM
+chmod +x "$DEFAULT_SUM_BIN/sha256sum"
+: >"$WORKDIR/default-checksum.log"
+: >"$WORKDIR/curl.log"
+set +e
+run_setup "$WORKDIR/y-default-install" CHECKSUM_LOG="$WORKDIR/default-checksum.log" PATH="$DEFAULT_SUM_BIN:$WORKDIR/y-default-install/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+installed_mode="$(stat -c %a "$WORKDIR/y-default-install/bin/yq" 2>/dev/null || stat -f %Lp "$WORKDIR/y-default-install/bin/yq" 2>/dev/null || true)"
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/y-default-install/bin/yq" ] \
+   && [ "$installed_mode" = 755 ] \
+   && cmp -s "$DEFAULT_YQ_FIXTURE" "$WORKDIR/y-default-install/bin/yq" \
+   && "$WORKDIR/y-default-install/bin/yq" --version | grep -q 'version v4.53.6' \
+   && grep -q 'releases/download/v4.53.6/yq_linux_amd64' "$WORKDIR/curl.log" \
+   && grep -q 'c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385' "$WORKDIR/default-checksum.log"; then
+  pass "setup, default yq v4.53.6: installs fixture bytes through the checksum stub with mode 755, expected URL and version"
+else
+  fail "setup default yq install: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log") checksum=$(cat "$WORKDIR/default-checksum.log")"
+fi
+
+# A checksum-verified older mikefarah/yq binary must be rejected before
+# replacing an existing prefix binary. The release tag itself is valid and
+# above minimum, so this exercises validation of the downloaded artifact.
 printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.52.0"\n' >"$REL/yq/yq_linux_amd64"
 oldsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
 [ -n "$oldsum" ] || oldsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
+mkdir -p "$WORKDIR/y-oldinstall/bin"
+printf 'existing yq must survive\n' >"$WORKDIR/y-oldinstall/bin/yq"
 set +e
-run_setup "$WORKDIR/y-oldinstall" MERGEPATH_YQ_VERSION=v4.52.0 MERGEPATH_YQ_SHA256="$oldsum" PATH="$WORKDIR/y-oldinstall/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+run_setup "$WORKDIR/y-oldinstall" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$oldsum" PATH="$WORKDIR/y-oldinstall/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4 at v4.53.6 or later" "$WORKDIR/setup.err" && ! grep -q "installed yq" "$WORKDIR/setup.err"; then
-  pass "setup, an override installing yq v4.52.0: fails instead of reporting a yq older than the minimum"
+if [ "$rc" -eq 1 ] && grep -q "verified download for yq $YQVER does not run as mikefarah/yq v4 at v4.53.6 or later" "$WORKDIR/setup.err" \
+   && ! grep -q "installed yq" "$WORKDIR/setup.err" \
+   && [ "$(cat "$WORKDIR/y-oldinstall/bin/yq")" = "existing yq must survive" ]; then
+  pass "setup, a valid release tag with mikefarah/yq v4.52.0: refuses before replacing the existing prefix binary"
 else
   fail "setup yq old install: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
