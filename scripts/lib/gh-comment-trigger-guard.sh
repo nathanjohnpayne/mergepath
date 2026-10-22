@@ -126,24 +126,24 @@ gh_comment_guard_run_write() { # <command...>
     return $?
   fi
   out="$GH_COMMENT_GUARD_STATE/claimed-write.out"
-  # Only this shell may hold the claim. Each child step runs in a subshell
-  # that closes fd 9 first: a `cmd 9>&-` redirection alone leaves the fd in a
-  # command substitution, and bash's saved copy of it in subshells a function
-  # forks, so a killed wrapper's orphan could keep the claim (#1362).
-  ( exec 9>&-; trap 'gh_rest_cleanup 2>/dev/null || :' EXIT; "$@" ) >"$out" || rc=$?
+  # The POST and the readback below inherit the claim on purpose: a child
+  # that can still write keeps every other requester out until it ends, even
+  # if this wrapper is killed meanwhile. Only the read-only recount releases
+  # it in its own shell (gh_comment_guard_authorize) (#1362).
+  "$@" >"$out" || rc=$?
   cat "$out"
   [ "$rc" -eq 0 ] || return "$rc"
   repo="${GH_COMMENT_GUARD_CLAIM%#*}" pr="${GH_COMMENT_GUARD_CLAIM##*#}"
   id=$(grep -oE 'issuecomment-[0-9]+' "$out" | tail -1 | sed 's/issuecomment-//') || id=""
   if [ -n "$id" ]; then
-    comment=$(exec 9>&-; unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
+    comment=$(unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
       GH_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" GITHUB_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" \
       gh api "repos/$repo/issues/comments/$id" 2>/dev/null) || comment=""
   fi
   if [ -z "$id" ] || ! printf '%s' "$comment" | jq -e --arg author "$AUTHOR" --arg pr "$pr" --arg id "$id" \
        '(.id | tostring) == $id and ((.user.login // "") | ascii_downcase) == ($author | ascii_downcase)
         and .body == "@codex review" and ((.issue_url // "") | endswith("/issues/" + $pr))' >/dev/null 2>&1; then
-    echo "comment-trigger-guard: the Codex request write for $repo#$pr returned without a confirmed comment id; refusing to treat it as posted (#1362). It may have landed: rerun scripts/codex-review-request.sh, which finds an existing trigger instead of posting another." >&2
+    echo "comment-trigger-guard: the Codex request write for $repo#$pr returned without a confirmed comment id; refusing to treat it as posted (#1362). It may have landed: check the PR for the author's new Codex request comment and wait for Codex's response before requesting again. A polling rerun of scripts/codex-review-request.sh posts another request, spending a slot, unless Codex already reports that request Running on HEAD." >&2
     return 5
   fi
   exec 9>&-
@@ -157,8 +157,9 @@ gh_comment_guard_authorize() {
   if [ "$trigger" = false ]; then return 0; fi
   repo=$(jq -er .repo "$metadata") && pr=$(jq -er .pr "$metadata") && head=$(jq -er .head "$metadata") || return 1
   gh_comment_guard_claim "$repo" "$pr" || return 1
-  # The substitution's own shell closes fd 9 before the recount runs, so a
-  # killed wrapper cannot leave the claim held by an orphaned recount.
+  # The recount only reads: its substitution's own shell closes fd 9 before
+  # it runs, so a killed wrapper cannot leave a hung recount holding the
+  # claim. Nothing that can write runs here.
   result=$(exec 9>&-; MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$head" \
     GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-$TOKEN}" \
     "$ROOT/scripts/codex-review-request.sh" --authorize-trigger-write --allow-moving-head "$pr" "$repo") || return 1
