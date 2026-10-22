@@ -14,11 +14,12 @@
 #      both run under the SAME verified author credential, the create
 #      via bootstrap::run_author_gh and the push via
 #      bootstrap::run_author_git.
-#   2. Seed the 21 canonical labels (needs-external-review,
+#   2. Seed the 16 active canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
 #      needs-local-agent, human-action, decision-needed, agent-action,
-#      phase-0..4, size:S/M/L, priority:critical/high/normal/low,
-#      status:blocked).
+#      size:S/M/L, priority:critical/high/normal/low, status:blocked). The
+#      deprecated phase-0..4 stay canonical but are not seeded;
+#      scripts/sync-labels.sh keeps the fleet in step.
 #      Eliminates the first-PR "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
 #      codex per BOOTSTRAP_INPUT_REVIEWERS). Each invite is async;
@@ -105,7 +106,7 @@ BOOTSTRAP_LABELS=(
   "phase-1|bfd4f2|Phase 1: core"
   "phase-2|bfd4f2|Phase 2"
   "phase-3|bfd4f2|Phase 3"
-  "phase-4|bfd4f2|Phase 4"
+  "phase-4|bfd4f2|Deprecated: use area:phase-4b. Kept for history; never newly created."
   "size:S|c2e0c6|Small: one or a few files, straightforward verification. Calibrated to nathanpaynedotcom#942/#849."
   "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
   "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
@@ -115,6 +116,26 @@ BOOTSTRAP_LABELS=(
   "priority:low|D4D8DD|Would not be missed. A candidate for closure at the next audit if still untouched."
   "status:blocked|6E7781|Cannot proceed until something outside this issue happens. Name what, in the issue."
 )
+
+# Deprecated canonical labels: still canonical (scripts/sync-labels.sh keeps
+# their colour and description in step wherever a repository already has
+# them, so their history stays legible) but never created. A new repository
+# is not seeded with them, and the fleet sync does not add them to one that
+# lacks them: their replacement (area:phase-4b) is hub taxonomy, so their
+# descriptions would point at a label most consumers do not have. Owner
+# decision, 2026-10-21. decision-needed stays active (owner decision,
+# 2026-10-22): every repository carries it, and it is the one label that
+# marks an issue as waiting on a human decision.
+# Descriptions stay within GitHub's 100-character limit: a longer one is
+# rejected with HTTP 422, so scripts/sync-labels.sh refuses the list.
+BOOTSTRAP_DEPRECATED_LABELS=(phase-0 phase-1 phase-2 phase-3 phase-4)
+
+# bootstrap::label_is_deprecated <name> -> 0 when <name> is deprecated.
+bootstrap::label_is_deprecated() {
+  local d
+  for d in "${BOOTSTRAP_DEPRECATED_LABELS[@]}"; do [ "$d" = "$1" ] && return 0; done
+  return 1
+}
 
 # 1Password reference for the REVIEWER_ASSIGNMENT_TOKEN PAT (the
 # nathanpayne-claude reviewer PAT). MUST be an item-UUID path, never a
@@ -483,6 +504,7 @@ bootstrap::_seed_labels() {
     color=${rest%%|*}
     desc=${rest#*|}
 
+
     # Reject a malformed entry rather than creating a mis-parsed label.
     # A separator typo used to be silently survivable: the old ':'
     # format turned "size:S:c2e0c6:..." into a label named `size` with
@@ -491,6 +513,13 @@ bootstrap::_seed_labels() {
     # must not take the other 18 labels down with it.
     if [ -z "$name" ] || [ -z "$desc" ] || ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
       bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description with a 6-digit hex colour) — skipped, label NOT created"
+      continue
+    fi
+
+    # A deprecated label is kept in step where it exists but never seeded.
+    # Checked only after the entry passed validation, so a malformed
+    # deprecated entry still warns.
+    if bootstrap::label_is_deprecated "$name"; then
       continue
     fi
 

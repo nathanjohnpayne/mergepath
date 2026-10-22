@@ -653,6 +653,15 @@ jobs:
             exit 1
           fi
 
+      - name: check_sync_labels
+        if: matrix.shard == 1
+        # Hub-only fleet label-sync suite: dry run writes nothing, apply
+        # (after install_yq_for_sync_manifest: sync-labels.sh reads the
+        # manifest with yq and fails closed without it)
+        # converges canonical labels, deprecated labels are never created.
+        # Consumer checkouts SKIP inside the wrapper (script + suite are hub-only).
+        run: ./scripts/ci/check_sync_labels || { rc=$?; if [ ! -f scripts/ci/check_sync_labels ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sync_labels not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_repo_lint_optimization
         if: matrix.shard == 2
         # The delegated test parses workflow YAML with mikefarah/yq.

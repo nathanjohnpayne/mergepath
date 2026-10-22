@@ -1,6 +1,6 @@
 # Bootstrap Label Seeding
 
-Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every entry of `BOOTSTRAP_LABELS` into the new remote, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit, to 20 when #1555 added `needs-local-agent`, and to 21 with `status:blocked`, which marks a blocker that no issue can point at under the same lane rule on every repository's board.
+Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every active entry of `BOOTSTRAP_LABELS` into the new remote, all but the deprecated ones listed in `BOOTSTRAP_DEPRECATED_LABELS`, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit, to 20 when #1555 added `needs-local-agent`, and to 21 with `status:blocked`, which marks a blocker that no issue can point at under the same lane rule on every repository's board.
 
 ## Acceptance criteria
 
@@ -18,9 +18,11 @@ Feature: the canonical issue-label set a bootstrapped repo starts with, and the 
 
 ### The seeded set
 
-- 21 labels: the four merge-gating blocking labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`), `needs-local-agent`, `human-action`, `decision-needed`, `agent-action`, `phase-0` through `phase-4`, `size:S`/`size:M`/`size:L`, `priority:critical`/`priority:high`/`priority:normal`/`priority:low`, and `status:blocked`.
+- 21 canonical labels in `BOOTSTRAP_LABELS`: the four merge-gating blocking labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`), `needs-local-agent`, `human-action`, `decision-needed`, `agent-action`, `phase-0` through `phase-4`, `size:S`/`size:M`/`size:L`, `priority:critical`/`priority:high`/`priority:normal`/`priority:low`, and `status:blocked`.
+- 16 of them are seeded. The five in `BOOTSTRAP_DEPRECATED_LABELS` (`phase-0` through `phase-4`) stay canonical but are never created. Their replacement (`area:phase-4b`) is hub taxonomy, so their descriptions would point at a label most consumers do not have (owner decision, 2026-10-21). `decision-needed` stays active: every repository carries it, and it is the one label that marks an issue as waiting on a human decision (owner decision, 2026-10-22). Every description is at most 100 characters, GitHub's limit; `scripts/sync-labels.sh` refuses a longer one before any read.
 - The `size:`, `priority:` and `status:blocked` names, colours and descriptions are byte-identical to mergepath's own live labels. This is the point of the shared subset: a drifted description is what makes a shared label stop meaning one thing, and the observed fleet drift was exactly that — one repo carried all three size colours identically (making S/M/L indistinguishable in the UI), another carried descriptions on a time axis rather than the canonical scope axis.
-- Seeding is idempotent. Every entry is created with `--force`, so re-running against a repo that already has a label updates its colour and description rather than erroring.
+- Seeding is idempotent. Every seeded (active) entry is created with `--force`, so re-running against a repo that already has a label updates its colour and description rather than erroring. A deprecated entry is still validated, and a malformed one still warns, but it is not created.
+- Existing repositories stay in step through `scripts/sync-labels.sh`, a sync-wave step. It reads the same `BOOTSTRAP_LABELS` and `BOOTSTRAP_DEPRECATED_LABELS` and, for the hub and every manifest consumer, creates missing active labels and updates a drifted colour (compared without regard to case) or description. It corrects deprecated labels only where they exist. Names match without regard to case, as GitHub matches them, and an update keeps the live spelling. It never deletes, renames or recreates a label, and never touches a label outside the canonical list. The default is a dry run that exits 1 when changes are planned; `--apply` writes through `scripts/gh-as-author.sh`. Every read is paginated REST.
 
 ### Deliberate exclusions
 
@@ -31,6 +33,6 @@ Feature: the canonical issue-label set a bootstrapped repo starts with, and the 
 
 - Seeding is **additive**: it creates or updates the entries in its own table and never enumerates the repo's existing labels, so it can neither delete nor rename one. This is what keeps it safe to re-run against a populated repo. Deleting a label strips it from closed issues, and several fleet labels are machine-read — `post-review` is the dedupe key the weekly sweep uses to find its rollup issue, the four blocking labels gate merges via `Label Gate`, and `observation` / `risk` / `automation` are applied by running automation.
 
-## Known gap
+## Keeping existing repositories in step
 
-- Stage C runs at repo **creation** only. Nothing re-seeds or audits an existing repo, so the set is frozen at enrolment and drift is undetected — the #780 defect class. The re-runnable reconciler and its scheduled drift audit are tracked separately; they touch `.github/**` and a canonical propagating doc and so are a Phase-4 change.
+- Stage C runs at repo **creation** only. Existing repositories are kept in step by `scripts/sync-labels.sh`, run as a sync-wave step (see the criterion above and `docs/agents/propagation-ordering.md`), which closes the #780 drift class for the canonical subset. A scheduled drift audit that runs it in dry-run mode between waves is not built yet.

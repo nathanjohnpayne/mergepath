@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# scripts/ci/check_sync_labels — run the fleet label-sync regression suite.
+#
+# Wraps tests/test_sync_labels.sh, the hermetic suite for
+# scripts/sync-labels.sh, the fleet canonical-label reconcile: dry run writes
+# nothing, apply creates missing active labels and fixes drifted colours and
+# descriptions, deprecated labels are corrected only where present, labels
+# outside the canonical list are never touched, and unreadable or malformed
+# input fails closed. Both the script and the suite are HUB-ONLY
+# (deliberately not in .mergepath-sync.yml), so a consumer checkout SKIPs
+# on the hub marker FIRST: no scripts/sync-to-downstream.sh means a consumer
+# checkout, so SKIP even if a stale copy of the test is present; the marker
+# without the test means the hub lost the suite, a hard error.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_sync_labels.sh"
+
+# Marker FIRST: a consumer checkout (no scripts/sync-to-downstream.sh) SKIPs
+# even when it carries a stale copy of the hub-only test, whose driver it
+# lacks. Only the hub, which has the marker, requires and runs the suite.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_sync_labels: SKIP (consumer checkout: no scripts/sync-to-downstream.sh; hub-only sync-labels suite)"
+  exit 0
+fi
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_sync_labels: ERROR (hub checkout is missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_sync_labels: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
