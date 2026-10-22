@@ -460,7 +460,8 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
 # "canceled" are confirmed terminal failures. Any other status text is
 # "unknown", which never authorizes a retry. retry_after_seconds is a retry
 # window the provider states in that comment ("retry after N seconds", "try
-# again in N minutes"), else null.
+# again in N minutes", hours or days, decimals rounded up), else null; a stated
+# window it cannot read is a year, never a shorter guess.
 #
 # Pure: jq over the passed strings only, no globals and no I/O.
 crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request-created-at
@@ -479,9 +480,22 @@ crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request
       | select($head | startswith($row.commit | ascii_downcase))
       | ($comment.updated_at // $comment.created_at // "") as $observed
       | select($observed != "" and $observed >= $since)
+      # A stated window whose length cannot be read (an unknown unit, or
+      # words such as "a few minutes") reads as a year: longer than any
+      # review deadline, so it never lets a retry post early.
       | ((.body // "")
-          | [match("(?i)(?:retry[- ]after|try again in)[:[:space:]]*([0-9]+)[[:space:]]*(seconds?|secs?|s|minutes?|mins?|m)?\\b"; "g")
-             | (.captures[0].string | tonumber) * (if ((.captures[1].string // "s") | test("^m"; "i")) then 60 else 1 end)]
+          | [match("(?i)(?:retry[- ]after|try again in)[:[:space:]]*(?<rest>[^\\n]{0,40})"; "g")
+             | .captures[0].string
+             | (capture("^(?<n>[0-9]+(?:\\.[0-9]+)?)[[:space:]]*(?<u>[[:alpha:]]*)") // null) as $d
+             | if $d == null then 31536000
+               else ($d.u | ascii_downcase) as $u
+                 | (if $u == "" or ($u | test("^(s|secs?|seconds?)$")) then 1
+                    elif ($u | test("^(m|mins?|minutes?)$")) then 60
+                    elif ($u | test("^(h|hrs?|hours?)$")) then 3600
+                    elif ($u | test("^(d|days?)$")) then 86400
+                    else null end) as $unit
+                 | if $unit == null then 31536000 else ($d.n | tonumber) * $unit | ceil end
+               end]
           | max // null) as $retry_after
       | { state:
             (if ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"

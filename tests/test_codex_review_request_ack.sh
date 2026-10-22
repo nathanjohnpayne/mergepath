@@ -2035,6 +2035,29 @@ test_scheduled_retry_at_deadline_is_reported() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a retry still scheduled at the deadline is reported, not replaced"
 }
 
+# The provider's stated retry window: seconds, minutes, hours, days and
+# decimals are read; a window it cannot read is a year, never a short guess.
+test_retry_window_parser() {
+  local before=$FAIL body cases got want text
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/lib/codex-request-evidence.sh"
+  cases='retry after 30 seconds|30
+Retry-After: 120|120
+Please try again in 3 minutes.|180
+Please try again in 1.5 minutes.|90
+try again in 1 hour|3600
+try again in 2 days|172800
+try again in 4 fortnights|31536000
+Please try again in a few minutes.|31536000
+No window stated.|null'
+  while IFS='|' read -r text want; do
+    body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ❌ **Failed** | `aaaaaaa` | Manual request |\n\n%s\n' "$text")
+    got=$(crqe_select_codex_run_state "$(jq -nc --arg b "$body" '[{id:1,user:{login:"bot"},body:$b,created_at:"2026-01-01T00:00:10Z",updated_at:"2026-01-01T00:00:10Z"}]')" bot aaaaaaab 2026-01-01T00:00:00Z | jq -r '.retry_after_seconds')
+    [ "$got" = "$want" ] || fail "#2664 window parser: '$text' read as $got, expected $want"
+  done <<<"$cases"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: the stated retry window reads every unit, and an unreadable one never shortens the wait"
+}
+
 # A resumed request first looks like a retry because a live intent precedes
 # it; that intent is withdrawn while the request waits. At the deadline the
 # fresh markers say it is an ordinary request, so the #1550 replacement runs.
@@ -2377,6 +2400,7 @@ test_retry_honors_longer_provider_window
 test_retry_window_lengthened_while_scheduled
 test_resumed_retry_is_not_replaced
 test_retry_marker_binding
+test_retry_window_parser
 test_withdrawn_intent_unlatches_resumed_request
 test_scheduled_retry_at_deadline_is_reported
 test_retry_needs_codex_acknowledgement
