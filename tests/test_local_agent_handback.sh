@@ -327,10 +327,10 @@ R
 exit 9
 G
   chmod +x "$LFIX/scripts/resolve-pr-threads.sh" "$LFIX/bin/gh"
-  lane_run() { # <login> [token]
+  lane_run() { # <login> [token] [GH_TOKEN, when it differs from the token]
     : >"$LFIX/lane.log"
     ( cd "$LFIX" && env -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY PATH="$LFIX/bin:$PATH" LANE_LOG="$LFIX/lane.log" LANE_LOGIN="$1" \
-        GH_TOKEN="${2:-x}" OP_PREFLIGHT_REVIEWER_PAT="${2:-x}" PR_NUMBER=12 REPO=o/r GITHUB_STEP_SUMMARY="$LFIX/summary" bash -eo pipefail step.sh ) >/dev/null 2>&1
+        GH_TOKEN="${3:-${2:-x}}" OP_PREFLIGHT_REVIEWER_PAT="${2:-x}" PR_NUMBER=12 REPO=o/r GITHUB_STEP_SUMMARY="$LFIX/summary" bash -eo pipefail step.sh ) >/dev/null 2>&1
   }
   set +e
   lane_run nathanpayne-codex; c1=$?; l1="$(cat "$LFIX/lane.log")"
@@ -348,18 +348,21 @@ G
   # gets --resolve-actioned --ci-app-identity and no reviewer identity, and its
   # identity check (not the lane) decides whether the policy names this app.
   # Whatever `GET /user` would say is irrelevant, and a user PAT never gets
-  # the flag.
+  # the flag. The lane classifies the token the resolver authenticates with,
+  # ${OP_PREFLIGHT_REVIEWER_PAT:-$GH_TOKEN}, not GH_TOKEN alone.
   set +e
   lane_run "" ghs_installation; c5=$?; l5="$(cat "$LFIX/lane.log")"
   lane_run nathanpayne-codex ghs_installation; c6=$?; l6="$(cat "$LFIX/lane.log")"
   lane_run nathanpayne-codex ghp_reviewer; c7=$?; l7="$(cat "$LFIX/lane.log")"
+  lane_run "" ghs_installation ghp_other; c8=$?; l8="$(cat "$LFIX/lane.log")"
   set -e
   if [ "$c5" -eq 0 ] && [ "$l5" = "agent= identity= args=12 --repo o/r --resolve-actioned --ci-app-identity" ] \
      && [ "$c6" -eq 0 ] && [ "$l6" = "$l5" ] \
-     && [ "$c7" -eq 0 ] && [ "$l7" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ]; then
+     && [ "$c7" -eq 0 ] && [ "$l7" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ] \
+     && [ "$c8" -eq 0 ] && [ "$l8" = "$l5" ]; then
     pass "lane runs an installation token only in the bounded --ci-app-identity mode, with no reviewer identity (#2726)"
   else
-    fail "lane CI-app routing: app rc=$c5 '$l5'; app reading as reviewer rc=$c6 '$l6'; PAT rc=$c7 '$l7'"
+    fail "lane CI-app routing: app rc=$c5 '$l5'; app reading as reviewer rc=$c6 '$l6'; PAT rc=$c7 '$l7'; app as the resolver's token only rc=$c8 '$l8'"
   fi
 else
   fail "thread-resolution-lane.yml missing, or no mikefarah/yq v4 to check it (yq on PATH: $(yq --version 2>&1 | head -1 || echo none); bash scripts/cloud-setup.sh installs it)"

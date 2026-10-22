@@ -669,6 +669,13 @@ printf 'non_reviewer_identities: [%s]\n' "$APP" >"$APP_POLICY.tmp"
 grep -v -e '^non_reviewer_identities:' -e '^  - nathanpayne-robot' "$APP_POLICY" >>"$APP_POLICY.tmp"
 mv "$APP_POLICY.tmp" "$APP_POLICY"
 app_case "non_reviewer_identities as an unparseable flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+# The membership test alone would also refuse here, as "not declared"; the
+# guard's job is to say the list cannot be parsed, not that it is missing.
+if grep -q "non_reviewer_identities in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable non_reviewer_identities list"
+else
+  fail "--expect-thread-resolution-app flow non_reviewer_identities: diagnostic: $APP_OUT"
+fi
 # available_reviewers as a flow list naming the app: the bash reader sees an
 # empty list, but the workflows' YAML readers give the app reviewer standing,
 # so the validator refuses what it cannot parse.

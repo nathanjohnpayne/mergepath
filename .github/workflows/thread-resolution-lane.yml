@@ -107,9 +107,11 @@ jobs:
           # identity-check.sh --expect-thread-resolution-app accepts only the
           # app this default-branch policy names in
           # thread_resolution_ci_app_identity, and nothing when it names none.
+          # Classify the token the resolver authenticates and identity-checks
+          # with, not only GH_TOKEN.
           . scripts/lib/credential-class.sh
           app_mode=()
-          if [ "$(credential_class "$GH_TOKEN")" = app-installed ]; then
+          if [ "$(credential_class "${OP_PREFLIGHT_REVIEWER_PAT:-$GH_TOKEN}")" = app-installed ]; then
             login="the CI app (thread_resolution_ci_app_identity)"
             app_mode=(--ci-app-identity)
           else

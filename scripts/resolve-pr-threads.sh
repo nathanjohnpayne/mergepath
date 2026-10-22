@@ -501,8 +501,10 @@ daily rollup / weekly sweep as the disposition of record):
                         app's installation token, verified by
                         identity-check.sh --expect-thread-resolution-app
                         against thread_resolution_ci_app_identity in this
-                        checkout's .github/review-policy.yml (#2726). The
-                        check is mandatory in this mode.
+                        checkout's .github/review-policy.yml (#2726).
+                        RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK does not
+                        skip the check in this mode; --dry-run does,
+                        because dry-run makes no changes.
 EOF
   exit 1
 }
@@ -1141,11 +1143,12 @@ fi
 # becomes a hard error inside the opt-out branch rather than a
 # precondition for entering it.
 #
-# #2726: --ci-app-identity selects the bounded CI-app mode instead, and it is
-# never skippable: RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK is a dev opt-out for
-# the reviewer path, not a way to resolve as an unverified app. Without the
-# flag an installation token reaches --expect-write-identity, which refuses
-# it whatever the policy configures.
+# #2726: --ci-app-identity selects the bounded CI-app mode instead, and
+# RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK does not skip its check: that is a dev
+# opt-out for the reviewer path, not a way to resolve as an unverified app.
+# --dry-run skips it, as it skips every identity check here, because dry-run
+# makes no changes. Without the flag an installation token reaches
+# --expect-write-identity, which refuses it whatever the policy configures.
 if { [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] || $CI_APP_IDENTITY; } && ! $DRY_RUN; then
   CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
   if [ ! -x "$CHECKER" ]; then

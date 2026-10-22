@@ -2753,11 +2753,21 @@ cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/reviewers-helpers.
 cp "$FIXTURE_ROOT/scripts/lib/preflight-helpers.sh" "$APP_ROOT/scripts/lib/"
 cp "$FIXTURE_ROOT/.mergepath-sync.yml" "$APP_ROOT/.mergepath-sync.yml"
 CI_APP='mergepath-ci[bot]'
-app_policy_2726() {  # configured | unconfigured
+app_policy_2726() {  # configured | unconfigured | undeclared | shared
+  # undeclared: the app is configured but missing from non_reviewer_identities.
+  # shared: the configured value is a reviewing bot, coderabbitai[bot]. Both
+  # are invalid, so the resolver must read them as unconfigured.
   {
     printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n'
-    printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$CI_APP"
-    [ "$1" != configured ] || printf 'thread_resolution_ci_app_identity: "%s"\n' "$CI_APP"
+    case "$1" in
+      undeclared) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n' ;;
+      shared) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - coderabbitai[bot]\n' ;;
+      *) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$CI_APP" ;;
+    esac
+    case "$1" in
+      configured|undeclared) printf 'thread_resolution_ci_app_identity: "%s"\n' "$CI_APP" ;;
+      shared) printf 'thread_resolution_ci_app_identity: "coderabbitai[bot]"\n' ;;
+    esac
   } >"$APP_ROOT/.github/review-policy.yml"
 }
 
@@ -2870,6 +2880,12 @@ case_2726 "an indented app marker is still the app's own" 0 resolved \
   $APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
 # Unconfigured, the app's marker is ordinary non-agent feedback (fail closed).
 case_2726 "app marker with the app unconfigured stays feedback" 3 untouched "$T2726_APP_MARKER" unconfigured ghp_x - --resolve-actioned
+# Configured but invalid reads as unconfigured: the login comes from the
+# validated read, so a value identity-check.sh would refuse never turns a
+# bot's marker into the resolver's own output.
+case_2726 "app marker with the app undeclared as a non-reviewer stays feedback" 3 untouched "$T2726_APP_MARKER" undeclared ghp_x - --resolve-actioned
+case_2726 "a reviewing bot configured as the app: its marker stays feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"coderabbitai","__typename":"Bot"}' "$APP_MARKER")" shared ghp_x - --resolve-actioned
 # A user account with the app's bare slug is not the app.
 case_2726 "marker from a same-named User is feedback" 3 untouched \
   "$(threads_2726_third '{"login":"mergepath-ci","__typename":"User"}' "$APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity

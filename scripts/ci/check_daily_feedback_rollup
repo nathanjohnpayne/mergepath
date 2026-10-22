@@ -582,5 +582,41 @@ if ! grep -qE 'dedupe: [0-9]+ prior-triaged mp-id' "$ERR_FILE"; then
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 8-case --dry-run smoke + #304 dedupe)"
+# #2726: a configured but INVALID app (here, missing from
+# non_reviewer_identities) reads as unconfigured. The script takes the login
+# from the validated read, so Thread G's marker is not a tag of record and the
+# thread surfaces alongside F and H.
+cat >"$APP_REPO/.github/review-policy.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+non_reviewer_identities:
+  - nathanpayne-robot
+thread_resolution_ci_app_identity: "mergepath-ci[bot]"
+YAML
+INVALID_OUT="$WORKDIR/dry-run-invalid.ndjson"
+INVALID_ERR="$WORKDIR/dry-run-invalid.err"
+set +e
+env -i \
+  PATH="$STUB_PATH" \
+  HOME="$WORKDIR" \
+  TMPDIR="$WORKDIR" \
+  GH_TOKEN="stub-token" \
+  REPO="owner/repo" \
+  ROLLUP_AGENT_AUTHORS="nathanjohnpayne:nathanpayne-claude" \
+  "$APP_REPO/scripts/daily-feedback-rollup.sh" --dry-run --since 2026-05-15 --until 2026-05-16 \
+  >"$INVALID_OUT" 2>"$INVALID_ERR"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: --dry-run with an invalid CI app policy exited rc=$RC" >&2
+  sed 's/^/    /' "$INVALID_ERR" >&2 || true
+  exit 1
+fi
+if ! grep -q '"thread_id":"PRT_thread_g"' "$INVALID_OUT"; then
+  echo "FAIL: thread G should surface when thread_resolution_ci_app_identity is invalid (undeclared in non_reviewer_identities); an invalid app's marker is not a tag of record (#2726)" >&2
+  cat "$INVALID_OUT" >&2
+  exit 1
+fi
+
+echo "check_daily_feedback_rollup: PASS (unit tests + 8-case --dry-run smoke + #304 dedupe + invalid CI app policy)"
 exit 0
