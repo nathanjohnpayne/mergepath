@@ -56,7 +56,7 @@ scripts/worktree-cleanup.sh                        # dry run: report only
 scripts/worktree-cleanup.sh --apply --min-age 24h  # remove safe candidates untouched for a day
 ```
 
-Locked worktrees and orphan directories are left alone unless you pass `--force-locked` or `--orphan-clean`. A worktree git refuses to remove is reported under `failed:` and the run carries on. Committed work always survives, because removing a worktree keeps its branch.
+Locked worktrees and orphan directories are left alone unless you pass `--force-locked` or `--orphan-clean`. A worktree git refuses to remove is reported under `failed:` and the run carries on. Commits on a branch survive, because removing a worktree keeps its branch. A detached worktree has no branch: for a closed or merged PR, a commit that exists only at that worktree's `HEAD` (on no branch, tag or remote) is lost when the worktree is removed, so branch or push such work first.
 
 **Daily cleanup.** To run that cleanup automatically, install the per-user launchd job from a clone whose main checkout is on an up-to-date `main`:
 
