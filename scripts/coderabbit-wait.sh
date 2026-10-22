@@ -1429,11 +1429,14 @@ parse_rate_limit_window() {
 # are the `> [!WARNING]` / `> ## Something unexpected happened` heading, and
 # a quoted line carries the processing-error sentence. A review or comment
 # that merely mentions either phrase (in prose, a quote or a fenced example)
-# stays review content. The persistent summary is excluded.
+# stays review content. The persistent summary is excluded. CodeRabbit's
+# leading vendor header line (#2734) is framing, not content, so it is
+# stripped first by the shared rule in scripts/lib/coderabbit-fence.sh.
 crw_is_processing_error_notice() {
-  local unfenced lead
-  [[ "$1" != "$SUMMARY_MARKER"* ]] || return 1
-  unfenced=$(crw_unfenced_body "$1") || return 1
+  local body unfenced lead
+  body=$(cr_strip_vendor_header "$1") || return 1
+  [[ "$body" != "$SUMMARY_MARKER"* ]] || return 1
+  unfenced=$(crw_unfenced_body "$body") || return 1
   lead=$(awk 'NF { sub(/[[:space:]]+$/, ""); print tolower($0); if (++n == 2) exit }' <<<"$unfenced") || return 1
   [ "$lead" = $'> [!warning]\n> ## something unexpected happened' ] || return 1
   grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$unfenced"

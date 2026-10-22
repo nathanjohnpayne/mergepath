@@ -366,6 +366,19 @@ test_review_mentioning_processing_error_still_clears() {
   [ "$FAIL" -ne "$before" ] || pass "H2: a review quoting or fencing the processing-error text is still a review"
 }
 
+# --- Test H3: the notice behind CodeRabbit's vendor header (#2734) ----------
+# Live comments now open with an invisible `<!-- coderabbit-ai-generated:v1 -->`
+# line. The processing-error notice behind it must still never clear.
+test_headered_processing_error_never_clears() {
+  local dir rc before=$FAIL
+  dir=$(make_case "headered-processing-error" 300 0 true $'<!-- coderabbit-ai-generated:v1 -->\n\n'"$UNKNOWN_WARNING_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" != "0" ] || fail "H3: the headered processing-error notice exited 0"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H3: the headered processing-error notice cleared an unreviewed head"
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H3: the headered notice fired the failover"
+  [ "$FAIL" -ne "$before" ] || pass "H3: the processing-error notice behind the vendor header never clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
+
 # #2139: drive the actual full clearance checker, then the fixture approval
 # step. CI is scoped out here; its production enforcement is covered separately.
 test_exact_head_substitution_approval() {
@@ -623,6 +636,7 @@ test_exact_head_substitution_approval
 test_spending_cap_fires
 test_unknown_prose_no_failover
 test_review_mentioning_processing_error_still_clears
+test_headered_processing_error_never_clears
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"
