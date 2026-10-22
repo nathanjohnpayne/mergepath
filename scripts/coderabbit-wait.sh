@@ -1424,6 +1424,27 @@ parse_rate_limit_window() {
 # mid-review CodeRabbit reads as a completed clean report. `summary_names_head`
 # and `summary_names_only_other_head` below carry the same correction; this
 # block is the rest of the #1005 sweep.
+# #2657: CodeRabbit's processing-error notice is not a review. Only the
+# provider-owned stanza counts: outside fences, its first two nonempty lines
+# are the `> [!WARNING]` / `> ## Something unexpected happened` heading, and
+# a quoted line carries the processing-error sentence. A review or comment
+# that merely mentions either phrase (in prose, a quote or a fenced example)
+# stays review content. The persistent summary is excluded. CodeRabbit's
+# leading vendor header line (#2734) is framing, not content, so it is
+# stripped first by the shared rule in scripts/lib/coderabbit-fence.sh.
+# Three-way, like the structural reader: 0 the notice, 1 not the notice, 3 the
+# body could not be read, which every caller treats as fail-closed rather than
+# as review evidence.
+crw_is_processing_error_notice() {
+  local body unfenced lead
+  body=$(cr_strip_vendor_header "$1") || return 3
+  [[ "$body" != "$SUMMARY_MARKER"* ]] || return 1
+  unfenced=$(crw_unfenced_body "$body") || return 3
+  lead=$(awk 'NF { sub(/[[:space:]]+$/, ""); print tolower($0); if (++n == 2) exit }' <<<"$unfenced") || return 3
+  [ "$lead" = $'> [!warning]\n> ## something unexpected happened' ] || return 1
+  grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$unfenced"
+}
+
 classify_comment() {
   local body=$1
   # #593: key on the stable auto-generated marker FIRST, before any prose
@@ -1477,6 +1498,18 @@ classify_comment() {
   # this legacy fallback.
   if [[ "$(cr_strip_vendor_header "$body")" != "$SUMMARY_MARKER"* ]] && grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
     echo "in_progress"
+    return
+  fi
+  # #2657: the processing-error notice is not a review, and grading it
+  # `review` let it clear an unreviewed head. It is graded like narration:
+  # the poll loop keeps polling and the review selector skips it, so the run
+  # ends in a timeout, never a clearance. An unreadable body grades the same
+  # way: this pure classifier cannot report a read failure, and `review` is the
+  # one class that can clear.
+  local pe_rc=0
+  crw_is_processing_error_notice "$body" || pe_rc=$?
+  if [ "$pe_rc" != 1 ]; then
+    echo "status_probe"
     return
   fi
   # The `review` default is deliberate, and it is only safe because NO CALLER
@@ -2922,6 +2955,7 @@ status_context_fast_path_blocked_by_comment() {
   local current_length
   local current_class current_rc reviews head_run review_rc run_id run_body run_class run_class_rc marker_rc
   local run_submitted_at accepted_after_rc
+  local pe_rc notice_at newer_rc pe_reviews pe_run pe_run_rc pe_run_id pe_run_body
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
@@ -2976,8 +3010,24 @@ status_context_fast_path_blocked_by_comment() {
     elif [ "$current_rc" != "0" ]; then
       current_class=review
     fi
+    # #2657: a processing-error notice is a refusal for the fast path too. A
+    # `success` StatusContext beside it proves no review, so only the same
+    # body-bearing current-HEAD review run that releases a rate-limit or
+    # pause refusal can release it.
+    if [ "$current_class" = review ]; then
+      pe_rc=0
+      crw_is_processing_error_notice "$comment_body" || pe_rc=$?
+      case "$pe_rc" in
+        0) current_class=processing_error ;;
+        1) : ;;
+        *)
+          log "StatusContext success suppressed: the newest CodeRabbit comment could not be read for a processing-error notice (#2657)"
+          return 0
+          ;;
+      esac
+    fi
     case "$current_class" in
-      rate_limit|paused)
+      rate_limit|paused|processing_error)
         reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
           log "StatusContext success suppressed: CodeRabbit's current comment is $current_class and the reviews list could not be read, so an actual current-HEAD review cannot be established (#956)"
           return 0
@@ -3008,6 +3058,22 @@ status_context_fast_path_blocked_by_comment() {
             log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries provider-owned $run_class state (#956)"
             return 1
           fi
+          # #2657: a review run whose body is the processing-error notice is
+          # no review either, so it cannot release the refusal.
+          pe_rc=0
+          crw_is_processing_error_notice "$run_body" || pe_rc=$?
+          case "$pe_rc" in
+            0)
+              STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+              log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id is CodeRabbit's processing-error notice, not a review (#2657)"
+              return 1
+              ;;
+            1) : ;;
+            *)
+              log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id could not be read for a processing-error notice (#2657)"
+              return 0
+              ;;
+          esac
           summary_blocking_marker_present "$run_body" || marker_rc=$?
           case "$marker_rc" in
             0)
@@ -3032,6 +3098,30 @@ status_context_fast_path_blocked_by_comment() {
             log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id has no readable submission time, so a later accepted replacement trigger cannot be ruled out — keep polling (#956)"
             return 0
           }
+          # #2657: a processing-error notice is CodeRabbit's word on its LATEST
+          # attempt, so only a run submitted strictly after the notice can
+          # release it; an older clean run on the same SHA predates the failure.
+          if [ "$current_class" = processing_error ]; then
+            notice_at=$(printf '%s' "$current" | jq -er '.fresh_at // .updated_at // .created_at | select(type == "string" and length > 0)') || {
+              log "StatusContext success suppressed: the processing-error notice has no readable time to order against review id=$run_id (#2657)"
+              return 0
+            }
+            newer_rc=0
+            jq -en --arg run "$run_submitted_at" --arg notice "$notice_at" \
+              '($run | fromdateiso8601) > ($notice | fromdateiso8601)' >/dev/null 2>&1 || newer_rc=$?
+            case "$newer_rc" in
+              0) : ;;
+              1)
+                STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+                log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id (submitted $run_submitted_at) is not newer than CodeRabbit's processing-error notice ($notice_at) (#2657)"
+                return 1
+                ;;
+              *)
+                log "StatusContext success suppressed: review id=$run_id could not be ordered against the processing-error notice (#2657)"
+                return 0
+                ;;
+            esac
+          fi
           accepted_after_rc=0
           crw_newer_review_trigger_accepted "$issue_comments" "$run_submitted_at" \
             || accepted_after_rc=$?
@@ -3054,6 +3144,43 @@ status_context_fast_path_blocked_by_comment() {
         STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
         log "StatusContext success is grading-only because CodeRabbit's current comment is $current_class and no body-bearing review run is pinned to current HEAD $HEAD_SHA — findings will still surface, but elapsed grace/window and body-less acknowledgements cannot permit clearance (#956)"
         return 1
+        ;;
+    esac
+  fi
+
+  # #2657: CodeRabbit can publish the processing-error notice as the
+  # current-HEAD review object itself, with no matching issue comment. The
+  # refusal branch above reads reviews only behind an issue-comment refusal,
+  # so check the newest body-bearing current-HEAD run here too: a completed
+  # StatusContext beside a run that says it was not processed proves nothing.
+  pe_reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
+    log "StatusContext success suppressed: the reviews list could not be read to rule out a processing-error review run (#2657)"
+    return 0
+  }
+  pe_run_rc=0
+  pe_run=$(crw_select_head_pinned_review_run "$pe_reviews" "$BOT_LOGIN" "$HEAD_SHA") || pe_run_rc=$?
+  if [ "$pe_run_rc" != 0 ]; then
+    log "StatusContext success suppressed: the current-HEAD review run could not be derived to rule out a processing-error notice (#2657)"
+    return 0
+  fi
+  if [ -n "$pe_run" ]; then
+    pe_run_id=$(printf '%s' "$pe_run" | jq -r '.id') || { log "StatusContext success suppressed: the current-HEAD review id could not be decoded (#2657)"; return 0; }
+    pe_run_body=$(printf '%s' "$pe_reviews" | jq -er --argjson id "$pe_run_id" 'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)') || {
+      log "StatusContext success suppressed: body-bearing review id=$pe_run_id could not be read back for a processing-error check (#2657)"
+      return 0
+    }
+    pe_rc=0
+    crw_is_processing_error_notice "$pe_run_body" || pe_rc=$?
+    case "$pe_rc" in
+      0)
+        STATUS_CONTEXT_CLEARANCE_REFUSAL=processing_error
+        log "StatusContext success is grading-only: the newest body-bearing current-HEAD review id=$pe_run_id is CodeRabbit's processing-error notice, not a review (#2657)"
+        return 1
+        ;;
+      1) : ;;
+      *)
+        log "StatusContext success suppressed: body-bearing current-HEAD review id=$pe_run_id could not be read for a processing-error notice (#2657)"
+        return 0
         ;;
     esac
   fi

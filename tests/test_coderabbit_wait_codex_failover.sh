@@ -48,6 +48,43 @@ NEW_RATE_LIMIT_BODY='<!-- This is an auto-generated comment: rate limited by cod
 
 <!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
 
+# #2657: the spending-cap body CodeRabbit posted on mergepath#2644
+# (2026-10-21), verbatim apart from the org id: a review-stack preface, the
+# rate-limited marker, the "Review limit reached" header, and a new
+# "Next included review available in" window line.
+SPENDING_CAP_BODY='<!-- coderabbit-ai-generated:v1 -->
+
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+<!-- review_stack_entry_start -->
+
+<a href="https://app.coderabbit.ai/change-stack/owner/repo/pull/999">Review in Change Stack</a>
+
+<!-- review_stack_entry_end -->
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+>
+> Your organization has reached its usage spending cap. Adjust your spending cap in the [billing tab](https://app.coderabbit.ai/settings/billing?tab=usage&orgId=org).
+>
+> **Next included review available in 7 minutes.**
+
+<!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
+
+# Unknown warning prose with no rate-limit marker or recognized header. It
+# must never be read as a confirmed rate limit.
+PROCESSING_ERROR_BODY='> [!WARNING]
+> ## Something unexpected happened
+>
+> We could not process this pull request right now. Please try again later.'
+
+# Warning prose the waiter recognizes as neither a provider marker nor the
+# processing-error stanza (#2657 review): it must never fire the failover.
+UNKNOWN_WARNING_BODY='> [!WARNING]
+> ## Review could not be completed
+>
+> The provider returned an unexpected response. Please try again later.'
+
 # make_case <name> <max_wait> <max_retries> <failover> [rate_limit_body]
 #   rate_limit_body defaults to the OLD format; pass NEW_RATE_LIMIT_BODY to
 #   exercise the adaptive-limit variant.
@@ -292,6 +329,72 @@ test_newformat_window_parsed() {
   [ "$FAIL" -ne "$before" ] || pass "F: published 13-minute window never delays Codex substitution"
 }
 
+
+# --- Test G: the spending-cap variant is a confirmed rate limit (#2657) -----
+test_spending_cap_fires() {
+  local dir rc before=$FAIL
+  dir=$(make_case "spending-cap" 1800 1 true "$SPENDING_CAP_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "5" ] || fail "G: expected exit 5 on the spending-cap body, got $rc; err=$(tail -3 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "G: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "G: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
+  [ "$(stub_calls "$dir")" = "1" ] || fail "G: Codex helper invoked $(stub_calls "$dir") time(s), expected 1"
+  grep -q -- '--failover' "$dir/state/codex-stub.log" 2>/dev/null || fail "G: failover trigger lacks --failover"
+  [ ! -s "$dir/state/sleeps.log" ] || fail "G: the spending cap slept instead of handing off to Codex"
+  [ ! -s "$dir/state/posts.log" ] || fail "G: the spending cap posted a CodeRabbit retry"
+  [ "$(jqf "$dir" '.disposition')" = proceed_on_codex_clearance ] || fail "G: spending cap was not handed to Codex"
+  [ "$FAIL" -ne "$before" ] || pass "G: the spending-cap body fires the Codex failover once with no sleep or retry"
+}
+
+# --- Test H: unknown warning prose is not a confirmed rate limit (#2657) -----
+test_unknown_prose_no_failover() {
+  local dir rc before=$FAIL
+  dir=$(make_case "unknown-prose" 300 0 true "$PROCESSING_ERROR_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H: unknown prose invoked the Codex failover $(stub_calls "$dir") time(s)"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H: unknown prose classified as rate_limit_stalled"
+  [ "$(jqf "$dir" '.codex_failover_requested' 2>/dev/null)" != "true" ] || fail "H: unknown prose reported a failover"
+  # It is not a review either: an unprocessed head must never clear.
+  [ "$rc" = "4" ] || fail "H: expected the processing-error notice to time out with exit 4, got $rc"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H: the processing-error notice cleared an unreviewed head"
+  [ "$FAIL" -ne "$before" ] || pass "H: CodeRabbit's processing-error notice neither fires the failover nor clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
+
+# --- Test H0: genuinely unknown warning prose never fires the failover -------
+test_unrecognized_warning_no_failover() {
+  local dir rc before=$FAIL
+  dir=$(make_case "unrecognized-warning" 300 0 true "$UNKNOWN_WARNING_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H0: unrecognized warning prose invoked the Codex failover $(stub_calls "$dir") time(s)"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "rate_limit_stalled" ] || fail "H0: unrecognized warning prose classified as rate_limit_stalled"
+  [ "$FAIL" -ne "$before" ] || pass "H0: unrecognized warning prose never fires the Codex failover (rc=$rc)"
+}
+
+# --- Test H2: a review that merely mentions the phrase stays a review (#2657) --
+# Only the provider-owned stanza is a processing error. Prose, a quote or a
+# fenced copy of the notice inside a genuine review must still clear.
+test_review_mentioning_processing_error_still_clears() {
+  local dir rc before=$FAIL body
+  body=$'Review completed. The new classifier handles CodeRabbit\'s "Something unexpected happened" notice, and we could not process this pull request is quoted below.\n\n```\n> [!WARNING]\n> ## Something unexpected happened\n>\n> We could not process this pull request right now.\n```\n\n> We could not process this pull request right now.'
+  dir=$(make_case "mentions-processing-error" 300 0 true "$body")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "0" ] || fail "H2: a review mentioning the notice did not clear, rc=$rc; err=$(tail -3 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" = "cleared" ] || fail "H2: status=$(jqf "$dir" '.status' 2>/dev/null), expected cleared"
+  [ "$FAIL" -ne "$before" ] || pass "H2: a review quoting or fencing the processing-error text is still a review"
+}
+
+# --- Test H3: the notice behind CodeRabbit's vendor header (#2734) ----------
+# Live comments now open with an invisible `<!-- coderabbit-ai-generated:v1 -->`
+# line. The processing-error notice behind it must still never clear.
+test_headered_processing_error_never_clears() {
+  local dir rc before=$FAIL
+  dir=$(make_case "headered-processing-error" 300 0 true $'<!-- coderabbit-ai-generated:v1 -->\n\n'"$PROCESSING_ERROR_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "4" ] || fail "H3: expected the headered processing-error notice to time out with exit 4, got $rc"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "H3: the headered processing-error notice cleared an unreviewed head"
+  [ "$(stub_calls "$dir")" = "0" ] || fail "H3: the headered notice fired the failover"
+  [ "$FAIL" -ne "$before" ] || pass "H3: the processing-error notice behind the vendor header never clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
 
 # #2139: drive the actual full clearance checker, then the fixture approval
 # step. CI is scoped out here; its production enforcement is covered separately.
@@ -547,6 +650,11 @@ test_failover_idempotent_across_retries
 test_newformat_fires
 test_newformat_window_parsed
 test_exact_head_substitution_approval
+test_spending_cap_fires
+test_unknown_prose_no_failover
+test_unrecognized_warning_no_failover
+test_review_mentioning_processing_error_still_clears
+test_headered_processing_error_never_clears
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"
