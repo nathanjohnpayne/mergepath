@@ -608,7 +608,9 @@ __cra_retire_base_cfg() { # <new-path-or-empty>
 # #2664: a retry intent recorded but not yet resolved (posted, or refused
 # and withdrawn) when the process exits, for example through an accounting or
 # blocking-budget stop inside the write path, is withdrawn on the way out.
-trap '[ "${RETRY_INTENT_PENDING:-false}" != true ] || retry_withdraw_intent; __cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
+# Once the retry's own write is in flight the intent stays live: that write
+# may have landed, and the intent then still marks it.
+trap '[ "${RETRY_INTENT_PENDING:-false}" != true ] || [ "${RETRY_WRITE_IN_FLIGHT:-false}" = true ] || retry_withdraw_intent; __cra_retire_base_cfg ""; [ -z "$__CRA_ENTRY_CFG_TMP" ] || rm -f "$__CRA_ENTRY_CFG_TMP"' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 DISCRETIONARY_TIERS_JSON='["p2","p3","nitpick"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
@@ -2803,6 +2805,7 @@ post_codex_trigger() {
       || die 3 "cannot read the Codex request generation; refusing a new '@codex review' trigger"
   fi
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
+  [ "$CODEX_RETRY_WRITE" != true ] || RETRY_WRITE_IN_FLIGHT=true
   MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
     MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$caller_mode" \
     MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$observed_generation" \
@@ -2970,14 +2973,28 @@ run_trigger_ack_gate() {
 
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
+    local ack_original=$TRIGGER_COMMENT_ID
     if ! post_codex_trigger; then
       if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ] || [ "$ACK_RETRY_REFUSED_BY_EXISTING" = true ]; then
         return 0
       fi
       die 3 "acknowledgement retry did not post a Codex trigger"
     fi
-    # An acknowledgement re-post is this run's automatic retry (#2664).
+    # An acknowledgement re-post is this run's automatic retry (#2664). It is
+    # bound like one, so a restarted session never retries it again. The
+    # binding follows the re-post, as for any retry; only a stop in the
+    # instant between the two leaves it unbound.
     AUTOMATIC_RETRY_USED=true
+    if [ -z "$RETRY_ORIGINAL_ID" ]; then
+      RETRY_ORIGINAL_ID=$ack_original RETRY_COMMENT_ID=$TRIGGER_COMMENT_ID
+      RETRY_STATE=posted RETRY_REASON=unacknowledged
+    fi
+    if [ -n "$ack_original" ] && [ -n "$TRIGGER_COMMENT_ID" ]; then
+      ( post_author_pr_comment "$CODEX_RETRY_MARKER_PREFIX head=$HEAD_SHA original=$ack_original retry=$TRIGGER_COMMENT_ID -->
+**Automatic Codex retry (nathanjohnpayne/mergepath#2664)** posted as request $TRIGGER_COMMENT_ID for request $ack_original, which Codex did not acknowledge." \
+        "acknowledgement re-post binding" body-file ) >/dev/null 2>&1 \
+        || log "WARN: the acknowledgement re-post binding could not be recorded (#2664)"
+    fi
   done
 }
 
@@ -3119,8 +3136,12 @@ retry_extend_backoff() {
   retry_after=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.retry_after_seconds // 0' 2>/dev/null) || retry_after=0
   [[ "$retry_after" =~ ^[0-9]+$ ]] || retry_after=0
   if [ "$retry_after" -gt "$RETRY_BACKOFF" ]; then
+    # The window runs from when this run saw it stated, not from when the
+    # failure was first seen.
+    local window_due
+    window_due=$(( $(date +%s) + retry_after ))
     RETRY_BACKOFF=$retry_after
-    RETRY_DUE=$((RETRY_SEEN_AT + RETRY_BACKOFF))
+    [ "$window_due" -le "$RETRY_DUE" ] || RETRY_DUE=$window_due
     log "Codex states a retry window of ${retry_after}s — the automatic retry for request $RETRY_ORIGINAL_ID waits until then (#2664)"
   fi
 }
@@ -3130,7 +3151,10 @@ post_codex_retry() {
   # The head this run requested a review of must still be the PR's head.
   live=$(gh_api_scalar --shape sha "retry live PR head" "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha') \
     || die 3 "cannot fence the automatic Codex retry head"
-  if [ "$live" != "$HEAD_SHA" ]; then retry_refuse head-changed; return 0; fi
+  if [ "$live" != "$HEAD_SHA" ]; then
+    retry_refuse head-changed
+    die 3 "PR head moved from $HEAD_SHA to $live while waiting on request $RETRY_ORIGINAL_ID; this run's request is for a superseded head, so no retry was posted. Run the requester on the new head (#2664)"
+  fi
   # A late result, a provider block or a run that is active again ends it.
   rescan_codex_state "automatic retry pre-post scan"
   if has_post_trigger_signal "$FINAL_SCAN"; then retry_refuse late-result; return 0; fi
@@ -3569,6 +3593,7 @@ RETRY_SEEN_AT=0
 RETRY_ACKED_ID=""
 RETRY_INTENT_ID=""
 RETRY_INTENT_PENDING=false
+RETRY_WRITE_IN_FLIGHT=false
 RETRY_PINNED_GENERATION=""
 RESUMED_IS_RETRY=false
 
@@ -3755,13 +3780,15 @@ run_review_poll
 RESUMED_BLOCK_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order the resumed provider refusal"
 # #2664: a resumed request that looked like an automatic retry is re-checked
 # against fresh markers before its replacement is withheld.
-if [ "$RESUMED_TRIGGER" = true ] && [ "$RESUMED_IS_RETRY" = true ] && { [ "$RETRY_STATE" = none ] || [ "$RETRY_STATE" = scheduled ]; }; then
+if [ "$RESUMED_TRIGGER" = true ] && { { [ "$RESUMED_IS_RETRY" = true ] && { [ "$RETRY_STATE" = none ] || [ "$RETRY_STATE" = scheduled ]; }; } \
+     || { [ "$RETRY_STATE" = refused ] && [ "$RETRY_REASON" = retry-of-retry ]; }; }; then
   resumed_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "resumed retry evidence") \
     || die 3 "cannot re-read the retry markers for the resumed request"
   if [ "$(crqe_request_is_retry "$resumed_comments" "$AUTHOR_IDENTITY" "$RESUMED_TRIGGER_ID")" != false ]; then
     retry_refuse retry-of-retry
   else
     log "pending request $RESUMED_TRIGGER_ID is no longer marked as an automatic retry (its intent was withdrawn) (#2664)"
+    if [ "$RETRY_STATE" = refused ]; then RETRY_STATE=none RETRY_REASON=""; fi
   fi
 fi
 # #2664: a resumed request whose run was confirmed failed or inactive, and

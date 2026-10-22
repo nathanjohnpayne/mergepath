@@ -167,6 +167,12 @@ case "$body" in
       jq -cn '{id:6000,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:01:30Z"}' >>"$state_dir/comments.jsonl"
     fi ;;
 esac
+# #2664: the retry's write lands but reports a transport failure.
+if [ "$kind" = trigger ] && [ "${CODEX_TEST_AMBIGUOUS_RETRY_POST:-0}" = 1 ] && [ -f "$state_dir/trigger-count" ]; then
+  jq -cn --argjson id 1999 '{id:$id,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-04T00:02:00Z"}' >>"$state_dir/comments.jsonl"
+  echo "unexpected EOF talking to api.github.com" >&2
+  exit 1
+fi
 # #2664: the fake time of every trigger, for the retry backoff assertions.
 if [ "$kind" = trigger ] && [ -f "$state_dir/fake-time" ]; then
   cat "$state_dir/fake-time" >>"$state_dir/trigger-times"
@@ -422,14 +428,15 @@ case "$endpoint" in
       pt=0; [ ! -f "$state_dir/post-trigger-reads" ] || pt=$(cat "$state_dir/post-trigger-reads")
       pt=$((pt + 1)); printf '%s\n' "$pt" >"$state_dir/post-trigger-reads"
       if [ "$pt" -eq 2 ]; then
+        cat "$state_dir/fake-time" >"$state_dir/window-at"
         body=$(printf '<!-- codex-pull-request-review-summary -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ❌ **Failed** | `aaaaaaa` | Manual request |\n\nPlease try again in 3 minutes.\n')
         jq -cn --arg body "$body" '{id:3005,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:"2026-06-04T00:00:20Z",updated_at:"2026-06-04T00:00:20Z"}' >>"$state_dir/comments.jsonl"
       fi
     fi
     # #2664: the intent that marks the resumed request is withdrawn while the
     # request is being polled (fake time 100 s after it was posted).
-    if [ "$scenario" = "retry-intent-withdrawn" ] && [ ! -f "$state_dir/intent-withdrawn" ] \
-       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + 100 ))" ]; then
+    if { [ "$scenario" = "retry-intent-withdrawn" ] || [ -n "${CODEX_TEST_WITHDRAW_AT:-}" ]; } && [ ! -f "$state_dir/intent-withdrawn" ] \
+       && [ "$(cat "$state_dir/fake-time")" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + ${CODEX_TEST_WITHDRAW_AT:-100} ))" ]; then
       touch "$state_dir/intent-withdrawn"
       jq -cn '{id:910,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 withdrawn=899 -->\nWithdrawn.",created_at:"2026-06-04T00:01:40Z"}' >>"$state_dir/comments.jsonl"
     fi
@@ -1983,8 +1990,11 @@ test_retry_window_lengthened_while_scheduled() {
   rc=$(run_retry_case "$dir" retry-window-late)
   [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 late window: exit $rc, $(trigger_count "$dir") triggers"
   jq -e '.retry.backoff_seconds == 180' "$dir/out.json" >/dev/null || fail "#2664 late window: $(jq -c .retry "$dir/out.json")"
-  [ "$(trigger_gap "$dir")" -ge 180 ] && [ "$(trigger_gap "$dir")" -le 195 ] \
-    || fail "#2664 late window: retry posted $(trigger_gap "$dir")s after the original, expected 180-195"
+  # The window runs from when it was stated, not from the first failure.
+  local since_window
+  since_window=$(( $(sed -n 2p "$dir/state/trigger-times") - $(cat "$dir/state/window-at") ))
+  [ "$since_window" -ge 180 ] && [ "$since_window" -le 195 ] \
+    || fail "#2664 late window: retry posted ${since_window}s after the window was stated, expected 180-195"
   [ "$FAIL" -ne "$before" ] || pass "#2664: a provider window stated during the backoff moves the scheduled retry out"
 }
 
@@ -2171,6 +2181,56 @@ test_rival_retry_after_check_is_refused() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: a rival retry after the latest-request check refuses this handler's retry"
 }
 
+# The retry's own write landed but reported a failure. The intent stays live
+# (it still marks that request), and nothing withdraws it on the way out.
+test_ambiguous_retry_write_keeps_its_intent() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-ambiguous-write" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  rc=$(run_retry_case "$dir" absent CODEX_TEST_AMBIGUOUS_RETRY_POST=1)
+  [ "$rc" = 3 ] || fail "#2664 ambiguous write: exit $rc, expected 3"
+  [ -n "$(retry_markers "$dir" | grep -v 'retry=\|withdrawn=')" ] && ! retry_markers "$dir" | grep -q 'withdrawn=' \
+    || fail "#2664 ambiguous write: expected a live intent and no withdrawal; $(retry_markers "$dir")"
+  (
+    # shellcheck source=/dev/null
+    . "$ROOT/scripts/lib/codex-request-evidence.sh"
+    [ "$(crqe_request_is_retry "$(jq -sc . "$dir/state/comments.jsonl")" nathanjohnpayne 1999)" = true ]
+  ) || fail "#2664 ambiguous write: the landed retry is not marked as a retry"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a retry write that may have landed keeps its intent live"
+}
+
+# A resumed request whose retry was refused as a retry-of-retry, because a
+# rival's intent was still live, is re-checked at the deadline: the intent was
+# withdrawn meanwhile, so the #1550 replacement runs.
+test_refused_retry_of_retry_rechecked_at_deadline() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-refused-recheck" 0 0 400)
+  seed_author_trigger "$dir" 880 "2026-06-03T23:50:00Z"
+  jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-codex-retry:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa original=880 -->\nIntent.",created_at:"2026-06-03T23:59:59Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_retry_case "$dir" retry-concurrent CODEX_TEST_FAIL_AT=60 CODEX_TEST_WITHDRAW_AT=200)
+  grep -q 'not posted: retry-of-retry' "$dir/err.log" || fail "#2664 refused recheck: the retry was not refused first; $(grep 2664 "$dir/err.log" | tail -3)"
+  grep -q 'no longer marked as an automatic retry' "$dir/err.log" && grep -q 're-running as a fresh request' "$dir/err.log" \
+    || fail "#2664 refused recheck: the refusal was not re-checked before the replacement; exit $rc"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a retry-of-retry refusal is re-checked against fresh markers before the replacement is withheld"
+}
+
+# An acknowledgement re-post is bound as the run's one retry, so a restarted
+# session that later sees it fail never retries it again.
+test_ack_repost_is_bound_as_the_retry() {
+  local dir rc before=$FAIL
+  dir=$(make_case "retry-ack-bound" 0 1 400)
+  rc=$(run_retry_case "$dir" review_after_retry CODEX_TEST_EYES=0)
+  [ "$(trigger_count "$dir")" = 2 ] || fail "#2664 ack binding: $(trigger_count "$dir") triggers, expected the original and its re-post"
+  retry_markers "$dir" | grep -q 'original=1001 retry=1002 -->' || fail "#2664 ack binding: no binding for the re-post; $(retry_markers "$dir")"
+  jq -e '.retry.state == "posted" and .retry.reason == "unacknowledged"' "$dir/out.json" >/dev/null \
+    || fail "#2664 ack binding: exit $rc, $(jq -c .retry "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: an acknowledgement re-post is bound as the request's one retry"
+}
+
 test_retry_refused_by_late_result_or_moved_head() {
   local scenario dir rc want before
   for scenario in retry-late-at-fence retry-head-changed; do
@@ -2185,6 +2245,11 @@ test_retry_refused_by_late_result_or_moved_head() {
       || fail "#2664 $scenario: expected refusal '$want'; stderr=$(tail -5 "$dir/err.log")"
     if [ "$scenario" = retry-late-at-fence ]; then
       [ "$rc" = 0 ] || fail "#2664 late result: exit $rc, expected the late response to end the wait"
+    else
+      # A moved head ends the run at the fence instead of waiting out the old
+      # head's deadline.
+      [ "$rc" = 3 ] && grep -q 'PR head moved from' "$dir/err.log" && ! grep -q 'deadline reached' "$dir/err.log" \
+        || fail "#2664 moved head: exit $rc, expected an immediate stop; $(tail -2 "$dir/err.log")"
     fi
     [ "$FAIL" -ne "$before" ] || pass "#2664: $want immediately before posting prevents the retry"
   done
@@ -2319,6 +2384,9 @@ test_restarted_session_resumes_failed_request
 test_refused_retry_withdraws_its_intent
 test_stop_after_intent_withdraws_it
 test_rival_retry_after_check_is_refused
+test_ambiguous_retry_write_keeps_its_intent
+test_refused_retry_of_retry_rechecked_at_deadline
+test_ack_repost_is_bound_as_the_retry
 test_retry_refused_by_late_result_or_moved_head
 test_retry_never_chains
 test_retry_withheld_from_a_retry_request
