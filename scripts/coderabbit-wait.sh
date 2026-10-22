@@ -1424,6 +1424,13 @@ parse_rate_limit_window() {
 # mid-review CodeRabbit reads as a completed clean report. `summary_names_head`
 # and `summary_names_only_other_head` below carry the same correction; this
 # block is the rest of the #1005 sweep.
+# #2657: CodeRabbit's processing-error notice ("Something unexpected happened
+# ... We could not process this pull request right now") is not a review. The
+# persistent summary is excluded, since its content may quote the phrase.
+crw_is_processing_error_notice() {
+  [[ "$1" != "$SUMMARY_MARKER"* ]] && grep -qiE 'Something unexpected happened|could not process this pull request' <<<"$1"
+}
+
 classify_comment() {
   local body=$1
   # #593: key on the stable auto-generated marker FIRST, before any prose
@@ -1478,14 +1485,11 @@ classify_comment() {
     echo "in_progress"
     return
   fi
-  # #2657: CodeRabbit's processing-error notice ("Something unexpected
-  # happened ... We could not process this pull request right now") is not a
-  # review, and grading it `review` let it clear an unreviewed head. It is
-  # graded like narration: the poll loop keeps polling and the review
-  # selector skips it, so the run ends in a timeout, never a clearance. The
-  # persistent summary is excluded as above, since its content may quote
-  # the phrase.
-  if [[ "$body" != "$SUMMARY_MARKER"* ]] && grep -qiE 'Something unexpected happened|could not process this pull request' <<<"$body"; then
+  # #2657: the processing-error notice is not a review, and grading it
+  # `review` let it clear an unreviewed head. It is graded like narration:
+  # the poll loop keeps polling and the review selector skips it, so the run
+  # ends in a timeout, never a clearance.
+  if crw_is_processing_error_notice "$body"; then
     echo "status_probe"
     return
   fi
@@ -2982,8 +2986,15 @@ status_context_fast_path_blocked_by_comment() {
     elif [ "$current_rc" != "0" ]; then
       current_class=review
     fi
+    # #2657: a processing-error notice is a refusal for the fast path too. A
+    # `success` StatusContext beside it proves no review, so only the same
+    # body-bearing current-HEAD review run that releases a rate-limit or
+    # pause refusal can release it.
+    if [ "$current_class" = review ] && crw_is_processing_error_notice "$comment_body"; then
+      current_class=processing_error
+    fi
     case "$current_class" in
-      rate_limit|paused)
+      rate_limit|paused|processing_error)
         reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
           log "StatusContext success suppressed: CodeRabbit's current comment is $current_class and the reviews list could not be read, so an actual current-HEAD review cannot be established (#956)"
           return 0

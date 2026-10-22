@@ -96,6 +96,10 @@ SUMMARY_BODY_WITH_RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: sum
 CodeRabbit is an incremental review system.
 ```'
 
+PROCESSING_ERROR_BODY='> [!WARNING]
+> ## Something unexpected happened
+>
+> We could not process this pull request right now. Please try again later.'
 LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
 
 Please wait before requesting another review.'
@@ -1282,6 +1286,28 @@ test_unknown_description_does_not_clear() {
 # --- Test 8: control — 'Review completed' still clears ----------------------
 # The #912 capture of a genuine run (af8496f @03:06:48Z). Guarding the
 # description must not cost the #221 fast path.
+# --- #2657: a processing-error notice beside a success status never clears ---
+test_processing_error_with_success_status_does_not_clear() {
+  local dir rc before=$FAIL
+  dir=$(make_case "processing-error" "$PROCESSING_ERROR_BODY" "$STATUS_TIME" "Review completed")
+  rc=$(run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE: the fast path cleared over CodeRabbit's processing-error notice; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE: status=cleared over a processing-error notice"
+  [ "$(stub_calls "$dir")" = "0" ] || fail "PE: a processing error fired the rate-limit failover"
+  [ "$FAIL" -ne "$before" ] || pass "PE: #2657 — a success StatusContext beside a processing-error notice never clears (rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null))"
+}
+
+# --- #2657 control: a body-bearing current-HEAD run still releases it ---------
+test_processing_error_with_actual_head_review_clears() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "processing-error-review" "$PROCESSING_ERROR_BODY" "2026-06-04T02:00:00Z" "Review completed")
+  reviews='[{"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "PE2: expected exit 0 with a body-bearing current-HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "PE2: status=$(jqf "$dir" '.status'), expected cleared"
+  [ "$FAIL" -ne "$before" ] || pass "PE2: #2657 — a body-bearing review run pinned to HEAD releases the processing-error refusal"
+}
+
 test_completed_description_still_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "desc-completed" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review completed")
@@ -2600,6 +2626,8 @@ test_summary_only_marker_is_findings_not_cleared
 test_ratelimited_description_without_notice_never_clears
 test_unknown_description_does_not_clear
 test_completed_description_still_clears
+test_processing_error_with_success_status_does_not_clear
+test_processing_error_with_actual_head_review_clears
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error
