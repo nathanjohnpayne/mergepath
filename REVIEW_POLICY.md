@@ -24,7 +24,7 @@ Anything else — a green under-threshold PR, or a Phase 4a clearance where `pha
 All agents author and push code under a single shared author identity:
 
 - **GitHub ID:** `nathanjohnpayne`
-- **Role:** Author and merger for all code changes
+- **Role:** Author and merger for all code changes; also the committer in local sessions. A Claude cloud session keeps its own approved, signed committer, as [Cloud Agent Environments](docs/agents/cloud-environments.md) describes.
 - **Used by:** Whichever agent is currently writing or fixing code
 
 When GitHub creates a commit during a squash merge, `update-branch`, or a web-UI merge, its committer may be GitHub's `GitHub <noreply@github.com>` / `web-flow` identity. That server-side identity is not selectable by the agent and is not an agent identity; the author identity, reviewer identities, signing requirements, and merge rules above and below remain unchanged.
@@ -61,6 +61,11 @@ It is a deny-list rather than an allow-list on purpose. An allow-list would have
 
 An absent or empty key is a legitimate configuration meaning "no such identity here", and makes the check inert. The protection is therefore opt-in per repo: a repo that has not adopted the key is unaffected rather than broken, and also unprotected.
 
+- **Use the dash-prefixed block form, one login per line.** An absent key, an empty key and the empty flow list `[]` are all inert. A non-empty inline value the block reader cannot consume, such as the flow list `[nathanpayne-robot]` or a bare scalar, makes the gate exit 2 rather than pass, because that shape would otherwise read the same as an absent key.
+- **Query modes are exempt.** `--derive-external-requiredness`, `--derive-phase-4-requiredness` and `--derive-rate-limit-protection` answer narrow questions about review coverage; folding an identity verdict into their answers would change what their callers think they asked.
+- **The review-provider App bots are not listed.** `coderabbitai[bot]` and `chatgpt-codex-connector[bot]` keep their review standing, because Phase 2.5 and Phase 4a depend on it.
+- **The check that goes red is `Merge clearance gate`,** and it can go red on an ordinary under-threshold PR with both of that gate's own knobs (`dependabot.reviewer_gate.enabled`, `codex.external_review_gate.enabled`) off. That is this lane-wide rule firing, not a misconfigured gate. Dismiss the review, then find out which process is holding that token: an approval from a CI account is a credential-routing incident, not a review to argue with.
+
 The current CI service account is `nathanpayne-robot`. It holds no reviewer standing and must never post a review — review state is what the no-self-approve and same-agent gates read. It is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT.
 
 ### Identity Rules
@@ -78,6 +83,8 @@ For repo work, `GH_TOKEN` is now the per-command attribution source for the guar
 - **Guarded write paths** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) MUST go through `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token, verifies it with `scripts/identity-check.sh --expect-write-identity` (its login must match and it must be a user-held credential, not a brokered or app-installed one, #1057), and runs exactly the wrapped command with `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrapped command must start with `gh` itself: a prefix such as `env`, `sudo` or `command` could replace the verified token after the check, so the wrappers refuse it before any write (#1057). The author wrapper also accepts exactly one `git` form, bootstrap's initial push: `GH_AS_AUTHOR_PUSH_REPO=<owner/repo> … -- git -C <dir> push -u origin HEAD`, where `<owner/repo>` comes from bootstrap's own input. `<dir>` must be a primary repository whose `.git/config` (parsed by git, includes off) holds only a fixed, value-checked allowlist, each key at most once. `remote.origin.url` must be exactly `https://github.com/<owner/repo>.git`, or its exact `git@github.com:` spelling, pushed over HTTPS. Anything else refuses the push. The push runs with gh's credential helper (the verified token) as git's only credential source, global and system config, `~/.netrc`, injected config and repository hooks out of reach. `GH_AS_AUTHOR_TRACE_MARKER` names a file the author wrapper creates after every check and immediately before the `gh` write; if it cannot, the wrapper exits 70 and nothing runs. The wrappers never change stored gh account selection.
 - **Bare and inline-token guarded writes** fail closed in `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not an approved substitute for the wrapper because it does not prove the token belongs to the expected identity.
 
+Post a PR review through `scripts/gh-as-reviewer.sh` with the running agent's registered reviewer identity, after local credential preflight or approved cloud credential provisioning. Do not rely on a GitHub connector session or on the account `gh auth status` shows. On a cloud surface the same wrapped `gh pr` and `gh issue` commands run, in the canonical forms [Cloud Agent Environments](docs/agents/cloud-environments.md) lists (long options, `--repo` always): the wrapper's REST transport turns each into REST calls and reads the byline back. The wrapper refuses `gh pr merge` there, so a merge is parked with a handback for a local session. Never hand-roll `gh api` writes in place of the wrapper.
+
 `codex-review-request.sh` posts the load-bearing Codex review command through `scripts/gh-as-author.sh`. The Codex GitHub App only monitors trigger comments authored by `nathanjohnpayne` (#405), so this trigger is an author-identity write even though the polling reads use the reviewer PAT. `coderabbit-wait.sh` and other long-tail helpers continue to use the cached PATs they load from preflight; the wrapper-mandatory contract in this section covers the core guarded `gh` write surface.
 
 #### PAT lookup table
@@ -94,7 +101,7 @@ For repo work, `GH_TOKEN` is now the per-command attribution source for the guar
 
 > **A 1Password item ID is not a stable identity.** On 2026-08-21 the item `o6ekjxjjl5gq6rmcneomrjahpu` was repurposed from Codex to the robot and Codex was recreated at `etak327mpz4drd4byxszfex4vm`; every row above still pointed at the old ID, so `--agent codex` silently resolved a **robot** token. Nothing in the table can catch that on its own — after any PAT rotation or item edit, re-verify each row by resolving **that row's** `op://` reference into `GH_TOKEN` and checking it — `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" scripts/identity-check.sh --expect-token-identity <login>`. The bare `scripts/identity-check.sh --expect-token-identity <login>` form does **not** verify a table row: it checks whatever is already in `$GH_TOKEN`, so it exits 3 with no token set and otherwise validates a cached token rather than the newly edited item. **Origin:** the robot PAT was created that day by repurposing the existing Codex 1Password item rather than minting a fresh one, so the id every doc and lookup already named silently changed identity while nothing referencing it changed — mint a new item for a new identity, never repurpose one. The correction landed here the same day, but `scripts/op-preflight.sh` is a canonical manifest path and no consumer had synced it when a Codex session resolved the robot token roughly five and a half hours later and posted approvals under the CI byline on nathanjohnpayne/nathanpaynedotcom#668: a canonical fix is not shipped until it reaches the consumers.
 
-**Cached-variable usage is the primary pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly — no biometric burned per call:
+**Cached-variable usage is the primary local pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly—no biometric burned per call. A cloud session has no 1Password: it sets `OP_PREFLIGHT_AUTHOR_PAT` and `OP_PREFLIGHT_REVIEWER_PAT` from provisioned credentials, runs the capability probe in [Cloud Agent Environments](docs/agents/cloud-environments.md), and never invokes local preflight. The same identity-checked wrappers apply in both environments. The local form:
 
 ```bash
 # Read-path identity check (PRIMARY — uses cached PAT, no biometric).
@@ -114,7 +121,7 @@ scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 
 ##### Fallback / setup-only: inline `op read`
 
-> **⚠️ This triggers a biometric prompt every call. Use only when `op-preflight.sh` is unavailable** — for example, during the initial bootstrap of a new machine before the cache directory exists, or in a CI runner that has not been wired through preflight. Routine agent work should always use the cached `$OP_PREFLIGHT_*_PAT` env vars above.
+> **⚠️ This triggers a biometric prompt every call. Use only when `op-preflight.sh` is unavailable**—for example, during the initial bootstrap of a new machine before the cache directory exists, or in a CI runner that has not been wired through preflight. Routine agent work should always use the cached `$OP_PREFLIGHT_*_PAT` env vars above. This form is never a retry after a 1Password authentication failure, and a missing preflight in a cloud session does not authorize it: cloud sessions use the provisioned credentials in [Cloud Agent Environments](docs/agents/cloud-environments.md).
 
 ```bash
 # Setup-only — every invocation prompts for Touch ID.
@@ -125,6 +132,7 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
 - To verify a cached PAT, use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or let the wrapper perform the same check before the write. Do not use `gh auth status` as an attribution proof; it is affected by env tokens and does not replace the wrapper's effective-login check.
 - If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.
+- If 1Password reports a sign-in or biometric failure, stop and follow the pause-and-prompt procedure in `docs/agents/shared-operating-rules.md` under "1Password CLI authentication failures". Wait for the human to confirm they are present and ready, then run preflight once. Do not retry individual credential reads or loop.
 - If GitHub returns `Review Can not approve your own pull request`, you either the PR author is not `nathanjohnpayne`, the reviewer token resolved to the author identity, or the no-self-approve scoping rule below applies. Confirm with `gh pr view <PR#> --json author` and `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh api user --jq .login` before retrying. If you intentionally skipped `--approve` under the no-self-approve scoping rule below (Phase 4 / above-threshold PRs), post `--comment` instead and let Phase 4 carry the gate.
 
 ### Reserved review commands
@@ -241,7 +249,7 @@ Notes on the token-wrapper contract:
 
 ### Phase 0: Credential Preflight
 
-> Run this once at the start of every PR review or deploy session. It front-loads all 1Password credential reads and SSH key authorization into a single burst of biometric prompts (~15 seconds), so the human can step away for the rest of the session.
+> In a local session, run this once at the start of every PR review or deploy session. It front-loads the 1Password credential reads for the chosen mode, plus SSH key authorization in `review` and `all` modes, into a single burst of biometric prompts (~15 seconds), so the human can step away for the rest of the session. Cloud sessions use provisioned credentials and the capability probe in [Cloud Agent Environments](docs/agents/cloud-environments.md), and must not invoke local 1Password preflight. Load deploy credentials only in a local session where a deploy is authorized.
 
 ```bash
 # Session start (one biometric burst). `--mode review` is the DEFAULT
@@ -261,13 +269,15 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 |------|--------------|
 | `review` | Reviewer PAT + author PAT + SSH keys (**DEFAULT**) |
 | `deploy` | GCP ADC credential + Cloudflare cache-purge token |
-| `all` | Everything |
+| `all` | Everything; use only for local work with an authorized deploy that also needs review credentials |
 
-After preflight, these environment variables are set:
+The mode controls which credentials preflight attempts to acquire, and these environment variables carry what it acquired:
 - `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity read-path API calls and as the preferred token source for `scripts/gh-as-reviewer.sh`. The wrapper verifies the token's effective login before any reviewer write.
 - `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls and as the preferred token source for `scripts/gh-as-author.sh`. The wrapper verifies the token before author writes and performs same-token author verification after `gh pr create`.
-- `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
-- `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
+- `GOOGLE_APPLICATION_CREDENTIALS`—used automatically by gcloud/Firebase scripts. Set in `deploy` or `all` mode only when the deploy credential was acquired: an `all` run can report degraded deploy acquisition and finish without it, so verify it before the authorized deploy.
+- `OP_PREFLIGHT_DONE=1`—flag indicating preflight has been run. It does not prove that every credential was acquired, and it does not authorize a deploy.
+
+Cached, ambient or explicitly exported credentials can survive a mode change, so a mode is not credential isolation and not proof that earlier exports are gone. Verify the exports the authorized task needs. An absent export does not authorize acquiring more credentials or widening the task.
 
 Resolved credentials are also persisted to a chmod-600 session file at `$XDG_CACHE_HOME/mergepath/op-preflight-<agent>.env` (default `$HOME/.cache/mergepath/`). Re-running the preflight command within the TTL window (10h default since #765, shortened or lengthened via `OP_PREFLIGHT_TTL_SECONDS`) short-circuits to the cached values — **no new biometric prompt**. This is what lets agent drivers (Claude Code, Cursor, Codex CLI) re-run preflight at the top of every tool call without repeatedly re-unlocking 1Password; each tool call spawns a fresh subshell that cannot see env vars exported by a prior call, so the session file is the only persistence layer that survives. See nathanjohnpayne/mergepath#139 for the failure mode that motivated this design.
 
@@ -278,7 +288,7 @@ Session-cache maintenance:
 
 The session file contains plaintext PATs guarded only by filesystem permissions (0600) and is readable by any process running as your user — equivalent to the protection `op` itself provides for its unlocked session. Rotate the PATs in 1Password and purge the cache if you suspect the machine was compromised.
 
-If any `op` command fails mid-session (rare — only if 1Password locks or the 12-hour hard limit is reached), re-run the preflight command with `--refresh` to force a fresh fetch.
+If a 1Password authentication prompt fails mid-session (rare—only if 1Password locks or the 12-hour hard limit is reached), stop and follow the pause-and-prompt procedure in `docs/agents/shared-operating-rules.md` under "1Password CLI authentication failures". Wait for the human to confirm they are present and ready, then re-run preflight once (`--refresh` forces a fresh fetch). Do not retry individual credential reads, and do not refresh automatically or in a loop.
 
 ### Phase 1: Authoring
 
@@ -288,7 +298,7 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 ### Phase 2: Internal Review (Self-Peer Review)
 
-4. The agent selects its registered reviewer credentials through `scripts/gh-as-reviewer.sh` (e.g., `nathanpayne-claude`) for review API activity. Git commit author identity remains `nathanjohnpayne`.
+4. The agent selects its registered reviewer credentials through `scripts/gh-as-reviewer.sh` (e.g., `nathanpayne-claude`) for review API activity. Git commit author identity remains `nathanjohnpayne`; a Claude cloud session keeps its approved signed committer.
 5. The reviewer identity checks out the PR branch, reviews the diff, and posts review comments on the PR with specific, actionable feedback.
 6. The agent addresses each comment and pushes fix commits to the same branch with the human author identity. Author-attributed GitHub writes use `scripts/gh-as-author.sh`.
 7. Steps 4–6 repeat until the reviewer identity approves the PR with no outstanding issues. The mechanism of "approves" is scope-dependent: for under-threshold PRs (Phase 3 below), the reviewer identity posts `gh pr review --approve` to satisfy branch protection's required-approving-review check. For above-threshold PRs (Phase 4), the reviewer identity posts `gh pr review --comment` only — the cross-agent merge gate is carried by Phase 4 (anchored Codex review or affirmative verdict in branch 2 of gate (b), or external reviewer's `APPROVED` in Phase 4b). See [No-self-approve scoping](#no-self-approve-scoping) above.
@@ -588,6 +598,8 @@ Readiness validation is event-driven rather than runner-polled. Three triggers r
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
+**Where automation is enabled, it runs before any manual step.** With `phase_4b_automation.enabled: true` and `mode: local`, a PR that reaches Phase 4b (a Codex timeout, requester exit `4`; a spent request ceiling, requester exit `7` with `cap_exhausted.kind: "request-ceiling"`; Phase 4a being unavailable; or a `phase_4b_default` route after 4a clearance) goes first to `scripts/phase-4b-review.sh <PR#> --repo <owner/repo>`, run from a trusted default-branch checkout, never from the checkout of the PR under review (#628). Exit `0` posts an `APPROVED` review pinned to the reviewed HEAD. Exit `1` posts `CHANGES_REQUESTED`: a completed round to address and rerun. `phase_4b_automation.max_review_rounds` caps occupied round slots per PR through the round ledger (#2663): a run reserves its slot before dispatch, and the slot stays occupied after a crash or an uncertain review POST, so the cap can stop a PR before that many reviews have posted. A spent cap stops for the human rather than falling through to the manual handoff. A hold (exit `6`, including a wait to rerun after the emitted `retry_after`) is not a failure, and a tripwire or tiebreaker stop (exit `8`) goes to the human. Steps 11b–20b below apply only when the orchestrator falls back to them (exit `4`, `fell_back_to_manual: true`), when automation is off (exit `5`), or when the orchestrator is missing from disk. Exits `3`, `7` and `10` are hard stops to fix and rerun, never a handoff. The full exit contract is under **Automated Phase 4b** below.
+
 **Deterministic egregious-case escalation (#1757).** Model-authoritative Phase 4b remains the ordinary path, with the owner-accepted hostile-diff residual. After existing provider/feedback barriers permit continuation, the trusted orchestrator checks the complete immutable PR input on posting and retained-evidence paths for literal reviewer/verdict instructions and the authorization/review-policy/required-publisher/credential-handling path inventory, before dispatching the Phase 4b adapter. Earlier provider requests, stops and manual fallbacks remain possible; existing disagreement, runaway and human-stop signals retain their earlier barriers. A matched tripwire stops for human-mediated review with exit8, without Phase 4b adapter execution or approval publication. Pure previews retain their existing behavior. Report the fixed reason codes from `barrier.tripwire.tripwires` when escalating this stop. An ordinary (non-historical) wave canary that the trusted capture byte-verified against canonical source, whose audited head is on the first-parent history of the hub's default branch as GitHub serves it, read live by a commit-only clone (no local ref or checkout state is consulted, #2694) and whose base is on that head's first-parent history, is exempt (`exemption: verified-propagation`, #2633): every line already merged on the hub through its own review and tripwire stop, so ordinary sync waves post the automated verdict with no human step. The owner's `--admin-override "<quote>"` on `phase-4b-review.sh` or `wave-audit.sh` runs the real adapter past a deterministic tripwire and posts its verdict, recording the quote and the overridden reason codes in the review body. It never overrides the wave-audit byte budget (use the historical-prefix procedure), holds, feedback accounting, input integrity, drift, request-budget evidence or any provider-barrier result; a Codex human stop keeps its owner tiebreak (#2544), and an adapter that yields no usable verdict after an overridden tripwire exits 8, never the proceedable exit 4. A clear result is not proof of resistance to hostile instructions. The exact finite alarms, conservative path inventory, residuals and tests are specified in [Deterministic Phase 4b escalation](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_escalation.md).
 
 The trusted orchestrator captures one coherent full base/head pair and generates a private read-only diff from those exact Git objects and their merge base. Adapters consume only that supplied file. Trusted adapter code binds its verdict to the original and bounded review-diff SHA-256 digests; the posted review records those digests and commit IDs. A mutable PR diff read, unbound verdict, changed input, or observed A to B to A head-transition generation cannot post a review. See [the immutable-input contract](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_immutable_input.md).
@@ -642,7 +654,7 @@ The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fir
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
 
-**Operating instructions:** the runtime branching that consumes `phase_4b_default` is defined in this [Phase 4b Triggers](#phase-4b-triggers) section. Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → post handoff per § Handoff Message Format), 2 (config/API/malformed-metadata error → stop), 3 (bad args → fix invocation).
+**Operating instructions:** the runtime branching that consumes `phase_4b_default` is defined in this [Phase 4b Triggers](#phase-4b-triggers) section. Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → run the automated orchestrator where it is enabled, otherwise post the handoff per § Handoff Message Format), 2 (config/API/malformed-metadata error → stop), 3 (bad args → fix invocation).
 
 A valid changed-file entry whose patch is absent, null, or an empty string requires Phase 4b conservatively (exit 1), because incomplete content cannot establish that a diff is routine (#2295). This structured recommendation reports zero files inspected and names the unavailable paths; it does not assert that a content trigger matched or clear any review gate. Non-string patches, malformed entries, failed API/body reads and invalid configuration remain exit 2. Existing policy short-circuits remain unchanged; `--detect-only` still bypasses them and applies the same conservative content rule.
 
@@ -693,9 +705,9 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
                              ▼
   ┌─────────────────────────────────────────────────────────┐
   │  PHASE 2: INTERNAL REVIEW                                │
-  │  Agent switches to nathanpayne-{agent}                   │
+  │  Reviewer API writes → gh-as-reviewer.sh                 │
   │  Reviews PR → posts comments                             │
-  │  Agent switches to nathanjohnpayne → fixes               │
+  │  Fix commits keep human author nathanjohnpayne           │
   │  ↻ Repeat until approved                                 │
   └──────────────────────────┬──────────────────────────────┘
                              │
@@ -1156,6 +1168,20 @@ It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#p
 
 Every `resolveReviewThread` call must be **confirmed by a follow-up readback**: re-read the thread (via `reviewThreads` or the top-level `nodes(ids:)` lookup) and verify it reports `isResolved: true`. A mutation that returns success but does not read back resolved (state drift, eventual-consistency lag, or a token that could write but a later read that cannot) must be treated as a failure — **never infer a thread is resolved from an unconfirmed write** (fail closed). `scripts/resolve-pr-threads.sh` does this automatically: after resolving, it reads back every thread it resolved and exits non-zero if any does not confirm `isResolved: true`.
 
+### Recovering from a stale required check
+
+The merge gate does not simply read the rollup's list, and a red run can outlive the condition that made it red. Two facts decide what retires one:
+
+- **The three script-backed contexts have two lineages.** `Merge clearance gate`, `Codex P1 unresolved threads` and `CodeRabbit unresolved blocking findings` each have a job-native check run per workflow run and a Checks-API lineage that `.github/workflows/required-check-publisher.yml` owns, one shared suite per head where the newest POST wins. The newest run of each lineage must be green ([Required Check Publisher](specs/required_check_publisher.md) § Two lineages). Other required contexts, such as `Label Gate` and `Self-Review Required`, have only the job-native lineage.
+- **A later green job-native run does not reliably retire an earlier red one.** On [#2232](https://github.com/nathanjohnpayne/mergepath/pull/2232), 18 failed job-native `Merge clearance gate` runs held a cleared head `BLOCKED` until each was rerun. A consumer measurement found that a newer run of the same triggering event did supersede an older red one ([nathanjohnpayne/nathanpaynedotcom#1072](https://github.com/nathanjohnpayne/nathanpaynedotcom/pull/1072)), but the two disagree, so do not rely on supersession: treat every counted red run as blocking until it is rerun or the head moves.
+
+1. **Enumerate what the rollup counts**, not what the check-runs page shows. Query GraphQL `statusCheckRollup.contexts` on the PR's head commit with `isRequired(pullRequestNumber: N)`, paginated, since a PR with many review events carries well over 100 contexts. The contexts are a union, so make the query type-aware: a `CheckRun` carries `status` and `conclusion`, a legacy `StatusContext` carries `state`. Keep every required node that does not permit a merge: a check run that is not completed, or whose conclusion is anything but `SUCCESS`, `SKIPPED` or `NEUTRAL` (so `STALE` blocks as well as `FAILURE`, `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED` and `STARTUP_FAILURE`), and a status context whose state is anything but `SUCCESS`. A status context has no workflow run; refresh it through the producer that posts it. Tell the lineages apart: a job-native node's `checkSuite.workflowRun.databaseId` is the run that produced it and the only ID `gh run rerun` takes. A Checks-API node sits in the head's shared suite, which is whichever suite was created first on the head, so its `workflowRun` is absent or belongs to an unrelated workflow; never pass it to `gh run rerun`.
+2. **Make the underlying condition true first.** Reply to and resolve the threads, remove the label through the sanctioned path, or fix the body. A rerun made before that fails again and adds nothing.
+3. **Rerun each red job-native run of a live-state gate in place:** `gh run rerun --failed <run-id>` for a `FAILURE`. `--failed` reruns only failed jobs, so for the other blocking conclusions use a whole-run `gh run rerun <run-id>`. The live-state gates are `Codex P1 unresolved threads`, `Merge clearance gate`, `CodeRabbit unresolved blocking findings`, and `Label Gate`, which reads the PR's live labels since [#1339](https://github.com/nathanjohnpayne/mergepath/issues/1339). A gate that depends only on the head commit, such as a build, test or lint job, settles a flake the same way.
+4. **Refresh a red Checks-API entry with a fresh publisher pass,** never with a rerun of the shared suite's unrelated run. Each run of the `Merge Clearance Gate` workflow for the head, from any event it listens to or a rerun of its latest run, makes `required-check-publisher.yml` republish all three contexts, and a `repo-lint` completion does the same. The operator break-glass is a `required-check-republish` `repository_dispatch` with `client_payload[pr]` set to the PR number: it is PAT-gated (a `GITHUB_TOKEN`-sent event creates no run), always runs the default-branch definition, and republishes all three contexts for that PR.
+5. **A gate that reads the frozen event payload cannot be retired by a rerun,** because GitHub replays the original payload. `Self-Review Required` is one: it validates `github.event.pull_request.body`. Fix and save the PR body instead: `pr-review-policy.yml` listens for `pull_request: edited`, so the edit produces a fresh run without dismissing approvals. If the old red run still blocks after that run goes green, a new head commit is the escape, but where `dismiss_stale_reviews` is on it dismisses approvals and restarts the review round, so keep it as the fallback. Before #1339, `Label Gate` was in this class too.
+6. **Break-glass stays human-only.** `BREAK_GLASS_MERGE_STATE=1` and `--admin` need the human's authorization in chat.
+
 ## Review Policy Configuration
 
 Each repository contains a `.github/review-policy.yml` file that governs review behavior. This file is read by the agent at the start of every review cycle.
@@ -1286,16 +1312,21 @@ Agents must automate identity switching so that commits and PR activity are attr
 
 ### Git commit identity (user.name / user.email)
 
-Commit identity is **not** switched per session, and never per repository. Every agent commits as the human author identity, which lives in the machine's **global** git config (`~/.gitconfig`) next to `user.signingkey` — so `git commit` attributes and signs correctly in every repo and every worktree with no per-session step. Reviewer identities (`nathanpayne-{agent}`) never author commits; they exist for GitHub API activity only, and that attribution comes from the PAT wrappers described below, not from git config.
+Commit identity is **not** switched per session, and never per repository. In a local session every agent commits as the human author identity, which lives in the machine's **global** git config (`~/.gitconfig`) next to `user.signingkey`—so `git commit` attributes and signs correctly in every repo and every worktree with no per-session step. Reviewer identities (`nathanpayne-{agent}`) never author commits; they exist for GitHub API activity only, and that attribution comes from the PAT wrappers described below, not from git config.
 
 ```bash
 # Verify the identity a commit here would use, and where it comes from.
 git config --show-origin --get user.name
 git config --show-origin --get user.email
 git config --show-origin --get user.signingkey
+# Verify the identities git will actually use; environment overrides win over config.
+git var GIT_AUTHOR_IDENT
+git var GIT_COMMITTER_IDENT
 ```
 
-Provisioning the real human author identity belongs to verified machine setup, outside every managed checkout. This policy deliberately publishes no copy-pastable identity setter with placeholder values: if any verified value above is absent or wrong, stop and run the approved machine-setup flow, then repeat the read-only checks before committing.
+Confirm that the effective author is the verified human author: `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` replace the configured `user.name` and `user.email`, so the configured values alone prove nothing. In a local session, also confirm that the effective committer is that identity. A Claude cloud session is the exception, described in [Cloud Agent Environments](docs/agents/cloud-environments.md): it sets the author through `GIT_AUTHOR_*` environment variables and keeps the image's signed cloud committer, so there the configured `user.name` and `user.email` describe the committer and are not proof of the author.
+
+Provisioning the real human author identity belongs to verified machine setup, outside every managed checkout. This policy deliberately publishes no copy-pastable identity setter with placeholder values: if any verified value above is absent or wrong for the session, stop and run the approved setup flow for that environment, then repeat the read-only checks before committing.
 
 **Never run a bare `git config user.name` / `git config user.email` inside a managed checkout.** Without `--global`, `git config` writes the *current repository's* `.git/config`, which every worktree of that repository shares. Such an override is invisible to `git config --global --get user.email`, outlives the session that made it, and silently reattributes — and, when `commit.gpgsign` is set alongside it, unsigns — every later commit from every worktree. That corruption reached `main` twice under an undeliverable `.example` fixture address before anyone noticed ([#777](https://github.com/nathanjohnpayne/mergepath/issues/777)), and an earlier revision of this very section, which instructed a bare repo-local `git config user.email`, is how it got there. `scripts/ci/check_git_identity_hygiene` now fails on both the leftover override and on the instruction shape that produces it.
 
@@ -1374,8 +1405,9 @@ Ordinary author-wrapped merges run the fresh threshold-aware clearance dispatche
 - Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrapper call `identity-check.sh --expect-write-identity` before the write. Do not use `gh auth status` as an attribution proof.
 - If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, you either the PR author is wrong, the reviewer token resolved to the author identity, or the [No-self-approve scoping](#no-self-approve-scoping) rule applies. Confirm the PR author and token identity before retrying.
+- In a cloud session without 1Password, follow [Cloud Agent Environments](docs/agents/cloud-environments.md): use the provisioned author and reviewer PATs through the same identity-checked wrappers, and do not invoke local credential preflight. The wrapper refuses `gh pr merge` on a cloud surface, so park the merge with a handback for a local session.
 
-> **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
+> **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/shared-operating-rules.md` under "1Password CLI authentication failures." Wait for the human to confirm they are present and ready before running preflight once. Do not fall back to inline credential reads, hardcode tokens, skip review, or retry in a loop.
 
 ### PAT requirements for reviewer identities
 
@@ -1514,7 +1546,7 @@ Filing a post-merge issue noting the recreated-PR situation is optional but help
 7. Export the public key: `ssh-add -L | grep "{Agent}" > ~/.ssh/id_nathanpayne_{agent}.pub`
 8. Add a `Host github-{agent}` block to `~/.ssh/config` pointing at the new public key file.
 9. Add the identity to `available_reviewers` in each relevant repo's `.github/review-policy.yml`.
-10. Add the PAT as a repository secret (e.g., `{AGENT}_PAT`) for CI workflows.
+10. **Do not add a per-agent reviewer PAT (such as `{AGENT}_PAT`) as a repository secret.** The agent's review work runs in its own session: a local session reads the PAT through canonical review-mode preflight, and a cloud session uses provisioned credentials and the capability probe in [Cloud Agent Environments](docs/agents/cloud-environments.md). `DEPLOYMENT.md` gives the rationale in its "Do NOT add … as repo secrets" note. The one reviewer-identity secret the repo does keep, `REVIEWER_ASSIGNMENT_TOKEN`, serves specific CI workflows and is set up as `DEPLOYMENT.md` describes; a new agent does not need its own.
 11. Configure the new agent's environment with both the `nathanjohnpayne` author credentials and the `nathanpayne-{agent}` reviewer credentials.
 12. The new agent follows the same workflow described above.
 
