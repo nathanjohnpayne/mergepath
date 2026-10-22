@@ -3089,8 +3089,9 @@ p4b1143_run() {  # p4b1143_run <body-file-or-""> <extra orchestrator args...>
 
 # The validator parses the author once, then the assignment below parses the
 # same body a second time. Intercept only that INNER parser command, identified
-# by its real script path and `--author` mode; node version checks and every
-# other parser mode delegate untouched. This exercises the production caller
+# by its real script path and `--author` mode after the `-e` import boundary;
+# node version checks, the outer watchdog and other modes delegate untouched.
+# This exercises the production caller
 # without encoding incidental outer-node or validation-call counts.
 P4B1143_NODE_DIR="$WORK/p4b1143-node-bin"
 P4B1143_AUTHOR_PARSE_COUNT="$WORK/p4b1143-author-parse-count"
@@ -3099,30 +3100,48 @@ mkdir -p "$P4B1143_NODE_DIR"
 P4B1143_REAL_NODE="$(command -v node)"
 cat > "$P4B1143_NODE_DIR/node" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-}" = "$P4B1143_PARSER_PATH" ] && [ "${2:-}" = "--author" ]; then
+if [ "${1:-}" = -e ] && [ "${3:-}" = "$P4B1143_PARSER_PATH" ] && [ "${4:-}" = --author ]; then
   n=$(( $( [ -f "$P4B1143_AUTHOR_PARSE_COUNT" ] && cat "$P4B1143_AUTHOR_PARSE_COUNT" || echo 0 ) + 1 ))
   printf '%s\n' "$n" > "$P4B1143_AUTHOR_PARSE_COUNT"
   # The first --author parse belongs to pr_body_validate; the second belongs to
   # BODY_AUTHOR extraction and must retain the caller's infrastructure contract.
-  [ "$n" -ne 2 ] || exit 124
+  [ "$n" -ne "$P4B1143_FAIL_AUTHOR_PARSE" ] || exit 124
 fi
 exec "$P4B1143_REAL_NODE" "$@"
 SH
 chmod +x "$P4B1143_NODE_DIR/node"
 printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143_BODY"
-rm -f "$P4B1143_AUTHOR_PARSE_COUNT"
-set +e
-out="$(PATH="$P4B1143_NODE_DIR:$PATH" \
-  P4B1143_REAL_NODE="$P4B1143_REAL_NODE" P4B1143_PARSER_PATH="$P4B1143_PARSER_PATH" \
-  P4B1143_AUTHOR_PARSE_COUNT="$P4B1143_AUTHOR_PARSE_COUNT" \
-  MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  CLAUDE_BIN="$BIN/fake-claude-approve-usage" P4B_FAKE_PR_BODY_FILE="$P4B1143_BODY" \
-  bash "$ORCH" 124 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)"
-rc=$?
-set -e
+p4b1395_run() {  # author-parse number to fail; 0 keeps every real parse
+  rm -f "$P4B1143_AUTHOR_PARSE_COUNT" "$WORK/p4b1395-wrapper.log"
+  rc=0
+  out="$(PATH="$P4B1143_NODE_DIR:$PATH" \
+    P4B1143_REAL_NODE="$P4B1143_REAL_NODE" P4B1143_PARSER_PATH="$P4B1143_PARSER_PATH" \
+    P4B1143_AUTHOR_PARSE_COUNT="$P4B1143_AUTHOR_PARSE_COUNT" P4B1143_FAIL_AUTHOR_PARSE="$1" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b1395-wrapper.log" \
+    MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+    CLAUDE_BIN="$BIN/fake-claude-approve-usage" P4B_FAKE_PR_BODY_FILE="$P4B1143_BODY" \
+    bash "$ORCH" 124 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)" || rc=$?
+}
+
+# Prove the shim observes actual author parses while delegating valid parsing,
+# the version probe and the other modes. Refusal evidence needs this control.
+p4b1395_run 0
+if [ "$rc" = 0 ] \
+   && [ "$(cat "$P4B1143_AUTHOR_PARSE_COUNT" 2>/dev/null || echo 0)" -ge 2 ] \
+   && grep -Fq '[dry-run] would post APPROVED' <<<"$out" \
+   && grep -Fq '"review_posted": false' <<<"$out" \
+   && [ ! -e "$WORK/p4b1395-wrapper.log" ]; then
+  pass "#1395: author-parser shim delegates valid parses and reaches approval preview"
+else
+  fail "#1395: author-parser shim positive control (rc=$rc author-parses=$(cat "$P4B1143_AUTHOR_PARSE_COUNT" 2>/dev/null || true) out=$out)"
+fi
+
+p4b1395_run 2
 if [ "$rc" = 3 ] \
    && [ "$(cat "$P4B1143_AUTHOR_PARSE_COUNT" 2>/dev/null || true)" = 2 ] \
-   && printf '%s' "$out" | grep -Fq 'ERROR: could not parse Authoring-Agent from PR body (parser did not complete)'; then
+   && grep -Fq 'ERROR: could not parse Authoring-Agent from PR body (parser did not complete)' <<<"$out" \
+   && ! grep -Fq 'would post' <<<"$out" \
+   && [ ! -e "$WORK/p4b1395-wrapper.log" ]; then
   pass "#1395: second Authoring-Agent parser failure maps to infrastructure exit 3"
 else
   fail "#1395: second Authoring-Agent parser failure must map to exit 3 (rc=$rc author-parses=$(cat "$P4B1143_AUTHOR_PARSE_COUNT" 2>/dev/null || true) out=$out)"

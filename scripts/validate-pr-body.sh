@@ -50,13 +50,18 @@ done
 
 BODY="$(cat)"
 if [ "$SELF_REVIEW_ONLY" = true ]; then
-  if pr_body_has_self_review "$BODY"; then
+  review_rc=0
+  pr_body_has_self_review "$BODY" || review_rc=$?
+  if [ "$review_rc" -eq 0 ]; then
     echo "Self-Review section found."
     exit 0
+  elif [ "$review_rc" -eq 1 ]; then
+    echo "PR description must contain a '## Self-Review' section." >&2
+    echo "A heading inside a fenced code block does not count." >&2
+    echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene." >&2
+  else
+    pr_body_self_review_parser_error "$review_rc"
   fi
-  echo "PR description must contain a '## Self-Review' section." >&2
-  echo "A heading inside a fenced code block does not count." >&2
-  echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene." >&2
   exit 1
 fi
 # A concrete policy path is passed unconditionally. Passing "" here would skip
