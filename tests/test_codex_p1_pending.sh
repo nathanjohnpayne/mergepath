@@ -75,10 +75,42 @@ for lib in feedback-policy-helpers.sh gh-api-array.sh gh-api-scalar.sh; do
   cp "$ROOT/scripts/lib/$lib" "$W/scripts/lib/"
 done
 cp "$ROOT/.github/review-policy.yml" "$W/.github/review-policy.yml"
+# This suite exercises the legacy scan, so its fixture enables it. A consumer's
+# own policy is per-repo config the sync does not carry: it may leave
+# codex.p1_gate out or set it false, while the hub's enables it. Replace any
+# existing stanza under codex: with one that is enabled.
+grep -Eq '^codex:' "$W/.github/review-policy.yml" \
+  || { echo "ERROR: the trusted policy has no codex: block; update this test" >&2; exit 1; }
+# The stanza takes the codex block's own child indentation (two spaces in
+# every consumer today, but any width is valid YAML), and its key twice that.
+ind=$(awk '/^codex:/ { c = 1; next } c && /^[^[:space:]#]/ { exit }
+  c && /^[[:space:]]+[^[:space:]#]/ { match($0, /^ +/); print RLENGTH; exit }' "$W/.github/review-policy.yml")
+[ -n "$ind" ] || ind=2
+awk -v ind="$ind" '
+  BEGIN { pad = sprintf("%" ind "s", ""); kid = sprintf("%" (2 * ind) "s", "") }
+  /^codex:/ { print; print pad "p1_gate:"; print kid "enabled: true"; in_codex = 1; next }
+  in_codex && /^[^[:space:]#]/ { in_codex = 0; skip = 0 }
+  in_codex && index($0, pad "p1_gate:") == 1 { skip = 1; next }
+  # The old stanza runs to the next sibling key: blank lines, comments and
+  # deeper lines inside it all go with it.
+  skip && index($0, pad) == 1 && substr($0, ind + 1, 1) ~ /[^[:space:]#]/ { skip = 0 }
+  skip { next }
+  { print }
+' "$W/.github/review-policy.yml" >"$W/.github/review-policy.yml.new" \
+  && mv "$W/.github/review-policy.yml.new" "$W/.github/review-policy.yml"
+# Exactly one enabled key under codex.p1_gate, and it is true.
+p1_enabled=$(awk -v ind="$ind" '
+  BEGIN { pad = sprintf("%" ind "s", ""); kid = sprintf("%" (2 * ind) "s", "") }
+  /^codex:/ { c = 1; next }
+  c && /^[^[:space:]#]/ { c = 0 }
+  c && index($0, pad "p1_gate:") == 1 { g = 1; next }
+  g && index($0, pad) == 1 && substr($0, ind + 1, 1) ~ /[^[:space:]#]/ { g = 0 }
+  g && index($0, kid "enabled:") == 1 { v = substr($0, length(kid) + 9); sub(/^[[:space:]]*/, "", v); sub(/[[:space:]]*(#.*)?$/, "", v); print v }
+' "$W/.github/review-policy.yml")
+[ "$p1_enabled" = true ] \
+  || { echo "ERROR: could not enable codex.p1_gate in the fixture policy (got '$p1_enabled'); update this test" >&2; exit 1; }
 chmod +x "$W/scripts/codex-p1-gate.sh" "$W/scripts/workflow/codex-p1-snapshot-retry.py" \
   "$W/scripts/gate-api-lineage-blocking.sh"
-grep -Eq '^  p1_gate:' "$W/.github/review-policy.yml" \
-  || { echo "ERROR: the trusted policy no longer enables the legacy scan; update this test" >&2; exit 1; }
 
 # Accounting stub: answers from $STATE/accounting (first line: rc, rest: the
 # JSON answer). ACCOUNTING_SEQ: one answer file per call, consumed in order,

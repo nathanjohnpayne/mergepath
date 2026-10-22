@@ -1471,10 +1471,11 @@ classify_comment() {
   fi
   # #1569: the persistent summary's walkthrough and release notes narrate the
   # PR's own changes, so these phrases there are content, not live state.
-  # Use the same byte-zero marker prefix as the summary selector. Actual
-  # in-progress markers and narration retain their earlier precedence; unmarked
-  # standalone status notices retain this legacy fallback.
-  if [[ "$body" != "$SUMMARY_MARKER"* ]] && grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
+  # Use the same marker prefix as the summary selector, after CodeRabbit's
+  # leading vendor header (#2734). Actual in-progress markers and narration
+  # retain their earlier precedence; unmarked standalone status notices retain
+  # this legacy fallback.
+  if [[ "$(cr_strip_vendor_header "$body")" != "$SUMMARY_MARKER"* ]] && grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
     echo "in_progress"
     return
   fi
@@ -1682,6 +1683,10 @@ crw_unfenced_body() {
 crw_provider_owned_refusal_class() {
   local body=$1 unfenced heading_body first_line narration_lead narration_first_line
   unfenced=$(crw_unfenced_body "$body") || return 3
+  # CodeRabbit's leading vendor header is framing, not the first heading line
+  # (#2734). Left in place, it displaced every first-line form below, and a
+  # headered heading-only refusal fell to classify_comment's `review` default.
+  unfenced=$(cr_strip_vendor_header "$unfenced")
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
     return 0
@@ -4307,8 +4312,8 @@ crw_select_head_pinned_review_run() {
 
 # BEGIN coderabbit_summary_selector
 # Select the PR's single summarize comment — the newest bot comment whose body
-# STARTS with the auto-generated summarize marker — as base64(json+body), or
-# nothing.
+# STARTS with the auto-generated summarize marker, after CodeRabbit's leading
+# vendor header if it carries one (#2734) — as base64(json+body), or nothing.
 #
 # Extracted (#857) because the probe now reads it from TWO places: the
 # no-review-object branch, where it is the head evidence (#851), and the
@@ -4323,12 +4328,17 @@ crw_select_head_pinned_review_run() {
 # edited in place, so a wall-clock floor would stop counting a completed
 # publication once the head had sat long enough.
 #
-# Pure: jq over the passed strings only, no globals and no I/O.
+# The vendor header is stripped by the shared CR_STRIP_VENDOR_HEADER_JQ
+# (scripts/lib/coderabbit-fence.sh), only as the body's first line: a header
+# anywhere else leaves the body as written, so the quoting-reply argument above
+# is unchanged.
+#
+# Pure: jq over the passed strings and the shared jq definition only, no I/O.
 #
 # crw_select_summary_comment <issue-comments-json> <bot-login> <summary-marker>
 crw_select_summary_comment() {
-  printf '%s' "${1:-}" | jq -r --arg bot "${2:-}" --arg m "${3:-}" '
-    [ .[] | select(.user.login == $bot) | select((.body // "") | startswith($m))
+  printf '%s' "${1:-}" | jq -r --arg bot "${2:-}" --arg m "${3:-}" "$CR_STRIP_VENDOR_HEADER_JQ"'
+    [ .[] | select(.user.login == $bot) | select((.body // "") | cr_strip_vendor_header | startswith($m))
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)} ]
     | sort_by(.fresh_at) | last
     | if . == null then empty
@@ -5290,7 +5300,8 @@ probe_emit_verdict() {
         # narration, or a later ack would displace a summary carrying a
         # blocking marker and the probe would report clean (#878 hazard 6).
         if [ "$class" = "review" ]; then
-          case "$body" in "$SUMMARY_MARKER"*) summary_body="$body"; break ;; esac
+          # After the vendor header, as crw_select_summary_comment reads it (#2734).
+          case "$(cr_strip_vendor_header "$body")" in "$SUMMARY_MARKER"*) summary_body="$body"; break ;; esac
           continue
         fi
         if [ -z "$newest_class" ]; then newest_class="$class"; newest_body="$body"; fi

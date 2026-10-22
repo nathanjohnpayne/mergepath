@@ -347,6 +347,8 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
       | if (type == "string" or type == "number") then tostring else "__invalid__" end
     else "10" end') || return 1
   case "$cap" in ''|*[!0-9]*) return 1 ;; esac
+  # Bound the raw decimal width before Bash arithmetic: an attacker-sized
+  # policy scalar can overflow or make arithmetic evaluation fail.
   [ "${#cap}" -le 9 ] || return 1
   cap=$(printf '%s' "$cap" | sed 's/^0*//')
   [ -n "$cap" ] || cap=0
