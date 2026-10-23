@@ -272,6 +272,7 @@ case "$endpoint" in
     # request may record its timeout. CODEX_TEST_GQL_FORCE_PUSHES replaces the
     # event nodes ([] = no force-push).
     nodes_default='[{"createdAt":"2026-06-03T23:58:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+    if [ "${CODEX_TEST_GQL_FORCE_PUSHES:-}" = fail ]; then echo 'simulated GraphQL failure' >&2; exit 1; fi
     jq -cn --argjson nodes "${CODEX_TEST_GQL_FORCE_PUSHES:-$nodes_default}" \
       '{data:{repository:{pullRequest:{timelineItems:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$nodes}}}}}'
     ;;
@@ -1324,15 +1325,22 @@ CASES
   rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=none CODEX_TEST_GQL_FORCE_PUSHES='[]' run_case "$dir" absent 1)
   [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
     || fail "#2664 no push proof, Running: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
-  # A later pull_request run from another activity on the unchanged head does
-  # not move the push time (Codex P2 on #2779): the request still holds.
   dir=$(make_case "resume-later-activity-run" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_PUSH_LATER_RUN_AT=2026-06-04T00:00:20Z run_case "$dir" absent 1)
-  [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
-    || fail "#2664 later activity run: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: only a push time or the exact-head Running summary ties a request to the current head"
+  # A workflow run alone, even one dispatched before the request, is no tie:
+  # with no force-push and no Running summary, a new request posts.
+  rc=$(CODEX_TEST_PUSH_LATER_RUN_AT=2026-06-04T00:00:20Z CODEX_TEST_GQL_FORCE_PUSHES='[]' run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q 'no strong tie to the current head' "$dir/err.log" \
+    || fail "#2664 workflow run is no tie: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  # An unreadable force-push timeline is not absent evidence: exit 3, no post.
+  dir=$(make_case "resume-tie-unreadable" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_GQL_FORCE_PUSHES=fail run_case "$dir" absent 1)
+  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 0 ] \
+    || fail "#2664 unreadable force-push timeline: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: only a strong force-push tie or the exact-head Running summary ties a request; an unreadable tie read exits 3"
 }
 
 # A request Codex already answered with a required-tier finding needs a new

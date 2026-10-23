@@ -3221,7 +3221,14 @@ resume_pending_codex_request() {
   # unprovable tie costs a slot, never a deadlock or a waiver.
   local tie_at tie_epoch
   RESUME_STRONG_TIE=false
-  tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) || tie_at=""
+  # Unreadable evidence is not absent evidence: a failed read is retried once
+  # and then exits 3, rather than posting beside a request that may be
+  # strongly tied and still running (CodeRabbit on #2779).
+  if ! tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null); then
+    sleep 2
+    tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) \
+      || die 3 "cannot read the PR's force-push timeline for the same-head hold"
+  fi
   tie_epoch=$(jq -rn --arg t "$tie_at" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || tie_epoch=""
   if [[ "$tie_epoch" =~ ^[0-9]+$ ]] && [ "$created_epoch" -gt "$tie_epoch" ]; then
     RESUME_STRONG_TIE=true
