@@ -267,7 +267,12 @@ case "$endpoint" in
     printf '%s\n' "${CODEX_TEST_COMMIT_DATE:-$now}"
     ;;
   repos/owner/repo/issues/999/timeline)
-    printf '[]\n'
+    # #2664: CODEX_TEST_FORCE_PUSHED_AT adds a head_ref_force_pushed event.
+    if [ -n "${CODEX_TEST_FORCE_PUSHED_AT:-}" ]; then
+      jq -cn --arg t "$CODEX_TEST_FORCE_PUSHED_AT" '[{event:"head_ref_force_pushed",created_at:$t}]'
+    else
+      printf '[]\n'
+    fi
     ;;
   repos/owner/repo/pulls/999/reviews)
     # #1550 scenarios count review reads: read 1 is the pre-flight scan.
@@ -1475,20 +1480,31 @@ test_expired_rerun_never_resumes() {
 # A current marker bound to an OLDER lowercase request does not settle a newer
 # case-variant request the selector picked.
 test_marker_for_older_request_does_not_block_resume() {
-  local dir rc count
-  dir=$(make_case "resume-marker-older" 0 0 60)
-  jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-03T23:59:00Z"}' >>"$dir/state/comments.jsonl"
-  jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=899 -->",created_at:"2026-06-03T23:59:30Z"}' >>"$dir/state/comments.jsonl"
-  jq -cn --arg created "$RESUME_TRIGGER_AT" '{id:900,user:{login:"nathanjohnpayne"},body:"@CODEX REVIEW",created_at:$created}' >>"$dir/state/comments.jsonl"
-  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
-  set_clock_after_request "$dir" 30
-  rc=$(run_case "$dir" resume-running 1)
-  count=$(trigger_count "$dir")
-  if [ "$rc" = 0 ] && [ "$count" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log"; then
-    pass "#1550: a current marker bound to an older request does not block resuming a newer case-variant request"
-  else
-    fail "#1550 older-marker: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
-  fi
+  local dir rc count variant body before=$FAIL
+  for variant in lowercase case-varied; do
+    body="@codex review"; [ "$variant" = lowercase ] || body="@CODEX REVIEW"
+    dir=$(make_case "resume-marker-older-$variant" 0 0 60)
+    jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-03T23:59:00Z"}' >>"$dir/state/comments.jsonl"
+    jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=899 -->",created_at:"2026-06-03T23:59:30Z"}' >>"$dir/state/comments.jsonl"
+    jq -cn --arg created "$RESUME_TRIGGER_AT" --arg body "$body" '{id:900,user:{login:"nathanjohnpayne"},body:$body,created_at:$created}' >>"$dir/state/comments.jsonl"
+    seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 30
+    rc=$(run_case "$dir" resume-running 1)
+    count=$(trigger_count "$dir")
+    if [ "$variant" = lowercase ]; then
+      # A current marker bound to an older request does not block holding a
+      # newer one.
+      [ "$rc" = 0 ] && [ "$count" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
+        || fail "#1550 older-marker ($variant): exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+    else
+      # #2664 (Phase 4b advisory on #2779): the timeout handoff binds only the
+      # exact lowercase command, so a case-varied request is not held, even
+      # with a Running summary; a new request posts.
+      [ "$count" = 1 ] && grep -q 'not the exact lowercase command' "$dir/err.log" \
+        || fail "#1550 older-marker ($variant): exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "#1550: a marker bound to an older request does not block holding a newer one; a case-varied request is not held (#2664)"
 }
 
 # #2664: a restart after a same-head request's own deadline records its
@@ -1900,6 +1916,42 @@ failed|❌ **Failed**|2026-06-04T00:00:10Z|failed
 CASES
 }
 
+# Phase 4b advisories on #2779 (ffc83780). Each case fails on that head.
+test_round4_head_tie_edges() {
+  local dir rc before=$FAIL
+  # A case-varied request is selected as the pending request, but the
+  # timeout binding recognizes only the exact lowercase command, so it
+  # cannot be held to a timeout handoff. It is not resumed: a new request
+  # posts and the run hands off normally (exit 4), never exit 3.
+  dir=$(make_case "resume-case-varied" 0 0 60)
+  jq -cn --arg t "$RESUME_TRIGGER_AT" '{id:900,user:{login:"nathanjohnpayne"},body:"@CODEX REVIEW",created_at:$t}' \
+    >>"$dir/state/comments.jsonl"
+  set_clock_after_request "$dir" 90
+  rc=$(run_case "$dir" absent 1)
+  [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 1 ] \
+    || fail "#2664 case-varied: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  # A workflow run dispatched after the request does not reject it: the
+  # exact-head Running summary since the request still ties it to the head.
+  dir=$(make_case "resume-late-dispatch-running" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
+    || fail "#2664 late dispatch, Running: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  # A force-push after the request dates the head even when a future
+  # committer date keeps it out of the reaction anchor, and an earlier run
+  # of the same commit (from before the branch moved away) does not.
+  dir=$(make_case "resume-force-push-future-commit" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  set_clock_after_request "$dir" 60
+  rc=$(CODEX_TEST_COMMIT_DATE=2099-01-01T00:00:00Z CODEX_TEST_FORCE_PUSHED_AT=2026-06-04T00:00:30Z \
+    CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-03T23:59:00Z run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q "predates the current head's push\|cannot be tied to the current head" "$dir/err.log" \
+    || fail "#2664 force-push, future commit: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: case-varied requests, late dispatch with Running and a hidden force-push are handled"
+}
+
 # Overlapping requests on one head: the row cannot be tied to either, so a
 # Failed row reads as ambiguous, and nothing is retried or re-posted.
 test_overlapping_requests_are_ambiguous() {
@@ -2030,6 +2082,7 @@ test_delayed_claim_then_rerun_holds() {
 }
 
 test_codex_run_diagnostic_and_report
+test_round4_head_tie_edges
 test_overlapping_requests_are_ambiguous
 test_refreshed_provider_window
 test_retry_window_parser

@@ -3167,7 +3167,10 @@ rescan_codex_state() { # <what>
 # An unreadable list proves nothing.
 head_push_proof_at() {
   local forced="" dispatched="" runs
-  case "$ANCHOR_SOURCE" in head_ref_force_pushed*) forced=$HEAD_PUSHED_AT ;; esac
+  # Read directly, not through ANCHOR_SOURCE: that picks the force-push only
+  # when it is later than the committer date, so a future-dated commit would
+  # hide it (#2779 Phase 4b advisory).
+  forced=$(crqe_latest_head_transition "${TIMELINE_JSON:-[]}" 2>/dev/null) || forced=""
   runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
     -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
   dispatched=$(printf '%s' "$runs" | jq -r -s --arg b "$HEAD_REF" '
@@ -3213,15 +3216,21 @@ resume_pending_codex_request() {
   # A request older than it belongs to an earlier head, so a new request is
   # posted as before. Without one, the request holds only on the exact-head
   # Running summary (#1550), checked below.
-  local push_proof push_epoch head_proven=false
+  local push_proof push_epoch head_proven=false predates_push=false
   push_proof=$HEAD_PUSH_PROOF
   push_epoch=$(jq -rn --arg t "$push_proof" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || push_epoch=""
+  # The push time is positive evidence only: a run can be dispatched after a
+  # request already posted on this head, so an earlier request is left to the
+  # Running-summary check below rather than rejected here.
   if [[ "$push_epoch" =~ ^[0-9]+$ ]]; then
-    if [ "$created_epoch" -lt "$push_epoch" ]; then
-      log "pending request $(printf '%s' "$pending" | jq -r .id) predates the current head's push ($push_proof) — not resuming"
-      return 1
-    fi
-    head_proven=true
+    if [ "$created_epoch" -ge "$push_epoch" ]; then head_proven=true; else predates_push=true; fi
+  fi
+  # The timeout handoff binds only the exact lowercase command
+  # (codex_phase4a_trigger_comment_is_latest), so a case-varied request could
+  # be held but never handed off. It is not held; a new request posts.
+  if ! printf '%s' "$pending" | jq -e '(.body // "") == "@codex review"' >/dev/null 2>&1; then
+    log "pending request $(printf '%s' "$pending" | jq -r .id) is not the exact lowercase command the timeout handoff binds — not resuming"
+    return 1
   fi
   # At the request ceiling the #813 cap path keeps precedence: it polls the
   # final request without timeout authority and reports the ceiling. This is
@@ -3302,7 +3311,11 @@ resume_pending_codex_request() {
     RESUME_PENDING_RUNNING=true
   fi
   if [ "$head_proven" != true ] && [ "$RESUME_PENDING_RUNNING" != true ]; then
-    log "pending request $(printf '%s' "$pending" | jq -r .id) cannot be tied to the current head (no push time or Running summary) — not resuming"
+    if [ "$predates_push" = true ]; then
+      log "pending request $(printf '%s' "$pending" | jq -r .id) predates the current head's push ($push_proof) and no exact-head Running summary ties it — not resuming"
+    else
+      log "pending request $(printf '%s' "$pending" | jq -r .id) cannot be tied to the current head (no push time or Running summary) — not resuming"
+    fi
     return 1
   fi
 
