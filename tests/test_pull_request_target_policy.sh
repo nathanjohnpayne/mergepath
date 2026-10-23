@@ -161,6 +161,14 @@ T="$(fresh_tree tarball)"
 edit "$T/.github/workflows/$AC" "s.replace('    steps:\n', '    steps:\n      - run: curl -sL \"\$API/repos/\$FORK/tarball/\$HEAD_SHA\" | tar xz\n', 1)"
 T_TARBALL="$T"
 
+T="$(fresh_tree git-global-options)"
+edit "$T/.github/workflows/$DA" "s.replace('    steps:\n', '    steps:\n      - run: |\n          git -C candidate fetch origin \"\$SHA\"\n          git -c protocol.version=2 clone \"\$URL\" c2\n', 1)"
+T_GITOPTS="$T"
+
+T="$(fresh_tree registry-file-deleted)"
+rm "$T/.github/workflows/$MQ"
+T_DELETED="$T"
+
 T="$(fresh_tree trigger-replaced)"
 edit "$T/.github/workflows/$MQ" "s.replace('on:\n  pull_request_target:\n', 'on:\n  pull_request:\n', 1)"
 T_REPLACED="$T"
@@ -208,6 +216,9 @@ for mode in "${MODES[@]}"; do
   expect "lint flags gh pr checkout" 1 'runs: gh pr checkout' "$mode" lint --root "$T_GHCO"
   expect "lint flags git clone of the fork" 1 'runs: git clone ' "$mode" lint --root "$T_CLONE"
   expect "lint flags the fork's coordinates in shell" 1 'runs: ./fetch.sh .*head.repo.clone_url' "$mode" lint --root "$T_HEADREPO"
+  expect "lint flags git behind -C" 1 'runs: git -C candidate fetch' "$mode" lint --root "$T_GITOPTS"
+  expect "lint flags git behind -c" 1 'runs: git -c protocol.version=2 clone' "$mode" lint --root "$T_GITOPTS"
+  expect "lint flags a deleted registry workflow" 1 'merge-queue-authorization.yml is in REGISTRY but missing' "$mode" lint --root "$T_DELETED"
   expect "lint flags gh repo clone" 1 'runs: gh repo clone' "$mode" lint --root "$T_GHCLONE"
   expect "lint flags an archive download" 1 'runs: curl .*tarball' "$mode" lint --root "$T_TARBALL"
   expect "lint flags a registered workflow that lost pull_request_target" 1 'merge-queue-authorization.yml no longer triggers on pull_request_target' "$mode" lint --root "$T_REPLACED"
@@ -221,12 +232,7 @@ for mode in "${MODES[@]}"; do
   expect "lint ignores candidate-code words inside comments" 0 '^PASS' "$mode" lint --root "$T_COMMENT"
   expect "lint flags download-artifact" 1 'downloads an artifact' "$mode" lint --root "$T_ARTIFACT"
   expect "lint flags a remote reusable workflow" 1 'job remote calls reusable workflow octo/shared' "$mode" lint --root "$T_REUSABLE"
-  out="$(run_tool "$mode" lint --root "$T_REUSABLE" 2>&1 || true)"
-  if printf '%s\n' "$out" | grep -q 'job local'; then
-    fail "lint flagged a local reusable workflow [$mode]"
-  else
-    pass "lint allows a local reusable workflow [$mode]"
-  fi
+  expect "lint flags a local reusable workflow" 1 'job local calls reusable workflow ./.github/workflows/local.yml' "$mode" lint --root "$T_REUSABLE"
   expect "lint normalizes expression spacing" 0 '^PASS' "$mode" lint --root "$T_SPACING"
   expect "lint leaves non-pull_request_target workflows alone" 0 '^PASS: 3 ' "$mode" lint --root "$T_NONTARGET"
 done

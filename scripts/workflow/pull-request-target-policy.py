@@ -50,12 +50,14 @@ SAFE_CHECKOUT_REFS = {
     '${{ github.event.pull_request.base.sha }}',
     '${{ github.event.repository.default_branch }}',
 }
-# Shell text that retrieves code: git transports, gh downloads, archive
-# endpoints, generic HTTP clients and the fork's repository coordinates. None
-# of the registered workflows needs any of them, so this is a tripwire on the
-# whole class rather than a proof that candidate code never runs.
+# Shell text that can retrieve code: any git command (none of the registered
+# workflows runs git in a step, so global options such as `git -C` cannot hide
+# a subcommand), gh downloads, archive endpoints, generic HTTP clients and the
+# fork's repository coordinates. A tripwire on the class, not a proof that
+# candidate code never runs: an arbitrary program can fetch code in ways no
+# text check decides. The boundary itself is the base-side checkout.
 UNSAFE_RUN = re.compile(
-    r'\bgit\s+(clone|fetch|pull|checkout|switch|worktree|submodule|archive)\b'
+    r'\bgit\b'
     r'|\bgh\s+(pr\s+checkout|repo\s+clone|run\s+download|release\s+download)\b'
     r'|refs/pull/|pull/\$\{\{|tarball|zipball|head\.repo\.|\bcurl\b|\bwget\b')
 REPO_RE = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
@@ -127,7 +129,9 @@ def unsafe_patterns(doc):
     for job_id, job in (jobs or {}).items():
         if not isinstance(job, dict):
             continue
-        if isinstance(job.get('uses'), str) and not job['uses'].startswith('./'):
+        if 'uses' in job:
+            # Local or remote, a called workflow runs with the caller's secrets
+            # and this lint does not follow it.
             found.append('job %s calls reusable workflow %s' % (job_id, job['uses']))
         for idx, step in enumerate(job.get('steps') or []):
             if not isinstance(step, dict):
@@ -186,6 +190,10 @@ def lint(root):
                             % (rel, sorted(events), sorted(REGISTRY[rel])))
         for item in unsafe_patterns(doc):
             findings.append('%s: %s' % (rel, item))
+    for rel in REGISTRY:
+        if not (Path(root) / rel).is_file():
+            findings.append('%s is in REGISTRY but missing: drop it from REGISTRY and delete its event '
+                            'policy on every public consumer, or restore the file' % rel)
     for f in findings:
         print('FAIL: %s' % f)
     if not findings:
