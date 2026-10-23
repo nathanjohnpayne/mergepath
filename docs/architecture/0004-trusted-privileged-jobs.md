@@ -111,6 +111,9 @@ claim_pattern:
   job_workflow_ref: nathanjohnpayne/<repo>/\.github/workflows/<file>\.yml@refs/heads/main
   event_name: (workflow_run|repository_dispatch|schedule)
   runner_environment: github-hosted
+# Exact pin to the one app this design uses: its numeric ID (or its configured
+# name on a self-hosted deployment). Never app_pattern.
+app: "<app_id>"
 permissions:
   # the minimum for that workflow's credentialed jobs; see the table below
 ```
@@ -118,6 +121,7 @@ permissions:
 - **`subject` is exact.** A `pull_request` run (`…:pull_request`), a branch push or branch dispatch (`…:ref:refs/heads/<branch>`) and any job that names an environment (`…:environment:<name>`) all fail it. No policy uses `subject_pattern` or a wildcard over refs or repositories.
 - **`workflow_ref` pins the calling workflow file**, so another workflow on `main` cannot use the policy. GitHub documents `job_workflow_ref` for reusable workflows; the pilot records whether it is present on these jobs. If it is absent, drop it and keep `workflow_ref`, because a claim pattern over an absent claim must not be relied on to pass or fail.
 - **`event_name` is load-bearing.** A `pull_request_target` run's `GITHUB_REF` is the default branch, and GitHub does not document its OIDC subject, so it may present the same `…:ref:refs/heads/main` subject as a trusted run. The `event_name` pattern is what keeps such a run, and a `main` `workflow_dispatch` where none is intended, out of each policy. The pilot records the subject a `pull_request_target` run actually presents.
+- **`app` pins one GitHub App.** An unpinned exchange in a multi-App Octo STS pool is load-balanced across that pool's installations, and a pin fails closed instead of re-routing ([Octo STS app pinning](https://github.com/octo-sts/app/blob/main/README.md#app-pinning-trust-policy-app--app_pattern)). Without the pin, successive tokens could act as different bot logins. That would break the single-login contract of `thread_resolution_ci_app_identity` (`scripts/lib/reviewers-helpers.sh`), and every possible login would also need to be in `non_reviewer_identities`. Every policy therefore sets `app` to the same exact value, never `app_pattern`.
 - **`repository_id` and `repository_owner_id`** stop a recycled name from matching while the name-only subject format is in use.
 - **OIDC claims cannot name a job.** The granularity of a policy is therefore the workflow file, and its `permissions` are the union for that file's credentialed jobs. Jobs in the same file that need no token do not get `id-token: write`, which the [lint below](#who-may-request-id-token-write) enforces.
 
@@ -158,7 +162,7 @@ The policy files are credential grants. They sit under `.github/**`, so changing
   - any workflow-level `permissions:` block.
 - **Enforcement:** a repository lint, in the same family as #2775's regression check, fails when `id-token: write` appears outside this (workflow, job) allowlist. The trust policies refuse such tokens anyway; the lint keeps that refusal from being the only control.
 
-The pilot (#2732) must also record the bot login the hosted app's tokens act as, add it to `non_reviewer_identities` and `thread_resolution_ci_app_identity` ([#2726](https://github.com/nathanjohnpayne/mergepath/issues/2726)), and confirm that its writes start the follow-on workflows each caller needs.
+The pilot (#2732) must also record the bot login the pinned app's tokens act as, add it to `non_reviewer_identities` and `thread_resolution_ci_app_identity` ([#2726](https://github.com/nathanjohnpayne/mergepath/issues/2726)), and confirm that its writes start the follow-on workflows each caller needs.
 
 ## Caller mapping
 
@@ -298,6 +302,7 @@ Accepting this record accepts the invariants, the environment layout and the Oct
   - minimum classic scopes;
   - event-specific secret availability for Dependabot-actor `pull_request_target` runs.
 - **#2732 (pilot):**
+  - the `app` pin value and the bot login of the pinned app, the same on every exchange;
   - the emitted `sub` and the presence of `job_workflow_ref`, including the subject a `pull_request_target` run presents;
   - label add and `DELETE` on a PR under `pull_requests: write` alone;
   - default-branch policy reads, and refusal of PR runs, unpinned workflows and branch-edited policies;
