@@ -38,7 +38,7 @@
 # consumer state rather than against this file's existing assumptions:
 #
 #   for repo in matchline nathanpaynedotcom overridebroadway \
-#               device-source-of-truth friends-and-family-billing \
+#               friends-and-family-billing \
 #               device-platform-reporting swipewatch tadlockpsychiatry \
 #               gaycruisebingo; do
 #     gh api "repos/nathanjohnpayne/$repo/contents/<path>" --jq .sha \
