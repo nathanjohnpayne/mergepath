@@ -145,6 +145,26 @@ T="$(fresh_tree git-fetch)"
 edit "$T/.github/workflows/$DA" "s.replace('    steps:\n', '    steps:\n      - run: |\n          # git fetch is fine in a comment\n          git fetch origin \"\$HEAD_SHA\"\n', 1)"
 T_FETCH="$T"
 
+T="$(fresh_tree git-clone)"
+edit "$T/.github/workflows/$DA" "s.replace('    steps:\n', '    steps:\n      - run: |\n          git clone \"\$FORK_URL\" candidate\n          ./candidate/test.sh\n', 1)"
+T_CLONE="$T"
+
+T="$(fresh_tree head-repo-expression)"
+edit "$T/.github/workflows/$DA" "s.replace('    steps:\n', '    steps:\n      - run: ./fetch.sh \"\${{ github.event.pull_request.head.repo.clone_url }}\"\n', 1)"
+T_HEADREPO="$T"
+
+T="$(fresh_tree gh-repo-clone)"
+edit "$T/.github/workflows/$MQ" "s.replace('    steps:\n', '    steps:\n      - run: gh repo clone \"\$FORK\" candidate\n', 1)"
+T_GHCLONE="$T"
+
+T="$(fresh_tree tarball)"
+edit "$T/.github/workflows/$AC" "s.replace('    steps:\n', '    steps:\n      - run: curl -sL \"\$API/repos/\$FORK/tarball/\$HEAD_SHA\" | tar xz\n', 1)"
+T_TARBALL="$T"
+
+T="$(fresh_tree trigger-replaced)"
+edit "$T/.github/workflows/$MQ" "s.replace('on:\n  pull_request_target:\n', 'on:\n  pull_request:\n', 1)"
+T_REPLACED="$T"
+
 T="$(fresh_tree comment-only)"
 edit "$T/.github/workflows/$DA" "s.replace('    steps:\n', '    steps:\n      - run: |\n          # never: gh pr checkout, git fetch, refs/pull/1/merge\n          echo ok\n', 1)"
 T_COMMENT="$T"
@@ -186,6 +206,11 @@ for mode in "${MODES[@]}"; do
   expect "lint flags a fork-repository checkout" 1 'auto-clear-blocking-labels.yml: job .* checks out repository .*head.repo.full_name' "$mode" lint --root "$T_FORKREPO"
   expect "lint flags allow-unsafe-pr-checkout" 1 'sets allow-unsafe-pr-checkout' "$mode" lint --root "$T_UNSAFE"
   expect "lint flags gh pr checkout" 1 'runs: gh pr checkout' "$mode" lint --root "$T_GHCO"
+  expect "lint flags git clone of the fork" 1 'runs: git clone ' "$mode" lint --root "$T_CLONE"
+  expect "lint flags the fork's coordinates in shell" 1 'runs: ./fetch.sh .*head.repo.clone_url' "$mode" lint --root "$T_HEADREPO"
+  expect "lint flags gh repo clone" 1 'runs: gh repo clone' "$mode" lint --root "$T_GHCLONE"
+  expect "lint flags an archive download" 1 'runs: curl .*tarball' "$mode" lint --root "$T_TARBALL"
+  expect "lint flags a registered workflow that lost pull_request_target" 1 'merge-queue-authorization.yml no longer triggers on pull_request_target' "$mode" lint --root "$T_REPLACED"
   expect "lint flags git fetch but not its comment" 1 'runs: git fetch origin' "$mode" lint --root "$T_FETCH"
   out="$(run_tool "$mode" lint --root "$T_FETCH" 2>&1 || true)"
   if printf '%s\n' "$out" | grep -q 'git fetch is fine'; then

@@ -50,8 +50,14 @@ SAFE_CHECKOUT_REFS = {
     '${{ github.event.pull_request.base.sha }}',
     '${{ github.event.repository.default_branch }}',
 }
-# Shell text that fetches or checks out candidate code.
-UNSAFE_RUN = re.compile(r'gh\s+pr\s+checkout|refs/pull/|pull/\$\{\{|\bgit\s+(fetch|checkout|switch|worktree)\b')
+# Shell text that retrieves code: git transports, gh downloads, archive
+# endpoints, generic HTTP clients and the fork's repository coordinates. None
+# of the registered workflows needs any of them, so this is a tripwire on the
+# whole class rather than a proof that candidate code never runs.
+UNSAFE_RUN = re.compile(
+    r'\bgit\s+(clone|fetch|pull|checkout|switch|worktree|submodule|archive)\b'
+    r'|\bgh\s+(pr\s+checkout|repo\s+clone|run\s+download|release\s+download)\b'
+    r'|refs/pull/|pull/\$\{\{|tarball|zipball|head\.repo\.|\bcurl\b|\bwget\b')
 REPO_RE = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 
 
@@ -163,6 +169,10 @@ def lint(root):
         doc = load_yaml(wf.read_text(), rel)
         events = trigger_events(doc)
         if 'pull_request_target' not in events:
+            if rel in REGISTRY:
+                findings.append('%s no longer triggers on pull_request_target (triggers: %s): drop it from '
+                                'REGISTRY and delete its event policy on every public consumer, or restore '
+                                'the trigger' % (rel, sorted(events)))
             continue
         seen.add(rel)
         if rel not in REGISTRY:
