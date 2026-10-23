@@ -1463,7 +1463,6 @@ The SSH-remote-switch covers every repo on the operator's machine (template, con
 - mergepath
 - swipewatch
 - nathanpaynedotcom
-- device-source-of-truth
 - overridebroadway
 - friends-and-family-billing
 - docs
