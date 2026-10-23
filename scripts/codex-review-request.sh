@@ -1700,13 +1700,15 @@ scan_codex_state() {
 
   # #2664: what the Review Summary row says about the latest request, for
   # reporting only. The row names no request, so another request on this
-  # head whose window overlaps makes it ambiguous.
+  # head whose window overlaps makes it ambiguous. "On this head" uses the
+  # push proof, never the committer date; with no proof every overlapping
+  # author request counts, since none can be ruled out (Codex P2 on #2779).
   local run='{"state":"none","observed_at":null,"comment_id":null,"retry_after_seconds":null}'
   if [ "$request" != null ]; then
     run=$(crqe_select_codex_run_state "$issue_comments" "$BOT_LOGIN" "$HEAD_SHA" \
       "$(printf '%s' "$request" | jq -r '.created_at // ""')") || return 3
     run=$(printf '%s' "$issue_comments" | jq -c --argjson run "$run" --argjson req "$request" \
-      --arg author "$AUTHOR_IDENTITY" --arg head_at "${HEAD_PUSHED_AT:-}" --argjson window "${TIMEOUT_SECONDS:-0}" '
+      --arg author "$AUTHOR_IDENTITY" --arg head_at "${HEAD_PUSH_PROOF:-}" --argjson window "${TIMEOUT_SECONDS:-0}" '
       def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
       ($req.created_at | epoch) as $mine
       | [ .[] | select((.user.login // "") == $author)
@@ -3212,7 +3214,7 @@ resume_pending_codex_request() {
   # posted as before. Without one, the request holds only on the exact-head
   # Running summary (#1550), checked below.
   local push_proof push_epoch head_proven=false
-  push_proof=$(head_push_proof_at)
+  push_proof=$HEAD_PUSH_PROOF
   push_epoch=$(jq -rn --arg t "$push_proof" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || push_epoch=""
   if [[ "$push_epoch" =~ ^[0-9]+$ ]]; then
     if [ "$created_epoch" -lt "$push_epoch" ]; then
@@ -3329,6 +3331,9 @@ resume_pending_codex_request() {
 }
 
 # --- pre-flight: is Codex already working on HEAD? --------------------------
+
+# #2664: read once per run, before any scan; scans run in subshells.
+HEAD_PUSH_PROOF=$(head_push_proof_at)
 
 log "checking for existing Codex signal on HEAD"
 if ! INITIAL_SCAN=$(scan_codex_state); then

@@ -1913,7 +1913,18 @@ test_overlapping_requests_are_ambiguous() {
   [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 overlap: $(trigger_count "$dir") triggers posted, expected only the original"
   jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
     || fail "#2664 overlap: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests make the row ambiguous; nothing is retried"
+  # A request from the earlier head does not overlap: its commit is dated
+  # before it but the head was pushed after it (Codex P2 on #2779), so the
+  # Failed row is reported as such.
+  dir=$(make_case "run-overlap-old-head" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z \
+    CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-03T23:59:55Z CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
+  jq -e '.codex_run.final_state == "failed" and .codex_run.overlapping_request == false' "$dir/out.json" >/dev/null \
+    || fail "#2664 overlap, old head: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; nothing is retried"
 }
 
 # A restated provider window moves the reported not-before time by its
