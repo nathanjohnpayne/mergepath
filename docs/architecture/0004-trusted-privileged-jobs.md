@@ -29,19 +29,26 @@ The #2718 split decides *which* credential each caller gets: a non-reviewer CI G
 
 ## Decision
 
-Eight invariants. Every credentialed caller in the fleet satisfies all of them after cutover.
+Nine invariants. Every credentialed caller in the fleet satisfies all of them after cutover.
+
+In them, an **authority credential** is an environment secret or a CI app token (from Octo STS, or from the stored-key fallback). The job's implicit `GITHUB_TOKEN`, limited by that job's `permissions:`, is not an authority credential.
 
 1. **No authority credential is a repository or organization secret.** Each lives only in an environment whose deployment branch policy admits exactly the default branch, or is minted at run time by Octo STS and never stored.
-2. **Candidate-triggered workflows hold no authority credential.** A workflow triggered by `pull_request`, `pull_request_review` or `pull_request_review_comment` references no secret and declares no `id-token: write`. Its native required verdicts stay where they are, and its credentialed mutations move. Its existing `GITHUB_TOKEN` writes (the `github-actions[bot]`-owned fail-closed label, comment and propagation marker in `pr-review-policy.yml`, and the workflow-level grants in `agent-review.yml`) are not authority credentials under this record. For a same-repository PR they give no more than the pusher already has, and C6's label-owner fence depends on that ownership. Making those workflows fully read-only stays #1547's Security Cloud acceptance item, unchanged here.
+2. **Candidate-triggered workflows are authority-free.** A workflow triggered by `pull_request`, `pull_request_review` or `pull_request_review_comment` references no secret and declares no `id-token: write`. Its native required verdicts stay where they are, and its credentialed mutations move. Its existing `GITHUB_TOKEN` writes (the `github-actions[bot]`-owned fail-closed label, comment and propagation marker in `pr-review-policy.yml`, and the workflow-level grants in `agent-review.yml`) are not authority credentials under this record. For a same-repository PR they give no more than the pusher already has, and C6's label-owner fence depends on that ownership. Making those workflows fully read-only stays #1547's Security Cloud acceptance item, unchanged here.
 3. **Credentialed jobs run only trusted definitions.** The trigger is one of:
    - `workflow_run`, `repository_dispatch` or `schedule` (default-branch definitions);
    - `pull_request_target` (a default-branch definition since 2025-12-08), with an in-file guard that the PR's base is the default branch wherever the job reads base-branch content;
    - `workflow_dispatch`, limited to the default branch by the credential's own admission rule, never by an in-file guard alone.
 4. **Credentialed jobs execute nothing candidate-controlled.** See [Execution rules](#execution-rules-for-credentialed-jobs).
 5. **Every mutation binds to the exact current head.** Event payloads, run associations, dispatch payloads and producer outputs are untrusted nominations: a PR number and, where the event carries one, a head SHA. The job re-derives the live PR and refuses unless its base ref is the default branch and its head equals the nominated head. It captures the live head and base SHAs and repeats that pair check and the existing writer fences immediately before each write.
-6. **One job, one credential.** A job that needs two credentials becomes two jobs, passing only a PR number and head SHA between them, each re-verified. A job can name only one environment, so this also keeps the author and reviewer PATs in separate environments.
+6. **One authority credential per job, plus the implicit `GITHUB_TOKEN`.** A job may use at most one authority credential, alongside its own `GITHUB_TOKEN`. A job that needs two authority credentials becomes two jobs, passing only a PR number and head SHA between them, each re-verified. A job can name only one environment, so this also keeps the author and reviewer PATs in separate environments.
 7. **The CI app's token is used only for event-producing writes and the reads that need its viewer.** Other reads and writes that need no follow-on workflow use the job's `GITHUB_TOKEN`.
 8. **`id-token: write` is granted per job, on an allowlist.** Only the trusted jobs that exchange for an Octo STS token request it. Each Octo STS trust policy pins the exact subject and the calling workflow file, so a token request from any other run is refused.
+9. **Trusted PR consumers admit only same-repository PRs (C2 to C7).** GitHub documents that a workflow started by `workflow_run` "is able to access secrets and write tokens, even if the previous workflow was not" ([events reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)). Without this rule, a fork PR's read-only producer run could nominate a privileged mutation. Before any token exchange or mutation, each consumer job therefore:
+   - requires `github.event.workflow_run.head_repository.id` to equal `github.event.workflow_run.repository.id` and the running repository's `github.repository_id`, as a job-level `if:` so a fork-nominated job never starts;
+   - re-requires, after reading the live PR, that its `head.repo.id` equals its `base.repo.id`.
+
+   A null or absent head repository fails the check, and a failed check exits without exchanging a token or writing. Fork PRs therefore keep today's behaviour of no credentialed mutation. Mutating fork PRs would need a new owner decision and its own design.
 
 ## Trusted triggers and their admission
 
@@ -127,7 +134,7 @@ permissions:
 
 ### Policies per repository
 
-Each repository in the fleet carries the first four policies (eight repositories, 32 files), because all four workflows are propagated fleet-wide. They are generated from one template with that repository's name and IDs. The last two exist only if the condition in their rows holds. Each pins one workflow file, because `workflow_ref` names one.
+Each repository in the fleet carries the first four policies (eight repositories, 32 files), because all four workflows are propagated fleet-wide. They are generated from one template with that repository's name and IDs. The last two exist only if the condition in their rows holds. For those two, the policy file lives in the target repository, but `subject`, `repository_id`, `repository_owner_id`, `workflow_ref` and `job_workflow_ref` all carry the hub's values, because the hub runs the workflow that presents the token. Each pins one workflow file, because `workflow_ref` names one.
 
 | Identity | Workflow pinned | `event_name` | `permissions` | Callers |
 |---|---|---|---|---|
@@ -166,17 +173,17 @@ The pilot (#2732) must also record the bot login the pinned app's tokens act as,
 
 ## Caller mapping
 
-Every credentialed row of the inventory, C1 to C26. "App" means the CI app token from the named Octo STS identity (or the fallback minted the same way). Verdicts that are required checks stay in their current read-only jobs.
+Every credentialed row of the inventory, C1 to C26. "App" means the CI app token from the named Octo STS identity (or the fallback minted the same way). Verdicts that are required checks stay in their current authority-free jobs.
 
 | ID | Target trigger and definition | Credential and environment | `id-token` | Exact-head binding | Notes |
 |---|---|---|---|---|---|
 | C1 `load-config` | Unchanged candidate job (`pull_request`, `pull_request_review`) | `GITHUB_TOKEN` (`contents: read`) for the non-default-base policy reads; no PAT | No | Event base SHA, as today | Same-repository reads need no PAT. Also removes C1 from #2776's empty-token question |
-| C2 `triage` label add | Classification stays native; the label add moves to `trusted-review-mutations.yml` (`workflow_run`, default branch) | App `review-mutations` for the label; `GITHUB_TOKEN` for reads | Yes (consumer job) | `workflow_run.head_sha` equal to the live head, rechecked before the write | The consumer re-runs the classifier from default-branch helpers against the governing base policy and never uses the candidate run's outputs |
-| C3 `assign` | Same consumer | `GITHUB_TOKEN` (`pull-requests: write`) | No | As C2 | The app token only if #2727 shows the request must start a workflow |
-| C4 `detect-disagreement` | Detection as fixed by #2775; the label and comment writes move to the consumer | App `review-mutations` | Yes | The review's `commit_id` and `workflow_run.head_sha` equal to the live head | Decides from live reviews and the base policy's `available_reviewers` (#975). A deliberate behaviour change: today the job removes `needs-human-review` when agreement returns (`agent-review.yml:1112`). Under R-169 the consumer never removes an existing hold; only a human does |
-| C5 `block-self-approval` | Classification in the consumer; dismissal and `policy-violation` label there | App `review-mutations` | Yes | As C4, plus a re-read of the review before dismissal | Dismissal rights depend on protection settings (inventory open question 5). #2727 confirms no merge path depends on the dismissal landing first; the clearance gate's own approval checks (#1080) are the merge control |
-| C6 fail-closed label `DELETE` | Verdict stays native; the `DELETE` moves to `trusted-policy-mutations.yml` (`workflow_run`) | App `policy-mutations` | Yes | Live head and base equal the run's pair; label-owner fence repeated | Keeps the `unlabeled` event that re-arms the settle and Label Gate |
-| C7 propagation lane | Same consumer | `GITHUB_TOKEN` (job-level `contents: write`) for the `merge-clearance-recheck` dispatch; App `policy-mutations` for the label removal | Yes | Live pair fence before each write, as today | The dispatch payload still grants nothing; the gate re-verifies |
+| C2 `triage` label add | Classification stays native; the label add moves to `trusted-review-mutations.yml` (`workflow_run`, default branch) | App `review-mutations` (the job's one authority credential) for the label; the implicit `GITHUB_TOKEN` for reads | Yes (consumer job) | Same-repository admission (invariant 9); `workflow_run.head_sha` equal to the live head, rechecked before the write | The consumer re-runs the classifier from default-branch helpers against the governing base policy and never uses the candidate run's outputs |
+| C3 `assign` | Same consumer | `GITHUB_TOKEN` (`pull-requests: write`) | No | As C2, including same-repository admission | The app token only if #2727 shows the request must start a workflow |
+| C4 `detect-disagreement` | Detection as fixed by #2775; the label and comment writes move to the consumer | App `review-mutations` | Yes | Same-repository admission; the review's `commit_id` and `workflow_run.head_sha` equal to the live head | Decides from live reviews and the base policy's `available_reviewers` (#975). A deliberate behaviour change: today the job removes `needs-human-review` when agreement returns (`agent-review.yml:1112`). Under R-169 the consumer never removes an existing hold; only a human does |
+| C5 `block-self-approval` | Classification in the consumer; dismissal and `policy-violation` label there | App `review-mutations` | Yes | As C4 (including same-repository admission), plus a re-read of the review before dismissal | Dismissal rights depend on protection settings (inventory open question 5). #2727 confirms no merge path depends on the dismissal landing first; the clearance gate's own approval checks (#1080) are the merge control |
+| C6 fail-closed label `DELETE` | Verdict stays native; the `DELETE` moves to `trusted-policy-mutations.yml` (`workflow_run`) | App `policy-mutations` | Yes | Same-repository admission; live head and base equal the run's pair; label-owner fence repeated | Keeps the `unlabeled` event that re-arms the settle and Label Gate |
+| C7 propagation lane | Same consumer | App `policy-mutations` (the job's one authority credential) for the label removal; the implicit `GITHUB_TOKEN`, with job-level `contents: write`, for the `merge-clearance-recheck` dispatch | Yes | Same-repository admission; live pair fence before each write, as today | The dispatch payload still grants nothing; the gate re-verifies |
 | C8 auto-clear gate and `DELETE` | The `pull_request_target` job becomes a credential-free nominator that dispatches `auto-clear-evaluate` with a job-level `contents: write` `GITHUB_TOKEN`. Evaluation runs on `repository_dispatch` and `workflow_run` | App `auto-clear`, no environment | Yes (evaluation job only) | Dispatch payload is a PR number only; captured head and base must equal live values before the `DELETE`, as today | Keeps every existing auto-clear trigger (see [#2733](#compatibility-with-2733)) |
 | C9 protective retraction | Moves out of the label job into a continuation job; the `pull_request_target` call site goes with the nominator | `AUTHOR_MERGE_TOKEN` in `merge-queue-policy` | No | Live PR re-read | Dormant arm path (open question 13) |
 | C10 approved-PR continuation | Continuation job, `workflow_run`, default branch | `AUTHOR_MERGE_TOKEN` in `merge-queue-policy`, with the `github_pat_` class check | No | As today (`workflow_run` association or head-SHA match, live snapshot) | Whether it can move to the app with a policy-derived identity pin is #2728's open question 15 |
@@ -196,7 +203,17 @@ Every credentialed row of the inventory, C1 to C26. "App" means the CI app token
 | C24 drift tracking issue | Unchanged | `GITHUB_TOKEN` (`issues: write`) | No | Not a PR mutation | |
 | C25, C26 fiveacross stray sweep | Delete the stray workflow, `scripts/sweep-unresolved-feedback/` and `scripts/bootstrap/` from fiveacross before any token moves (open question 11) | None | No | Not applicable | C26 writes cross-repository to mergepath today |
 
-The consumers must handle what `workflow_run` does not give them. `workflow_run.pull_requests` can be empty, notably for fork PRs, so a consumer resolves the PR from the run's head SHA, or from a PR number carried in the producer's `run-name` as an untrusted nomination (the [#2278](https://github.com/nathanjohnpayne/mergepath/pull/2278) approach), and then applies the exact-head rule. A workflow on a non-default branch can also borrow the producer's `name`. That only nominates an evaluation the consumer re-derives, and the consumer also requires `workflow_run.path` to be the expected file and `workflow_run.event` to be a candidate event. Fork PRs get no secrets and so no mutations today. Whether the consumers start mutating fork PRs is a behaviour change for #2727 to decide, not a side effect (see #2393).
+The consumers must handle what `workflow_run` does not give them. `workflow_run.pull_requests` can be empty, notably for fork PRs, so a consumer resolves the PR from the run's head SHA, or from a PR number carried in the producer's `run-name` as an untrusted nomination (the [#2278](https://github.com/nathanjohnpayne/mergepath/pull/2278) approach), and then applies the exact-head rule. A workflow on a non-default branch can also borrow the producer's `name`. That only nominates an evaluation the consumer re-derives. Before it does anything else, the consumer validates these `github.event.workflow_run` fields (the same object as the [workflow-runs REST resource](https://docs.github.com/en/rest/actions/workflow-runs)):
+
+| Field | Required value | Why |
+|---|---|---|
+| `workflow_id` | The numeric ID of the expected producer file in this repository, read from `GET /repos/{owner}/{repo}/actions/workflows/agent-review.yml` (or `pr-review-policy.yml`) with the job's `GITHUB_TOKEN` | The ID is stable and identifies the file, not its display name |
+| `path` | After removing one trailing `@<ref>` suffix, exactly `.github/workflows/agent-review.yml` (or `pr-review-policy.yml`) | A cross-check only. GitHub's REST example reports `.github/workflows/build.yml@main`; this repository's live runs (read 2026-10-23) report the bare path. A prefix or substring match is never used |
+| `event` | `pull_request` or `pull_request_review` for `trusted-review-mutations.yml`; `pull_request` for `trusted-policy-mutations.yml` | The producers' own triggers; anything else is not a candidate PR run |
+| `head_repository.id`, `repository.id` | Equal to each other and to `github.repository_id` | Invariant 9 |
+| `head_sha` | The nominated head; the live PR's head must equal it | Invariant 5 |
+
+`head_branch`, `conclusion`, `display_title` and artifacts are never authorization inputs. A consumer may use `conclusion` to skip work, but never to admit it.
 
 Dependabot-actor PR runs need the same care. Whether a `workflow_run` started by a Dependabot-actor run gets an OIDC token is for the pilot to record with #2776. The rule is fail closed: no token means no write. The Dependabot lane's own credentials stay in C13 and C14, on `pull_request_target`. GitHub withholds secrets from a Dependabot-initiated `pull_request_target` run only "if the base ref of the pull request was created by Dependabot" ([Dependabot on Actions](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-on-actions)), and C13 and C14's base-is-default guard rules that case out. The live record agrees: nathanpaynedotcom [run 39737679498](https://github.com/nathanjohnpayne/nathanpaynedotcom/actions/runs/39737679498) (actor `dependabot[bot]`, `pull_request_target`, 2026-10-22) completed the approve-and-merge step, which hard-fails on an empty token. That page does not mention environment secrets, so #2729 must prove they resolve on such a run before the repository copies go.
 
@@ -225,7 +242,7 @@ Event policies are repository settings that admit a run by path and event whatev
 
 - **Threat model.** #1547's model (a same-repository branch pusher running code with standing authority) is the one this design closes; see [Validation](#validation-against-the-1547-threat-model).
 - **Shared principles.** It adopts the parked design's principles unchanged:
-  - candidate workflows are read-only and secret-free;
+  - candidate workflows are secret-free; #2278 also makes them read-only, while this record makes them authority-free and leaves their existing `GITHUB_TOKEN` writes to #1547 (invariant 2);
   - privileged mutations run in trusted default-branch consumers that validate an immutable PR, head and base binding and repeat the live writer fences;
   - a non-reviewer app performs event-producing mutations and never approves or merges;
   - Dependabot approval and merge are separate protected jobs;
@@ -261,6 +278,7 @@ Event policies are repository settings that admit a run by path and event whatev
 | OIDC token requested by any run | Exact `sub`, `workflow_ref`, `event_name`, `ref` and repository IDs in every policy; the `id-token` allowlist lint |
 | Policy edited on a branch | A pilot requirement: Octo STS must be shown to read only the default branch. Policy files are Phase 4 paths |
 | Stale nomination, or a head pushed between check and write | Invariant 5's exact-head binding and the repeated writer fences |
+| A fork PR's read-only producer nominates a privileged `workflow_run` consumer | Invariant 9's same-repository admission, as a job-level `if:` and again on the live PR, before any exchange or write |
 | Silent fallback to a surviving repository shadow during cutover | New Dependabot secret name; author `github_pat_` class check; shadow removal before the cutover is declared |
 
 ## Residual risks
@@ -294,7 +312,7 @@ Accepting this record accepts the invariants, the environment layout and the Oct
   - the `id-token` allowlist lint;
   - the bot login (into `non_reviewer_identities` and `thread_resolution_ci_app_identity`);
   - per-caller confirmation of follow-on events and of merge safety under consumer latency;
-  - the fork-PR behaviour decision.
+  - the `workflow_run` field validation and same-repository admission (invariant 9), with fork and borrowed-name rejection tests.
 - **#2728:**
   - the permission set, including the GraphQL merge permissions (open question 14);
   - the `github_pat_` class check;
