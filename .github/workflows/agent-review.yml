@@ -1100,9 +1100,12 @@ jobs:
               path.resolve(process.env.GITHUB_WORKSPACE, 'scripts/disagreement-detector.cjs')
             );
 
-            // An unproven allow-list classifies nobody, and with nobody
-            // classified decide() would REMOVE an existing label. So an empty
-            // or unreadable list leaves the label alone instead (#975).
+            // An unproven allow-list (resolver failure, missing loader, empty
+            // or malformed list) must neither hide a live conflict nor clear
+            // an escalation (#975). With nobody classified, decide() would
+            // REMOVE an existing label and never apply one. So it classifies
+            // every reviewer on the PR instead, may only APPLY the label, and
+            // fails the job so the policy failure is visible.
             let reviewerAccounts = [];
             try {
               const parsed = JSON.parse(process.env.REVIEWERS_JSON || '[]');
@@ -1112,10 +1115,7 @@ jobs:
             } catch (e) {
               reviewerAccounts = [];
             }
-            if (reviewerAccounts.length === 0) {
-              core.warning('No governing available_reviewers list; leaving needs-human-review unchanged.');
-              return;
-            }
+            const allowListProven = reviewerAccounts.length > 0;
 
             // Paginate reviews — long histories (>30) otherwise truncate and
             // mask the latest-on-HEAD signal. Mirrors the pagination
@@ -1138,12 +1138,16 @@ jobs:
             });
             const hasLabel = labels.data.some(l => l.name === 'needs-human-review');
 
-            const decision = decide({
+            if (!allowListProven) {
+              reviewerAccounts = [...new Set(reviews.map(r => r.user && r.user.login).filter(Boolean))];
+            }
+            let decision = decide({
               reviews,
               reviewerAccounts,
               headSha: context.payload.pull_request.head.sha,
               hasLabel,
             });
+            if (!allowListProven && decision === 'remove') decision = 'noop';
 
             if (decision === 'apply') {
               await github.rest.issues.addLabels({
@@ -1180,6 +1184,9 @@ jobs:
                 // Label may already be removed — ignore 404
                 if (e.status !== 404) throw e;
               }
+            }
+            if (!allowListProven) {
+              core.setFailed('No governing available_reviewers list: classified every reviewer and never removed needs-human-review (#975).');
             }
             // decision === 'noop' — nothing to do.
 
