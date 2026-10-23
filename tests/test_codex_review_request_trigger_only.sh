@@ -2016,11 +2016,11 @@ test_write_boundary_authorization_caller_mode() {
           || fail "#2582 authorization ($label): expected refusal '$want' (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "#2582 authorization must never post ($label)"
-  # #2664: CODEX_TEST_LINT_RUNS=dispatched dates the head's push 30 s before
-  # the fixture's requests, so dup_author is on this head and dup_author_older
-  # (60 s earlier) is not.
+  # #2664: a same-head duplicate with no strong tie (no force-push put HEAD in
+  # place before it) and no Running summary is not held, so polling mode
+  # authorizes a new counted request; a workflow run is no tie.
   done <<'CASES'
-poll-dup|dup_author|poll|false|pending-request-unanswered
+poll-dup|dup_author|poll|false|authorized
 poll-older-head-dup|dup_author_older|poll|false|authorized
 poll-fresh|fresh|poll|false|authorized
 poll-content-free|fresh|poll|true|authorized

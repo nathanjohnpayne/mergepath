@@ -1305,23 +1305,23 @@ CASES
   dir=$(make_case "resume-older-head" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z run_case "$dir" absent 1)
-  [ "$(trigger_count "$dir")" = 1 ] && grep -q "predates the current head's push" "$dir/err.log" \
+  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z CODEX_TEST_GQL_FORCE_PUSHES='[]' run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q "no strong tie to the current head" "$dir/err.log" \
     || fail "#2664 older head: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
   # With no push time, a committer date never ties the request to the head:
   # without the exact-head Running summary it does not hold.
   dir=$(make_case "resume-no-push-proof" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=none run_case "$dir" absent 1)
-  [ "$(trigger_count "$dir")" = 1 ] && grep -q 'cannot be tied to the current head' "$dir/err.log" \
+  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=none CODEX_TEST_GQL_FORCE_PUSHES='[]' run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q 'no strong tie to the current head' "$dir/err.log" \
     || fail "#2664 no push proof: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
   # The exact-head Running summary still ties it (#1550).
   dir=$(make_case "resume-no-push-proof-running" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
   set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=none run_case "$dir" absent 1)
+  rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=none CODEX_TEST_GQL_FORCE_PUSHES='[]' run_case "$dir" absent 1)
   [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
     || fail "#2664 no push proof, Running: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
   # A later pull_request run from another activity on the unchanged head does
@@ -1931,44 +1931,51 @@ CASES
 # unattributed. Only a force-push that put HEAD in place before the request
 # is a strong tie.
 test_weak_tie_mints_no_timeout() {
-  local dir rc before=$FAIL label nodes env_extra
+  local dir rc before=$FAIL label nodes running clock expect
   local ff='[{"createdAt":"2026-06-03T23:58:00Z","afterCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]'
   local rewind='[{"createdAt":"2026-06-03T23:50:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"createdAt":"2026-06-03T23:55:00Z","afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"}}]'
-  local after_request='[{"createdAt":"2026-06-04T00:00:20Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
-  while IFS='|' read -r label nodes; do
-    case "$nodes" in ff) nodes=$ff ;; rewind) nodes=$rewind ;; after) nodes=$after_request ;; esac
+  local same='[{"createdAt":"2026-06-04T00:00:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  local after='[{"createdAt":"2026-06-04T00:00:20Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  while IFS='|' read -r label nodes running clock expect; do
+    case "$nodes" in ff) nodes=$ff ;; rewind) nodes=$rewind ;; same) nodes=$same ;; after) nodes=$after ;; esac
     dir=$(make_case "weak-tie-$label" 0 0 60)
     seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
-    # The force-push-then-Running case: Codex Running on this head since the
-    # request, though the head arrived after it.
-    [ "$label" != force-push-then-running ] || seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:30Z"
-    set_clock_after_request "$dir" 90
+    [ "$running" != yes ] || seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:30Z"
+    set_clock_after_request "$dir" "$clock"
     rc=$(CODEX_TEST_GQL_FORCE_PUSHES="$nodes" run_case "$dir" absent 1)
-    if [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 0 ] \
-       && [ "$(jq -r '.terminal_determination // "null"' "$dir/out.json")" = null ] \
-       && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = unattributed ] \
-       && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
-       && grep -q 'unattributed; a deliberate fresh request is needed' "$dir/err.log"; then
-      :
-    else
-      fail "#2664 weak tie ($label): exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null); stderr=$(tail -2 "$dir/err.log")"
-    fi
+    case "$expect" in
+      fresh)
+        # Not held: one new counted request posts (no deadlock), and request
+        # 900 never gets a timeout determination.
+        [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 1 ] \
+          && ! grep -q 'trigger_comment_id=900' "$dir/state/comments.jsonl" \
+          && grep -q 'not resuming; a new counted request posts' "$dir/err.log" \
+          || fail "#2664 weak tie ($label): exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")" ;;
+      unattributed)
+        # Held on the Running summary within its wait; at expiry no marker.
+        [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 0 ] \
+          && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+          && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = unattributed ] \
+          || fail "#2664 weak tie ($label): exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null)" ;;
+    esac
   done <<'CASES'
-no-force-push|[]
-fast-forward-after-force-push|ff
-rewind-and-return|rewind
-force-push-then-running|after
+no-force-push|[]|no|90|fresh
+fast-forward-after-force-push|ff|no|90|fresh
+rewind-and-return|rewind|no|90|fresh
+same-second-force-push|same|no|90|fresh
+force-push-then-running-expired|after|yes|90|fresh
+force-push-then-running-held|after|yes|30|unattributed
 CASES
-  # The strong tie: the latest force-push put HEAD in place before the
-  # request, so its expiry records the timeout.
+  # The strong tie: the latest force-push put HEAD in place strictly before
+  # the request, so the request is held through its expiry and records it.
   dir=$(make_case "strong-tie" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 90
   rc=$(run_case "$dir" absent 1)
-  [ "$rc" = 4 ] && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = timeout-recorded ] \
+  [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 0 ] && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = timeout-recorded ] \
     && grep -q 'trigger_comment_id=900' "$dir/state/comments.jsonl" \
-    || fail "#2664 strong tie: exit $rc, $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null)"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: a held request mints a timeout only on a strong head tie; weak ties (fast-forward, rewind, force-push then Running, none) report it unattributed"
+    || fail "#2664 strong tie: exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: only a strong head tie holds through expiry and mints a timeout; weak and same-second ties post a fresh counted request or end unattributed"
 }
 
 # Phase 4b advisories on #2779 (ffc83780). Each case fails on that head.
@@ -2001,8 +2008,9 @@ test_round4_head_tie_edges() {
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 60
   rc=$(CODEX_TEST_COMMIT_DATE=2099-01-01T00:00:00Z CODEX_TEST_FORCE_PUSHED_AT=2026-06-04T00:00:30Z \
+    CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-04T00:00:30Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' \
     CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-03T23:59:00Z run_case "$dir" absent 1)
-  [ "$(trigger_count "$dir")" = 1 ] && grep -q "predates the current head's push\|cannot be tied to the current head" "$dir/err.log" \
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q "no strong tie to the current head" "$dir/err.log" \
     || fail "#2664 force-push, future commit: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "#2664: case-varied requests, late dispatch with Running and a hidden force-push are handled"
 }

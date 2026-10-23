@@ -3211,21 +3211,20 @@ resume_pending_codex_request() {
     || die 3 "cannot parse the pending Codex request's timestamp '$created'"
   [[ "$created_epoch" =~ ^[0-9]+$ ]] || die 3 "cannot parse the pending Codex request's timestamp '$created'"
 
-  # #2664: only a request posted on the current head can hold it, and the
-  # committer date proves nothing about that: a commit made before a request
-  # on the old head and pushed after it has an earlier date. Only a push time
-  # the author cannot set ties the request to this head (head_push_proof_at).
-  # A request older than it belongs to an earlier head, so a new request is
-  # posted as before. Without one, the request holds only on the exact-head
-  # Running summary (#1550), checked below.
-  local push_proof push_epoch head_proven=false predates_push=false
-  push_proof=$HEAD_PUSH_PROOF
-  push_epoch=$(jq -rn --arg t "$push_proof" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || push_epoch=""
-  # The push time is positive evidence only: a run can be dispatched after a
-  # request already posted on this head, so an earlier request is left to the
-  # Running-summary check below rather than rejected here.
-  if [[ "$push_epoch" =~ ^[0-9]+$ ]]; then
-    if [ "$created_epoch" -ge "$push_epoch" ]; then head_proven=true; else predates_push=true; fi
+  # #2664: only a request tied to the current head can hold it, and neither
+  # the committer date nor a workflow run proves that tie (#2779 Phase 4b). It
+  # holds on a strong tie: it was posted strictly after the PR's latest
+  # force-push, and that force-push put HEAD in place
+  # (crqe_head_force_push_tie_at). It also holds on the exact-head Running
+  # summary since the request (#1550), but only while it is within its own
+  # wait. Otherwise a new counted request posts, as before #2664: an
+  # unprovable tie costs a slot, never a deadlock or a waiver.
+  local tie_at tie_epoch
+  RESUME_STRONG_TIE=false
+  tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) || tie_at=""
+  tie_epoch=$(jq -rn --arg t "$tie_at" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || tie_epoch=""
+  if [[ "$tie_epoch" =~ ^[0-9]+$ ]] && [ "$created_epoch" -gt "$tie_epoch" ]; then
+    RESUME_STRONG_TIE=true
   fi
   # The timeout handoff binds only the exact lowercase command
   # (codex_phase4a_trigger_comment_is_latest), so a case-varied request could
@@ -3312,17 +3311,18 @@ resume_pending_codex_request() {
   if [ "$status" = running ] && [ -n "$observed" ] && ! [[ "$observed" < "$created" ]]; then
     RESUME_PENDING_RUNNING=true
   fi
-  if [ "$head_proven" != true ] && [ "$RESUME_PENDING_RUNNING" != true ]; then
-    if [ "$predates_push" = true ]; then
-      log "pending request $(printf '%s' "$pending" | jq -r .id) predates the current head's push ($push_proof) and no exact-head Running summary ties it — not resuming"
-    else
-      log "pending request $(printf '%s' "$pending" | jq -r .id) cannot be tied to the current head (no push time or Running summary) — not resuming"
-    fi
-    return 1
-  fi
-
   now=$(date +%s)
   deadline=$((created_epoch + TIMEOUT_SECONDS))
+  if [ "$RESUME_STRONG_TIE" != true ]; then
+    if [ "$RESUME_PENDING_RUNNING" != true ]; then
+      log "pending request $(printf '%s' "$pending" | jq -r .id) has no strong tie to the current head and no Running summary — not resuming; a new counted request posts"
+      return 1
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      log "pending request $(printf '%s' "$pending" | jq -r .id) is tied only by a Running summary and is past its wait — not resuming; a new counted request posts"
+      return 1
+    fi
+  fi
   RESUME_PENDING_STATE=pending
   if [ "$now" -ge "$deadline" ]; then
     # Past its own wait: the wait below ends at once, and the request's
@@ -3374,6 +3374,7 @@ RESUMED_TRIGGER=false
 # invocation resumed first, although this process posts normally.
 RESUMED_EVER=false
 RESUME_PENDING_RUNNING=false
+RESUME_STRONG_TIE=false
 RESUME_PENDING_STATE=""
 # #2664 reporting of the waited-on request's run (see codex_run_tick).
 CODEX_RUN_DIAGNOSTIC_JSON=null
@@ -3662,28 +3663,26 @@ fi
 # #2664: a timeout determination is minted only from a strong head tie:
 # this run's own request, or a held request posted after the PR's latest
 # force-push, when that force-push put HEAD in place
-# (crqe_head_force_push_tie_at). The hold's weaker ties (a workflow run, a
-# Running summary) only keep a rerun from posting beside the request. They
-# cannot tie an older head's request to this head well enough to hand this
-# head to Phase 4b (#2779 Phase 4b P1s). Without a strong tie the run exits 4
-# with no marker and reports the request as unattributed.
+# (crqe_head_force_push_tie_at), strictly later. The hold's weaker tie (a
+# Running summary) only keeps a rerun from posting beside the request while
+# it is within its wait. It cannot tie an older head's request to this head
+# well enough to hand this head to Phase 4b (#2779 Phase 4b P1s). Without a
+# strong tie the run exits 4 with no marker and reports the request as
+# unattributed, and a rerun posts a new counted request.
 CODEX_RUN_HANDOFF=""
 if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then
   strong_tie=$TRIGGER_POSTED
-  if [ "$strong_tie" != true ]; then
-    tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) || tie_at=""
-    if [ -n "$tie_at" ] && ! [[ "$TRIGGER_SIGNAL_THRESHOLD" < "$tie_at" ]]; then
-      strong_tie=true
-      log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} follows the force-push that put HEAD in place ($tie_at) — recording its timeout"
-    fi
+  if [ "$strong_tie" != true ] && [ "$RESUMED_TRIGGER" = true ] && [ "$RESUME_STRONG_TIE" = true ]; then
+    strong_tie=true
+    log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} was posted after the force-push that put HEAD in place — recording its timeout"
   fi
   if [ "$strong_tie" = true ]; then
     record_phase4a_timeout_determination
     CODEX_RUN_HANDOFF=timeout-recorded
   else
     CODEX_RUN_HANDOFF=unattributed
-    log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} is unanswered, and no force-push of HEAD before it ties it to this head: unattributed; a deliberate fresh request is needed. No timeout determination is recorded (#2664)"
+    log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} is unanswered and tied only by a Running summary: unattributed; a rerun posts a new counted request. No timeout determination is recorded (#2664)"
   fi
 fi
 
