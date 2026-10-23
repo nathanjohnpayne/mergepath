@@ -233,8 +233,11 @@ case "$endpoint" in
     if [ "${CODEX_TEST_PUSH_DISPATCHED_AT:-}" = none ]; then
       printf '{"total_count":0,"workflow_runs":[]}\n'
     else
-      jq -cn --arg t "${CODEX_TEST_PUSH_DISPATCHED_AT:-2026-06-03T23:59:00Z}" \
-        '{total_count:1,workflow_runs:[{id:41,name:"CI",event:"pull_request",head_branch:"",created_at:$t}]}'
+      # CODEX_TEST_PUSH_LATER_RUN_AT adds a later pull_request run on the same
+      # head, as a review_requested or labeled activity would.
+      jq -cn --arg t "${CODEX_TEST_PUSH_DISPATCHED_AT:-2026-06-03T23:59:00Z}" --arg later "${CODEX_TEST_PUSH_LATER_RUN_AT:-}" \
+        '{total_count:1,workflow_runs:([{id:41,name:"CI",event:"pull_request",head_branch:"",created_at:$t}]
+          + (if $later == "" then [] else [{id:42,name:"CI",event:"pull_request",head_branch:"",created_at:$later}] end))}'
     fi
     ;;
   repos/owner/repo/pulls/999)
@@ -1307,6 +1310,14 @@ CASES
   rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=none run_case "$dir" absent 1)
   [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
     || fail "#2664 no push proof, Running: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  # A later pull_request run from another activity on the unchanged head does
+  # not move the push time (Codex P2 on #2779): the request still holds.
+  dir=$(make_case "resume-later-activity-run" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_PUSH_LATER_RUN_AT=2026-06-04T00:00:20Z run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
+    || fail "#2664 later activity run: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "#2664: only a push time or the exact-head Running summary ties a request to the current head"
 }
 

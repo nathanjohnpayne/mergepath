@@ -3154,12 +3154,15 @@ rescan_codex_state() { # <what>
 # plus review_timeout_seconds), so resuming never extends a request's wait.
 # A resumed request grants no timeout authority: if it expires unanswered, the
 # caller posts a new trigger, and only that trigger can mint a timeout marker.
-# #2664: a push time for HEAD that the author cannot set, or empty. A
-# force-push timeline event dates the push itself. Otherwise the latest
-# pull_request or push workflow run for HEAD on the PR branch was created
-# after the push it ran for, so a request after it was posted on this head.
-# The latest run is used: a later run only moves the bound later, which
-# holds fewer requests. An unreadable list proves nothing.
+# #2664: a push time for HEAD that the author cannot set, or empty. The
+# earliest pull_request or push workflow run for HEAD on the PR branch was
+# created just after HEAD reached the branch, so a request after it was
+# posted on this head. The earliest is used because a later pull_request run
+# can come from another activity (review_requested, labeled, reopened) on the
+# unchanged head and would wrongly date it later (Codex P2 on #2779). A
+# branch moved back to an earlier commit is a non-fast-forward update, so its
+# force-push timeline event dates that push, and the later of the two wins.
+# An unreadable list proves nothing.
 head_push_proof_at() {
   local forced="" dispatched="" runs
   case "$ANCHOR_SOURCE" in head_ref_force_pushed*) forced=$HEAD_PUSHED_AT ;; esac
@@ -3171,7 +3174,7 @@ head_push_proof_at() {
            | select(.event == "pull_request" or .event == "push")
            | select($b == "" or (.head_branch // "") == $b)
            | (.created_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) ] | max // ""
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) ] | min // ""
     else "" end' 2>/dev/null) || dispatched=""
   if [ -n "$forced" ] && { [ -z "$dispatched" ] || [[ "$forced" > "$dispatched" ]]; }; then
     printf '%s' "$forced"
