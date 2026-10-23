@@ -98,9 +98,36 @@ NAME = "check_pipeline_token_checkouts"
 
 PIPELINE_TOKENS = ("AUTHOR_MERGE_TOKEN", "REVIEWER_ASSIGNMENT_TOKEN", "CI_ACTOR_TOKEN")
 PIPELINE_TOKEN_NAMES = {t.lower() for t in PIPELINE_TOKENS}
-_EXPRESSION_BODY_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 # Expression contexts and secret names are case-insensitive in Actions.
 _SECRETS_RE = re.compile(r"\bsecrets\b(?:\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*))?", re.IGNORECASE)
+
+
+def expression_bodies(text):
+    """Yield the body of every `${{ ... }}` expression in `text`.
+
+    `}}` inside a single-quoted string literal (`format('}}{0}', ...)`) does
+    not close the expression. The escaped quote `''` needs no special case:
+    it closes and reopens the literal. An expression
+    with no closing `}}` yields the rest of the text, so a malformed one is
+    read in full rather than skipped.
+    """
+    pos = 0
+    while True:
+        start = text.find("${{", pos)
+        if start < 0:
+            return
+        i, n, quoted = start + 3, len(text), False
+        while i < n:
+            if quoted:
+                if text[i] == "'":
+                    quoted = False
+            elif text[i] == "'":
+                quoted = True
+            elif text.startswith("}}", i):
+                break
+            i += 1
+        yield text[start + 3:i]
+        pos = i + 2
 
 
 def holds_pipeline_token(text):
@@ -110,7 +137,7 @@ def holds_pipeline_token(text):
     secret counts, because computed access (`secrets[format(...)]`,
     `toJSON(secrets)`) can reach any of them.
     """
-    for body in _EXPRESSION_BODY_RE.findall(text):
+    for body in expression_bodies(text):
         for m in _SECRETS_RE.finditer(body):
             if m.group(1) is None or m.group(1).lower() in PIPELINE_TOKEN_NAMES:
                 return True
@@ -409,6 +436,12 @@ SELF_TEST_CASES = [
     ("toJSON ( secrets ) with spaces counts", _job(CHECKOUT + _run("echo '${{ toJSON ( secrets ) }}'")), 1),
     ("computed bracket access counts",
      _job(CHECKOUT + _run("echo ${{ secrets[format('CI_{0}_TOKEN', 'ACTOR')] }}")), 1),
+    ("a quoted }} inside the expression does not hide the read",
+     _job(CHECKOUT + _run("echo \"${{ format('}}{0}', secrets.CI_ACTOR_TOKEN) }}\"")), 1),
+    ("an escaped quote inside a string literal does not end it",
+     _job(CHECKOUT + _run("echo \"${{ format('it''s }}{0}', secrets.CI_ACTOR_TOKEN) }}\"")), 1),
+    ("an unterminated expression is read to the end",
+     _job(CHECKOUT + _run("echo \"${{ format('{0}', secrets.CI_ACTOR_TOKEN)\"")), 1),
     ("spaced dot access counts", _job(CHECKOUT + _run("echo ${{ secrets . CI_ACTOR_TOKEN }}")), 1),
     ("lower-case secret name counts", _job(CHECKOUT + _run("echo ${{ secrets.ci_actor_token }}")), 1),
     ("mixed-case secrets context counts", _job(CHECKOUT + _run("echo ${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}")), 1),
