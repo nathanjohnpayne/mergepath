@@ -1702,15 +1702,16 @@ scan_codex_state() {
 
   # #2664: what the Review Summary row says about the latest request, for
   # reporting only. The row names no request, so another request on this
-  # head whose window overlaps makes it ambiguous. "On this head" uses the
-  # push proof, never the committer date; with no proof every overlapping
-  # author request counts, since none can be ruled out (Codex P2 on #2779).
+  # head whose window overlaps makes it ambiguous. "On this head" uses only
+  # the proven head transition (HEAD_TRANSITION_AT), never the committer date
+  # or a workflow run; with none, every overlapping author request counts,
+  # since none can be ruled out (#2779 review).
   local run='{"state":"none","observed_at":null,"comment_id":null,"retry_after_seconds":null}'
   if [ "$request" != null ]; then
     run=$(crqe_select_codex_run_state "$issue_comments" "$BOT_LOGIN" "$HEAD_SHA" \
       "$(printf '%s' "$request" | jq -r '.created_at // ""')") || return 3
     run=$(printf '%s' "$issue_comments" | jq -c --argjson run "$run" --argjson req "$request" \
-      --arg author "$AUTHOR_IDENTITY" --arg head_at "${HEAD_PUSH_PROOF:-}" --argjson window "${TIMEOUT_SECONDS:-0}" '
+      --arg author "$AUTHOR_IDENTITY" --arg head_at "${HEAD_TRANSITION_AT:-}" --argjson window "${TIMEOUT_SECONDS:-0}" '
       def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
       ($req.created_at | epoch) as $mine
       | [ .[] | select((.user.login // "") == $author)
@@ -3158,38 +3159,6 @@ rescan_codex_state() { # <what>
 # plus review_timeout_seconds), so resuming never extends a request's wait.
 # A resumed request grants no timeout authority: if it expires unanswered, the
 # caller posts a new trigger, and only that trigger can mint a timeout marker.
-# #2664: a push time for HEAD that the author cannot set, or empty. The
-# earliest pull_request or push workflow run for HEAD on the PR branch was
-# created just after HEAD reached the branch, so a request after it was
-# posted on this head. The earliest is used because a later pull_request run
-# can come from another activity (review_requested, labeled, reopened) on the
-# unchanged head and would wrongly date it later (Codex P2 on #2779). A
-# branch moved back to an earlier commit is a non-fast-forward update, so its
-# force-push timeline event dates that push, and the later of the two wins.
-# An unreadable list proves nothing.
-head_push_proof_at() {
-  local forced="" dispatched="" runs
-  # Read directly, not through ANCHOR_SOURCE: that picks the force-push only
-  # when it is later than the committer date, so a future-dated commit would
-  # hide it (#2779 Phase 4b advisory).
-  forced=$(crqe_latest_head_transition "${TIMELINE_JSON:-[]}" 2>/dev/null) || forced=""
-  runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
-    -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
-  dispatched=$(printf '%s' "$runs" | jq -r -s --arg b "$HEAD_REF" '
-    if length > 0 and all(.[]; type == "object" and ((.workflow_runs | type) == "array"))
-    then [ .[].workflow_runs[]
-           | select(.event == "pull_request" or .event == "push")
-           | select($b == "" or (.head_branch // "") == $b)
-           | (.created_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) ] | min // ""
-    else "" end' 2>/dev/null) || dispatched=""
-  if [ -n "$forced" ] && { [ -z "$dispatched" ] || [[ "$forced" > "$dispatched" ]]; }; then
-    printf '%s' "$forced"
-  else
-    printf '%s' "$dispatched"
-  fi
-}
-
 resume_pending_codex_request() {
   [ -n "$AUTHOR_IDENTITY" ] || return 1
   local comments="" pending created created_epoch summary status observed now deadline
@@ -3232,6 +3201,15 @@ resume_pending_codex_request() {
   tie_epoch=$(jq -rn --arg t "$tie_at" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || tie_epoch=""
   if [[ "$tie_epoch" =~ ^[0-9]+$ ]] && [ "$created_epoch" -gt "$tie_epoch" ]; then
     RESUME_STRONG_TIE=true
+  fi
+  # An edited comment is no request evidence for its own wait: the selector
+  # reads its current body, but the deadline runs from created_at, so a
+  # comment edited into the command long after it was posted would expire at
+  # once and record a timeout for a wait that never happened (direct adapter
+  # review of #2779). It is not held; a new counted request posts.
+  if printf '%s' "$pending" | jq -e '(.updated_at // .created_at) != .created_at' >/dev/null 2>&1; then
+    log "pending request $(printf '%s' "$pending" | jq -r .id) was edited after it was posted — not resuming; a new counted request posts"
+    return 1
   fi
   # The timeout handoff binds only the exact lowercase command
   # (codex_phase4a_trigger_comment_is_latest), so a case-varied request could
@@ -3355,7 +3333,11 @@ resume_pending_codex_request() {
 # --- pre-flight: is Codex already working on HEAD? --------------------------
 
 # #2664: read once per run, before any scan; scans run in subshells.
-HEAD_PUSH_PROOF=$(head_push_proof_at)
+# The overlap report's cutoff is the proven head transition only: the latest
+# force-push, when it put HEAD in place. A workflow run can be created after
+# requests already posted on this head, so it never excludes one. With no
+# proven transition, or an unreadable one, every author request counts.
+HEAD_TRANSITION_AT=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) || HEAD_TRANSITION_AT=""
 
 log "checking for existing Codex signal on HEAD"
 if ! INITIAL_SCAN=$(scan_codex_state); then

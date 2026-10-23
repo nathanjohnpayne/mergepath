@@ -2020,7 +2020,18 @@ test_round4_head_tie_edges() {
     CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-03T23:59:00Z run_case "$dir" absent 1)
   [ "$(trigger_count "$dir")" = 1 ] && grep -q "no strong tie to the current head" "$dir/err.log" \
     || fail "#2664 force-push, future commit: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: case-varied requests, late dispatch with Running and a hidden force-push are handled"
+  # An edited comment is no request evidence for its own wait: posted before
+  # its deadline, edited into the command after it, it is not held, gets no
+  # timeout, and a new counted request posts (direct adapter review, P1).
+  dir=$(make_case "resume-edited-request" 0 0 60)
+  jq -cn --arg t "$RESUME_TRIGGER_AT" '{id:900,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$t,updated_at:"2026-06-04T00:01:30Z"}' \
+    >>"$dir/state/comments.jsonl"
+  set_clock_after_request "$dir" 100
+  rc=$(run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && ! grep -q 'trigger_comment_id=900' "$dir/state/comments.jsonl" \
+    && grep -q 'was edited after it was posted' "$dir/err.log" \
+    || fail "#2664 edited request: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: case-varied and edited requests, late dispatch with Running and a hidden force-push are handled"
 }
 
 # Overlapping requests on one head: the row cannot be tied to either, so a
@@ -2043,11 +2054,22 @@ test_overlapping_requests_are_ambiguous() {
   seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
   set_clock_after_request "$dir" 0
   rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z \
-    CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-03T23:59:55Z CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:55Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
     CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
   jq -e '.codex_run.final_state == "failed" and .codex_run.overlapping_request == false' "$dir/out.json" >/dev/null \
     || fail "#2664 overlap, old head: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; nothing is retried"
+  # A workflow run created after both requests does not exclude the earlier
+  # one: only the proven head transition (23:59 here) is a cutoff (direct
+  # adapter review of #2779 on 8483ba27).
+  dir=$(make_case "run-overlap-late-dispatch" 0 0 400)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z \
+    CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
+  jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
+    || fail "#2664 overlap, late dispatch: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; a late workflow run excludes nothing; nothing is retried"
 }
 
 # A restated provider window moves the reported not-before time by its
