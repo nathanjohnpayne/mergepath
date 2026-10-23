@@ -33,6 +33,7 @@ import re
 import shlex
 import subprocess
 import sys
+from urllib.parse import quote
 
 API_VERSION = '2026-03-10'
 # Each propagated workflow that triggers on pull_request_target, pinned to
@@ -247,7 +248,8 @@ def policy_detail(repo, summary):
 
 def repo_workflow_events(repo, ref, path):
     """Events of R's own copy of path at ref, or None when R has no such file."""
-    cmd = ['gh', 'api', 'repos/%s/contents/%s?ref=%s' % (repo, path, ref)]
+    # A ref may hold &, # or other URL syntax: encode it in full.
+    cmd = ['gh', 'api', 'repos/%s/contents/%s?ref=%s' % (repo, path, quote(ref, safe=''))]
     out = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if out.returncode != 0:
         if 'HTTP 404' in out.stderr or '"status":"404"' in out.stdout:
@@ -342,7 +344,7 @@ def verify(repo, ref):
     policies = [policy_detail(repo, s) for s in summaries]
     # The contents API answers a missing ref with the same 404 as a missing
     # file, so resolve the ref first: otherwise a typo reads as "all absent".
-    gh_json(['repos/%s/commits/%s' % (repo, ref)])
+    gh_json(['repos/%s/commits/%s' % (repo, quote(ref, safe=''))])
     failed = 0
     print('%s: %d applicable Actions polic%s' % (repo, len(policies), 'y' if len(policies) == 1 else 'ies'))
     for path in REGISTRY:

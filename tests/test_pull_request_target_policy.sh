@@ -439,6 +439,15 @@ verify_expect "verify checks the repo's own trigger list, not only REGISTRY" "$F
 F="$(fixture bad-ref)"; owner_policies "$F"; touch "$F/no-ref"
 verify_expect "an unresolvable ref is an API error, not three absences" "$F" 3 'repos/octo/demo/commits/main failed'
 
+F="$(fixture odd-ref)"; owner_policies "$F"
+out="$(GH_FIXTURE="$F" PATH="$SHIM:$PATH" python3 "$TOOL" verify --repo "$REPO" --ref 'release&candidate#1' 2>&1)" || true
+if grep -q 'contents/.github/workflows/dependabot-auto-merge.yml?ref=release%26candidate%231$' "$F/calls.log" \
+   && grep -q 'commits/release%26candidate%231$' "$F/calls.log"; then
+  pass "verify percent-encodes the ref in the commit lookup and every contents read"
+else
+  fail "ref encoding"; cat "$F/calls.log" >&2
+fi
+
 F="$(fixture trigger-dropped)"; owner_policies "$F"
 edit "$F/contents/.github/workflows/$MQ" "s.replace('on:\n  pull_request_target:\n', 'on:\n  pull_request:\n', 1)"
 verify_expect "a registered workflow without pull_request_target fails verify" "$F" 1 \
