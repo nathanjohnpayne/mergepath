@@ -37,11 +37,14 @@ TWO TIERS
    code it vouches for.
 
 A checkout is PINNED when its `ref:` is exactly one of the trusted
-expressions in TRUSTED_REF_EXPRESSIONS, or a literal that is not a
-`refs/pull/` ref. Anything else -- `github.head_ref`, `github.sha`,
-`github.event.pull_request.head.*`, a mixed expression -- is unpinned. This is
-an allow-list on purpose: a deny-list of candidate expressions is the
-fail-open shape.
+expressions in TRUSTED_REF_EXPRESSIONS and that expression is populated on
+every pull-request event the workflow listens to. `github.base_ref` exists only
+on `pull_request` and `pull_request_target`; on a review event it is empty, and
+checkout then falls back to the merge ref. Anything else -- a literal branch,
+tag or SHA (a same-repository branch is exactly the threat), `github.head_ref`,
+`github.sha`, `github.event.pull_request.head.*`, a mixed expression -- is
+unpinned. This is an allow-list on purpose: a deny-list of candidate
+expressions is the fail-open shape.
 
 EXECUTION SHAPES (tier 2)
 
@@ -95,11 +98,14 @@ TOKEN_RE = re.compile(
 MERGE_REF_EVENTS = {"pull_request", "pull_request_review", "pull_request_review_comment"}
 BASE_REF_EVENTS = {"pull_request_target"}
 
+PR_EVENTS = MERGE_REF_EVENTS | BASE_REF_EVENTS
+
+# Trusted expression -> the pull-request events on which it is populated.
 TRUSTED_REF_EXPRESSIONS = {
-    "github.event.repository.default_branch",
-    "github.event.pull_request.base.sha",
-    "github.event.pull_request.base.ref",
-    "github.base_ref",
+    "github.event.repository.default_branch": PR_EVENTS,
+    "github.event.pull_request.base.sha": PR_EVENTS,
+    "github.event.pull_request.base.ref": PR_EVENTS,
+    "github.base_ref": {"pull_request", "pull_request_target"},
 }
 EXPRESSION_RE = re.compile(r"^\$\{\{\s*([A-Za-z0-9_.]+)\s*\}\}$")
 
@@ -366,16 +372,13 @@ def workflow_events(doc):
     return set()
 
 
-def ref_is_pinned(ref):
+def ref_is_pinned(ref, events):
     if not isinstance(ref, str) or not ref.strip():
         return False
-    ref = ref.strip()
-    m = EXPRESSION_RE.match(ref)
-    if m:
-        return m.group(1) in TRUSTED_REF_EXPRESSIONS
-    if "${{" in ref or ref.startswith("refs/pull/"):
+    m = EXPRESSION_RE.match(ref.strip())
+    if not m or m.group(1) not in TRUSTED_REF_EXPRESSIONS:
         return False
-    return True
+    return (events & PR_EVENTS) <= TRUSTED_REF_EXPRESSIONS[m.group(1)]
 
 
 def is_checkout(step):
@@ -394,7 +397,7 @@ def unpinned_checkout_index(steps, events):
             if merge_ref:
                 return idx
             continue
-        if not ref_is_pinned(ref):
+        if not ref_is_pinned(ref, events):
             return idx
     return None
 
@@ -578,7 +581,16 @@ SELF_TEST_CASES = [
     ("push-only workflow passes", _job(CHECKOUT + TOKEN_STEP + _run("./x.sh"), on="push"), {}, 0, None),
     ("default-branch pin passes", _job(_pinned("${{ github.event.repository.default_branch }}") + TOKEN_STEP + _run("./x.sh")), {}, 0, None),
     ("base.sha pin passes", _job(_pinned("${{ github.event.pull_request.base.sha }}") + TOKEN_STEP), {}, 0, None),
-    ("literal branch pin passes", _job(_pinned("main") + TOKEN_STEP), {}, 0, None),
+    ("literal branch fails", _job(_pinned("main") + TOKEN_STEP), {}, 1, None),
+    ("literal feature branch fails", _job(_pinned("attacker-feature") + TOKEN_STEP), {}, 1, None),
+    ("literal SHA fails", _job(_pinned("0123456789abcdef0123456789abcdef01234567") + TOKEN_STEP), {}, 1, None),
+    ("base_ref on pull_request passes", _job(_pinned("${{ github.base_ref }}") + TOKEN_STEP), {}, 0, None),
+    ("base_ref on pull_request_review fails",
+     _job(_pinned("${{ github.base_ref }}") + TOKEN_STEP, on="pull_request_review"), {}, 1, None),
+    ("base_ref with a review event beside pull_request fails",
+     _job(_pinned("${{ github.base_ref }}") + TOKEN_STEP, on="[pull_request, pull_request_review_comment]"), {}, 1, None),
+    ("base.sha on pull_request_review passes",
+     _job(_pinned("${{ github.event.pull_request.base.sha }}") + TOKEN_STEP, on="pull_request_review"), {}, 0, None),
     ("head.sha ref fails", _job(_pinned("${{ github.event.pull_request.head.sha }}") + TOKEN_STEP), {}, 1, None),
     ("head_ref fails", _job(_pinned("${{ github.head_ref }}") + TOKEN_STEP), {}, 1, None),
     ("refs/pull literal fails", _job(_pinned("refs/pull/1/merge") + TOKEN_STEP), {}, 1, None),
@@ -657,7 +669,7 @@ def self_test(load):
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, ".github", "workflows"))
         with open(os.path.join(tmp, ".github", "workflows", "wf.yml"), "w") as fh:
-            fh.write(_job(_pinned("main") + TOKEN_STEP))
+            fh.write(_job(_pinned("${{ github.event.repository.default_branch }}") + TOKEN_STEP))
         v = scan_tree(tmp, load, REVIEWED_FIXTURE)
         if not (len(v) == 1 and "stale" in v[0]):
             failures += 1
