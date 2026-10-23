@@ -691,6 +691,15 @@ jobs:
         if: matrix.shard == 2
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # GitHub blocks pull_request_target in public repositories from
+      # 2026-11-02 unless an explicit Actions event policy allows it (#2733).
+      # The owner's per-workflow policies allowlist each workflow's pinned
+      # events, so this lints the trigger lists and the base-side checkouts
+      # against the tool's registry. Travels to every consumer; hermetic.
+      - name: check_pull_request_target_policy
+        if: matrix.shard == 3
+        run: ./scripts/ci/check_pull_request_target_policy || { rc=$?; if [ ! -f scripts/ci/check_pull_request_target_policy ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pull_request_target_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         if: matrix.shard == 3
         # Requires yq via the delegated verified-propagation suite —
