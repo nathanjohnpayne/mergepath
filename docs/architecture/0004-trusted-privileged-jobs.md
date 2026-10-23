@@ -198,7 +198,9 @@ Every credentialed row of the inventory, C1 to C26. "App" means the CI app token
 
 The consumers must handle what `workflow_run` does not give them. `workflow_run.pull_requests` can be empty, notably for fork PRs, so a consumer resolves the PR from the run's head SHA, or from a PR number carried in the producer's `run-name` as an untrusted nomination (the [#2278](https://github.com/nathanjohnpayne/mergepath/pull/2278) approach), and then applies the exact-head rule. A workflow on a non-default branch can also borrow the producer's `name`. That only nominates an evaluation the consumer re-derives, and the consumer also requires `workflow_run.path` to be the expected file and `workflow_run.event` to be a candidate event. Fork PRs get no secrets and so no mutations today. Whether the consumers start mutating fork PRs is a behaviour change for #2727 to decide, not a side effect (see #2393).
 
-Dependabot-actor PR runs need the same care. Whether a `workflow_run` started by a Dependabot-actor run gets an OIDC token is for the pilot to record with #2776. The rule is fail closed: no token means no write. The Dependabot lane's own credentials stay in C13 and C14.
+Dependabot-actor PR runs need the same care. Whether a `workflow_run` started by a Dependabot-actor run gets an OIDC token is for the pilot to record with #2776. The rule is fail closed: no token means no write. The Dependabot lane's own credentials stay in C13 and C14, on `pull_request_target`. GitHub withholds secrets from a Dependabot-initiated `pull_request_target` run only "if the base ref of the pull request was created by Dependabot" ([Dependabot on Actions](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-on-actions)), and C13 and C14's base-is-default guard rules that case out. The live record agrees: nathanpaynedotcom [run 39737679498](https://github.com/nathanjohnpayne/nathanpaynedotcom/actions/runs/39737679498) (actor `dependabot[bot]`, `pull_request_target`, 2026-10-22) completed the approve-and-merge step, which hard-fails on an empty token. That page does not mention environment secrets, so #2729 must prove they resolve on such a run before the repository copies go.
+
+If they do not, the C13 and C14 jobs move to a default-branch `workflow_run` or `repository_dispatch` consumer nominated by the credential-free `pull_request_target` run. That consumer gets the same base guard, provenance re-verification and exact-head binding, and the invariants are unchanged.
 
 ## Compatibility with #2733
 
@@ -300,7 +302,7 @@ Accepting this record accepts the invariants, the environment layout and the Oct
 - **#2729:**
   - the `dependabot-reviewer` environment and the approval and merge job split;
   - minimum classic scopes;
-  - event-specific secret availability for Dependabot-actor `pull_request_target` runs.
+  - that `dependabot-reviewer` and `merge-queue-policy` environment secrets resolve on a Dependabot-initiated `pull_request_target` run against `main`, or else the downstream-consumer variant above.
 - **#2732 (pilot):**
   - the `app` pin value and the bot login of the pinned app, the same on every exchange;
   - the emitted `sub` and the presence of `job_workflow_ref`, including the subject a `pull_request_target` run presents;
