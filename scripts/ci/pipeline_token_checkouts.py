@@ -92,7 +92,10 @@ NAME = "check_pipeline_token_checkouts"
 PIPELINE_TOKENS = ("AUTHOR_MERGE_TOKEN", "REVIEWER_ASSIGNMENT_TOKEN", "CI_ACTOR_TOKEN")
 TOKEN_RE = re.compile(
     r"\bsecrets\s*\.\s*(?:%s)\b|\bsecrets\s*\[\s*['\"](?:%s)['\"]\s*\]|\btoJSON\(\s*secrets\s*\)"
-    % ("|".join(PIPELINE_TOKENS), "|".join(PIPELINE_TOKENS))
+    % ("|".join(PIPELINE_TOKENS), "|".join(PIPELINE_TOKENS)),
+    # Secret names and expression contexts are case-insensitive in Actions:
+    # `${{ Secrets.ci_actor_token }}` still hands the job the PAT.
+    re.IGNORECASE,
 )
 
 MERGE_REF_EVENTS = {"pull_request", "pull_request_review", "pull_request_review_comment"}
@@ -233,7 +236,13 @@ def neutralize_shell(src, start="N"):
                 i += 1
                 continue
             stack[-1][1] -= 1
-        if c == "<" and not src.startswith("<<<", i):
+        if src.startswith("<<<", i):
+            # A here-string: consume all three characters so the trailing
+            # `<< word` is not read as a heredoc that swallows later lines.
+            out.append("<<<")
+            i += 3
+            continue
+        if c == "<":
             m = _HEREDOC_RE.match(src, i)
             if m:
                 pending.append((m.group(3), bool(m.group(2)), bool(m.group(1))))
@@ -381,9 +390,15 @@ def ref_is_pinned(ref, events):
     return (events & PR_EVENTS) <= TRUSTED_REF_EXPRESSIONS[m.group(1)]
 
 
-def is_checkout(step):
+def action_name(step):
+    """The `uses:` action without its version, lower-cased: GitHub resolves
+    owner and repository names case-insensitively."""
     uses = step.get("uses")
-    return isinstance(uses, str) and uses.split("@", 1)[0].strip() == "actions/checkout"
+    return uses.split("@", 1)[0].strip().lower() if isinstance(uses, str) else ""
+
+
+def is_checkout(step):
+    return action_name(step) == "actions/checkout"
 
 
 def unpinned_checkout_index(steps, events):
@@ -414,7 +429,7 @@ def scan_steps(steps):
         run = step.get("run")
         if isinstance(run, str):
             hits += ["step %r %s" % (label, h) for h in scan_run(run)]
-        if isinstance(uses, str) and uses.split("@", 1)[0].strip() == "actions/github-script":
+        if action_name(step) == "actions/github-script":
             script = (step.get("with") or {}).get("script")
             if isinstance(script, str):
                 hits += ["step %r %s" % (label, h) for h in scan_github_script(script)]
@@ -576,6 +591,10 @@ SELF_TEST_CASES = [
     ("workflow-level env token counts",
      _job(CHECKOUT + _run("./scripts/x.sh"), env="env:\n  T: ${{ secrets.AUTHOR_MERGE_TOKEN }}\n"), {}, 1, "relative path"),
     ("toJSON(secrets) counts", _job(CHECKOUT + _run("echo '${{ toJSON(secrets) }}' | jq .")), {}, 1, None),
+    ("lower-case secret name counts", _job(CHECKOUT + _run("echo ${{ secrets.ci_actor_token }}")), {}, 1, None),
+    ("mixed-case secrets context counts", _job(CHECKOUT + _run("echo ${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}")), {}, 1, None),
+    ("mixed-case checkout action counts",
+     _job("      - uses: Actions/Checkout@v7\n" + TOKEN_STEP), {}, 1, None),
     ("bracket secret access counts", _job(CHECKOUT + _run("echo ${{ secrets['CI_ACTOR_TOKEN'] }}")), {}, 1, None),
     ("GITHUB_TOKEN only passes", _job(CHECKOUT + _run("GH_TOKEN=${{ secrets.GITHUB_TOKEN }} ./x.sh")), {}, 0, None),
     ("push-only workflow passes", _job(CHECKOUT + TOKEN_STEP + _run("./x.sh"), on="push"), {}, 0, None),
@@ -650,6 +669,12 @@ SELF_TEST_CASES = [
     ("reviewed: line after a heredoc is code",
      _job(CHECKOUT + TOKEN_STEP + "      - run: |\n          cat <<'EOF'\n          text\n          EOF\n          ./x.sh\n"),
      REVIEWED_FIXTURE, 1, None),
+    ("reviewed: a here-string does not open a heredoc",
+     _job(CHECKOUT + TOKEN_STEP + "      - run: |\n          grep -q x <<< done\n          ./scripts/x.sh\n          done\n"),
+     REVIEWED_FIXTURE, 1, "relative path"),
+    ("reviewed: mixed-case github-script is scanned",
+     _job(CHECKOUT + _script("require('js-yaml')").replace("actions/github-script@v9", "Actions/GitHub-Script@v9")),
+     REVIEWED_FIXTURE, 1, "non-built-in"),
     ("reviewed: steps before the checkout are not scanned",
      _job(_run("./bootstrap.sh") + CHECKOUT + TOKEN_STEP), REVIEWED_FIXTURE, 0, None),
 ]
