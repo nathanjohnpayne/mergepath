@@ -269,6 +269,9 @@ case "$endpoint" in
         [ -z "${CODEX_TEST_FRESHNESS_TRANSITION:-}" ] || touch "$CODEX_TEST_STATE_DIR/freshness-scan-complete"
         jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      # #2664: the same request, posted a minute before the head was pushed,
+      # so it does not hold the current head.
+      dup_author_older) jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:(($t | fromdateiso8601) - 60 | todateiso8601),body:"@codex review"}]' ;;
       # #2582: the same request, with Codex reporting a review of HEAD Running since.
       dup_author_running)
         jq -cn --arg who "$author" --arg t "$t" --arg h "${head_sha:0:7}" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"},
@@ -1928,8 +1931,9 @@ test_write_boundary_authorization() {
   for label in fresh cap_at_limit stale_head body-P2 dup_author content-free concurrent no-generation; do
     scenario=$label mode=""
     # concurrent: a request landed after the polling-mode requester read the
-    # timeline, so the generation it names is one request short.
-    case "$label" in concurrent) scenario=dup_author mode=poll ;; no-generation) scenario=fresh ;; esac
+    # timeline, so the generation it names is one request short. It predates
+    # the head, so the #2664 same-head hold does not refuse it first.
+    case "$label" in concurrent) scenario=dup_author_older mode=poll ;; no-generation) scenario=fresh ;; esac
     dir=$(make_case "authorize-$label")
     auto=false
     gate=$(write_gate_stub "$dir" false)
@@ -1993,6 +1997,7 @@ test_write_boundary_authorization_caller_mode() {
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$mode" \
+        CODEX_TEST_LINT_RUNS=dispatched CODEX_TEST_CHECK_STARTED=2026-06-03T23:59:30Z \
         MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$(observed_generation "$dir" "$scenario")" \
         MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
@@ -2011,8 +2016,12 @@ test_write_boundary_authorization_caller_mode() {
           || fail "#2582 authorization ($label): expected refusal '$want' (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "#2582 authorization must never post ($label)"
+  # #2664: a same-head duplicate with no strong tie (no force-push put HEAD in
+  # place before it) and no Running summary is not held, so polling mode
+  # authorizes a new counted request; a workflow run is no tie.
   done <<'CASES'
 poll-dup|dup_author|poll|false|authorized
+poll-older-head-dup|dup_author_older|poll|false|authorized
 poll-fresh|fresh|poll|false|authorized
 poll-content-free|fresh|poll|true|authorized
 poll-running|dup_author_running|poll|false|pending-request-running

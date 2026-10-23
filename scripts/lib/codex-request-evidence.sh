@@ -170,6 +170,35 @@ crqe_force_push_heads() { # repo pr
     | unique' 2>/dev/null
 }
 
+# #2664: the time of the PR's latest force-push when that force-push put
+# <head> in place, else empty. Every later change of head is a push that
+# either moves away from <head> (the head is then no longer <head>) or
+# returns to it from a descendant, which is itself a force-push. So when the
+# latest force-push's afterCommit is <head>, <head> has been the head without
+# a break since then. Fails when the GraphQL read fails or a page has no
+# timeline; callers treat that as no tie.
+crqe_head_force_push_tie_at() { # repo pr head
+  local out
+  out=$(gh api graphql --paginate -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f query='
+    query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ... on HeadRefForcePushedEvent { createdAt afterCommit { oid } } }
+          }
+        }
+      }
+    }' 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -sre --arg head "$3" '
+    if length == 0 or any(.[]; (.data.repository.pullRequest.timelineItems.nodes | type) != "array")
+    then error("force-push timeline") else . end
+    | [ .[].data.repository.pullRequest.timelineItems.nodes[]
+        | select((.createdAt | type) == "string" and (try (.createdAt | fromdateiso8601) catch null) != null) ]
+    | (max_by(.createdAt) // null) as $latest
+    | if $latest != null and (($latest.afterCommit.oid // "") | ascii_downcase) == ($head | ascii_downcase)
+      then $latest.createdAt else "" end' 2>/dev/null
+}
 
 # Prints the sorted ids of the exempt failover triggers. <heads-json> is
 # crqe_pr_head_set's output; absent or [] exempts nothing.
@@ -508,39 +537,6 @@ crqe_select_codex_run_state() { # issue-comments-json bot-login head-sha request
           retry_after_seconds: $retry_after }
     ]
     | max_by([.observed_at, .comment_id]) // {state: "none", observed_at: null, comment_id: null, retry_after_seconds: null}
-  '
-}
-
-# #2664: whether request <id> is itself an automatic retry. Before a retry
-# the requester records an intent marker
-# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> -->`, and once the
-# retry has posted it records the binding
-# `<!-- mergepath-codex-retry:v1 head=<sha> original=<id> retry=<id> -->`.
-# A request is a retry when a binding names it. Without a binding for its
-# original (the handler stopped between posting and binding), an intent
-# marker still marks the first configured-author request after it, within
-# 300 seconds by GitHub's timestamps. An intent whose original already has a
-# binding is a losing handler's leftover and marks nothing, so it can never
-# turn a later ordinary request into a "retry", and an intent the handler
-# withdrew (`... original=<id> withdrawn=<intent id> -->`, recorded when
-# its retry was not posted) marks nothing. Any head counts, so the
-# predicate can only withhold a retry, never grant one. Prints true or false.
-crqe_request_is_retry() { # issue-comments-json author request-id
-  printf '%s\n' "${1:-[]}" | jq -r --arg author "$2" --argjson id "$3" '
-    def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
-    def marker: (.body // "") | capture("\\A<!-- mergepath-codex-retry:v1 head=[0-9a-f]{40} original=(?<original>[1-9][0-9]*)( retry=(?<retry>[1-9][0-9]*))?( withdrawn=(?<withdrawn>[1-9][0-9]*))? -->")?;
-    def num: if . == null then null else tonumber end;
-    [ .[] | select((.user.login // "") == $author) ] as $own
-    | [ $own[] | select((.body // "") | test("\\A@codex review\\z"; "i")) ] | sort_by(.id) as $requests
-    | [ $own[] | (marker // empty) as $m | . + {original: ($m.original | tonumber), retry: ($m.retry | num), withdrawn: ($m.withdrawn | num)} ] as $markers
-    | [ $markers[] | select(.retry != null) ] as $bound
-    | [ $markers[] | select(.withdrawn != null) | .withdrawn ] as $withdrawn
-    | any($bound[]; .retry == $id)
-      or any($markers[] | select(.retry == null and .withdrawn == null) | . as $m
-          | select(any($bound[]; .original == $m.original) | not) | select(any($withdrawn[]; . == $m.id) | not);
-        . as $m
-        | ([ $requests[] | select(.id > $m.id) ] | first) as $next
-        | $next != null and $next.id == $id and (($next.created_at | epoch) - ($m.created_at | epoch)) <= 300)
   '
 }
 
