@@ -15,6 +15,12 @@
 
 set -euo pipefail
 
+# Production intentionally honors this caller override. The test fixtures
+# model their own Firebase project (or shared ADC) contexts, so discard an
+# ambient value once at the suite boundary; cases can still set it explicitly
+# on an individual invocation when testing project selection.
+unset OP_PREFLIGHT_FIREBASE_PROJECT_ID
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/op-preflight.sh"
 
