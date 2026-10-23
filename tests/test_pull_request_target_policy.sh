@@ -281,7 +281,10 @@ case "$path" in
   repos/*/contents/*)
     rel="${path#repos/*/*/contents/}"; rel="${rel%%\?*}"
     [ -f "$GH_FIXTURE/contents/$rel" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
-    jq -n --arg c "$(base64 < "$GH_FIXTURE/contents/$rel" | tr -d '\n')" '{content: $c, encoding: "base64"}' ;;
+    # --rawfile, not --arg: a large workflow's base64 exceeds Linux's
+    # per-argument limit (MAX_ARG_STRLEN), which macOS does not have.
+    base64 < "$GH_FIXTURE/contents/$rel" | tr -d '\n' > "$GH_FIXTURE/b64.tmp"
+    jq -n --rawfile c "$GH_FIXTURE/b64.tmp" '{content: $c, encoding: "base64"}' ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
 SH
