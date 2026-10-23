@@ -391,7 +391,7 @@ make_case() {
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   # #1178: hard-sourced by the waiter, so the fixture must carry it too.
-  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
+  cp "${CODERABBIT_TEST_DESCRIPTION_HELPER_SOURCE:-$ROOT/scripts/lib/coderabbit-fence.sh}" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   printf '%s' "$comment_body" >"$dir/state/comment-body.txt"
@@ -1446,9 +1446,10 @@ test_trailing_probe_flag_is_usage_error() {
 test_status_description_predicate_unit() {
   local snip="$WORKDIR/status-desc-helpers.sh" bad="" before=$FAIL
   awk '/^# BEGIN coderabbit_status_description_helpers$/{f=1;next} /^# END coderabbit_status_description_helpers$/{f=0} f' \
-    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+    "${CODERABBIT_TEST_DESCRIPTION_HELPER_SOURCE:-$ROOT/scripts/lib/coderabbit-fence.sh}" >"$snip"
   # shellcheck disable=SC1090
   . "$snip"
+  declare -F crw_status_description_permits_clearance >/dev/null || return 1
   # The permitted set: empty (the field is optional metadata; refusing it would
   # disable the #221 fast path for every status posted without one) and the
   # completed-review family in either casing.
@@ -2529,7 +2530,7 @@ $pad"
 test_notice_less_timeout_contract() {
   local snip="$WORKDIR/timeout-functions.sh" harness="$WORKDIR/timeout-harness.sh"
   local name state desc trust enabled helper_rc pause terminal prior rc out calls
-  awk '/^# BEGIN coderabbit_status_description_helpers/{p=1} p{print} /^# END coderabbit_status_description_helpers/{p=0}' "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  awk '/^# BEGIN coderabbit_status_description_helpers/{p=1} p{print} /^# END coderabbit_status_description_helpers/{p=0}' "${CODERABBIT_TEST_DESCRIPTION_HELPER_SOURCE:-$ROOT/scripts/lib/coderabbit-fence.sh}" >"$snip"
   awk '/^# BEGIN coderabbit_timeout_disposition/{p=1} p{print} /^# END coderabbit_timeout_disposition/{p=0}' "$ROOT/scripts/coderabbit-wait.sh" >>"$snip"
   cat >"$WORKDIR/timeout-codex.sh" <<'EOF'
 #!/usr/bin/env bash
