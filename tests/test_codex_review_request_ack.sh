@@ -266,6 +266,15 @@ case "$endpoint" in
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
     printf '%s\n' "${CODEX_TEST_COMMIT_DATE:-$now}"
     ;;
+  graphql)
+    # #2664: the strong head tie's force-push read. By default the latest
+    # force-push put HEAD in place before every seeded request, so a held
+    # request may record its timeout. CODEX_TEST_GQL_FORCE_PUSHES replaces the
+    # event nodes ([] = no force-push).
+    nodes_default='[{"createdAt":"2026-06-03T23:58:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+    jq -cn --argjson nodes "${CODEX_TEST_GQL_FORCE_PUSHES:-$nodes_default}" \
+      '{data:{repository:{pullRequest:{timelineItems:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$nodes}}}}}'
+    ;;
   repos/owner/repo/issues/999/timeline)
     # #2664: CODEX_TEST_FORCE_PUSHED_AT adds a head_ref_force_pushed event.
     if [ -n "${CODEX_TEST_FORCE_PUSHED_AT:-}" ]; then
@@ -1520,7 +1529,7 @@ test_resume_past_deadline_posts_new_request() {
   rc=$(run_case "$dir" absent 1)
   count=$(trigger_count "$dir")
   [ "$count" = 0 ] || fail "#2664 past deadline: $count trigger(s), expected none"
-  grep -q 'past its 60s wait — recording its timeout' "$dir/err.log" || fail "#2664 past deadline: no handoff log; $(tail -3 "$dir/err.log")"
+  grep -q 'past its 60s wait — handing it off' "$dir/err.log" || fail "#2664 past deadline: no handoff log; $(tail -3 "$dir/err.log")"
   [ "$rc" = 4 ] && [ "$(jq -r '.terminal_determination.outcome // "none"' "$dir/out.json")" = timeout ] \
     && grep -q 'trigger_comment_id=900' "$dir/state/comments.jsonl" \
     || fail "#2664 past deadline ($row): exit $rc, expected 4 with request 900's timeout recorded"
@@ -1916,6 +1925,52 @@ failed|❌ **Failed**|2026-06-04T00:00:10Z|failed
 CASES
 }
 
+# #2664, Phase 4b P1s on #2779 (review 5623593261): a held request whose tie
+# to HEAD is weak (a workflow run or a Running summary) is waited on, but at
+# expiry it mints no timeout determination: exit 4, no marker, reported as
+# unattributed. Only a force-push that put HEAD in place before the request
+# is a strong tie.
+test_weak_tie_mints_no_timeout() {
+  local dir rc before=$FAIL label nodes env_extra
+  local ff='[{"createdAt":"2026-06-03T23:58:00Z","afterCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]'
+  local rewind='[{"createdAt":"2026-06-03T23:50:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"createdAt":"2026-06-03T23:55:00Z","afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"}}]'
+  local after_request='[{"createdAt":"2026-06-04T00:00:20Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  while IFS='|' read -r label nodes; do
+    case "$nodes" in ff) nodes=$ff ;; rewind) nodes=$rewind ;; after) nodes=$after_request ;; esac
+    dir=$(make_case "weak-tie-$label" 0 0 60)
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    # The force-push-then-Running case: Codex Running on this head since the
+    # request, though the head arrived after it.
+    [ "$label" != force-push-then-running ] || seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:30Z"
+    set_clock_after_request "$dir" 90
+    rc=$(CODEX_TEST_GQL_FORCE_PUSHES="$nodes" run_case "$dir" absent 1)
+    if [ "$rc" = 4 ] && [ "$(trigger_count "$dir")" = 0 ] \
+       && [ "$(jq -r '.terminal_determination // "null"' "$dir/out.json")" = null ] \
+       && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = unattributed ] \
+       && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+       && grep -q 'unattributed; a deliberate fresh request is needed' "$dir/err.log"; then
+      :
+    else
+      fail "#2664 weak tie ($label): exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null); stderr=$(tail -2 "$dir/err.log")"
+    fi
+  done <<'CASES'
+no-force-push|[]
+fast-forward-after-force-push|ff
+rewind-and-return|rewind
+force-push-then-running|after
+CASES
+  # The strong tie: the latest force-push put HEAD in place before the
+  # request, so its expiry records the timeout.
+  dir=$(make_case "strong-tie" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  set_clock_after_request "$dir" 90
+  rc=$(run_case "$dir" absent 1)
+  [ "$rc" = 4 ] && [ "$(jq -r '.codex_run.handoff' "$dir/out.json")" = timeout-recorded ] \
+    && grep -q 'trigger_comment_id=900' "$dir/state/comments.jsonl" \
+    || fail "#2664 strong tie: exit $rc, $(jq -c '{terminal_determination, handoff: .codex_run.handoff}' "$dir/out.json" 2>/dev/null)"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: a held request mints a timeout only on a strong head tie; weak ties (fast-forward, rewind, force-push then Running, none) report it unattributed"
+}
+
 # Phase 4b advisories on #2779 (ffc83780). Each case fails on that head.
 test_round4_head_tie_edges() {
   local dir rc before=$FAIL
@@ -2083,6 +2138,7 @@ test_delayed_claim_then_rerun_holds() {
 
 test_codex_run_diagnostic_and_report
 test_round4_head_tie_edges
+test_weak_tie_mints_no_timeout
 test_overlapping_requests_are_ambiguous
 test_refreshed_provider_window
 test_retry_window_parser

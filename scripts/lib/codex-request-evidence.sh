@@ -170,6 +170,35 @@ crqe_force_push_heads() { # repo pr
     | unique' 2>/dev/null
 }
 
+# #2664: the time of the PR's latest force-push when that force-push put
+# <head> in place, else empty. Every later change of head is a push that
+# either moves away from <head> (the head is then no longer <head>) or
+# returns to it from a descendant, which is itself a force-push. So when the
+# latest force-push's afterCommit is <head>, <head> has been the head without
+# a break since then. Fails when the GraphQL read fails or a page has no
+# timeline; callers treat that as no tie.
+crqe_head_force_push_tie_at() { # repo pr head
+  local out
+  out=$(gh api graphql --paginate -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f query='
+    query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes { ... on HeadRefForcePushedEvent { createdAt afterCommit { oid } } }
+          }
+        }
+      }
+    }' 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -sre --arg head "$3" '
+    if length == 0 or any(.[]; (.data.repository.pullRequest.timelineItems.nodes | type) != "array")
+    then error("force-push timeline") else . end
+    | [ .[].data.repository.pullRequest.timelineItems.nodes[]
+        | select((.createdAt | type) == "string" and (try (.createdAt | fromdateiso8601) catch null) != null) ]
+    | (max_by(.createdAt) // null) as $latest
+    | if $latest != null and (($latest.afterCommit.oid // "") | ascii_downcase) == ($head | ascii_downcase)
+      then $latest.createdAt else "" end' 2>/dev/null
+}
 
 # Prints the sorted ids of the exempt failover triggers. <heads-json> is
 # crqe_pr_head_set's output; absent or [] exempts nothing.

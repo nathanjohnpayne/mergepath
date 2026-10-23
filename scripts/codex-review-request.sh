@@ -205,7 +205,7 @@
 #     # counts from the resumed request's posting, so it includes time before
 #     # this run started.
 #     "codex_run": {request_comment_id, diagnostic, final_state,
-#                   overlapping_request, provider_window},
+#                   overlapping_request, handoff, provider_window},
 #     # #2664, polling runs only: what Codex's Review Summary row said about
 #     # the waited-on request. diagnostic is the state recorded at 300 s (or
 #     # null); final_state is the state at the end of the wait (active,
@@ -213,7 +213,9 @@
 #     # "ambiguous" means another request on this head overlaps, so the row
 #     # cannot be tied to this one. provider_window is a retry window Codex
 #     # stated, as {seconds, not_before}. All of it is reporting only: no
-#     # state here posts, retries, cancels or clears anything.
+#     # state here posts, retries, cancels or clears anything. handoff is
+#     # "timeout-recorded" or "unattributed" when the wait ended unanswered:
+#     # a held request without a strong head tie records no determination.
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
 #   }
@@ -3421,7 +3423,7 @@ elif [ "$REQUEST_MODE" = poll ] && resume_pending_codex_request; then
   else
     case "$RESUME_PENDING_STATE" in
       pending) log "resuming pending request $RESUMED_TRIGGER_ID on this head (unanswered; Codex Running: $RESUME_PENDING_RUNNING); no new trigger (#1550, #2664), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed" ;;
-      expired) log "pending request $RESUMED_TRIGGER_ID on this head is unanswered past its ${TIMEOUT_SECONDS}s wait — recording its timeout for Phase 4b, not posting a fresh request (#2664)" ;;
+      expired) log "pending request $RESUMED_TRIGGER_ID on this head is unanswered past its ${TIMEOUT_SECONDS}s wait — handing it off, not posting a fresh request (#2664)" ;;
     esac
   fi
 else
@@ -3551,11 +3553,13 @@ codex_run_tick() {
 codex_run_json() {
   local watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
   jq -nc --arg id "$watched" --argjson diagnostic "$CODEX_RUN_DIAGNOSTIC_JSON" --arg final "$CODEX_RUN_FINAL_STATE" \
+    --arg handoff "${CODEX_RUN_HANDOFF:-}" \
     --argjson overlap "$CODEX_RUN_OVERLAP" --argjson window "$CODEX_RUN_WINDOW_JSON" '
     { request_comment_id: (if $id == "" then null else ($id | tonumber? // null) end),
       diagnostic: $diagnostic,
       final_state: (if $final == "" then null else $final end),
       overlapping_request: $overlap,
+      handoff: (if $handoff == "" then null else $handoff end),
       provider_window: $window }'
 }
 
@@ -3655,11 +3659,32 @@ if [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; then
     log "request ${TERMINAL_TRIGGER_COMMENT_ID:-?} unanswered at the end of its ${TIMEOUT_SECONDS}s wait; the Review Summary reads '$CODEX_RUN_FINAL_STATE' — reported, not retried or cancelled (#2664)"
   fi
 fi
-# #2664: an unanswered request this run resumed on the current head is
-# recorded exactly like this run's own; the determination clears nothing.
+# #2664: a timeout determination is minted only from a strong head tie:
+# this run's own request, or a held request posted after the PR's latest
+# force-push, when that force-push put HEAD in place
+# (crqe_head_force_push_tie_at). The hold's weaker ties (a workflow run, a
+# Running summary) only keep a rerun from posting beside the request. They
+# cannot tie an older head's request to this head well enough to hand this
+# head to Phase 4b (#2779 Phase 4b P1s). Without a strong tie the run exits 4
+# with no marker and reports the request as unattributed.
+CODEX_RUN_HANDOFF=""
 if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then
-  record_phase4a_timeout_determination
+  strong_tie=$TRIGGER_POSTED
+  if [ "$strong_tie" != true ]; then
+    tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) || tie_at=""
+    if [ -n "$tie_at" ] && ! [[ "$TRIGGER_SIGNAL_THRESHOLD" < "$tie_at" ]]; then
+      strong_tie=true
+      log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} follows the force-push that put HEAD in place ($tie_at) — recording its timeout"
+    fi
+  fi
+  if [ "$strong_tie" = true ]; then
+    record_phase4a_timeout_determination
+    CODEX_RUN_HANDOFF=timeout-recorded
+  else
+    CODEX_RUN_HANDOFF=unattributed
+    log "held request ${TERMINAL_TRIGGER_COMMENT_ID:-?} is unanswered, and no force-push of HEAD before it ties it to this head: unattributed; a deliberate fresh request is needed. No timeout determination is recorded (#2664)"
+  fi
 fi
 
 jq -n \
