@@ -26,6 +26,19 @@ p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 # are found regardless of $PWD or how the caller was invoked.
 P4B_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# #939: share the waiter's positive StatusContext description predicate.
+# Missing/partial propagation cannot corroborate rc-7 completion; the ordinary
+# bounded not-yet path remains available without changing other exit classes.
+P4B_CODERABBIT_STATUS_DESCRIPTION_OK=false
+if [ -r "$P4B_LIB_DIR/../lib/coderabbit-fence.sh" ]; then
+  # shellcheck source=../lib/coderabbit-fence.sh
+  if . "$P4B_LIB_DIR/../lib/coderabbit-fence.sh" \
+      && declare -F crw_normalize_status_description >/dev/null \
+      && declare -F crw_status_description_permits_clearance >/dev/null; then
+    P4B_CODERABBIT_STATUS_DESCRIPTION_OK=true
+  fi
+fi
+
 # #1085 durable Phase 4a timeout grammar. The orchestrator's manifest requires
 # this helper alongside the Phase 4b kit; retain an explicit readiness bit so
 # a partial propagation skew escalates instead of silently treating an
@@ -207,9 +220,10 @@ p4b_top_field() {
 
 # p4b_barrier_class_coderabbit <head> <rc> <json>
 # Maps one scripts/coderabbit-wait.sh result — polling or --probe — to a
-# class. Pure: jq over the passed string only, no I/O, always returns 0.
+# class. Pure: shared description predicate + jq over the passed string only;
+# no provider I/O, always returns 0.
 p4b_barrier_class_coderabbit() {
-  local head="$1" rc="$2" json="$3" probe_head probe_observed
+  local head="$1" rc="$2" json="$3" probe_head probe_observed probe_description
   case "$rc" in
     0)
       # Terminal, but only for the head about to be approved. An rc 0
@@ -322,14 +336,17 @@ p4b_barrier_class_coderabbit() {
       # terminal. A missing or unmodelled observed fails closed to
       # not-yet.
       #
-      # With all conjuncts the claim matches what the Codex arm accepts
-      # (#684): CodeRabbit has reviewed AND completed the head about to be
-      # approved. Inline findings stay owned by
-      # coderabbit-severity-gate.sh, so counting the set as reported skips
-      # no disposition; the disclosed residual is a spurious success
-      # (#595) landing on this exact head AND postdating the head's own
-      # review object while its summary is still in flight WITH no adverse
-      # notice pending, which would skip the #535 summary-only escalation.
+      # #939: the same sampled description must positively name a completed
+      # review, using the waiter's one predicate. Explicit empty strings retain
+      # its optional-metadata escape; absent/null/nonstring fields from older
+      # probes stay bounded not-yet. State/time alone cannot distinguish a
+      # refusal success from a completed review. No adverse notice, head, run,
+      # endpoint or temporal conjunct is relaxed by the description check.
+      # The checked jq projection appends one local suffix so a successful but
+      # empty decoder output cannot borrow the explicit-empty escape. Strip
+      # exactly that suffix before applying the unchanged predicate; trailing
+      # description whitespace/newlines and punctuation retain their meaning.
+      # Inline findings remain owned by coderabbit-severity-gate.sh.
       # endpoint must be "reviews": the probe's "issues" evidence on rc 7
       # is a pending notice or a prior-head summary, never head-anchored
       # terminality. The head equality is belt-and-braces on top of the
@@ -374,6 +391,10 @@ p4b_barrier_class_coderabbit() {
          && { [ "$probe_observed" = "awaiting-summary" ] || [ "$probe_observed" = "terminal" ]; } \
          && [ "$(printf '%s' "$json" | jq -r '.review.endpoint // empty' 2>/dev/null || true)" = "reviews" ] \
          && [ "$(printf '%s' "$json" | jq -r '.probe.context_state // empty' 2>/dev/null || true)" = "success" ] \
+         && [ "${P4B_CODERABBIT_STATUS_DESCRIPTION_OK:-false}" = true ] \
+         && probe_description="$(printf '%s' "$json" | jq -er '.probe.context_description | select(type == "string") | . + "."' 2>/dev/null)" \
+         && [ "$probe_description" != "${probe_description%.}" ] \
+         && crw_status_description_permits_clearance "${probe_description%.}" \
          && [ "$(printf '%s' "$json" | jq -r '
                   (.review.submitted_at // "") as $r
                   | (.probe.context_updated_at // "") as $c

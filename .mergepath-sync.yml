@@ -2607,6 +2607,7 @@ paths:
     type: kit
     consumers: all
     requires:
+      - "scripts/lib/coderabbit-fence.sh"   # #939, shared StatusContext completion predicate
       - "scripts/lib/feedback-policy-helpers.sh"   # #1305, governing policy parser
       - "scripts/lib/codex-request-evidence.sh"   # #1305, request counting and timeout reconciliation
       - "scripts/workflow/resolve_base_policy.sh"   # #1305, governing request-cap policy

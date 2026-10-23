@@ -23,6 +23,92 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# Pure rc-7 description controls (#939): expected under 5s, no orchestrator,
+# adapter, credentials or network. Mutation validation uses only this mode.
+if [ "${1:-}" = --status-description-only ]; then
+  command -v jq >/dev/null 2>&1 || { echo 'ERROR: jq required' >&2; exit 1; }
+  LIB="${P4B_TEST_STATUS_DESCRIPTION_LIB:-$LIB}"
+  # shellcheck disable=SC1090
+  . "$LIB"
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-status-description.XXXXXX")"
+  trap 'rm -rf "$WORK"' EXIT
+  head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  base=$(jq -nc --arg head "$head" '{head_sha:$head,
+    review:{endpoint:"reviews",submitted_at:"2026-06-04T00:00:06Z"},
+    probe:{observed:"awaiting-summary",context_state:"success",
+      context_updated_at:"2026-06-04T00:00:07Z",context_description:"Review completed"}}')
+  n=0
+  status_description_expect() {
+    local want=$1 label=$2 json=$3 rc=0 actual
+    actual=$(p4b_barrier_class_coderabbit "$head" "${4:-7}" "$json") || rc=$?
+    [ "$rc" -eq 0 ] && [ "$actual" = "$want" ] \
+      || { echo "FAIL: #939 $label: rc=$rc actual=$actual want=$want" >&2; exit 1; }
+    n=$((n + 1))
+  }
+  for description in '' ' ' 'Review complete' 'Review completed' '  REVIEW COMPLETED  ' $'\n  \n' $'\n Review completed \n'; do
+    status_description_expect reported "accepted '$description'" "$(jq -c --arg d "$description" '.probe.context_description=$d' <<<"$base")"
+  done
+  for description in 'Review rate limited' 'Review in progress' 'Review queued' \
+      'No review completed' 'Review completely skipped' \
+      'Review complete — 0 files reviewed' 'Review completed.' 'new vendor wording'; do
+    status_description_expect not-yet "rejected '$description'" "$(jq -c --arg d "$description" '.probe.context_description=$d' <<<"$base")"
+  done
+  for value in null true 1 '[]' '{}'; do
+    status_description_expect not-yet "nonstring $value" "$(jq -c --argjson d "$value" '.probe.context_description=$d' <<<"$base")"
+  done
+  status_description_expect not-yet legacy-missing "$(jq -c 'del(.probe.context_description)' <<<"$base")"
+  for observed in paused in_progress unknown ''; do
+    status_description_expect not-yet "observed $observed" "$(jq -c --arg o "$observed" '.probe.observed=$o' <<<"$base")"
+  done
+  status_description_expect rate-limited adverse-refusal "$(jq -c '.probe.observed="rate_limit"' <<<"$base")"
+  status_description_expect reported terminal "$(jq -c '.probe.observed="terminal"' <<<"$base")"
+  for filter in '.head_sha="old"' '.review.endpoint="issues"' 'del(.review)' \
+      '.probe.context_state="pending"' '.probe.context_state=null' \
+      '.probe.context_updated_at="2026-06-04T00:00:05Z"' \
+      '.probe.context_updated_at="invalid"' 'del(.probe.context_updated_at)' \
+      'del(.review.submitted_at)'; do
+    status_description_expect not-yet "$filter" "$(jq -c "$filter" <<<"$base")"
+  done
+  status_description_expect reported same-second "$(jq -c '.probe.context_updated_at=.review.submitted_at' <<<"$base")"
+  status_description_expect not-yet polling "$base" 4
+  status_description_expect escalate infrastructure "$base" 3
+  status_description_expect escalate summary-finding "$base" 2
+  status_description_expect not-yet malformed '{'
+  # Inject only the description projection after successful positive controls.
+  # An extraction error cannot become the optional-empty description escape.
+  real_jq=$(command -v jq)
+  jq() {
+    if [ "${1:-}" = -er ] && [ "${2:-}" = '.probe.context_description | select(type == "string") | . + "."' ]; then
+      case "$description_decode_mode" in
+        failed-empty) return 3 ;;
+        zero-empty) return 0 ;;
+        failed-output) printf 'Review completed.'; return 3 ;;
+        zero-no-suffix) printf 'Review completed'; return 0 ;;
+      esac
+    fi
+    "$real_jq" "$@"
+  }
+  for description_decode_mode in failed-empty zero-empty failed-output zero-no-suffix; do
+    status_description_expect not-yet "description extraction $description_decode_mode" "$base"
+  done
+  unset -f jq
+  status_description_expect reported description-extraction-recovered "$base"
+  # Source fresh shells so a previous helper definition cannot mask absent or
+  # partially propagated helpers. Neither fixture invokes the orchestrator.
+  mkdir -p "$WORK/scripts/phase-4b" "$WORK/scripts/lib"
+  cp "$LIB" "$WORK/scripts/phase-4b/lib.sh"
+  for helper in missing partial; do
+    if [ "$helper" = partial ]; then
+      printf '%s\n' 'crw_status_description_permits_clearance() { return 0; }' >"$WORK/scripts/lib/coderabbit-fence.sh"
+    fi
+    actual=$(bash -c '. "$1"; p4b_barrier_class_coderabbit "$2" 7 "$3"' bash "$WORK/scripts/phase-4b/lib.sh" "$head" "$base")
+    [ "$actual" = not-yet ] || { echo "FAIL: #939 $helper helper granted $actual" >&2; exit 1; }
+    n=$((n + 1))
+  done
+  echo "Results: $n passed, 0 failed (#939 pure status-description controls)"
+  exit 0
+fi
+
 # Focused PR-policy tuple reads (#1523): expected under 2s, no adapter,
 # credentials or network. This mode is also run by the ordinary suite.
 if [ "${1:-}" = --policy-tuple-only ]; then
@@ -324,6 +410,7 @@ fi
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
+  bash "$0" --status-description-only
 fi
 
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
@@ -4947,11 +5034,11 @@ bad=""
 # the summary publication while coderabbitai[bot] had two COMMENTED reviews
 # on the exact head and a per-SHA success postdating them, and the barrier
 # held not-yet until it escalated.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = reported ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = reported ] \
                                                          || bad="$bad rc7-review-object-ctx"
 # At-or-after is inclusive: a status refreshed the same second as the
 # object still corroborates it.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:06Z"}}')" = reported ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:06Z"}}')" = reported ] \
                                                          || bad="$bad rc7-review-object-eqctx"
 # Observed-state precedence (P1 round 3 on #875): an ACTIVE adverse state
 # named by the probe — a pending rate-limit / pause / in-progress notice
@@ -4964,15 +5051,15 @@ bad=""
 # It still does not OPEN — which is all the #875 precedence rule ever
 # asserted — but it now carries its own class, because a refusal and a delay
 # need different handling and only the composer can choose between them.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = rate-limited ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = rate-limited ] \
                                                          || bad="$bad rc7-observed-ratelimit"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"paused","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"paused","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-paused"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"in_progress","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"in_progress","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-inprogress"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-missing"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"someday-new-state","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"someday-new-state","context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-unmodelled"
 # A BARE just-posted review object must NOT open the barrier (P1 on #875):
 # the PR-level summary still in flight can carry the ONLY blocking marker
@@ -4992,29 +5079,29 @@ bad=""
 # PREDATES the review object belongs to the PREVIOUS run against this sha —
 # the new object's summary and status refresh are still pending, so the
 # stale success must not open the barrier past them.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-stalectx"
 # Either half of the correlation missing, or unparseable, fails closed —
 # an old probe emission (no submitted_at / no context_updated_at) keeps
 # the pre-#869 bounded wait.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-nosubmitted"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-noctxat"
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-badts"
 # Stale-head evidence must not clear even fully corroborated — the same
 # #794 posture as rc 0.
-[ "$(_cr 7 '{"head_sha":"old999","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"old999","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-stale"
 # "issues" evidence on rc 7 is a pending notice or a prior-head summary,
 # never head-anchored terminality — a correlated context success cannot
 # upgrade it.
-[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-issues-evidence"
 # The channel is probe-only: a polling timeout (rc 4) never carries
 # review-object evidence, and unmodelled shapes must not open the barrier.
-[ "$(_cr 4 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 4 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_description":"Review completed","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc4-no-channel"
 # rc 5 is only an escalation when the #489 failover did NOT engage. When it
 # did, AGENTS.md step 5 makes the stall a non-blocking note and the Codex arm
