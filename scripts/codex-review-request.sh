@@ -3154,6 +3154,32 @@ rescan_codex_state() { # <what>
 # plus review_timeout_seconds), so resuming never extends a request's wait.
 # A resumed request grants no timeout authority: if it expires unanswered, the
 # caller posts a new trigger, and only that trigger can mint a timeout marker.
+# #2664: a push time for HEAD that the author cannot set, or empty. A
+# force-push timeline event dates the push itself. Otherwise the latest
+# pull_request or push workflow run for HEAD on the PR branch was created
+# after the push it ran for, so a request after it was posted on this head.
+# The latest run is used: a later run only moves the bound later, which
+# holds fewer requests. An unreadable list proves nothing.
+head_push_proof_at() {
+  local forced="" dispatched="" runs
+  case "$ANCHOR_SOURCE" in head_ref_force_pushed*) forced=$HEAD_PUSHED_AT ;; esac
+  runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
+    -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
+  dispatched=$(printf '%s' "$runs" | jq -r -s --arg b "$HEAD_REF" '
+    if length > 0 and all(.[]; type == "object" and ((.workflow_runs | type) == "array"))
+    then [ .[].workflow_runs[]
+           | select(.event == "pull_request" or .event == "push")
+           | select($b == "" or (.head_branch // "") == $b)
+           | (.created_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) ] | max // ""
+    else "" end' 2>/dev/null) || dispatched=""
+  if [ -n "$forced" ] && { [ -z "$dispatched" ] || [[ "$forced" > "$dispatched" ]]; }; then
+    printf '%s' "$forced"
+  else
+    printf '%s' "$dispatched"
+  fi
+}
+
 resume_pending_codex_request() {
   [ -n "$AUTHOR_IDENTITY" ] || return 1
   local comments="" pending created created_epoch summary status observed now deadline
@@ -3175,16 +3201,22 @@ resume_pending_codex_request() {
     || die 3 "cannot parse the pending Codex request's timestamp '$created'"
   [[ "$created_epoch" =~ ^[0-9]+$ ]] || die 3 "cannot parse the pending Codex request's timestamp '$created'"
 
-  # #2664: only a request posted on the current head can hold it. One posted
-  # before the head was pushed belongs to an earlier head, so a new request
-  # is posted as before. HEAD_PUSHED_AT falls back to the author-controlled
-  # committer date. A date in the future is no evidence at all, so it cannot
-  # release the pending request either: the request is still held.
-  local head_epoch
-  head_epoch=$(jq -rn --arg t "$HEAD_PUSHED_AT" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || head_epoch=""
-  if [[ "$head_epoch" =~ ^[0-9]+$ ]] && [ "$head_epoch" -le "$(date +%s)" ] && [ "$created_epoch" -lt "$head_epoch" ]; then
-    log "pending request $(printf '%s' "$pending" | jq -r .id) predates the current head — not resuming"
-    return 1
+  # #2664: only a request posted on the current head can hold it, and the
+  # committer date proves nothing about that: a commit made before a request
+  # on the old head and pushed after it has an earlier date. Only a push time
+  # the author cannot set ties the request to this head (head_push_proof_at).
+  # A request older than it belongs to an earlier head, so a new request is
+  # posted as before. Without one, the request holds only on the exact-head
+  # Running summary (#1550), checked below.
+  local push_proof push_epoch head_proven=false
+  push_proof=$(head_push_proof_at)
+  push_epoch=$(jq -rn --arg t "$push_proof" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || push_epoch=""
+  if [[ "$push_epoch" =~ ^[0-9]+$ ]]; then
+    if [ "$created_epoch" -lt "$push_epoch" ]; then
+      log "pending request $(printf '%s' "$pending" | jq -r .id) predates the current head's push ($push_proof) — not resuming"
+      return 1
+    fi
+    head_proven=true
   fi
   # At the request ceiling the #813 cap path keeps precedence: it polls the
   # final request without timeout authority and reports the ceiling. This is
@@ -3226,7 +3258,7 @@ resume_pending_codex_request() {
   # recognizes case variants, so a newer selected command can postdate a marker
   # the parser still calls current. Compare the bound trigger id, exactly as
   # preserve_final_request_timeout does.
-  local marker_json marker_state settled=false
+  local marker_json marker_state
   if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
      || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
     log "terminal-marker helper unavailable — not resuming (#1550)"
@@ -3240,10 +3272,11 @@ resume_pending_codex_request() {
     current)
       if printf '%s' "$marker_json" | jq -e --argjson trigger "$pending" \
            '.trigger_comment_id == $trigger.id' >/dev/null 2>&1; then
-        # #2664: it timed out already, and that determination is the handoff
-        # to Phase 4b. A fresh request on this head would treat it as never
-        # sent, so it is reported, not replaced.
-        settled=true
+        # #2664: its timeout is recorded and handed to Phase 4b, so it is not
+        # in flight. A later run on this head is a new round: it posts a new
+        # counted request, which supersedes that determination (#1085).
+        log "pending request $(printf '%s' "$pending" | jq -r .id) has a current Phase 4a timeout marker — not resuming"
+        return 1
       fi
       ;;
     *) die 3 "cannot classify the pending Codex request for resume: trusted terminal-marker evidence is malformed" ;;
@@ -3263,14 +3296,15 @@ resume_pending_codex_request() {
   if [ "$status" = running ] && [ -n "$observed" ] && ! [[ "$observed" < "$created" ]]; then
     RESUME_PENDING_RUNNING=true
   fi
+  if [ "$head_proven" != true ] && [ "$RESUME_PENDING_RUNNING" != true ]; then
+    log "pending request $(printf '%s' "$pending" | jq -r .id) cannot be tied to the current head (no push time or Running summary) — not resuming"
+    return 1
+  fi
 
   now=$(date +%s)
   deadline=$((created_epoch + TIMEOUT_SECONDS))
   RESUME_PENDING_STATE=pending
-  if [ "$settled" = true ]; then
-    RESUME_PENDING_STATE=timed-out
-    deadline=$now
-  elif [ "$now" -ge "$deadline" ]; then
+  if [ "$now" -ge "$deadline" ]; then
     # Past its own wait: the wait below ends at once, and the request's
     # timeout determination is recorded as for any expired request.
     RESUME_PENDING_STATE=expired
@@ -3367,7 +3401,6 @@ elif [ "$REQUEST_MODE" = poll ] && resume_pending_codex_request; then
     case "$RESUME_PENDING_STATE" in
       pending) log "resuming pending request $RESUMED_TRIGGER_ID on this head (unanswered; Codex Running: $RESUME_PENDING_RUNNING); no new trigger (#1550, #2664), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed" ;;
       expired) log "pending request $RESUMED_TRIGGER_ID on this head is unanswered past its ${TIMEOUT_SECONDS}s wait — recording its timeout for Phase 4b, not posting a fresh request (#2664)" ;;
-      timed-out) log "pending request $RESUMED_TRIGGER_ID on this head already has its Phase 4a timeout determination — reporting it for Phase 4b, not posting a fresh request (#2664)" ;;
     esac
   fi
 else

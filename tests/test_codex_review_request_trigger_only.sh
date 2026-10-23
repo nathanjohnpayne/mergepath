@@ -1997,6 +1997,7 @@ test_write_boundary_authorization_caller_mode() {
         CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         MERGEPATH_CODEX_TRIGGER_CALLER_MODE="$mode" \
+        CODEX_TEST_LINT_RUNS=dispatched CODEX_TEST_CHECK_STARTED=2026-06-03T23:59:30Z \
         MERGEPATH_CODEX_TRIGGER_OBSERVED_GENERATION="$(observed_generation "$dir" "$scenario")" \
         MERGEPATH_CODEX_AUTO_TRIGGER="$auto" MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD="$gate" \
         ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
@@ -2015,6 +2016,9 @@ test_write_boundary_authorization_caller_mode() {
           || fail "#2582 authorization ($label): expected refusal '$want' (rc=$rc; $(cat "$dir/err.log"))" ;;
     esac
     [ "$(trig_count "$dir")" = 0 ] || fail "#2582 authorization must never post ($label)"
+  # #2664: CODEX_TEST_LINT_RUNS=dispatched dates the head's push 30 s before
+  # the fixture's requests, so dup_author is on this head and dup_author_older
+  # (60 s earlier) is not.
   done <<'CASES'
 poll-dup|dup_author|poll|false|pending-request-unanswered
 poll-older-head-dup|dup_author_older|poll|false|authorized

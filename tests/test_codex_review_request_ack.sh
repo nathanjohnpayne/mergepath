@@ -217,10 +217,26 @@ shift
 if [ "${1:-}" = "--paginate" ]; then
   shift
 fi
+# #2664: the same-head hold's push-time read is `gh api --paginate -X GET
+# repos/.../actions/runs -f head_sha=... -F per_page=100`. Other -X reads
+# still reach the unexpected-endpoint branch, as before.
+[ "${1:-}" != "-X" ] || shift 2
 
 endpoint=${1:-}
 
 case "$endpoint" in
+  # #2664: a pull_request run dispatched for HEAD, the push time the
+  # same-head hold needs. It is not repo-lint, so the moving-head guard's
+  # CI-pickup read stays unreadable here. CODEX_TEST_PUSH_DISPATCHED_AT=none
+  # lists no run (no push-time proof).
+  repos/owner/repo/actions/runs)
+    if [ "${CODEX_TEST_PUSH_DISPATCHED_AT:-}" = none ]; then
+      printf '{"total_count":0,"workflow_runs":[]}\n'
+    else
+      jq -cn --arg t "${CODEX_TEST_PUSH_DISPATCHED_AT:-2026-06-03T23:59:00Z}" \
+        '{total_count:1,workflow_runs:[{id:41,name:"CI",event:"pull_request",head_branch:"",created_at:$t}]}'
+    fi
+    ;;
   repos/owner/repo/pulls/999)
     # The initial HEAD fetch and the governing-policy resolver both need full
     # PR metadata. Only preserve_final_request_timeout's explicit scalar read
@@ -1265,15 +1281,33 @@ before-request|⏳ **Running**|aaaaaaa|2026-06-03T23:59:00Z|the Running summary 
 completed|✅ **Completed**|aaaaaaa|2026-06-04T00:00:10Z|the summary reports Completed rather than Running
 CASES
   # A request posted before the current head was pushed belongs to an earlier
-  # head, so the ordinary new request is posted.
+  # head, so the ordinary new request is posted. The commit here was made
+  # before the request and pushed after it: its committer date is earlier,
+  # so only the push time can tell (Codex P2 on #2779).
   local before=$FAIL
   dir=$(make_case "resume-older-head" 0 0 60)
   seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
   set_clock_after_request "$dir" 30
-  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-04T00:00:20Z run_case "$dir" absent 1)
-  [ "$(trigger_count "$dir")" = 1 ] && grep -q 'predates the current head' "$dir/err.log" \
+  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q "predates the current head's push" "$dir/err.log" \
     || fail "#2664 older head: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: a request from an earlier head does not hold the current head"
+  # With no push time, a committer date never ties the request to the head:
+  # without the exact-head Running summary it does not hold.
+  dir=$(make_case "resume-no-push-proof" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_COMMIT_DATE=2026-06-03T23:00:00Z CODEX_TEST_PUSH_DISPATCHED_AT=none run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 1 ] && grep -q 'cannot be tied to the current head' "$dir/err.log" \
+    || fail "#2664 no push proof: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  # The exact-head Running summary still ties it (#1550).
+  dir=$(make_case "resume-no-push-proof-running" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_PUSH_DISPATCHED_AT=none run_case "$dir" absent 1)
+  [ "$(trigger_count "$dir")" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log" \
+    || fail "#2664 no push proof, Running: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2664: only a push time or the exact-head Running summary ties a request to the current head"
 }
 
 # A request Codex already answered with a required-tier finding needs a new
@@ -1309,9 +1343,7 @@ test_resumed_block_does_not_clear_on_stale_review() {
   [ "$FAIL" -ne "$before" ] || pass "#1550: a resumed request ending on a provider block exits 4, not 0 on an older review"
 }
 
-# A request that already minted a Phase 4a timeout marker is settled: that
-# determination is its handoff to Phase 4b, so a rerun reports it and posts
-# nothing (#2664; the earlier #1550 behavior posted a fresh request).
+# A request that already minted a Phase 4a timeout marker is settled.
 test_request_with_timeout_marker_is_not_resumed() {
   local dir rc count
   dir=$(make_case "resume-marked" 0 0 60)
@@ -1322,11 +1354,10 @@ test_request_with_timeout_marker_is_not_resumed() {
   set_clock_after_request "$dir" 30
   rc=$(run_case "$dir" absent 1)
   count=$(trigger_count "$dir")
-  if [ "$count" = 0 ] && [ "$rc" = 4 ] && grep -q "already has its Phase 4a timeout determination" "$dir/err.log" \
-     && [ "$(jq -r '.terminal_determination.marker_comment_id // "none"' "$dir/out.json")" = 901 ]; then
-    pass "#2664: a request that already holds a current timeout marker is reported, not replaced"
+  if [ "$count" = 1 ] && grep -q "has a current Phase 4a timeout marker — not resuming" "$dir/err.log"; then
+    pass "#1550: a request that already holds a current timeout marker is not resumed"
   else
-    fail "#2664 marked: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+    fail "#1550 marked: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
   fi
 }
 
