@@ -34,32 +34,46 @@ REVIEWED DATA-ONLY JOBS
 
 A job that needs the candidate tree as DATA and runs no code from it is
 recorded in REVIEWED_CANDIDATE_CHECKOUTS with its reason and the SHA-256 of
-its exact source block in the workflow file (the job's key line through the
-line before the next line at or above its indentation). The review covers that
-text and nothing else: any edit to the job -- one added step, one changed
-argument, one comment -- fails the gate until someone re-reviews the job and
-records the new hash, which the failure prints. An entry whose job no longer
-has the shape fails as stale, so the list cannot outlive the code it vouches
-for.
+its WHOLE parsed workflow document (canonical JSON). The review covers
+everything that decides what the job runs, not just its own lines: triggers,
+workflow-level `env` and `defaults` (a `BASH_ENV` there is sourced by every
+`run:` step), YAML anchors and merge keys, and sibling jobs whose outputs it
+reads. Any semantic edit to that workflow fails the gate until someone
+re-reviews the job and records the new hash, which the failure prints.
+Comments and formatting do not change the parsed document, so they do not
+invalidate a review. An entry whose job no longer has the shape fails as
+stale, so the list cannot outlive the code it vouches for.
 
-A checkout is PINNED when its `ref:` is exactly one of the trusted
-expressions in TRUSTED_REF_EXPRESSIONS and that expression is populated on
-every pull-request event the workflow listens to. `github.base_ref` exists only
+A checkout is PINNED when every input it sets is in TRUSTED_CHECKOUT_INPUTS,
+its `repository:` is absent or exactly `${{ github.repository }}`, and its
+`ref:` is exactly one of the trusted expressions in TRUSTED_REF_EXPRESSIONS,
+populated on every pull-request event the workflow listens to. `github.base_ref` exists only
 on `pull_request` and `pull_request_target`; on a review event it is empty, and
 checkout then falls back to the merge ref. Anything else -- a literal branch,
 tag or SHA (a same-repository branch is exactly the threat), `github.head_ref`,
 `github.sha`, `github.event.pull_request.head.*`, a mixed expression -- is
-unpinned. This is an allow-list on purpose: a deny-list of candidate
-expressions is the fail-open shape.
+unpinned. A trusted ref in another repository (`repository: attacker/x`) or
+from another server (`github-server-url:`) is unpinned too. These are
+allow-lists on purpose: a deny-list of candidate expressions is the
+fail-open shape.
+
+A job HOLDS a pipeline token when any `${{ }}` expression in it, or in the
+workflow-level `env`/`defaults`, reads `secrets` other than as
+`secrets.<NAME>` with NAME outside the three tokens. So
+`secrets.CI_ACTOR_TOKEN` (any case), `secrets['X']`,
+`secrets[format(...)]` and `toJSON(secrets)` all count; only a named,
+non-pipeline secret such as `secrets.GITHUB_TOKEN` does not.
 
 DOES NOT CATCH
 
-    * A reviewed job's code that is unchanged but reaches candidate files
-      through something outside its block (a trusted helper it calls). The
-      review has to cover what those helpers do with the candidate tree.
+    * What a reviewed job's trusted helpers (outside the workflow file) do
+      with the candidate tree. The fingerprint pins the workflow, so the
+      review has to cover those helpers too.
     * Composite actions under `.github/actions/` and reusable workflows
       called with `secrets: inherit`; only `.github/workflows/*.y(a)ml` jobs
       with steps are read.
+    * A secret reached without an expression in the job or the workflow-level
+      `env`/`defaults` (for example an action that reads secrets itself).
     * Events other than the four pull-request events above (`workflow_run`
       with a head checkout, `issue_comment` that checks out a PR head).
 
@@ -83,13 +97,25 @@ import sys
 NAME = "check_pipeline_token_checkouts"
 
 PIPELINE_TOKENS = ("AUTHOR_MERGE_TOKEN", "REVIEWER_ASSIGNMENT_TOKEN", "CI_ACTOR_TOKEN")
-TOKEN_RE = re.compile(
-    r"\bsecrets\s*\.\s*(?:%s)\b|\bsecrets\s*\[\s*['\"](?:%s)['\"]\s*\]|\btoJSON\(\s*secrets\s*\)"
-    % ("|".join(PIPELINE_TOKENS), "|".join(PIPELINE_TOKENS)),
-    # Secret names and expression contexts are case-insensitive in Actions:
-    # `${{ Secrets.ci_actor_token }}` still hands the job the PAT.
-    re.IGNORECASE,
-)
+PIPELINE_TOKEN_NAMES = {t.lower() for t in PIPELINE_TOKENS}
+_EXPRESSION_BODY_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# Expression contexts and secret names are case-insensitive in Actions.
+_SECRETS_RE = re.compile(r"\bsecrets\b(?:\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*))?", re.IGNORECASE)
+
+
+def holds_pipeline_token(text):
+    """True when an expression in `text` may read a pipeline token.
+
+    Conservative: any `secrets` access that is not a named, non-pipeline
+    secret counts, because computed access (`secrets[format(...)]`,
+    `toJSON(secrets)`) can reach any of them.
+    """
+    for body in _EXPRESSION_BODY_RE.findall(text):
+        for m in _SECRETS_RE.finditer(body):
+            if m.group(1) is None or m.group(1).lower() in PIPELINE_TOKEN_NAMES:
+                return True
+    return False
+
 
 MERGE_REF_EVENTS = {"pull_request", "pull_request_review", "pull_request_review_comment"}
 BASE_REF_EVENTS = {"pull_request_target"}
@@ -105,13 +131,24 @@ TRUSTED_REF_EXPRESSIONS = {
 }
 EXPRESSION_RE = re.compile(r"^\$\{\{\s*([A-Za-z0-9_.]+)\s*\}\}$")
 
+# actions/checkout inputs that cannot point it at other content. `ref` and
+# `repository` are further constrained below; anything else, such as
+# `github-server-url`, makes the checkout unpinned.
+TRUSTED_CHECKOUT_INPUTS = {
+    "ref", "repository", "persist-credentials", "fetch-depth", "fetch-tags",
+    "path", "clean", "filter", "sparse-checkout", "sparse-checkout-cone-mode",
+    "lfs", "submodules", "set-safe-directory", "show-progress", "token",
+    "ssh-key", "ssh-known-hosts", "ssh-strict", "ssh-user",
+}
+
 # Jobs that check out the candidate as data and run no code from it, keyed by
-# (workflow basename, job id). `sha256` pins the job's exact source block; an
-# edit to the job fails the gate until the job is re-reviewed and this hash is
-# updated to the one the failure prints.
+# (workflow basename, job id). `sha256` pins the whole parsed workflow
+# (workflow_fingerprint); a semantic edit anywhere in it fails the gate until
+# the job is re-reviewed and this hash is updated to the one the failure
+# prints.
 REVIEWED_CANDIDATE_CHECKOUTS = {
     ("pr-review-policy.yml", "external-review-labeling"): {
-        "sha256": "f8adb94f4bc23ca7ac5e8786bfa219276ba2e562f656def342d36689f4c021eb",
+        "sha256": "5f374a06d88e3b8585c2f3efdc86c9e74acac8718ca0b5f71842711a6af32c09",
         "reason": (
             "#2725 C6/C7: the candidate tree is diffed and byte-verified as data; "
             "every helper runs from a base-SHA or default-branch git worktree, and "
@@ -139,9 +176,33 @@ def ref_is_pinned(ref, events):
     if not isinstance(ref, str) or not ref.strip():
         return False
     m = EXPRESSION_RE.match(ref.strip())
-    if not m or m.group(1) not in TRUSTED_REF_EXPRESSIONS:
+    expr = m.group(1).lower() if m else None
+    if expr not in TRUSTED_REF_EXPRESSIONS:
         return False
-    return (events & PR_EVENTS) <= TRUSTED_REF_EXPRESSIONS[m.group(1)]
+    return (events & PR_EVENTS) <= TRUSTED_REF_EXPRESSIONS[expr]
+
+
+def checkout_is_pinned(step, events):
+    inputs = step.get("with")
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, dict):
+        return False
+    # Action inputs are case-insensitive.
+    inputs = {str(k).lower(): v for k, v in inputs.items()}
+    if any(k not in TRUSTED_CHECKOUT_INPUTS for k in inputs):
+        return False
+    repository = inputs.get("repository")
+    if repository is not None:
+        m = EXPRESSION_RE.match(str(repository).strip())
+        if not m or m.group(1).lower() != "github.repository":
+            return False
+    ref = inputs.get("ref")
+    if ref is None or (isinstance(ref, str) and not ref.strip()):
+        # No ref: the event's default checkout, which is the merge ref on
+        # the merge-ref events and the base on pull_request_target.
+        return not (events & MERGE_REF_EVENTS)
+    return ref_is_pinned(ref, events)
 
 
 def action_name(step):
@@ -157,75 +218,33 @@ def is_checkout(step):
 
 def unpinned_checkout_index(steps, events):
     """Index of the first candidate checkout in `steps`, or None."""
-    merge_ref = bool(events & MERGE_REF_EVENTS)
     for idx, step in enumerate(steps):
-        if not isinstance(step, dict) or not is_checkout(step):
-            continue
-        ref = (step.get("with") or {}).get("ref")
-        if ref is None or (isinstance(ref, str) and not ref.strip()):
-            if merge_ref:
-                return idx
-            continue
-        if not ref_is_pinned(ref, events):
+        if isinstance(step, dict) and is_checkout(step) and not checkout_is_pinned(step, events):
             return idx
     return None
 
 
-
-_JOBS_KEY_RE = re.compile(r"^jobs:\s*(?:#.*)?$")
-
-
-def _indent(line):
-    return len(line) - len(line.lstrip(" "))
-
-
-def job_source(text, job_id):
-    """The job's source block, or None when it cannot be located.
-
-    The block runs from the job's key line, at the indentation of the first
-    entry under the top-level `jobs:`, to the line before the next non-blank
-    line at or above that indentation. Trailing blank lines are dropped.
-    """
-    lines = text.replace("\r\n", "\n").split("\n")
-    try:
-        top = next(i for i, ln in enumerate(lines) if _JOBS_KEY_RE.match(ln))
-    except StopIteration:
-        return None
-    indent = None
-    for ln in lines[top + 1:]:
-        if ln.strip() and not ln.lstrip().startswith("#"):
-            indent = _indent(ln)
-            break
-    if not indent:
-        return None
-    key_re = re.compile(r"^ {%d}(['\"]?)%s\1:\s*(?:#.*)?$" % (indent, re.escape(job_id)))
-    start = None
-    for i in range(top + 1, len(lines)):
-        ln = lines[i]
-        if ln.strip() and _indent(ln) == 0:
-            break
-        if key_re.match(ln):
-            start = i
-            break
-    if start is None:
-        return None
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        if lines[i].strip() and _indent(lines[i]) <= indent:
-            end = i
-            break
-    block = lines[start:end]
-    while block and not block[-1].strip():
-        block.pop()
-    return "\n".join(block) + "\n"
+def _canonical(node, top=False):
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            # PyYAML (YAML 1.1) reads the top-level `on:` key as True; yq
+            # (YAML 1.2) reads it as "on". Both must give one fingerprint.
+            key = "on" if (top and k is True) else str(k)
+            out[key] = _canonical(v)
+        return out
+    if isinstance(node, list):
+        return [_canonical(v) for v in node]
+    return node
 
 
-def job_source_sha256(text, job_id):
-    block = job_source(text, job_id)
-    return None if block is None else hashlib.sha256(block.encode("utf-8")).hexdigest()
+def workflow_fingerprint(doc):
+    canon = json.dumps(_canonical(doc, top=True), sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False, default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def scan_workflow(doc, basename, reviewed, text):
+def scan_workflow(doc, basename, reviewed):
     """Return (violations, reviewed keys that matched)."""
     violations, matched = [], set()
     if not isinstance(doc, dict):
@@ -234,14 +253,14 @@ def scan_workflow(doc, basename, reviewed, text):
     if not events & PR_EVENTS:
         return violations, matched
     workflow_level = json.dumps({k: doc.get(k) for k in ("env", "defaults")}, default=str)
-    workflow_token = bool(TOKEN_RE.search(workflow_level))
+    workflow_token = holds_pipeline_token(workflow_level)
     for job_id, job in (doc.get("jobs") or {}).items():
         if not isinstance(job, dict):
             continue
         steps = job.get("steps")
         if not isinstance(steps, list):
             continue
-        if not (workflow_token or TOKEN_RE.search(json.dumps(job, default=str))):
+        if not (workflow_token or holds_pipeline_token(json.dumps(job, default=str))):
             continue
         idx = unpinned_checkout_index(steps, events)
         if idx is None:
@@ -250,22 +269,18 @@ def scan_workflow(doc, basename, reviewed, text):
         where = "%s job %s" % (basename, job_id)
         if key in reviewed:
             matched.add(key)
-            current = job_source_sha256(text, str(job_id))
-            if current is None:
+            current = workflow_fingerprint(doc)
+            if current != reviewed[key].get("sha256"):
                 violations.append(
-                    "%s is a reviewed data-only job, but its source block cannot be "
-                    "located to verify the review; treat it as unreviewed" % where)
-            elif current != reviewed[key].get("sha256"):
-                violations.append(
-                    "%s is a reviewed data-only job whose source changed since its "
-                    "review (recorded sha256 %s, now %s). Re-review that it still runs "
-                    "no code from the candidate checkout while a pipeline token is in "
-                    "scope, then record the new hash in REVIEWED_CANDIDATE_CHECKOUTS"
+                    "%s is a reviewed data-only job whose workflow changed since its "
+                    "review (recorded sha256 %s, now %s). Re-review that the job still "
+                    "runs no code from the candidate checkout while a pipeline token is "
+                    "in scope, then record the new hash in REVIEWED_CANDIDATE_CHECKOUTS"
                     % (where, reviewed[key].get("sha256"), current))
             continue
         violations.append(
             "%s holds a pipeline token and checks out a candidate-controlled tree "
-            "(step %d has no trusted ref:). Pin it to "
+            "(step %d is not pinned to trusted content). Pin it to "
             "${{ github.event.repository.default_branch }} or the base SHA, or, for a "
             "job that runs no candidate code, record it in REVIEWED_CANDIDATE_CHECKOUTS"
             % (where, idx))
@@ -312,7 +327,7 @@ def scan_tree(root, load, reviewed):
         except Exception as exc:  # noqa: BLE001 - any parse failure fails closed
             violations.append("%s: cannot parse (%s)" % (base, exc))
             continue
-        v, m = scan_workflow(doc, base, reviewed, text)
+        v, m = scan_workflow(doc, base, reviewed)
         violations += v
         matched |= m
     for key in sorted(reviewed):
@@ -371,9 +386,9 @@ def _run(cmd):
 
 
 # A data-only job of the C6/C7 shape: candidate checkout, helpers from a
-# trusted worktree, the token used for one write. Its hash is computed by the
-# self-test, which then edits it the ways Codex and CodeRabbit found the old
-# execution scan could be bypassed.
+# trusted worktree, the token used for one write. Its fingerprint is computed
+# by the self-test, which then edits the workflow the ways the reviews of #2786
+# found the earlier execution scan and job-text hash could be bypassed.
 REVIEWED_JOB = _job(
     CHECKOUT
     + _run('git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"')
@@ -391,13 +406,19 @@ SELF_TEST_CASES = [
     ("workflow-level env token counts",
      _job(CHECKOUT + _run("true"), env="env:\n  T: ${{ secrets.AUTHOR_MERGE_TOKEN }}\n"), 1),
     ("toJSON(secrets) counts", _job(CHECKOUT + _run("echo '${{ toJSON(secrets) }}' | jq .")), 1),
+    ("toJSON ( secrets ) with spaces counts", _job(CHECKOUT + _run("echo '${{ toJSON ( secrets ) }}'")), 1),
+    ("computed bracket access counts",
+     _job(CHECKOUT + _run("echo ${{ secrets[format('CI_{0}_TOKEN', 'ACTOR')] }}")), 1),
+    ("spaced dot access counts", _job(CHECKOUT + _run("echo ${{ secrets . CI_ACTOR_TOKEN }}")), 1),
     ("lower-case secret name counts", _job(CHECKOUT + _run("echo ${{ secrets.ci_actor_token }}")), 1),
     ("mixed-case secrets context counts", _job(CHECKOUT + _run("echo ${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}")), 1),
     ("mixed-case checkout action counts", _job("      - uses: Actions/Checkout@v7\n" + TOKEN_STEP), 1),
     ("bracket secret access counts", _job(CHECKOUT + _run("echo ${{ secrets['CI_ACTOR_TOKEN'] }}")), 1),
     ("GITHUB_TOKEN only passes", _job(CHECKOUT + _run("GH_TOKEN=${{ secrets.GITHUB_TOKEN }} ./x.sh")), 0),
+    ("the word secrets outside an expression passes", _job(CHECKOUT + _run("echo no secrets here")), 0),
     ("push-only workflow passes", _job(CHECKOUT + TOKEN_STEP, on="push"), 0),
     ("default-branch pin passes", _job(_pinned("${{ github.event.repository.default_branch }}") + TOKEN_STEP), 0),
+    ("mixed-case trusted expression passes", _job(_pinned("${{ GitHub.Event.Repository.Default_Branch }}") + TOKEN_STEP), 0),
     ("base.sha pin passes", _job(_pinned("${{ github.event.pull_request.base.sha }}") + TOKEN_STEP), 0),
     ("literal branch fails", _job(_pinned("main") + TOKEN_STEP), 1),
     ("literal feature branch fails", _job(_pinned("attacker-feature") + TOKEN_STEP), 1),
@@ -415,21 +436,44 @@ SELF_TEST_CASES = [
     ("mixed expression fails", _job(_pinned("${{ github.event.repository.default_branch || github.head_ref }}") + TOKEN_STEP), 1),
     ("empty ref fails", _job(_pinned("''") + TOKEN_STEP), 1),
     ("second checkout unpinned fails", _job(_pinned("${{ github.base_ref }}") + CHECKOUT + TOKEN_STEP), 1),
+    ("trusted ref in another repository fails",
+     _job(_pinned("${{ github.event.repository.default_branch }}") + "          repository: attacker/evil\n" + TOKEN_STEP), 1),
+    ("trusted ref with repository github.repository passes",
+     _job(_pinned("${{ github.event.repository.default_branch }}") + "          repository: ${{ github.repository }}\n" + TOKEN_STEP), 0),
+    ("another server fails",
+     _job(_pinned("${{ github.event.repository.default_branch }}") + "          github-server-url: https://evil.example\n" + TOKEN_STEP), 1),
+    ("an unknown checkout input fails",
+     _job(_pinned("${{ github.event.repository.default_branch }}") + "          new-input: x\n" + TOKEN_STEP), 1),
+    ("a mixed-case Ref input is still the ref",
+     _job("      - uses: actions/checkout@v7\n        with:\n          Ref: ${{ github.event.pull_request.head.sha }}\n" + TOKEN_STEP), 1),
+    ("a mixed-case Ref input with a trusted value passes",
+     _job("      - uses: actions/checkout@v7\n        with:\n          Ref: ${{ github.event.pull_request.base.sha }}\n" + TOKEN_STEP), 0),
     ("prt with no ref passes", _job(CHECKOUT + TOKEN_STEP + _run("./x.sh"), on="pull_request_target"), 0),
+    ("prt with no ref in another repository fails",
+     _job("      - uses: actions/checkout@v7\n        with:\n          repository: attacker/evil\n" + TOKEN_STEP,
+          on="pull_request_target"), 1),
     ("prt with head ref fails",
      _job(_pinned("${{ github.event.pull_request.head.sha }}") + TOKEN_STEP, on="pull_request_target"), 1),
     ("tokenless job with candidate checkout passes", _job(CHECKOUT + _run("./x.sh")), 0),
     ("unreviewed data-only job fails", REVIEWED_JOB, 1),
 ]
 
-# Edits to REVIEWED_JOB that must each invalidate its review.
+# Edits to REVIEWED_JOB's workflow that must each invalidate its review.
 REVIEWED_EDITS = [
     ("an added wrapper-spelled execution", lambda t: t.replace(
         TOKEN_STEP, _run("timeout 30 ./evil.sh") + TOKEN_STEP, 1)),
     ("an eval of a quoted command", lambda t: t.replace(
         TOKEN_STEP, _run("eval './evil.sh'") + TOKEN_STEP, 1)),
     ("a changed argument", lambda t: t.replace('"$PWD"', '"$PWD" --exec', 1)),
-    ("an added comment", lambda t: t.replace(TOKEN_STEP, "      # reviewed?\n" + TOKEN_STEP, 1)),
+    ("a step after a comment at the job's indentation", lambda t: t.replace(
+        "  other:\n", "  # extra\n" + _run("./evil.sh") + "  other:\n", 1)),
+    ("a workflow-level BASH_ENV", lambda t: t.replace(
+        "jobs:\n", "env:\n  BASH_ENV: ${{ github.workspace }}/evil.sh\njobs:\n", 1)),
+    ("job-level defaults", lambda t: t.replace(
+        "  j:\n    runs-on: ubuntu-latest\n",
+        "  j:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        shell: bash --rcfile evil {0}\n", 1)),
+    ("an edited sibling job", lambda t: t.replace(_run("true"), _run("./evil.sh"))),
+    ("an added trigger", lambda t: t.replace("on: pull_request\n", "on: [pull_request, pull_request_target]\n", 1)),
 ]
 
 
@@ -444,34 +488,31 @@ def self_test(load):
             print("  FAIL: %s%s" % (name, ": " + detail if detail else ""))
 
     for name, text, want in SELF_TEST_CASES:
-        violations, _ = scan_workflow(load(text), "wf.yml", {}, text)
+        violations, _ = scan_workflow(load(text), "wf.yml", {})
         check(name, len(violations) == want, "want %d violation(s), got %r" % (want, violations))
 
-    def reviewed_for(text):
-        return {("wf.yml", "j"): {"sha256": job_source_sha256(text, "j"), "reason": "fixture"}}
-
-    review = reviewed_for(REVIEWED_JOB)
-    v, _ = scan_workflow(load(REVIEWED_JOB), "wf.yml", review, REVIEWED_JOB)
-    check("reviewed job at its recorded hash passes", v == [], repr(v))
+    review = {("wf.yml", "j"): {"sha256": workflow_fingerprint(load(REVIEWED_JOB)), "reason": "fixture"}}
+    v, _ = scan_workflow(load(REVIEWED_JOB), "wf.yml", review)
+    check("reviewed job at its recorded fingerprint passes", v == [], repr(v))
     for name, edit in REVIEWED_EDITS:
         text = edit(REVIEWED_JOB)
         check("edit applies: " + name, text != REVIEWED_JOB)
-        v, _ = scan_workflow(load(text), "wf.yml", review, text)
-        check("reviewed job with %s fails" % name, len(v) == 1 and "source changed" in v[0], repr(v))
-    # The block ends at the next job: editing a sibling keeps the review.
-    sibling = REVIEWED_JOB.replace(_run("true"), _run("false"))
-    check("sibling edit applies", sibling.endswith(_run("false")))
-    v, _ = scan_workflow(load(sibling), "wf.yml", review, sibling)
-    check("editing another job keeps the review", v == [], repr(v))
-    # Block extraction: quoted key, four-space indentation, flow style.
-    quoted = REVIEWED_JOB.replace("\n  j:\n", "\n  'j':\n", 1)
-    check("quoted job key is located", job_source(quoted, "j") is not None)
-    wide = "on: pull_request\njobs:\n    j:\n        steps: []\n    k:\n        steps: []\n"
-    check("four-space job block", job_source(wide, "j") == "    j:\n        steps: []\n", repr(job_source(wide, "j")))
-    flow = "on: pull_request\njobs: {j: {runs-on: x, steps: [{uses: actions/checkout@v7}, " \
-           "{run: 'echo ${{ secrets.CI_ACTOR_TOKEN }}'}]}}\n"
-    v, _ = scan_workflow(load(flow), "wf.yml", {("wf.yml", "j"): {"sha256": "x"}}, flow)
-    check("an unlocatable reviewed job fails closed", len(v) == 1 and "cannot be located" in v[0], repr(v))
+        v, _ = scan_workflow(load(text), "wf.yml", review)
+        check("reviewed job with %s fails" % name, len(v) == 1 and "workflow changed" in v[0], repr(v))
+    # Comments and formatting do not change the parsed document.
+    cosmetic = "# header\n" + REVIEWED_JOB.replace("\n  other:\n", "\n  # note\n\n  other:\n", 1)
+    check("cosmetic edit applies", cosmetic != REVIEWED_JOB)
+    v, _ = scan_workflow(load(cosmetic), "wf.yml", review)
+    check("a comment-only edit keeps the review", v == [], repr(v))
+    # PyYAML reads top-level `on:` as True, yq as "on": one fingerprint.
+    doc = load(REVIEWED_JOB)
+    swapped = dict(doc)
+    if "on" in swapped:
+        swapped[True] = swapped.pop("on")
+    elif True in swapped:
+        swapped["on"] = swapped.pop(True)
+    check("the `on` key spelling does not change the fingerprint",
+          workflow_fingerprint(doc) == workflow_fingerprint(swapped))
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
