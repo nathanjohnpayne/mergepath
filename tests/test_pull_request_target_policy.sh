@@ -125,6 +125,10 @@ T="$(fresh_tree head-checkout)"
 edit "$T/.github/workflows/$DA" "s.replace('github.event.pull_request.base.sha }}', 'github.event.pull_request.head.sha }}', 1)"
 T_HEAD="$T"
 
+T="$(fresh_tree mixed-case-checkout)"
+edit "$T/.github/workflows/$DA" "s.replace('uses: actions/checkout@', 'uses: actIONS/Checkout@', 1).replace('github.event.pull_request.base.sha }}', 'github.event.pull_request.head.sha }}', 1)"
+T_MIXED="$T"
+
 T="$(fresh_tree merge-ref-checkout)"
 edit "$T/.github/workflows/$MQ" "s.replace('ref: \${{ github.event.pull_request.base.sha }}', 'ref: refs/pull/\${{ github.event.pull_request.number }}/merge', 1)"
 T_MERGEREF="$T"
@@ -210,6 +214,7 @@ for mode in "${MODES[@]}"; do
   expect "lint flags a trigger added to a registered workflow" 1 "auto-clear-blocking-labels.yml triggers on .*workflow_dispatch.* but REGISTRY pins" "$mode" lint --root "$T_ADDED"
   expect "lint flags a push trigger added to the queue recorder" 1 "merge-queue-authorization.yml triggers on .*push.* but REGISTRY pins" "$mode" lint --root "$T_MQPUSH"
   expect "lint flags a head-SHA checkout" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_HEAD"
+  expect "lint matches action names case-insensitively" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_MIXED"
   expect "lint flags a merge-ref checkout" 1 'merge-queue-authorization.yml: job .* checks out ref refs/pull/' "$mode" lint --root "$T_MERGEREF"
   expect "lint flags a fork-repository checkout" 1 'auto-clear-blocking-labels.yml: job .* checks out repository .*head.repo.full_name' "$mode" lint --root "$T_FORKREPO"
   expect "lint flags allow-unsafe-pr-checkout" 1 'sets allow-unsafe-pr-checkout' "$mode" lint --root "$T_UNSAFE"
@@ -278,6 +283,9 @@ case "$path" in
     id="${path##*/}"
     [ -f "$GH_FIXTURE/policy-$id.json" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     cat "$GH_FIXTURE/policy-$id.json" ;;
+  repos/*/commits/*)
+    [ ! -f "$GH_FIXTURE/no-ref" ] || { echo "gh: No commit found for SHA: main (HTTP 422)" >&2; exit 1; }
+    printf '{"sha":"%040d"}\n' 1 ;;
   repos/*/contents/*)
     rel="${path#repos/*/*/contents/}"; rel="${rel%%\?*}"
     [ -f "$GH_FIXTURE/contents/$rel" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
@@ -421,6 +429,15 @@ edit "$F/contents/.github/workflows/$DA" "s.replace('on:\n  pull_request_target:
 verify_expect "verify checks the repo's own trigger list, not only REGISTRY" "$F" 1 \
   '^BLOCKED .github/workflows/dependabot-auto-merge.yml on pull_request_target, workflow_dispatch \[events differ from REGISTRY' \
   'does not allow workflow_dispatch'
+
+F="$(fixture bad-ref)"; owner_policies "$F"; touch "$F/no-ref"
+verify_expect "an unresolvable ref is an API error, not three absences" "$F" 3 'repos/octo/demo/commits/main failed'
+
+F="$(fixture trigger-dropped)"; owner_policies "$F"
+edit "$F/contents/.github/workflows/$MQ" "s.replace('on:\n  pull_request_target:\n', 'on:\n  pull_request:\n', 1)"
+verify_expect "a registered workflow without pull_request_target fails verify" "$F" 1 \
+  '^DRIFT   .github/workflows/merge-queue-authorization.yml no longer triggers on pull_request_target at main \(triggers: pull_request\)' \
+  '^OK +.github/workflows/dependabot-auto-merge.yml'
 
 F="$(fixture no-access)"; rm "$F/policies.json"
 verify_expect "a 404 on the policy list is an API error naming the owner token" "$F" 3 'use the owner token'

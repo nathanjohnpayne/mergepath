@@ -138,17 +138,19 @@ def unsafe_patterns(doc):
                 continue
             where = 'job %s step %d' % (job_id, idx + 1)
             uses = step.get('uses') if isinstance(step.get('uses'), str) else ''
+            # GitHub resolves an action's owner/repo case-insensitively.
+            action = uses.split('@', 1)[0].lower()
             with_ = step.get('with') if isinstance(step.get('with'), dict) else {}
             if 'allow-unsafe-pr-checkout' in with_:
                 found.append('%s sets allow-unsafe-pr-checkout' % where)
-            if uses.startswith('actions/checkout@'):
+            if action == 'actions/checkout':
                 if 'ref' not in with_:
                     pass  # the default for pull_request_target is the default branch
                 elif normalize_expr(with_['ref']) not in SAFE_CHECKOUT_REFS:
                     found.append('%s checks out ref %s' % (where, with_['ref']))
                 if 'repository' in with_ and normalize_expr(with_['repository']) != '${{ github.repository }}':
                     found.append('%s checks out repository %s' % (where, with_['repository']))
-            elif uses.startswith('actions/download-artifact@'):
+            elif action == 'actions/download-artifact':
                 found.append('%s downloads an artifact' % where)
             run = step.get('run')
             if isinstance(run, str):
@@ -334,6 +336,9 @@ def evaluate(path, events, policies):
 def verify(repo, ref):
     summaries = list_policies(repo, has_parents=True)
     policies = [policy_detail(repo, s) for s in summaries]
+    # The contents API answers a missing ref with the same 404 as a missing
+    # file, so resolve the ref first: otherwise a typo reads as "all absent".
+    gh_json(['repos/%s/commits/%s' % (repo, ref)])
     failed = 0
     print('%s: %d applicable Actions polic%s' % (repo, len(policies), 'y' if len(policies) == 1 else 'ies'))
     for path in REGISTRY:
@@ -342,7 +347,10 @@ def verify(repo, ref):
             print('ABSENT  %s (not on %s; nothing to allow)' % (path, ref))
             continue
         if 'pull_request_target' not in events:
-            print('SKIP    %s (does not trigger on pull_request_target at %s)' % (path, ref))
+            # Registry and policy are stale: lint fails the same drift locally.
+            print('DRIFT   %s no longer triggers on pull_request_target at %s (triggers: %s)'
+                  % (path, ref, ', '.join(events)))
+            failed += 1
             continue
         verdict, reasons = evaluate(path, events, policies)
         drift = '' if sorted(events) == sorted(REGISTRY[path]) else ' [events differ from REGISTRY: %s]' % sorted(events)
