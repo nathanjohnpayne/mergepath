@@ -1052,10 +1052,12 @@ jobs:
       - name: Resolve the governing reviewer allow-list
         id: policy
         env:
-          # Read-only, and only on a non-default base: the resolver fetches
-          # that base's policy file. A default-base PR makes no API call
-          # (#769). github.token can read this repository's contents, so no
-          # PAT is in scope while the policy is resolved.
+          # Read-only, and used only when the policy is not already the
+          # checked-out one: a non-default base (the resolver fetches that
+          # base's file) or a default-branch tip that has moved past the
+          # event's base SHA (below). Otherwise no API call is made (#769).
+          # github.token can read this repository's contents, so no PAT is in
+          # scope while the policy is resolved.
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -1069,6 +1071,23 @@ jobs:
             echo "reviewers=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # On a default-base PR the loader reads the local policy with no API
+          # call (#769), but the checkout follows the movable default-branch
+          # tip. If that tip is not the event's base SHA, read the policy at
+          # BASE_SHA instead, so the classification uses one policy
+          # generation. A policy update landing mid-run must not clear an
+          # escalation. An unreadable policy leaves the list unproven, and
+          # the next step then fails closed.
+          CONFIG=".github/review-policy.yml"
+          if [ "$BASE_REF" = "$DEFAULT_BRANCH" ] && [ "$(git rev-parse HEAD)" != "$BASE_SHA" ]; then
+            CONFIG="$(mktemp)"
+            if ! gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
+                -H "Accept: application/vnd.github.raw" > "$CONFIG"; then
+              echo "::warning::Could not read .github/review-policy.yml at base $BASE_SHA; the reviewer allow-list is unproven."
+              echo "reviewers=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           # The loader emits fail-closed outputs (reviewers=[]) and exits 0
           # when it cannot resolve the governing policy.
           bash "$LOADER" \
@@ -1076,7 +1095,7 @@ jobs:
             --base-ref "$BASE_REF" \
             --base-sha "$BASE_SHA" \
             --default-branch "$DEFAULT_BRANCH" \
-            --default-config ".github/review-policy.yml"
+            --default-config "$CONFIG"
 
       - name: Check for conflicting reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
