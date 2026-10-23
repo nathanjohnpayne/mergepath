@@ -5,7 +5,9 @@ set -euo pipefail
 
 COCKPIT_CALLER_DIR="$(pwd -P)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COCKPIT_AGENT=codex
+# Default to the reviewer identity no agent reviews with, so the dashboard's polling
+# never spends the GraphQL budget a working reviewer needs.
+COCKPIT_AGENT=cursor
 COCKPIT_PORT=0
 COCKPIT_EXTRA_ARGS=()
 

@@ -43,7 +43,7 @@ These run on your own machine and never in CI.
 **Mergepath Cockpit** is a local browser dashboard. Warm the credential cache, then launch it:
 
 ```bash
-eval "$(scripts/op-preflight.sh --agent codex --mode review)"
+eval "$(scripts/op-preflight.sh --agent cursor --mode review)"
 scripts/cockpit.sh
 ```
 

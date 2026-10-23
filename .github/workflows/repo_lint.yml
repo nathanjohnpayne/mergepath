@@ -237,16 +237,20 @@ jobs:
       # verification step at the end of the job. Nothing earlier in the job
       # needs `python3`, so the placement costs no coverage.
       #
-      # Versions are pinned deliberately: an unpinned `pip install` lets a
-      # future release silently change parse/render behavior for a
-      # merge-relevant gate and a CommonMark oracle, on a runner that always
-      # installs the latest release. Both pins are the current stable release
-      # at time of writing — PyYAML 6.0.3 (2025-09-25) and markdown-it-py
-      # 4.2.0 — and markdown-it-py 4.2.0 additionally matches the existing
-      # .github/workflows/md-prose-wrap.yml pin, so the two gates that both
-      # cross-check documents agree on one renderer version fleet-wide.
-      # Bumping either pin is a deliberate edit, reviewed like any other
-      # change to a merge-relevant fence; it is not expected to track latest.
+      # These exact pins constrain the two direct packages so their own
+      # versions cannot silently drift and change parse/render behavior for a
+      # merge-relevant gate or CommonMark oracle. Both pins are the current
+      # stable release at time of writing — PyYAML 6.0.3 (2025-09-25) and
+      # markdown-it-py 4.2.0 — and the latter matches the existing
+      # .github/workflows/md-prose-wrap.yml pin, so both document gates use
+      # the same renderer version. Bumping either pin is a deliberate,
+      # reviewed edit; it is not expected to track latest.
+      #
+      # These direct pins do not lock or hash the transitive dependency graph:
+      # pip still resolves dependencies such as markdown-it-py's mdurl. This
+      # step therefore does not guarantee a fully reproducible environment.
+      # A locked, hashes-backed graph and its update process would be a
+      # separate reviewed change, not an implication of these direct pins.
       #
       # No self-bootstrap `|| { ...; }` tail here, unlike several check_*
       # steps below: a failed `pip install` (network, index, or resolver

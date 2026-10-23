@@ -110,7 +110,7 @@ def shared_ci_snapshot(app, repo, _fetch_now):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
-    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
+    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="cursor",
                         help="agent whose existing credential cache is used for author telemetry and confirmed sync")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
     parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")

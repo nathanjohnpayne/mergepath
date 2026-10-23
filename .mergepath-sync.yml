@@ -2589,7 +2589,7 @@ paths:
   # the fleet was uniformly public from 2026-07-06; it went ACTIVE on
   # 2026-09-01 when device-source-of-truth was measured private, and it
   # is moot again as of 2026-09-05, when that repo was dropped as a
-  # consumer and the remaining seven are all public. Do not treat either
+  # consumer (it was archived 2026-10-22) and the remaining seven are all public. Do not treat either
   # moot period as the standing state -- re-read the visibility fields.)
   # Keep it mergepath-only. (CodeRabbit Major, #271.)
 
@@ -2869,7 +2869,8 @@ paths:
   # lintable surface" rationale; #458 folded it into the ESM entry below
   # (React 19 + TypeScript + Vite SPA, root package.json, ~148 .ts/.tsx).
   # It was dropped as a consumer entirely on 2026-09-05 when the repo went
-  # dormant, so it no longer appears in that entry.
+  # dormant, so it no longer appears in that entry. It was archived on
+  # 2026-10-22.
   # overridebroadway carried the same false rationale; #461 folds it into
   # the CJS entry below (CJS + React 19 + TypeScript, root package.json,
   # ~81 .ts/.tsx) — the first CJS + TS consumer of the floor. The CJS
