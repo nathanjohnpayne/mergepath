@@ -382,6 +382,31 @@ make_case() {
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
+  # Name the two selected-comment caller sites in the fixture copy only. The
+  # awk shim can then inject at either caller directly, regardless of how many
+  # unrelated structural reads happen first.
+  # shellcheck disable=SC2016 # literal sed search and replacement expressions
+  sed -i.bak \
+    's/CLASS=$(crw_classify_selected_comment "$COMMENT_BODY")/CLASS=$(CODERABBIT_TEST_STRUCTURAL_SITE=main_poll crw_classify_selected_comment "$COMMENT_BODY")/' \
+    "$dir/scripts/coderabbit-wait.sh"
+  python3 - "$dir/scripts/coderabbit-wait.sh" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+code = p.read_text()
+old = '''    class=$(crw_classify_selected_comment "$body") || {
+      log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+'''
+new = '''    class=$(CODERABBIT_TEST_STRUCTURAL_SITE=post_probe crw_classify_selected_comment "$body") || {
+      log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+'''
+assert code.count(old) == 1, "post-probe selected-comment call site was not unique"
+p.write_text(code.replace(old, new, 1))
+PY
+  grep -Fq 'CODERABBIT_TEST_STRUCTURAL_SITE=main_poll crw_classify_selected_comment' "$dir/scripts/coderabbit-wait.sh" \
+    || { fail "$name: could not tag main-loop selected-comment classifier in fixture copy"; return 1; }
+  grep -Fq 'CODERABBIT_TEST_STRUCTURAL_SITE=post_probe crw_classify_selected_comment' "$dir/scripts/coderabbit-wait.sh" \
+    || { fail "$name: could not tag post-probe selected-comment classifier in fixture copy"; return 1; }
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #1008: both fetch wrappers
@@ -440,6 +465,16 @@ EOF
 set -euo pipefail
 case "${1:-}" in
   *'function fence_info'*)
+    if [ -n "${CODERABBIT_TEST_FAIL_STRUCTURAL_SITE:-}" ] \
+      && [ "${CODERABBIT_TEST_STRUCTURAL_SITE:-}" = "$CODERABBIT_TEST_FAIL_STRUCTURAL_SITE" ]; then
+      printf '%s\n' "$CODERABBIT_TEST_STRUCTURAL_SITE" \
+        >"${CODERABBIT_TEST_STATE_DIR:?}/structural-awk-failure-site"
+      echo "simulated structural reader failure at selected-comment site $CODERABBIT_TEST_STRUCTURAL_SITE" >&2
+      exit 44
+    fi
+    # Preserve the count-targeted injector for existing tests whose intended
+    # failure is in a different structural consumer (not the selected-comment
+    # classifier addressed by #1341).
     if [ -n "${CODERABBIT_TEST_FAIL_STRUCTURAL_ON:-}" ]; then
       count_file=${CODERABBIT_TEST_STATE_DIR:?}/structural-awk-count
       count=0
@@ -645,6 +680,7 @@ run_case() {
       CODERABBIT_TEST_STATE_DIR="$dir/state" \
       CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="${CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON:-}" \
       CODERABBIT_TEST_FAIL_REVIEWS_AFTER="${CODERABBIT_TEST_FAIL_REVIEWS_AFTER:-}" \
+      CODERABBIT_TEST_FAIL_STRUCTURAL_SITE="${CODERABBIT_TEST_FAIL_STRUCTURAL_SITE:-}" \
       CODERABBIT_TEST_FAIL_STRUCTURAL_ON="${CODERABBIT_TEST_FAIL_STRUCTURAL_ON:-}" \
       CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
       CODEX_STUB_LOG="$dir/state/codex-stub.log" \
@@ -911,16 +947,33 @@ test_selected_comment_structural_failure_fails_closed() {
 
   dir=$(make_case "selected-comment-structural-failure-main" "$REVIEW_BODY_CLEAN")
   sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
-  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=3 run_case "$dir")
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_SITE=main_poll run_case "$dir")
   [ "$rc" = "3" ] || fail "3b6b main: structural classification failure must stop polling with infra, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b6b main: unread selected comment was reported as cleared"
+  [ "$(stub_calls "$dir")" = 0 ] || fail "3b6b main: unread selected comment triggered Codex"
   grep -q 'could not structurally classify the latest CodeRabbit comment' "$dir/err.log" || fail "3b6b main: expected fail-closed structural-classification diagnostic"
+  [ "$(cat "$dir/state/structural-awk-failure-site" 2>/dev/null)" = main_poll ] || fail "3b6b main: injection did not reach the selected-comment main-loop classifier"
+
+  # Negative control: an unrelated structural read has the same fence_info
+  # program shape but no selected-comment site tag, so it must not consume the
+  # caller-targeted failure.
+  mkdir -p "$dir/state/unrelated"
+  CODERABBIT_TEST_FAIL_STRUCTURAL_SITE=main_poll \
+    CODERABBIT_TEST_STATE_DIR="$dir/state/unrelated" \
+    "$dir/bin/awk" 'function fence_info() {}' </dev/null >/dev/null 2>>"$dir/err.log" \
+    || fail "3b6b control: unrelated structural read unexpectedly failed"
+  [ ! -f "$dir/state/unrelated/structural-awk-failure-site" ] \
+    || fail "3b6b control: unrelated structural read consumed the selected-comment injection"
 
   dir=$(make_case "selected-comment-structural-failure-terminal" "$REVIEW_BODY_CLEAN")
   sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
   sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
-  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=3 run_case "$dir")
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_SITE=post_probe run_case "$dir")
   [ "$rc" = "4" ] || fail "3b6b terminal: structural classification failure must preserve advisory timeout, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "3b6b terminal: unread selected comment changed the advisory timeout verdict"
+  [ "$(stub_calls "$dir")" = 0 ] || fail "3b6b terminal: unread selected comment triggered Codex"
   grep -q 'could not be structurally classified' "$dir/err.log" || fail "3b6b terminal: expected suppressed terminal-upgrade diagnostic"
+  [ "$(cat "$dir/state/structural-awk-failure-site" 2>/dev/null)" = post_probe ] || fail "3b6b terminal: injection did not reach the selected-comment post-probe classifier"
   [ "$FAIL" -ne "$before" ] || pass "3b6b: selected-comment structural reader failure stops polling and suppresses terminal clearance"
 }
 
