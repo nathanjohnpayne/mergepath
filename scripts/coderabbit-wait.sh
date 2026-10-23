@@ -262,6 +262,9 @@
 #       # summary and status refresh are pending, and a success predating
 #       # the object belongs to a different run.
 #       "context_updated_at": null | "<iso-8601>"
+#       # The SAME sample's description (#939): an explicit empty string is
+#       # retained; null on unsampled, opted-out, error and terminal paths.
+#       "context_description": null | "<status description>"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -940,88 +943,8 @@ fetch_api_array_best_effort() {
   }
 }
 
-# BEGIN coderabbit_status_description_helpers
-# True when a CodeRabbit StatusContext `success` may be trusted as CLEARANCE,
-# judged by the status' own `description` string. Pure: no globals, no I/O —
-# extracted by sentinel and sourced directly by
-# tests/test_coderabbit_wait_statuscontext_ratelimit.sh.
-#
-# #891 / #897 / #912 are ONE defect filed three times from three sessions:
-# `state: success` does not mean "reviewed". CodeRabbit publishes its
-# rate-limited state AS a success status and carries the truth only in the
-# description. The observed vocabulary, from the three live captures:
-#
-#   success | Review completed      a run finished        (#912, af8496f @03:06:48Z)
-#   success | Review rate limited   NO review ran         (#897 c00abf0, #891 f0198d9,
-#                                                          #912 af8496f)
-#   pending | Review in progress    a run is underway     (#897, #919)
-#   pending | Review queued         a run is queued       (#897)
-#
-# Only `success` ever reaches the fast path, so the discriminator that matters
-# is between the first two. `emit_status_context_verdict` already knows success
-# means "completed, not clean" (#224) and scans inline findings before
-# clearing — but a rate-limited head has zero inline findings for the trivial
-# reason that nothing was scanned, so the finding scan cannot tell it from a
-# genuinely clean review.
-#
-# The test is POSITIVE — clear only on a description that names a completed
-# review. A deny-list of the known refusal wordings goes blind the moment
-# CodeRabbit renames one, and "the guard had no scope over a wording it had
-# never seen" is precisely the #891/#912 defect. An unrecognized NON-empty
-# description therefore suppresses the fast path, and the wait falls through to
-# the comment-driven poll that reaches its own verdict.
-#
-# The one escape is an EMPTY description, which is permitted. That is not a
-# hole: `description` is optional metadata in the statuses API, every observed
-# false clear carries a non-empty one, and refusing an empty description would
-# disable the fast path for any status posted without one — while the fast path
-# is what keeps a clean fix-up push from burning the whole poll budget (#221).
-# A liveness cost paid on a shape that has never false-cleared is the wrong
-# trade.
-#
-# The permitted wordings are an EXACT allowlist over the normalized string, not
-# a substring or prefix match (Codex P1 on #936). `*"review complete"*` read
-# "names a completed review" off any description CONTAINING that phrase, and
-# three wordings contain it while meaning the opposite or less:
-#
-#   No review completed        the review did NOT happen
-#   Review completely skipped  the review did NOT happen
-#   Review complete — 0 files reviewed   (a prefix-anchored fix accepts this too)
-#
-# A guard whose whole job is to reject descriptions that deny a completed review
-# cannot be satisfied by a longer wording that embeds one. Exactness is what
-# makes the doctrine above hold in both directions: only a description that IS
-# one of the completed-review wordings clears, and every other non-empty string
-# — refusal, pending, extended, or unseen — falls through to the comment-driven
-# poll. The set is small and vendor-published, so enumerating it costs nothing;
-# a wording CodeRabbit adds later suppresses the fast path until it is added
-# here, which is a liveness cost on the safe side.
-#
-# Normalization is case and SURROUNDING whitespace only — transport noise, not
-# vocabulary. A whitespace-only description normalizes to empty and takes the
-# empty-description escape above, since it is indistinguishable from an absent
-# field. Nothing else is stripped: trailing punctuation or an appended clause
-# makes the string a wording nobody has shipped, which is exactly the case the
-# positive test is meant to refuse.
-crw_normalize_status_description() {
-  local desc=${1:-} lower
-  lower=$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]')
-  # Bash 3.2 trim: strip the leading, then the trailing, whitespace run.
-  lower="${lower#"${lower%%[![:space:]]*}"}"
-  lower="${lower%"${lower##*[![:space:]]}"}"
-  printf '%s' "$lower"
-}
-
-crw_status_description_permits_clearance() {
-  local lower
-  lower=$(crw_normalize_status_description "${1:-}") || return 1
-  [ -n "$lower" ] || return 0
-  case "$lower" in
-    "review complete"|"review completed") return 0 ;;
-  esac
-  return 1
-}
-# END coderabbit_status_description_helpers
+# Status description normalization and clearance share the CodeRabbit helpers
+# sourced above (scripts/lib/coderabbit-fence.sh, #939).
 
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
 # Emits compact JSON with:
@@ -3983,14 +3906,14 @@ STATUS_PROBE_RAN=false
 # same additive posture blocking_tier_unresolved takes when it does not apply.
 PROBE_OBSERVED=""
 PROBE_JSON=null
-# Per-SHA StatusContext state and refresh time sampled by the probe's rc-7
+# Per-SHA StatusContext state, refresh time and description sampled by the probe's rc-7
 # review-object branch (#869); empty (→ null in the JSON) everywhere else,
 # including every polling run and every trust-opted-out policy. The
 # timestamp exists so the Phase 4b barrier can require the success to be
 # at-or-after the review object it corroborates — a same-SHA rerun exposes
 # the previous run's success while the new summary is pending.
 PROBE_CONTEXT_STATE=""
-PROBE_CONTEXT_UPDATED_AT=""
+PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
 # Same-content carry-forward EVIDENCE (#1335), set only by the probe's
 # no-review-object summary branch via crw_probe_carryforward_evidence; `null`
 # everywhere else. It is evidence, never a verdict: it changes no exit code and
@@ -4117,8 +4040,8 @@ emit_json_and_exit() {
 
   # --probe (#814): `terminal` covers a probe run that reached a real
   # verdict (0 / 2 / 6). Null on every polling run. context_state and
-  # context_updated_at carry the per-SHA StatusContext (state + refresh
-  # time) sampled by the rc-7 review-object branch (#869) and are null on
+  # context_updated_at and context_description carry the per-SHA StatusContext
+  # (state, refresh time and description) sampled by the rc-7 review-object branch (#869) and are null on
   # every other path.
   # `carryforward` (#1335) is null except on the rc-7 `none` /
   # `summary-without-head-review` emits, where crw_probe_carryforward_evidence
@@ -4127,10 +4050,12 @@ emit_json_and_exit() {
     PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
       --arg ctx "${PROBE_CONTEXT_STATE:-}" \
       --arg ctxat "${PROBE_CONTEXT_UPDATED_AT:-}" \
+      --argjson ctxdesc "${PROBE_CONTEXT_DESCRIPTION_JSON:-null}" \
       --argjson carry "${PROBE_CARRYFORWARD_JSON:-null}" \
       '{mode: true, observed: $observed,
         context_state: (if $ctx == "" then null else $ctx end),
         context_updated_at: (if $ctxat == "" then null else $ctxat end),
+        context_description: $ctxdesc,
         carryforward: $carry}')
   fi
 
@@ -4866,7 +4791,7 @@ crw_probe_maybe_emit_status_refusal() {
     *) die 3 "unusable current-head status refusal result" ;;
   esac
   if [ "$resampled" != true ]; then
-    PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+    PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null; PROBE_CARRYFORWARD_JSON=null
     probe_emit_verdict true "$record"
     die 3 "internal: status-refusal resample returned without a verdict"
   fi
@@ -4884,7 +4809,7 @@ crw_probe_maybe_emit_status_refusal() {
   crw_rate_limit_hides_a_finding "$HEAD_SHA" "$notice" "$review_body" "$comments" || rc=$?
   case "$rc" in
     0)
-      PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+      PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null; PROBE_CARRYFORWARD_JSON=null
       PROBE_OBSERVED=terminal
       emit_json_and_exit findings 2 "${CRW_HIDDEN_FINDING_JSON:-${review:-$notice_evidence}}" 1 ;;
     1) ;;
@@ -4893,7 +4818,7 @@ crw_probe_maybe_emit_status_refusal() {
   # A newly accepted trigger or provider-owned active/pause publication supersedes
   # the older refusal even when its mutable summary still names the prior head.
   at=$(jq -r '.updated_at' <<<"$record") || die 3 "unreadable refusal timestamp"
-  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null; PROBE_CARRYFORWARD_JSON=null
   if [ -n "$review" ]; then
     rc=0
     jq -e --arg at "$at" '(.submitted_at | fromdateiso8601) >= ($at | fromdateiso8601)' <<<"$review" >/dev/null 2>&1 || rc=$?
@@ -4924,13 +4849,13 @@ crw_probe_maybe_emit_status_refusal() {
       in_progress|paused)
         evidence=$(printf '%s' "$row" | base64 --decode | jq -c '{id, created_at, updated_at, endpoint: "issue_comments", body_excerpt: (.body[0:200])}') \
           || die 3 "unreadable active-publication evidence"
-        PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+        PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null; PROBE_CARRYFORWARD_JSON=null
         probe_not_yet "$class" "$evidence" ;;
     esac
   done <<<"$rows"
   evidence=$(jq -c '. + {endpoint: "status_context", disposition: "rate_limit", permits_clearance: false}' <<<"$record") \
     || die 3 "unreadable refusal provenance"
-  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null; PROBE_CARRYFORWARD_JSON=null
   log "probe: configured provider explicitly refused current-head review in its latest trusted status; reporting rate_limit, not review clearance (#2120)"
   probe_not_yet rate_limit "$evidence"
 }
@@ -5324,7 +5249,8 @@ crw_probe_carryforward_evidence() {
 # cost of one allowance unit rather than by risking a false REPORTED. One
 # narrower, CONJUNCTIVE role is admitted (#869), trust-gated by
 # trust_status_context_for_clearance: the status rides along in the rc-7
-# JSON as probe.context_state / probe.context_updated_at when the evidence
+# JSON as probe.context_state / probe.context_updated_at /
+# probe.context_description when the evidence
 # is a HEAD-pinned review object, so the Phase 4b barrier can require
 # per-SHA completion — refreshed at-or-after that object — before opening
 # on an object whose PR-level summary is still in flight. The status
@@ -5442,14 +5368,14 @@ probe_emit_verdict() {
       # object alone — the PR-level summary still in flight can carry the
       # ONLY blocking marker (the #535 summary-only class, e.g. the
       # auto-pause note). Sample the per-SHA StatusContext — state AND
-      # refresh time — into probe.context_state / probe.context_updated_at
+      # refresh time and description — into the three probe.context_* fields
       # so the barrier can require `success` that is at-or-after this
       # review object's submitted_at: on a same-SHA rerun the statuses
       # endpoint still exposes the PREVIOUS run's success while the new
       # object's summary and status refresh are pending, and a success
       # that PREDATES the object it would corroborate belongs to a
       # different run. Trust-gated by the same policy switch as every
-      # other status read; both fields left null when the policy opts out,
+      # other status read; all three fields left null when the policy opts out,
       # which fails closed at the barrier (not-yet). Sampled once — the
       # re-scan pass reuses the first sample rather than reading a surface
       # that postdates it.
@@ -5467,6 +5393,8 @@ probe_emit_verdict() {
         ctx_record=$(check_status_context_record) || ctx_record=""
         PROBE_CONTEXT_STATE=$(crw_status_record_state "$ctx_record")
         PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
+        PROBE_CONTEXT_DESCRIPTION_JSON=$(printf '%s' "$ctx_record" | jq -c 'if .state == "unreadable" then null else (.description | select(type == "string")) end' 2>/dev/null || printf null)
+        [ -n "$PROBE_CONTEXT_DESCRIPTION_JSON" ] || PROBE_CONTEXT_DESCRIPTION_JSON=null
       fi
       # #869 TOCTOU: the success just observed post-dates the comments
       # snapshot, so the summary may already be up. One re-fetch, one
@@ -5512,7 +5440,7 @@ probe_emit_verdict() {
           if [ "$(classify_comment "$sbody")" = "paused" ]; then
             log "probe: no notice after the run on $HEAD_SHA, but the anchor-free summary is a PAUSE — reporting paused with the note as evidence so the resume path is reachable (#857)"
             PROBE_CONTEXT_STATE=""
-            PROBE_CONTEXT_UPDATED_AT=""
+            PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
             sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')
             probe_not_yet "paused" "$sjson"
           fi
@@ -5573,7 +5501,7 @@ probe_emit_verdict() {
         [ "$rl_rc" = 3 ] && die 3 "a surface could not be read while checking whether the rate-limit state on $HEAD_SHA hides a blocking finding — an unread surface is not evidence that it carries none (#1178)"
         if [ "$rl_rc" = 0 ]; then
           PROBE_CONTEXT_STATE=""
-          PROBE_CONTEXT_UPDATED_AT=""
+          PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
           PROBE_OBSERVED="terminal"
           log "probe: the rate-limit state on $HEAD_SHA hides a blocking finding — escalating rather than reporting a bare refusal (#1178)"
           emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$review}" 1
@@ -5591,9 +5519,9 @@ probe_emit_verdict() {
     # A published summary is the verdict source, not the rc-7 payload —
     # clear the rc-7-only status fields (possibly sampled on a first pass
     # of the loop above) so the documented contract holds: context_state /
-    # context_updated_at are null on every non-rc-7 path.
+    # context_updated_at / context_description are null on every non-rc-7 path.
     PROBE_CONTEXT_STATE=""
-    PROBE_CONTEXT_UPDATED_AT=""
+    PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
 
     # The one verdict this mode does make, and only because nothing else can.
     # A blocking finding carried SOLELY by the PR-level summary (#535) is

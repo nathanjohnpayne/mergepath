@@ -41,7 +41,7 @@ make_case() {
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   # #1178: hard-sourced by coderabbit-wait.sh, so the fixture must carry it.
-  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
+  cp "${CODERABBIT_TEST_DESCRIPTION_HELPER_SOURCE:-$ROOT/scripts/lib/coderabbit-fence.sh}" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -1730,7 +1730,7 @@ test_2360_same_second_status_ordering() {
 if [ "${1:-}" = --status-refusal-only ]; then
   test_2360_same_second_status_ordering
   helpers="$WORKDIR/status-refusal-helpers.sh"
-  sed -n '/^# BEGIN coderabbit_status_description_helpers$/,/^# END coderabbit_status_description_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
+  sed -n '/^# BEGIN coderabbit_status_description_helpers$/,/^# END coderabbit_status_description_helpers$/p' "${CODERABBIT_TEST_DESCRIPTION_HELPER_SOURCE:-$ROOT/scripts/lib/coderabbit-fence.sh}" >"$helpers"
   sed -n '/^# BEGIN coderabbit_probe_status_refusal_helpers$/,/^# END coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
   # shellcheck disable=SC1090
   . "$helpers"
@@ -2198,6 +2198,8 @@ test_probe_state_space_sweep() {
         obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
         want=$(expected_observed "$trust" "$status" "$scenario")
         local why=""
+        jq -e '.probe | has("context_description") and .context_description == null' "$dir/out.json" >/dev/null 2>&1 \
+          || why="unexpected sampled description outside the rc-7 review-object path"
         [ "$posts" = "0" ] || why="posted $posts"
         [ "$obs" = "$want" ] || why="${why:+$why; }observed=$obs want=$want"
         [ "$codex" = "0" ] || why="${why:+$why; }invoked codex-review-request $codex time(s)"
@@ -2271,7 +2273,7 @@ test_probe_summary_lagging_head_review_is_not_yet() {
   assert_probe_not_yet "$dir" "$rc" awaiting-summary \
     "a review whose summary has not landed is publication-incomplete, not reported"
   ctx=$(jq -r '.probe.context_state | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$ctx" = "null" ]; then
+  if [ "$ctx" = "null" ] && jq -e '.probe.context_description == null and (.probe | has("context_description"))' "$dir/out.json" >/dev/null; then
     pass "#869 probe: with trust_status_context_for_clearance=false the awaiting-summary JSON carries context_state=null (barrier stays closed)"
   else
     fail "#869 probe: expected context_state=null under trust=false; got $ctx"
@@ -2379,6 +2381,7 @@ test_869_probe_summary_landing_mid_probe_is_scanned() {
   fetches=$(cat "$dir/state/issues-fetch-count" 2>/dev/null || echo 0)
   if [ "$rc" = "0" ] && [ "$status" = "reported" ] && [ "$observed" = "terminal" ] \
      && [ "$id" = "9998" ] && [ "$ctx" = "null" ] && [ "$fetches" = "2" ] \
+     && jq -e '.probe.context_description == null and (.probe | has("context_description"))' "$dir/out.json" >/dev/null \
      && [ "$(probe_count "$dir")" = "0" ]; then
     pass "#869 probe: a clean summary landing mid-probe is re-scanned and reported rc 0 (one bounded re-fetch, context fields null)"
   else
@@ -2393,7 +2396,8 @@ test_869_probe_summary_landing_mid_probe_is_scanned() {
     run_probe_case "$dir2" probe_summary_lands_during_probe_marker)
   status2=$(jq -r '.status' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
   fetches2=$(cat "$dir2/state/issues-fetch-count" 2>/dev/null || echo 0)
-  if [ "$rc2" = "2" ] && [ "$status2" = "findings" ] && [ "$fetches2" = "2" ]; then
+  if [ "$rc2" = "2" ] && [ "$status2" = "findings" ] && [ "$fetches2" = "2" ] \
+      && jq -e '.probe.context_description == null and (.probe | has("context_description"))' "$dir2/out.json" >/dev/null; then
     pass "#869 probe: a mid-probe summary carrying the #535 blocking marker escalates rc 2 instead of opening the barrier unscanned"
   else
     fail "#869 probe: mid-probe marker summary → rc=$rc2 status=$status2 fetches=$fetches2 (expected 2/findings/2)"
@@ -3915,7 +3919,7 @@ test_900_review_run_selector_ignores_bodyless_replies() {
     jq -nc --argjson rev "${1:-null}" --arg cu "$2" --arg sha "$sha" '
       {head_sha: $sha,
        probe: {observed: "awaiting-summary", context_state: "success",
-               context_updated_at: $cu}}
+               context_description: "Review completed", context_updated_at: $cu}}
       + (if $rev == null then {} else {review: $rev} end)'
   }
 
@@ -4701,6 +4705,77 @@ PY1673
   fi
 }
 
+# #939: drive the real sampled-record and JSON emitter, including the empty
+# optional description. Status changes after the sample must not swap only the
+# description while leaving the first sample's state/time in place.
+test_939_context_description() {
+  local name description dir rc
+  for name in completed empty normalized unknown escaped; do
+    case "$name" in
+      completed) description='Review completed' ;;
+      empty) description='' ;;
+      normalized) description='  REVIEW COMPLETE  ' ;;
+      unknown) description='Review complete — 0 files reviewed' ;;
+      escaped) description=$(printf 'unknown "quoted" \\ status\nnext line') ;;
+    esac
+    dir=$(make_case "probe-939-$name" 600 true 30 3 2)
+    enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+      CODERABBIT_TEST_STATUS_DESCRIPTION="$description" \
+      run_probe_case "$dir" probe_summary_lags_review)
+    if [ "$rc" = 7 ] && jq -e --arg description "$description" '
+        .probe.observed == "awaiting-summary" and .probe.context_state == "success" and
+        .probe.context_updated_at == "2026-06-04T00:00:07Z" and
+        .probe.context_description == $description' "$dir/out.json" >/dev/null; then
+      pass "#939 sampled description $name preserves the exact status record"
+    else fail "#939 sampled description $name (rc=$rc)"; fi
+  done
+  # Every sampled state carries its own description, including missing status.
+  for name in failure pending error absent; do
+    description="description for $name"
+    dir=$(make_case "probe-939-state-$name" 600 true 30 3 2)
+    enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS="$name" CODERABBIT_TEST_STATUS_DESCRIPTION="$description" \
+      run_probe_case "$dir" probe_summary_lags_review)
+    if [ "$name" = absent ]; then name=missing; description=''; fi
+    if [ "$rc" = 7 ] && jq -e --arg state "$name" --arg description "$description" '
+        .probe.context_state == $state and .probe.context_description == $description' "$dir/out.json" >/dev/null; then
+      pass "#939 sampled state $name preserves its matching description"
+    else fail "#939 sampled state $name lost its description (rc=$rc)"; fi
+  done
+  dir=$(make_case probe-939-same-sample 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' CODERABBIT_TEST_STATUS2=success \
+    CODERABBIT_TEST_STATUS2_DESCRIPTION='No review completed' \
+    run_probe_case "$dir" probe_summary_lags_review)
+  if [ "$rc" = 7 ] && jq -e '.probe.context_description == "Review completed"' "$dir/out.json" >/dev/null; then
+    pass '#939 publication rescan retains the first status sample description'
+  else fail "#939 publication rescan swapped description (rc=$rc)"; fi
+  dir=$(make_case probe-939-refusal-reset 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    CODERABBIT_TEST_STATUS_DESCRIPTION='Review rate limited' \
+    run_probe_case "$dir" probe_summary_lags_review)
+  if [ "$rc" = 7 ] && jq -e '.probe.observed == "rate_limit" and
+      .probe.context_state == null and .probe.context_updated_at == null and
+      .probe.context_description == null and (.probe | has("context_description"))' "$dir/out.json" >/dev/null; then
+    pass '#939 refusal resample clears all three context fields together'
+  else fail "#939 refusal resample leaked a sampled description (rc=$rc)"; fi
+}
+
+if [ "${1:-}" = --context-description-only ]; then
+  command -v jq >/dev/null 2>&1 || { echo 'ERROR: jq required' >&2; exit 1; }
+  test_939_context_description
+  test_probe_summary_lagging_head_review_is_not_yet
+  test_869_probe_awaiting_summary_context_state
+  test_869_probe_summary_landing_mid_probe_is_scanned
+  test_936_unreadable_status_is_not_an_absent_status
+  echo "Results: $PASS passed, $FAIL failed"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 if [ "${CODERABBIT_TEST_ONLY_1038:-0}" = 1 ]; then
   test_851_summary_helpers_unit
   echo "Results: $PASS passed, $FAIL failed"
@@ -4708,6 +4783,7 @@ if [ "${CODERABBIT_TEST_ONLY_1038:-0}" = 1 ]; then
   exit $?
 fi
 
+test_939_context_description
 test_1673_discretionary_counts
 if test_878_nested_tier_errors; then
   pass "#878: nested marker predicates preserve extraction errors separately from absence and API failure"
