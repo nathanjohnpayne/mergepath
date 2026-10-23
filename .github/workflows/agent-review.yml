@@ -1027,23 +1027,88 @@ jobs:
     if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout trusted disagreement detector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # #2775: the github-script step below holds the CI-actor PAT and
+          # require()s scripts/disagreement-detector.cjs. With no `ref:` a
+          # pull_request_review event checks out refs/pull/N/merge, so a
+          # same-repo branch could rewrite the detector and run it with the
+          # token. Load it only from the trusted default branch, as
+          # block-self-approval does. scripts/ci/check_pipeline_token_checkouts
+          # fails any token-holding job that regresses to this shape.
+          ref: ${{ github.event.repository.default_branch }}
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      - name: Install js-yaml
-        run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
+      # #975 (this job's row) and #2775: the reviewer allow-list comes from
+      # the policy governing the PR's base, through the same trusted loader
+      # load-config uses, not from the PR's own copy. Parsing it in shell also
+      # retires the run-time js-yaml install, an unpinned registry package
+      # the PAT-holding step used to require(). load-config cannot be
+      # reused directly: its `if:` admits only APPROVED review events, and
+      # this job needs CHANGES_REQUESTED events too.
+      - name: Resolve the governing reviewer allow-list
+        id: policy
+        env:
+          # Read-only, and used only when the policy is not already the
+          # checked-out one: a non-default base (the resolver fetches that
+          # base's file) or a default-branch tip that has moved past the
+          # event's base SHA (below). Otherwise no API call is made (#769).
+          # github.token can read this repository's contents, so no PAT is in
+          # scope while the policy is resolved.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          LOADER="scripts/workflow/load_review_config.sh"
+          if [ ! -f "$LOADER" ]; then
+            # Fail closed: an empty allow-list makes the next step a no-op.
+            echo "::warning::$LOADER is not on the default branch; leaving needs-human-review unchanged."
+            echo "reviewers=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a default-base PR the loader reads the local policy with no API
+          # call (#769), but the checkout follows the movable default-branch
+          # tip. If that tip is not the event's base SHA, read the policy at
+          # BASE_SHA instead, so the classification uses one policy
+          # generation. A policy update landing mid-run must not clear an
+          # escalation. An unreadable policy leaves the list unproven, and
+          # the next step then fails closed.
+          CONFIG=".github/review-policy.yml"
+          if [ "$BASE_REF" = "$DEFAULT_BRANCH" ] && [ "$(git rev-parse HEAD)" != "$BASE_SHA" ]; then
+            CONFIG="$(mktemp)"
+            if ! gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
+                -H "Accept: application/vnd.github.raw" > "$CONFIG"; then
+              echo "::warning::Could not read .github/review-policy.yml at base $BASE_SHA; the reviewer allow-list is unproven."
+              echo "reviewers=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # The loader emits fail-closed outputs (reviewers=[]) and exits 0
+          # when it cannot resolve the governing policy.
+          bash "$LOADER" \
+            --repo "$REPO" \
+            --base-ref "$BASE_REF" \
+            --base-sha "$BASE_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --default-config "$CONFIG"
 
       - name: Check for conflicting reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEWERS_JSON: ${{ steps.policy.outputs.reviewers }}
         with:
+          # #2775 C4: this step still needs a PAT. Removing needs-human-review
+          # must fire the `unlabeled` event that re-arms readiness (#620), and
+          # label events written with GITHUB_TOKEN start no workflow runs.
+          # Everything this process loads now comes from the trusted checkout.
           github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
-            const fs = require('fs');
             const path = require('path');
-            const yaml = require('js-yaml');
 
             // Decision logic lives in scripts/disagreement-detector.cjs
             // so the workflow and the fixture-driven test
@@ -1054,13 +1119,22 @@ jobs:
               path.resolve(process.env.GITHUB_WORKSPACE, 'scripts/disagreement-detector.cjs')
             );
 
-            let reviewerAccounts;
+            // An unproven allow-list (resolver failure, missing loader, empty
+            // or malformed list) must neither hide a live conflict nor clear
+            // an escalation (#975). With nobody classified, decide() would
+            // REMOVE an existing label and never apply one. So it classifies
+            // every reviewer on the PR instead, may only APPLY the label, and
+            // fails the job so the policy failure is visible.
+            let reviewerAccounts = [];
             try {
-              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
-              reviewerAccounts = config.available_reviewers || [];
+              const parsed = JSON.parse(process.env.REVIEWERS_JSON || '[]');
+              if (Array.isArray(parsed)) {
+                reviewerAccounts = parsed.filter(r => typeof r === 'string' && r);
+              }
             } catch (e) {
-              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+              reviewerAccounts = [];
             }
+            const allowListProven = reviewerAccounts.length > 0;
 
             // Paginate reviews — long histories (>30) otherwise truncate and
             // mask the latest-on-HEAD signal. Mirrors the pagination
@@ -1083,12 +1157,16 @@ jobs:
             });
             const hasLabel = labels.data.some(l => l.name === 'needs-human-review');
 
-            const decision = decide({
+            if (!allowListProven) {
+              reviewerAccounts = [...new Set(reviews.map(r => r.user && r.user.login).filter(Boolean))];
+            }
+            let decision = decide({
               reviews,
               reviewerAccounts,
               headSha: context.payload.pull_request.head.sha,
               hasLabel,
             });
+            if (!allowListProven && decision === 'remove') decision = 'noop';
 
             if (decision === 'apply') {
               await github.rest.issues.addLabels({
@@ -1125,6 +1203,9 @@ jobs:
                 // Label may already be removed — ignore 404
                 if (e.status !== 404) throw e;
               }
+            }
+            if (!allowListProven) {
+              core.setFailed('No governing available_reviewers list: classified every reviewer and never removed needs-human-review (#975).');
             }
             // decision === 'noop' — nothing to do.
 
