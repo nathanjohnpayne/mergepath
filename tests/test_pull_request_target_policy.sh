@@ -129,6 +129,10 @@ T="$(fresh_tree mixed-case-checkout)"
 edit "$T/.github/workflows/$DA" "s.replace('uses: actions/checkout@', 'uses: actIONS/Checkout@', 1).replace('github.event.pull_request.base.sha }}', 'github.event.pull_request.head.sha }}', 1)"
 T_MIXED="$T"
 
+T="$(fresh_tree upper-case-inputs)"
+edit "$T/.github/workflows/$MQ" "s.replace('          ref: \${{ github.event.pull_request.base.sha }}\n', '          REF: \${{ github.event.pull_request.head.sha }}\n          ALLOW-UNSAFE-PR-CHECKOUT: true\n', 1)"
+T_UPPER="$T"
+
 T="$(fresh_tree merge-ref-checkout)"
 edit "$T/.github/workflows/$MQ" "s.replace('ref: \${{ github.event.pull_request.base.sha }}', 'ref: refs/pull/\${{ github.event.pull_request.number }}/merge', 1)"
 T_MERGEREF="$T"
@@ -215,6 +219,8 @@ for mode in "${MODES[@]}"; do
   expect "lint flags a push trigger added to the queue recorder" 1 "merge-queue-authorization.yml triggers on .*push.* but REGISTRY pins" "$mode" lint --root "$T_MQPUSH"
   expect "lint flags a head-SHA checkout" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_HEAD"
   expect "lint matches action names case-insensitively" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_MIXED"
+  expect "lint reads checkout inputs in any case (ref)" 1 'merge-queue-authorization.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_UPPER"
+  expect "lint reads checkout inputs in any case (unsafe flag)" 1 'merge-queue-authorization.yml: job .* sets allow-unsafe-pr-checkout' "$mode" lint --root "$T_UPPER"
   expect "lint flags a merge-ref checkout" 1 'merge-queue-authorization.yml: job .* checks out ref refs/pull/' "$mode" lint --root "$T_MERGEREF"
   expect "lint flags a fork-repository checkout" 1 'auto-clear-blocking-labels.yml: job .* checks out repository .*head.repo.full_name' "$mode" lint --root "$T_FORKREPO"
   expect "lint flags allow-unsafe-pr-checkout" 1 'sets allow-unsafe-pr-checkout' "$mode" lint --root "$T_UNSAFE"
@@ -466,12 +472,13 @@ else
   fail "plan payload file"
 fi
 add_policy "$F" 22 "$(python3 "$TOOL" payloads | jq -c '.[1]')"
-out="$(GH_FIXTURE="$F" PATH="$SHIM:$PATH" python3 "$TOOL" plan --repo "$REPO" --out "$OUT" 2>&1)"
-if printf '%s\n' "$out" | grep -q '^# ERROR: 2 policies named "Mergepath auto-clear-blocking-labels events"' \
+rc=0
+out="$(GH_FIXTURE="$F" PATH="$SHIM:$PATH" python3 "$TOOL" plan --repo "$REPO" --out "$OUT" 2>&1)" || rc=$?
+if [ "$rc" = 1 ] && printf '%s\n' "$out" | grep -q '^# ERROR: 2 policies named "Mergepath auto-clear-blocking-labels events"' \
    && ! printf '%s\n' "$out" | grep -q 'policies/2[12] --input'; then
-  pass "plan refuses to pick between duplicate names"
+  pass "plan refuses to pick between duplicate names and exits 1"
 else
-  fail "plan duplicate names"; printf '%s\n' "$out" >&2
+  fail "plan duplicate names (exit $rc)"; printf '%s\n' "$out" >&2
 fi
 
 # --- Part 5: usage --------------------------------------------------------------

@@ -140,17 +140,21 @@ def unsafe_patterns(doc):
             uses = step.get('uses') if isinstance(step.get('uses'), str) else ''
             # GitHub resolves an action's owner/repo case-insensitively.
             action = uses.split('@', 1)[0].lower()
-            with_ = step.get('with') if isinstance(step.get('with'), dict) else {}
-            if 'allow-unsafe-pr-checkout' in with_:
-                found.append('%s sets allow-unsafe-pr-checkout' % where)
-            if action == 'actions/checkout':
-                if 'ref' not in with_:
-                    pass  # the default for pull_request_target is the default branch
-                elif normalize_expr(with_['ref']) not in SAFE_CHECKOUT_REFS:
-                    found.append('%s checks out ref %s' % (where, with_['ref']))
-                if 'repository' in with_ and normalize_expr(with_['repository']) != '${{ github.repository }}':
-                    found.append('%s checks out repository %s' % (where, with_['repository']))
-            elif action == 'actions/download-artifact':
+            # The runner passes inputs as upper-cased INPUT_* variables, so an
+            # input key matches in any case; keep every spelling, not the last.
+            inputs = [(str(k).lower(), v) for k, v in step['with'].items()] \
+                if isinstance(step.get('with'), dict) else []
+            for key, value in inputs:
+                if key == 'allow-unsafe-pr-checkout':
+                    found.append('%s sets allow-unsafe-pr-checkout' % where)
+                # Without a ref, pull_request_target checks out the default branch.
+                elif action == 'actions/checkout' and key == 'ref' \
+                        and normalize_expr(value) not in SAFE_CHECKOUT_REFS:
+                    found.append('%s checks out ref %s' % (where, value))
+                elif action == 'actions/checkout' and key == 'repository' \
+                        and normalize_expr(value) != '${{ github.repository }}':
+                    found.append('%s checks out repository %s' % (where, value))
+            if action == 'actions/download-artifact':
                 found.append('%s downloads an artifact' % where)
             run = step.get('run')
             if isinstance(run, str):
@@ -367,6 +371,7 @@ def plan(repo, out_dir):
         existing.setdefault(pol.get('name'), []).append(pol.get('id'))
     os.makedirs(out_dir, exist_ok=True)
     print('# Run as the repository owner (Administration: write), one command per line.')
+    incomplete = False
     for path in REGISTRY:
         body = payload(path)
         file = os.path.join(out_dir, '%s.%s.json' % (repo.replace('/', '__'), Path(path).stem))
@@ -376,13 +381,14 @@ def plan(repo, out_dir):
         ids = existing.get(body['name'], [])
         if len(ids) > 1:
             print('# ERROR: %d policies named "%s" (ids %s); resolve by hand' % (len(ids), body['name'], ids))
+            incomplete = True
             continue
         method, endpoint = ('PUT', 'repos/%s/actions/policies/%s' % (repo, ids[0])) if ids else \
                            ('POST', 'repos/%s/actions/policies' % repo)
         argv = ['scripts/gh-as-author.sh', '--', 'gh', 'api', '--method', method, '-H',
                 'X-GitHub-Api-Version: %s' % API_VERSION, endpoint, '--input', file]
         print(' '.join(shlex.quote(a) for a in argv))
-    return 0
+    return 1 if incomplete else 0
 
 
 def main(argv):
