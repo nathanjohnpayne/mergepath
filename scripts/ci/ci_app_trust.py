@@ -90,6 +90,12 @@ NAME = "check_ci_app_trust"
 
 OWNER = "nathanjohnpayne"
 HUB = OWNER + "/mergepath"
+# Numeric IDs (public `GET /repos/nathanjohnpayne/mergepath`, 2026-10-26). A
+# fleet-read policy lives in the target repository but its token comes from
+# the hub's run, so its repository and owner claims are always these; a policy
+# for an OWNER repository always carries OWNER_ID.
+OWNER_ID = "23488723"
+HUB_REPOSITORY_ID = "1190939344"
 ISSUER = "https://token.actions.githubusercontent.com"
 
 # The numeric ID (or, on a self-hosted deployment, the configured name) of the
@@ -173,6 +179,10 @@ def render_policy(identity, repository, repository_id, owner_id, app, immutable=
     spec = IDENTITIES[identity]
     caller = repository if spec["repo"] == "self" else HUB
     owner, name = caller.split("/", 1)
+    if spec["repo"] == "hub":
+        repository_id = HUB_REPOSITORY_ID
+    if owner == OWNER:
+        owner_id = OWNER_ID
     if immutable:
         subject = "repo:%s@%s/%s@%s:ref:refs/heads/main" % (owner, owner_id, name, repository_id)
     else:
@@ -635,7 +645,29 @@ def self_test(load):
                          WF, ALLOW)
     check("a SHA-suffixed local action still fails as local", len(v) == 1 and "local" in v[0], repr(v))
 
+    import contextlib
+    import io
     hub_doc = _good("fleet-read-drift")
+    check("fleet-read policies carry the hub's repository and owner IDs",
+          (hub_doc["claim_pattern"]["repository_id"], hub_doc["claim_pattern"]["repository_owner_id"])
+          == (HUB_REPOSITORY_ID, OWNER_ID))
+    for ident in ("fleet-read-sweep", "fleet-read-drift"):
+        wrong = _mut(lambda d: d["claim_pattern"].update(repository_id="111"), ident)
+        v = check_policy(load(_policy_text(wrong)), ident, REPO, PIN)
+        check("%s with the storing repository's ID fails" % ident, bool(v), repr(v))
+    wrong = _mut(lambda d: d["claim_pattern"].update(repository_owner_id="999"))
+    v = check_policy(load(_policy_text(wrong)), "review-mutations", REPO, PIN)
+    check("a fleet policy with another owner ID fails", bool(v), repr(v))
+    for args, want in (
+            (["fleet-read-sweep", "--repository", REPO, "--repository-id", "111", "--owner-id", OWNER_ID,
+              "--app", PIN], 2),
+            (["fleet-read-sweep", "--repository", REPO, "--repository-id", HUB_REPOSITORY_ID,
+              "--owner-id", OWNER_ID, "--app", PIN], 0),
+            (["review-mutations", "--repository", REPO, "--repository-id", "111", "--owner-id", "999",
+              "--app", PIN], 2)):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = render_main(list(args))
+        check("render %s %s exits %d" % (args[0], args[4], want), rc == want, "got %d" % rc)
     check("fleet-read policies carry the hub's subject", hub_doc["subject"] == "repo:%s:ref:refs/heads/main" % HUB)
     check("fleet-read workflow_ref names the hub",
           hub_doc["claim_pattern"]["workflow_ref"].startswith("nathanjohnpayne/mergepath/"))
@@ -698,8 +730,9 @@ def self_test(load):
         v = scan_policies(tmp, load, REPO, PIN)
         check("an unparseable policy fails closed", len(v) == 1 and "cannot parse" in v[0], repr(v))
     for bad in ("bad", "a/b/c", "", "-x/y"):
-        check("--repository %r is a usage error" % bad,
-              main(["--check", os.devnull, "--repository", bad]) == 2)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["--check", os.devnull, "--repository", bad])
+        check("--repository %r is a usage error" % bad, rc == 2, "got %d" % rc)
     print("%s: self-test %d/%d passed" % (NAME, total - failures, total))
     return failures == 0
 
@@ -735,6 +768,13 @@ def render_main(args):
         return 2
     doc = render_policy(rest[0], opts["--repository"], opts["--repository-id"], opts["--owner-id"],
                         app, immutable=bool(opts.get("--immutable")))
+    claims = doc["claim_pattern"]
+    if (claims["repository_id"], claims["repository_owner_id"]) != (opts["--repository-id"], opts["--owner-id"]):
+        print("%s: %s presents the IDs of %s (repository %s, owner %s), not the ones passed; "
+              "for a fleet-read identity pass the hub's IDs, whatever repository stores the policy"
+              % (NAME, rest[0], HUB if IDENTITIES[rest[0]]["repo"] == "hub" else opts["--repository"],
+                 claims["repository_id"], claims["repository_owner_id"]), file=sys.stderr)
+        return 2
     sys.stdout.write(dump_policy(doc, rest[0]))
     return 0
 
