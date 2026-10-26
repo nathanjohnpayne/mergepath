@@ -107,10 +107,12 @@
 #     (gate (a)) is skipped for this invocation because this gate is ITSELF
 #     a required check; waiting on the full required-check rollup (which
 #     includes this gate) would deadlock. CI green is enforced
-#     independently by the other required checks. Verified propagation PRs
-#     (trusted github-actions[bot] lane marker, label absent) are EXEMPT —
-#     the pr-review-policy.yml lane already cleared them; re-deriving would
-#     force them into Phase 4 and break the lane (#429 Codex round-2 P1).
+#     independently by the other required checks. When the force-on label is
+#     absent, a propagation PR is exempt only after this gate independently
+#     verifies the live head/base pair from its trusted checkout. The lane
+#     marker is diagnostic evidence only; a later head or base move requires
+#     fresh byte verification. Re-deriving a verified mirror would force it
+#     into Phase 4 and break the lane (#429 Codex round-2 P1).
 #
 #   Any other PR (under-threshold, non-Dependabot, or relevant knob off):
 #     CLEAN PASS (exit 0) unless a human-controlled hold is present. It can be a required
@@ -1276,15 +1278,15 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
     REQUIRES_EXTERNAL=true
     REQUIRES_REASON="needs-external-review label present"
   elif lane_verified; then
-    # Verified propagation PR: a trusted github-actions[bot] lane marker
-    # scoped to THIS head/base pair is present (label absent). The lane already
-    # byte-verified this exact pair and exempted it from external review;
-    # defer to it and do NOT re-derive from threshold/paths (#429).
-    log "verified propagation lane (trusted pair marker for $HEAD_SHA/$BASE_SHA, label absent) — exempt from external-review derivation; deferring to pr-review-policy.yml lane"
+    # The trusted live verifier just verified THIS head/base pair. A lane
+    # marker is diagnostic only; it does not grant this exemption. A later
+    # head/base move requires fresh verification. The force-on label above
+    # still takes precedence over this predicate (#429).
+    log "verified propagation lane (trusted live byte verification for $HEAD_SHA/$BASE_SHA, label absent) — exempt from external-review derivation"
   else
     lane_rc=$?
-    # Indeterminate marker read (rc 2): in the FULL gate, falling through to
-    # threshold/paths derivation is fail-safe (external review can only be
+    # Indeterminate live verification (rc 2): in the FULL gate, falling
+    # through to threshold/paths derivation is fail-safe (external review can only be
     # ADDED, never removed, so an uncertain read at worst over-requires and
     # blocks). But in the query modes, `true` is the value that authorizes
     # the rc=5 CodeRabbit downgrade, and a verified propagation PR's real
