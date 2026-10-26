@@ -14,7 +14,7 @@
 
 Octo STS is open source and runs either as Chainguard's hosted service (`https://octo-sts.dev`, GitHub App `octo-sts`) or as a deployment the owner runs. The trust policy format, the action and the exchange are the same either way.
 
-Live readback, 2026-10-26, unauthenticated `GET https://api.github.com/apps/octo-sts`: app ID `801323`, owner `octo-sts`, bot login `octo-sts[bot]` (user ID `157150467`). The installation requests these permissions: Actions write, **Administration write**, Checks write, **Contents write**, Deployments write, Discussions write, Environments write, Issues write, Members write, Metadata read, Organization administration write, Organization API insights read, Organization custom roles and custom organization roles write, Organization events read, Organization projects write, Packages write, Pages write, Pull requests write, Repository projects write, Security events write, Statuses write, **Workflows write**. The project README lists Administration as read-only; the live app requests write. The live value is the one an installation grants.
+Live readback, 2026-10-26, unauthenticated `GET https://api.github.com/apps/octo-sts`: app ID `801323`, owner `octo-sts`, bot login `octo-sts[bot]` (user ID `157150467`). These are the app's **registered** permissions, the set a new installation is asked to accept: Actions write, **Administration write**, Checks write, **Contents write**, Deployments write, Discussions write, Environments write, Issues write, Members write, Metadata read, Organization administration write, Organization API insights read, Organization custom roles and custom organization roles write, Organization events read, Organization projects write, Packages write, Pages write, Pull requests write, Repository projects write, Security events write, Statuses write, **Workflows write**. The project README lists Administration as read-only, while the registered set says write. The effective permissions of a particular installation are not in this response; the owner reads them on the install screen and on the installation's settings page (see [Before the pilot](#before-the-pilot)), and they bound what Octo STS can mint for that installation.
 
 | | Hosted (`octo-sts`, app 801323) | Self-hosted |
 |---|---|---|
@@ -52,7 +52,7 @@ The output is ADR 0004's template: exact `issuer` and `subject` (name-only, or t
 
 `scripts/ci/check_ci_app_trust` runs in repo-lint (`lint-fast` shard 1) on the hub and every consumer. Until a later slice extends it, it enforces:
 
-- **Who may request `id-token: write`.** Only a (workflow, job) pair in `ALLOWED_ID_TOKEN_JOBS`; that list is empty, so any grant anywhere fails today. A workflow-level grant always fails, including `permissions: write-all`. An allow-listed job may trigger only on its identity's events, names no environment, checks out this repository at `${{ github.workflow_sha }}` with `persist-credentials: false`, uses only SHA-pinned non-local actions, and restores no artifact or cache.
+- **Who may request `id-token: write`.** Only a (workflow, job) pair in `ALLOWED_ID_TOKEN_JOBS`; that list is empty, so any grant anywhere fails today. A workflow-level grant always fails, including `permissions: write-all`. An allow-listed job may trigger only on its identity's events, names no environment and no job-level `container` or `services` image, checks out this repository at `${{ github.workflow_sha }}` with `persist-credentials: false`, uses only SHA-pinned non-local actions, and restores no artifact or cache.
 - **Trust policies.** Every file in `.github/chainguard/` must be `<identity>.sts.yaml` for a known identity, and its parsed content must equal the rendered template for this repository. Every policy must pin `APP_PIN`, which is `None` until the pilot records it, so no policy can land before the pilot does.
 
 The gate cannot see what Octo STS itself accepts. Those are pilot items.
@@ -93,7 +93,7 @@ Every step here is owner-performed. Agents prepare and verify; they do not execu
 
 1. Decide the pilot hosting (recommended: hosted, for the pilot only). Record it on #2732.
 2. Install the app on `nathanjohnpayne/mergepath` only. Hosted: `https://github.com/apps/octo-sts/installations/new`, choose **Only select repositories**, select `mergepath`. Self-hosted: register the app with the permission set in the hosting table, deploy the service, then install it the same way.
-3. Read back the installation as the owner: `gh api /user/installations --jq '.installations[] | {app_slug, app_id, repository_selection, permissions}'`. Post the output on #2732.
+3. Verify the installation on its settings page (`https://github.com/settings/installations`, then **Configure** on the app). Confirm that **Repository access** is **Only select repositories** with exactly `mergepath` listed, and record the permissions the page shows. Post both on #2732. A normal owner `gh` token cannot list an installation's repositories: GitHub documents `GET /user/installations/{installation_id}/repositories` for a GitHub App user access token of that app only, so the settings page is the owner-side record.
 
 ### Pilot
 

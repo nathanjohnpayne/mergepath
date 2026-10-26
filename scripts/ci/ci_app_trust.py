@@ -22,8 +22,10 @@ PART A: WHO MAY REQUEST `id-token: write` (ADR "Who may request")
 
       * every workflow trigger is one of its identity's events (no candidate
         event, no `pull_request_target`, no undeclared `workflow_dispatch`);
-      * it names no `environment` (that changes the OIDC `sub`) and is not a
-        reusable-workflow call;
+      * it names no `environment` (that changes the OIDC `sub`), is not a
+        reusable-workflow call, and declares no job-level `container` or
+        `services` image (every step would share the OIDC request variables
+        with that image);
       * every checkout is this repository at `${{ github.workflow_sha }}`
         with `persist-credentials: false` and only allow-listed inputs;
       * no local action (`uses: ./...`), no `docker://` action, every other
@@ -148,7 +150,7 @@ ALLOWED_ID_TOKEN_JOBS = {}
 TRUSTED_CHECKOUT_INPUTS = {"ref", "repository", "persist-credentials", "fetch-depth",
                            "sparse-checkout", "sparse-checkout-cone-mode", "path"}
 SHA_PINNED_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
-REPO_RE = re.compile(r"^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$")
+REPO_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$")
 DIGITS_RE = re.compile(r"^[0-9]+$")
 APP_RE = re.compile(r"^(?:[0-9]+|[a-z][a-z0-9-]*)$")
 POLICY_SUFFIX = ".sts.yaml"
@@ -324,6 +326,11 @@ def execution_violations(job, events, identity):
         out.append("names an environment (its OIDC sub would lose the ref)")
     if "uses" in job:
         out.append("is a reusable-workflow call")
+    for key in ("container", "services"):
+        if key in job:
+            # Every step, OIDC request variables included, runs in or beside
+            # that image: third-party code that could mint the token.
+            out.append("declares a job-level %s image" % key)
     for i, step in enumerate(job.get("steps") or []):
         if not isinstance(step, dict):
             out.append("step %d cannot be read" % i)
@@ -522,6 +529,12 @@ WORKFLOW_CASES = [
     ("a reusable-workflow call fails", WF,
      "on: workflow_run\njobs:\n  consume:\n    permissions:\n      id-token: write\n"
      "    uses: ./.github/workflows/x.yml\n", ALLOW, 1),
+    ("a job-level container image fails", WF,
+     _wf(GOOD_CHECKOUT + EXCHANGE, extra="    container: node:20\n"), ALLOW, 1),
+    ("a pinned container image still fails", WF,
+     _wf(GOOD_CHECKOUT + EXCHANGE, extra="    container:\n      image: node@sha256:%s\n" % ("0" * 64)), ALLOW, 1),
+    ("a service container fails", WF,
+     _wf(GOOD_CHECKOUT + EXCHANGE, extra="    services:\n      db:\n        image: postgres:16\n"), ALLOW, 1),
     ("a listed job in another file fails", "other.yml", _wf(GOOD_CHECKOUT + EXCHANGE),
      {("other.yml", "consume"): "review-mutations"}, 1),
     ("a second, unlisted job in the file fails", WF,
@@ -684,6 +697,9 @@ def self_test(load):
             fh.write("issuer: [\n")
         v = scan_policies(tmp, load, REPO, PIN)
         check("an unparseable policy fails closed", len(v) == 1 and "cannot parse" in v[0], repr(v))
+    for bad in ("bad", "a/b/c", "", "-x/y"):
+        check("--repository %r is a usage error" % bad,
+              main(["--check", os.devnull, "--repository", bad]) == 2)
     print("%s: self-test %d/%d passed" % (NAME, total - failures, total))
     return failures == 0
 
@@ -731,7 +747,8 @@ def main(argv):
     if args and args[0] in ("--self-test", "--check"):
         mode = args.pop(0)[2:]
     opts, rest = _opts(args, ("--repository",))
-    if len(rest) > 1 or (rest and mode != "check") or (opts and mode == "self-test"):
+    if len(rest) > 1 or (rest and mode != "check") or (opts and mode == "self-test") \
+            or ("--repository" in opts and not REPO_RE.match(opts["--repository"])):
         print("usage: %s [--self-test | --check [ROOT] [--repository OWNER/NAME] | --render ...]" % NAME,
               file=sys.stderr)
         return 2
