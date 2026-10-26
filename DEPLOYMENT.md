@@ -329,7 +329,7 @@ gh secret set CI_ACTOR_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Priva
 
 # Run these only after the protected environment above exists and its exact
 # main-only policy has been read back.
-gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<author-token-item-id>/token')"   # this repository's fine-grained nathanjohnpayne PAT (specs/author_merge_token.md)
+op read 'op://Private/<author-token-item-id>/token' | gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo {owner}/{repo}   # this repository's fine-grained nathanjohnpayne PAT, via stdin (specs/author_merge_token.md)
 gh secret set MERGE_QUEUE_POLICY_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<merge-queue-policy-token-item-id>/token')"   # pairwise-distinct target policy PAT
 gh secret set MERGE_QUEUE_SOURCE_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<merge-queue-source-token-item-id>/token')"   # pairwise-distinct source-only PAT
 ```

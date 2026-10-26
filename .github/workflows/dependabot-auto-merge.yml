@@ -513,14 +513,20 @@ jobs:
           # per-repository fine-grained author token (#2728). The login check
           # above cannot tell it from the shared classic token, which a
           # missing merge-queue-policy copy silently falls back to.
+          # A repeated key fails closed: the first match could be an `any`
+          # left above the cutover's `fine-grained`.
           REQUIRED_AUTHOR_CLASS=$(awk '
             /^[^[:space:]]/ && $1 == "author_merge_token_class:" {
+              n++
               sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
               gsub(/[[:space:]]*#.*$/, "", $0)
-              gsub(/^["\047]|["\047]$/, "", $0)
               sub(/[[:space:]]+$/, "", $0)
-              print
-              exit
+              gsub(/^["\047]|["\047]$/, "", $0)
+              value = $0
+            }
+            END {
+              if (n > 1) print "duplicate-key"
+              else if (n == 1) print value
             }
           ' "$POLICY")
           if [ -n "$REQUIRED_AUTHOR_CLASS" ] && [ "$REQUIRED_AUTHOR_CLASS" != "any" ]; then

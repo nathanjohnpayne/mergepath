@@ -65,6 +65,7 @@ The requirement is the top-level `author_merge_token_class` key in each reposito
 | absent, or `any` | Not cut over. The class is not checked, and today's identity checks are unchanged. |
 | `fine-grained` | The token must start with `github_pat_`. A classic token, an OAuth or installation token, the brokered placeholder or an empty value fails. |
 | anything else | Fails closed as an unknown requirement. |
+| the key more than once | Fails closed (`duplicate-key`). Both readers would otherwise take the first match, so an `any` left above a later `fine-grained` would skip the check. |
 
 - `credential_meets_author_token_class` in `scripts/lib/credential-class.sh` is the single decision: exit 0 for a met or absent requirement, 1 for a mismatch, 2 for an unknown value.
 - **C10 and C12** read the key from the governing base policy that `approval-merge-continuation.sh` already resolves for `author_identity`, and check the token right after the login check. A mismatch or an unknown value is an infrastructure error (exit 3) before any readiness read. A met requirement logs `approval continuation: author token meets author_merge_token_class 'fine-grained'`.
@@ -104,13 +105,11 @@ Do these in order, one repository at a time.
 
 1. **Create the token** at GitHub → Settings → Developer settings → Fine-grained tokens, with the [settings and permissions above](#permission-set). Name it `mergepath author <repo>`.
 2. **Store it in 1Password** in the `Private` vault, as a new item titled `GitHub PAT nathanjohnpayne author <repo>` with the value in field `token` and the expiry date in a field. Note the item ID: look items up by ID, never by title.
-3. **Set the environment secret**, leaving the repository copy in place:
+3. **Set the environment secret**, leaving the repository copy in place. Pipe the value in: `gh secret set` reads it from standard input when `--body` is omitted, which keeps it out of the process list that `--body "$(op read …)"` would put it in.
 
    ```bash
-   gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo nathanjohnpayne/<repo> --body "$(op read 'op://Private/<item-id>/token')"
+   op read 'op://Private/<item-id>/token' | gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo nathanjohnpayne/<repo>
    ```
-
-   `gh secret set` also reads the value from standard input when `--body` is omitted, which keeps it out of the process list: `op read 'op://Private/<item-id>/token' | gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo nathanjohnpayne/<repo>`.
 4. **Read back names only.** `gh api repos/nathanjohnpayne/<repo>/environments/merge-queue-policy/secrets --jq '.secrets[].name'` lists `AUTHOR_MERGE_TOKEN`.
 5. **Verify the token before the policy requires it.** On the next Dependabot patch or minor PR, the merge step completes and `gh pr view <n> --repo nathanjohnpayne/<repo> --json mergedBy --jq .mergedBy.login` prints `nathanjohnpayne`. On the next approved PR, the auto-clear continuation pass prints merge-ready (or follows the P2 outcome). A job that names the environment prefers the environment copy, so these runs already use the new token.
 6. **Require the class.** Merge a PR in that repository setting `author_merge_token_class: fine-grained` in `.github/review-policy.yml`. From then on, a missing environment copy fails closed instead of using the classic repository copy.
@@ -158,5 +157,5 @@ Ownership of every token: `nathanjohnpayne` (the repository owner), who mints, s
 
 ## Tests
 
-- `tests/test_author_merge_token.sh` covers `credential_meets_author_token_class` and executes the shipped C14 block from `.github/workflows/dependabot-auto-merge.yml` against sample policies: absent, `any`, `fine-grained` with each token class, quoted and commented values, an unknown value, and a missing or older library. `scripts/ci/check_workflow_parsers` runs it.
-- `tests/test_approval_merge_continuation.sh` covers the C10 and C12 wiring: a `fine-grained` policy rejects a classic token before any readiness read, accepts `github_pat_` and logs it, `any` keeps the classic token, an unknown value fails closed, and an older library is harmless under `any` but fails closed under `fine-grained`.
+- `tests/test_author_merge_token.sh` covers `credential_meets_author_token_class` and executes the shipped C14 block from `.github/workflows/dependabot-auto-merge.yml` against sample policies: absent, `any`, `fine-grained` with each token class, quoted, commented and trailing-space values, a repeated key, an unknown value, and a missing or older library. `scripts/ci/check_workflow_parsers` runs it.
+- `tests/test_approval_merge_continuation.sh` covers the C10 and C12 wiring: a `fine-grained` policy rejects a classic token before any readiness read, accepts `github_pat_` and logs it, `any` keeps the classic token, an unknown value and a repeated key fail closed, and an older library is harmless under `any` but fails closed under `fine-grained`.

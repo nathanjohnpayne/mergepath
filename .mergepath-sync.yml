@@ -2683,6 +2683,7 @@ paths:
       - "tests/test_identity_check.sh"         # check_gh_as_author (#2726)
       - "tests/test_dependabot_auto_merge_check_wait.sh"  # check_workflow_parsers (#889)
       - "tests/test_author_merge_token.sh"     # check_workflow_parsers (#2728)
+      - ".github/workflows/dependabot-auto-merge.yml"  # test_author_merge_token.sh extracts and runs its class block (#2728)
       - "tests/test_git_identity_hygiene.sh"   # check_git_identity_hygiene (#777)
       - "tests/test_op_preflight_check.sh"     # check_op_preflight_contract
       - "tests/test_op_preflight_token_mode.sh"  # check_op_preflight_contract

@@ -67,11 +67,11 @@ fi
 mkdir -p "$TMP/base/.github" "$TMP/base/scripts/lib"
 cp "$LIB" "$TMP/base/scripts/lib/credential-class.sh"
 
-run_block() {  # <policy-line or empty> <token>; prints the exit code
+run_block() {  # <policy-lines or empty> <token>; prints the exit code
   local line="$1" token="$2" rc
   {
     printf 'author_identity: nathanjohnpayne\n'
-    [ -z "$line" ] || printf '%s\n' "$line"
+    [ -z "$line" ] || printf '%b\n' "$line"
   } > "$TMP/base/.github/review-policy.yml"
   set +e
   (
@@ -102,6 +102,9 @@ expect_block 1 "author_merge_token_class: fine-grained"     "ghp_sharedclassic" 
 expect_block 1 'author_merge_token_class: "fine-grained"'   "ghp_sharedclassic"   "workflow: a quoted value is still enforced"
 expect_block 1 "author_merge_token_class: fine-grained # cut over" "ghp_sharedclassic" "workflow: a trailing comment is still enforced"
 expect_block 1 "author_merge_token_class: classic"          "ghp_sharedclassic"   "workflow: an unknown value fails closed" "unknown author_merge_token_class 'classic'"
+expect_block 0 'author_merge_token_class: "fine-grained"   ' "github_pat_11ABCDEF" "workflow: a quoted value with trailing spaces is read" "meets author_merge_token_class 'fine-grained'"
+expect_block 1 "author_merge_token_class: 'fine-grained'  " "ghp_sharedclassic"   "workflow: a single-quoted value with trailing spaces is enforced" "Is the merge-queue-policy environment copy missing?"
+expect_block 1 "author_merge_token_class: any\nauthor_merge_token_class: fine-grained" "ghp_sharedclassic" "workflow: a repeated key fails closed" "unknown author_merge_token_class 'duplicate-key'"
 
 sed '/^credential_meets_author_token_class()/,$d' "$LIB" > "$TMP/base/scripts/lib/credential-class.sh"
 expect_block 1 "author_merge_token_class: fine-grained"     "github_pat_11ABCDEF" "workflow: an older library fails closed" "predates the class check"

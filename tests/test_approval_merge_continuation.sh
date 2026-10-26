@@ -217,6 +217,9 @@ run_case() {
   if [ -n "${STUB_AUTHOR_CLASS:-}" ]; then
     printf 'author_merge_token_class: %s\n' "$STUB_AUTHOR_CLASS" >> "$TMP/root/policy.yml"
   fi
+  if [ -n "${STUB_AUTHOR_CLASS_REPEAT:-}" ]; then
+    printf 'author_merge_token_class: %s\n' "$STUB_AUTHOR_CLASS_REPEAT" >> "$TMP/root/policy.yml"
+  fi
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
@@ -302,7 +305,7 @@ reset_fixtures() {
   unset STUB_WORKFLOW_QUEUE_SOURCE_TOKEN
   unset STUB_PROTECTIVE_DONE
   unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
-  unset STUB_AUTHOR_CLASS
+  unset STUB_AUTHOR_CLASS STUB_AUTHOR_CLASS_REPEAT
 }
 
 reset_fixtures
@@ -1833,6 +1836,23 @@ if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
   pass "unknown author_merge_token_class fails closed"
 else
   fail "unknown author_merge_token_class must fail closed (rc=$rc)"
+fi
+
+# The scalar reader takes the first match, so a repeated key must fail closed:
+# an `any` left above the cutover's `fine-grained` would otherwise win.
+reset_fixtures
+STUB_AUTHOR_CLASS="any"
+STUB_AUTHOR_CLASS_REPEAT="fine-grained"
+TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+set +e
+run_case
+rc=$?
+set -e
+if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq "unknown author_merge_token_class 'duplicate-key'" "$TMP/subject.out"; then
+  pass "a repeated author_merge_token_class key fails closed"
+else
+  fail "a repeated author_merge_token_class key must fail closed (rc=$rc)"
 fi
 
 # A consumer can receive this script before the library that defines the class
