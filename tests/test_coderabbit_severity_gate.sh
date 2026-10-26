@@ -510,6 +510,82 @@ REFACTOR_BODY="**🛠️ Refactor suggestion**
 
 Extract this into a helper."
 
+# #2804: exercise publication metadata through the real gate and fake gh.
+# Keep this focused mode ahead of the legacy cases for bounded mutation runs.
+test_batch_continuations() {
+  local scratch pr comments threads reviews base marker root continuation out rc
+  scratch=$(make_scratch_with_config true)
+  pr=$(make_pr_fixture "$HEAD_SHA")
+  comments=$(make_comments_fixture '[]')
+  threads=$(make_threads_fixture '[]')
+  marker='<!-- coderabbit-review-publication v1 publication=69d54167-7071-4e27-9a82-4079dcd03f7d attempt=b738a69a-09d7-4b7b-9e6b-220e260b06f9 batch='
+  # The vendor header makes this use own-commits-range, as the real report did.
+  root="<!-- coderabbit-ai-generated:v1 -->
+
+<details><summary>📥 Commits</summary>
+
+Reviewing files that changed between 1111111111111111111111111111111111111111 and $HEAD_SHA.
+
+</details>
+
+${marker}1/2 -->"
+  continuation="<!-- coderabbit-ai-generated:v1 -->
+
+**Review continued from previous batch...**
+
+${marker}2/2 -->"
+  base=$(jq -cn --arg sha "$HEAD_SHA" --arg root "$root" --arg continuation "$continuation" '
+    [{id: 8001, body: $root, submitted_at: "2026-10-26T22:29:13Z"},
+     {id: 8002, body: $continuation, submitted_at: "2026-10-26T22:30:17Z"}]
+    | map(. + {user: {login: "coderabbitai[bot]"}, commit_id: $sha, state: "COMMENTED"})')
+  batch_case() {
+    local label=$1 expected=$2 transform=$3 inline=${4:-false} diagnostic=${5:-}
+    reviews="$WORKDIR/batch-reviews.json"
+    jq -c "$transform" <<<"$base" > "$reviews"
+    if [ "$inline" = true ]; then
+      comments=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+      threads=$(make_threads_fixture '[{isResolved:false, comment_ids:[2001]}]')
+    else
+      comments=$(make_comments_fixture '[]')
+      threads=$(make_threads_fixture '[]')
+    fi
+    rc=0
+    out=$(FIXTURE_PR="$pr" FIXTURE_COMMENTS="$comments" FIXTURE_THREADS="$threads" \
+      FIXTURE_ISSUE_COMMENTS='' FIXTURE_REVIEWS="$reviews" REQUIRE_REVIEW_SUMMARY=true \
+      run_gate "$scratch" 99 owner/repo 2>&1) || rc=$?
+    if [ "$rc" = "$expected" ] && { [ -z "$diagnostic" ] || grep -q "$diagnostic" <<<"$out"; }; then
+      pass "#2804: $label → exit $expected"
+    else
+      fail "#2804: $label expected exit $expected/$diagnostic, got $rc"
+      printf '%s\n' "$out" >&2
+    fi
+  }
+  batch_case 'complete metadata keeps root report' 0 '.' false 'recognised by: own-commits-range'
+  batch_case 'root-only legacy acceptance stays unchanged' 0 '[.[0]]'
+  batch_case 'root summary Major remains blocking' 1 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives."' false 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'unresolved inline Major remains blocking' 1 '.' true 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'continuation without root stays unread' 3 '[.[1]]'
+  batch_case 'incomplete publication stays unread' 3 'map(.body |= sub("/2 -->"; "/3 -->"))'
+  batch_case 'mismatched attempt stays unread' 3 '.[1].body |= sub("b738a69a"; "c738a69a")'
+  batch_case 'mismatched publication stays unread' 3 '.[1].body |= sub("69d54167"; "79d54167")'
+  batch_case 'mismatched total stays unread' 3 '.[1].body |= sub("2/2"; "2/3")'
+  batch_case 'duplicate ordinal stays unread' 3 '. + [.[1] + {id: 8003}]'
+  batch_case 'malformed ordinal stays unread' 3 '.[1].body |= sub("2/2"; "02/2")'
+  batch_case 'extra continuation prose stays unread' 3 '.[1].body += "\nUnread finding text."'
+  batch_case 'other-head root cannot pair' 3 '.[0].commit_id = "1111111111111111111111111111111111111111"'
+  batch_case 'other-provider root cannot pair' 3 '.[0].user.login = "other[bot]"'
+  batch_case 'later unknown review still holds' 3 '. + [.[1] + {id: 8003, body: "Unknown next report", submitted_at: "2026-10-26T22:31:00Z"}]'
+  batch_case 'dismissed publication retains root report' 0 'map(.state = "DISMISSED")'
+  batch_case 'later same-head report retains supersession' 0 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nEarlier finding." | . + [.[1] + {id: 8003, body: "**Actionable comments posted: 0**", submitted_at: "2026-10-26T22:31:00Z"}]'
+  unset -f batch_case
+}
+test_batch_continuations
+if [ "${1:-}" = --batch-continuations-only ]; then
+  printf 'batch continuations: %s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 # ---------------------------------------------------------------------------
 # Test 1: Gate disabled — exit 0, no API calls.
 # ---------------------------------------------------------------------------
