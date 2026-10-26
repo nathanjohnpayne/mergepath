@@ -245,6 +245,8 @@ case "$endpoint" in
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml" ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) printf '%s\n' "$now" ;;
   repos/owner/repo/issues/999/timeline)      printf '[]\n' ;;
+  # #2664: the same-head hold's force-push read; no force-push here.
+  graphql) printf '%s\n' '{"data":{"repository":{"pullRequest":{"timelineItems":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
   repos/owner/repo/pulls/999/reviews)        printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments)       printf '[]\n' ;;
   repos/owner/repo/issues/999/reactions)     printf '[]\n' ;;
