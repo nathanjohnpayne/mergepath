@@ -733,6 +733,10 @@ def self_test(load):
         with contextlib.redirect_stderr(io.StringIO()):
             rc = main(["--check", os.devnull, "--repository", bad])
         check("--repository %r is a usage error" % bad, rc == 2, "got %d" % rc)
+    for args in (["--check", "--repository"], ["--check", os.devnull, "--repository"], ["--check", "--bogus"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(list(args))
+        check("%s is a usage error" % " ".join(args), rc == 2, "got %d" % rc)
     print("%s: self-test %d/%d passed" % (NAME, total - failures, total))
     return failures == 0
 
@@ -787,7 +791,10 @@ def main(argv):
     if args and args[0] in ("--self-test", "--check"):
         mode = args.pop(0)[2:]
     opts, rest = _opts(args, ("--repository",))
+    # An option left in `rest` lost its value (`--check --repository`); never
+    # let it become the scan root.
     if len(rest) > 1 or (rest and mode != "check") or (opts and mode == "self-test") \
+            or any(r.startswith("-") for r in rest) \
             or ("--repository" in opts and not REPO_RE.match(opts["--repository"])):
         print("usage: %s [--self-test | --check [ROOT] [--repository OWNER/NAME] | --render ...]" % NAME,
               file=sys.stderr)
