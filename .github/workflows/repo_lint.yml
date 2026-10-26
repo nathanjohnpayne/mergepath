@@ -887,6 +887,16 @@ jobs:
         # check_no_token_in_output.
         run: ./scripts/ci/check_pipeline_token_checkouts || { rc=$?; if [ -f scripts/ci/check_pipeline_token_checkouts ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_pipeline_token_checkouts is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/pipeline_token_checkouts.py ]; then echo "check_pipeline_token_checkouts is absent while its gate payload scripts/ci/pipeline_token_checkouts.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_pipeline_token_checkouts not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
+      - name: check_ci_app_trust
+        if: matrix.shard == 1
+        # #2727 / ADR 0004: only allow-listed trusted jobs may request
+        # `id-token: write` (none yet), and every .github/chainguard/*.sts.yaml
+        # Octo STS trust policy must equal the ADR template and the app pin the
+        # #2732 pilot records. Embedded self-test, then a scan. Soft-pass only
+        # when the launcher AND its payload are both absent (bootstrap skew); a
+        # missing launcher beside its payload is a deletion and fails.
+        run: ./scripts/ci/check_ci_app_trust || { rc=$?; if [ -f scripts/ci/check_ci_app_trust ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_ci_app_trust is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/ci_app_trust.py ]; then echo "check_ci_app_trust is absent while its gate payload scripts/ci/ci_app_trust.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_ci_app_trust not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
+
       - name: check_self_approval_detector
         if: matrix.shard == 4
         run: ./scripts/ci/check_self_approval_detector || { rc=$?; if [ ! -f scripts/ci/check_self_approval_detector ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_self_approval_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
