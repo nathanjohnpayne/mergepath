@@ -308,7 +308,7 @@ Before enabling Dependabot auto-merge or #1058, create the target Actions enviro
 
 | Secret name | Value | PAT type |
 |---|---|---|
-| `AUTHOR_MERGE_TOKEN` | PAT for the **author identity** (`nathanjohnpayne`) used by trusted `pull_request_target`, `workflow_run`, scheduled, and protected `repository_dispatch` paths | Classic with `repo` scope (author account) |
+| `AUTHOR_MERGE_TOKEN` | PAT for the **author identity** (`nathanjohnpayne`) used by trusted `pull_request_target`, `workflow_run`, scheduled, and protected `repository_dispatch` paths | Fine-grained, this repository only: `Contents` and `Pull requests` read and write; `Issues`, `Actions`, `Commit statuses` and `Administration` read; plus automatic `Metadata: read`. One token per repository, from its own 1Password item; see [`specs/author_merge_token.md`](specs/author_merge_token.md). Until a repository cuts over, the shared classic `repo`-scope author PAT |
 | `MERGE_QUEUE_POLICY_TOKEN` | Distinct PAT for the **author identity** (`nathanjohnpayne`) used only by #1058 target-topology read operations (REST `GET` plus fixed GraphQL) | Fine-grained, selected target repository only; organization `Administration: write`; target repository `Administration: write`, `Actions: read`, `Secrets: read`, `Environments: read`, `Contents: read`, `Issues: read`, `Pull requests: read`, plus automatic `Metadata: read` |
 | `MERGE_QUEUE_SOURCE_TOKEN` | Distinct PAT for the **author identity** (`nathanjohnpayne`) used only by #1058 reads against the public policy-source repository | Fine-grained, selected policy-source repository only; `Actions: read`, plus automatic `Metadata: read` |
 
@@ -329,7 +329,7 @@ gh secret set CI_ACTOR_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Priva
 
 # Run these only after the protected environment above exists and its exact
 # main-only policy has been read back.
-gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"   # nathanjohnpayne (author identity)
+gh secret set AUTHOR_MERGE_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<author-token-item-id>/token')"   # this repository's fine-grained nathanjohnpayne PAT (specs/author_merge_token.md)
 gh secret set MERGE_QUEUE_POLICY_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<merge-queue-policy-token-item-id>/token')"   # pairwise-distinct target policy PAT
 gh secret set MERGE_QUEUE_SOURCE_TOKEN --env merge-queue-policy --repo {owner}/{repo} --body "$(op read 'op://Private/<merge-queue-source-token-item-id>/token')"   # pairwise-distinct source-only PAT
 ```

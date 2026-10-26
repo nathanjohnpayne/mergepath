@@ -855,6 +855,16 @@ paths:
     requires:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/lib/credential-class.sh"   # the author-token class gate (#2728)
+  # Pairs with scripts/ci/check_workflow_parsers (#2728): the author-token class
+  # gate in scripts/lib/credential-class.sh, and the shipped Dependabot merge
+  # step that reads author_merge_token_class and calls it.
+  - path: tests/test_author_merge_token.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/credential-class.sh"
+      - ".github/workflows/dependabot-auto-merge.yml"
   - path: tests/test_approval_independence_check.sh
     # Adversarial public-seam coverage for the #1094 last-moment live body,
     # latest-state review pagination, exact-head, and fail-closed contracts.
@@ -2266,6 +2276,9 @@ paths:
       # the base checkout and refuse auto-merge when either is absent.
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
+      # The merge step sources it once the base-SHA policy sets
+      # author_merge_token_class (#2728), and refuses the merge without it.
+      - "scripts/lib/credential-class.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all
@@ -2669,6 +2682,7 @@ paths:
       - "tests/test_identity_check_fail_closed.sh"  # check_gh_as_author (#284/#405)
       - "tests/test_identity_check.sh"         # check_gh_as_author (#2726)
       - "tests/test_dependabot_auto_merge_check_wait.sh"  # check_workflow_parsers (#889)
+      - "tests/test_author_merge_token.sh"     # check_workflow_parsers (#2728)
       - "tests/test_git_identity_hygiene.sh"   # check_git_identity_hygiene (#777)
       - "tests/test_op_preflight_check.sh"     # check_op_preflight_contract
       - "tests/test_op_preflight_token_mode.sh"  # check_op_preflight_contract
@@ -2821,6 +2835,7 @@ paths:
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
       - "scripts/codex-review-ledger.sh"  # governing historical completion observations (#2401)
+      - "scripts/lib/credential-class.sh" # approval-merge-continuation.sh author-token class gate (#2728)
       - "tests/test_owner_admin_override.py"  # pair historical observation runtime and regressions
       - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"

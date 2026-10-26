@@ -76,6 +76,7 @@
       "scripts/workflow/report-approval-continuation-failures.sh",
       "tests/test_approval_merge_continuation.sh",
       "tests/test_merge_clearance_gate.sh",
+      "scripts/lib/credential-class.sh",
       "scripts/workflow/installation-budget.sh",
       "scripts/gate-api-lineage-blocking.sh",
       "scripts/merge-clearance-gate.sh",
@@ -223,6 +224,7 @@
       "scripts/lib/gh-api-array.sh"
     ],
     "check_codex_scripts": [
+      "scripts/lib/credential-class.sh",
       "scripts/lib/codex-request-evidence.sh",
       "tests/test_codex_request_evidence.sh",
       "scripts/codex-review-ledger.sh",
@@ -304,6 +306,7 @@
       "tests/test_feedback_policy_helpers.sh"
     ],
     "check_gh_as_author": [
+      "scripts/lib/credential-class.sh",
       ".claude/settings.json",
       ".codex/hooks.json",
       ".github/workflows/agent-review.yml",
@@ -376,6 +379,7 @@
       "scripts/lib/reviewers-helpers.sh"
     ],
     "check_merge_group_required_checks": [
+      "scripts/lib/credential-class.sh",
       "tests/test_merge_group_required_checks.sh",
       "scripts/gh-as-author.sh",
       "scripts/identity-check.sh",
@@ -408,6 +412,7 @@
       "scripts/bootstrap/template-mirror.sh"
     ],
     "check_op_preflight_contract": [
+      "scripts/lib/credential-class.sh",
       "tests/test_agent_capability_probe.sh",
       "tests/test_cloud_environment.sh",
       "tests/test_helper_autosource.sh",
@@ -439,6 +444,7 @@
       "tests/test_phase_4b_accounting.sh"
     ],
     "check_phase_4b_automation": [
+      "scripts/lib/credential-class.sh",
       "scripts/lib/coderabbit-fence.sh",
       "scripts/lib/ci-check-modes.sh",
       "scripts/lib/pr-body-contract.mjs",
@@ -569,6 +575,7 @@
       "scripts/lib/template-substitution.sh"
     ],
     "check_resolve_pr_threads": [
+      "scripts/lib/credential-class.sh",
       "tests/test_resolve_pr_threads_rationale_tag.sh",
       "tests/test_resolve_pr_threads_read_failure.sh",
       "tests/test_resolve_pr_threads_staleness_pagination.sh",
@@ -610,7 +617,8 @@
       "tests/test_self_approval_detector.sh",
       "tests/test_approval_independence_check.sh",
       "tests/test_approval_merge_continuation.sh",
-      "tests/test_merge_clearance_gate.sh"
+      "tests/test_merge_clearance_gate.sh",
+      "scripts/lib/credential-class.sh"
     ],
     "check_session_finalization": [
       "tests/test_session_finalization_check.sh",
@@ -668,6 +676,8 @@
     ],
     "check_workflow_parsers": [
       "tests/test_dependabot_auto_merge_check_wait.sh",
+      "tests/test_author_merge_token.sh",
+      "scripts/lib/credential-class.sh",
       "tests/test_655_repo_lint_local_observed.sh",
       "tests/test_load_review_config.sh",
       "scripts/ci/fixtures/workflow-parsers/*",

@@ -26,6 +26,8 @@ case "$PR_NUMBER" in *[!0-9]*|'') usage ;; esac
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 # shellcheck source=../lib/review-policy-scalar.sh
 source "$ROOT/scripts/lib/review-policy-scalar.sh"
+# shellcheck source=../lib/credential-class.sh
+source "$ROOT/scripts/lib/credential-class.sh"
 
 RETRACT_ON_EXIT=0
 MERGEPATH_ARM_RETAINED=0
@@ -348,8 +350,10 @@ else
 fi
 set -e
 expected_author=""
+required_author_token_class=""
 if [ "$policy_rc" -eq 0 ] && [ -f "$policy" ]; then
   expected_author=$(review_policy_scalar "$policy" author_identity)
+  required_author_token_class=$(review_policy_scalar "$policy" author_merge_token_class)
 fi
 if [ -n "${policy:-}" ] && [ "$policy" != "$ROOT/.github/review-policy.yml" ]; then
   rm -f "$policy"
@@ -468,6 +472,24 @@ rm -f "$identity_err"
 [ "$identity_rc" -eq 0 ] || infra_error "could not verify merge token identity: ${identity_msg:-unknown API error}"
 [ -n "$login" ] || infra_error "merge token identity is empty"
 [ "$login" = "$expected_author" ] || infra_error "merge token resolves to $login, expected $expected_author"
+# After a repository's cutover its governing policy requires the per-repository
+# fine-grained token (#2728). The login check above cannot tell that token from
+# the shared classic one, which a missing environment copy silently falls back to.
+# Only a repository that opted in calls the library function, so a consumer
+# that receives this script ahead of the library keeps today's behaviour.
+if [ -n "$required_author_token_class" ] && [ "$required_author_token_class" != "any" ]; then
+  declare -F credential_meets_author_token_class >/dev/null \
+    || infra_error "governing policy sets author_merge_token_class '$required_author_token_class', but scripts/lib/credential-class.sh cannot check it"
+  set +e
+  credential_meets_author_token_class "$required_author_token_class" "${GH_TOKEN:-}"
+  author_class_rc=$?
+  set -e
+  case "$author_class_rc" in
+    0) echo "approval continuation: author token meets author_merge_token_class '$required_author_token_class'" ;;
+    1) infra_error "governing policy requires a $required_author_token_class author token, and this one is not (is the merge-queue-policy environment copy missing?)" ;;
+    *) infra_error "governing policy names an unknown author_merge_token_class '$required_author_token_class'" ;;
+  esac
+fi
 
 # Re-read after the exact-base policy fetch in normal mode too. The preceding
 # workflow-token invocation is a separate process; an arm can appear between

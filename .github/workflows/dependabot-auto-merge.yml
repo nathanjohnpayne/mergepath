@@ -509,6 +509,45 @@ jobs:
             exit 1
           fi
 
+          # After this repository's cutover, the base-SHA policy requires the
+          # per-repository fine-grained author token (#2728). The login check
+          # above cannot tell it from the shared classic token, which a
+          # missing merge-queue-policy copy silently falls back to.
+          REQUIRED_AUTHOR_CLASS=$(awk '
+            /^[^[:space:]]/ && $1 == "author_merge_token_class:" {
+              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+              gsub(/[[:space:]]*#.*$/, "", $0)
+              gsub(/^["\047]|["\047]$/, "", $0)
+              sub(/[[:space:]]+$/, "", $0)
+              print
+              exit
+            }
+          ' "$POLICY")
+          if [ -n "$REQUIRED_AUTHOR_CLASS" ] && [ "$REQUIRED_AUTHOR_CLASS" != "any" ]; then
+            if [ ! -r scripts/lib/credential-class.sh ]; then
+              echo "::error::$POLICY sets author_merge_token_class '$REQUIRED_AUTHOR_CLASS', but scripts/lib/credential-class.sh is missing from the base checkout."
+              exit 1
+            fi
+            # shellcheck source=/dev/null
+            . scripts/lib/credential-class.sh
+            if ! declare -F credential_meets_author_token_class >/dev/null; then
+              echo "::error::$POLICY sets author_merge_token_class '$REQUIRED_AUTHOR_CLASS', but the base checkout's scripts/lib/credential-class.sh predates the class check."
+              exit 1
+            fi
+            set +e
+            credential_meets_author_token_class "$REQUIRED_AUTHOR_CLASS" "$AUTHOR_MERGE_TOKEN"
+            AUTHOR_CLASS_RC=$?
+            set -e
+            if [ "$AUTHOR_CLASS_RC" -eq 1 ]; then
+              echo "::error::$POLICY requires a $REQUIRED_AUTHOR_CLASS AUTHOR_MERGE_TOKEN, and this one is not. Is the merge-queue-policy environment copy missing?"
+              exit 1
+            elif [ "$AUTHOR_CLASS_RC" -ne 0 ]; then
+              echo "::error::$POLICY names an unknown author_merge_token_class '$REQUIRED_AUTHOR_CLASS'."
+              exit 1
+            fi
+            echo "::notice::AUTHOR_MERGE_TOKEN meets author_merge_token_class '$REQUIRED_AUTHOR_CLASS'."
+          fi
+
           # Approve. set -e ensures we abort on failure rather than
           # continuing to the merge step with no approval on record.
           # The review is bound to APPROVE_SHA via commit_id, the SHA whose

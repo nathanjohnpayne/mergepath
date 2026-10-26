@@ -38,6 +38,21 @@
 #   credential_is_user_held <token> [<headers-file>]
 #     Exit 0 iff credential_class prints `user-held`.
 #
+#   credential_meets_author_token_class <required> <token>
+#     The per-repository author-token class gate (#2728). <required> is the
+#     governing policy's `author_merge_token_class` value:
+#       "" or any     exit 0; the repository has not cut over, so the class
+#                     is not checked here (callers keep their own identity
+#                     checks)
+#       fine-grained  exit 0 iff <token> is a fine-grained personal access
+#                     token (`github_pat_`)
+#       anything else exit 2: an unknown requirement fails closed
+#     Exit 1 when the token does not meet a known requirement. The point is
+#     the cutover: a job that names `merge-queue-policy` silently resolves
+#     `secrets.AUTHOR_MERGE_TOKEN` from the repository when the environment
+#     lacks it, and the shared classic token is `user-held` too, so only the
+#     form tells the per-repository token from that fallback.
+#
 # Token prefixes: https://github.blog/2021-04-05-behind-githubs-new-authentication-token-formats/
 #   ghp_  classic personal access token        -> user-held
 #   github_pat_  fine-grained personal access token -> user-held
@@ -95,4 +110,22 @@ credential_class() {
 
 credential_is_user_held() {
   [ "$(credential_class "${1:-}" "${2:-}")" = "user-held" ]
+}
+
+credential_meets_author_token_class() {
+  local required="${1:-}"
+  local token="${2:-}"
+
+  case "$required" in
+    ''|any)
+      return 0
+      ;;
+    fine-grained)
+      case "$token" in
+        github_pat_?*) return 0 ;;
+      esac
+      return 1
+      ;;
+  esac
+  return 2
 }
