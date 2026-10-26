@@ -209,7 +209,7 @@ The consumers must handle what `workflow_run` does not give them. `workflow_run.
 
 | Field | Required value | Why |
 |---|---|---|
-| `workflow_id` | The numeric ID of the expected producer file in this repository, read from `GET /repos/{owner}/{repo}/actions/workflows/agent-review.yml` (or `pr-review-policy.yml`) with the job's `GITHUB_TOKEN` | The ID is stable and identifies the file, not its display name |
+| `workflow_id` | The numeric ID of the expected producer file in this repository, read from `GET /repos/{owner}/{repo}/actions/workflows/agent-review.yml` (or `pr-review-policy.yml`) with the job's `GITHUB_TOKEN`. The consumer job therefore declares `actions: read` in its job-level `permissions:`, because scopes it does not list are `none` | The ID is stable and identifies the file, not its display name |
 | `path` | After removing one trailing `@<ref>` suffix, exactly `.github/workflows/agent-review.yml` (or `pr-review-policy.yml`) | A cross-check only. GitHub's REST example reports `.github/workflows/build.yml@main`; this repository's live runs (read 2026-10-23) report the bare path. A prefix or substring match is never used |
 | `event` | `pull_request` or `pull_request_review` for `trusted-review-mutations.yml`; `pull_request` for `trusted-policy-mutations.yml` | The producers' own triggers; anything else is not a candidate PR run |
 | `head_repository.id`, `repository.id` | Equal to each other and to `github.repository_id` | Invariant 9 |
