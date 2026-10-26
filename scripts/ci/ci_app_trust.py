@@ -29,12 +29,26 @@ PART A: WHO MAY REQUEST `id-token: write` (ADR "Who may request")
       * every checkout is this repository at `${{ github.workflow_sha }}`
         with `persist-credentials: false` and only allow-listed inputs;
       * no local action (`uses: ./...`), no `docker://` action, every other
-        action pinned to a full 40-hex commit SHA;
+        action a canonical `owner/repo[/path]@ref` (no empty, `.` or `..`
+        component: the runner drops empty ones, so `actions/checkout/@sha`
+        would run checkout under another spelling) pinned to a full 40-hex
+        commit SHA;
       * no artifact download and no cache restore (`actions/cache*`, or a
         `cache` input on any action).
 
     An allow-list entry whose job no longer exists, or no longer requests the
     grant, fails as stale.
+
+    OIDC jobs that are not app consumers (build provenance, for example) are
+    reviewed one by one in REVIEWED_OTHER_OIDC_JOBS, keyed by repository. Such
+    a job must sit outside every identity's workflow (so no trust policy can
+    name it), mention Octo STS nowhere, not be a reusable-workflow call, and
+    use only canonical SHA-pinned actions. An entry applies only in its own
+    repository; where the repository is unknown, none applies.
+
+    Every `.yml`/`.yaml` file in `.github/workflows` is read, dot-prefixed
+    names included. `--check` refuses a root with no `.github/workflows`
+    directory instead of passing an empty scan.
 
 PART B: TRUST POLICY FILES (ADR "Octo STS trust policies")
 
@@ -78,7 +92,6 @@ Usage:
 Exit: 0 clean, 1 violations or a failed self-test, 2 environment/usage error.
 """
 
-import glob
 import json
 import os
 import re
@@ -153,9 +166,26 @@ IDENTITIES = {
 # adds a trusted consumer; each addition is a Phase 4 change to this file.
 ALLOWED_ID_TOKEN_JOBS = {}
 
+# OIDC jobs that are not CI app consumers, reviewed one by one:
+# (repository, workflow basename, job id) -> reason. An entry applies only in
+# its own repository, and only while the job stays outside every identity's
+# workflow, names Octo STS nowhere, and uses only canonical SHA-pinned
+# actions. No trust policy can name its workflow, so it can never mint an app
+# token; the entry exists so that the allow-list above is not the only
+# control and the grant is still recorded and reviewed.
+REVIEWED_OTHER_OIDC_JOBS = {
+    ("nathanjohnpayne/nathanpaynedotcom", "build-artifact.yml", "attest"):
+        "SLSA build provenance for the deploy artifact (#1238): "
+        "actions/attest-build-provenance needs id-token: write; no checkout, no repository code",
+}
+
 TRUSTED_CHECKOUT_INPUTS = {"ref", "repository", "persist-credentials", "fetch-depth",
                            "sparse-checkout", "sparse-checkout-cone-mode", "path"}
-SHA_PINNED_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
+# owner/repo[/path]@ref with no empty, `.` or `..` component. The runner drops
+# empty components, so `actions/checkout/@sha` runs checkout; a spelling this
+# does not accept is refused rather than normalised.
+ACTION_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)@([^@\s]+)$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REPO_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$")
 DIGITS_RE = re.compile(r"^[0-9]+$")
 APP_RE = re.compile(r"^(?:[0-9]+|[a-z][a-z0-9-]*)$")
@@ -323,6 +353,27 @@ def _with(step):
     return {str(k).lower(): v for k, v in w.items()} if isinstance(w, dict) else {}
 
 
+def action_ref(uses):
+    """(lower-cased name, ref) for a canonical remote action, else None."""
+    m = ACTION_RE.match(uses)
+    if not m or any(c in (".", "..") for c in m.group(1).split("/")):
+        return None
+    return m.group(1).lower(), m.group(2)
+
+
+def action_violations(uses, where):
+    """Violations for one step `uses:` value; also returns its canonical name."""
+    low = uses.lower()
+    if low.startswith("./") or low.startswith("docker://"):
+        return ["%s: local and docker actions are not allowed" % where], None
+    ref = action_ref(uses)
+    if ref is None:
+        return ["%s: not a canonical owner/repo[/path]@ref action reference" % where], None
+    if not SHA_RE.match(ref[1]):
+        return ["%s: not pinned to a full commit SHA" % where], ref[0]
+    return [], ref[0]
+
+
 def execution_violations(job, events, identity):
     out = []
     allowed = set(IDENTITIES[identity]["events"])
@@ -348,14 +399,11 @@ def execution_violations(job, events, identity):
         uses = _action(step)
         if not uses:
             continue
-        low = uses.lower()
         where = "step %d (%s)" % (i, uses)
-        if low.startswith("./") or low.startswith("docker://"):
-            out.append("%s: local and docker actions are not allowed" % where)
+        v, name = action_violations(uses, where)
+        out += v
+        if name is None:
             continue
-        if not SHA_PINNED_RE.match(uses):
-            out.append("%s: not pinned to a full commit SHA" % where)
-        name = low.split("@", 1)[0]
         inputs = _with(step)
         if name in ("actions/download-artifact",) or name.startswith("actions/cache"):
             out.append("%s: artifacts and caches are not allowed" % where)
@@ -375,8 +423,27 @@ def execution_violations(job, events, identity):
     return out
 
 
-def scan_workflow(doc, basename, allowed):
-    """(violations, set of matched allow-list keys)."""
+def other_oidc_violations(job, basename):
+    out = []
+    if basename in {spec["workflow"] for spec in IDENTITIES.values()}:
+        out.append("is in a workflow a trust policy pins; it must be an ALLOWED_ID_TOKEN_JOBS entry")
+    if "uses" in job:
+        out.append("is a reusable-workflow call")
+    if "octo-sts" in json.dumps(job, default=str).lower():
+        out.append("mentions Octo STS; an app token exchange belongs on ALLOWED_ID_TOKEN_JOBS")
+    for i, step in enumerate(job.get("steps") or []):
+        if not isinstance(step, dict):
+            out.append("step %d cannot be read" % i)
+            continue
+        uses = _action(step)
+        if uses:
+            out += action_violations(uses, "step %d (%s)" % (i, uses))[0]
+    return out
+
+
+def scan_workflow(doc, basename, allowed, repository=None, reviewed_other=None):
+    """(violations, set of matched allow-list and reviewed-entry keys)."""
+    reviewed_other = reviewed_other or {}
     violations, matched = [], set()
     if not isinstance(doc, dict):
         return ["%s: not a mapping" % basename], matched
@@ -399,6 +466,12 @@ def scan_workflow(doc, basename, allowed):
             violations.append("%s: permissions cannot be read and may grant id-token: write" % where)
             continue
         identity = allowed.get(key)
+        other = (repository, basename, str(job_id))
+        # No entry has a None repository, so an unknown repository matches none.
+        if identity is None and other in reviewed_other:
+            matched.add(other)
+            violations += ["%s: %s" % (where, v) for v in other_oidc_violations(job, basename)]
+            continue
         if identity is None:
             violations.append("%s: requests id-token: write but is not in ALLOWED_ID_TOKEN_JOBS "
                               "(ADR 0004 'Who may request id-token: write')" % where)
@@ -412,11 +485,20 @@ def scan_workflow(doc, basename, allowed):
     return violations, matched
 
 
-def scan_workflows(root, load, allowed):
+def workflow_files(root):
+    """Every .yml/.yaml file in .github/workflows, dot-prefixed names included:
+    GitHub runs them, and glob's `*` skips them."""
+    wf_dir = os.path.join(root, ".github", "workflows")
+    if not os.path.isdir(wf_dir):
+        return []
+    return sorted(os.path.join(wf_dir, n) for n in os.listdir(wf_dir)
+                  if n.endswith((".yml", ".yaml")) and os.path.isfile(os.path.join(wf_dir, n)))
+
+
+def scan_workflows(root, load, allowed, repository=None, reviewed_other=None):
+    reviewed_other = reviewed_other or {}
     violations, matched, seen = [], set(), set()
-    files = sorted(glob.glob(os.path.join(root, ".github", "workflows", "*.yml"))
-                   + glob.glob(os.path.join(root, ".github", "workflows", "*.yaml")))
-    for path in files:
+    for path in workflow_files(root):
         base = os.path.basename(path)
         seen.add(base)
         try:
@@ -425,13 +507,17 @@ def scan_workflows(root, load, allowed):
         except Exception as exc:  # noqa: BLE001 - any parse failure fails closed
             violations.append("%s: cannot parse (%s)" % (base, exc))
             continue
-        v, m = scan_workflow(doc, base, allowed)
+        v, m = scan_workflow(doc, base, allowed, repository, reviewed_other)
         violations += v
         matched |= m
     for key in sorted(allowed):
         if key not in matched:
             violations.append("stale ALLOWED_ID_TOKEN_JOBS entry %s job %s: no such job requests "
                               "id-token: write; remove the entry" % key)
+    for key in sorted(reviewed_other):
+        if key[0] == repository and key not in matched:
+            violations.append("stale REVIEWED_OTHER_OIDC_JOBS entry %s %s job %s: no such job "
+                              "requests id-token: write; remove the entry" % key)
     return violations
 
 
@@ -545,6 +631,18 @@ WORKFLOW_CASES = [
      _wf(GOOD_CHECKOUT + EXCHANGE, extra="    container:\n      image: node@sha256:%s\n" % ("0" * 64)), ALLOW, 1),
     ("a service container fails", WF,
      _wf(GOOD_CHECKOUT + EXCHANGE, extra="    services:\n      db:\n        image: postgres:16\n"), ALLOW, 1),
+    ("a trailing-slash checkout is refused, not trusted", WF,
+     _wf(GOOD_CHECKOUT.replace("actions/checkout@", "actions/checkout/@")
+         .replace("github.workflow_sha", "github.event.workflow_run.head_sha") + EXCHANGE), ALLOW, 1),
+    ("a trailing-slash artifact download is refused", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/download-artifact/@%s\n" % SHA + EXCHANGE), ALLOW, 1),
+    ("an empty path component is refused", WF,
+     _wf(GOOD_CHECKOUT.replace("actions/checkout@", "actions//checkout@") + EXCHANGE), ALLOW, 1),
+    ("a dot path component is refused", WF,
+     _wf(GOOD_CHECKOUT.replace("actions/checkout@", "actions/./checkout@") + EXCHANGE), ALLOW, 1),
+    ("an upper-case checkout is still checkout", WF,
+     _wf(GOOD_CHECKOUT.replace("actions/checkout@", "Actions/Checkout@")
+         .replace("github.workflow_sha", "github.head_ref") + EXCHANGE), ALLOW, 1),
     ("a listed job in another file fails", "other.yml", _wf(GOOD_CHECKOUT + EXCHANGE),
      {("other.yml", "consume"): "review-mutations"}, 1),
     ("a second, unlisted job in the file fails", WF,
@@ -679,6 +777,45 @@ def self_test(load):
     check("the shipped allow-list names known identities",
           all(i in IDENTITIES and IDENTITIES[i]["workflow"] == k[0] for k, i in ALLOWED_ID_TOKEN_JOBS.items()))
 
+    # A non-app OIDC job of the nathanpaynedotcom build-artifact.yml `attest`
+    # shape, reviewed under REVIEWED_OTHER_OIDC_JOBS.
+    site = "nathanjohnpayne/nathanpaynedotcom"
+    attest = ("on: push\njobs:\n  attest:\n    runs-on: ubuntu-latest\n    permissions:\n"
+              "      contents: read\n      id-token: write\n      attestations: write\n    steps:\n"
+              "      - uses: actions/download-artifact@%s\n"
+              "      - uses: actions/attest-build-provenance@%s\n" % (SHA, SHA))
+    other = {(site, "build-artifact.yml", "attest"): "fixture"}
+    for name, text, base, repo, want in (
+            ("a reviewed non-app OIDC job passes in its repository", attest, "build-artifact.yml", site, 0),
+            ("the same job in another repository fails", attest, "build-artifact.yml", REPO, 1),
+            ("the same job with no known repository fails closed", attest, "build-artifact.yml", None, 1),
+            ("a reviewed job that adds an Octo STS step fails",
+             attest + EXCHANGE, "build-artifact.yml", site, 1),
+            ("a reviewed job that curls the exchange fails",
+             attest + "      - run: curl https://octo-sts.dev/sts/exchange\n", "build-artifact.yml", site, 1),
+            ("a reviewed job with a tag-pinned action fails",
+             attest.replace("attest-build-provenance@" + SHA, "attest-build-provenance@v4"),
+             "build-artifact.yml", site, 1),
+            ("a reviewed job with a non-canonical action fails",
+             attest.replace("actions/attest-build-provenance@", "actions/attest-build-provenance/@"),
+             "build-artifact.yml", site, 1),
+            ("a reviewed job turned into a reusable-workflow call fails",
+             "on: push\njobs:\n  attest:\n    permissions:\n      id-token: write\n"
+             "    uses: nathanjohnpayne/x/.github/workflows/y.yml@%s\n" % SHA, "build-artifact.yml", site, 1)):
+        v, _ = scan_workflow(load(text), base, {}, repo, other)
+        check(name, len(v) == want, "want %d, got %r" % (want, v))
+    in_identity = {(site, WF, "attest"): "fixture"}
+    v, _ = scan_workflow(load(attest), WF, {}, site, in_identity)
+    check("a reviewed entry inside a pinned identity workflow fails",
+          len(v) == 1 and "trust policy pins" in v[0], repr(v))
+    check("the shipped reviewed entries name known identities' complement",
+          all(k[1] not in {sp["workflow"] for sp in IDENTITIES.values()} for k in REVIEWED_OTHER_OIDC_JOBS))
+
+    for root in (os.path.join(os.devnull, "missing"), os.devnull):
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["--check", root, "--repository", REPO])
+        check("--check %s is an environment error, not a pass" % root, rc == 2, "got %d" % rc)
+
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         wf_dir = os.path.join(tmp, ".github", "workflows")
@@ -700,6 +837,25 @@ def self_test(load):
             fh.write("on: [workflow_run\n")
         v = scan_workflows(tmp, load, {})
         check("an unparseable workflow fails closed", len(v) == 1 and "cannot parse" in v[0], repr(v))
+        os.remove(os.path.join(wf_dir, "bad.yml"))
+        with open(os.path.join(wf_dir, ".hidden.yml"), "w") as fh:
+            fh.write(_wf(GOOD_CHECKOUT))
+        v = scan_workflows(tmp, load, {})
+        check("a dot-prefixed workflow is scanned", len(v) == 1 and ".hidden.yml" in v[0], repr(v))
+        os.rename(os.path.join(wf_dir, ".hidden.yml"), os.path.join(wf_dir, ".hidden.yaml"))
+        v = scan_workflows(tmp, load, {})
+        check("a dot-prefixed .yaml workflow is scanned", len(v) == 1, repr(v))
+        os.remove(os.path.join(wf_dir, ".hidden.yaml"))
+        with open(os.path.join(wf_dir, "build-artifact.yml"), "w") as fh:
+            fh.write(attest)
+        check("scan honours a reviewed non-app OIDC job", scan_workflows(tmp, load, {}, site, other) == [])
+        with open(os.path.join(wf_dir, "build-artifact.yml"), "w") as fh:
+            fh.write(attest.replace("      id-token: write\n", ""))
+        v = scan_workflows(tmp, load, {}, site, other)
+        check("a stale reviewed entry fails in its repository", len(v) == 1 and "stale" in v[0], repr(v))
+        check("a reviewed entry for another repository is not stale here",
+              scan_workflows(tmp, load, {}, REPO, other) == [])
+        os.remove(os.path.join(wf_dir, "build-artifact.yml"))
 
         check("no policy directory passes", scan_policies(tmp, load, None, None) == [])
         os.makedirs(p_dir)
@@ -811,8 +967,13 @@ def main(argv):
         root = rest[0] if rest else (subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                                     capture_output=True, text=True).stdout.strip()
                                      or os.getcwd())
+        if not os.path.isdir(os.path.join(root, ".github", "workflows")):
+            print("%s: ERROR (%s has no .github/workflows directory; refusing to report a clean "
+                  "scan of nothing)" % (NAME, root), file=sys.stderr)
+            return 2
         repository = opts.get("--repository") or detect_repository(root)
-        violations = scan_workflows(root, load, ALLOWED_ID_TOKEN_JOBS) \
+        violations = scan_workflows(root, load, ALLOWED_ID_TOKEN_JOBS, repository,
+                                    REVIEWED_OTHER_OIDC_JOBS) \
             + scan_policies(root, load, repository, APP_PIN)
         for v in violations:
             print("%s: FAIL %s" % (NAME, v))
