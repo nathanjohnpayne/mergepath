@@ -3180,28 +3180,7 @@ resume_pending_codex_request() {
     || die 3 "cannot parse the pending Codex request's timestamp '$created'"
   [[ "$created_epoch" =~ ^[0-9]+$ ]] || die 3 "cannot parse the pending Codex request's timestamp '$created'"
 
-  # #2664: only a request tied to the current head can hold it, and neither
-  # the committer date nor a workflow run proves that tie (#2779 Phase 4b). It
-  # holds on a strong tie: it was posted strictly after the PR's latest
-  # force-push, and that force-push put HEAD in place
-  # (crqe_head_force_push_tie_at). It also holds on the exact-head Running
-  # summary since the request (#1550), but only while it is within its own
-  # wait. Otherwise a new counted request posts, as before #2664: an
-  # unprovable tie costs a slot, never a deadlock or a waiver.
-  local tie_at tie_epoch
   RESUME_STRONG_TIE=false
-  # Unreadable evidence is not absent evidence: a failed read is retried once
-  # and then exits 3, rather than posting beside a request that may be
-  # strongly tied and still running (CodeRabbit on #2779).
-  if ! tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null); then
-    sleep 2
-    tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) \
-      || die 3 "cannot read the PR's force-push timeline for the same-head hold"
-  fi
-  tie_epoch=$(jq -rn --arg t "$tie_at" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || tie_epoch=""
-  if [[ "$tie_epoch" =~ ^[0-9]+$ ]] && [ "$created_epoch" -gt "$tie_epoch" ]; then
-    RESUME_STRONG_TIE=true
-  fi
   # An edited comment is no request evidence for its own wait: the selector
   # reads its current body, but the deadline runs from created_at, so a
   # comment edited into the command long after it was posted would expire at
@@ -3295,6 +3274,28 @@ resume_pending_codex_request() {
   RESUME_PENDING_RUNNING=false
   if [ "$status" = running ] && [ -n "$observed" ] && ! [[ "$observed" < "$created" ]]; then
     RESUME_PENDING_RUNNING=true
+  fi
+  # #2793: the optional tie read matters only after the cheap resume vetoes.
+  # #2664: only a request tied to the current head can hold it, and neither
+  # the committer date nor a workflow run proves that tie (#2779 Phase 4b). It
+  # holds on a strong tie: it was posted strictly after the PR's latest
+  # force-push, and that force-push put HEAD in place
+  # (crqe_head_force_push_tie_at). It also holds on the exact-head Running
+  # summary since the request (#1550), but only while it is within its own
+  # wait. Otherwise a new counted request posts, as before #2664: an
+  # unprovable tie costs a slot, never a deadlock or a waiver.
+  local tie_at tie_epoch
+  # Unreadable evidence is not absent evidence: a failed read is retried once
+  # and then exits 3, rather than posting beside a request that may be
+  # strongly tied and still running (CodeRabbit on #2779).
+  if ! tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null); then
+    sleep 2
+    tie_at=$(crqe_head_force_push_tie_at "$REPO" "$PR_NUMBER" "$HEAD_SHA" 2>/dev/null) \
+      || die 3 "cannot read the PR's force-push timeline for the same-head hold"
+  fi
+  tie_epoch=$(jq -rn --arg t "$tie_at" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || tie_epoch=""
+  if [[ "$tie_epoch" =~ ^[0-9]+$ ]] && [ "$created_epoch" -gt "$tie_epoch" ]; then
+    RESUME_STRONG_TIE=true
   fi
   now=$(date +%s)
   deadline=$((created_epoch + TIMEOUT_SECONDS))

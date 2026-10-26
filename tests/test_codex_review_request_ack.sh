@@ -271,6 +271,12 @@ case "$endpoint" in
     # force-push put HEAD in place before every seeded request, so a held
     # request may record its timeout. CODEX_TEST_GQL_FORCE_PUSHES replaces the
     # event nodes ([] = no force-push).
+    # Count the time-bearing tie query separately from the force-push head
+    # set used for budgets. This includes HEAD_TRANSITION_AT's independent
+    # reporting read, plus the real wrapper's authorization when it runs.
+    case "$*" in
+      *'createdAt afterCommit'*) printf '%s\n' tie >>"$state_dir/tie-reads" ;;
+    esac
     nodes_default='[{"createdAt":"2026-06-03T23:58:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
     if [ "${CODEX_TEST_GQL_FORCE_PUSHES:-}" = fail ]; then echo 'simulated GraphQL failure' >&2; exit 1; fi
     jq -cn --argjson nodes "${CODEX_TEST_GQL_FORCE_PUSHES:-$nodes_default}" \
@@ -1622,7 +1628,7 @@ test_default_reply_deadline_is_1800() {
   fi
 }
 
-test_prior_reaction_cannot_clear_backdated_ordinary_push
+[ "${1:-}" = --resume-tie-order-only ] || test_prior_reaction_cannot_clear_backdated_ordinary_push
 # Drive the shipped author wrapper and its canonical trigger authorization.
 # The existing transport fake remains only the final GH write sink.
 make_real_wrapper_case() {
@@ -1720,7 +1726,7 @@ test_real_wrapper_duplicate_ack_retry_keeps_polling() {
   done
 }
 
-test_real_wrapper_duplicate_ack_retry_keeps_polling
+[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_duplicate_ack_retry_keeps_polling
 
 # #1362: two requesters for the same PR both decide to post against an empty
 # timeline. The first wrapper is held at its authorization recount; the second
@@ -1773,7 +1779,7 @@ test_real_wrapper_claim_lets_one_of_two_requesters_post() {
   done
 }
 
-test_real_wrapper_claim_lets_one_of_two_requesters_post
+[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_claim_lets_one_of_two_requesters_post
 
 # #1362 staggered interleaving (direct Codex review on #2715): B completes its
 # pre-flight scan and resume check while the PR has no request, A then posts,
@@ -1815,7 +1821,7 @@ test_real_wrapper_staggered_requester_refuses() {
   [ "$FAIL" -ne "$before" ] || pass "#1362 real wrapper: a requester decided before another posted refuses, even after its later reads see that request"
 }
 
-test_real_wrapper_staggered_requester_refuses
+[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_staggered_requester_refuses
 
 # #2664 (supersedes the #2582 case): a polling run that finds an unanswered
 # request on the current head waits on it instead of posting another, so the
@@ -1840,6 +1846,92 @@ test_real_wrapper_authorizes_polling_mode_new_requests() {
     [ "$FAIL" -ne "$before" ] || pass "#2664 real wrapper: $scenario holds the same-head request and hands it off"
   done
 }
+
+# #2793: exercise the copied requester, evidence helper and real author
+# wrapper. The transport fails all GraphQL reads, including the independent
+# reporting query; cheap resume vetoes must still reach their normal path.
+test_resume_tie_read_follows_cheap_vetoes() {
+  local row dir rc before expected_rc expected_triggers expected_reads reads scenario
+  for row in edited case-varied ceiling answered provider-blocked timeout-settled; do
+    before=$FAIL
+    dir=$(make_case "tie-order-$row" 0 0 60)
+    make_real_wrapper_case "$dir"
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    scenario=absent
+    expected_rc=4
+    expected_triggers=1
+    # The outer reporting read and the wrapper's authorization reporting
+    # read remain. Neither requester reaches its optional resume tie read.
+    expected_reads=2
+    case "$row" in
+      edited)
+        jq -c '.updated_at="2026-06-04T00:00:10Z"' "$dir/state/comments.jsonl" >"$dir/state/edited.jsonl"
+        mv "$dir/state/edited.jsonl" "$dir/state/comments.jsonl" ;;
+      case-varied)
+        jq -c '.body="@CODEX REVIEW"' "$dir/state/comments.jsonl" >"$dir/state/varied.jsonl"
+        mv "$dir/state/varied.jsonl" "$dir/state/comments.jsonl" ;;
+      ceiling)
+        printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
+        expected_rc=7; expected_triggers=0; expected_reads=1 ;;
+      answered) scenario=answered-running; expected_rc=0 ;;
+      provider-blocked)
+        jq -cn '{id:901,user:{login:"chatgpt-codex-connector[bot]"},body:"You have reached your Codex usage limits for code reviews.",created_at:"2026-06-04T00:00:20Z"}' >>"$dir/state/comments.jsonl" ;;
+      timeout-settled)
+        jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=900 -->",created_at:"2026-06-04T00:00:05Z"}' >>"$dir/state/comments.jsonl" ;;
+    esac
+    set_clock_after_request "$dir" 40
+    rc=$(CODEX_TEST_GQL_FORCE_PUSHES=fail MERGEPATH_GH_TRANSPORT=gh run_case "$dir" "$scenario" 1 ghp_fixture_author)
+    reads=$(wc -l <"$dir/state/tie-reads" | tr -d ' ')
+    [ "$rc" = "$expected_rc" ] && [ "$(trigger_count "$dir")" = "$expected_triggers" ] \
+      && [ "$reads" = "$expected_reads" ] \
+      && jq -e '.request_resumed != true' "$dir/out.json" >/dev/null \
+      || fail "#2793 $row: exit $rc (want $expected_rc), $(trigger_count "$dir") trigger(s) (want $expected_triggers), $reads tie reads (want $expected_reads); stderr=$(tail -2 "$dir/err.log")"
+    if [ "$row" = provider-blocked ]; then
+      jq -e '.blocked_reason == "usage_limit" and .terminal_determination == null' "$dir/out.json" >/dev/null \
+        || fail '#2793 provider block lost its refusal or gained timeout authority'
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2793 $row: failed tie API preserves exit $rc, $expected_triggers counted request(s), $reads reporting-only tie read(s)"
+  done
+}
+
+test_eligible_resume_tie_read_still_fails_closed() {
+  local mode dir rc reads before expected_rc expected_reads
+  # A successful native control precedes the unreadable-evidence control.
+  for mode in readable unreadable; do
+    before=$FAIL
+    dir=$(make_case "tie-order-eligible-$mode" 0 0 60)
+    make_real_wrapper_case "$dir"
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    set_clock_after_request "$dir" 30
+    expected_rc=4; expected_reads=2
+    if [ "$mode" = unreadable ]; then
+      expected_rc=3; expected_reads=3
+      rc=$(CODEX_TEST_GQL_FORCE_PUSHES=fail MERGEPATH_GH_TRANSPORT=gh run_case "$dir" absent 1 ghp_fixture_author)
+    else
+      rc=$(MERGEPATH_GH_TRANSPORT=gh run_case "$dir" absent 1 ghp_fixture_author)
+    fi
+    reads=$(wc -l <"$dir/state/tie-reads" | tr -d ' ')
+    [ "$rc" = "$expected_rc" ] && [ "$(trigger_count "$dir")" = 0 ] && [ "$reads" = "$expected_reads" ] \
+      || fail "#2793 eligible $mode: exit $rc, $(trigger_count "$dir") triggers, $reads tie reads; stderr=$(tail -2 "$dir/err.log")"
+    if [ "$mode" = unreadable ]; then
+      [ ! -f "$dir/state/post-count" ] && [ ! -s "$dir/out.json" ] \
+        && grep -q "cannot read the PR's force-push timeline for the same-head hold" "$dir/err.log" \
+        || fail '#2793 eligible unreadable: expected one resume retry, exit 3 and zero author writes'
+    else
+      jq -e '.request_resumed == true and .terminal_determination.outcome == "timeout"' "$dir/out.json" >/dev/null \
+        || fail '#2793 eligible readable: strong tie did not retain its timeout handoff'
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#2793 eligible $mode: exit $rc, no trigger, $reads tie reads including reporting"
+  done
+}
+
+test_eligible_resume_tie_read_still_fails_closed
+test_resume_tie_read_follows_cheap_vetoes
+if [ "${1:-}" = --resume-tie-order-only ]; then
+  echo "Results: $PASS passed, $FAIL failed"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
 
 test_real_wrapper_authorizes_polling_mode_new_requests
 
