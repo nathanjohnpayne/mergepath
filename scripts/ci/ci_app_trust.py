@@ -13,11 +13,13 @@ so this gate holds each to the ADR's exact shape.
 
 PART A: WHO MAY REQUEST `id-token: write` (ADR "Who may request")
 
-    Only a (workflow, job) pair in ALLOWED_ID_TOKEN_JOBS may hold
-    `id-token: write`, directly or through `permissions: write-all`. A
-    workflow-level grant is always a violation. The allow-list is EMPTY until
-    the migration slices of #2727 add the trusted consumers, so today any
-    grant anywhere fails. An allow-listed job must also satisfy the ADR's
+    Only a (workflow, job) pair in ALLOWED_ID_TOKEN_JOBS, or a reviewed
+    non-app job in REVIEWED_OTHER_OIDC_JOBS (below), may hold `id-token:
+    write`, directly or through `permissions: write-all`. A workflow-level
+    grant is always a violation. ALLOWED_ID_TOKEN_JOBS is EMPTY until the
+    migration slices of #2727 add the trusted consumers, so today every app
+    consumer grant fails; only the reviewed non-app jobs pass, under their
+    own restrictions. An allow-listed job must also satisfy the ADR's
     execution rules:
 
       * every workflow trigger is one of its identity's events (no candidate

@@ -3,7 +3,8 @@
 #
 # The CI app trust gate for #2727 (ADR 0004). Fails when a job requests
 # `id-token: write` outside the allow-list of trusted Octo STS consumers (the
-# list is empty until a migration slice adds one), when an allow-listed job
+# list is empty until a migration slice adds one) and outside the reviewed
+# non-app OIDC jobs, when an allow-listed or reviewed job
 # breaks the ADR's execution rules, or when a `.github/chainguard/*.sts.yaml`
 # trust policy differs from the ADR template or lands before the #2732 pilot
 # records the app pin.
