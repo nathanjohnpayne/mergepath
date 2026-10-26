@@ -354,9 +354,15 @@ required_author_token_class=""
 if [ "$policy_rc" -eq 0 ] && [ -f "$policy" ]; then
   expected_author=$(review_policy_scalar "$policy" author_identity)
   required_author_token_class=$(review_policy_scalar "$policy" author_merge_token_class)
-  # The scalar reader takes the first match. A repeated key fails closed: the
-  # first could be an `any` left above the cutover's `fine-grained`.
-  if [ "$(grep -c '^author_merge_token_class:' "$policy" || true)" -gt 1 ]; then
+  # The scalar reader takes the first exact match. A repeated key fails closed:
+  # the first could be an `any` left above the cutover's `fine-grained`. So does
+  # any other spelling of the key (quoted, or a space before the colon), which
+  # that reader would miss and treat as absent.
+  author_class_keys=$(grep -Ec "^[\"']?author_merge_token_class[\"']?[[:space:]]*:" "$policy" || true)
+  author_class_exact=$(grep -c '^author_merge_token_class:' "$policy" || true)
+  if [ "$author_class_keys" -ne "$author_class_exact" ]; then
+    required_author_token_class="malformed-key"
+  elif [ "$author_class_exact" -gt 1 ]; then
     required_author_token_class="duplicate-key"
   fi
 fi

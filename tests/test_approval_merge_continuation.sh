@@ -220,6 +220,9 @@ run_case() {
   if [ -n "${STUB_AUTHOR_CLASS_REPEAT:-}" ]; then
     printf 'author_merge_token_class: %s\n' "$STUB_AUTHOR_CLASS_REPEAT" >> "$TMP/root/policy.yml"
   fi
+  if [ -n "${STUB_AUTHOR_CLASS_LINE:-}" ]; then
+    printf '%s\n' "$STUB_AUTHOR_CLASS_LINE" >> "$TMP/root/policy.yml"
+  fi
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
@@ -305,7 +308,7 @@ reset_fixtures() {
   unset STUB_WORKFLOW_QUEUE_SOURCE_TOKEN
   unset STUB_PROTECTIVE_DONE
   unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
-  unset STUB_AUTHOR_CLASS STUB_AUTHOR_CLASS_REPEAT
+  unset STUB_AUTHOR_CLASS STUB_AUTHOR_CLASS_REPEAT STUB_AUTHOR_CLASS_LINE
 }
 
 reset_fixtures
@@ -1854,6 +1857,24 @@ if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
 else
   fail "a repeated author_merge_token_class key must fail closed (rc=$rc)"
 fi
+
+# Another spelling of the key is valid YAML the exact scalar reader misses, so
+# it would read as absent (`any`) and skip the check; it must fail closed.
+for odd_line in 'author_merge_token_class : fine-grained' '"author_merge_token_class": fine-grained'; do
+  reset_fixtures
+  STUB_AUTHOR_CLASS_LINE="$odd_line"
+  TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+  set +e
+  run_case
+  rc=$?
+  set -e
+  if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+     && grep -Fq "unknown author_merge_token_class 'malformed-key'" "$TMP/subject.out"; then
+    pass "a non-canonical class key spelling fails closed: $odd_line"
+  else
+    fail "a non-canonical class key spelling must fail closed: $odd_line (rc=$rc)"
+  fi
+done
 
 # A consumer can receive this script before the library that defines the class
 # gate. With no requirement it must keep working; with one it must fail closed.
