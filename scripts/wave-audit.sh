@@ -18,10 +18,13 @@
 #          parseable title must agree or the run fails closed), or --head-sha
 #   diff = git diff base..head -- <manifest paths minus excluded prefixes>
 #
-# dispatched through scripts/phase-4b-review.sh with --diff-file. A curated
-# diff is also the only workable input: `gh pr diff` refuses wave-sized sync
-# PRs outright (HTTP 406 above 20k lines), so the orchestrator's own fetch
-# path cannot ingest them.
+# dispatched through scripts/phase-4b-review.sh with a structured
+# --wave-scope-file naming the canonical range; trusted wave code regenerates
+# curated bytes after live canary byte verification. --diff-file is only an
+# equality assertion against object-derived bytes, never trusted review input.
+# Hosted `gh pr diff` refuses wave-sized sync PRs outright (HTTP 406 above
+# 20k lines); the structured canonical range enables trusted regeneration
+# of the curated bytes.
 #
 # Verdict contract — fix at the SOURCE, never in the mirror:
 #   exit 0  APPROVED posted on the canary. The wave-audit-pass/<head>

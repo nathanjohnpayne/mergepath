@@ -283,7 +283,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-119.** Exit 6 is held, not failed: wait the carried retry interval and rerun; never post the manual handoff for a hold. ● — REVIEW_POLICY.md § Phase 4b
 
-**R-120.** Only exits 2, 3, 4, and 5 fall through to the manual handoff. ● — REVIEW_POLICY.md § Phase 4b
+**R-120.** Only orchestrator exits 4 and 5 use the manual handoff; exit 3 is terminal with no handoff, and adapter exit 2 maps to orchestrator exit 4. ● — REVIEW_POLICY.md § Phase 4b
 
 **R-121.** Action-shaped holds (draft PR, non-base target) get their cause fixed, not retried. ○ — REVIEW_POLICY.md § Phase 4b
 
