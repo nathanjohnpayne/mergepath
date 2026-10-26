@@ -111,7 +111,7 @@ BOOTSTRAP_LABELS=(
   "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
   "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
   "priority:critical|B60205|Broken now on the merge path, dated evidence, no workaround. Expect this to be empty."
-  "priority:high|D93F0B|Measured live impact, or it blocks a named issue. Cite that evidence in the issue."
+  "priority:high|D93F0B|Actionable now; delay has demonstrated material cost. Cite evidence in the issue."
   "priority:normal|8B949E|Default. Worth doing; no observed live impact, or it fails in the safe direction."
   "priority:low|D4D8DD|Would not be missed. A candidate for closure at the next audit if still untouched."
   "status:blocked|6E7781|Cannot proceed until something outside this issue happens. Name what, in the issue."

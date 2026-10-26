@@ -29,6 +29,18 @@ Feature: the canonical issue-label set a bootstrapped repo starts with, and the 
 - `size:XL` is not seeded. It existed in `nathanpaynedotcom` and was applied to zero issues, open or closed.
 - `area:*`, every `status:*` value other than `status:blocked`, and repo-local `type:*` values are not seeded. They are per-repo vocabulary; imposing the hub's scheme on a repo with a handful of open issues is bureaucracy rather than standardization. `status:blocked` is the exception because it marks a blocker that no issue can point at, such as a vendor or an outside event, under the same lane rule on every board (`scripts/gh-projects/README.md` § Status lanes), so it must mean the same thing in every repository.
 
+### Priority decision and audit rule
+
+`priority:high` means an issue is actionable now and delaying it has a demonstrated material cost. Apply these questions in order: can engineering make meaningful progress now; does evidence show material impact; and should this issue be scheduled ahead of other actionable high-priority work? A “no” at any step means the issue does not qualify as high.
+
+Material impact includes a currently reachable safety or correctness defect with meaningful blast radius, a recurring production or workflow failure with measured cost, a direct blocker of other high-value work that is ready to proceed, or time-sensitive delay that materially increases risk or cost. “Improvement,” “optimization,” or “architecture” describes solution shape and does not exclude an issue from high priority; assess the problem's demonstrated impact. A `type:bug` label does not by itself qualify an issue. Eventual automatic recovery does not mitigate the impact that occurred while the failure was active.
+
+`status:blocked` does not qualify as high while the issue remains blocked. `type:decision` does not qualify merely because the decision matters; assess it under the same actionability, evidence, and comparative-urgency criteria. An existing `priority:high` label is not evidence that the issue still qualifies.
+
+Use asymmetric evidence review when auditing priorities. A proposed promotion may start from a summary, but verify the full issue evidence before applying it. Before demoting an existing `priority:high` for absent or insufficient evidence, read the complete issue and inspect every relevant evidence section, including sections headed Evidence, Observed, Impact, Reproduction, Incident, or equivalent. Do not infer absence of evidence from an excerpt or from the issue's opening paragraphs. Automatic recovery or later resolution does not erase evidence of prior impact.
+
+As a backlog health check, `priority:high` should ordinarily cover about 10–15% of open issues. A substantially higher share is a signal to re-audit the decisions, not a quota or a target: retain every issue that meets the material-impact rule and do not promote or demote issues merely to reach the band.
+
 ## Preservation boundaries
 
 - Seeding is **additive**: it creates or updates the entries in its own table and never enumerates the repo's existing labels, so it can neither delete nor rename one. This is what keeps it safe to re-run against a populated repo. Deleting a label strips it from closed issues, and several fleet labels are machine-read — `post-review` is the dedupe key the weekly sweep uses to find its rollup issue, the four blocking labels gate merges via `Label Gate`, and `observation` / `risk` / `automation` are applied by running automation.

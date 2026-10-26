@@ -60,7 +60,6 @@ The full bootstrap loop runs across each repo the bootstrap wizard has provision
 
 <!-- bootstrap-loop-list-start -->
 - friends-and-family-billing
-- device-source-of-truth
 - swipewatch
 - nathanpaynedotcom
 - overridebroadway

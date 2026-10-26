@@ -887,6 +887,18 @@ paths:
       - "scripts/ci/check_stalled_pr_resume"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+  - path: tests/test_pull_request_target_policy.sh
+    # Hermetic suite for the pull_request_target event-policy tool (#2733).
+    # It lints this checkout's three pull_request_target workflows and copies
+    # them into its fixtures, so they are declared alongside the tool.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/ci/check_pull_request_target_policy"
+      - ".github/workflows/auto-clear-blocking-labels.yml"
+      - ".github/workflows/dependabot-auto-merge.yml"
+      - ".github/workflows/merge-queue-authorization.yml"
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
@@ -2577,7 +2589,7 @@ paths:
   # the fleet was uniformly public from 2026-07-06; it went ACTIVE on
   # 2026-09-01 when device-source-of-truth was measured private, and it
   # is moot again as of 2026-09-05, when that repo was dropped as a
-  # consumer and the remaining seven are all public. Do not treat either
+  # consumer (it was archived 2026-10-22) and the remaining seven are all public. Do not treat either
   # moot period as the standing state -- re-read the visibility fields.)
   # Keep it mergepath-only. (CodeRabbit Major, #271.)
 
@@ -2595,6 +2607,7 @@ paths:
     type: kit
     consumers: all
     requires:
+      - "scripts/lib/coderabbit-fence.sh"   # #939, shared StatusContext completion predicate
       - "scripts/lib/feedback-policy-helpers.sh"   # #1305, governing policy parser
       - "scripts/lib/codex-request-evidence.sh"   # #1305, request counting and timeout reconciliation
       - "scripts/workflow/resolve_base_policy.sh"   # #1305, governing request-cap policy
@@ -2717,6 +2730,7 @@ paths:
       - "tests/test_approval_merge_continuation.sh"  # check_auto_clear_workflow (#1062)
       - "tests/test_repo_lint_latency_report.sh"  # check_repo_lint_latency_report (#1062)
       - "tests/test_stalled_pr_resume.sh"         # check_stalled_pr_resume (#2165)
+      - "tests/test_pull_request_target_policy.sh"  # check_pull_request_target_policy (#2733)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
@@ -2856,7 +2870,8 @@ paths:
   # lintable surface" rationale; #458 folded it into the ESM entry below
   # (React 19 + TypeScript + Vite SPA, root package.json, ~148 .ts/.tsx).
   # It was dropped as a consumer entirely on 2026-09-05 when the repo went
-  # dormant, so it no longer appears in that entry.
+  # dormant, so it no longer appears in that entry. It was archived on
+  # 2026-10-22.
   # overridebroadway carried the same false rationale; #461 folds it into
   # the CJS entry below (CJS + React 19 + TypeScript, root package.json,
   # ~81 .ts/.tsx) — the first CJS + TS consumer of the floor. The CJS

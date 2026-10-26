@@ -95,7 +95,8 @@ knowledge_base:
   # consumer was public and `auto` resolved to `local` everywhere; from
   # 2026-09-01 device-source-of-truth was PRIVATE and resolved to
   # `global`, making the fleet briefly non-uniform. That repo was dropped
-  # as a consumer on 2026-09-05, so all seven remaining consumers and
+  # as a consumer on 2026-09-05 (and archived on 2026-10-22), so all
+  # seven remaining consumers and
   # this template repo are public and resolve to `local` again. Do not
   # read that as permanent — it is a consequence of current visibility,
   # not of the `auto` setting. (.coderabbit.yml is NOT propagated —

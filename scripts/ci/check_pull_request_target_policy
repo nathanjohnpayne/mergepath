@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# check_pull_request_target_policy
+#
+# Runs tests/test_pull_request_target_policy.sh, the hermetic suite for
+# scripts/workflow/pull-request-target-policy.py (#2733), and through it
+# `lint` on this checkout: the workflows that trigger on pull_request_target
+# are exactly the tool's REGISTRY, each triggers on exactly its pinned events,
+# and none checks out or fetches candidate code. GitHub enforces a default
+# policy blocking pull_request_target in public repositories from 2026-11-02;
+# the owner's explicit per-workflow event policies allow exactly the pinned
+# events, so a trigger added without updating them would be blocked. The tool
+# travels with the scripts/workflow/ kit and the three workflows reach every
+# consumer, so this wrapper runs on the hub and on every consumer. No token,
+# no network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_pull_request_target_policy.sh"
+TOOL="$REPO_ROOT/scripts/workflow/pull-request-target-policy.py"
+
+for f in "$TEST_SCRIPT" "$TOOL"; do
+  if [ ! -f "$f" ]; then
+    echo "check_pull_request_target_policy: ERROR (missing $f)" >&2
+    exit 1
+  fi
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_pull_request_target_policy: ERROR (jq is required — the wrapped suite cannot assert without it)" >&2
+  exit 1
+fi
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$TOOL"
+  echo "check_pull_request_target_policy: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_pull_request_target_policy: PASS"

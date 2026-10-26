@@ -691,6 +691,15 @@ jobs:
         if: matrix.shard == 2
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # GitHub blocks pull_request_target in public repositories from
+      # 2026-11-02 unless an explicit Actions event policy allows it (#2733).
+      # The owner's per-workflow policies allowlist each workflow's pinned
+      # events, so this lints the trigger lists and the base-side checkouts
+      # against the tool's registry. Travels to every consumer; hermetic.
+      - name: check_pull_request_target_policy
+        if: matrix.shard == 3
+        run: ./scripts/ci/check_pull_request_target_policy || { rc=$?; if [ ! -f scripts/ci/check_pull_request_target_policy ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pull_request_target_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         if: matrix.shard == 3
         # Requires yq via the delegated verified-propagation suite —
@@ -865,6 +874,18 @@ jobs:
       - name: check_disagreement_detector
         if: matrix.shard == 1
         run: ./scripts/ci/check_disagreement_detector || { rc=$?; if [ ! -f scripts/ci/check_disagreement_detector ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_disagreement_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_pipeline_token_checkouts
+        if: matrix.shard == 1
+        # #2775: a job holding AUTHOR_MERGE_TOKEN, REVIEWER_ASSIGNMENT_TOKEN or
+        # CI_ACTOR_TOKEN must not check out the candidate tree on a
+        # pull_request / pull_request_review(_comment) event. Embedded
+        # self-test, then a scan of .github/workflows/. PyYAML comes from the
+        # provisioned venv above; yq is the fallback. Soft-pass only when the
+        # launcher AND its payload are both absent (bootstrap skew); a missing
+        # launcher beside its payload is a deletion and fails, as for
+        # check_no_token_in_output.
+        run: ./scripts/ci/check_pipeline_token_checkouts || { rc=$?; if [ -f scripts/ci/check_pipeline_token_checkouts ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_pipeline_token_checkouts is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/pipeline_token_checkouts.py ]; then echo "check_pipeline_token_checkouts is absent while its gate payload scripts/ci/pipeline_token_checkouts.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_pipeline_token_checkouts not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_self_approval_detector
         if: matrix.shard == 4
