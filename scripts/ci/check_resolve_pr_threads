@@ -641,6 +641,29 @@ else
   bash "$READFAIL_TEST" 2>&1 | sed 's/^/      /' >&2 || true
 fi
 
+# ── Test 9c: delegate to tests/test_resolve_pr_threads_bind_head.sh
+# Exercises #2727's --bind-head (ADR 0004, caller C17): refusal of a PR that is
+# not open against the default branch, the head/base capture before any
+# evidence, evidence bound to that pair (commit list, cited commits, no local
+# ledger rows), the re-read before every write, the bounded restart and the
+# stop after a write. Same delegation pattern as Test 9b.
+echo
+echo "resolve-pr-threads.sh --bind-head head/base binding (#2727)"
+
+BIND_TEST="$ROOT/tests/test_resolve_pr_threads_bind_head.sh"
+if [ ! -f "$BIND_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $BIND_TEST" >&2
+elif bash "$BIND_TEST" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_bind_head.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_bind_head.sh exited non-zero" >&2
+  echo "    re-running with output:" >&2
+  bash "$BIND_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
 # ── Test 10: delegate to tests/test_resolve_pr_threads_verified_propagation.sh
 # Exercises the #572 --resolve-verified-propagation mode: canonical/templated
 # routing-class threads resolve ONLY on a byte-verified propagation match
