@@ -27,6 +27,14 @@ As of the 2026-05-21 reconciliation against 1Password Environments and the 1Pass
 - Mergepath's CI/headless review-auth proof is manual-only: `.github/workflows/onepassword-headless-proof.yml` reads a dedicated canary via `OP_SERVICE_ACCOUNT_TOKEN`, compares a SHA-256 digest without printing the value, and exercises `scripts/op-preflight.sh` token mode against an explicit `OP_PREFLIGHT_REVIEWER_PAT_REF` in a service-account-accessible proof vault. The setup helper also requires a shared-vault negative-scope sentinel (`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` / `--negative-scope-ref`) unless that check is explicitly skipped. Dispatch it after provisioning or rotating the service-account token.
 - Existing Mergepath scripts: shelling out to `op read`, `op run`, or `op inject` remains acceptable. Do not introduce a language-SDK migration unless a separate design decision calls for it.
 
+## Per-repository author token
+
+`AUTHOR_MERGE_TOKEN` moves from the shared classic `nathanjohnpayne` PAT to one fine-grained PAT per repository, in that repository's `merge-queue-policy` environment ([`specs/author_merge_token.md`](../../specs/author_merge_token.md), #2728). The owner mints, stores, sets, rotates and revokes every copy. An agent never reads, sets or deletes the secret.
+
+- **Policy flip:** an agent may open a repository's cutover PR setting `author_merge_token_class: fine-grained` in `.github/review-policy.yml` only after the owner says that repository's token is set and verified (runbook steps 1 to 5). Setting it earlier makes C14 and the approval continuation fail closed on the classic fallback.
+- **One key, one spelling:** never add a second `author_merge_token_class` line; change the existing one. Write it exactly `author_merge_token_class: <value>` at the start of the line. A repeated key fails closed as `duplicate-key`, and any other spelling (a quoted key, a space before the colon) fails closed as `malformed-key`.
+- **Diagnosing a failure:** a job that says the token does not meet `fine-grained` resolved a value that is not a fine-grained PAT. The most likely cause is a missing environment copy, so the job fell back to the classic repository secret; the environment copy may also be empty, classic or the wrong value. Ask the owner to check the environment secret's presence and its 1Password source item. It is an owner fix, not something to retry.
+
 ## Credential source debugging
 
 When `op-firebase-deploy` runs, it prints a single line on stderr identifying which step in the [Deploy credential precedence](../../DEPLOYMENT.md#deploy-credential-precedence-canonical) won:

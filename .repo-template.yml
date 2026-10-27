@@ -28,6 +28,9 @@ spec_test_map:
   owner_admin_override: tests/test_owner_admin_override.py
   stalled_pr_resume: tests/test_stalled_pr_resume.sh
   credential_isolation: tests/test_credential_isolation.py
+  author_merge_token:
+    - tests/test_author_merge_token.sh
+    - tests/test_approval_merge_continuation.sh
   cockpit_sync:
     - tests/test_cockpit_sync.py
     - tests/test_cockpit_sync_ui.cjs

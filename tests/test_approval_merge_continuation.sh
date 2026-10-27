@@ -10,6 +10,7 @@ mkdir -p "$TMP/bin" "$TMP/root/.github" "$TMP/root/scripts/lib" "$TMP/root/scrip
 cp "$SUBJECT" "$TMP/subject.sh"
 cp "$ROOT/scripts/lib/blocking-labels.sh" "$TMP/root/scripts/lib/blocking-labels.sh"
 cp "$ROOT/scripts/lib/review-policy-scalar.sh" "$TMP/root/scripts/lib/review-policy-scalar.sh"
+cp "$ROOT/scripts/lib/credential-class.sh" "$TMP/root/scripts/lib/credential-class.sh"
 
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -213,6 +214,15 @@ run_case() {
   : > "$TMP/accounting-token.log"
   : > "$TMP/queue-policy.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR-nathanjohnpayne}" > "$TMP/root/policy.yml"
+  if [ -n "${STUB_AUTHOR_CLASS:-}" ]; then
+    printf 'author_merge_token_class: %s\n' "$STUB_AUTHOR_CLASS" >> "$TMP/root/policy.yml"
+  fi
+  if [ -n "${STUB_AUTHOR_CLASS_REPEAT:-}" ]; then
+    printf 'author_merge_token_class: %s\n' "$STUB_AUTHOR_CLASS_REPEAT" >> "$TMP/root/policy.yml"
+  fi
+  if [ -n "${STUB_AUTHOR_CLASS_LINE:-}" ]; then
+    printf '%s\n' "$STUB_AUTHOR_CLASS_LINE" >> "$TMP/root/policy.yml"
+  fi
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
@@ -298,6 +308,7 @@ reset_fixtures() {
   unset STUB_WORKFLOW_QUEUE_SOURCE_TOKEN
   unset STUB_PROTECTIVE_DONE
   unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
+  unset STUB_AUTHOR_CLASS STUB_AUTHOR_CLASS_REPEAT STUB_AUTHOR_CLASS_LINE
 }
 
 reset_fixtures
@@ -1779,6 +1790,135 @@ if run_case && [ "$(cat "$TMP/accounting-token.log" 2>/dev/null)" = "author-merg
 else
   fail "expected accounting to fall back to the ambient GH_TOKEN (got: $(cat "$TMP/accounting-token.log" 2>/dev/null || echo '<missing>'))"
 fi
+
+# #2728: after a repository's cutover its governing base policy requires the
+# per-repository fine-grained author token. The shared classic token passes the
+# login check, so only the class gate stops a silent repository-secret fallback.
+reset_fixtures
+STUB_AUTHOR_CLASS="fine-grained"
+TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+set +e
+run_case
+rc=$?
+set -e
+if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq 'requires a fine-grained author token' "$TMP/subject.out"; then
+  pass "fine-grained policy rejects the shared classic token before readiness"
+else
+  fail "fine-grained policy must reject a classic author token (rc=$rc)"
+fi
+
+reset_fixtures
+STUB_AUTHOR_CLASS="fine-grained"
+TEST_AMBIENT_GH_TOKEN="github_pat_perrepo"
+if run_case && [ -s "$TMP/readiness.log" ] \
+   && grep -Fq "author token meets author_merge_token_class 'fine-grained'" "$TMP/subject.out"; then
+  pass "fine-grained policy accepts a github_pat_ author token and says so"
+else
+  fail "fine-grained policy must accept a github_pat_ author token"
+fi
+
+reset_fixtures
+STUB_AUTHOR_CLASS="any"
+TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+if run_case && [ -s "$TMP/readiness.log" ]; then
+  pass "policy class any keeps accepting the classic token"
+else
+  fail "policy class any must keep accepting the classic token"
+fi
+
+reset_fixtures
+STUB_AUTHOR_CLASS="classic"
+TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+set +e
+run_case
+rc=$?
+set -e
+if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq "unknown author_merge_token_class 'classic'" "$TMP/subject.out"; then
+  pass "unknown author_merge_token_class fails closed"
+else
+  fail "unknown author_merge_token_class must fail closed (rc=$rc)"
+fi
+
+# The scalar reader takes the first match, so a repeated key must fail closed:
+# an `any` left above the cutover's `fine-grained` would otherwise win.
+reset_fixtures
+STUB_AUTHOR_CLASS="any"
+STUB_AUTHOR_CLASS_REPEAT="fine-grained"
+TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+set +e
+run_case
+rc=$?
+set -e
+if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq "unknown author_merge_token_class 'duplicate-key'" "$TMP/subject.out"; then
+  pass "a repeated author_merge_token_class key fails closed"
+else
+  fail "a repeated author_merge_token_class key must fail closed (rc=$rc)"
+fi
+
+# Another spelling of the key is valid YAML the exact scalar reader misses, so
+# it would read as absent (`any`) and skip the check; it must fail closed.
+for odd_line in 'author_merge_token_class : fine-grained' '"author_merge_token_class": fine-grained'; do
+  reset_fixtures
+  STUB_AUTHOR_CLASS_LINE="$odd_line"
+  TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+  set +e
+  run_case
+  rc=$?
+  set -e
+  if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+     && grep -Fq "unknown author_merge_token_class 'malformed-key'" "$TMP/subject.out"; then
+    pass "a non-canonical class key spelling fails closed: $odd_line"
+  else
+    fail "a non-canonical class key spelling must fail closed: $odd_line (rc=$rc)"
+  fi
+done
+
+# A present key with no value (or only a comment) would read as absent (`any`).
+for empty_line in 'author_merge_token_class:' 'author_merge_token_class: # fine-grained'; do
+  reset_fixtures
+  STUB_AUTHOR_CLASS_LINE="$empty_line"
+  TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+  set +e
+  run_case
+  rc=$?
+  set -e
+  if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+     && grep -Fq "unknown author_merge_token_class 'empty-value'" "$TMP/subject.out"; then
+    pass "a class key with no value fails closed: $empty_line"
+  else
+    fail "a class key with no value must fail closed: $empty_line (rc=$rc)"
+  fi
+done
+
+# A consumer can receive this script before the library that defines the class
+# gate. With no requirement it must keep working; with one it must fail closed.
+cp "$TMP/root/scripts/lib/credential-class.sh" "$TMP/credential-class.full"
+sed '/^credential_meets_author_token_class()/,$d' "$TMP/credential-class.full" \
+  > "$TMP/root/scripts/lib/credential-class.sh"
+reset_fixtures
+STUB_AUTHOR_CLASS="any"
+if run_case && [ -s "$TMP/readiness.log" ]; then
+  pass "an older library without the class gate is harmless while the policy says any"
+else
+  fail "an older library must not break continuation while the policy says any"
+fi
+reset_fixtures
+STUB_AUTHOR_CLASS="fine-grained"
+TEST_AMBIENT_GH_TOKEN="github_pat_perrepo"
+set +e
+run_case
+rc=$?
+set -e
+if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq 'cannot check it' "$TMP/subject.out"; then
+  pass "an older library fails closed once the policy requires a class"
+else
+  fail "an older library must fail closed once the policy requires a class (rc=$rc)"
+fi
+cp "$TMP/credential-class.full" "$TMP/root/scripts/lib/credential-class.sh"
 
 echo "test_approval_merge_continuation: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

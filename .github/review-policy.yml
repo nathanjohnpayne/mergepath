@@ -178,6 +178,20 @@ default_external_reviewer: nathanpayne-codex
 author_identity: nathanjohnpayne
 
 # ---------------------------------------------------------------------------
+# Author merge token class (#2728)
+# ---------------------------------------------------------------------------
+# The credential class the author-token jobs require of AUTHOR_MERGE_TOKEN:
+# approval continuation (auto-clear-blocking-labels.yml) and the Dependabot
+# merge (dependabot-auto-merge.yml). `any` keeps today's checks. `fine-grained`
+# also requires a fine-grained PAT (`github_pat_`), so a missing
+# merge-queue-policy environment copy cannot silently fall back to the shared
+# classic repository secret. A repository's cutover PR sets `fine-grained`
+# once the owner has provisioned its per-repository token; see
+# specs/author_merge_token.md. Absent means `any`; any other value fails
+# closed.
+author_merge_token_class: any
+
+# ---------------------------------------------------------------------------
 # Native merge-queue rollout (#1058)
 # ---------------------------------------------------------------------------
 # This is deliberately dark until organization ownership, queue/protection
