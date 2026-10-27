@@ -357,6 +357,15 @@ if [ "$rc" -eq 0 ] && grep -q "mergepath-resolve: rebuttal-recorded" "$STATE/arg
   ok "control: without --bind-head the unbound rebuttal sets rebuttal-recorded and resolves"
 else bad "classification control"; show; fi
 
+echo "Test 18b: an unproven later fix claim does not resurrect an earlier rebuttal"
+# A rebuttal, then a "Fixed" reply whose commit is not in the captured head
+# (dropped by a force-push), and no fix commit touching the file.
+NO_FIX=1 SECOND_REPLY="Fixed in deadbee1234." run_case "$P0" \
+  "Disagree: this path is intentional for the propagation lane, see the design note." --resolve-actioned --bind-head
+if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ] && grep -q "outside 111111111111" <<<"$out"; then
+  ok "the unproven fix claim leaves the thread open; the old rebuttal is not revived"
+else bad "superseded rebuttal"; show; fi
+
 echo "Test 16: a local ledger row (which names no head) is not evidence under --bind-head"
 LEDGER_DIR="$SCRATCH/ledger"; mkdir -p "$LEDGER_DIR"
 printf '%s\n' '{"comment_id":5001,"repo":"test/repo","verdict":"fixed","recorded_at":"2026-01-02T00:00:00Z"}' \

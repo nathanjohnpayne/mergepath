@@ -923,28 +923,34 @@ bind_reply_commits_bound() {
   return 0
 }
 
-# bind_filter_thread <thread_json> → the thread without the agent replies whose
-# cited commits fall outside the captured head. Applied once, before the
-# thread is classified, so no predicate (the tag-class ladder, the reply
-# polarity, the disposition check) can rest on evidence about another pair
-# (CodeRabbit on #2816). Non-agent comments are never removed, so the bot's
-# last word and the re-raise floor are unchanged.
-bind_filter_thread() {
-  local tj="$1" cnt i login body keep="[]"
+# bind_thread_unbound_reply <thread_json> — exit 0 when an agent reply in the
+# CURRENT round (after the latest non-agent comment, the same window
+# thread_reply_disposition reads) cites a commit outside the captured head.
+# Such a thread is left open: removing that reply would resurrect whatever
+# disposition it superseded (an older rebuttal behind a later "Fixed" whose
+# commit a force-push dropped, Codex on #2816), and keeping it would rest the
+# decision on another pair. Replies before the latest re-raise are already
+# superseded by it and are not read.
+bind_thread_unbound_reply() {
+  local tj="$1" cnt i login body last_nonagent_idx=-1
   cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
   case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
   i=0
   while [ "$i" -lt "$cnt" ]; do
+    is_self_comment_local "$tj" "$i" || last_nonagent_idx=$i
+    i=$((i + 1))
+  done
+  i=$((last_nonagent_idx + 1))
+  [ "$i" -lt 1 ] && i=1
+  while [ "$i" -lt "$cnt" ]; do
     login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
     body=$(printf '%s' "$tj" | jq -r ".all_comments[$i].body // \"\"")
     if [ -n "$login" ] && is_agent_author_local "$login" && ! bind_reply_commits_bound "$body"; then
-      echo "  INFO: --bind-head: ignoring a reply by $login that cites a commit outside the captured head (#2727)" >&2
-    else
-      keep=$(printf '%s' "$keep" | jq -c --argjson i "$i" '. + [$i]')
+      return 0
     fi
     i=$((i + 1))
   done
-  printf '%s' "$tj" | jq -c --argjson keep "$keep" '.all_comments = [.all_comments as $c | $keep[] | $c[.]]'
+  return 1
 }
 
 if $BIND_HEAD; then
@@ -3343,12 +3349,6 @@ thread_reply_disposition() {
       "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
     esac
     if [ -n "$login" ] && [ -n "$body" ] && is_agent_author_local "$login"; then
-      # --bind-head (#2727): a reply citing a commit outside the captured
-      # head is evidence about another pair; look for a later reply instead.
-      if $BIND_HEAD && ! bind_reply_commits_bound "$body"; then
-        k=$((k + 1))
-        continue
-      fi
       return 0
     fi
     k=$((k + 1))
@@ -3833,10 +3833,15 @@ while IFS= read -r thread; do
       SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
       continue
     fi
-    # --bind-head (#2727): drop agent replies that cite a commit outside the
-    # captured head before ANY classification reads the thread.
-    if $BIND_HEAD; then
-      thread=$(bind_filter_thread "$thread")
+    # --bind-head (#2727): a current-round agent reply citing a commit outside
+    # the captured head leaves the thread open, before ANY classification
+    # reads it (see bind_thread_unbound_reply).
+    if $BIND_HEAD && bind_thread_unbound_reply "$thread"; then
+      echo "  SKIP (never dispositioned on the captured head: a reply cites a commit outside ${CAPTURED_HEAD:0:12}): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    Reply again citing a commit of the current head (or none, for a rebuttal), then re-dispatch (#2727)."
+      SKIPPED_NOT_DISPOSITIONED=$((SKIPPED_NOT_DISPOSITIONED + 1))
+      continue
     fi
     # GATE path: classify with routing skipped, so a canonical/templated
     # thread that was actually fixed/rebutted resolves on its action
