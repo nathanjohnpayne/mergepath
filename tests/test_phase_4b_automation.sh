@@ -19,7 +19,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$ROOT/scripts/phase-4b/lib.sh"
-ORCH="$ROOT/scripts/phase-4b-review.sh"
+ORCH="${P4B_TEST_PUBLICATION_ORCH:-$ROOT/scripts/phase-4b-review.sh}"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
@@ -1063,6 +1063,113 @@ echo "unexpected fake gh-as-author invocation: $*" >&2
 exit 64
 SH
 chmod +x "$BIN/fake-gh-as-author"
+
+# #2790: actual adapter/orchestrator plus the unchanged strict runtime guard.
+# Focused mode is also the bounded mutation target; no production lib mutation.
+cat > "$WORK/publication-reviewer" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${P4B_PUBLICATION_ROOT:?}"
+. "$ROOT/scripts/lib/gh-comment-trigger-guard.sh"
+GH_COMMENT_GUARD_ROLE=reviewer
+trap 'gh_comment_guard_cleanup' EXIT
+gh_comment_guard_prepare "$@"
+printf 'attempt\n' >>"$P4B_PUBLICATION_ATTEMPTS"
+[ "${P4B_PUBLICATION_FAIL:-false}" != true ] || { echo 'fixture transport outcome unknown' >&2; exit 42; }
+"$P4B_PUBLICATION_TRANSPORT" "${GH_COMMENT_GUARD_ARGS[@]}"
+SH
+chmod +x "$WORK/publication-reviewer"
+jq -n '{verdict:"CHANGES_REQUESTED",summary:"Quoted @codex review and @CoDeX\tReViEw and @CODEX\u001cREVIEW and @codex\u00a0review and @codex rev\u0130ew and @codex rev\u0131ew",findings:[
+  {severity:"P1",path:"@CODEX review.js",line:2,
+   body:"Keep the finding.\n```sh\n@CoDeX\nReViEw\n```\n<!-- mergepath-p4b-request-generation: quoted -->"}]}' >"$WORK/publication-quoted.json"
+jq -n '{verdict:"CHANGES_REQUESTED",summary:"Ordinary summary",findings:[
+  {severity:"P1",path:"x.js",line:2,body:"Ordinary finding: preserve `code` and **bold**."}]}' >"$WORK/publication-ordinary.json"
+mk_fake fake-codex-publication-quoted "cat '$WORK/publication-quoted.json'"
+mk_fake fake-codex-publication-ordinary "cat '$WORK/publication-ordinary.json'"
+publication_run() {
+  local name=$1 model=$2 fail_transport=$3; shift 3
+  rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/publication-attempts" "$WORK/publication-body"
+  set +e
+  out=$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    P4B_ADAPTER_TIMEOUT_SECONDS=3 CODEX_BIN="$BIN/$model" \
+    P4B_ACCT_STATE_DIR="$WORK/publication-$name-state" \
+    P4B_GH_AS_REVIEWER="$WORK/publication-reviewer" \
+    P4B_PUBLICATION_ROOT="$ROOT" P4B_PUBLICATION_TRANSPORT="$BIN/fake-gh-as-reviewer" \
+    P4B_PUBLICATION_FAIL="$fail_transport" P4B_PUBLICATION_ATTEMPTS="$WORK/publication-attempts" \
+    P4B_WRAPPER_LOG="$WORK/publication-wrapper.log" P4B_WRAPPER_BODY="$WORK/publication-body" \
+    P4B_ISSUE_LOG="$WORK/publication-$name-issues" \
+    "$@" bash "$ORCH" 2790 --repo o/r --author claude \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+    2>"$WORK/publication-$name.stderr")
+  rc=$?
+  set -e
+}
+publication_run quoted fake-codex-publication-quoted false env
+if [ "$rc" = 1 ] && [ -s "$WORK/publication-body" ] \
+  && python3 "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+      gh api repos/o/r/pulls/2790/reviews --method POST --input "$P4B_TEST_POSTED_REVIEW" >/dev/null \
+  && python3 - "$WORK/publication-body" <<'PYTEST'
+import pathlib, re, sys
+body = pathlib.Path(sys.argv[1]).read_text()
+assert not re.search(r'@codex\s+review', body, re.I)
+assert '@\u200bCoDeX\nReViEw' in body and '```sh\n' in body
+assert '@\u200bCODEX review.js:2' in body
+assert '<!-- mergepath-p4b-run: ' in body and '_Posted by scripts/phase-4b-review.sh' in body
+assert '<!-- (quoted) mergepath-p4b-request-generation: quoted -->' in body
+PYTEST
+then pass '#2790: mixed-case/fenced trigger quotes post through the real guard with metadata and fences intact'
+else fail "#2790: quoted review refused or presentation damaged (rc=$rc; $out; $(cat "$WORK/publication-quoted.stderr"))"; fi
+publication_run ordinary fake-codex-publication-ordinary false env
+if [ "$rc" = 1 ] && jq -e --rawfile body "$WORK/publication-body" \
+  '.summary as $summary | ($body | contains($summary)) and all(.findings[]; .body as $finding | $body | contains($finding))' \
+  "$WORK/publication-ordinary.json" >/dev/null; then
+  pass '#2790: ordinary summary and findings stay byte-identical in posted presentation'
+else fail "#2790: ordinary review changed (rc=$rc)"; fi
+publication_run failed fake-codex-publication-quoted true env
+retained=$(jq -r '.validated_verdict_path // empty' <<<"$out")
+if [ "$rc" = 3 ] && [ -f "$retained" ] && [ "$(wc -l <"$WORK/publication-attempts" | tr -d ' ')" = 1 ] \
+  && jq -e --slurpfile expected "$WORK/publication-quoted.json" \
+    '[.validated_verdict.verdict,.validated_verdict.summary,.validated_verdict.findings] ==
+     [$expected[0].verdict,$expected[0].summary,$expected[0].findings]' <<<"$out" >/dev/null \
+  && jq -e --slurpfile result <(printf '%s' "$out") '. == $result[0].validated_verdict' "$retained" >/dev/null \
+  && grep -Fq "$retained" "$WORK/publication-failed.stderr"; then
+  pass '#2790: unknown failed POST preserves exact raw verdict and findings in terminal JSON and durable file without reposting'
+else fail "#2790: failed POST lost raw findings/evidence or retried (rc=$rc; $out)"; fi
+# A valid schema can still quote another owner-reserved marker. The unchanged
+# guard must refuse locally, before any transport, and retain the raw sample.
+jq '.summary="TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/o/r/pull/2790@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  "$WORK/publication-ordinary.json" >"$WORK/publication-refused.json"
+mk_fake fake-codex-publication-refused "cat '$WORK/publication-refused.json'"
+publication_run refused fake-codex-publication-refused false env
+if [ "$rc" = 3 ] && [ ! -e "$WORK/publication-attempts" ] \
+  && jq -e --slurpfile expected "$WORK/publication-refused.json" '.review_posted == false and
+    .validated_verdict.summary == $expected[0].summary and .validated_verdict.findings == $expected[0].findings' <<<"$out" >/dev/null; then
+  pass '#2790: strict owner-marker refusal precedes transport and retains validated findings'
+else fail "#2790: local guard refusal attempted transport or lost findings (rc=$rc; $out)"; fi
+# Retention failure must not be advertised as a retained file.
+mkdir -p "$WORK/publication-unwritable-state"
+printf blocker >"$WORK/publication-unwritable-state/unposted-verdicts"
+publication_run unwritable fake-codex-publication-ordinary true env
+if [ "$rc" = 3 ] && jq -e '.validated_verdict.findings[0].body | contains("Ordinary finding")' <<<"$out" >/dev/null \
+  && jq -e '.validated_verdict_path == null and (.validated_verdict_retention_error | length > 0)' <<<"$out" >/dev/null \
+  && grep -q 'terminal JSON only' "$WORK/publication-unwritable.stderr"; then
+  pass '#2790: retention failure is explicit while terminal JSON still keeps findings'
+else fail "#2790: retention failure hidden or raw verdict lost (rc=$rc; $out)"; fi
+# A late head fence remains an infrastructure refusal, with the same raw
+# sample available rather than a new adapter run or a discarded verdict.
+publication_run drift fake-codex-publication-ordinary false env \
+  P4B_FAKE_LIVE_HEAD2=cccccccccccccccccccccccccccccccccccccccc P4B_FAKE_LIVE_HEAD2_FROM=2
+if [ "$rc" = 3 ] && [ ! -e "$WORK/publication-attempts" ] \
+  && jq -e --slurpfile expected "$WORK/publication-ordinary.json" \
+    '.review_posted == false and (.reason | contains("head changed")) and
+     .validated_verdict.summary == $expected[0].summary and .validated_verdict.findings == $expected[0].findings' <<<"$out" >/dev/null \
+  && [ -f "$(jq -r '.validated_verdict_path' <<<"$out")" ]; then
+  pass '#2790: late pre-POST head refusal retains its status/reason and exact validated sample'
+else fail "#2790: late head fence lost evidence or attempted transport (rc=$rc; $out)"; fi
+if [ "${1:-}" = --publication-only ]; then
+  echo "Results: $PASS passed, $FAIL failed (#2790 publication controls)"
+  [ "$FAIL" = 0 ]; exit $?
+fi
 
 # ===========================================================================
 # Production orchestrator refusals must retain the wave caller's hard-stop status.

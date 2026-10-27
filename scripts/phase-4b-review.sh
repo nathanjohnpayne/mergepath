@@ -128,6 +128,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
+# Raw adapter evidence is independent of the presentation rewritten for GitHub.
+P4B_VALIDATED_VERDICT=""
+P4B_VERDICT_EVIDENCE_FILE=""
+P4B_VERDICT_EVIDENCE_ERROR=""
+p4b_unposted_verdict_summary() {
+  if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
+    jq -nc --argjson v "$P4B_VALIDATED_VERDICT" --arg path "$P4B_VERDICT_EVIDENCE_FILE" \
+      --arg error "$P4B_VERDICT_EVIDENCE_ERROR" \
+      '{validated_verdict:$v,validated_verdict_path:(if $path == "" then null else $path end)}
+       + if $error == "" then {} else {validated_verdict_retention_error:$error} end'
+  else
+    printf '{}\n'
+  fi
+}
+p4b_die_diagnostic() {
+  shift # The caller owns the exit code and error message.
+  if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
+    jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "$HEAD" --arg reviewer "$REVIEWER" \
+      --arg reason "$*" --argjson extra "$(admin_override_summary)" \
+      '{pr_number:$pr,repo:$repo,head_sha:$head,reviewer_identity:$reviewer,
+        review_posted:false,reason:$reason} + $extra'
+  fi
+}
 # shellcheck source=phase-4b/immutable-input.sh
 . "$ROOT/phase-4b/immutable-input.sh"
 
@@ -595,6 +618,15 @@ if [ -r "$ROOT/phase-4b/heartbeat.sh" ]; then
 fi
 _p4b_on_exit() {
   local rc="$1"
+  if [ -n "$P4B_VERDICT_EVIDENCE_FILE" ]; then
+    if [ "${REVIEW_POSTED:-false}" = true ] || [ "$rc" = 0 ]; then
+      rm -f "$P4B_VERDICT_EVIDENCE_FILE" || true
+    else
+      p4b_warn "validated adapter verdict retained at $P4B_VERDICT_EVIDENCE_FILE"
+    fi
+  elif [ -n "$P4B_VERDICT_EVIDENCE_ERROR" ]; then
+    p4b_warn "$P4B_VERDICT_EVIDENCE_ERROR; validated verdict is available in terminal JSON only"
+  fi
   if declare -F _p4b_cleanup_tmp >/dev/null 2>&1; then _p4b_cleanup_tmp || true; fi
   # #2663: give back an unspent round reservation. Never after a POST was
   # attempted: an uncertain publication keeps its slot until reconciled.
@@ -737,7 +769,8 @@ refuse_approval_if_request_generation_moved() {
 admin_override_summary() {
   jq -nc --argjson overridden "$ADMIN_OVERRIDDEN" --arg quote "$ADMIN_OVERRIDE_QUOTE" \
     --argjson set "$ADMIN_OVERRIDE_SET" \
-    '{admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)}'
+    '{admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)}' \
+    | jq --argjson evidence "$(p4b_unposted_verdict_summary)" '. + $evidence'
 }
 
 # --- manual-handoff fallback -----------------------------------------------
@@ -1707,13 +1740,33 @@ fi
 if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
 fi
+# Preserve the exact schema-valid, bound adapter result before any presentation
+# normalization or late fence can refuse publication (#2790). This private file
+# survives unsuccessful runs; successful publication removes it at EXIT.
+P4B_VALIDATED_VERDICT="$VERDICT_JSON"
+if [ "$DRY_RUN" != true ]; then
+  evidence_dir="${P4B_ACCT_STATE_DIR:-$(p4b_repo_root)/.mergepath}/unposted-verdicts"
+  if mkdir -p "$evidence_dir" && chmod 700 "$evidence_dir" \
+    && evidence_dir="$(cd "$evidence_dir" && pwd)" \
+    && P4B_VERDICT_EVIDENCE_FILE="$(mktemp "$evidence_dir/pr-${PR}.XXXXXX")" \
+    && printf '%s\n' "$P4B_VALIDATED_VERDICT" > "$P4B_VERDICT_EVIDENCE_FILE"; then
+    :
+  else
+    [ -z "$P4B_VERDICT_EVIDENCE_FILE" ] || rm -f "$P4B_VERDICT_EVIDENCE_FILE" || true
+    P4B_VERDICT_EVIDENCE_FILE=""
+    P4B_VERDICT_EVIDENCE_ERROR="could not retain validated adapter verdict under $evidence_dir"
+  fi
+fi
 # #1598: the approval's request-generation record must be writer-owned. The
 # verdict's text (summary, findings) is rendered into the body and echoed by
 # the accounting block, so neutralize any copy of the record marker in it;
-# the substitute merge gate accepts exactly one marker.
+# the substitute merge gate accepts exactly one marker. Reserved Codex command
+# quotes also receive a zero-width break (Python guard whitespace includes
+# U+001C through U+001F in addition to the regex engine's Unicode whitespace).
 VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
   walk(if type == "string"
-       then gsub("<!--(?<s>\\s*)mergepath-p4b-request-generation"; "<!--\(.s)(quoted) mergepath-p4b-request-generation")
+       then gsub("@(?<command>codex[\\s\u001c-\u001f]+rev[i\u0130\u0131]ew)"; "@\u200b\(.command)"; "i")
+          | gsub("<!--(?<s>\\s*)mergepath-p4b-request-generation"; "<!--\(.s)(quoted) mergepath-p4b-request-generation")
        else . end)')" || fall_back_to_manual "adapter verdict could not be normalized"
 
 # A Codex trigger can arrive without changing the PR head while the external
@@ -2336,6 +2389,17 @@ post_review() {
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
+  # Run the SAME strict payload guard locally before transport is attempted.
+  # A definitive refusal here cannot publish; only this writer may return its
+  # reservation at EXIT. Once the wrapper is invoked, every failure remains an
+  # uncertain POST and keeps its slot, including a lost response (#2663/#2790).
+  if ! python3 "$ROOT/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+    gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file" >/dev/null; then
+    rm -f "$payload_file"
+    cleanup_pre_post_refusal_side_effects "review payload refused by local comment guard" true \
+      "Review publication" "the review payload for ${REPO}#${PR}"
+    return 1
+  fi
   P4B_ROUND_POST_ATTEMPTED=true
   set +e
   review_response="$(

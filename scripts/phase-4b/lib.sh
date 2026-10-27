@@ -16,7 +16,14 @@
 p4b_log()  { echo "[phase-4b] $*" >&2; }
 p4b_warn() { echo "[phase-4b] WARN: $*" >&2; }
 # p4b_die <exit-code> <message...>
-p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
+p4b_die() {
+  local c="$1"; shift
+  echo "[phase-4b] ERROR: $*" >&2
+  # The orchestrator can retain a validated but unpublished verdict (#2790).
+  # Diagnostics are advisory: never replace the original refusal's exit code.
+  if declare -F p4b_die_diagnostic >/dev/null 2>&1; then p4b_die_diagnostic "$c" "$@" || true; fi
+  exit "$c"
+}
 
 # --- config location -------------------------------------------------------
 
