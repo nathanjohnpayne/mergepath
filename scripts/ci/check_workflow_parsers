@@ -1360,29 +1360,29 @@ else
 fi
 
 echo
-echo "dependabot-auto-merge.yml reviewer-token fail-closed regression (#374 Pattern A)"
+echo "dependabot-auto-merge.yml reviewer-token fail-closed regression (#374 Pattern A, #2729)"
 
 if workflow_guard_block_contains_exit \
   "$dependabot_workflow" \
-  'if [ -z "${GH_TOKEN:-}" ]; then' \
-  'GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set'; then
+  'if [ -z "${REVIEWER_TOKEN:-}" ]; then' \
+  'DEPENDABOT_REVIEWER_TOKEN is unavailable from the dependabot-reviewer environment'; then
   pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN is empty"
+  echo "  PASS: Dependabot auto-merge exits when DEPENDABOT_REVIEWER_TOKEN is empty"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN/GH_TOKEN is empty" >&2
+  echo "  FAIL: Dependabot auto-merge must fail closed when DEPENDABOT_REVIEWER_TOKEN is empty" >&2
 fi
 
-if grep -Fq 'ACTING_AS=$(gh api user --jq .login' "$dependabot_workflow" &&
+if grep -Fq 'ACTING_AS=$(GH_TOKEN="$REVIEWER_TOKEN" gh api user --jq .login' "$dependabot_workflow" &&
    workflow_guard_block_contains_exit \
      "$dependabot_workflow" \
      'if [ -z "$ACTING_AS" ]; then' \
      'gh api user returned empty'; then
   pass=$((pass + 1))
-  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity"
+  echo "  PASS: Dependabot auto-merge exits when DEPENDABOT_REVIEWER_TOKEN cannot resolve an identity"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity" >&2
+  echo "  FAIL: Dependabot auto-merge must fail closed when DEPENDABOT_REVIEWER_TOKEN cannot resolve an identity" >&2
 fi
 
 if workflow_guard_block_contains_exit \
@@ -1393,7 +1393,7 @@ if workflow_guard_block_contains_exit \
   echo "  PASS: Dependabot auto-merge exits when the reviewer token resolves to the PR author"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN resolves to the PR author" >&2
+  echo "  FAIL: Dependabot auto-merge must fail closed when DEPENDABOT_REVIEWER_TOKEN resolves to the PR author" >&2
 fi
 
 if workflow_guard_block_contains_exit \
@@ -1404,7 +1404,7 @@ if workflow_guard_block_contains_exit \
   echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN is not in available_reviewers" >&2
+  echo "  FAIL: Dependabot auto-merge must fail closed when DEPENDABOT_REVIEWER_TOKEN is not in available_reviewers" >&2
 fi
 
 if grep -Fq "!contains(github.event.pull_request.labels.*.name, 'human-hold')" "$dependabot_workflow"; then
@@ -1517,6 +1517,16 @@ if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-re
 else
   echo "  FAIL: agent-review must avoid runner polling and keep readiness unarmed without a base-bound merge boundary" >&2
   fail=$((fail + 1))
+fi
+
+echo
+echo "dependabot-auto-merge.yml reviewer environment and base guard (#2729)"
+if tests/test_dependabot_reviewer_environment.sh; then
+  pass=$((pass + 1))
+  echo "  PASS: approval reads DEPENDABOT_REVIEWER_TOKEN only in the approve job, fails closed, and both jobs carry the base-is-default guard"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot reviewer environment, exact-head approval or base guard regressed" >&2
 fi
 
 echo

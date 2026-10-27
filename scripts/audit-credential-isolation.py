@@ -8,7 +8,8 @@ from urllib.parse import quote
 
 AUTHORITY = {'AUTHOR_MERGE_TOKEN', 'REVIEWER_ASSIGNMENT_TOKEN', 'CLAUDE_PAT', 'CODEX_PAT',
              'MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN',
-             'CURSOR_PAT', 'OP_SERVICE_ACCOUNT_TOKEN', 'BRANCH_PROTECTION_AUDIT_TOKEN', 'CI_ACTOR_TOKEN'}
+             'CURSOR_PAT', 'OP_SERVICE_ACCOUNT_TOKEN', 'BRANCH_PROTECTION_AUDIT_TOKEN', 'CI_ACTOR_TOKEN',
+             'DEPENDABOT_REVIEWER_TOKEN'}
 
 
 def deployment_policy(environment):
@@ -22,8 +23,17 @@ def deployment_policy(environment):
     return policy
 
 
-def assess(repo_secrets, environment, policies, branch, organization_secrets=None):
-    """Return drift; malformed or incomplete observations are infrastructure."""
+def assess(repo_secrets, environment, policies, branch, organization_secrets=None,
+           environment_secrets=None, expected_secrets=None):
+    """Return drift; malformed or incomplete observations are infrastructure.
+
+    With expected_secrets, the environment must hold exactly those secret
+    names (#2729: `dependabot-reviewer` holds DEPENDABOT_REVIEWER_TOKEN and
+    nothing else). Only the expected names, fixed by the caller, are ever
+    reported; other observed names are counted, never echoed. That mode also
+    requires an unattended environment: a required-reviewers rule or a
+    non-zero wait timer would stall the job that reads the secret.
+    """
     if not isinstance(repo_secrets, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in repo_secrets):
         raise ValueError('repository secret metadata is malformed')
     organization_secrets = [] if organization_secrets is None else organization_secrets
@@ -50,6 +60,31 @@ def assess(repo_secrets, environment, policies, branch, organization_secrets=Non
         drift.append('The credential environment must use a custom branch policy')
     if not policies or any(item['name'] != branch or item['type'] != 'branch' for item in policies):
         drift.append(f'The credential environment must permit only the literal default branch {branch}')
+    if expected_secrets is not None:
+        if not isinstance(environment_secrets, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in environment_secrets):
+            raise ValueError('environment secret metadata is malformed')
+        held = [item['name'] for item in environment_secrets]
+        # Fixed labels again: a missing name is reported from AUTHORITY, never
+        # from the caller's or the API's strings (main() restricts
+        # expected_secrets to AUTHORITY names).
+        missing = sorted(name for name in AUTHORITY if name in expected_secrets and name not in held)
+        if missing:
+            drift.append('The credential environment lacks: ' + ', '.join(missing))
+        others = sum(1 for name in held if name not in expected_secrets)
+        if others:
+            drift.append(f'The credential environment holds {others} secret(s) besides the expected ones')
+        # GitHub omits protection_rules on an environment that has none.
+        rules = environment.get('protection_rules', [])
+        if not isinstance(rules, list) or not all(isinstance(rule, dict) and isinstance(rule.get('type'), str) for rule in rules):
+            raise ValueError('environment protection rules are malformed')
+        if any(rule['type'] == 'required_reviewers' for rule in rules):
+            drift.append('The credential environment requires reviewers, which stalls its job')
+        for rule in rules:
+            if rule['type'] == 'wait_timer':
+                if type(rule.get('wait_timer')) is not int:
+                    raise ValueError('environment wait timer is malformed')
+                if rule['wait_timer'] > 0:
+                    drift.append('The credential environment has a wait timer, which delays its job')
     return drift
 
 
@@ -58,9 +93,16 @@ def main():
     parser.add_argument('--repo', required=True)
     parser.add_argument('--branch', required=True)
     parser.add_argument('--environment', default='merge-queue-policy')
+    parser.add_argument('--expect-secrets', metavar='NAME[,NAME...]',
+                        help='also require the environment to hold exactly these secret names')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo):
         parser.error('--repo must be owner/repository')
+    expected = None
+    if args.expect_secrets is not None:
+        expected = sorted(set(args.expect_secrets.split(',')))
+        if not all(name in AUTHORITY for name in expected):
+            parser.error('--expect-secrets takes authority credential names: ' + ', '.join(sorted(AUTHORITY)))
 
     def api(endpoint):
         result = subprocess.run(['gh', 'api', '--paginate', '--slurp', endpoint], check=True,
@@ -118,7 +160,10 @@ def main():
         policy = deployment_policy(environments[0])
         policies = (items(root + '/environments/' + env + '/deployment-branch-policies?per_page=100', 'branch_policies')
                     if isinstance(policy, dict) and policy.get('custom_branch_policies') is True else [])
-        drift = assess(secrets, environments[0], policies, args.branch, organization_secrets)
+        environment_secrets = (items(root + '/environments/' + env + '/secrets?per_page=100', 'secrets')
+                               if expected is not None else None)
+        drift = assess(secrets, environments[0], policies, args.branch, organization_secrets,
+                       environment_secrets, expected)
         print(json.dumps({'repo': args.repo, 'environment': args.environment,
                           'status': 'DRIFT' if drift else 'PASS', 'drift': drift}))
         return 3 if drift else 0

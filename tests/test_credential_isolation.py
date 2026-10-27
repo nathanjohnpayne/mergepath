@@ -54,6 +54,39 @@ class IsolationTests(unittest.TestCase):
         for env in ({**CLOSED,'can_admins_bypass':True}, {**CLOSED,'deployment_branch_policy':None}):
             self.assertTrue(isolation.assess([], env, MAIN, 'main'))
 
+    def test_expected_environment_secrets_hold_exactly_the_named_set(self):
+        expected = ['DEPENDABOT_REVIEWER_TOKEN']
+        self.assertEqual(isolation.assess([], CLOSED, MAIN, 'main', None,
+                                          [{'name': 'DEPENDABOT_REVIEWER_TOKEN'}], expected), [])
+        self.assertEqual(isolation.assess([], CLOSED, MAIN, 'main', None, [], expected),
+                         ['The credential environment lacks: DEPENDABOT_REVIEWER_TOKEN'])
+        drift = isolation.assess([], CLOSED, MAIN, 'main', None,
+                                 [{'name': 'DEPENDABOT_REVIEWER_TOKEN'}, {'name': 'AUTHOR_MERGE_TOKEN'}], expected)
+        self.assertEqual(drift, ['The credential environment holds 1 secret(s) besides the expected ones'])
+        self.assertNotIn('AUTHOR_MERGE_TOKEN', json.dumps(drift))
+        with self.assertRaises(ValueError):
+            isolation.assess([], CLOSED, MAIN, 'main', None, None, expected)
+
+    def test_expected_mode_requires_an_unattended_environment(self):
+        expected = ['DEPENDABOT_REVIEWER_TOKEN']
+        held = [{'name': 'DEPENDABOT_REVIEWER_TOKEN'}]
+        def run(rules):
+            return isolation.assess([], dict(CLOSED, protection_rules=rules), MAIN, 'main', None, held, expected)
+        self.assertEqual(run([{'type': 'branch_policy'}, {'type': 'wait_timer', 'wait_timer': 0}]), [])
+        self.assertEqual(run([{'type': 'required_reviewers', 'reviewers': []}]),
+                         ['The credential environment requires reviewers, which stalls its job'])
+        self.assertEqual(run([{'type': 'wait_timer', 'wait_timer': 5}]),
+                         ['The credential environment has a wait timer, which delays its job'])
+        for malformed in ('rules', [{}], [{'type': 'wait_timer'}]):
+            with self.assertRaises(ValueError):
+                run(malformed)
+        # Without --expect-secrets the existing merge-queue-policy audit is unchanged.
+        self.assertEqual(isolation.assess([], dict(CLOSED, protection_rules=[{'type': 'required_reviewers'}]), MAIN, 'main'), [])
+
+    def test_dependabot_reviewer_token_shadow_is_drift(self):
+        self.assertIn('DEPENDABOT_REVIEWER_TOKEN',
+                      isolation.assess([{'name': 'DEPENDABOT_REVIEWER_TOKEN'}], CLOSED, MAIN, 'main')[0])
+
     def test_unreadable_metadata_is_error(self):
         for secrets, env, policies in ((None,CLOSED,MAIN), ([],{},MAIN), ([],CLOSED,[{}])):
             with self.assertRaises(ValueError): isolation.assess(secrets, env, policies, 'main')
@@ -62,16 +95,18 @@ class IsolationTests(unittest.TestCase):
 class IsolationCliTests(unittest.TestCase):
     def run_audit(self, *, secrets=None, env=None, policies=None, failure=None,
                   owner_type='User', organization_secrets=None, failure_text='permission denied', inventory=None,
-                  repository=None):
+                  repository=None, environment='merge-queue-policy', expect=None, env_secrets=None):
         root = 'repos/owner/repo'
         observations = {
             root: [{'owner': {'type': owner_type}}] if repository is None else repository,
             root + '/actions/organization-secrets?per_page=100': organization_secrets or [{'total_count': 0, 'secrets': []}],
             root + '/environments?per_page=100': inventory or [{'total_count': 0, 'environments': []}],
             root + '/actions/secrets?per_page=100': secrets if secrets is not None else [{'total_count': 0, 'secrets': []}],
-            root + '/environments/merge-queue-policy': [CLOSED] if env is None else env,
-            root + '/environments/merge-queue-policy/deployment-branch-policies?per_page=100':
+            root + '/environments/' + environment: [CLOSED] if env is None else env,
+            root + '/environments/' + environment + '/deployment-branch-policies?per_page=100':
                 policies if policies is not None else [{'total_count': 1, 'branch_policies': MAIN}],
+            root + '/environments/' + environment + '/secrets?per_page=100':
+                env_secrets if env_secrets is not None else [{'total_count': 0, 'secrets': []}],
         }
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -90,11 +125,13 @@ if path == os.environ.get('AUDIT_FAILURE'):
 print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[path]))
 ''')
             gh.chmod(0o755)
-            environment = dict(os.environ, PATH=str(temp) + os.pathsep + os.environ['PATH'],
+            environment_vars = dict(os.environ, PATH=str(temp) + os.pathsep + os.environ['PATH'],
                                AUDIT_CALLS=str(temp / 'calls'), AUDIT_OBSERVATIONS=str(temp / 'observations.json'),
                                AUDIT_FAILURE=failure or '', AUDIT_FAILURE_TEXT=failure_text)
+            extra = ([] if environment == 'merge-queue-policy' else ['--environment', environment])
+            extra += [] if expect is None else ['--expect-secrets', expect]
             result = subprocess.run(['python3', str(ROOT / 'scripts/audit-credential-isolation.py'),
-                                     '--repo', 'owner/repo', '--branch', 'main'], env=environment,
+                                     '--repo', 'owner/repo', '--branch', 'main', *extra], env=environment_vars,
                                     text=True, capture_output=True)
             calls = (temp / 'calls').read_text().splitlines()
             return result.returncode, json.loads(result.stdout), calls
@@ -108,6 +145,30 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
         self.assertEqual(report['status'], 'DRIFT')
         self.assertIn('AUTHOR_MERGE_TOKEN', report['drift'][0])
         self.assertEqual(len(calls), 4)
+
+    def test_dependabot_reviewer_environment_reads_back_its_secret_names(self):
+        held = [{'total_count': 1, 'secrets': [{'name': 'DEPENDABOT_REVIEWER_TOKEN'}]}]
+        code, report, calls = self.run_audit(environment='dependabot-reviewer',
+                                             expect='DEPENDABOT_REVIEWER_TOKEN', env_secrets=held)
+        self.assertEqual((code, report['status'], report['environment']), (0, 'PASS', 'dependabot-reviewer'))
+        self.assertIn('repos/owner/repo/environments/dependabot-reviewer/secrets?per_page=100', calls)
+        code, report, _ = self.run_audit(environment='dependabot-reviewer', expect='DEPENDABOT_REVIEWER_TOKEN')
+        self.assertEqual((code, report['status']), (3, 'DRIFT'))
+        self.assertIn('The credential environment lacks: DEPENDABOT_REVIEWER_TOKEN', report['drift'])
+        code, report, _ = self.run_audit(environment='dependabot-reviewer', expect='DEPENDABOT_REVIEWER_TOKEN',
+                                         failure='repos/owner/repo/environments/dependabot-reviewer/secrets?per_page=100')
+        self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_expect_secrets_accepts_only_authority_names(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/audit-credential-isolation.py'),
+                                 '--repo', 'owner/repo', '--branch', 'main', '--expect-secrets', 'BUILD_KEY'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('authority credential names', result.stderr)
+
+    def test_environment_secrets_are_not_read_without_expect(self):
+        _, _, calls = self.run_audit()
+        self.assertFalse(any(call.endswith('/secrets?per_page=100') and '/environments/' in call for call in calls))
 
     def test_isolated_environment_cli_passes(self):
         code, report, calls = self.run_audit()

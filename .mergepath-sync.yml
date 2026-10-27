@@ -1349,6 +1349,18 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+  # #2729: check_workflow_parsers runs it against the propagated
+  # dependabot-auto-merge.yml (approve/merge job split, reviewer environment,
+  # base-is-default guard). It copies the provenance libs into a sandbox and
+  # runs the workflow's approve step; it also needs jq, python3 and PyYAML or
+  # yq.
+  - path: tests/test_dependabot_reviewer_environment.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/dependabot-auto-merge.yml"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
   # Pairs with scripts/ci/check_dependabot_coupled_groups (#2162): the
   # fixture suite its --self-test runs in every consumer's deep lane.
   - path: tests/test_dependabot_coupled_groups.sh
@@ -2684,6 +2696,7 @@ paths:
       - "tests/test_dependabot_auto_merge_check_wait.sh"  # check_workflow_parsers (#889)
       - "tests/test_author_merge_token.sh"     # check_workflow_parsers (#2728)
       - ".github/workflows/dependabot-auto-merge.yml"  # test_author_merge_token.sh extracts and runs its class block (#2728)
+      - "tests/test_dependabot_reviewer_environment.sh"  # check_workflow_parsers (#2729)
       - "tests/test_git_identity_hygiene.sh"   # check_git_identity_hygiene (#777)
       - "tests/test_op_preflight_check.sh"     # check_op_preflight_contract
       - "tests/test_op_preflight_token_mode.sh"  # check_op_preflight_contract
@@ -3130,6 +3143,14 @@ doc_ownership:
       Promote to canonical once the rules have been exercised on a
       consumer and the hub-specific citations are separated from the
       rules themselves.
+  - path: docs/agents/dependabot-reviewer-environment.md
+    class: hub-only
+    note: >-
+      Owner runbook for the dependabot-reviewer environment and its
+      dedicated classic reviewer PAT (#2729). HUB-ONLY: it covers every
+      fleet repository from here, names this repo's audit script, and holds
+      the single token record; consumers receive the workflow, not the
+      runbook. AGENTS.md links it absolutely.
   - path: docs/agents/tracker-unblock-runbook.md
     class: hub-only
     note: >-
