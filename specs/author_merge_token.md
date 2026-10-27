@@ -125,7 +125,24 @@ Do these in order, one repository at a time.
 
 Revoke nothing until all eight inventory rows are verified and every repository copy is gone.
 
-1. **Prove no copy remains.** Run `scripts/audit-branch-protection.sh --fleet --require-credential-isolation` with an owner credential that has Secrets: read and Environments: read (it reads names, never values); listing a repository's Dependabot secrets needs Dependabot secrets: read as well, and list secret names (repository, environment and Dependabot) for every repository `nathanjohnpayne` owns, not only the fleet, looking for `AUTHOR_MERGE_TOKEN`. Every hit outside a `merge-queue-policy` environment holding a verified fine-grained token is either replaced first, through the per-repository steps, or deleted.
+1. **Prove no copy remains.** Take a names-only inventory of every repository `nathanjohnpayne` owns, archived ones included, across all three secret scopes: repository, environment and Dependabot. Run it with an owner credential that can list them: Secrets: read, Environments: read and Dependabot secrets: read. It reads names, never values. `scripts/audit-branch-protection.sh --fleet --require-credential-isolation` is not enough on its own: it covers only the hub and the `.mergepath-sync.yml` consumers, and it does not list environment or Dependabot secret names.
+
+   ```bash
+   bash -o pipefail <<'EOF' | grep -E 'AUTHOR_MERGE_TOKEN$|READ-FAILED'
+   repos=$(gh repo list nathanjohnpayne --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+   [ "$?" -eq 0 ] && [ -n "$repos" ] || echo "READ-FAILED repository list"
+   for repo in $repos; do
+     gh api --paginate "repos/$repo/actions/secrets" --jq '.secrets[].name' | sed "s|^|$repo repository |" || echo "$repo READ-FAILED repository"
+     gh api --paginate "repos/$repo/dependabot/secrets" --jq '.secrets[].name' | sed "s|^|$repo dependabot |" || echo "$repo READ-FAILED dependabot"
+     envs=$(gh api --paginate "repos/$repo/environments" --jq '.environments[].name') || { echo "$repo READ-FAILED environments"; continue; }
+     for env in $envs; do
+       gh api --paginate "repos/$repo/environments/$env/secrets" --jq '.secrets[].name' | sed "s|^|$repo environment:$env |" || echo "$repo READ-FAILED environment:$env"
+     done
+   done
+   EOF
+   ```
+
+   `pipefail` makes a failed read print `READ-FAILED` instead of passing for "no secrets", and that includes the repository list itself. The inventory proves absence only when it prints no `READ-FAILED` line, and its only `AUTHOR_MERGE_TOKEN` lines are `environment:merge-queue-policy` on repositories whose inventory row is verified. Rerun after any `READ-FAILED`. Every other hit is either replaced first, through the per-repository steps, or deleted.
 2. **Identify what holds the shared classic value.** `DEPLOYMENT.md` set the CI copies from `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token`, the human author PAT that local sessions also use as `OP_PREFLIGHT_AUTHOR_PAT` through `scripts/op-preflight.sh` and `scripts/gh-as-author.sh`. Also confirm that `BRANCH_PROTECTION_AUDIT_TOKEN` and `MERGE_QUEUE_POLICY_TOKEN`, wherever they are set, come from different items. If either shares the classic value, give it its own token, per its specification, before step 3.
 3. **Invalidate the classic value.** The CI copies were readable by any same-repository branch workflow (ADR 0004 § Context), so the value they held must stop working.
    - If it is the local author PAT, **regenerate** it rather than delete it: GitHub → Settings → Developer settings → Tokens (classic) → the token → Regenerate. Write the new value to the same 1Password item, then refresh every agent's preflight cache with `eval "$(scripts/op-preflight.sh --agent <agent> --refresh)"` (claude, codex and cursor each keep their own). A plain re-run serves the cached, now revoked value until the cache's TTL expires. The local route is [#2129](https://github.com/nathanjohnpayne/mergepath/issues/2129)'s concern and is not retired here.
