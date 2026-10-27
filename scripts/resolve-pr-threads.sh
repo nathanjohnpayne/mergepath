@@ -513,11 +513,12 @@ daily rollup / weekly sweep as the disposition of record):
   --bind-head           With --resolve-actioned only (#2727, ADR 0004 C17):
                         refuse (exit 5) unless the PR is open against the
                         default branch; capture its head and base SHAs before
-                        any evidence is read; accept only evidence bound to
-                        that pair (a cited commit must be in the captured
-                        head's commit list; local ledger rows, which carry no
-                        head, are not accepted); re-read the pair before every
-                        write. A pair that moves before any write restarts the
+                        any evidence is read; take fix-commit evidence only
+                        from the captured head's complete commit list, and
+                        read no local ledger (its rows name no head); re-read
+                        the pair immediately before every write. Commits a
+                        reply's text cites are not checked (see the #2727
+                        specification's residuals). A pair that moves before any write restarts the
                         run against a fresh capture (at most twice); after a
                         write it stops every remaining resolution (exit 5).
 EOF
@@ -842,9 +843,11 @@ fi
 # ref, never the PR's base, so the resolver itself refuses a PR that is not
 # open against the default branch. It captures the live head and base SHAs
 # here, BEFORE the thread enumeration and before any evidence is evaluated;
-# evidence must then apply to that pair (a cited commit must be one of the
-# captured head's commits, see bind_reply_commits_bound), and the pair is
-# re-read immediately before every write (bind_recheck). A pair that moves
+# fix-commit evidence then comes only from that head's complete commit list,
+# no local ledger is read, and the pair is re-read immediately before every
+# write (bind_recheck). Commits a reply's free-form text cites are NOT checked:
+# binding prose did not converge in review, and the owner dropped it from this
+# slice (#2816; residual recorded in docs/audits/ci-app-credentials-2026-10.md). A pair that moves
 # before any write re-runs the resolver against a fresh capture, at most
 # BIND_MAX_RESTARTS times; once this run has written, a moved pair stops
 # every remaining resolution (exit 5), as invariant 5 requires.
@@ -897,60 +900,6 @@ bind_recheck() {
   fi
   [ "$live" = "$CAPTURED_PAIR" ] && return 0
   bind_restart_or_stop "the head/base pair changed before $1 (captured: $CAPTURED_PAIR; live: $live)"
-}
-
-# bind_reply_commits_bound <body> — exit 0 when every commit the reply cites
-# is one of the captured head's commits. A citation is a 7-40 character hex
-# token with at least one digit and one letter (so comment IDs and plain words
-# are not read as SHAs). A reply that cites a commit outside the captured
-# head (dropped by a force-push, on another branch, or on the base) is
-# evidence about some other pair and does not count. A reply citing nothing
-# (a rebuttal) applies to any pair.
-bind_reply_commits_bound() {
-  local body="$1" tok shas
-  shas=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r '.[].sha // empty' 2>/dev/null) || shas=""
-  # Split on every non-alphanumeric character, then keep whole hex tokens.
-  # (A boundary-consuming grep would skip the second of two SHAs one
-  # separator apart, CodeRabbit on #2816.)
-  for tok in $(printf '%s' "$body" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '\n' | grep -xE '[0-9a-f]{7,40}'); do
-    case "$tok" in *[0-9]*) ;; *) continue ;; esac
-    case "$tok" in *[a-f]*) ;; *) continue ;; esac
-    # A here-string, not `printf | grep -q`: grep -q exits on the first match,
-    # and under pipefail the writer's SIGPIPE would turn a valid citation into
-    # a failure (Codex on #2816).
-    grep -q "^$tok" <<<"$shas" || return 1
-  done
-  return 0
-}
-
-# bind_thread_unbound_reply <thread_json> — exit 0 when an agent reply in the
-# CURRENT round (after the latest non-agent comment, the same window
-# thread_reply_disposition reads) cites a commit outside the captured head.
-# Such a thread is left open: removing that reply would resurrect whatever
-# disposition it superseded (an older rebuttal behind a later "Fixed" whose
-# commit a force-push dropped, Codex on #2816), and keeping it would rest the
-# decision on another pair. Replies before the latest re-raise are already
-# superseded by it and are not read.
-bind_thread_unbound_reply() {
-  local tj="$1" cnt i login body last_nonagent_idx=-1
-  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
-  case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
-  i=0
-  while [ "$i" -lt "$cnt" ]; do
-    is_self_comment_local "$tj" "$i" || last_nonagent_idx=$i
-    i=$((i + 1))
-  done
-  i=$((last_nonagent_idx + 1))
-  [ "$i" -lt 1 ] && i=1
-  while [ "$i" -lt "$cnt" ]; do
-    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
-    body=$(printf '%s' "$tj" | jq -r ".all_comments[$i].body // \"\"")
-    if [ -n "$login" ] && is_agent_author_local "$login" && ! bind_reply_commits_bound "$body"; then
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  return 1
 }
 
 if $BIND_HEAD; then
@@ -3833,16 +3782,6 @@ while IFS= read -r thread; do
       SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
       continue
     fi
-    # --bind-head (#2727): a current-round agent reply citing a commit outside
-    # the captured head leaves the thread open, before ANY classification
-    # reads it (see bind_thread_unbound_reply).
-    if $BIND_HEAD && bind_thread_unbound_reply "$thread"; then
-      echo "  SKIP (never dispositioned on the captured head: a reply cites a commit outside ${CAPTURED_HEAD:0:12}): [$AUTHOR] $PATH_"
-      echo "    $EXCERPT"
-      echo "    Reply again citing a commit of the current head (or none, for a rebuttal), then re-dispatch (#2727)."
-      SKIPPED_NOT_DISPOSITIONED=$((SKIPPED_NOT_DISPOSITIONED + 1))
-      continue
-    fi
     # GATE path: classify with routing skipped, so a canonical/templated
     # thread that was actually fixed/rebutted resolves on its action
     # evidence, while a fresh routing-only finding still falls through to a
@@ -4027,10 +3966,6 @@ while IFS= read -r thread; do
     continue
   fi
 
-  # --bind-head (#2727): the first write for this thread (the tag reply, or
-  # the resolve itself under --no-tag-reply) happens only on the captured pair.
-  bind_recheck "the writes for [$AUTHOR] $PATH_" || break
-
   # mergepath#305 — emit `[mergepath-resolve: <class>] <rationale>`
   # reply BEFORE the resolve mutation. The classifier in
   # scripts/lib/daily-feedback-rollup-helpers.sh reads this tag and
@@ -4186,10 +4121,14 @@ while IFS= read -r thread; do
       tag_class="$thread_class"
       tag_rationale=$(synth_rationale "$tag_class" "$thread")
     fi
-    # --bind-head (#2727): count the write as ATTEMPTED before dispatch. A
-    # write GitHub accepts whose response is lost reads as a failure here, so
-    # counting only confirmed writes would let a moved pair restart after a
-    # persisted write (Codex on #2816).
+    # --bind-head (#2727): re-read the pair immediately before the tag post,
+    # after the class and rationale are prepared (preparing them reads the
+    # comment history and commit list; the automated Phase 4b review of #2816
+    # found the re-read placed before that work). Then count the write as
+    # ATTEMPTED before dispatch: a write GitHub accepts whose response is lost
+    # reads as a failure here, so counting only confirmed writes would let a
+    # moved pair restart after a persisted write (Codex on #2816).
+    bind_recheck "the tag reply for [$AUTHOR] $PATH_" || break
     BIND_WRITES=$((BIND_WRITES + 1))
     if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
       echo "  TAGGED [$AUTHOR] $PATH_ → [mergepath-resolve: $tag_class]"

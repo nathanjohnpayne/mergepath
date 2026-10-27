@@ -55,6 +55,14 @@ cat > "$SCRATCH/gh" <<'GH_STUB'
 # Every call is logged; mutations are recognized from the query text.
 all="$*"
 printf '%s\n' "$all" >> "$STATE/argv"
+# One line per call, for ordering assertions: pair, tag, resolve or other.
+case "$all" in
+  *addPullRequestReviewThreadReply*) ev=tag ;;
+  *resolveReviewThread*) ev=resolve ;;
+  *"pulls/7"*".base.sha"*) ev=pair ;;
+  *) ev=other ;;
+esac
+echo "$ev" >> "$STATE/events"
 current_pair() { head -1 "$STATE/pairs"; }
 pop_pair() {
   local n; n=$(wc -l < "$STATE/pairs" | tr -d ' ')
@@ -224,11 +232,10 @@ if [ "$rc" -eq 5 ] && [ "$(grep -c 'WRITE tag' "$STATE/writes")" -eq 1 ] && ! gr
 else bad "lost tag response"; show; fi
 
 echo "Test 5c: a resolve whose response is lost still counts as a write"
-# Two threads, no tag replies: capture, then two re-reads per thread. The pair
-# moves before the second thread's writes, after the first resolve was
+# Two threads, no tag replies: the capture, then one re-read before each
+# resolve. The pair moves before the second resolve, after the first was
 # accepted but its response lost.
 TWO_THREADS=1 RESOLVE_LOST=1 run_case "$P0
-$P0
 $P0
 $H1 $B0 main open" "$REBUTTAL" --resolve-actioned --bind-head --no-tag-reply
 # Exit 2, not 5: the unconfirmed mutation is a failure, which takes precedence.
@@ -272,44 +279,32 @@ if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
   ok "a 249-commit list ending at the head is accepted"
 else bad "249-commit list"; show; fi
 
-echo "Test 8c: a citation of the FIRST commit in a long list is bound (no SIGPIPE false negative)"
-EARLY=a000000000
-for attempt in 1 2 3; do
-  COMMIT_COUNT=249 run_case "$P0" "Disagree: $EARLY already makes this path intentional, see the design note." --resolve-actioned --bind-head
-  [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes" || break
-done
+echo "Test 9: a reply's cited commits are not checked (the recorded residual)"
+# The owner dropped reply-citation binding from this slice (#2816): a rebuttal
+# citing a commit outside the captured head is accepted, as in today's lane.
+# This case pins the residual so a later change to it is deliberate.
+run_case "$P0" "Disagree: this was already handled by deadbee1234 on another branch, intentional." --resolve-actioned --bind-head
 if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
-  ok "an early citation in a 249-commit list resolves on every attempt"
-else bad "early citation in a long list"; show; fi
-# The race is timing-dependent, so also hold the shape: the membership test
-# must not pipe into an early-exiting reader.
-bind_fn=$(sed -n '/^bind_reply_commits_bound() {/,/^}/p' "$SCRIPT" | grep -v '^[[:space:]]*#')
-if [ -n "$bind_fn" ] && ! grep -Eq '[|][[:space:]]*grep -q' <<<"$bind_fn"; then
-  ok "bind_reply_commits_bound pipes nothing into grep -q"
-else bad "bind_reply_commits_bound still pipes into grep -q"; fi
+  ok "residual: an out-of-head citation in a rebuttal does not block the resolve"
+else bad "citation residual"; show; fi
 
-UNBOUND_REPLY="Disagree: this was already handled by deadbee1234 on another branch, intentional."
-echo "Test 9: a reply citing a commit outside the captured head is not evidence"
-run_case "$P0" "$UNBOUND_REPLY" --resolve-actioned --bind-head
-if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ] && grep -q "never dispositioned" <<<"$out"; then
-  ok "unbound citation left the thread open (exit 3)"
-else bad "unbound citation"; show; fi
-run_case "$P0" "$UNBOUND_REPLY" --resolve-actioned
-if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
-  ok "control: the same reply resolves without --bind-head"
-else bad "unbound-citation control"; show; fi
+echo "Test 10: a fix claim still needs a fix commit in the captured head's list"
+NO_FIX=1 run_case "$P0" "Fixed in deadbee1234." --resolve-actioned --bind-head
+if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
+  ok "a fix claim with no fix commit in the captured head's list leaves the thread open"
+else bad "fix claim without a bound fix commit"; show; fi
 
-echo "Test 10: a reply citing one of the captured head's commits is evidence"
-run_case "$P0" "Disagree: ${C1:0:10} already makes this path intentional, see the design note." --resolve-actioned --bind-head
-if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
-  ok "bound citation resolves"
-else bad "bound citation"; show; fi
-
-echo "Test 11: comment IDs and plain words are not read as commit citations"
-run_case "$P0" "Disagree: see comment 4383337359; the defaced example is intentional by design." --resolve-actioned --bind-head
-if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
-  ok "numeric IDs and hex-letter words do not block the evidence"
-else bad "non-SHA tokens"; show; fi
+echo "Test 11: each write is immediately preceded by a pair re-read"
+# An addressed-elsewhere thread: preparing its tag reads the commit list and
+# the fix commit's files. The re-read must come after that preparation, so the
+# gh call immediately before each write is the pair read (Phase 4b on #2816).
+run_case "$P0" "Fixed in ${C1:0:10}." --resolve-actioned --bind-head
+before_tag=$(grep -B1 -m1 -x tag "$STATE/events" | head -1)
+before_resolve=$(grep -B1 -m1 -x resolve "$STATE/events" | head -1)
+if [ "$rc" -eq 0 ] && grep -q "mergepath-resolve: addressed-elsewhere" "$STATE/argv" \
+   && [ "$before_tag" = pair ] && [ "$before_resolve" = pair ]; then
+  ok "the pair read is the last gh call before the tag reply and before the resolve"
+else bad "re-read ordering (before tag: $before_tag; before resolve: $before_resolve)"; show; fi
 
 echo "Test 12: a failed re-read stops before the write (exit 4)"
 COMMITS_LAST="$H0" run_case "$P0
@@ -335,36 +330,6 @@ run_case "$H0 $B0 release open" "$REBUTTAL" --resolve-actioned
 if [ "$rc" -eq 0 ] && [ "$(pairreads)" -eq 0 ]; then
   ok "no pair read and no refusal on the default path"
 else bad "default path unchanged"; show; fi
-
-echo "Test 17: a second citation one separator after a bound one is still checked"
-run_case "$P0" "Disagree: ${C1:0:10} deadbee1234 make this path intentional, see the design note." --resolve-actioned --bind-head
-if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
-  ok "the unbound second SHA left the thread open"
-else bad "adjacent citations"; show; fi
-
-echo "Test 18: an unbound rebuttal cannot set the class when a later bound reply exists"
-# No fix commit, a long rebuttal citing a commit outside the head, then a short
-# bound acknowledgement. Unbound, the stale rebuttal classifies the thread and
-# the acknowledgement dispositions it; bound, the rebuttal is not evidence.
-NO_FIX=1 SECOND_REPLY="Ack, see ${C1:0:10}." run_case "$P0" \
-  "Disagree: deadbee1234 already handled this, it is intentional by design here." --resolve-actioned --bind-head
-if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
-  ok "the unbound rebuttal did not classify the thread; left open"
-else bad "classification binding"; show; fi
-NO_FIX=1 SECOND_REPLY="Ack, see ${C1:0:10}." run_case "$P0" \
-  "Disagree: deadbee1234 already handled this, it is intentional by design here." --resolve-actioned
-if [ "$rc" -eq 0 ] && grep -q "mergepath-resolve: rebuttal-recorded" "$STATE/argv"; then
-  ok "control: without --bind-head the unbound rebuttal sets rebuttal-recorded and resolves"
-else bad "classification control"; show; fi
-
-echo "Test 18b: an unproven later fix claim does not resurrect an earlier rebuttal"
-# A rebuttal, then a "Fixed" reply whose commit is not in the captured head
-# (dropped by a force-push), and no fix commit touching the file.
-NO_FIX=1 SECOND_REPLY="Fixed in deadbee1234." run_case "$P0" \
-  "Disagree: this path is intentional for the propagation lane, see the design note." --resolve-actioned --bind-head
-if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ] && grep -q "outside 111111111111" <<<"$out"; then
-  ok "the unproven fix claim leaves the thread open; the old rebuttal is not revived"
-else bad "superseded rebuttal"; show; fi
 
 echo "Test 16: a local ledger row (which names no head) is not evidence under --bind-head"
 LEDGER_DIR="$SCRATCH/ledger"; mkdir -p "$LEDGER_DIR"
