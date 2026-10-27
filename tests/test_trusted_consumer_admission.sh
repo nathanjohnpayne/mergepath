@@ -42,7 +42,9 @@ case "$2" in
         [ -f "$STATE/pulls2.json" ] && cat "$STATE/pulls2.json"; exit 0 ;;
     esac
     exit 1 ;;
-  repos/o/r/pulls/*) fails pr && exit 1; cat "$STATE/pr.json" ;;
+  # pr_<n>.json, when present, is PR #n's live state; pr.json otherwise.
+  repos/o/r/pulls/*) fails pr && exit 1; n="${2##*/}"
+    if [ -f "$STATE/pr_$n.json" ]; then cat "$STATE/pr_$n.json"; else cat "$STATE/pr.json"; fi ;;
   *) exit 1 ;;
 esac
 GH
@@ -148,6 +150,30 @@ admit
 expect "a pull_requests entry for another base repository is ignored" 0 '.pr == 7'
 reset; event '.workflow_run.pull_requests = [{number: 5, head: {sha: "'"$H2"'"}, base: {repo: {id: '"$RID"'}}}]'; admit
 expect "a pull_requests entry for another head is ignored" 3
+
+echo "live nomination (#2823, #2822 item 1)"
+# open_pr <n> [state]: a same-repository PR at $H, as the commit lookup and
+# the live read both print it.
+open_pr() {
+  jq -n --argjson n "$1" --arg s "${2:-open}" --arg h "$H" --arg b "$B" --argjson rid "$RID" \
+    '{number: $n, state: $s, head: {sha: $h, repo: {id: $rid}}, base: {sha: $b, ref: "main", repo: {id: $rid}}}'
+}
+two_nominated='.workflow_run.pull_requests = [{number: 7, head: {sha: "'"$H"'"}, base: {repo: {id: '"$RID"'}}},
+  {number: 8, head: {sha: "'"$H"'"}, base: {repo: {id: '"$RID"'}}}]'
+reset; event "$two_nominated"; open_pr 8 closed > "$STATE/pr_8.json"; open_pr 7 | jq -s . > "$STATE/pulls.json"; admit
+expect "a snapshot PR that closed later does not decline the one still open" 0 '.pr == 7'
+reset; event .; { open_pr 7; open_pr 8; } | jq -s . > "$STATE/pulls.json"; open_pr 8 > "$STATE/pr_8.json"; admit
+expect "a second same-head PR opened after the snapshot makes the nomination ambiguous" 3
+grep -q "more than one open PR" <<<"$err" && ok "the late second PR is declined as ambiguous" \
+  || bad "late second PR reason (err=$err)"
+reset; event .; open_pr 7 closed > "$STATE/pr_7.json"; open_pr 8 | jq -s . > "$STATE/pulls.json"; open_pr 8 > "$STATE/pr_8.json"; admit
+expect "a live PR the event did not nominate is declined" 3
+grep -q "which the event did not nominate" <<<"$err" && ok "an unnominated live PR is declined for that reason" \
+  || bad "unnominated live PR reason (err=$err)"
+reset; event .; admit
+expect "a nominated open PR the commit lookup does not list yet is admitted" 0 '.pr == 7'
+reset; event .; touch "$STATE/fail_pulls"; admit
+expect "an unreadable commit lookup exits 4 even with a nonempty snapshot" 4
 
 echo "live PR"
 reset; event .; jq --arg h "$H2" '.head.sha = $h' "$STATE/pr.json" > "$STATE/x" && mv "$STATE/x" "$STATE/pr.json"; admit

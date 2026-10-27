@@ -23,6 +23,121 @@ ORCH="${P4B_TEST_PUBLICATION_ORCH:-$ROOT/scripts/phase-4b-review.sh}"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# Exact final-command controls use the small and large native bound samples.
+# No transport runs here; posted means the formatter's confirmed-POST state.
+if [ "${1:-}" = --publication-final-summary-only ]; then
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-final-summary.XXXXXX")"
+  trap 'if [ -n "${P4B_TEST_FINAL_SUMMARY_ARTIFACTS:-}" ]; then cp -R "$WORK" "$P4B_TEST_FINAL_SUMMARY_ARTIFACTS"; fi; rm -rf "$WORK"' EXIT
+  python3 - "$ORCH" "$WORK" "$2" "$3" <<'PY_FINAL_SUMMARY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+source_path, work, small, large = map(Path, sys.argv[1:])
+for name, raw in [("small-bound.json", small), ("large-bound.json", large)]:
+    (work / name).write_bytes(raw.read_bytes())
+source = source_path.read_text()
+tail = source[source.index("# --- emit machine-readable summary"):]
+def extract(name):
+    start = source.index(name + "() {")
+    return source[start:source.index("\n}\n", start) + 3]
+helpers = "\n".join(extract(name) for name in
+                    ["p4b_unposted_verdict_summary", "admin_override_summary"])
+prefix = "printf '%s\\n' \"$P4B_VALIDATED_VERDICT\" | jq -s \\\n"
+guard = ('  if length == 1 and (.[0] | type == "object") then .[0]\n'
+         '  else error("expected exactly one validated verdict object") end\n'
+         '  | . as $validated_verdict\n  | {')
+legacy = tail
+if tail.startswith("# --- emit machine-readable summary") and prefix in tail:
+    assert tail.count(prefix) == 1 and tail.count(guard) == 1
+    legacy = tail.replace(prefix, 'jq -n \\\n', 1).replace(guard, '  {', 1)
+    legacy = legacy.replace('  --argjson review_posted ',
+        '  --argjson validated_verdict "$P4B_VALIDATED_VERDICT" \\\n  --argjson review_posted ', 1)
+lost = tail.replace('{validated_verdict: $validated_verdict}',
+                    '{validated_verdict: ($validated_verdict | .findings = [])}', 1)
+assert lost != tail
+setup = r'''#!/usr/bin/env bash
+set -euo pipefail
+P4B_VALIDATED_VERDICT=$(cat "$1")
+P4B_VERDICT_EVIDENCE_FILE=''; P4B_VERDICT_EVIDENCE_ERROR=''
+PR=2790; REPO=o/r; HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+DIRECTION='claude->codex'; REVIEWER=nathanpayne-codex; ADAPTER=codex
+VERDICT=CHANGES_REQUESTED; REVIEW_ACKNOWLEDGMENT=''; TOKEN_COUNT=''; USAGE_SOURCE=''
+ADAPTER_TIMEOUT=3; EFFECTIVE_EFFORT=''; FINDINGS_COUNT=1
+P4B_ROUND_CAP_JSON='{"cap":10,"rounds":0}'; ENABLED_VIA=fixture
+ADMIN_OVERRIDDEN='[]'; ADMIN_OVERRIDE_QUOTE=''; ADMIN_OVERRIDE_SET=false; EXIT_CODE=1
+if [ "$2" = dry ]; then DRY_RUN=true; REVIEW_POSTED=false; else DRY_RUN=false; REVIEW_POSTED=true; fi
+'''
+scripts = {}
+for name, body in [("actual", tail), ("argv-inverse", legacy), ("finding-loss-inverse", lost)]:
+    script = work / (name + ".sh")
+    script.write_text(setup + helpers + "\n" + body)
+    scripts[name] = script
+(work / "source-proof.json").write_text(json.dumps({
+    "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+    "exact_tail_sha256": hashlib.sha256(tail.encode()).hexdigest(),
+    "same_scalar_bindings_and_filter": True}, indent=2))
+results = []
+def invoke(label, variant, raw, context):
+    started = time.monotonic()
+    process = subprocess.Popen(['bash', str(scripts[variant]), str(raw), context],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    (work / (label + ".stdout")).write_bytes(stdout)
+    (work / (label + ".stderr")).write_bytes(stderr)
+    results.append({"label": label, "pid": process.pid, "pgid": process.pid,
+                    "exit": process.returncode, "duration_seconds": time.monotonic() - started})
+    (work / "results.json").write_text(json.dumps(results, indent=2))
+    return process.returncode, stdout, stderr
+def complete(raw, context, result):
+    code, stdout, stderr = result
+    assert code == 1 and stdout and not stderr, (context, code, stderr[:300])
+    document = json.loads(stdout)
+    assert document["review_posted"] == (context == "posted")
+    assert document["dry_run"] == (context == "dry")
+    assert document["verdict"] == "CHANGES_REQUESTED" and document["findings_count"] == 1
+    assert document["review_acknowledgment"] == "" and document["usage_source"] is None
+    assert "validated_verdict_path" not in document
+    if context == "dry":
+        assert document["validated_verdict"] == json.loads(raw.read_bytes()), "lost raw finding/object"
+    else:
+        assert "validated_verdict" not in document
+    return stdout, stderr
+for context in ["dry", "posted"]:
+    actual = invoke("small-" + context, "actual", small, context)
+    reference = invoke("small-reference-" + context, "argv-inverse", small, context)
+    assert complete(small, context, actual) == complete(small, context, reference), "small terminal bytes changed"
+    complete(large, context, invoke("large-" + context, "actual", large, context))
+    inverse = invoke("large-argv-inverse-" + context, "argv-inverse", large, context)
+    assert inverse[0] != 0 and not inverse[1] and b'Argument list too long' in inverse[2], "argv inverse did not discriminate"
+for name, content in [("empty", ""), ("malformed", "{"), ("multiple", "{}\n{}\n"), ("scalar", "null")]:
+    raw = work / (name + ".json")
+    raw.write_text(content)
+    for context in ["dry", "posted"]:
+        code, stdout, _ = invoke(name + "-" + context, "actual", raw, context)
+        assert code != 0 and not stdout, (name, context, "invalid final stream accepted")
+try:
+    complete(small, "dry", invoke("lost-findings", "finding-loss-inverse", small, "dry"))
+except AssertionError as error:
+    assert str(error) == "lost raw finding/object", error
+else:
+    raise AssertionError("finding-loss inverse escaped complete-object assertion")
+print("Final summary controls: complete large dry/posted objects, exact small byte parity, eight invalid streams and argv/finding-loss inverses passed")
+PY_FINAL_SUMMARY
+  exit 0
+fi
+
 # #2790: exact source functions exercise every unpublished-summary consumer.
 # Pure fixture controls only; no adapter, provider, credentials or library mutation.
 if [ "${1:-}" = --publication-summary-only ]; then
@@ -1410,6 +1525,11 @@ for large_storage in retained blocked; do
     fi
   else fail "#2790: large $large_storage refusal lost evidence or changed native binding/transport/exit (rc=$rc)"; fi
 done
+if bash "$0" --publication-final-summary-only "$WORK/publication-dry-raw.json" "$WORK/publication-large-retained-raw.json"; then
+  pass '#2790: final summary preserves complete raw objects without argv transport and keeps small terminal bytes unchanged'
+else
+  fail '#2790: final summary lost raw evidence, accepted invalid input, or changed terminal bytes'
+fi
 if [ "${1:-}" = --publication-only ]; then
   echo "Results: $PASS passed, $FAIL failed (#2790 publication controls)"
   [ "$FAIL" = 0 ]; exit $?
@@ -7736,7 +7856,7 @@ _budget_fallback_final_line="$(grep -n '^  revalidate_codex_request_budget_autho
 _handoff_capture_line="$(grep -n '^[[:space:]]*handoff_output=$(PHASE_4B_REVIEWER_IDENTITY=' "$ORCH" | cut -d: -f1)"
 _fallback_warn_line="$(grep -n '^  p4b_warn "falling back to the manual Phase 4b handoff:' "$ORCH" | cut -d: -f1)"
 _handoff_case_line="$(grep -n '^    case "\$handoff_rc" in$' "$ORCH" | cut -d: -f1)"
-_fallback_json_line="$(grep -n '^  jq -n --argjson pr "\$PR" --arg repo "\$REPO" --arg head ' "$ORCH" | head -1 | cut -d: -f1)"
+_fallback_json_line="$(grep -n '^  printf .*| jq -s --argjson pr "\$PR" --arg repo "\$REPO" --arg head ' "$ORCH" | sed -n '1p' | cut -d: -f1)"
 _budget_pre_post_line="$(grep -n '^  revalidate_codex_request_budget_authority pre-post$' "$ORCH" | tail -1 | cut -d: -f1)"
 _budget_pre_post_early_line="$(grep -n '^  revalidate_codex_request_budget_authority pre-post$' "$ORCH" | sed -n '3p' | cut -d: -f1)"
 _pre_post_line="$(grep -n '^  revalidate_phase4a_timeout_generation pre-post$' "$ORCH" | cut -d: -f1)"

@@ -2598,7 +2598,7 @@ case "$VERDICT" in
 esac
 
 # --- emit machine-readable summary -----------------------------------------
-jq -n \
+printf '%s\n' "$P4B_VALIDATED_VERDICT" | jq -s \
   --argjson pr "$PR" \
   --arg repo "$REPO" \
   --arg head "${HEAD:-}" \
@@ -2606,7 +2606,6 @@ jq -n \
   --arg reviewer "$REVIEWER" \
   --arg adapter "$ADAPTER" \
   --arg verdict "$VERDICT" \
-  --argjson validated_verdict "$P4B_VALIDATED_VERDICT" \
   --argjson review_posted "$REVIEW_POSTED" \
   --arg review_acknowledgment "$REVIEW_ACKNOWLEDGMENT" \
   --argjson dry_run "$DRY_RUN" \
@@ -2618,7 +2617,10 @@ jq -n \
   --argjson ao "$(admin_override_summary)" \
   --argjson round_cap "$P4B_ROUND_CAP_JSON" \
   --arg enabled_via "$ENABLED_VIA" '
-  {
+  if length == 1 and (.[0] | type == "object") then .[0]
+  else error("expected exactly one validated verdict object") end
+  | . as $validated_verdict
+  | {
     pr_number: $pr,
     repo: $repo,
     head_sha: $head,

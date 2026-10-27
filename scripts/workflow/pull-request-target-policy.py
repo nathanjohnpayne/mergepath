@@ -35,6 +35,16 @@ import subprocess
 import sys
 from urllib.parse import quote
 
+# The canonical owner/repo[/path]@ref check lives with the CI app trust gate
+# (#2823); this lint and scripts/ci/pipeline_token_checkouts.py share it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'ci'))
+try:
+    from ci_app_trust import action_ref  # noqa: E402
+except ImportError as exc:
+    sys.stderr.write('pull-request-target-policy: cannot load scripts/ci/ci_app_trust.py (%s); '
+                     'the scripts/ci kit travels with this tool\n' % exc)
+    sys.exit(2)
+
 API_VERSION = '2026-03-10'
 # Each propagated workflow that triggers on pull_request_target, pinned to
 # every event it triggers on. An event rule is an allowlist, so a policy
@@ -138,9 +148,16 @@ def unsafe_patterns(doc):
             if not isinstance(step, dict):
                 continue
             where = 'job %s step %d' % (job_id, idx + 1)
-            uses = step.get('uses') if isinstance(step.get('uses'), str) else ''
-            # GitHub resolves an action's owner/repo case-insensitively.
-            action = uses.split('@', 1)[0].lower()
+            uses = step.get('uses').strip() if isinstance(step.get('uses'), str) else ''
+            # GitHub resolves an action's owner/repo case-insensitively; the
+            # canonical name is already lower-cased.
+            ref = action_ref(uses) if uses else None
+            action = ref[0] if ref else ''
+            # The runner drops empty path components, so `actions/checkout/@sha`
+            # and `actions//checkout@sha` run checkout. A remote reference this
+            # lint cannot name is refused rather than normalised (#2823).
+            if uses and ref is None and not uses.lower().startswith(('./', 'docker://')):
+                found.append('%s uses non-canonical action reference %s' % (where, uses))
             # The runner passes inputs as upper-cased INPUT_* variables, so an
             # input key matches in any case; keep every spelling, not the last.
             inputs = [(str(k).lower(), v) for k, v in step['with'].items()] \

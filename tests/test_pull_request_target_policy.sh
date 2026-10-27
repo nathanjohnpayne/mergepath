@@ -129,6 +129,15 @@ T="$(fresh_tree mixed-case-checkout)"
 edit "$T/.github/workflows/$DA" "s.replace('uses: actions/checkout@', 'uses: actIONS/Checkout@', 1).replace('github.event.pull_request.base.sha }}', 'github.event.pull_request.head.sha }}', 1)"
 T_MIXED="$T"
 
+# #2823: the runner drops empty path components, so these run checkout.
+T="$(fresh_tree trailing-slash-checkout)"
+edit "$T/.github/workflows/$DA" "s.replace('uses: actions/checkout@', 'uses: actions/checkout/@', 1)"
+T_TRAILING="$T"
+
+T="$(fresh_tree double-slash-checkout)"
+edit "$T/.github/workflows/$MQ" "s.replace('uses: actions/checkout@', 'uses: actions//checkout@', 1).replace('github.event.pull_request.base.sha }}', 'github.event.pull_request.head.sha }}', 1)"
+T_DOUBLE="$T"
+
 T="$(fresh_tree upper-case-inputs)"
 edit "$T/.github/workflows/$MQ" "s.replace('          ref: \${{ github.event.pull_request.base.sha }}\n', '          REF: \${{ github.event.pull_request.head.sha }}\n          ALLOW-UNSAFE-PR-CHECKOUT: true\n', 1)"
 T_UPPER="$T"
@@ -219,6 +228,8 @@ for mode in "${MODES[@]}"; do
   expect "lint flags a push trigger added to the queue recorder" 1 "merge-queue-authorization.yml triggers on .*push.* but REGISTRY pins" "$mode" lint --root "$T_MQPUSH"
   expect "lint flags a head-SHA checkout" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_HEAD"
   expect "lint matches action names case-insensitively" 1 'dependabot-auto-merge.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_MIXED"
+  expect "lint refuses a trailing-slash checkout reference" 1 'dependabot-auto-merge.yml: job .* uses non-canonical action reference actions/checkout/@' "$mode" lint --root "$T_TRAILING"
+  expect "lint refuses a double-slash checkout reference" 1 'merge-queue-authorization.yml: job .* uses non-canonical action reference actions//checkout@' "$mode" lint --root "$T_DOUBLE"
   expect "lint reads checkout inputs in any case (ref)" 1 'merge-queue-authorization.yml: job .* checks out ref .*head.sha' "$mode" lint --root "$T_UPPER"
   expect "lint reads checkout inputs in any case (unsafe flag)" 1 'merge-queue-authorization.yml: job .* sets allow-unsafe-pr-checkout' "$mode" lint --root "$T_UPPER"
   expect "lint flags a merge-ref checkout" 1 'merge-queue-authorization.yml: job .* checks out ref refs/pull/' "$mode" lint --root "$T_MERGEREF"
