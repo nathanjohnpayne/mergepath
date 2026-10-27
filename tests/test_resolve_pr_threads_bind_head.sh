@@ -300,6 +300,18 @@ if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ] && grep -q "never dispositioned" <<<
   ok "ledger-only evidence left the thread open under --bind-head"
 else bad "ledger under bind"; show; fi
 
+echo "Test 19: a stale local deferral row does not block a bound reply under --bind-head"
+printf '%s\n' '{"comment_id":5001,"repo":"test/repo","verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-02T00:00:00Z"}' \
+  > "$LEDGER_DIR/coderabbit-feedback-ledger.jsonl"
+LEDGER_DIR="$LEDGER_DIR" run_case "$P0" "$REBUTTAL" --resolve-actioned
+if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
+  ok "control: without --bind-head the local deferral keeps the thread open"
+else bad "deferral control"; show; fi
+LEDGER_DIR="$LEDGER_DIR" run_case "$P0" "$REBUTTAL" --resolve-actioned --bind-head
+if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
+  ok "the ledger is not read under --bind-head; the bound rebuttal resolves"
+else bad "deferral under bind"; show; fi
+
 echo
 echo "test_resolve_pr_threads_bind_head: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

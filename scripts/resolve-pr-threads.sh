@@ -3232,6 +3232,14 @@ class_is_actioned() {
 # Mirrors the defaults (and env overrides) of the two recorder scripts, so a
 # repo that relocates its ledgers keeps working without a second knob.
 ledger_paths() {
+  # --bind-head (#2727): a local ledger row names no head, so it cannot prove
+  # it applies to the captured pair. Read no ledger at all, so neither a
+  # verdict nor a polarity (a stale deferral blocking a bound reply, a stale
+  # rebuttal classifying a neutral one) reaches the decision (CodeRabbit on
+  # #2816). The CI lane's fresh checkout has no ledger anyway.
+  if $BIND_HEAD; then
+    return 0
+  fi
   local dir="${MERGEPATH_FEEDBACK_LEDGER_DIR:-$REPO_ROOT_FOR_MANIFEST/.mergepath}"
   printf '%s\n%s\n' \
     "${CODEX_FEEDBACK_LEDGER:-$dir/codex-feedback-ledger.jsonl}" \
@@ -3454,12 +3462,6 @@ finding_dispositioned() {
   if thread_reply_disposition "$tj"; then
     printf 'agent reply on the thread after the latest re-raise'
     return 0
-  fi
-  # --bind-head (#2727): a local ledger row names no head, so it cannot prove
-  # it applies to the captured pair. (The CI lane's fresh checkout has no
-  # ledger anyway; a session records its disposition on the thread.)
-  if $BIND_HEAD; then
-    return 1
   fi
   floor=$(latest_nonagent_created "$tj")
   ids=$(current_round_finding_ids "$tj" "$floor") || return 1
