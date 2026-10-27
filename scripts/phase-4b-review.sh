@@ -624,7 +624,7 @@ _p4b_on_exit() {
     else
       p4b_warn "validated adapter verdict retained at $P4B_VERDICT_EVIDENCE_FILE"
     fi
-  elif [ -n "$P4B_VERDICT_EVIDENCE_ERROR" ]; then
+  elif [ -n "$P4B_VERDICT_EVIDENCE_ERROR" ] && [ "${REVIEW_POSTED:-false}" != true ]; then
     p4b_warn "$P4B_VERDICT_EVIDENCE_ERROR; validated verdict is available in terminal JSON only"
   fi
   if declare -F _p4b_cleanup_tmp >/dev/null 2>&1; then _p4b_cleanup_tmp || true; fi

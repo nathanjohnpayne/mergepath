@@ -1150,11 +1150,30 @@ else fail "#2790: local guard refusal attempted transport or lost findings (rc=$
 mkdir -p "$WORK/publication-unwritable-state"
 printf blocker >"$WORK/publication-unwritable-state/unposted-verdicts"
 publication_run unwritable fake-codex-publication-ordinary true env
-if [ "$rc" = 3 ] && jq -e '.validated_verdict.findings[0].body | contains("Ordinary finding")' <<<"$out" >/dev/null \
+printf '%s\n' "$out" >"$WORK/publication-unwritable-summary.json"
+if [ "$rc" = 3 ] && jq -e --slurpfile expected "$WORK/publication-ordinary.json" \
+  '.review_posted == false and [.validated_verdict.verdict,.validated_verdict.summary,.validated_verdict.findings] ==
+   [$expected[0].verdict,$expected[0].summary,$expected[0].findings]' <<<"$out" >/dev/null \
   && jq -e '.validated_verdict_path == null and (.validated_verdict_retention_error | length > 0)' <<<"$out" >/dev/null \
   && grep -q 'terminal JSON only' "$WORK/publication-unwritable.stderr"; then
   pass '#2790: retention failure is explicit while terminal JSON still keeps findings'
 else fail "#2790: retention failure hidden or raw verdict lost (rc=$rc; $out)"; fi
+# A completed POST does not expose the raw verdict in terminal JSON, so a
+# failed private copy must not advertise that unavailable fallback (#2790).
+mkdir -p "$WORK/publication-unwritable-posted-state"
+printf blocker >"$WORK/publication-unwritable-posted-state/unposted-verdicts"
+publication_run unwritable-posted fake-codex-publication-ordinary false env
+printf '%s\n' "$out" >"$WORK/publication-unwritable-posted-summary.json"
+cp "$P4B_TEST_POSTED_REVIEW" "$WORK/publication-unwritable-posted-review.json"
+if [ "$rc" = 1 ] && [ "$(wc -l <"$WORK/publication-attempts" | tr -d ' ')" = 1 ] \
+  && jq -e '.review_posted == true and .verdict == "CHANGES_REQUESTED"
+    and (has("validated_verdict") | not) and (has("validated_verdict_retention_error") | not)' <<<"$out" >/dev/null \
+  && jq -e --slurpfile expected "$WORK/publication-ordinary.json" \
+    '.body | contains($expected[0].summary) and contains($expected[0].findings[0].body)' \
+    "$P4B_TEST_POSTED_REVIEW" >/dev/null \
+  && ! grep -Fq 'validated verdict is available in terminal JSON only' "$WORK/publication-unwritable-posted.stderr"; then
+  pass '#2790: successful POST with storage failure preserves its posted review without advertising absent terminal evidence'
+else fail "#2790: successful POST advertised unavailable terminal evidence (rc=$rc; $out)"; fi
 # A late head fence remains an infrastructure refusal, with the same raw
 # sample available rather than a new adapter run or a discarded verdict.
 publication_run drift fake-codex-publication-ordinary false env \
