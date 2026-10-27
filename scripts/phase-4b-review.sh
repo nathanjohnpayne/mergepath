@@ -2394,7 +2394,7 @@ post_review() {
   # reservation at EXIT. Once the wrapper is invoked, every failure remains an
   # uncertain POST and keeps its slot, including a lost response (#2663/#2790).
   if ! python3 "$ROOT/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
-    gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file" >/dev/null; then
+    gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file" >/dev/null; then # NO_BARE_GH_WRITE_EXEMPT: inert argv to the preceding pure Python payload inspector; actual POST uses the reviewer wrapper below.
     rm -f "$payload_file"
     cleanup_pre_post_refusal_side_effects "review payload refused by local comment guard" true \
       "Review publication" "the review payload for ${REPO}#${PR}"
