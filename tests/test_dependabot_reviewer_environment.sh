@@ -42,7 +42,7 @@ trap 'rm -rf "$WORK"' EXIT
 # behavioral half, so both halves test the same parsed file.
 # ---------------------------------------------------------------------------
 set +e
-structural=$(python3 - "$WORKFLOW" "$WORK/approve.sh" <<'PY'
+structural=$(python3 - "$WORKFLOW" "$WORK/approve.sh" "$WORK" <<'PY'
 import json
 import re
 import subprocess
@@ -154,6 +154,26 @@ check(ordered and 0 <= first_check < first_wait,
 outs = approve.get('outputs') or {}
 check(all(k in outs for k in ('approved_sha', 'approved_by', 'merge')),
       'approve exports approved_sha, approved_by and merge')
+
+# #2823: Actions `==` ignores case, so the job `if:` admits a base named
+# `Main`. Each job's first step must repeat the comparison exactly, hold no
+# secret, run no action, and no later step may opt back in after a failure;
+# its `run:` is written to $WORK/guard-<job>.sh for the behavioral half.
+for name, job in (('approve', approve), ('merge', merge)):
+    steps_list = job.get('steps') or []
+    first = steps_list[0] if steps_list else {}
+    env = first.get('env') or {}
+    check('uses' not in first and 'if' not in first and env == {
+              'BASE_REF': '${{ github.event.pull_request.base.ref }}',
+              'DEFAULT_BRANCH': '${{ github.event.repository.default_branch }}'}
+          and '"$BASE_REF" != "$DEFAULT_BRANCH"' in first.get('run', ''),
+          '%s first step is the exact base guard, before any checkout or secret' % name)
+    reopen = [s.get('name') or s.get('uses') for s in steps_list[1:]
+              if re.search(r'always\(\)|failure\(\)|cancelled\(\)', str(s.get('if', '')))
+              or s.get('continue-on-error')]
+    check(not reopen and not job.get('continue-on-error'),
+          '%s: no step after the guard runs once it fails (got %s)' % (name, reopen))
+    open('%s/guard-%s.sh' % (sys.argv[3], name), 'w').write(first.get('run', ''))
 print('\n'.join(results))
 PY
 )
@@ -168,6 +188,27 @@ while IFS= read -r line; do
     FAIL:*) fail "${line#FAIL: }" ;;
   esac
 done <<<"$structural"
+
+# ---------------------------------------------------------------------------
+# Behavioral: the exact base guard (#2823). Run as Actions runs `run:`
+# (bash -e). A `Main` base must fail it in both jobs, so the token-holding
+# steps after it never run; the exact default branch passes.
+# ---------------------------------------------------------------------------
+for job in approve merge; do
+  guard="$WORK/guard-$job.sh"
+  for base in Main MAIN main- '' refs/heads/main; do
+    if BASE_REF="$base" DEFAULT_BRANCH=main bash -e "$guard" >/dev/null 2>&1; then
+      fail "$job guard admits base '$base' for default branch 'main'"
+    else
+      pass "$job guard refuses base '$base' for default branch 'main'"
+    fi
+  done
+  if BASE_REF=main DEFAULT_BRANCH=main bash -e "$guard" >/dev/null 2>&1; then
+    pass "$job guard admits the exact default branch"
+  else
+    fail "$job guard refuses the exact default branch"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # Behavioral: the approve step. A sandbox holds the base checkout's pieces the

@@ -93,6 +93,11 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The canonical owner/repo[/path]@ref check (#2823). One definition, shared
+# with the CI app trust gate, so the two gates agree on what a step runs.
+from ci_app_trust import action_ref  # noqa: E402
+
 NAME = "check_pipeline_token_checkouts"
 
 PIPELINE_TOKENS = ("AUTHOR_MERGE_TOKEN", "REVIEWER_ASSIGNMENT_TOKEN", "CI_ACTOR_TOKEN")
@@ -232,14 +237,38 @@ def checkout_is_pinned(step, events):
 
 
 def action_name(step):
-    """The `uses:` action without its version, lower-cased: GitHub resolves
-    owner and repository names case-insensitively."""
+    """The canonical `uses:` action without its version, lower-cased (GitHub
+    resolves owner and repository names case-insensitively); "" for a step
+    with no remote action or a non-canonical one."""
     uses = step.get("uses")
-    return uses.split("@", 1)[0].strip().lower() if isinstance(uses, str) else ""
+    ref = action_ref(uses.strip()) if isinstance(uses, str) else None
+    return ref[0] if ref else ""
+
+
+def is_noncanonical(step):
+    """A remote `uses:` that is not canonical owner/repo[/path]@ref. The
+    runner drops empty path components, so `actions/checkout/@sha` and
+    `actions//checkout@sha` run checkout; the gate cannot name what such a
+    step runs, so it is refused rather than normalised (#2823)."""
+    uses = step.get("uses")
+    if not isinstance(uses, str):
+        return False
+    low = uses.strip().lower()
+    if low.startswith("./") or low.startswith("docker://"):
+        return False
+    return action_ref(uses.strip()) is None
 
 
 def is_checkout(step):
     return action_name(step) == "actions/checkout"
+
+
+def noncanonical_action_index(steps):
+    """Index of the first non-canonical remote action in `steps`, or None."""
+    for idx, step in enumerate(steps):
+        if isinstance(step, dict) and is_noncanonical(step):
+            return idx
+    return None
 
 
 def unpinned_checkout_index(steps, events):
@@ -288,11 +317,21 @@ def scan_workflow(doc, basename, reviewed):
             continue
         if not (workflow_token or holds_pipeline_token(json.dumps(job, default=str))):
             continue
+        where = "%s job %s" % (basename, job_id)
+        bad = noncanonical_action_index(steps)
+        if bad is not None:
+            # Not reviewable: a reviewed entry cannot vouch for a step whose
+            # action the gate cannot name.
+            violations.append(
+                "%s holds a pipeline token and step %d names its action %r, which is "
+                "not a canonical owner/repo[/path]@ref reference; the runner may still "
+                "run it as actions/checkout. Spell it canonically"
+                % (where, bad, steps[bad].get("uses")))
+            continue
         idx = unpinned_checkout_index(steps, events)
         if idx is None:
             continue
         key = (basename, str(job_id))
-        where = "%s job %s" % (basename, job_id)
         if key in reviewed:
             matched.add(key)
             current = workflow_fingerprint(doc)
@@ -448,6 +487,19 @@ SELF_TEST_CASES = [
     ("lower-case secret name counts", _job(CHECKOUT + _run("echo ${{ secrets.ci_actor_token }}")), 1),
     ("mixed-case secrets context counts", _job(CHECKOUT + _run("echo ${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}")), 1),
     ("mixed-case checkout action counts", _job("      - uses: Actions/Checkout@v7\n" + TOKEN_STEP), 1),
+    # #2823: the runner drops empty path components, so these run checkout.
+    ("a trailing-slash checkout counts",
+     _job("      - uses: actions/checkout/@0000000000000000000000000000000000000000\n" + TOKEN_STEP), 1),
+    ("a double-slash checkout counts",
+     _job("      - uses: actions//checkout@0000000000000000000000000000000000000000\n" + TOKEN_STEP), 1),
+    ("a pinned non-canonical checkout still fails",
+     _job("      - uses: actions//checkout@v7\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n"
+          + TOKEN_STEP), 1),
+    ("a dot-segment action fails", _job("      - uses: actions/./checkout@v7\n" + TOKEN_STEP), 1),
+    ("a non-canonical action in a tokenless job passes",
+     _job("      - uses: actions//checkout@v7\n" + _run("./x.sh")), 0),
+    ("a local action is not a non-canonical remote one",
+     _job(_pinned("${{ github.event.pull_request.base.sha }}") + "      - uses: ./.github/actions/x\n" + TOKEN_STEP), 0),
     ("bracket secret access counts", _job(CHECKOUT + _run("echo ${{ secrets['CI_ACTOR_TOKEN'] }}")), 1),
     ("GITHUB_TOKEN only passes", _job(CHECKOUT + _run("GH_TOKEN=${{ secrets.GITHUB_TOKEN }} ./x.sh")), 0),
     ("the word secrets outside an expression passes", _job(CHECKOUT + _run("echo no secrets here")), 0),

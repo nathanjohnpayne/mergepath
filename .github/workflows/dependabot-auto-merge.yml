@@ -22,6 +22,12 @@ name: Dependabot Auto-merge
 # (inventory open question 16). The environments' `main` rule cannot be that
 # control: GitHub evaluates it against the default branch for every
 # pull_request_target run, whatever the PR's base.
+#
+# The job-level `if:` is only a cheap pre-filter: Actions `==` ignores case,
+# so a collaborator's branch named `Main` passes it. Each job's FIRST step
+# therefore repeats the comparison in the shell, byte for byte, before the
+# checkout and before any base-controlled script runs; on a mismatch it
+# fails the job, and no later step runs (#2823).
 
 on:
   pull_request_target:
@@ -53,8 +59,9 @@ jobs:
   approve:
     runs-on: ubuntu-latest
     # Dependabot-opened PRs whose base is the default branch only. The base
-    # half is the C13 base-is-default guard: it is what makes the
-    # base.sha checkout below a default-branch commit (see the header).
+    # half is a case-insensitive pre-filter for the C13 base-is-default
+    # guard; the first step below is the exact check that makes the
+    # base.sha checkout a default-branch commit (see the header).
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.base.ref == github.event.repository.default_branch
@@ -76,6 +83,21 @@ jobs:
       update_type: ${{ steps.metadata.outputs.update-type }}
       dependency_group: ${{ steps.metadata.outputs.dependency-group }}
     steps:
+      # Exact, case-sensitive base-is-default check (#2823). The job `if:`
+      # compares case-insensitively, so this step, not that one, is the
+      # guard: it runs before the base.sha checkout, holds no secret, and
+      # its failure skips every later step, the token-holding one included.
+      - name: Require the exact default branch as base
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_REF" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::PR base '$BASE_REF' is not exactly the default branch '$DEFAULT_BRANCH'; refusing to run base-controlled code."
+            exit 1
+          fi
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
       # Check out the BASE ref (the target branch's tip), NOT the PR
       # HEAD. This workflow runs under pull_request_target which has
       # write permissions and access to secrets — checking out PR-author-
@@ -412,6 +434,21 @@ jobs:
     # credential environments (ADR 0004).
     environment: merge-queue-policy
     steps:
+      # Exact, case-sensitive base-is-default check (#2823). The job `if:`
+      # compares case-insensitively, so this step, not that one, is the
+      # guard: it runs before the base.sha checkout, holds no secret, and
+      # its failure skips every later step, the merge itself included.
+      - name: Require the exact default branch as base
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_REF" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::PR base '$BASE_REF' is not exactly the default branch '$DEFAULT_BRANCH'; refusing to run base-controlled code."
+            exit 1
+          fi
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
       # The same base-SHA checkout as `approve`, for the same reasons: its
       # scripts/ and review-policy.yml, never candidate code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

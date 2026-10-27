@@ -30,8 +30,10 @@
 #   5. workflow_id equals the id GitHub reports for that file in this
 #      repository (the stable identity; a borrowed `name:` fails here);
 #   6. head_sha is 40 hex, and exactly one open PR of this repository has that
-#      head, nominated by workflow_run.pull_requests or, when GitHub left that
-#      empty, by GET commits/{sha}/pulls;
+#      head, counted from live state: GET commits/{sha}/pulls plus each PR in
+#      workflow_run.pull_requests re-read live. When that snapshot names any
+#      PR, the unique live PR must be one of them; when GitHub left it empty,
+#      the commit lookup alone decides;
 #   7. the live PR is open, its head is head_sha, its base ref is the default
 #      branch, and head.repo.id == base.repo.id == $GITHUB_REPOSITORY_ID.
 # head_branch, conclusion, display_title and artifacts are never read.
@@ -149,29 +151,44 @@ WANT_WF_ID=$(gh api "repos/$REPO/actions/workflows/$PRODUCER" --jq .id 2>/dev/nu
 [ "$(jq -r '.workflow_id // ""' <<<"$WR")" = "$WANT_WF_ID" ] \
   || decline "workflow_id $(jq -r '.workflow_id // "null"' <<<"$WR") is not $PRODUCER's ($WANT_WF_ID): a borrowed name"
 
-# 6. the nominated PR: exactly one open same-repository PR with this head.
+# 6. the nominated PR: exactly one open same-repository PR with this head,
+# counted from LIVE state (#2823). workflow_run.pull_requests is a snapshot
+# from when the run was created: a PR in it may have closed since, and a
+# second PR may have opened at the same head after it. So the snapshot only
+# nominates; the count is taken over the commit's current PR associations
+# plus each nominated PR re-read live, keeping the ones that are open, at
+# this head and same-repository. When the event nominated any PR, the unique
+# live PR must be one of them; when it nominated none, the commit lookup
+# alone decides.
 HEAD_SHA=$(jq -r '.head_sha // ""' <<<"$WR")
 [[ "$HEAD_SHA" =~ $SHA_RE ]] || decline "head_sha is not 40 hex"
-CANDIDATES=$(jq -c --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
-  [.pull_requests[]? | select(.head.sha == $h and ((.base.repo.id // 0) | tostring) == $rid) | .number] | unique' <<<"$WR")
-if [ "$(jq 'length' <<<"$CANDIDATES")" -eq 0 ]; then
-  # GitHub leaves pull_requests empty in some cases; resolve from the commit.
-  # Every page: the endpoint pages at 30, and a qualifying PR (or a second
-  # one, which makes the nomination ambiguous) can sit on a later page. gh
-  # prints one array per page, which jq -s concatenates.
-  PULLS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls?per_page=100" 2>/dev/null) \
-    || cannot_read "the PRs for commit $HEAD_SHA"
-  CANDIDATES=$(jq -cs --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
-    [.[][]? | select(.state == "open" and .head.sha == $h
-                   and ((.head.repo.id // 0) | tostring) == $rid
-                   and ((.base.repo.id // 0) | tostring) == $rid) | .number] | unique' <<<"$PULLS") \
-    || cannot_read "the PRs for commit $HEAD_SHA (unparseable)"
-fi
+NOMINATED=$(jq -c --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
+  [.pull_requests[]? | select(.head.sha == $h and ((.base.repo.id // 0) | tostring) == $rid) | .number
+   | select(type == "number")] | unique' <<<"$WR")
+# Every page: the endpoint pages at 30, and a qualifying PR (or a second one,
+# which makes the nomination ambiguous) can sit on a later page. gh prints one
+# array per page, which jq -s concatenates.
+PULLS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls?per_page=100" 2>/dev/null)   || cannot_read "the PRs for commit $HEAD_SHA"
+CANDIDATES=$(jq -cs --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
+  [.[][]? | select(.state == "open" and .head.sha == $h
+                 and ((.head.repo.id // 0) | tostring) == $rid
+                 and ((.base.repo.id // 0) | tostring) == $rid) | .number] | unique' <<<"$PULLS")   || cannot_read "the PRs for commit $HEAD_SHA (unparseable)"
+for n in $(jq -r '.[]' <<<"$NOMINATED"); do
+  # Assign first: a failed read inside an argument's $( ) would not stop set -e.
+  NOM_LIVE=$(live_pr "$n")
+  if jq -e --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '.state == "open" and .head_sha == $h
+       and ((.head_repo_id // 0) | tostring) == $rid and ((.base_repo_id // 0) | tostring) == $rid'        <<<"$NOM_LIVE" >/dev/null; then
+    CANDIDATES=$(jq -c --argjson n "$n" '. + [$n] | unique' <<<"$CANDIDATES")
+  fi
+done
 case "$(jq 'length' <<<"$CANDIDATES")" in
   1) PR=$(jq -r '.[0]' <<<"$CANDIDATES") ;;
   0) decline "no open same-repository PR has head $HEAD_SHA" ;;
-  *) decline "more than one PR has head $HEAD_SHA ($(jq -c . <<<"$CANDIDATES")); refusing to choose" ;;
+  *) decline "more than one open PR has head $HEAD_SHA ($(jq -c . <<<"$CANDIDATES")); refusing to choose" ;;
 esac
+if [ "$(jq 'length' <<<"$NOMINATED")" -gt 0 ] && ! jq -e --argjson n "$PR" 'index($n) != null' <<<"$NOMINATED" >/dev/null; then
+  decline "the only open PR with head $HEAD_SHA is #$PR, which the event did not nominate ($(jq -c . <<<"$NOMINATED"))"
+fi
 
 # 7. the live PR.
 DEF=$(default_branch)
