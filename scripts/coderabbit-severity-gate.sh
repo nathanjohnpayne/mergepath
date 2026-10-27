@@ -1156,23 +1156,33 @@ fi
 # and the superseded body is dropped by the correlation filter below on the
 # review-triggered path, exactly as a superseded marker-led summary is.
 HEAD_SUMMARY_RUNS_JSON='[]'
+CR_BATCH_MARKED_JSON='[]'
 while IFS= read -r cr_run_json; do
   [ -n "$cr_run_json" ] || continue
   cr_run_body=$(printf '%s' "$cr_run_json" | jq -r '.body')
   # Continuation intent precedes both summary acceptors: unread extra payload
   # must not turn a rejected continuation into a new report that hides its root.
-  # Inspect unfenced text so a genuine report quoting these forms remains data.
+  # Keep only authored standalone lines from the fence-filtered reader: quoted
+  # examples cannot supply intent or inflate the shared publication inventory.
   case "$cr_run_body" in
     *'<!-- coderabbit-review-publication'*|*'**Review continued from previous batch...**'*)
       cr_run_unfenced=$(summary_unfenced_numbered "$cr_run_body") \
         || die 2 "could not READ CodeRabbit continuation intent"
-      cr_run_continuation=$(printf '%s' "$cr_run_unfenced" | jq -Rrs '
-        split("\n") | map(sub("^[0-9]+\t"; "")) | join("\n")
-        | test("(?m)^\\*\\*Review continued from previous batch\\.\\.\\.\\*\\*$")
-          or (contains("<!-- coderabbit-review-publication")
-              and (([match("<!-- coderabbit-review-publication"; "g")] | length) != 1
-                   or ([match("(?m)^<!-- coderabbit-review-publication[^\r\n]* batch=1/[^\r\n]*$"; "g")] | length) != 1))
+      cr_run_publication=$(printf '%s' "$cr_run_unfenced" | jq -Rrcs '
+        split("\n") | map(sub("^[0-9]+\t"; "")) as $lines
+        | [$lines[] | select(startswith("<!-- coderabbit-review-publication"))] as $markers
+        | {markers: $markers,
+           continuation: (any($lines[]; . == "**Review continued from previous batch...**")
+             or (($markers | length) > 0
+                 and (($markers | length) != 1
+                      or ([$markers[] | select(test("^<!-- coderabbit-review-publication[^\r\n]* batch=1/[^\r\n]*$"))] | length) != 1)))}
       ') || die 2 "could not CLASSIFY CodeRabbit continuation intent"
+      CR_BATCH_MARKED_JSON=$(printf '%s' "$CR_BATCH_MARKED_JSON" | jq -c \
+        --argjson run "$cr_run_json" --argjson publication "$cr_run_publication" \
+        '. + [$run + {publication_markers: $publication.markers}]') \
+        || die 2 "could not INVENTORY CodeRabbit publication metadata"
+      cr_run_continuation=$(printf '%s' "$cr_run_publication" | jq -r '.continuation') \
+        || die 2 "could not READ CodeRabbit continuation classification"
       [ "$cr_run_continuation" != true ] || continue
       ;;
   esac
@@ -1217,17 +1227,16 @@ EOF
 # Inventory only complete groups rooted in an already recognised report. Keep
 # the root in HEAD_SUMMARY_RUNS_JSON so its findings and correlation floor stay
 # authoritative. Incomplete groups receive no metadata exemption.
-CR_BATCH_INVENTORY=$(printf '%s' "$HEAD_REVIEW_RUNS_JSON" | jq -c \
+CR_BATCH_INVENTORY=$(printf '%s' "$CR_BATCH_MARKED_JSON" | jq -c \
   --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" '
   def uuid: "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
   def marker:
     "<!-- coderabbit-review-publication v1 publication=(?<publication>" + uuid
     + ") attempt=(?<attempt>" + uuid + ") batch=(?<ordinal>[1-9][0-9]*)/(?<total>[1-9][0-9]*) -->";
   ($recognised | map(.id)) as $roots
-  | [ .[] | select(.body | contains("<!-- coderabbit-review-publication"))
-      | [.body | match("(?m)^" + marker + "$"; "g")] as $matches
-      | if ($matches | length) == 1
-           and ([.body | match("<!-- coderabbit-review-publication"; "g")] | length) == 1
+  | [ .[] | select((.publication_markers | length) > 0)
+      | [.publication_markers[] | match("^" + marker + "$"; "g")] as $matches
+      | if ($matches | length) == 1 and (.publication_markers | length) == 1
         then ($matches[0].captures | map({key: .name, value: .string}) | from_entries) as $meta
           | . + {batch: ($meta + {ordinal: ($meta.ordinal | tonumber),
                                   total: ($meta.total | tonumber)}),

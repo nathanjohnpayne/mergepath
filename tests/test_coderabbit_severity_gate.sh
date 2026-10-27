@@ -586,6 +586,25 @@ ${marker}2/2 -->"
   batch_case 'malformed metadata without notice cannot escape into result-line acceptor' 3 '.[1].body = "**Actionable comments posted: 0**\n\n<!-- coderabbit-review-publication v1 batch=oops -->"'
   batch_case 'genuine root quoting continuation forms remains readable' 1 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives.\n\n```\n**Review continued from previous batch...**\n<!-- coderabbit-review-publication v1 batch=2/2 -->\n```" | [.[0]]' false 'CodeRabbit blocking-tier unresolved: 1'
   CR_GATE_TEST_FAIL_AWK_PROGRAM='NR, line' batch_case 'unread continuation intent refuses infrastructure decision' 2 '.' false 'could not READ CodeRabbit continuation intent'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'fenced marker example preserves clean batched root' 0 '.[0].body += ("\n\n```\n" + .[1].body + "\n```")'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'fenced marker example preserves root Major' 1 '.[0].body += ("\n\n```\n" + .[1].body + "\n```\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives.")' false 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'blockquote marker example preserves clean root' 0 '.[0].body += ("\n\n> " + (.[1].body | split("\n") | join("\n> ")))'
+  batch_case 'blockquote marker example preserves root Major' 1 '.[0].body += ("\n\n> " + (.[1].body | split("\n") | join("\n> ")) + "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives.")' false 'CodeRabbit blocking-tier unresolved: 1'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'inline code marker example preserves clean root' 0 '.[0].body += ("\n\nThe marker is `" + (.[1].body | split("\n") | last) + "`.")'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'inline code marker example preserves root Major' 1 '.[0].body += ("\n\nThe marker is `" + (.[1].body | split("\n") | last) + "`.\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives.")' false 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'blockquote notice preserves clean root' 0 '.[0].body += "\n\n> **Review continued from previous batch...**"'
+  batch_case 'blockquote notice preserves root Major' 1 '.[0].body += "\n\n> **Review continued from previous batch...**\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives."' false 'CodeRabbit blocking-tier unresolved: 1'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'inline code notice preserves clean root' 0 '.[0].body += "\n\n`**Review continued from previous batch...**`"'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'inline code notice preserves root Major' 1 '.[0].body += "\n\n`**Review continued from previous batch...**`\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives."' false 'CodeRabbit blocking-tier unresolved: 1'
+  # shellcheck disable=SC2016 # Preserve literal Markdown backticks in this jq fixture.
+  batch_case 'extra fenced continuation payload stays unread' 3 '.[1].body += "\n\n```\nA quoted payload is still extra continuation data.\n```"'
+  batch_case 'extra blockquoted continuation payload stays unread' 3 '.[1].body += "\n\n> A quoted payload is still extra continuation data."'
   unset -f batch_case
 }
 test_batch_continuations
