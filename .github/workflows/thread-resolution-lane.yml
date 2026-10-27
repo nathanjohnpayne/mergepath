@@ -71,12 +71,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # #2727 / #2732 (ADR 0004, caller C17): which credential resolves. The CI
+  # app path runs only once this default-branch commit carries the lane's Octo
+  # STS trust policy, which check_ci_app_trust lets land only with the pinned
+  # app (APP_PIN) the pilot records. Until then every run takes the reviewer-PAT
+  # path below, unchanged. Removing the policy file returns the lane to the PAT.
+  # Never a fallback between the two: a configured app path that fails to
+  # exchange or to resolve fails the run.
+  route:
+    name: Route the resolution credential
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.route.outputs.app }}
+    steps:
+      - name: Checkout the trust-policy directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/chainguard
+      - name: Route on the lane's trust policy
+        id: route
+        run: |
+          if [ -f .github/chainguard/thread-resolution.sts.yaml ]; then
+            echo "app=true" >>"$GITHUB_OUTPUT"
+            echo "The thread-resolution trust policy is present: resolving as the CI app (Octo STS)."
+          else
+            echo "app=false" >>"$GITHUB_OUTPUT"
+            echo "No thread-resolution trust policy: resolving with the reviewer PAT."
+          fi
+
   resolve:
     name: Resolve actioned bot threads
     # Backstop, not the primary control: with repository_dispatch as the
     # only trigger, github.ref_name is always the default branch. It exists
     # so that re-adding a ref-selectable trigger fails closed (#550).
-    if: github.ref_name == github.event.repository.default_branch
+    needs: route
+    if: github.ref_name == github.event.repository.default_branch && needs.route.outputs.app != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -146,6 +179,67 @@ jobs:
               echo "### Thread resolution lane: $REPO#$PR_NUMBER"
               echo
               echo "resolve-pr-threads.sh --resolve-actioned exited $rc as $login (0 = nothing left unresolved, 3 = some threads left open; see the log). A thread whose only disposition is in a session's local ledger stays open: reply on it, then dispatch again."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$rc"
+
+  # #2727 / #2732: the CI-app path. ADR 0004's execution rules apply to the whole
+  # job because it requests id-token: write: it checks out the default branch at
+  # the commit that defines this run, runs only SHA-pinned actions and default-
+  # branch scripts, names no environment and holds no other credential. The
+  # token lives only in the resolve step's env, and octo-sts/action revokes it
+  # in its post step. scripts/ci/ci_app_trust.py allow-lists exactly this job.
+  resolve-app:
+    name: Resolve actioned bot threads (CI app)
+    needs: route
+    if: github.ref_name == github.event.repository.default_branch && needs.route.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Exchange the OIDC token for the thread-resolution app token
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: thread-resolution
+
+      - name: Resolve actioned threads as the CI app
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+          OP_PREFLIGHT_REVIEWER_PAT: ${{ steps.sts.outputs.token }}
+          PR_NUMBER: ${{ github.event.client_payload.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The exchange must have produced an installation token. Anything else
+          # is a failed exchange, never a reason to fall back to the reviewer PAT.
+          . scripts/lib/credential-class.sh
+          if [ -z "$GH_TOKEN" ] || [ "$(credential_class "$GH_TOKEN")" != app-installed ]; then
+            echo "ERROR: the Octo STS exchange did not return an installation token; refusing to resolve (no fallback to the reviewer PAT)." >&2
+            exit 1
+          fi
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
+          esac
+          rc=0
+          # --ci-app-identity: identity-check.sh --expect-thread-resolution-app
+          # accepts only the app this default-branch policy names in
+          # thread_resolution_ci_app_identity (#2726). It implies --bind-head.
+          scripts/resolve-pr-threads.sh "$PR_NUMBER" --repo "$REPO" --resolve-actioned --bind-head --ci-app-identity || rc=$?
+          if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+            {
+              echo "### Thread resolution lane: $REPO#$PR_NUMBER (CI app)"
+              echo
+              echo "resolve-pr-threads.sh --resolve-actioned --ci-app-identity exited $rc (0 = nothing left unresolved, 3 = some threads left open; see the log)."
             } >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi

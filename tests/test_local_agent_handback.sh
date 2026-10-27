@@ -274,7 +274,7 @@ if [ -r "$LANE" ] && yq --version 2>/dev/null | grep -q 'mikefarah/yq'; then
   ref="$(yq -r '.jobs.resolve.steps[0].with.ref' "$LANE")"
   persist="$(yq -r '.jobs.resolve.steps[0].with."persist-credentials"' "$LANE")"
   perms="$(yq -o=json -I=0 '.permissions' "$LANE")"
-  if [ "$guard" = "github.ref_name == github.event.repository.default_branch" ] \
+  if [ "$guard" = "github.ref_name == github.event.repository.default_branch && needs.route.outputs.app != 'true'" ] \
      && [ "$ref" = '${{ github.event.repository.default_branch }}' ] \
      && [ "$persist" = "false" ] && [ "$perms" = '{"contents":"read"}' ]; then
     pass "lane runs only the default branch's definition and scripts, read-only, with no persisted checkout token"
@@ -363,6 +363,55 @@ G
     pass "lane runs an installation token only in the bounded --ci-app-identity mode, with no reviewer identity (#2726)"
   else
     fail "lane CI-app routing: app rc=$c5 '$l5'; app reading as reviewer rc=$c6 '$l6'; PAT rc=$c7 '$l7'; app as the resolver's token only rc=$c8 '$l8'"
+  fi
+  # #2727 / #2732: the CI-app path. The route job decides from the trust
+  # policy alone; the PAT and app jobs are mutually exclusive on its output.
+  r_guard="$(yq -r '.jobs.route.if' "$LANE")"
+  r_ref="$(yq -r '.jobs.route.steps[0].with.ref' "$LANE")"
+  r_perms="$(yq -o=json -I=0 '.jobs.route.permissions // {}' "$LANE")"
+  a_guard="$(yq -r '.jobs."resolve-app".if' "$LANE")"
+  a_perms="$(yq -o=json -I=0 '.jobs."resolve-app".permissions' "$LANE")"
+  a_ref="$(yq -r '.jobs."resolve-app".steps[0].with.ref' "$LANE")"
+  a_sts="$(yq -r '.jobs."resolve-app".steps[] | select(.id == "sts") | .uses + " " + .with.identity' "$LANE")"
+  if [ "$r_guard" = "github.ref_name == github.event.repository.default_branch" ] && [ "$r_ref" = '${{ github.workflow_sha }}' ] \
+     && [ "$r_perms" = '{}' ] \
+     && [ "$a_guard" = "github.ref_name == github.event.repository.default_branch && needs.route.outputs.app == 'true'" ] \
+     && [ "$a_perms" = '{"contents":"read","id-token":"write"}' ] && [ "$a_ref" = '${{ github.workflow_sha }}' ] \
+     && [ "$a_sts" = "octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 thread-resolution" ]; then
+    pass "lane routes to the CI-app job only on the route job's output, and only that job requests id-token: write (#2727)"
+  else
+    fail "lane CI-app routing drifted: route=$r_guard ref=$r_ref perms=$r_perms app=$a_guard perms=$a_perms ref=$a_ref sts=$a_sts"
+  fi
+  route_step="$(yq -r '.jobs.route.steps[] | select(.id == "route") | .run' "$LANE")"
+  RFIX="$WORKDIR/route"; mkdir -p "$RFIX"
+  printf '%s\n' "$route_step" >"$RFIX/step.sh"
+  ( cd "$RFIX" && GITHUB_OUTPUT="$RFIX/out" bash -eo pipefail step.sh ) >/dev/null 2>&1
+  r_off="$(cat "$RFIX/out")"
+  mkdir -p "$RFIX/.github/chainguard" && : >"$RFIX/.github/chainguard/thread-resolution.sts.yaml"
+  ( cd "$RFIX" && GITHUB_OUTPUT="$RFIX/out2" bash -eo pipefail step.sh ) >/dev/null 2>&1
+  r_on="$(cat "$RFIX/out2")"
+  if [ "$r_off" = "app=false" ] && [ "$r_on" = "app=true" ]; then
+    pass "the route step selects the CI app only when the lane's trust policy exists"
+  else
+    fail "route step: without policy '$r_off', with policy '$r_on'"
+  fi
+  app_step="$(yq -r '.jobs."resolve-app".steps[] | select(.name == "Resolve actioned threads as the CI app") | .run' "$LANE")"
+  printf '%s\n' "$app_step" >"$LFIX/app-step.sh"
+  app_run() { # <token>
+    : >"$LFIX/lane.log"
+    ( cd "$LFIX" && env -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY PATH="$LFIX/bin:$PATH" LANE_LOG="$LFIX/lane.log" \
+        GH_TOKEN="$1" OP_PREFLIGHT_REVIEWER_PAT="$1" PR_NUMBER=12 REPO=o/r GITHUB_STEP_SUMMARY="$LFIX/summary" bash -eo pipefail app-step.sh ) >/dev/null 2>&1
+  }
+  set +e
+  app_run ghs_installation; a1=$?; m1="$(cat "$LFIX/lane.log")"
+  app_run ghp_reviewer; a2=$?; m2="$(cat "$LFIX/lane.log")"
+  app_run ""; a3=$?; m3="$(cat "$LFIX/lane.log")"
+  set -e
+  if [ "$a1" -eq 0 ] && [ "$m1" = "agent= identity= args=12 --repo o/r --resolve-actioned --bind-head --ci-app-identity" ] \
+     && [ "$a2" -ne 0 ] && [ -z "$m2" ] && [ "$a3" -ne 0 ] && [ -z "$m3" ]; then
+    pass "the CI-app job resolves only with an installation token, bound and in --ci-app-identity mode, and never falls back to a PAT"
+  else
+    fail "CI-app step: app rc=$a1 '$m1'; PAT rc=$a2 '$m2'; empty rc=$a3 '$m3'"
   fi
 else
   fail "thread-resolution-lane.yml missing, or no mikefarah/yq v4 to check it (yq on PATH: $(yq --version 2>&1 | head -1 || echo none); bash scripts/cloud-setup.sh installs it)"

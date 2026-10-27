@@ -2575,7 +2575,7 @@ jq -n \
   --arg reviewer "$REVIEWER" \
   --arg adapter "$ADAPTER" \
   --arg verdict "$VERDICT" \
-  --argjson validated_verdict "$VERDICT_JSON" \
+  --argjson validated_verdict "$P4B_VALIDATED_VERDICT" \
   --argjson review_posted "$REVIEW_POSTED" \
   --arg review_acknowledgment "$REVIEW_ACKNOWLEDGMENT" \
   --argjson dry_run "$DRY_RUN" \

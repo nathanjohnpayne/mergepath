@@ -1166,6 +1166,39 @@ if [ "$rc" = 3 ] && [ ! -e "$WORK/publication-attempts" ] \
   && [ -f "$(jq -r '.validated_verdict_path' <<<"$out")" ]; then
   pass '#2790: late pre-POST head refusal retains its status/reason and exact validated sample'
 else fail "#2790: late head fence lost evidence or attempted transport (rc=$rc; $out)"; fi
+# Successful previews expose the exact native adapter result, before the
+# publication-only trigger/record-marker normalization (#2790).
+mkdir -p "$WORK/publication-dry-adapters"
+cat > "$WORK/publication-dry-adapters/review-via-codex.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+"$P4B_PUBLICATION_NATIVE_ADAPTER" "$@" > "$P4B_PUBLICATION_RAW_VERDICT"
+cat "$P4B_PUBLICATION_RAW_VERDICT"
+SH
+chmod +x "$WORK/publication-dry-adapters/review-via-codex.sh"
+rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/publication-attempts"
+set +e
+out=$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  CODEX_BIN="$BIN/fake-codex-publication-quoted" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+  P4B_ADAPTER_DIR="$WORK/publication-dry-adapters" \
+  P4B_PUBLICATION_NATIVE_ADAPTER="$AD_CODEX" P4B_PUBLICATION_RAW_VERDICT="$WORK/publication-dry-raw.json" \
+  P4B_ACCT_STATE_DIR="$WORK/publication-dry-state" P4B_GH_AS_REVIEWER="$WORK/publication-reviewer" \
+  P4B_PUBLICATION_ROOT="$ROOT" P4B_PUBLICATION_ATTEMPTS="$WORK/publication-attempts" \
+  P4B_ISSUE_LOG="$WORK/publication-dry-issues" \
+  bash "$ORCH" 2790 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --diff-file "$DIFF" --dry-run 2>"$WORK/publication-dry.stderr")
+rc=$?
+set -e
+if [ "$rc" = 1 ] && jq -e --slurpfile raw "$WORK/publication-dry-raw.json" \
+  '.dry_run == true and .review_posted == false and .validated_verdict == $raw[0]
+   and .validated_verdict.review_input.head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$out" >/dev/null; then
+  pass '#2790: successful dry-run returns the complete exact raw bound verdict with reserved quotes and record markers'
+else fail "#2790: dry-run raw verdict changed (rc=$rc; $out)"; fi
+if [ "$rc" = 1 ] && [ ! -e "$WORK/publication-attempts" ] && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+  && [ ! -e "$WORK/publication-dry-issues" ] && [ ! -e "$WORK/publication-dry-state" ] \
+  && jq -e 'has("validated_verdict_path") | not' <<<"$out" >/dev/null; then
+  pass '#2790: raw dry-run result publishes nothing and creates no durable verdict/accounting state'
+else fail "#2790: dry-run published or retained durable state (rc=$rc; $out)"; fi
 if [ "${1:-}" = --publication-only ]; then
   echo "Results: $PASS passed, $FAIL failed (#2790 publication controls)"
   [ "$FAIL" = 0 ]; exit $?
