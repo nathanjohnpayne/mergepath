@@ -875,7 +875,7 @@ bind_restart_or_stop() {
     RESOLVE_PR_THREADS_BIND_ATTEMPT=$((BIND_ATTEMPT + 1)) exec bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
   fi
   if [ "$BIND_WRITES" -gt 0 ]; then
-    echo "BIND: $reason. This run already wrote ($BIND_WRITES write(s)), so it stops every remaining resolution instead of re-evaluating (#2727)." >&2
+    echo "BIND: $reason. This run already attempted $BIND_WRITES write(s), so it stops every remaining resolution instead of re-evaluating (#2727)." >&2
   else
     echo "BIND: $reason. The re-evaluation budget ($BIND_MAX_RESTARTS) is spent; stopping every remaining resolution (#2727)." >&2
   fi
@@ -4169,10 +4169,14 @@ while IFS= read -r thread; do
       tag_class="$thread_class"
       tag_rationale=$(synth_rationale "$tag_class" "$thread")
     fi
+    # --bind-head (#2727): count the write as ATTEMPTED before dispatch. A
+    # write GitHub accepts whose response is lost reads as a failure here, so
+    # counting only confirmed writes would let a moved pair restart after a
+    # persisted write (Codex on #2816).
+    BIND_WRITES=$((BIND_WRITES + 1))
     if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
       echo "  TAGGED [$AUTHOR] $PATH_ → [mergepath-resolve: $tag_class]"
       TAG_REPLY_POSTED=$((TAG_REPLY_POSTED + 1))
-      BIND_WRITES=$((BIND_WRITES + 1))
     else
       TAG_REPLY_FAILED=$((TAG_REPLY_FAILED + 1))
       if [ "$MODE" = "resolve-targeted" ]; then
@@ -4196,6 +4200,8 @@ while IFS= read -r thread; do
   # RESOLVED_IDS for the consolidated reviewThreads readback after the loop.
   # --bind-head (#2727): re-read the pair immediately before the resolve.
   bind_recheck "resolving [$AUTHOR] $PATH_" || break
+  # Counted as attempted before dispatch, for the same reason as the tag reply.
+  BIND_WRITES=$((BIND_WRITES + 1))
   resolve_state=""
   mutation_err="$(mktemp "${TMPDIR:-/tmp}/resolve-pr-threads-mutation.XXXXXX")"
   if mutation_out=$(gh_pat api graphql -f query='
@@ -4215,7 +4221,6 @@ while IFS= read -r thread; do
   if [ "$resolve_state" = "true" ]; then
     echo "  RESOLVED [$AUTHOR] $PATH_"
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
-    BIND_WRITES=$((BIND_WRITES + 1))
     RESOLVED_IDS+=("$THREAD_ID")
   else
     echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected (returned isResolved=${resolve_state:-none})" >&2

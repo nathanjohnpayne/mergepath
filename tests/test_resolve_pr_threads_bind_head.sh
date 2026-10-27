@@ -64,8 +64,12 @@ case "$1 $2" in
   "api graphql")
     case "$all" in
       *addPullRequestReviewThreadReply*) echo "WRITE tag" >> "$STATE/writes"
+        # TAG_LOST=1: GitHub persists the first tag, but the response is lost.
+        if [ -s "$STATE/tag_lost" ]; then rm -f "$STATE/tag_lost"; echo "gh: connection reset" >&2; exit 1; fi
         echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C1"}}}}' ;;
       *resolveReviewThread*) echo "WRITE resolve" >> "$STATE/writes"
+        # RESOLVE_LOST=1: GitHub persists the first resolve, but the response is lost.
+        if [ -s "$STATE/resolve_lost" ]; then rm -f "$STATE/resolve_lost"; echo "gh: connection reset" >&2; exit 1; fi
         echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}' ;;
       *"nodes(ids:"*) echo '{"data":{"nodes":[{"id":"PRT_1","isResolved":true}]}}' ;;
       *) cat "$STATE/threads" ;;
@@ -141,6 +145,14 @@ run_case() {
   [ -z "${COMMITS_LAST:-}" ] || printf '%s' "$COMMITS_LAST" > "$STATE/stale_last"
   [ "${BOT_ONLY:-}" != 1 ] || threads_bot_only > "$STATE/threads"
   [ "${NO_FIX:-}" != 1 ] || echo 1 > "$STATE/no_fix"
+  [ "${TAG_LOST:-}" != 1 ] || echo 1 > "$STATE/tag_lost"
+  [ "${RESOLVE_LOST:-}" != 1 ] || echo 1 > "$STATE/resolve_lost"
+  # TWO_THREADS=1: a second, identical thread, so a second write follows.
+  if [ "${TWO_THREADS:-}" = 1 ]; then
+    jq -c '.data.repository.pullRequest.reviewThreads |= (.totalCount = 2
+      | .nodes += [.nodes[0] | .id = "PRT_2"])' "$STATE/threads" > "$STATE/threads.2"
+    mv "$STATE/threads.2" "$STATE/threads"
+  fi
   [ -z "${SECOND_REPLY:-}" ] || threads_with_two_replies "$reply" "$SECOND_REPLY" > "$STATE/threads"
   : > "$STATE/argv"; : > "$STATE/writes"; : > "$STATE/pairreads"
   out=$(cd "$FIX" && STATE="$STATE" C1="$C1" PATH="$SCRATCH:$PATH" \
@@ -189,9 +201,32 @@ run_case "$P0
 $P0
 $H1 $B0 main open" "$REBUTTAL" --resolve-actioned --bind-head
 if [ "$rc" -eq 5 ] && grep -q "WRITE tag" "$STATE/writes" && ! grep -q "WRITE resolve" "$STATE/writes" \
-   && grep -q "already wrote" <<<"$out"; then
+   && grep -q "already attempted" <<<"$out"; then
   ok "stopped with exit 5 after the tag, no resolve"
 else bad "stop after a write"; show; fi
+
+echo "Test 5b: a tag reply whose response is lost still counts as a write"
+TAG_LOST=1 run_case "$P0
+$P0
+$H1 $B0 main open" "$REBUTTAL" --resolve-actioned --bind-head
+if [ "$rc" -eq 5 ] && [ "$(grep -c 'WRITE tag' "$STATE/writes")" -eq 1 ] && ! grep -q "WRITE resolve" "$STATE/writes" \
+   && grep -q "already attempted 1 write" <<<"$out"; then
+  ok "an accepted-but-unconfirmed tag stops the run instead of restarting it"
+else bad "lost tag response"; show; fi
+
+echo "Test 5c: a resolve whose response is lost still counts as a write"
+# Two threads, no tag replies: capture, then two re-reads per thread. The pair
+# moves before the second thread's writes, after the first resolve was
+# accepted but its response lost.
+TWO_THREADS=1 RESOLVE_LOST=1 run_case "$P0
+$P0
+$P0
+$H1 $B0 main open" "$REBUTTAL" --resolve-actioned --bind-head --no-tag-reply
+# Exit 2, not 5: the unconfirmed mutation is a failure, which takes precedence.
+if [ "$rc" -eq 2 ] && [ "$(grep -c 'WRITE resolve' "$STATE/writes")" -eq 1 ] \
+   && grep -q "already attempted 1 write" <<<"$out"; then
+  ok "an accepted-but-unconfirmed resolve stops the run (exit 2) instead of restarting it"
+else bad "lost resolve response"; show; fi
 
 echo "Test 6: a base that moves counts as a moved pair"
 run_case "$P0
