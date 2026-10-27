@@ -1156,9 +1156,36 @@ fi
 # and the superseded body is dropped by the correlation filter below on the
 # review-triggered path, exactly as a superseded marker-led summary is.
 HEAD_SUMMARY_RUNS_JSON='[]'
+CR_BATCH_MARKED_JSON='[]'
 while IFS= read -r cr_run_json; do
   [ -n "$cr_run_json" ] || continue
   cr_run_body=$(printf '%s' "$cr_run_json" | jq -r '.body')
+  # Continuation intent precedes both summary acceptors: unread extra payload
+  # must not turn a rejected continuation into a new report that hides its root.
+  # Keep only authored standalone lines from the fence-filtered reader: quoted
+  # examples cannot supply intent or inflate the shared publication inventory.
+  case "$cr_run_body" in
+    *'<!-- coderabbit-review-publication'*|*'**Review continued from previous batch...**'*)
+      cr_run_unfenced=$(summary_unfenced_numbered "$cr_run_body") \
+        || die 2 "could not READ CodeRabbit continuation intent"
+      cr_run_publication=$(printf '%s' "$cr_run_unfenced" | jq -Rrcs '
+        split("\n") | map(sub("^[0-9]+\t"; "")) as $lines
+        | [$lines[] | select(startswith("<!-- coderabbit-review-publication"))] as $markers
+        | {markers: $markers,
+           continuation: (any($lines[]; . == "**Review continued from previous batch...**")
+             or (($markers | length) > 0
+                 and (($markers | length) != 1
+                      or ([$markers[] | select(test("^<!-- coderabbit-review-publication[^\r\n]* batch=1/[^\r\n]*$"))] | length) != 1)))}
+      ') || die 2 "could not CLASSIFY CodeRabbit continuation intent"
+      CR_BATCH_MARKED_JSON=$(printf '%s' "$CR_BATCH_MARKED_JSON" | jq -c \
+        --argjson run "$cr_run_json" --argjson publication "$cr_run_publication" \
+        '. + [$run + {publication_markers: $publication.markers}]') \
+        || die 2 "could not INVENTORY CodeRabbit publication metadata"
+      cr_run_continuation=$(printf '%s' "$cr_run_publication" | jq -r '.continuation') \
+        || die 2 "could not READ CodeRabbit continuation classification"
+      [ "$cr_run_continuation" != true ] || continue
+      ;;
+  esac
   cr_run_recognised_by=''
   # jq's `test` rather than a shell grep, so the acceptor keeps the exact
   # semantics the constant was written against.
@@ -1195,6 +1222,44 @@ while IFS= read -r cr_run_json; do
 done <<EOF
 $(echo "$HEAD_REVIEW_RUNS_JSON" | jq -c '.[]')
 EOF
+
+# Publication continuations are metadata, not independently clean summaries.
+# Inventory only complete groups rooted in an already recognised report. Keep
+# the root in HEAD_SUMMARY_RUNS_JSON so its findings and correlation floor stay
+# authoritative. Incomplete groups receive no metadata exemption.
+CR_BATCH_INVENTORY=$(printf '%s' "$CR_BATCH_MARKED_JSON" | jq -c \
+  --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" '
+  def uuid: "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+  def marker:
+    "<!-- coderabbit-review-publication v1 publication=(?<publication>" + uuid
+    + ") attempt=(?<attempt>" + uuid + ") batch=(?<ordinal>[1-9][0-9]*)/(?<total>[1-9][0-9]*) -->";
+  ($recognised | map(.id)) as $roots
+  | [ .[] | select((.publication_markers | length) > 0)
+      | [.publication_markers[] | match("^" + marker + "$"; "g")] as $matches
+      | if ($matches | length) == 1 and (.publication_markers | length) == 1
+        then ($matches[0].captures | map({key: .name, value: .string}) | from_entries) as $meta
+          | . + {batch: ($meta + {ordinal: ($meta.ordinal | tonumber),
+                                  total: ($meta.total | tonumber)}),
+                 metadata_only: (.body == ("<!-- coderabbit-ai-generated:v1 -->\n\n**Review continued from previous batch...**\n\n" + $matches[0].string))}
+        else . + {batch: null, metadata_only: false}
+        end
+    ] as $marked
+  | [ $marked[] | select(.batch != null) ]
+  | group_by(.batch.publication)
+  | [ .[] | . as $group | .[0].batch as $first
+      | select(($group | length) == $first.total
+               and ($group | map(.batch.attempt) | unique | length) == 1
+               and ($group | map(.batch.total) | unique | length) == 1
+               and ($group | map(.id) | unique | length) == $first.total
+               and ($group | map(.batch.ordinal) | sort) == [range(1; $first.total + 1)])
+      | select(all($group[];
+          if .batch.ordinal == 1 then .id as $id | ($roots | index($id)) != null
+          else .metadata_only end))
+      | $group[] | .id
+    ] as $complete
+  | {continuations: [$marked[] | select(.batch != null and .batch.ordinal > 1)
+                     | .id as $id | select(($complete | index($id)) != null) | .id]}
+') || die 2 "could not READ CodeRabbit publication metadata"
 
 # The correlation floor for the same-head re-review filter below. Taken from the
 # runs that actually CARRY a recognised summary, never from any non-empty run
@@ -1257,9 +1322,10 @@ SUMMARY_CORRELATION_ID=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r 'last.id // 0')
 HEAD_UNRECOGNISED_NEWER_IDS=$(jq -rn \
   --argjson runs "$HEAD_REVIEW_RUNS_JSON" \
   --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" \
+  --argjson batches "$CR_BATCH_INVENTORY" \
   --arg at "$SUMMARY_CORRELATION_AT" \
   --argjson atid "$SUMMARY_CORRELATION_ID" '
-  ($recognised | map(.id)) as $known
+  (($recognised | map(.id)) + $batches.continuations) as $known
   | [ $runs[]
       # `. as $run` FIRST: inside `index(...)` the input `.` is $known, the
       # ARRAY, so a bare `.id` there indexes an array with a string and aborts
