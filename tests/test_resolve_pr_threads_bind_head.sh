@@ -89,7 +89,10 @@ case "$1 $2" in
     printf '[{"sha":"%s","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"},{"sha":"%s","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]\n' "$C1" "$h" ;;
   "api repos/test/repo/commits/"*)
     # C1 touches the finding's file, so it is fix-commit evidence.
-    case "$2" in *"$C1"*) echo '["docs/notes.md"]' ;; *) echo '[]' ;; esac ;;
+    # NO_FIX=1 makes it touch nothing, so no fix-commit evidence exists.
+    if [ -s "$STATE/no_fix" ]; then echo '[]'; else
+      case "$2" in *"$C1"*) echo '["docs/notes.md"]' ;; *) echo '[]' ;; esac
+    fi ;;
   *) echo '{}' ;;
 esac
 exit 0
@@ -115,6 +118,17 @@ threads_bot_only() {
      allComments:{nodes:[{author:{login:"coderabbitai"},body:"A finding",databaseId:5001,createdAt:"2026-01-01T00:00:00Z"}]}}]}}}}}'
 }
 
+threads_with_two_replies() {
+  jq -n --arg r1 "$1" --arg r2 "$2" '{data:{repository:{pullRequest:{reviewThreads:{totalCount:1,pageInfo:{hasNextPage:false,endCursor:null},nodes:[
+    {id:"PRT_1",isResolved:false,isOutdated:false,
+     commentsFirst:{nodes:[{author:{login:"coderabbitai"},path:"docs/notes.md",body:"A finding",createdAt:"2026-01-01T00:00:00Z"}]},
+     commentsLast:{nodes:[{commit:{oid:"x"}}]},
+     allComments:{nodes:[
+       {author:{login:"coderabbitai"},body:"A finding",databaseId:5001,createdAt:"2026-01-01T00:00:00Z"},
+       {author:{login:"nathanpayne-claude"},body:$r1,databaseId:5002,createdAt:"2026-01-02T00:00:00Z"},
+       {author:{login:"nathanpayne-claude"},body:$r2,databaseId:5003,createdAt:"2026-01-03T00:00:00Z"}]}}]}}}}}'
+}
+
 REBUTTAL="Disagree: this is intentional for the propagation path, see the design note."
 
 # run_case <pairs (one per line)> <reply> [extra args...] — rc in $rc, output in $out.
@@ -126,6 +140,8 @@ run_case() {
   threads_with_reply "$reply" > "$STATE/threads"
   [ -z "${COMMITS_LAST:-}" ] || printf '%s' "$COMMITS_LAST" > "$STATE/stale_last"
   [ "${BOT_ONLY:-}" != 1 ] || threads_bot_only > "$STATE/threads"
+  [ "${NO_FIX:-}" != 1 ] || echo 1 > "$STATE/no_fix"
+  [ -z "${SECOND_REPLY:-}" ] || threads_with_two_replies "$reply" "$SECOND_REPLY" > "$STATE/threads"
   : > "$STATE/argv"; : > "$STATE/writes"; : > "$STATE/pairreads"
   out=$(cd "$FIX" && STATE="$STATE" C1="$C1" PATH="$SCRATCH:$PATH" \
     RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=1 \
@@ -249,6 +265,27 @@ run_case "$H0 $B0 release open" "$REBUTTAL" --resolve-actioned
 if [ "$rc" -eq 0 ] && [ "$(pairreads)" -eq 0 ]; then
   ok "no pair read and no refusal on the default path"
 else bad "default path unchanged"; show; fi
+
+echo "Test 17: a second citation one separator after a bound one is still checked"
+run_case "$P0" "Disagree: ${C1:0:10} deadbee1234 make this path intentional, see the design note." --resolve-actioned --bind-head
+if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
+  ok "the unbound second SHA left the thread open"
+else bad "adjacent citations"; show; fi
+
+echo "Test 18: an unbound rebuttal cannot set the class when a later bound reply exists"
+# No fix commit, a long rebuttal citing a commit outside the head, then a short
+# bound acknowledgement. Unbound, the stale rebuttal classifies the thread and
+# the acknowledgement dispositions it; bound, the rebuttal is not evidence.
+NO_FIX=1 SECOND_REPLY="Ack, see ${C1:0:10}." run_case "$P0" \
+  "Disagree: deadbee1234 already handled this, it is intentional by design here." --resolve-actioned --bind-head
+if [ "$rc" -eq 3 ] && [ "$(writes)" -eq 0 ]; then
+  ok "the unbound rebuttal did not classify the thread; left open"
+else bad "classification binding"; show; fi
+NO_FIX=1 SECOND_REPLY="Ack, see ${C1:0:10}." run_case "$P0" \
+  "Disagree: deadbee1234 already handled this, it is intentional by design here." --resolve-actioned
+if [ "$rc" -eq 0 ] && grep -q "mergepath-resolve: rebuttal-recorded" "$STATE/argv"; then
+  ok "control: without --bind-head the unbound rebuttal sets rebuttal-recorded and resolves"
+else bad "classification control"; show; fi
 
 echo "Test 16: a local ledger row (which names no head) is not evidence under --bind-head"
 LEDGER_DIR="$SCRATCH/ledger"; mkdir -p "$LEDGER_DIR"

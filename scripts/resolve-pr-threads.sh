@@ -909,12 +909,39 @@ bind_recheck() {
 bind_reply_commits_bound() {
   local body="$1" tok shas
   shas=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r '.[].sha // empty' 2>/dev/null) || shas=""
-  for tok in $(printf '%s' "$body" | tr 'A-Z' 'a-z' | grep -oE '(^|[^0-9a-z])[0-9a-f]{7,40}([^0-9a-z]|$)' | grep -oE '[0-9a-f]{7,40}'); do
+  # Split on every non-alphanumeric character, then keep whole hex tokens.
+  # (A boundary-consuming grep would skip the second of two SHAs one
+  # separator apart, CodeRabbit on #2816.)
+  for tok in $(printf '%s' "$body" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '\n' | grep -xE '[0-9a-f]{7,40}'); do
     case "$tok" in *[0-9]*) ;; *) continue ;; esac
     case "$tok" in *[a-f]*) ;; *) continue ;; esac
     printf '%s\n' "$shas" | grep -q "^$tok" || return 1
   done
   return 0
+}
+
+# bind_filter_thread <thread_json> → the thread without the agent replies whose
+# cited commits fall outside the captured head. Applied once, before the
+# thread is classified, so no predicate (the tag-class ladder, the reply
+# polarity, the disposition check) can rest on evidence about another pair
+# (CodeRabbit on #2816). Non-agent comments are never removed, so the bot's
+# last word and the re-raise floor are unchanged.
+bind_filter_thread() {
+  local tj="$1" cnt i login body keep="[]"
+  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+  i=0
+  while [ "$i" -lt "$cnt" ]; do
+    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
+    body=$(printf '%s' "$tj" | jq -r ".all_comments[$i].body // \"\"")
+    if [ -n "$login" ] && is_agent_author_local "$login" && ! bind_reply_commits_bound "$body"; then
+      echo "  INFO: --bind-head: ignoring a reply by $login that cites a commit outside the captured head (#2727)" >&2
+    else
+      keep=$(printf '%s' "$keep" | jq -c --argjson i "$i" '. + [$i]')
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$tj" | jq -c --argjson keep "$keep" '.all_comments = [.all_comments as $c | $keep[] | $c[.]]'
 }
 
 if $BIND_HEAD; then
@@ -3791,6 +3818,11 @@ while IFS= read -r thread; do
       echo "    unresolved; retry, or resolve deliberately via --auto-resolve-bots."
       SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
       continue
+    fi
+    # --bind-head (#2727): drop agent replies that cite a commit outside the
+    # captured head before ANY classification reads the thread.
+    if $BIND_HEAD; then
+      thread=$(bind_filter_thread "$thread")
     fi
     # GATE path: classify with routing skipped, so a canonical/templated
     # thread that was actually fixed/rebutted resolves on its action
