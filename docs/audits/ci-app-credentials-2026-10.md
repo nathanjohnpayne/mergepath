@@ -115,10 +115,16 @@ The pilot vehicle is the thread-resolution lane (C17). It has three jobs:
 
 A failed exchange fails the run. The lane never falls back from the app to the PAT.
 
+**This procedure is for the hosted app only.** Its pin `801323`, its bot login `octo-sts[bot]`, and the exchange endpoint (`octo-sts/action`'s default `octo-sts.dev`, since `resolve-app` passes no `domain`) all belong to Chainguard's hosted deployment. A self-hosted pilot needs that app's ID and bot login in steps 1 to 3, and a `domain` input on the exchange step. Those values exist only once the owner deploys the service, so a self-hosted pilot is a separate PR.
+
 **Pilot PR (#2732, agent-prepared, merged through review).** Merging it turns the CI-app path on for `mergepath` only. It makes three changes:
 
 1. Sets `APP_PIN` in `scripts/ci/ci_app_trust.py` to the hosted app's ID, `"801323"`, once the install screen confirms it.
 2. Adds the policy, generated rather than hand-written:
+
+   ```bash
+   mkdir -p .github/chainguard
+   ```
 
    ```bash
    scripts/ci/check_ci_app_trust --render thread-resolution --repository nathanjohnpayne/mergepath --repository-id 1190939344 --owner-id 23488723 --app 801323 > .github/chainguard/thread-resolution.sts.yaml
@@ -128,7 +134,11 @@ A failed exchange fails the run. The lane never falls back from the app to the P
 
 **Exercise.** Run these steps in order and record each result in the pilot record:
 
-1. On a PR with an actioned bot thread (a reply on the thread, or a fix commit in the PR), run:
+1. Find a PR with an actioned bot thread, in a form the resolver accepts. The lane's fresh checkout has no local ledger, so the evidence must be on GitHub. After the bot's latest comment on the thread, an agent identity listed in `MERGEPATH_AGENT_AUTHORS` must reply with one of these:
+   - a rebuttal of at least 30 characters (`rebuttal-recorded`);
+   - a fix claim such as `Fixed in <sha>.`, where the PR also has an agent-authored commit, made after that comment, that touches the thread's file (`addressed-elsewhere`).
+
+   `scripts/resolve-pr-threads.sh <PR> --resolve-actioned --dry-run` shows locally whether the thread would resolve. Then run:
 
    ```bash
    scripts/dispatch-thread-resolution-lane.sh <PR>
