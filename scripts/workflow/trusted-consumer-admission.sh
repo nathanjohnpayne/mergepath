@@ -156,9 +156,13 @@ CANDIDATES=$(jq -c --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
   [.pull_requests[]? | select(.head.sha == $h and ((.base.repo.id // 0) | tostring) == $rid) | .number] | unique' <<<"$WR")
 if [ "$(jq 'length' <<<"$CANDIDATES")" -eq 0 ]; then
   # GitHub leaves pull_requests empty in some cases; resolve from the commit.
-  PULLS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null) || cannot_read "the PRs for commit $HEAD_SHA"
-  CANDIDATES=$(jq -c --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
-    [.[]? | select(.state == "open" and .head.sha == $h
+  # Every page: the endpoint pages at 30, and a qualifying PR (or a second
+  # one, which makes the nomination ambiguous) can sit on a later page. gh
+  # prints one array per page, which jq -s concatenates.
+  PULLS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls?per_page=100" 2>/dev/null) \
+    || cannot_read "the PRs for commit $HEAD_SHA"
+  CANDIDATES=$(jq -cs --arg h "$HEAD_SHA" --arg rid "$REPO_ID" '
+    [.[][]? | select(.state == "open" and .head.sha == $h
                    and ((.head.repo.id // 0) | tostring) == $rid
                    and ((.base.repo.id // 0) | tostring) == $rid) | .number] | unique' <<<"$PULLS") \
     || cannot_read "the PRs for commit $HEAD_SHA (unparseable)"

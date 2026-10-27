@@ -35,7 +35,13 @@ fails() { [ -f "$STATE/fail_$1" ]; }
 case "$2" in
   repos/o/r) fails default && exit 1; cat "$STATE/default" ;;
   repos/o/r/actions/workflows/*) fails wf && exit 1; cat "$STATE/wf_id" ;;
-  repos/o/r/commits/*/pulls) fails pulls && exit 1; cat "$STATE/pulls.json" ;;
+  # --paginate makes gh print one JSON array per page; pulls2.json is page 2.
+  --paginate)
+    case "$3" in
+      repos/o/r/commits/*/pulls*) fails pulls && exit 1; cat "$STATE/pulls.json"
+        [ -f "$STATE/pulls2.json" ] && cat "$STATE/pulls2.json"; exit 0 ;;
+    esac
+    exit 1 ;;
   repos/o/r/pulls/*) fails pr && exit 1; cat "$STATE/pr.json" ;;
   *) exit 1 ;;
 esac
@@ -126,6 +132,16 @@ admit
 expect "two PRs with the same head are declined, not chosen between" 3
 reset; event '.workflow_run.pull_requests = []'; admit
 expect "no PR for the commit is declined" 3
+reset; event '.workflow_run.pull_requests = []'
+jq -n --arg h "$H2" --argjson rid "$RID" '[range(0; 30) | {number: (100 + .), state: "open", head: {sha: $h, repo: {id: $rid}}, base: {repo: {id: $rid}}}]' > "$STATE/pulls.json"
+jq -n --arg h "$H" --argjson rid "$RID" '[{number: 7, state: "open", head: {sha: $h, repo: {id: $rid}}, base: {repo: {id: $rid}}}]' > "$STATE/pulls2.json"
+admit
+expect "a qualifying PR on a later page of the commit lookup is found" 0 '.pr == 7'
+reset; event '.workflow_run.pull_requests = []'
+jq -n --arg h "$H" --argjson rid "$RID" '[{number: 7, state: "open", head: {sha: $h, repo: {id: $rid}}, base: {repo: {id: $rid}}}]' > "$STATE/pulls.json"
+jq -n --arg h "$H" --argjson rid "$RID" '[{number: 8, state: "open", head: {sha: $h, repo: {id: $rid}}, base: {repo: {id: $rid}}}]' > "$STATE/pulls2.json"
+admit
+expect "a second qualifying PR on a later page makes the nomination ambiguous" 3
 reset; event '.workflow_run.pull_requests = [{number: 5, head: {sha: "'"$H"'"}, base: {repo: {id: 99}}}]'
 jq -n --arg h "$H" --argjson rid "$RID" '[{number: 7, state: "open", head: {sha: $h, repo: {id: $rid}}, base: {repo: {id: $rid}}}]' > "$STATE/pulls.json"
 admit
@@ -177,7 +193,9 @@ expect "admit without --events is a usage error" 1
 reset; run recheck --pr 7 --head abc --base "$B"
 expect "recheck with a malformed SHA is a usage error" 1
 reset; event .
-out=$(cd "$ROOT" && PATH="$SCRATCH:$PATH" STATE="$STATE" GITHUB_EVENT_PATH="$STATE/event.json" \
+# GitHub Actions sets GITHUB_REPOSITORY_ID for every step, so unset it here
+# or this case would inherit the runner's value (Codex on #2818).
+out=$(cd "$ROOT" && env -u GITHUB_REPOSITORY_ID PATH="$SCRATCH:$PATH" STATE="$STATE" GITHUB_EVENT_PATH="$STATE/event.json" \
   GITHUB_REPOSITORY=o/r bash "$HELPER" admit --producer agent-review.yml --events pull_request 2>/dev/null); rc=$?
 expect "a missing GITHUB_REPOSITORY_ID is a usage error" 1
 
