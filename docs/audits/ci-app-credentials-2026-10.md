@@ -138,7 +138,7 @@ A failed exchange fails the run. The lane never falls back from the app to the P
    - a rebuttal of at least 30 characters (`rebuttal-recorded`);
    - a fix claim such as `Fixed in <sha>.`, where the PR also has an agent-authored commit, made after that comment, that touches the thread's file (`addressed-elsewhere`).
 
-   `scripts/resolve-pr-threads.sh <PR> --resolve-actioned --dry-run` shows locally whether the thread would resolve. Then run:
+   `scripts/resolve-pr-threads.sh <PR> --resolve-actioned --bind-head --dry-run` shows locally whether the thread would resolve under the same head/base binding and evidence rules as `resolve-app`. It runs with the local reviewer PAT, so only the identity check differs. Then run:
 
    ```bash
    scripts/dispatch-thread-resolution-lane.sh <PR>
