@@ -490,7 +490,7 @@ fi
 
 # Ordering: the approve is bound to a verified SHA, and each merge path
 # re-verifies the SHA it is pinned to.
-approve_block=$(awk '/APPROVE_SHA=\$\(gh pr view/{p=1} p{print} /event=APPROVE/{exit}' "$WORKFLOW")
+approve_block=$(awk '/HEAD_AND_BASE=\$\(gh pr view/{p=1} p{print} /event=APPROVE/{exit}' "$WORKFLOW")
 if [[ "$approve_block" == *'require_dependabot_provenance "$APPROVE_SHA"'* ]] \
    && [[ "$approve_block" == *'-f commit_id="$APPROVE_SHA"'* ]] \
    && ! grep -Fq 'gh pr review --approve' "$WORKFLOW"; then

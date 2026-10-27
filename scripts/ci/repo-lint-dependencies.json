@@ -704,6 +704,7 @@
       "tests/test_dependabot_auto_merge_check_wait.sh",
       "tests/test_author_merge_token.sh",
       "scripts/lib/credential-class.sh",
+      "tests/test_dependabot_reviewer_environment.sh",
       "tests/test_655_repo_lint_local_observed.sh",
       "tests/test_load_review_config.sh",
       "scripts/ci/fixtures/workflow-parsers/*",
