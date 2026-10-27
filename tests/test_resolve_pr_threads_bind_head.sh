@@ -93,7 +93,8 @@ case "$1 $2" in
     # COMMIT_COUNT=N pads the list with older commits to N entries in all.
     n=$(cat "$STATE/commit_count" 2>/dev/null || echo 2)
     jq -nc --arg c1 "$C1" --arg h "$h" --argjson n "$n" '
-      [range(0; $n - 2) | {sha: ("%040d" | . ), login: "nathanpayne-claude", date: "2025-12-01T00:00:00Z"}]
+      [range(0; $n - 2) | . as $i | {sha: ("a" + ($i | tostring) + ("0" * (39 - ($i | tostring | length)))),
+                                    login: "nathanpayne-claude", date: "2025-12-01T00:00:00Z"}]
       + [{sha: $c1, login: "nathanpayne-claude", date: "2026-01-02T00:00:00Z"},
          {sha: $h, login: "nathanpayne-claude", date: "2026-01-03T00:00:00Z"}]' \
     | { pg=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9][0-9]*\).*/\1/p'); pg=${pg:-1}
@@ -270,6 +271,22 @@ COMMIT_COUNT=249 run_case "$P0" "$REBUTTAL" --resolve-actioned --bind-head
 if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
   ok "a 249-commit list ending at the head is accepted"
 else bad "249-commit list"; show; fi
+
+echo "Test 8c: a citation of the FIRST commit in a long list is bound (no SIGPIPE false negative)"
+EARLY=a000000000
+for attempt in 1 2 3; do
+  COMMIT_COUNT=249 run_case "$P0" "Disagree: $EARLY already makes this path intentional, see the design note." --resolve-actioned --bind-head
+  [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes" || break
+done
+if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
+  ok "an early citation in a 249-commit list resolves on every attempt"
+else bad "early citation in a long list"; show; fi
+# The race is timing-dependent, so also hold the shape: the membership test
+# must not pipe into an early-exiting reader.
+bind_fn=$(sed -n '/^bind_reply_commits_bound() {/,/^}/p' "$SCRIPT" | grep -v '^[[:space:]]*#')
+if [ -n "$bind_fn" ] && ! grep -Eq '[|][[:space:]]*grep -q' <<<"$bind_fn"; then
+  ok "bind_reply_commits_bound pipes nothing into grep -q"
+else bad "bind_reply_commits_bound still pipes into grep -q"; fi
 
 UNBOUND_REPLY="Disagree: this was already handled by deadbee1234 on another branch, intentional."
 echo "Test 9: a reply citing a commit outside the captured head is not evidence"

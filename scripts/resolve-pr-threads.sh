@@ -915,7 +915,10 @@ bind_reply_commits_bound() {
   for tok in $(printf '%s' "$body" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '\n' | grep -xE '[0-9a-f]{7,40}'); do
     case "$tok" in *[0-9]*) ;; *) continue ;; esac
     case "$tok" in *[a-f]*) ;; *) continue ;; esac
-    printf '%s\n' "$shas" | grep -q "^$tok" || return 1
+    # A here-string, not `printf | grep -q`: grep -q exits on the first match,
+    # and under pipefail the writer's SIGPIPE would turn a valid citation into
+    # a failure (Codex on #2816).
+    grep -q "^$tok" <<<"$shas" || return 1
   done
   return 0
 }
