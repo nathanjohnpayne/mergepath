@@ -52,7 +52,7 @@ The output is ADR 0004's template: exact `issuer` and `subject` (name-only, or t
 
 `scripts/ci/check_ci_app_trust` runs in repo-lint (`lint-fast` shard 1) on the hub and every consumer. Until a later slice extends it, it enforces:
 
-- **Who may request `id-token: write`.** Only a (workflow, job) pair in `ALLOWED_ID_TOKEN_JOBS`, or a reviewed non-app OIDC job (below). The allow-list is empty, so every app consumer grant fails today; the reviewed non-app jobs pass only under their own restrictions. A workflow-level grant always fails, including `permissions: write-all`. An allow-listed job may trigger only on its identity's events, names no environment and no job-level `container` or `services` image, checks out this repository at `${{ github.workflow_sha }}` with `persist-credentials: false`, uses only canonical SHA-pinned non-local actions, and restores no artifact or cache. An OIDC job that is not an app consumer, such as nathanpaynedotcom's `build-artifact.yml` `attest` job (SLSA build provenance), is recorded one by one in `REVIEWED_OTHER_OIDC_JOBS` for its repository. It must stay outside every identity's workflow, so no trust policy can name it, and must not mention Octo STS.
+- **Who may request `id-token: write`.** Only a (workflow, job) pair in `ALLOWED_ID_TOKEN_JOBS`, or a reviewed non-app OIDC job (below). The allow-list grows one job per slice. Its first entry is the thread-resolution lane's `resolve-app` job, the pilot vehicle. Every other app consumer grant fails, and the reviewed non-app jobs pass only under their own restrictions. A workflow-level grant always fails, including `permissions: write-all`. An allow-listed job may trigger only on its identity's events, names no environment and no job-level `container` or `services` image, checks out this repository at `${{ github.workflow_sha }}` with `persist-credentials: false`, uses only canonical SHA-pinned non-local actions, and restores no artifact or cache. An OIDC job that is not an app consumer, such as nathanpaynedotcom's `build-artifact.yml` `attest` job (SLSA build provenance), is recorded one by one in `REVIEWED_OTHER_OIDC_JOBS` for its repository. It must stay outside every identity's workflow, so no trust policy can name it, and must not mention Octo STS.
 - **Trust policies.** Every file in `.github/chainguard/` must be `<identity>.sts.yaml` for a known identity, and its parsed content must equal the rendered template for this repository. Every policy must pin `APP_PIN`, which is `None` until the pilot records it, so no policy can land before the pilot does.
 
 The gate cannot see what Octo STS itself accepts. Those are pilot items.
@@ -107,7 +107,52 @@ Every step here is owner-performed. Agents prepare and verify; they do not execu
 
 ### Pilot
 
-The pilot PR, prepared by an agent and merged through review, sets `APP_PIN` and adds the hub's policy for one identity. Merging it is the owner's acceptance of the pin. The pilot then records each row of the table below. A row that fails stops cutover.
+The pilot vehicle is the thread-resolution lane (C17). It has three jobs:
+
+- **`route`.** It reads whether the lane's trust policy `.github/chainguard/thread-resolution.sts.yaml` exists on the default-branch commit that defines the run.
+- **`resolve`.** Without the policy, it is today's reviewer-PAT path, unchanged.
+- **`resolve-app`.** With the policy, it requests `id-token: write`, exchanges through `octo-sts/action` (pinned to v1.1.1) for the `thread-resolution` identity, and resolves with `--resolve-actioned --bind-head --ci-app-identity`.
+
+A failed exchange fails the run. The lane never falls back from the app to the PAT.
+
+**This procedure is for the hosted app only.** Its pin `801323`, its bot login `octo-sts[bot]`, and the exchange endpoint (`octo-sts/action`'s default `octo-sts.dev`, since `resolve-app` passes no `domain`) all belong to Chainguard's hosted deployment. A self-hosted pilot needs that app's ID and bot login in steps 1 to 3, and a `domain` input on the exchange step. Those values exist only once the owner deploys the service, so a self-hosted pilot is a separate PR.
+
+**Pilot PR (#2732, agent-prepared, merged through review).** Merging it turns the CI-app path on for `mergepath` only. It makes three changes:
+
+1. Sets `APP_PIN` in `scripts/ci/ci_app_trust.py` to the hosted app's ID, `"801323"`, once the install screen confirms it.
+2. Adds the policy, generated rather than hand-written:
+
+   ```bash
+   mkdir -p .github/chainguard
+   ```
+
+   ```bash
+   scripts/ci/check_ci_app_trust --render thread-resolution --repository nathanjohnpayne/mergepath --repository-id 1190939344 --owner-id 23488723 --app 801323 > .github/chainguard/thread-resolution.sts.yaml
+   ```
+
+3. In `.github/review-policy.yml`, sets `thread_resolution_ci_app_identity: "octo-sts[bot]"` and adds `octo-sts[bot]` to `non_reviewer_identities`, never to `available_reviewers`. Without this, `identity-check.sh --expect-thread-resolution-app` refuses the app and the run fails.
+
+**Exercise.** Run these steps in order and record each result in the pilot record:
+
+1. Find a PR with an actioned bot thread, in a form the resolver accepts. The lane's fresh checkout has no local ledger, so the evidence must be on GitHub. After the bot's latest comment on the thread, an agent identity listed in `MERGEPATH_AGENT_AUTHORS` must reply with one of these:
+   - a rebuttal of at least 30 characters (`rebuttal-recorded`);
+   - a fix claim such as `Fixed in <sha>.`, where the PR also has an agent-authored commit, made after that comment, that touches the thread's file (`addressed-elsewhere`).
+
+   `scripts/resolve-pr-threads.sh <PR> --resolve-actioned --bind-head --dry-run` shows locally whether the thread would resolve under the same head/base binding and evidence rules as `resolve-app`. It runs with the local reviewer PAT, so only the identity check differs. Then run:
+
+   ```bash
+   scripts/dispatch-thread-resolution-lane.sh <PR>
+   ```
+
+   - `resolve-app` must run, the exchange must succeed, and the thread must be resolved by `octo-sts[bot]`.
+   - A successful exchange shows that the `repository_dispatch` subject is exactly the policy's `repo:nathanjohnpayne/mergepath:ref:refs/heads/main`, because the policy matches `subject` exactly.
+2. Confirm that the reply on the resolved thread (a `pull_request_review_comment`) started the clearance, Codex P1 and CodeRabbit severity gates.
+3. Edit the policy on a branch, for example by removing `pull_requests: write`. Dispatch again. The exchange must still follow the default branch's policy.
+4. Exercise the other refusals in the record, such as a `pull_request` run and an unpinned workflow. Use throwaway workflows on a branch that request the token for the same identity. Each must be refused.
+
+**Rollback.** Revert the pilot PR, or delete the policy file. `route` then sends every run back to the PAT path.
+
+The owner's merge of the pilot PR is the acceptance of the pin. A row that fails stops cutover.
 
 ### Fleet rollout
 

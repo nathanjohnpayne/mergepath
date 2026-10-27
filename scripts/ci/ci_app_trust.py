@@ -16,11 +16,12 @@ PART A: WHO MAY REQUEST `id-token: write` (ADR "Who may request")
     Only a (workflow, job) pair in ALLOWED_ID_TOKEN_JOBS, or a reviewed
     non-app job in REVIEWED_OTHER_OIDC_JOBS (below), may hold `id-token:
     write`, directly or through `permissions: write-all`. A workflow-level
-    grant is always a violation. ALLOWED_ID_TOKEN_JOBS is EMPTY until the
-    migration slices of #2727 add the trusted consumers, so today every app
-    consumer grant fails; only the reviewed non-app jobs pass, under their
-    own restrictions. An allow-listed job must also satisfy the ADR's
-    execution rules:
+    grant is always a violation. ALLOWED_ID_TOKEN_JOBS grows one job at a
+    time as #2727's slices add trusted consumers; the first is the
+    thread-resolution lane's `resolve-app` job (C17, the #2732 pilot
+    vehicle). Every other app consumer grant fails; the reviewed non-app jobs
+    pass only under their own restrictions. An allow-listed job must also
+    satisfy the ADR's execution rules:
 
       * every workflow trigger is one of its identity's events (no candidate
         event, no `pull_request_target`, no undeclared `workflow_dispatch`);
@@ -164,9 +165,13 @@ IDENTITIES = {
     },
 }
 
-# (workflow basename, job id) -> identity. Empty until a #2727 migration slice
-# adds a trusted consumer; each addition is a Phase 4 change to this file.
-ALLOWED_ID_TOKEN_JOBS = {}
+# (workflow basename, job id) -> identity. Each addition is a Phase 4 change to
+# this file, made by the #2727 slice that adds the trusted job.
+ALLOWED_ID_TOKEN_JOBS = {
+    # C17, the #2732 pilot vehicle: runs only once the lane's trust policy is
+    # committed (its `route` job keys on the file), which needs APP_PIN.
+    ("thread-resolution-lane.yml", "resolve-app"): "thread-resolution",
+}
 
 # OIDC jobs that are not CI app consumers, reviewed one by one:
 # (repository, workflow basename, job id) -> reason. An entry applies only in
