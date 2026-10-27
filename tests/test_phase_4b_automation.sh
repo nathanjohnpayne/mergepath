@@ -23,6 +23,156 @@ ORCH="${P4B_TEST_PUBLICATION_ORCH:-$ROOT/scripts/phase-4b-review.sh}"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# #2790: exact source functions exercise every unpublished-summary consumer.
+# Pure fixture controls only; no adapter, provider, credentials or library mutation.
+if [ "${1:-}" = --publication-summary-only ]; then
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-summary-test.XXXXXX")"
+  trap 'rm -rf "$WORK"' EXIT
+  python3 - "$ROOT" "$ORCH" "$WORK" <<'PY_SUMMARY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+
+root, source_path, work = map(Path, sys.argv[1:])
+source = source_path.read_text()
+names = ["p4b_unposted_verdict_summary", "admin_override_summary", "p4b_die_diagnostic",
+         "fall_back_to_manual", "hold_for_external_review", "stop_for_human_tiebreaker",
+         "round_cap_evidence_error", "round_cap_stop", "stop_for_barrier_error"]
+def extract(name):
+    start = source.index(name + "() {")
+    return source[start:source.index("\n}\n", start) + 3]
+functions = work / "functions.sh"
+functions.write_text("\n".join(map(extract, names)))
+(work / "extraction.json").write_text(json.dumps({name: hashlib.sha256(extract(name).encode()).hexdigest() for name in names}))
+harness = work / "harness.sh"
+harness.write_text(r'''#!/usr/bin/env bash
+set -euo pipefail
+. "$1"
+raw_file=$2; scenario=$3; fault=$4
+P4B_VALIDATED_VERDICT=$(cat "$raw_file")
+P4B_VERDICT_EVIDENCE_FILE="$raw_file"; P4B_VERDICT_EVIDENCE_ERROR=''
+REVIEW_POSTED=false; DRY_RUN=false
+PR=2790; REPO=o/r; HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+REVIEWER=nathanpayne-codex; ADAPTER=codex; DIRECTION='claude->codex'; ENABLED_VIA=fixture
+ADMIN_OVERRIDDEN='[]'; ADMIN_OVERRIDE_SET=false; ADMIN_OVERRIDE_QUOTE=''
+P4B_ROUND_WHERE=pre-post; P4B_ROUND_CAP_JSON='{"cap":10,"rounds":0}'
+HANDOFF=/fixture/no-handoff
+p4b_warn() { printf '%s\n' "$*" >&2; }
+revalidate_codex_request_budget_authority() { :; }
+require_feedback_accounted() { :; }
+p4b_acct_on() { return 1; }
+cleanup_pre_post_refusal_side_effects() { :; }
+release_round_reservation() { :; }
+bad_summary_producer() {
+  case "${fault#*-}" in
+    empty) : ;;
+    malformed) printf '{' ;;
+    multiple) printf '{}\n{}\n' ;;
+    scalar) printf 'null\n' ;;
+    failed) printf '{}\n'; printf 'injected producer failure\n' >&2; return 23 ;;
+  esac
+}
+case "$fault" in
+  evidence-*) p4b_unposted_verdict_summary() { bad_summary_producer; } ;;
+  admin-*) admin_override_summary() { bad_summary_producer; } ;;
+esac
+payload='{"decision":"error","reason":"fixture refusal","retry_after":30}'
+case "$scenario" in
+  raw) p4b_unposted_verdict_summary ;;
+  admin) admin_override_summary ;;
+  diagnostic) p4b_die_diagnostic 3 'fixture refusal' ;;
+  manual) fall_back_to_manual 'fixture refusal' ;;
+  manual-admin)
+    ADMIN_OVERRIDDEN='["fixture-tripwire"]'; ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE='fixture quote'
+    fall_back_to_manual 'fixture refusal' ;;
+  hold) hold_for_external_review "$payload" ;;
+  human) stop_for_human_tiebreaker "$payload" ;;
+  round-error) round_cap_evidence_error 'fixture refusal' ;;
+  round-hold) round_cap_stop 6 fixture-state 'fixture refusal' pre-post ;;
+  budget) stop_for_barrier_error "$payload" ;;
+esac
+''')
+results = []
+def invoke(label, args, expected=None):
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    (work / (label + ".stdout")).write_bytes(stdout)
+    (work / (label + ".stderr")).write_bytes(stderr)
+    results.append({"label": label, "argv": args, "pid": process.pid,
+                    "pgid": process.pid, "exit": process.returncode})
+    (work / "results.json").write_text(json.dumps(results, indent=2))
+    if expected is not None:
+        assert process.returncode == expected, (label, process.returncode, stderr[:300])
+    return process.returncode, stdout
+
+expected_exits = {"raw": 0, "admin": 0, "diagnostic": 0, "manual": 4,
+                  "manual-admin": 8, "hold": 6, "human": 8, "round-error": 10,
+                  "round-hold": 6, "budget": 10}
+diff = work / "review.diff"
+diff.write_bytes(b'diff --git a/x.js b/x.js\n+true\n')
+digest = hashlib.sha256(diff.read_bytes()).hexdigest()
+metadata = work / "input.json"
+metadata.write_text(json.dumps({"head_sha": "a" * 40, "base_sha": "b" * 40,
+    "merge_base_sha": "b" * 40, "diff_sha256": digest,
+    "head_transitions_sha256": hashlib.sha256(b'[]').hexdigest()}))
+policy = work / "policy.yml"
+policy.write_text("phase_4b_automation:\n  enabled: true\n")
+os.environ["MERGEPATH_REVIEW_POLICY_PATH"] = str(policy)
+for size, length in [("small", 128), ("large", 1280 * 1024)]:
+    model = work / (size + "-model.json")
+    model.write_text(json.dumps({"verdict": "CHANGES_REQUESTED", "summary": "fixture summary",
+        "findings": [{"severity": "P1", "path": "x.js", "line": 1, "body": "retained finding " + "x" * length}],
+        "usage": None, "cli_version": None}))
+    bind = ['bash', '-c', '. "$1"; . "$2"; value=$(cat "$3"); '
+        'p4b_validate_verdict "$value" && p4b_bind_input "$4" "$5" "$5" "$value"', 'bind',
+        str(root / 'scripts/phase-4b/lib.sh'), str(root / 'scripts/phase-4b/immutable-input.sh'),
+        str(model), str(metadata), str(diff)]
+    _, bound = invoke(size + "-actual-binding", bind, 0)
+    raw_file = work / (size + "-bound.json")
+    raw_file.write_bytes(bound)
+    expected = json.loads(bound)
+    assert expected["review_input"]["diff_sha256"] == digest
+    for scenario, code in expected_exits.items():
+        _, stdout = invoke(size + "-" + scenario,
+            ['bash', str(harness), str(functions), str(raw_file), scenario, 'none'], code)
+        document = json.loads(stdout)
+        assert document["validated_verdict"] == expected, (size, scenario, "lost raw evidence")
+        assert document["validated_verdict_path"] == str(raw_file)
+        if scenario not in ("raw", "admin"):
+            assert document["review_posted"] is False
+        if scenario not in ("raw", "admin", "diagnostic"):
+            assert document["verdict"] is None
+small = work / "small-bound.json"
+for name, content in [("malformed", "{"), ("whitespace", " \n"),
+                      ("multiple", "{}\n{}\n"), ("scalar", "null")]:
+    sample = work / (name + ".json")
+    sample.write_text(content)
+    code, stdout = invoke("raw-negative-" + name,
+        ['bash', str(harness), str(functions), str(sample), 'raw', 'none'])
+    assert code != 0 and not stdout, (name, "raw stream accepted")
+for name in ["empty", "malformed", "multiple", "scalar", "failed"]:
+    code, stdout = invoke("evidence-negative-" + name,
+        ['bash', str(harness), str(functions), str(small), 'admin', 'evidence-' + name])
+    assert code != 0 and not stdout, (name, "evidence stream accepted")
+    for scenario in expected_exits.keys() - {"raw", "admin"}:
+        code, stdout = invoke("admin-negative-" + scenario + "-" + name,
+            ['bash', str(harness), str(functions), str(small), scenario, 'admin-' + name])
+        assert code != 0 and not stdout, (name, scenario, "admin stream accepted")
+print("Publication summary controls: 20 complete-object positives and 49 invalid/failed-stream negatives passed")
+PY_SUMMARY
+  exit 0
+fi
+
 # Pure rc-7 description controls (#939): expected under 5s, no orchestrator,
 # adapter, credentials or network. Mutation validation uses only this mode.
 if [ "${1:-}" = --status-description-only ]; then
@@ -411,6 +561,7 @@ fi
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
   bash "$0" --status-description-only
+  bash "$0" --publication-summary-only
 fi
 
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
@@ -1218,6 +1369,47 @@ if [ "$rc" = 1 ] && [ ! -e "$WORK/publication-attempts" ] && [ ! -e "$P4B_TEST_P
   && jq -e 'has("validated_verdict_path") | not' <<<"$out" >/dev/null; then
   pass '#2790: raw dry-run result publishes nothing and creates no durable verdict/accounting state'
 else fail "#2790: dry-run published or retained durable state (rc=$rc; $out)"; fi
+# Large valid output reaches a post-validation head fence without depending
+# on any OS's ability to POST a large body through older publication paths.
+cp "$POLICY_ON" "$WORK/publication-large-policy.yml"
+printf '  accounting:\n    enabled: false\n' >> "$WORK/publication-large-policy.yml"
+python3 - "$WORK/publication-large.json" <<'PY_LARGE'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"verdict":"CHANGES_REQUESTED",
+    "summary":"large validated finding", "findings":[{"severity":"P1","path":"x.js","line":2,
+    "body":"Keep the entire finding: " + "x" * (1280 * 1024)}], "usage":None,"cli_version":None}))
+PY_LARGE
+mk_fake fake-codex-publication-large "cat '$WORK/publication-large.json'"
+large_diff_digest=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$DIFF")
+for large_storage in retained blocked; do
+  if [ "$large_storage" = blocked ]; then
+    mkdir -p "$WORK/publication-large-$large_storage-state"
+    printf blocker >"$WORK/publication-large-$large_storage-state/unposted-verdicts"
+  fi
+  POLICY_ON="$WORK/publication-large-policy.yml" publication_run "large-$large_storage" fake-codex-publication-large false env \
+    P4B_ADAPTER_TIMEOUT_SECONDS=60 P4B_ADAPTER_DIR="$WORK/publication-dry-adapters" \
+    P4B_PUBLICATION_NATIVE_ADAPTER="$AD_CODEX" P4B_PUBLICATION_RAW_VERDICT="$WORK/publication-large-$large_storage-raw.json" \
+    P4B_FAKE_LIVE_HEAD2=cccccccccccccccccccccccccccccccccccccccc P4B_FAKE_LIVE_HEAD2_FROM=2
+  printf '%s\n' "$out" >"$WORK/publication-large-$large_storage-summary.json"
+  if [ "$rc" = 3 ] && [ -n "$out" ] && [ ! -e "$WORK/publication-attempts" ] && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+    && jq -se --slurpfile raw "$WORK/publication-large-$large_storage-raw.json" --arg digest "$large_diff_digest" \
+      'length == 1 and (.[0] | .review_posted == false and (.reason | contains("head changed")) and .validated_verdict == $raw[0]
+       and .validated_verdict.review_input.head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       and .validated_verdict.review_input.diff_sha256 == $digest
+       and .validated_verdict.review_input.reviewed_diff_sha256 == $digest)' <<<"$out" >/dev/null; then
+    if [ "$large_storage" = retained ]; then
+      retained=$(jq -r '.validated_verdict_path' <<<"$out")
+      jq -se --slurpfile raw "$WORK/publication-large-$large_storage-raw.json" 'length == 1 and .[0] == $raw[0]' "$retained" >/dev/null \
+        && pass '#2790: large late-head refusal retains the complete bound verdict in terminal JSON and private file' \
+        || fail '#2790: large retained evidence differs from the actual adapter verdict'
+    else
+      jq -e '.validated_verdict_path == null and (.validated_verdict_retention_error | length > 0)' <<<"$out" >/dev/null \
+        && grep -q 'terminal JSON only' "$WORK/publication-large-$large_storage.stderr" \
+        && pass '#2790: large late-head refusal keeps complete terminal evidence when private retention fails' \
+        || fail '#2790: large storage refusal lacks its truthful retention diagnostic'
+    fi
+  else fail "#2790: large $large_storage refusal lost evidence or changed native binding/transport/exit (rc=$rc)"; fi
+done
 if [ "${1:-}" = --publication-only ]; then
   echo "Results: $PASS passed, $FAIL failed (#2790 publication controls)"
   [ "$FAIL" = 0 ]; exit $?

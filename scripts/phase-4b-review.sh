@@ -134,21 +134,27 @@ P4B_VERDICT_EVIDENCE_FILE=""
 P4B_VERDICT_EVIDENCE_ERROR=""
 p4b_unposted_verdict_summary() {
   if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
-    jq -nc --argjson v "$P4B_VALIDATED_VERDICT" --arg path "$P4B_VERDICT_EVIDENCE_FILE" \
+    printf '%s\n' "$P4B_VALIDATED_VERDICT" | jq -cs --arg path "$P4B_VERDICT_EVIDENCE_FILE" \
       --arg error "$P4B_VERDICT_EVIDENCE_ERROR" \
-      '{validated_verdict:$v,validated_verdict_path:(if $path == "" then null else $path end)}
-       + if $error == "" then {} else {validated_verdict_retention_error:$error} end'
+      'if length == 1 and (.[0] | type == "object") then
+         {validated_verdict:.[0],validated_verdict_path:(if $path == "" then null else $path end)}
+         + if $error == "" then {} else {validated_verdict_retention_error:$error} end
+       else error("expected exactly one validated verdict object") end'
   else
     printf '{}\n'
   fi
 }
 p4b_die_diagnostic() {
   shift # The caller owns the exit code and error message.
+  local extra
   if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
-    jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "$HEAD" --arg reviewer "$REVIEWER" \
-      --arg reason "$*" --argjson extra "$(admin_override_summary)" \
-      '{pr_number:$pr,repo:$repo,head_sha:$head,reviewer_identity:$reviewer,
-        review_posted:false,reason:$reason} + $extra'
+    extra="$(admin_override_summary)" || return 1
+    printf '%s\n' "$extra" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "$HEAD" --arg reviewer "$REVIEWER" \
+      --arg reason "$*" \
+      'if length == 1 and (.[0] | type == "object") then .[0] as $extra |
+         {pr_number:$pr,repo:$repo,head_sha:$head,reviewer_identity:$reviewer,
+          review_posted:false,reason:$reason} + $extra
+       else error("expected exactly one admin summary object") end'
   fi
 }
 # shellcheck source=phase-4b/immutable-input.sh
@@ -767,10 +773,13 @@ refuse_approval_if_request_generation_moved() {
 # #2633: the admin override fields every terminal summary carries, so a run
 # that absorbed a tripwire reports it however it ends.
 admin_override_summary() {
-  jq -nc --argjson overridden "$ADMIN_OVERRIDDEN" --arg quote "$ADMIN_OVERRIDE_QUOTE" \
-    --argjson set "$ADMIN_OVERRIDE_SET" \
-    '{admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)}' \
-    | jq --argjson evidence "$(p4b_unposted_verdict_summary)" '. + $evidence'
+  local evidence
+  evidence="$(p4b_unposted_verdict_summary)" || return 1
+  printf '%s\n' "$evidence" | jq -s --argjson overridden "$ADMIN_OVERRIDDEN" --arg quote "$ADMIN_OVERRIDE_QUOTE" \
+    --argjson set "$ADMIN_OVERRIDE_SET" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $evidence |
+      {admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)} + $evidence
+    else error("expected exactly one unpublished verdict summary object") end'
 }
 
 # --- manual-handoff fallback -----------------------------------------------
@@ -827,15 +836,18 @@ fall_back_to_manual() {
   fi
   if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
     p4b_warn "admin override (#2633): the adapter produced no usable verdict ($why); the overridden tripwire still requires human-mediated review"
-    jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+    local ao
+    ao="$(admin_override_summary)" || exit 8
+    printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
           --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-          --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
-          --argjson ao "$(admin_override_summary)" '
+          --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" '
+      if length == 1 and (.[0] | type == "object") then .[0] as $ao |
       {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
        reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
        review_posted:false, fell_back_to_manual:false, barrier_pending:false,
        human_tiebreaker_required:true, reason:$why,
-       automation_enabled:true, enabled_via:$enabled_via} + $ao'
+       automation_enabled:true, enabled_via:$enabled_via} + $ao
+      else error("expected exactly one admin summary object") end' || exit 8
     exit 8
   fi
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
@@ -849,14 +861,17 @@ fall_back_to_manual() {
       *) p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually" ;;
     esac
   fi
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 4
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
-        --argjson ao "$(admin_override_summary)" '
+        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
      reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
      review_posted:false, fell_back_to_manual:true, reason:$why,
-     automation_enabled:true, enabled_via:$enabled_via} + $ao'
+     automation_enabled:true, enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 4
   exit 4
 }
 
@@ -884,16 +899,19 @@ fall_back_to_manual() {
 hold_for_external_review() {
   local payload="$1"
   p4b_warn "external review has not reached the current head; holding without posting (retry_after=$(printf '%s' "$payload" | jq -r '.retry_after // 0')s)"
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 6
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
-        --argjson ao "$(admin_override_summary)" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
      reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
      review_posted:false, fell_back_to_manual:false, barrier_pending:true,
      retry_after:($b.retry_after // 0), barrier:$b,
      reason:"external review has not reached the current head",
-     automation_enabled:true, enabled_via:$enabled_via} + $ao'
+     automation_enabled:true, enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 6
   exit 6
 }
 
@@ -932,10 +950,12 @@ stop_for_human_tiebreaker() {
   else
     p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
   fi
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 8
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
-        --argjson ao "$(admin_override_summary)" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
@@ -943,7 +963,8 @@ stop_for_human_tiebreaker() {
      automation_enabled:true,enabled_via:$enabled_via}
     # #2663: a spent round cap reports round_cap at the top level, as every
     # other round-cap stop does.
-    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end) + $ao'
+    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end) + $ao
+    else error("expected exactly one admin summary object") end' || exit 8
   exit 8
 }
 
@@ -982,15 +1003,18 @@ round_cap_evidence_error() {
   [ "$P4B_ROUND_WHERE" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
     "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
   p4b_warn "$reason; stopping without review publication or Phase 4b handoff"
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 10
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" \
-        --argjson ao "$(admin_override_summary)" '
+        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      infrastructure_error:true,round_cap:{state:"unreadable"},reason:$reason,
-     automation_enabled:true,enabled_via:$enabled_via} + $ao'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 10
   exit 10
 }
 round_cap_stop() { # <exit> <state> <reason> <where>
@@ -1003,15 +1027,19 @@ round_cap_stop() { # <exit> <state> <reason> <where>
       '{decision:"human-tiebreaker",reason:$r,round_cap:($rc + {state:$s})}')"
   fi
   p4b_warn "$reason"
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 6
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --arg reason "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" \
-        --arg s "$state" --arg enabled_via "$ENABLED_VIA" --argjson ao "$(admin_override_summary)" '
+        --arg s "$state" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:true,retry_after:60,
      round_cap:($rc + {state:$s}),reason:$reason,
-     automation_enabled:true,enabled_via:$enabled_via} + $ao'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 6
   exit 6
 }
 round_api() { # <method> <endpoint> [<payload-json>] -> response on stdout, rc
@@ -1189,15 +1217,18 @@ enforce_phase4b_round_cap() {
 stop_for_barrier_error() {
   local payload="$1"
   p4b_warn "request-budget authority failed; stopping without review publication or Phase 4b handoff"
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+  local ao
+  ao="$(admin_override_summary)" || exit 10
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" \
-        --argjson ao "$(admin_override_summary)" '
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
      reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
      review_posted:false,fell_back_to_manual:false,barrier_pending:false,
      infrastructure_error:true,barrier:$b,reason:$b.reason,
-     automation_enabled:true,enabled_via:$enabled_via} + $ao'
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 10
   exit 10
 }
 
