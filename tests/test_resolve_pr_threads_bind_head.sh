@@ -90,7 +90,14 @@ case "$1 $2" in
     # always an earlier commit of the PR.
     h=$(cat "$STATE/last_pair" 2>/dev/null || current_pair); h="${h%% *}"
     [ -s "$STATE/stale_last" ] && h=$(cat "$STATE/stale_last")
-    printf '[{"sha":"%s","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"},{"sha":"%s","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]\n' "$C1" "$h" ;;
+    # COMMIT_COUNT=N pads the list with older commits to N entries in all.
+    n=$(cat "$STATE/commit_count" 2>/dev/null || echo 2)
+    jq -nc --arg c1 "$C1" --arg h "$h" --argjson n "$n" '
+      [range(0; $n - 2) | {sha: ("%040d" | . ), login: "nathanpayne-claude", date: "2025-12-01T00:00:00Z"}]
+      + [{sha: $c1, login: "nathanpayne-claude", date: "2026-01-02T00:00:00Z"},
+         {sha: $h, login: "nathanpayne-claude", date: "2026-01-03T00:00:00Z"}]' \
+    | { pg=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9][0-9]*\).*/\1/p'); pg=${pg:-1}
+        jq -c --argjson p "$pg" '.[(($p - 1) * 100):($p * 100)]'; } ;;
   "api repos/test/repo/commits/"*)
     # C1 touches the finding's file, so it is fix-commit evidence.
     # NO_FIX=1 makes it touch nothing, so no fix-commit evidence exists.
@@ -147,6 +154,7 @@ run_case() {
   [ "${NO_FIX:-}" != 1 ] || echo 1 > "$STATE/no_fix"
   [ "${TAG_LOST:-}" != 1 ] || echo 1 > "$STATE/tag_lost"
   [ "${RESOLVE_LOST:-}" != 1 ] || echo 1 > "$STATE/resolve_lost"
+  [ -z "${COMMIT_COUNT:-}" ] || echo "$COMMIT_COUNT" > "$STATE/commit_count"
   # TWO_THREADS=1: a second, identical thread, so a second write follows.
   if [ "${TWO_THREADS:-}" = 1 ]; then
     jq -c '.data.repository.pullRequest.reviewThreads |= (.totalCount = 2
@@ -252,6 +260,16 @@ COMMITS_LAST="$H2" run_case "$P0" "$REBUTTAL" --resolve-actioned --bind-head
 if [ "$rc" -eq 5 ] && [ "$(writes)" -eq 0 ] && grep -q "commit list ends at $H2" <<<"$out"; then
   ok "stale commit list refused after the restart budget, no write"
 else bad "stale commit list"; show; fi
+
+echo "Test 8b: a commit list at the endpoint's 250-commit cap may be incomplete and is not evidence"
+COMMIT_COUNT=250 run_case "$P0" "$REBUTTAL" --resolve-actioned --bind-head
+if [ "$rc" -eq 5 ] && [ "$(writes)" -eq 0 ] && grep -q "commit list has 250 commits" <<<"$out"; then
+  ok "a capped list stops the run with exit 5, no write"
+else bad "capped commit list"; show; fi
+COMMIT_COUNT=249 run_case "$P0" "$REBUTTAL" --resolve-actioned --bind-head
+if [ "$rc" -eq 0 ] && grep -q "WRITE resolve" "$STATE/writes"; then
+  ok "a 249-commit list ending at the head is accepted"
+else bad "249-commit list"; show; fi
 
 UNBOUND_REPLY="Disagree: this was already handled by deadbee1234 on another branch, intentional."
 echo "Test 9: a reply citing a commit outside the captured head is not evidence"

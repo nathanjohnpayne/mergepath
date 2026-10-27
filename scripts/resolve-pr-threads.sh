@@ -3796,10 +3796,19 @@ while IFS= read -r thread; do
     fetch_pr_tag_data
     augment_pr_commits_with_sha
     # --bind-head (#2727): fix evidence comes from this commit list, so it
-    # must be the CAPTURED head's. The list ends at the PR's head; any other
-    # last commit means the pair moved (or the PR exceeds the endpoint's
-    # 250-commit window), and nothing here is evidence for the capture.
+    # must be the CAPTURED head's, and complete. The list ends at the PR's
+    # head; any other last commit means the pair moved. The endpoint returns
+    # at most 250 commits and does not document which, so a list that long
+    # may omit fix commits even when it ends at the head: fail closed
+    # (CodeRabbit on #2816). Resolve such a PR locally, without the flag.
     if $BIND_HEAD && ! $BIND_COMMITS_VERIFIED; then
+      bind_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r 'length' 2>/dev/null || echo 0)
+      case "$bind_count" in ''|*[!0-9]*) bind_count=0 ;; esac
+      if [ "$bind_count" -ge 250 ]; then
+        echo "BIND: the PR commit list has $bind_count commits, the endpoint's 250-commit cap, so it may be incomplete; nothing in it is accepted as evidence. Stopping every remaining resolution; resolve this PR locally without --bind-head (#2727)." >&2
+        BIND_STOPPED=true
+        break
+      fi
       bind_last=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r 'last.sha // ""' 2>/dev/null || echo "")
       if [ "$bind_last" != "$CAPTURED_HEAD" ]; then
         bind_restart_or_stop "the PR commit list ends at ${bind_last:-nothing}, not the captured head ${CAPTURED_HEAD:0:12}" || break
