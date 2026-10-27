@@ -364,6 +364,9 @@ if [ "$policy_rc" -eq 0 ] && [ -f "$policy" ]; then
     required_author_token_class="malformed-key"
   elif [ "$author_class_exact" -gt 1 ]; then
     required_author_token_class="duplicate-key"
+  elif [ "$author_class_exact" -eq 1 ] && [ -z "$required_author_token_class" ]; then
+    # A present key with no value would otherwise read as absent (`any`).
+    required_author_token_class="empty-value"
   fi
 fi
 if [ -n "${policy:-}" ] && [ "$policy" != "$ROOT/.github/review-policy.yml" ]; then

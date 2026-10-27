@@ -514,9 +514,10 @@ jobs:
           # above cannot tell it from the shared classic token, which a
           # missing merge-queue-policy copy silently falls back to.
           # A repeated key fails closed: the first match could be an `any`
-          # left above the cutover's `fine-grained`. So does any other
+          # left above the cutover's `fine-grained`. So do any other
           # spelling of the key (quoted, or a space before the colon), which
-          # an exact reader would miss and treat as absent.
+          # an exact reader would miss, and a key with no value; both would
+          # otherwise read as absent.
           REQUIRED_AUTHOR_CLASS=$(awk '
             /^["\047]?author_merge_token_class["\047]?[[:space:]]*:/ && $1 != "author_merge_token_class:" {
               odd++
@@ -532,6 +533,7 @@ jobs:
             END {
               if (odd > 0) print "malformed-key"
               else if (n > 1) print "duplicate-key"
+              else if (n == 1 && value == "") print "empty-value"
               else if (n == 1) print value
             }
           ' "$POLICY")

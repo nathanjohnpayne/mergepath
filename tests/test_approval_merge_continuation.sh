@@ -1876,6 +1876,23 @@ for odd_line in 'author_merge_token_class : fine-grained' '"author_merge_token_c
   fi
 done
 
+# A present key with no value (or only a comment) would read as absent (`any`).
+for empty_line in 'author_merge_token_class:' 'author_merge_token_class: # fine-grained'; do
+  reset_fixtures
+  STUB_AUTHOR_CLASS_LINE="$empty_line"
+  TEST_AMBIENT_GH_TOKEN="ghp_sharedclassic"
+  set +e
+  run_case
+  rc=$?
+  set -e
+  if [ "$rc" -eq 3 ] && [ ! -s "$TMP/readiness.log" ] \
+     && grep -Fq "unknown author_merge_token_class 'empty-value'" "$TMP/subject.out"; then
+    pass "a class key with no value fails closed: $empty_line"
+  else
+    fail "a class key with no value must fail closed: $empty_line (rc=$rc)"
+  fi
+done
+
 # A consumer can receive this script before the library that defines the class
 # gate. With no requirement it must keep working; with one it must fail closed.
 cp "$TMP/root/scripts/lib/credential-class.sh" "$TMP/credential-class.full"

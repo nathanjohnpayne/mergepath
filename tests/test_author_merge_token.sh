@@ -108,6 +108,8 @@ expect_block 1 "author_merge_token_class: any\nauthor_merge_token_class: fine-gr
 expect_block 1 "author_merge_token_class : fine-grained"    "ghp_sharedclassic"   "workflow: a space before the colon fails closed" "unknown author_merge_token_class 'malformed-key'"
 expect_block 1 '"author_merge_token_class": fine-grained'   "github_pat_11ABCDEF" "workflow: a quoted key fails closed" "unknown author_merge_token_class 'malformed-key'"
 expect_block 0 "author_merge_token_class_note: fine-grained" "ghp_sharedclassic"  "workflow: a longer key is not the class key"
+expect_block 1 "author_merge_token_class:"                  "ghp_sharedclassic"   "workflow: a key with no value fails closed" "unknown author_merge_token_class 'empty-value'"
+expect_block 1 "author_merge_token_class: # fine-grained"   "ghp_sharedclassic"   "workflow: a key whose value is only a comment fails closed" "unknown author_merge_token_class 'empty-value'"
 
 sed '/^credential_meets_author_token_class()/,$d' "$LIB" > "$TMP/base/scripts/lib/credential-class.sh"
 expect_block 1 "author_merge_token_class: fine-grained"     "github_pat_11ABCDEF" "workflow: an older library fails closed" "predates the class check"
