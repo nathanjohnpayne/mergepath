@@ -78,8 +78,13 @@ ADR 0004 hands #2727 two confirmations per caller: that its writes still start t
 
 #2727 ships as a sequence of PRs. Each is inert or fails closed until the owner provisions what it needs.
 
-1. **This PR.** The specification and runbook, and the `check_ci_app_trust` gate. No workflow requests `id-token: write` and no policy is committed.
-2. **C17 resolver hardening.** `scripts/resolve-pr-threads.sh --resolve-actioned` refuses, failing closed, any PR whose live base ref is not the default branch, captures the live head and base SHAs before evaluating evidence, binds each evidence predicate to that pair, restarts on a change, and re-reads the pair before every `resolveReviewThread`, stopping the run on a mismatch. This hardens the current reviewer-PAT path too, so it does not wait for the pilot.
+1. **Specification and gate (merged in #2802).** The specification and runbook, and the `check_ci_app_trust` gate. No workflow requests `id-token: write` and no policy is committed.
+2. **C17 resolver hardening.** `scripts/resolve-pr-threads.sh --resolve-actioned --bind-head`, which the thread-resolution lane now passes and `--ci-app-identity` implies:
+   - **Refusal.** It refuses (exit 5) a PR that is not open against the default branch, before the threads are enumerated.
+   - **Capture.** It captures the live head and base SHAs before any evidence is read.
+   - **Bound evidence.** The fix-commit list must end at the captured head. A reply's cited commits must be commits of that head, and a reply that cites none (a rebuttal) applies to any pair. Local ledger rows, which name no head, are not accepted; the lane's fresh checkout has none anyway.
+   - **Re-read before every write.** The pair is re-read before the tag reply and before each `resolveReviewThread`. A pair that moves before any write re-runs the resolver against a fresh capture, at most twice. After a write, a moved pair stops every remaining resolution (exit 5), and a failed re-read stops with exit 4.
+   - **Local path unchanged.** Without the flag, the local reviewer-PAT path behaves as before. Binding the lane now hardens today's reviewer-PAT lane too, so this slice does not wait for the pilot.
 3. **Trusted consumers.** `trusted-review-mutations.yml` (C2, C4, C5) and `trusted-policy-mutations.yml` (C6, C7) on `workflow_run`, with the `workflow_run` field validation, invariant 9's same-repository admission, exact-head binding, and fork and borrowed-name rejection tests. Their jobs join `ALLOWED_ID_TOKEN_JOBS`. They make no write until a policy exists, because the exchange fails without one; the producers keep their current writes until cutover.
 4. **Auto-clear split.** The `pull_request_target` path becomes the credential-free nominator, and evaluation runs on `repository_dispatch`, `workflow_run` and `schedule` with the `auto-clear` identity. This slice extends the gate's event rule for a mixed-trigger file, with its own review.
 5. **Pilot (#2732).** Records the evidence below, sets `APP_PIN`, commits the hub's policies, and adds the bot login to `non_reviewer_identities` and `thread_resolution_ci_app_identity`.

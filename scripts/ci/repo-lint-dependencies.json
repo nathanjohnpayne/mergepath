@@ -604,6 +604,7 @@
       "scripts/lib/credential-class.sh",
       "tests/test_resolve_pr_threads_rationale_tag.sh",
       "tests/test_resolve_pr_threads_read_failure.sh",
+      "tests/test_resolve_pr_threads_bind_head.sh",
       "tests/test_resolve_pr_threads_staleness_pagination.sh",
       "tests/test_resolve_pr_threads_verified_propagation.sh",
       "scripts/identity-check.sh",

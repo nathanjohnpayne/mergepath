@@ -338,7 +338,7 @@ G
   lane_run ""; c3=$?; l3="$(cat "$LFIX/lane.log")"
   lane_run nathanpayne-rogue; c4=$?; l4="$(cat "$LFIX/lane.log")"
   set -e
-  if [ "$c1" -eq 0 ] && [ "$l1" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ] \
+  if [ "$c1" -eq 0 ] && [ "$l1" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned --bind-head" ] \
      && [ "$c2" -ne 0 ] && [ -z "$l2" ] && [ "$c3" -ne 0 ] && [ -z "$l3" ] && [ "$c4" -ne 0 ] && [ -z "$l4" ]; then
     pass "lane resolves as the listed reviewer its token reads as, and refuses an author, unlisted reviewer-shaped or unreadable token before resolving"
   else
@@ -356,9 +356,9 @@ G
   lane_run nathanpayne-codex ghp_reviewer; c7=$?; l7="$(cat "$LFIX/lane.log")"
   lane_run "" ghs_installation ghp_other; c8=$?; l8="$(cat "$LFIX/lane.log")"
   set -e
-  if [ "$c5" -eq 0 ] && [ "$l5" = "agent= identity= args=12 --repo o/r --resolve-actioned --ci-app-identity" ] \
+  if [ "$c5" -eq 0 ] && [ "$l5" = "agent= identity= args=12 --repo o/r --resolve-actioned --bind-head --ci-app-identity" ] \
      && [ "$c6" -eq 0 ] && [ "$l6" = "$l5" ] \
-     && [ "$c7" -eq 0 ] && [ "$l7" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ] \
+     && [ "$c7" -eq 0 ] && [ "$l7" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned --bind-head" ] \
      && [ "$c8" -eq 0 ] && [ "$l8" = "$l5" ]; then
     pass "lane runs an installation token only in the bounded --ci-app-identity mode, with no reviewer identity (#2726)"
   else

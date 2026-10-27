@@ -378,6 +378,11 @@
 #       resolution exist only in GraphQL, so no credential or retry changes
 #       the answer: hand the step to a session that can reach GraphQL. See
 #       scripts/lib/graphql-ceiling.sh.
+#   5 — REFUSED (#2727, ADR 0004 caller C17): with --bind-head, the PR is not
+#       open against the default branch, or its head/base pair moved during
+#       the run and the bounded re-evaluation budget is spent (or a write had
+#       already been made, so no re-evaluation is allowed). Every remaining
+#       resolution was stopped; nothing was resolved on an unproven pair.
 #   3 — unresolved threads exist (in --list mode), or a resolve mode left
 #       threads unresolved (human-authored, stale-HEAD, not-actioned,
 #       comments-incomplete, not-propagation-routed, drifted,
@@ -504,7 +509,17 @@ daily rollup / weekly sweep as the disposition of record):
                         checkout's .github/review-policy.yml (#2726).
                         RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK does not
                         skip the check in this mode; --dry-run does,
-                        because dry-run makes no changes.
+                        because dry-run makes no changes. Implies --bind-head.
+  --bind-head           With --resolve-actioned only (#2727, ADR 0004 C17):
+                        refuse (exit 5) unless the PR is open against the
+                        default branch; capture its head and base SHAs before
+                        any evidence is read; accept only evidence bound to
+                        that pair (a cited commit must be in the captured
+                        head's commit list; local ledger rows, which carry no
+                        head, are not accepted); re-read the pair before every
+                        write. A pair that moves before any write restarts the
+                        run against a fresh capture (at most twice); after a
+                        write it stops every remaining resolution (exit 5).
 EOF
   exit 1
 }
@@ -522,6 +537,10 @@ TARGET_ISSUE=""
 TARGET_COMMIT=""
 BULK_MODE_USED=false
 CI_APP_IDENTITY=false
+BIND_HEAD=false
+# The original argv, kept for --bind-head's bounded re-run against a fresh
+# head/base capture (#2727).
+ORIG_ARGS=("$@")
 # Match both REST and GraphQL bot-login formats. The REST API returns
 # `coderabbitai[bot]`; GraphQL `author{login}` returns `coderabbitai`
 # (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
@@ -578,6 +597,7 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     --no-tag-reply) NO_TAG_REPLY=true; shift ;;
     --ci-app-identity) CI_APP_IDENTITY=true; shift ;;
+    --bind-head) BIND_HEAD=true; shift ;;
     -h|--help) usage ;;
     -*) echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -662,6 +682,14 @@ fi
 # gh call.
 if $CI_APP_IDENTITY && [ "$MODE" != "resolve-actioned" ]; then
   echo "Error: --ci-app-identity is valid only with --resolve-actioned (#2726)" >&2
+  exit 1
+fi
+# #2727 (ADR 0004, caller C17): the CI app never resolves on an unbound pair,
+# so its mode always binds. --bind-head is also how the CI lane binds the
+# reviewer-PAT path today.
+$CI_APP_IDENTITY && BIND_HEAD=true
+if $BIND_HEAD && [ "$MODE" != "resolve-actioned" ]; then
+  echo "Error: --bind-head is valid only with --resolve-actioned (#2727)" >&2
   exit 1
 fi
 
@@ -807,6 +835,116 @@ else
       exit 4
       ;;
   esac
+fi
+
+# --- --bind-head: one captured head/base pair for the whole run (#2727) -----
+# ADR 0004 § Caller mapping, C17: the lane's `if:` checks only the dispatch
+# ref, never the PR's base, so the resolver itself refuses a PR that is not
+# open against the default branch. It captures the live head and base SHAs
+# here, BEFORE the thread enumeration and before any evidence is evaluated;
+# evidence must then apply to that pair (a cited commit must be one of the
+# captured head's commits, see bind_reply_commits_bound), and the pair is
+# re-read immediately before every write (bind_recheck). A pair that moves
+# before any write re-runs the resolver against a fresh capture, at most
+# BIND_MAX_RESTARTS times; once this run has written, a moved pair stops
+# every remaining resolution (exit 5), as invariant 5 requires.
+BIND_ATTEMPT="${RESOLVE_PR_THREADS_BIND_ATTEMPT:-0}"
+case "$BIND_ATTEMPT" in ''|*[!0-9]*) BIND_ATTEMPT=0 ;; esac
+BIND_MAX_RESTARTS=2
+BIND_WRITES=0
+BIND_STOPPED=false
+BIND_STOP_CODE=5
+BIND_COMMITS_VERIFIED=false
+CAPTURED_PAIR=""
+CAPTURED_HEAD=""
+
+# bind_read_pair → "<head sha> <base sha> <base ref> <state>" on stdout.
+bind_read_pair() {
+  gh_pat_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" \
+    --jq '[.head.sha, .base.sha, .base.ref, .state] | join(" ")'
+}
+
+# bind_restart_or_stop <reason> — re-run against a fresh capture when this
+# run has made no write and the restart budget remains (does not return);
+# otherwise print why every remaining resolution stops and return 1.
+bind_restart_or_stop() {
+  local reason="$1"
+  if [ "$BIND_WRITES" -eq 0 ] && [ "$BIND_ATTEMPT" -lt "$BIND_MAX_RESTARTS" ]; then
+    echo "BIND: $reason. No write made yet; re-evaluating against a fresh head/base capture (restart $((BIND_ATTEMPT + 1)) of $BIND_MAX_RESTARTS, #2727)." >&2
+    rm -rf "$COMMIT_FILES_CACHE_DIR"
+    RESOLVE_PR_THREADS_BIND_ATTEMPT=$((BIND_ATTEMPT + 1)) exec bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+  fi
+  if [ "$BIND_WRITES" -gt 0 ]; then
+    echo "BIND: $reason. This run already wrote ($BIND_WRITES write(s)), so it stops every remaining resolution instead of re-evaluating (#2727)." >&2
+  else
+    echo "BIND: $reason. The re-evaluation budget ($BIND_MAX_RESTARTS) is spent; stopping every remaining resolution (#2727)." >&2
+  fi
+  BIND_STOPPED=true
+  return 1
+}
+
+# bind_recheck <before-what> — exit 0 when the live pair still equals the
+# captured one. Runs immediately before each write; a read failure stops the
+# run (exit 4 at the end), never a write on an unproven pair.
+bind_recheck() {
+  $BIND_HEAD || return 0
+  local live
+  if ! live=$(bind_read_pair 2>/dev/null) || [ -z "$live" ]; then
+    echo "BIND: could not re-read the head/base pair of $REPO#$PR_NUM before $1; stopping every remaining resolution (#2727)." >&2
+    BIND_STOPPED=true
+    BIND_STOP_CODE=4
+    return 1
+  fi
+  [ "$live" = "$CAPTURED_PAIR" ] && return 0
+  bind_restart_or_stop "the head/base pair changed before $1 (captured: $CAPTURED_PAIR; live: $live)"
+}
+
+# bind_reply_commits_bound <body> — exit 0 when every commit the reply cites
+# is one of the captured head's commits. A citation is a 7-40 character hex
+# token with at least one digit and one letter (so comment IDs and plain words
+# are not read as SHAs). A reply that cites a commit outside the captured
+# head (dropped by a force-push, on another branch, or on the base) is
+# evidence about some other pair and does not count. A reply citing nothing
+# (a rebuttal) applies to any pair.
+bind_reply_commits_bound() {
+  local body="$1" tok shas
+  shas=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r '.[].sha // empty' 2>/dev/null) || shas=""
+  for tok in $(printf '%s' "$body" | tr 'A-Z' 'a-z' | grep -oE '(^|[^0-9a-z])[0-9a-f]{7,40}([^0-9a-z]|$)' | grep -oE '[0-9a-f]{7,40}'); do
+    case "$tok" in *[0-9]*) ;; *) continue ;; esac
+    case "$tok" in *[a-f]*) ;; *) continue ;; esac
+    printf '%s\n' "$shas" | grep -q "^$tok" || return 1
+  done
+  return 0
+}
+
+if $BIND_HEAD; then
+  BIND_DEFAULT_BRANCH=""
+  if ! BIND_DEFAULT_BRANCH=$(gh_pat_read api "repos/$OWNER/$NAME" --jq .default_branch 2>/dev/null) \
+     || [ -z "$BIND_DEFAULT_BRANCH" ]; then
+    echo "Could not READ the default branch of $REPO for --bind-head; nothing was resolved (#2727)." >&2
+    exit 4
+  fi
+  if ! CAPTURED_PAIR=$(bind_read_pair 2>/dev/null) || [ -z "$CAPTURED_PAIR" ]; then
+    echo "Could not READ the head/base pair of $REPO#$PR_NUM for --bind-head; nothing was resolved (#2727)." >&2
+    exit 4
+  fi
+  read -r CAPTURED_HEAD CAPTURED_BASE CAPTURED_BASE_REF CAPTURED_STATE <<<"$CAPTURED_PAIR"
+  if ! [[ "${CAPTURED_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || ! [[ "${CAPTURED_BASE:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSED: $REPO#$PR_NUM did not return a 40-hex head and base SHA ($CAPTURED_PAIR); nothing was resolved (#2727)." >&2
+    exit 4
+  fi
+  if [ "${CAPTURED_STATE:-}" != "open" ]; then
+    echo "REFUSED: $REPO#$PR_NUM is ${CAPTURED_STATE:-in an unknown state}, not open; --bind-head resolves only open PRs. Nothing was resolved (#2727)." >&2
+    exit 5
+  fi
+  if [ "${CAPTURED_BASE_REF:-}" != "$BIND_DEFAULT_BRANCH" ]; then
+    echo "REFUSED: $REPO#$PR_NUM targets '${CAPTURED_BASE_REF:-}', not the default branch '$BIND_DEFAULT_BRANCH'. ADR 0004 binds C17 to default-branch PRs only; nothing was resolved (#2727)." >&2
+    exit 5
+  fi
+  if [ "$CAPTURED_HEAD" != "$HEAD_OID" ]; then
+    bind_restart_or_stop "the head moved between two reads (${HEAD_OID:0:7} then ${CAPTURED_HEAD:0:7})" || exit 5
+  fi
+  echo "BIND: captured head ${CAPTURED_HEAD:0:12} and base ${CAPTURED_BASE:0:12} ($CAPTURED_BASE_REF) for $REPO#$PR_NUM before reading any evidence (#2727)."
 fi
 
 # Fetch all review threads with isResolved state. Three design
@@ -3167,6 +3305,12 @@ thread_reply_disposition() {
       "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
     esac
     if [ -n "$login" ] && [ -n "$body" ] && is_agent_author_local "$login"; then
+      # --bind-head (#2727): a reply citing a commit outside the captured
+      # head is evidence about another pair; look for a later reply instead.
+      if $BIND_HEAD && ! bind_reply_commits_bound "$body"; then
+        k=$((k + 1))
+        continue
+      fi
       return 0
     fi
     k=$((k + 1))
@@ -3283,6 +3427,12 @@ finding_dispositioned() {
   if thread_reply_disposition "$tj"; then
     printf 'agent reply on the thread after the latest re-raise'
     return 0
+  fi
+  # --bind-head (#2727): a local ledger row names no head, so it cannot prove
+  # it applies to the captured pair. (The CI lane's fresh checkout has no
+  # ledger anyway; a session records its disposition on the thread.)
+  if $BIND_HEAD; then
+    return 1
   fi
   floor=$(latest_nonagent_created "$tj")
   ids=$(current_round_finding_ids "$tj" "$floor") || return 1
@@ -3616,6 +3766,17 @@ while IFS= read -r thread; do
   if [ "$MODE" = "resolve-actioned" ]; then
     fetch_pr_tag_data
     augment_pr_commits_with_sha
+    # --bind-head (#2727): fix evidence comes from this commit list, so it
+    # must be the CAPTURED head's. The list ends at the PR's head; any other
+    # last commit means the pair moved (or the PR exceeds the endpoint's
+    # 250-commit window), and nothing here is evidence for the capture.
+    if $BIND_HEAD && ! $BIND_COMMITS_VERIFIED; then
+      bind_last=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r 'last.sha // ""' 2>/dev/null || echo "")
+      if [ "$bind_last" != "$CAPTURED_HEAD" ]; then
+        bind_restart_or_stop "the PR commit list ends at ${bind_last:-nothing}, not the captured head ${CAPTURED_HEAD:0:12}" || break
+      fi
+      BIND_COMMITS_VERIFIED=true
+    fi
     # #573 item 2: the staleness floor (latest_nonagent_created) is only
     # trustworthy over the COMPLETE thread. If the enumeration's last-50
     # window truncated this thread, re-fetch every comment before
@@ -3815,6 +3976,10 @@ while IFS= read -r thread; do
     continue
   fi
 
+  # --bind-head (#2727): the first write for this thread (the tag reply, or
+  # the resolve itself under --no-tag-reply) happens only on the captured pair.
+  bind_recheck "the writes for [$AUTHOR] $PATH_" || break
+
   # mergepath#305 — emit `[mergepath-resolve: <class>] <rationale>`
   # reply BEFORE the resolve mutation. The classifier in
   # scripts/lib/daily-feedback-rollup-helpers.sh reads this tag and
@@ -3973,6 +4138,7 @@ while IFS= read -r thread; do
     if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
       echo "  TAGGED [$AUTHOR] $PATH_ → [mergepath-resolve: $tag_class]"
       TAG_REPLY_POSTED=$((TAG_REPLY_POSTED + 1))
+      BIND_WRITES=$((BIND_WRITES + 1))
     else
       TAG_REPLY_FAILED=$((TAG_REPLY_FAILED + 1))
       if [ "$MODE" = "resolve-targeted" ]; then
@@ -3994,6 +4160,8 @@ while IFS= read -r thread; do
   # isResolved!=true did NOT actually resolve the thread, so it must count
   # as FAILED, not RESOLVED. Threads confirmed true here are collected into
   # RESOLVED_IDS for the consolidated reviewThreads readback after the loop.
+  # --bind-head (#2727): re-read the pair immediately before the resolve.
+  bind_recheck "resolving [$AUTHOR] $PATH_" || break
   resolve_state=""
   mutation_err="$(mktemp "${TMPDIR:-/tmp}/resolve-pr-threads-mutation.XXXXXX")"
   if mutation_out=$(gh_pat api graphql -f query='
@@ -4013,6 +4181,7 @@ while IFS= read -r thread; do
   if [ "$resolve_state" = "true" ]; then
     echo "  RESOLVED [$AUTHOR] $PATH_"
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+    BIND_WRITES=$((BIND_WRITES + 1))
     RESOLVED_IDS+=("$THREAD_ID")
   else
     echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected (returned isResolved=${resolve_state:-none})" >&2
@@ -4031,6 +4200,9 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
+  if $BIND_STOPPED; then
+    exit "$BIND_STOP_CODE"
+  fi
   if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_NOT_DISPOSITIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ] || [ "$SKIPPED_NOT_PROPAGATION" -gt 0 ] || [ "$SKIPPED_DRIFT" -gt 0 ] || [ "$SKIPPED_VERIFY_ERROR" -gt 0 ] || [ "$SKIPPED_NO_UPSTREAM_EVIDENCE" -gt 0 ]; then
     exit 3
   fi
@@ -4120,6 +4292,12 @@ fi
 # below). A readback failure is as fail-closed as a mutation failure.
 if [ "$FAILED_COUNT" -gt 0 ] || [ "$READBACK_FAILED" -gt 0 ]; then
   exit 2
+fi
+# --bind-head (#2727): a stopped run is not a completed pass, whatever it
+# resolved before the pair moved.
+if $BIND_STOPPED; then
+  echo "Stopped: the head/base pair could not be held for the whole run; re-dispatch to evaluate the new head (#2727)." >&2
+  exit "$BIND_STOP_CODE"
 fi
 # Use an explicit `if`, not `[ a ] || [ b ] && exit 3`. In that
 # one-liner `&&` and `||` are equal-precedence and left-associative,
