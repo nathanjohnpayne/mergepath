@@ -115,11 +115,12 @@ HUB_REPOSITORY_ID = "1190939344"
 ISSUER = "https://token.actions.githubusercontent.com"
 
 # The numeric ID (or, on a self-hosted deployment, the configured name) of the
-# one app every policy pins. None until the #2732 pilot records it; while None,
-# any committed policy fails. Hosted Octo STS is app 801323 (`octo-sts[bot]`)
-# per the public `GET /apps/octo-sts` on 2026-10-26, but the pin is the pilot's
-# to confirm and the hosting choice is the owner's.
-APP_PIN = None
+# one app every policy pins. Set by the #2732 pilot PR to the hosted Octo STS
+# app (`octo-sts`, bot `octo-sts[bot]`; public `GET /apps/octo-sts`,
+# 2026-10-26), which the owner confirms on the install screen before that PR
+# merges. Every committed policy must pin exactly this value; changing it is a
+# Phase 4 change that re-pins every policy in the tree.
+APP_PIN = "801323"
 
 # ADR 0004 "Policies per repository". `repo` is whose workflow presents the
 # token: "self" for the four fleet-wide identities, "hub" for the two
