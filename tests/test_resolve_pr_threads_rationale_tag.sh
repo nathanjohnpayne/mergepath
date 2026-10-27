@@ -215,7 +215,16 @@ JSON_COMMITS
         # and captures stdout; the stub doesn't actually parse --jq,
         # so we return the bare sha directly. Same pattern the
         # existing tests in scripts/ci/check_resolve_pr_threads use.
-        echo "HEADCURRENT"
+        # #2727: --bind-head (implied by --ci-app-identity) reads the
+        # head/base pair with a second --jq; serve STUB_PAIR there.
+        case "\$*" in
+          *".base.sha"*) echo "\${STUB_PAIR:-HEADCURRENT HEADBASE main open}" ;;
+          *) echo "\${STUB_HEAD:-HEADCURRENT}" ;;
+        esac
+        ;;
+      "repos/test/repo")
+        # #2727: --bind-head's default-branch read (--jq .default_branch).
+        echo "\${STUB_DEFAULT_BRANCH:-main}"
         ;;
       *)
         echo "{}" ;;
@@ -2782,6 +2791,10 @@ THREADS_2726_OPEN='{"data":{"repository":{"pullRequest":{"reviewThreads":{"total
   }
 ]}}}}}'
 
+H2726=1111111111111111111111111111111111111111
+B2726=2222222222222222222222222222222222222222
+COMMITS_2726='[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"},{"sha":"'"$H2726"'","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+
 # case_2726 <label> <expected rc> <expect: resolved|untouched|no-gh> <threads>
 #           <policy> <token> <extra env, space-free KEY=VALUE or -> <resolver args...>
 case_2726() {
@@ -2789,7 +2802,9 @@ case_2726() {
   shift 7
   app_policy_2726 "$policy"
   GH_ARGV_LOG="$SCRATCH/t2726.log"; : > "$GH_ARGV_LOG"
-  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T1" "$COMMITS_T1" '{"abc1234567":["scripts/foo.sh"]}'
+  # --ci-app-identity implies --bind-head (#2727): serve one bound pair, and
+  # end the commit list at its head, as GitHub does for an open PR.
+  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T1" "$COMMITS_2726" '{"abc1234567":["scripts/foo.sh"]}'
   make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
   [ "$extra" != - ] || extra=
   set +e
@@ -2797,6 +2812,7 @@ case_2726() {
   out=$(env -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY -u OP_PREFLIGHT_AGENT \
     -u RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK -u GH_HOST \
     GH_ARGV_LOG="$GH_ARGV_LOG" GH_TOKEN="$token" STUB_VIEWER_LOGIN="${STUB_VIEWER_LOGIN_2726:-$CI_APP}" \
+    STUB_HEAD="$H2726" STUB_PAIR="$H2726 $B2726 main open" \
     STUB_USER_LOGIN=nathanpayne-claude $extra PATH="$SCRATCH:$PATH" \
     bash "$APP_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "$@" 2>&1)
   rc=$?

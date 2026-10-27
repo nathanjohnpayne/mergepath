@@ -133,7 +133,12 @@ jobs:
             ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
           esac
           rc=0
-          scripts/resolve-pr-threads.sh "$PR_NUMBER" --repo "$REPO" --resolve-actioned ${app_mode[@]+"${app_mode[@]}"} || rc=$?
+          # --bind-head (#2727, ADR 0004 caller C17): refuse a PR that is not
+          # open against the default branch (the `if:` above checks only the
+          # dispatch ref, never the PR's base), capture the head/base pair
+          # before any evidence, and re-read it before every write. Exit 5 is
+          # that refusal or a stop on a moved pair, and fails the lane.
+          scripts/resolve-pr-threads.sh "$PR_NUMBER" --repo "$REPO" --resolve-actioned --bind-head ${app_mode[@]+"${app_mode[@]}"} || rc=$?
           # 3 means threads were left open on purpose (not actioned, human,
           # stale): a completed pass, reported in the log, not a lane failure.
           if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
