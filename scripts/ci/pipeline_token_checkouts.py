@@ -85,7 +85,6 @@ Usage:
 Exit: 0 clean, 1 violations or a failed self-test, 2 environment/usage error.
 """
 
-import glob
 import hashlib
 import json
 import os
@@ -342,8 +341,11 @@ def make_loader():
 
 def scan_tree(root, load, reviewed):
     violations, matched, seen = [], set(), set()
-    files = sorted(glob.glob(os.path.join(root, ".github", "workflows", "*.yml"))
-                   + glob.glob(os.path.join(root, ".github", "workflows", "*.yaml")))
+    # os.listdir, not glob: glob's `*` skips dot-prefixed names, and GitHub
+    # runs `.github/workflows/.x.yml` like any other workflow (#2802).
+    wf_dir = os.path.join(root, ".github", "workflows")
+    files = sorted(os.path.join(wf_dir, n) for n in (os.listdir(wf_dir) if os.path.isdir(wf_dir) else [])
+                   if n.endswith((".yml", ".yaml")) and os.path.isfile(os.path.join(wf_dir, n)))
     for path in files:
         base = os.path.basename(path)
         seen.add(base)
@@ -566,6 +568,11 @@ def self_test(load):
             fh.write("on: [pull_request\n")
         v = scan_tree(tmp, load, {})
         check("an unparseable workflow fails closed", len(v) == 1 and "cannot parse" in v[0], repr(v))
+        os.remove(os.path.join(wf_dir, "bad.yml"))
+        with open(os.path.join(wf_dir, ".hidden.yml"), "w") as fh:
+            fh.write(_job(CHECKOUT + TOKEN_STEP))
+        v = scan_tree(tmp, load, {})
+        check("a dot-prefixed workflow is scanned", len(v) == 1 and ".hidden.yml" in v[0], repr(v))
     print("%s: self-test %d/%d passed" % (NAME, total - failures, total))
     return failures == 0
 

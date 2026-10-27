@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# check_ci_app_trust
+#
+# The CI app trust gate for #2727 (ADR 0004). Fails when a job requests
+# `id-token: write` outside the allow-list of trusted Octo STS consumers (the
+# list is empty until a migration slice adds one) and outside the reviewed
+# non-app OIDC jobs, when an allow-listed or reviewed job
+# breaks the ADR's execution rules, or when a `.github/chainguard/*.sts.yaml`
+# trust policy differs from the ADR template or lands before the #2732 pilot
+# records the app pin.
+#
+# THIS FILE IS A LAUNCHER. The rules, the identity table, the allow-list, the
+# "does NOT catch" list and the embedded self-test all live in
+# scripts/ci/ci_app_trust.py; read its header first.
+#
+# Usage:
+#   check_ci_app_trust              # self-test, then scan this repo
+#   check_ci_app_trust --self-test  # embedded cases only
+#   check_ci_app_trust --check [DIR] [--repository OWNER/NAME]
+#   check_ci_app_trust --render IDENTITY --repository OWNER/NAME --repository-id N --owner-id N [--app APP]
+
+set -euo pipefail
+
+CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$CI_DIR/ci_app_trust.py"
+
+if [ ! -f "$GATE" ]; then
+  echo "check_ci_app_trust: ERROR (missing $GATE) — the launcher and its module travel together in the scripts/ci kit; a tree with one and not the other is a broken sync." >&2
+  exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "check_ci_app_trust: ERROR — python3 is required and was not found on PATH. A credential gate that silently does not run is the shape it exists to stop." >&2
+  exit 2
+fi
+
+exec python3 "$GATE" "$@"
