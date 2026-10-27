@@ -123,6 +123,9 @@ CONSUMER_ABSENT=(
   # both bootstrap and ongoing consumer propagation. The propagated CI wrapper
   # must take its marker-first consumer SKIP without either source present.
   ".github/templates/required-workflows"
+  # #2732: Octo STS trust policies are per repository and never propagate;
+  # the bootstrap mirror excludes the directory (a policy names one repo).
+  ".github/chainguard"
   "scripts/build/materialize-merge-queue-policy-source.sh"
   "mergepath"
   "packaging"
