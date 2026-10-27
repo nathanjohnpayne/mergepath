@@ -897,6 +897,14 @@ paths:
       - "scripts/ci/check_stalled_pr_resume"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+  - path: tests/test_trusted_consumer_admission.sh
+    # Hermetic suite for scripts/workflow/trusted-consumer-admission.sh (#2727,
+    # ADR 0004); check_trusted_consumer_admission runs it.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/ci/check_trusted_consumer_admission"
   - path: tests/test_pull_request_target_policy.sh
     # Hermetic suite for the pull_request_target event-policy tool (#2733).
     # It lints this checkout's three pull_request_target workflows and copies
@@ -2767,6 +2775,7 @@ paths:
       - "tests/test_repo_lint_latency_report.sh"  # check_repo_lint_latency_report (#1062)
       - "tests/test_stalled_pr_resume.sh"         # check_stalled_pr_resume (#2165)
       - "tests/test_pull_request_target_policy.sh"  # check_pull_request_target_policy (#2733)
+      - "tests/test_trusted_consumer_admission.sh"  # check_trusted_consumer_admission (#2727)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
