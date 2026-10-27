@@ -1159,6 +1159,23 @@ HEAD_SUMMARY_RUNS_JSON='[]'
 while IFS= read -r cr_run_json; do
   [ -n "$cr_run_json" ] || continue
   cr_run_body=$(printf '%s' "$cr_run_json" | jq -r '.body')
+  # Continuation intent precedes both summary acceptors: unread extra payload
+  # must not turn a rejected continuation into a new report that hides its root.
+  # Inspect unfenced text so a genuine report quoting these forms remains data.
+  case "$cr_run_body" in
+    *'<!-- coderabbit-review-publication'*|*'**Review continued from previous batch...**'*)
+      cr_run_unfenced=$(summary_unfenced_numbered "$cr_run_body") \
+        || die 2 "could not READ CodeRabbit continuation intent"
+      cr_run_continuation=$(printf '%s' "$cr_run_unfenced" | jq -Rrs '
+        split("\n") | map(sub("^[0-9]+\t"; "")) | join("\n")
+        | test("(?m)^\\*\\*Review continued from previous batch\\.\\.\\.\\*\\*$")
+          or (contains("<!-- coderabbit-review-publication")
+              and (([match("<!-- coderabbit-review-publication"; "g")] | length) != 1
+                   or ([match("(?m)^<!-- coderabbit-review-publication[^\r\n]* batch=1/[^\r\n]*$"; "g")] | length) != 1))
+      ') || die 2 "could not CLASSIFY CodeRabbit continuation intent"
+      [ "$cr_run_continuation" != true ] || continue
+      ;;
+  esac
   cr_run_recognised_by=''
   # jq's `test` rather than a shell grep, so the acceptor keeps the exact
   # semantics the constant was written against.

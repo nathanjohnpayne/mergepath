@@ -577,6 +577,15 @@ ${marker}2/2 -->"
   batch_case 'later unknown review still holds' 3 '. + [.[1] + {id: 8003, body: "Unknown next report", submitted_at: "2026-10-26T22:31:00Z"}]'
   batch_case 'dismissed publication retains root report' 0 'map(.state = "DISMISSED")'
   batch_case 'later same-head report retains supersession' 0 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nEarlier finding." | . + [.[1] + {id: 8003, body: "**Actionable comments posted: 0**", submitted_at: "2026-10-26T22:31:00Z"}]'
+  batch_case 'tainted own-range continuation cannot erase root Major' 1 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives." | .[1].body += ("\n\nReviewing files that changed between 1111111111111111111111111111111111111111 and " + .[0].commit_id + ".")' false 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'tainted own-range continuation with clean root stays unread' 3 '.[1].body += ("\n\nReviewing files that changed between 1111111111111111111111111111111111111111 and " + .[0].commit_id + ".")'
+  batch_case 'result-line continuation cannot erase root Major' 1 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives." | .[1].body = "**Actionable comments posted: 0**\n\n" + .[1].body' false 'CodeRabbit blocking-tier unresolved: 1'
+  batch_case 'result-line continuation with clean root stays unread' 3 '.[1].body = "**Actionable comments posted: 0**\n\n" + .[1].body'
+  batch_case 'malformed ordinal cannot escape into own-range acceptor' 3 '.[1].body |= sub("2/2"; "02/2") | .[1].body += ("\n\nReviewing files that changed between 1111111111111111111111111111111111111111 and " + .[0].commit_id + ".")'
+  batch_case 'missing continuation notice cannot escape into result-line acceptor' 3 '.[1].body = "**Actionable comments posted: 0**\n\n" + (.[1].body | split("**Review continued from previous batch...**") | join(""))'
+  batch_case 'malformed metadata without notice cannot escape into result-line acceptor' 3 '.[1].body = "**Actionable comments posted: 0**\n\n<!-- coderabbit-review-publication v1 batch=oops -->"'
+  batch_case 'genuine root quoting continuation forms remains readable' 1 '.[0].body += "\n\n**⚠️ Potential issue** | **Major**\nRoot finding survives.\n\n```\n**Review continued from previous batch...**\n<!-- coderabbit-review-publication v1 batch=2/2 -->\n```" | [.[0]]' false 'CodeRabbit blocking-tier unresolved: 1'
+  CR_GATE_TEST_FAIL_AWK_PROGRAM='NR, line' batch_case 'unread continuation intent refuses infrastructure decision' 2 '.' false 'could not READ CodeRabbit continuation intent'
   unset -f batch_case
 }
 test_batch_continuations
