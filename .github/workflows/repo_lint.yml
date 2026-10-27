@@ -700,6 +700,14 @@ jobs:
         if: matrix.shard == 3
         run: ./scripts/ci/check_pull_request_target_policy || { rc=$?; if [ ! -f scripts/ci/check_pull_request_target_policy ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pull_request_target_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # #2727 / ADR 0004: admission for the trusted workflow_run consumers
+      # (same-repository runs only, the producer's workflow id, path and event,
+      # one open PR at the run's head, a live PR still at that head on the
+      # default branch). Hermetic; travels to every consumer with the kit.
+      - name: check_trusted_consumer_admission
+        if: matrix.shard == 3
+        run: ./scripts/ci/check_trusted_consumer_admission || { rc=$?; if [ ! -f scripts/ci/check_trusted_consumer_admission ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_trusted_consumer_admission not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         if: matrix.shard == 3
         # Requires yq via the delegated verified-propagation suite —

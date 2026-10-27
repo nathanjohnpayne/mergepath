@@ -690,6 +690,10 @@
       "tests/test_template_substitution.sh",
       "scripts/lib/template-substitution.sh"
     ],
+    "check_trusted_consumer_admission": [
+      "scripts/workflow/trusted-consumer-admission.sh",
+      "tests/test_trusted_consumer_admission.sh"
+    ],
     "check_verify_propagation_pr": [
       "tests/test_match_protected_paths.sh",
       "tests/test_verify_propagation_pr.sh"

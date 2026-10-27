@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# check_trusted_consumer_admission
+#
+# Runs tests/test_trusted_consumer_admission.sh, the hermetic suite for
+# scripts/workflow/trusted-consumer-admission.sh (#2727, ADR 0004). That helper
+# decides whether a trusted workflow_run consumer may act on the PR its
+# candidate producer run nominates: same-repository admission (invariant 9),
+# the producer's workflow id, path and event, exactly one open PR with the run's
+# head, and a live PR that is open, same-repository, on the default branch and
+# still at that head. The helper travels with the scripts/workflow/ kit, so this
+# wrapper runs on the hub and on every consumer. No token, no network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_trusted_consumer_admission.sh"
+HELPER="$REPO_ROOT/scripts/workflow/trusted-consumer-admission.sh"
+
+for f in "$TEST_SCRIPT" "$HELPER"; do
+  if [ ! -f "$f" ]; then
+    echo "check_trusted_consumer_admission: ERROR (missing $f)" >&2
+    exit 1
+  fi
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_trusted_consumer_admission: ERROR (jq is required; the helper and its suite cannot decide without it)" >&2
+  exit 1
+fi
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  bash -n "$HELPER"
+  echo "check_trusted_consumer_admission: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_trusted_consumer_admission: PASS"
