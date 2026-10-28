@@ -275,6 +275,9 @@ assert_precedence() {   # $1 runner
   expect "precedence: retry_failed names its environment source" "$(policy_entry "$line" retry_failed)" "retry_failed=true (env MERGEPATH_PREPUSH_RETRY_FAILED)"
   run_plan_env "$r" MERGEPATH_PREPUSH_RETRY_FAILED=0 --retry-failed; line=$(policy_line "$OUT")
   expect "precedence: --retry-failed beats the environment" "$(policy_entry "$line" retry_failed)" "retry_failed=true (flag --retry-failed)"
+  # An environment variable set to '' counts as unset: the file decides.
+  run_plan_env "$r" MERGEPATH_PREPUSH_NICE=; line=$(policy_line "$OUT")
+  expect "precedence: an empty MERGEPATH_PREPUSH_NICE falls through to the file" "$(policy_entry "$line" nice)" "nice=$(file_value nice) (.github/prepush.yml)"
   # --deep is the deep key's own flag.
   run_plan_env "$r" MERGEPATH_PREPUSH_DEEP=0 --deep; line=$(policy_line "$OUT")
   expect "precedence: --deep beats MERGEPATH_PREPUSH_DEEP" "$(policy_entry "$line" deep)" "deep=true (flag --deep)"
@@ -333,6 +336,8 @@ INVALID_BODIES=(
   'full_suite: skip'
   ''
   '# comments only'
+  '"": off'
+  $'mode: full\n"": off'
 )
 assert_invalid_file_refused() {   # $1 runner
   local r="$1" body

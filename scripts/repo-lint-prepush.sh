@@ -133,7 +133,7 @@
 #                           MERGEPATH_PREPUSH_JOBS / --jobs still pin it)
 # A missing file is the defaults. A file that is not one YAML mapping of
 # known keys with valid values fails the run closed (exit 2), whatever the
-# environment overrides.
+# environment overrides. An environment variable set to '' counts as unset.
 
 set -euo pipefail
 
@@ -567,9 +567,12 @@ policy_read_file() {
   esac
   keys=$(yq -o=json -I=0 'keys' "$f") || policy_refuse "unreadable keys"
   jq -e 'length == (unique | length)' >/dev/null <<<"$keys" || policy_refuse "a key is set more than once"
-  k=$(jq -r --arg known "$(policy_keys | paste -sd ' ' -)" \
-        '.[] | tostring | select(. as $k | ($known | split(" ") | index($k)) == null)' <<<"$keys" | head -n 1)
-  [ -z "$k" ] || policy_refuse "unknown key '$k' (known: $(policy_keys | paste -sd ',' - | sed 's/,/, /g'))"
+  # Unknown keys are detected by count, not by the key text, so an empty
+  # key ("": off) is refused like any other; it is named JSON-quoted.
+  k=$(jq -c --arg known "$(policy_keys | paste -sd ' ' -)" \
+        '[.[] | tostring | select(. as $k | ($known | split(" ") | index($k)) == null)]' <<<"$keys") \
+    || policy_refuse "unreadable keys"
+  [ "$k" = '[]' ] || policy_refuse "unknown key $(jq -c '.[0]' <<<"$k") (known: $(policy_keys | paste -sd ',' - | sed 's/,/, /g'))"
   for k in $(jq -r '.[]' <<<"$keys"); do
     # Known keys are plain identifiers, so they are safe in a yq path.
     t=$(yq ".$k | tag" "$f") || policy_refuse "unreadable value of $k"
