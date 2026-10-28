@@ -53,9 +53,15 @@ echo "C6 helper parity with the producer"
 import sys, yaml
 steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["external-review-labeling"]["steps"]
 body = [s for s in steps if s.get("name") == "Reconcile a policy-owned fail-closed label"][0]["run"]
+import re
 script = open(sys.argv[2]).read()
 start = script.index("set -euo pipefail\n")
-sys.exit(0 if script[start:] == body else 1)
+def norm(text):
+    # The only permitted difference (#2727 3c): the helper joins the label
+    # DELETE onto one line to carry its NO_BARE_GH_WRITE_EXEMPT reason.
+    text = re.sub(r"[ \t]*\\\n[ \t]*", " ", text)
+    return re.sub(r"[ \t]+# NO_BARE_GH_WRITE_EXEMPT: [^\n]*", "", text)
+sys.exit(0 if norm(script[start:]) == norm(body) else 1)
 PY
 
 # The stub answers the calls the helpers make. pr_<k>.json is the k-th live

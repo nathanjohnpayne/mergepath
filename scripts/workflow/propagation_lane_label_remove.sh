@@ -77,7 +77,7 @@ if ! fenced "$LIVE"; then
   echo "PR head/base moved during the removal; leaving $LABEL to the newer head's run."
   exit 0
 fi
-if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$LABEL" >/dev/null; then
+if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$LABEL" >/dev/null; then  # NO_BARE_GH_WRITE_EXEMPT: CI workflow write under the exchanged policy-mutations app token; no agent identity to verify (#2727 3c)
   echo "::error::Could not remove $LABEL from PR #$PR_NUMBER." >&2
   exit 1
 fi

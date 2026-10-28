@@ -10,6 +10,8 @@
 # (trusted-policy-mutations.yml, job `mutate`) makes the same decision with
 # the same ownership proof. Until cutover (#2730) the producer keeps its
 # inline copy, and tests/test_policy_mutations.sh fails if the two differ.
+# The one permitted difference: the label DELETE is joined onto one line to
+# carry its NO_BARE_GH_WRITE_EXEMPT reason; the test normalizes exactly that.
 # Cutover deletes the inline step and leaves this file as the only copy.
 #
 # Contract:
@@ -168,8 +170,7 @@ if [ -z "$LABEL_REMOVAL_TOKEN" ]; then
   echo "::warning::Label-removal token is unavailable; preserving needs-external-review." >&2
   exit 0
 fi
-if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE \
-  "repos/$REPO/issues/$PR_NUMBER/labels/needs-external-review"; then
+if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/needs-external-review"; then  # NO_BARE_GH_WRITE_EXEMPT: CI workflow write under the producer PAT or the exchanged policy-mutations app token; no agent identity to verify (#2727 3c)
   echo "::warning::Could not remove needs-external-review; preserving the label for Label Gate." >&2
   exit 0
 fi
