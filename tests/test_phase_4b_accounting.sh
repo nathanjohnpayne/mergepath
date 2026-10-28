@@ -2469,13 +2469,76 @@ if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
   pass "two approvals of the same PR: the second record embeds only its own loop; each loop lives in exactly one ledger record (no double-count) (#615 round 6, finding 4)"
 else fail "no-double-count e2e (rc1=$rc1 rc2=$rc2, recA loops=$(printf '%s' "$REC_A2A" | jq '.loops|length' 2>/dev/null), recB loops=$(printf '%s' "$REC_A2B" | jq '.loops|length' 2>/dev/null), ledger-loops=$(jq -s '[ .[].loops | length ] | add' "$LEDGER_A2" 2>/dev/null))"; fi
 
-# (b) accounting sub-toggle off → plain summary only, exit 0, no state writes.
+# Verdict staging is independent of accounting; a successful post removes
+# its raw file but may leave this one private empty directory (#2790).
+no_accounting_state() {
+  python3 - "$1" <<'PY_STATE'
+from pathlib import Path
+import stat
+import sys
+
+state = Path(sys.argv[1])
+try:
+    mode = state.lstat().st_mode
+except FileNotFoundError:
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+try:
+    if (not stat.S_ISDIR(mode)
+            or {entry.name for entry in state.iterdir()} != {"unposted-verdicts"}):
+        sys.exit(1)
+    evidence = state / "unposted-verdicts"
+    mode = evidence.lstat().st_mode
+    sys.exit(0 if stat.S_ISDIR(mode) and stat.S_IMODE(mode) == 0o700
+             and not any(evidence.iterdir()) else 1)
+except OSError:
+    sys.exit(1)
+PY_STATE
+}
+
+# Exercise the exact invariant used below, including state that must still fail.
+STATE_CONTROLS="$WORK/accounting-state-controls"
+mkdir -p "$STATE_CONTROLS/empty/unposted-verdicts"
+chmod 700 "$STATE_CONTROLS/empty/unposted-verdicts"
+no_accounting_state "$STATE_CONTROLS/absent" \
+  && pass '#2790: absent state preserves the accounting opt-out' || fail '#2790: absent state refused'
+no_accounting_state "$STATE_CONTROLS/empty" \
+  && pass '#2790: only empty private verdict staging is allowed without accounting' || fail '#2790: private empty staging refused'
+for bad_state in ledger loops pending staged unknown hidden residual evidence-hidden root-link dangling-root evidence-link evidence-file public-evidence empty-root root-file; do
+  control="$STATE_CONTROLS/$bad_state"
+  mkdir -p "$control/unposted-verdicts"; chmod 700 "$control/unposted-verdicts"
+  case "$bad_state" in
+    ledger) : > "$control/phase-4b-ledger.jsonl" ;;
+    loops) mkdir "$control/phase-4b-loops" ;;
+    pending) mkdir "$control/phase-4b-pending" ;;
+    staged) : > "$control/staged-record.json" ;;
+    unknown) : > "$control/unexpected" ;;
+    hidden) : > "$control/.unexpected" ;;
+    residual) : > "$control/unposted-verdicts/pr-2790.residual" ;;
+    evidence-hidden) : > "$control/unposted-verdicts/.residual" ;;
+    root-link) mv "$control" "$control-target"; ln -s "$control-target" "$control" ;;
+    dangling-root) rmdir "$control/unposted-verdicts" "$control"; ln -s "$control-missing" "$control" ;;
+    evidence-link)
+      mkdir "$control-target"; chmod 700 "$control-target"
+      rmdir "$control/unposted-verdicts"; ln -s "$control-target" "$control/unposted-verdicts" ;;
+    evidence-file) rmdir "$control/unposted-verdicts"; : > "$control/unposted-verdicts" ;;
+    public-evidence) chmod 755 "$control/unposted-verdicts" ;;
+    empty-root) rmdir "$control/unposted-verdicts" ;;
+    root-file) rmdir "$control/unposted-verdicts" "$control"; : > "$control" ;;
+  esac
+  no_accounting_state "$control" \
+    && fail "#2790: accounting opt-out accepted $bad_state state" \
+    || pass "#2790: accounting opt-out rejects $bad_state state"
+done
+
+# (b) accounting sub-toggle off → plain summary only, exit 0, no accounting state writes.
 STATE_B="$WORK/state-b"; BODY_B="$WORK/body-b.md"
 set +e
 out="$(run_orch "$STATE_B" "$POLICY_ACCT_OFF" fake-codex-approve 202 P4B_WRAPPER_BODY="$BODY_B" -- 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B" && [ ! -d "$STATE_B" ]; then
-  pass "accounting.enabled: false → plain summary, no state writes, exit 0"
+if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B" && no_accounting_state "$STATE_B"; then
+  pass "accounting.enabled: false → plain summary, no accounting state writes, exit 0"
 else fail "sub-toggle off (rc=$rc)"; fi
 
 # (b2) #615 round 4 (fails pre-fix): the SAME opt-out formatted with
@@ -2486,8 +2549,8 @@ STATE_B2="$WORK/state-b2"; BODY_B2="$WORK/body-b2.md"
 set +e
 out="$(run_orch "$STATE_B2" "$POLICY_ACCT_OFF4" fake-codex-approve 216 P4B_WRAPPER_BODY="$BODY_B2" -- 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B2" && [ ! -d "$STATE_B2" ]; then
-  pass "a four-space-indented opt-out is honored end-to-end: plain summary, no state writes (#615 round 4)"
+if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B2" && no_accounting_state "$STATE_B2"; then
+  pass "a four-space-indented opt-out is honored end-to-end: plain summary, no accounting state writes (#615 round 4)"
 else fail "four-space sub-toggle off (rc=$rc, body=$(grep -c 'Phase 4b Approval Accounting' "$BODY_B2" 2>/dev/null) accounting block(s))"; fi
 
 # (c) forced report-generation error → plain summary posts, exit 0 (never
@@ -2551,8 +2614,8 @@ if [ "$rc" = 0 ] \
    && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
    && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C3" \
    && ! grep -q 'Phase 4b Approval Accounting' "$BODY_C3" \
-   && [ ! -d "$STATE_C3" ]; then
-  pass "missing accounting module: a valid APPROVED still posts plain (no undefined-hook manual fallback, no state writes) (#615 round 9 CodeRabbit)"
+   && no_accounting_state "$STATE_C3"; then
+  pass "missing accounting module: a valid APPROVED still posts plain (no undefined-hook manual fallback, no accounting state writes) (#615 round 9 CodeRabbit)"
 else fail "module-absent approval regressed (rc=$rc, out=$(printf '%s' "$out" | head -c 200), err=$(tail -c 300 "$WORK/noacct.err" 2>/dev/null))"; fi
 
 # (c4) #615 round 9, CodeRabbit (fails pre-fix), end-to-end: the current
