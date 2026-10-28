@@ -1557,6 +1557,12 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   latch_case 3 reviews-not-array '[]' 'null'
   latch_case 3 bad-timestamp "[$(ic nope "$PROCESSING_ERROR_BODY")]" '[]'
   latch_case 3 non-string-body '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]'
+  # A record whose author cannot be read could be the notice (CodeRabbit on
+  # #2857): a non-object, or an object with no string login, is unreadable.
+  latch_case 3 comment-non-object '[42]' '[]'
+  latch_case 3 review-non-object '[]' '[42]'
+  latch_case 3 comment-no-login "[$(ic $t0 "$PROCESSING_ERROR_BODY" | jq -c 'del(.user)')]" '[]'
+  latch_case 3 review-null-login '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY" | jq -c '.user.login = null')]"
   # A body that cannot be structurally read is unreadable, not "no notice".
   { cat "$snip"; printf '%s\n' 'crw_unfenced_body() { return 3; }'; } >"$mut"
   latch_case 3 structural-read-failure "[$(ic $t0 "Thanks for the feedback.")]" '[]' "$mut"
@@ -1794,6 +1800,31 @@ test_processing_error_latch_does_not_replace_run_grading() {
   grep -q "is CodeRabbit's processing-error notice, not a review" "$dir/err.log" \
     || fail "PE-graded (b): the refusal arm did not reject the notice-only object as its releasing run"
   [ "$FAIL" -ne "$before" ] || pass "PE-graded: 4b P1s on #2857 — a set latch still grades the head run, and a cleared latch does not make a notice-only object a review"
+}
+
+# --- CodeRabbit Major on #2857: a review-object notice's recovery run ---------
+# The notice is a HEAD review object at T0 and a later HEAD review at T3 carries
+# `_🟠 Major_`; the newest comment is a clean review comment, so the refusal arm
+# never runs. A superseded notice must change nothing: the verdict is the one
+# the same run gets with no notice at all (the control). Grading a run body
+# that no refusal arm reaches is outside the latch's job.
+test_processing_error_review_object_recovery_run_is_graded() {
+  local dir rc before=$FAIL reviews mode rc_notice="" st_notice=""
+  for mode in notice control; do
+    reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" --arg h "$HEAD_SHA_40" --arg mode "$mode" '
+      [ ( if $mode == "notice" then {"id":8817,"user":{"login":"coderabbitai[bot]"},"commit_id":$h,"submitted_at":"2026-06-04T00:00:00Z","body":$b} else empty end ),
+        {"id":8818,"user":{"login":"coderabbitai[bot]"},"commit_id":$h,"submitted_at":"2026-06-04T00:00:03Z","body":"Review completed.\n\n_🟠 Major_ | **A finding in the run that superseded the notice.**"} ]')
+    dir=$(make_case "pe-object-recovery-$mode" "$REVIEW_BODY_CLEAN" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:04Z")
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+    if [ "$mode" = notice ]; then
+      rc_notice=$rc; st_notice=$(jqf "$dir" '.status' 2>/dev/null)
+      grep -q 'clearance withheld' "$dir/err.log" && fail "PE-object-recovery: the later HEAD run did not supersede the notice object"
+    else
+      [ "$rc" = "$rc_notice" ] && [ "$(jqf "$dir" '.status' 2>/dev/null)" = "$st_notice" ] \
+        || fail "PE-object-recovery: a superseded notice object changed the verdict (notice rc=$rc_notice/$st_notice, control rc=$rc/$(jqf "$dir" '.status' 2>/dev/null))"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "PE-object-recovery: CodeRabbit on #2857 — a notice object superseded by a later HEAD run leaves that run's verdict exactly as it is with no notice"
 }
 
 test_completed_description_still_clears() {
@@ -2317,8 +2348,11 @@ test_failed_fast_path_comment_decode_does_not_clear() {
   [ "$rc" != "0" ] || fail "25: FALSE-CLEARED (exit 0) after the fast path's comment-list decode failed"
   [ "$rc" = "5" ] || fail "25: expected exit 5 (rate_limit_stalled, same as the test-1 control), got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "25: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
-  grep -q 'newest CodeRabbit comment could not be decoded' "$dir/err.log" \
-    || fail "25: expected the fast-path suppression message naming the failed decode; err=$(tail -4 "$dir/err.log")"
+  # The processing-error latch reads the same list first and, since #2857,
+  # refuses a non-object record as unreadable, so either read may be the one
+  # that names the failure. Both withhold clearance.
+  grep -qE 'newest CodeRabbit comment could not be decoded|processing-error latch could not be read' "$dir/err.log" \
+    || fail "25: expected the fast-path suppression message naming the failed read; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "25: a failed comment-list DECODE inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
 }
 
@@ -3147,6 +3181,7 @@ test_processing_error_probe_reported_withholds
 test_processing_error_superseded_by_later_summary_clears
 test_processing_error_recovery_run_is_graded
 test_processing_error_latch_does_not_replace_run_grading
+test_processing_error_review_object_recovery_run_is_graded
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error

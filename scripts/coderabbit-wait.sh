@@ -229,7 +229,11 @@
 #       # finished review.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
-#                   | "terminal",
+#                   | "terminal" | "processing_error",
+#       # `processing_error` replaces an rc-7 observation that would carry
+#       # barrier-opening evidence while CodeRabbit's processing-error notice
+#       # is its newest unsuperseded word on the head (#2752); the Phase 4b
+#       # barrier does not model it, so it reads as not-yet.
 #       # `paused` is reported from TWO surfaces (#857): the head-anchored
 #       # triage, and — when the anchor has moved past the notice after a fix
 #       # push — the anchor-free summarize comment, whose evidence carries the
@@ -4492,14 +4496,20 @@ crw_processing_error_latch_from() {
   # and every clearance would then read the latch as unreadable.
   rows=$(printf '%s\n%s\n' "$issue_comments" "$reviews" | jq -nr --arg bot "$bot" '
     input as $c | input as $r
-    | ( [ $c[] | select(type == "object" and (.user.login? == $bot))
-        | {src: "comment", id, commit_id: null, body,
-           at: ([.created_at, (.updated_at // .created_at)] | map(select(type == "string")) | max)} ]
-    + [ $r[] | select(type == "object" and (.user.login? == $bot))
-        | select((.body // "") != "")
-        | {src: "review", id, commit_id, body, at: .submitted_at} ] )
+    # A record that is not an object, or whose author login is not a string,
+    # cannot be ruled out as a notice from the bot: it is unreadable, not skipped.
+    | def authored: type == "object" and ((try .user.login catch null) | type) == "string";
+      ( [ $c[] | if authored | not then {bad: true}
+                 elif .user.login == $bot then
+                   {src: "comment", id, commit_id: null, body,
+                    at: ([.created_at, (.updated_at // .created_at)] | map(select(type == "string")) | max)}
+                 else empty end ]
+      + [ $r[] | if authored | not then {bad: true}
+                 elif .user.login == $bot and (.body // "") != "" then
+                   {src: "review", id, commit_id, body, at: .submitted_at}
+                 else empty end ] )
     | .[]
-    | if (.body | type) != "string" or (.at | type) != "string" then "UNREADABLE"
+    | if .bad == true or (.body | type) != "string" or (.at | type) != "string" then "UNREADABLE"
       else @base64 end
   ' 2>/dev/null) || return 3
   while IFS= read -r row; do

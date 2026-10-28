@@ -3199,9 +3199,11 @@ test_1005_classifier_pipe_buffer_unit() {
   # them.
   # shellcheck source=../scripts/lib/coderabbit-fence.sh
   . "$ROOT/scripts/lib/coderabbit-fence.sh"
-  # shellcheck disable=SC1090
-  . <(awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
-    "$ROOT/scripts/coderabbit-wait.sh")
+  # A file, not `. <(...)`: Bash 3.2 sources a process substitution as empty.
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$WORKDIR/classifier-summary-helpers.sh"
+  # shellcheck disable=SC1090,SC1091
+  . "$WORKDIR/classifier-summary-helpers.sh"
   # shellcheck disable=SC1090
   . "$snip"
 
