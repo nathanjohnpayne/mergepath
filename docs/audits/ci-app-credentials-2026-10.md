@@ -172,9 +172,9 @@ To be filled by #2732. Each row is mandatory.
 
 | Item | Result | Evidence |
 |---|---|---|
-| Hosting used for the pilot, and the owner's decision for the fleet | pending | |
-| `app` pin value accepted by the deployment, and the bot login every exchange acts as | pending | |
-| `sub` a `workflow_run`, `repository_dispatch` and `schedule` run presents; presence of `job_workflow_ref` | pending | |
+| Hosting used for the pilot, and the owner's decision for the fleet | Hosted (Chainguard's `octo-sts`), installed by the owner on 2026-10-27 as installation 176003718. The fleet decision is pending the pilot review. | The install page names developer `octo-sts` and `https://octo-sts.dev`; `GET /apps/octo-sts` returns ID 801323. Merged in #2821 (`73fb94fd`). |
+| `app` pin value accepted by the deployment, and the bot login every exchange acts as | The numeric pin `801323` is accepted: the exchange returned an installation token and `identity-check.sh --expect-thread-resolution-app` passed. The bot login on a resolved thread is pending. | [Run 40608015082](https://github.com/nathanjohnpayne/mergepath/actions/runs/40608015082) |
+| `sub` a `workflow_run`, `repository_dispatch` and `schedule` run presents; presence of `job_workflow_ref` | `repository_dispatch`: `repo:nathanjohnpayne/mergepath:ref:refs/heads/main`, with `job_workflow_ref` `nathanjohnpayne/mergepath/.github/workflows/thread-resolution-lane.yml@refs/heads/main`. `workflow_run` and `schedule` are pending. | [Run 40608015082](https://github.com/nathanjohnpayne/mergepath/actions/runs/40608015082) |
 | `sub` a `pull_request_target` run presents, and its refusal by `event_name` | pending | |
 | Refusal of a `pull_request` run, a branch `workflow_dispatch`, an unpinned workflow and a job naming an environment | pending | |
 | A policy edited on a non-default branch is ignored | pending | |
