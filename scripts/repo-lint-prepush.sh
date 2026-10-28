@@ -99,6 +99,30 @@
 # that lock. A host with neither tool fails closed (exit 2).
 # Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment
 # (including missing or mismatched CI packages).
+#
+# Per-repository policy (#2840): .github/prepush.yml, read from the tree the
+# run checks (the pushed commit's snapshot in a hook run, the checkout in a
+# manual run; never uncommitted edits during a push). Each key resolves as
+# --set KEY=VALUE (repeatable) > environment > the file > built-in default,
+# and the `policy` line names every effective value and its source.
+#   key                     environment                               default
+#   mode                    MERGEPATH_PREPUSH_MODE                    full
+#                           (off: run nothing; selected: only the selected
+#                           wrappers, no live assertions; full: as above)
+#   full_suite              MERGEPATH_PREPUSH_FULL_SUITE              run
+#                           (run | defer; validated, consumed by #2841)
+#   max_minutes             MERGEPATH_PREPUSH_MAX_MINUTES             0
+#                           (0 = no budget; validated, consumed by #2841)
+#   deep                    MERGEPATH_PREPUSH_DEEP (or --deep)        false
+#   nice                    MERGEPATH_PREPUSH_NICE                    10
+#   jobs_max                MERGEPATH_PREPUSH_JOBS_MAX                2
+#   load_per_cpu_threshold  MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD  1
+#                           (the default concurrency is jobs_max while the
+#                           load per CPU is below the threshold, else 1;
+#                           MERGEPATH_PREPUSH_JOBS / --jobs still pin it)
+# A missing file is the defaults. A file that is not one YAML mapping of
+# known keys with valid values fails the run closed (exit 2), whatever the
+# environment overrides.
 
 set -euo pipefail
 
@@ -319,14 +343,15 @@ host_cpus() {
 LOAD_1=''
 CPU_N=''
 DEFAULT_JOBS=2
-prepush_default_jobs() {
+prepush_default_jobs() {   # $1 jobs_max, $2 load_per_cpu_threshold (policy; 2 and 1 by default)
+  local jmax="${1:-2}" thr="${2:-1}"
   LOAD_1=$(host_load)
   CPU_N=$(host_cpus)
   if [ "$LOAD_1" != unknown ] && [ "$CPU_N" != '?' ] \
-     && awk -v l="$LOAD_1" -v c="$CPU_N" 'BEGIN { exit !(l + 0 >= c + 0) }'; then
+     && awk -v l="$LOAD_1" -v c="$CPU_N" -v t="$thr" 'BEGIN { exit !(l + 0 >= (c + 0) * (t + 0)) }'; then
     DEFAULT_JOBS=1
   else
-    DEFAULT_JOBS=2
+    DEFAULT_JOBS=$jmax
   fi
 }
 
@@ -422,6 +447,175 @@ retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lo
     END { if (p != "") print p "\t" h "\t" d "\t" x }')
 }
 
+# ── per-repository policy (#2840) ──
+# One table drives the file reader, the environment and flag tiers, the
+# validation and the `policy` line, so a key added for a later slice (#2841's
+# full-suite deferral and budget, #2842's live load policy) is one row here
+# plus the code that consumes it. Rows: key|environment variable|default.
+#
+# Location: .github/prepush.yml, a file of its own, beside the other per-repo
+# policy (review-policy.yml) but not inside it: review-policy.yml is merged
+# into every consumer by the propagation engine and read by the review
+# tooling, while this hook is hub-only local tooling; and a file of its own
+# lets a consumer adopt the hook (the epic's fleet slice) without touching
+# review configuration.
+#
+# Which copy: the one in the tree this run checks, which in a hook run is the
+# pushed commit's own snapshot (the cwd here), the same tree the workflow,
+# classifier and graph are read from. Never the working tree during a push:
+# an uncommitted edit cannot change the result, as for every other input.
+# Not the remote default branch's copy either: the hook never fetches, so
+# that copy is whatever stale ref the clone holds, there is none when the
+# merge base is missing, and a change to the policy would only take effect
+# a merge later, so the PR that changes it could not exercise it. The
+# policy can only lower local cost; it never touches CI's `lint`, and the
+# environment already overrides any of it, so reading the pushed copy gives
+# a branch no bypass it lacks.
+PREPUSH_POLICY_FILE=.github/prepush.yml
+PREPUSH_POLICY_TABLE='mode|MERGEPATH_PREPUSH_MODE|full
+full_suite|MERGEPATH_PREPUSH_FULL_SUITE|run
+max_minutes|MERGEPATH_PREPUSH_MAX_MINUTES|0
+deep|MERGEPATH_PREPUSH_DEEP|false
+nice|MERGEPATH_PREPUSH_NICE|10
+jobs_max|MERGEPATH_PREPUSH_JOBS_MAX|2
+load_per_cpu_threshold|MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD|1'
+POLICY_CLI=''   # --set KEY=VALUE pairs, one per line
+
+policy_keys() { printf '%s\n' "$PREPUSH_POLICY_TABLE" | cut -d'|' -f1; }
+policy_env_name() { printf '%s\n' "$PREPUSH_POLICY_TABLE" | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
+policy_default() { printf '%s\n' "$PREPUSH_POLICY_TABLE" | awk -F'|' -v k="$1" '$1 == k { print $3 }'; }
+
+# What a valid value of each key looks like, for the refusal message.
+policy_expect() {
+  case "$1" in
+    mode) echo 'one of off, selected, full' ;;
+    full_suite) echo 'one of run, defer' ;;
+    deep) echo 'true or false (1 or 0)' ;;
+    max_minutes) echo 'a whole number of minutes, 0 for no budget' ;;
+    nice) echo 'a non-negative integer' ;;
+    jobs_max) echo 'a positive integer' ;;
+    load_per_cpu_threshold) echo 'a positive decimal number, such as 1 or 1.5' ;;
+  esac
+}
+
+# Prints the canonical form of $2 for key $1; status 1 when it is invalid.
+# Every tier (flag, environment, file) goes through this one check.
+policy_normalize() {
+  local v="$2"
+  case "$1" in
+    mode) case "$v" in off|selected|full) printf '%s' "$v" ;; *) return 1 ;; esac ;;
+    full_suite) case "$v" in run|defer) printf '%s' "$v" ;; *) return 1 ;; esac ;;
+    deep) case "$v" in true|1) printf true ;; false|0) printf false ;; *) return 1 ;; esac ;;
+    max_minutes|nice|jobs_max)
+      case "$v" in ''|*[!0-9]*) return 1 ;; esac
+      [ "${#v}" -le 9 ] || return 1
+      v=$((10#$v))
+      [ "$1" != jobs_max ] || [ "$v" -gt 0 ] || return 1
+      printf '%s' "$v" ;;
+    load_per_cpu_threshold)
+      [[ "$v" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]] || return 1
+      awk -v t="$v" 'BEGIN { exit !(t + 0 > 0) }' || return 1
+      printf '%s' "$v" ;;
+    *) return 1 ;;
+  esac
+}
+
+policy_set() {   # $1 key, $2 value, $3 source
+  printf -v "POLICY_$1" '%s' "$2"
+  printf -v "POLICY_SRC_$1" '%s' "$3"
+}
+# The effective value and its source, for the rest of the runner.
+policy_value() { local n="POLICY_$1"; printf '%s' "${!n-}"; }
+policy_source() { local n="POLICY_SRC_$1"; printf '%s' "${!n-}"; }
+
+policy_refuse() {   # the file is invalid: fail closed, never fall back to defaults or to off
+  die "invalid $PREPUSH_POLICY_FILE: $*. Fix the file (see docs/agents/testing-requirements.md § Pre-push hook); a broken policy blocks the push rather than run less than it says. Bypass only in an emergency: MERGEPATH_PREPUSH_SKIP=1 or git push --no-verify"
+}
+
+# Reads $PREPUSH_POLICY_FILE (relative to the cwd) into POLICY_FILE_<key>;
+# POLICY_FILE_STATE is absent or present. Only absence means the defaults.
+policy_read_file() {
+  local f="$PREPUSH_POLICY_FILE" json err tag keys k t raw norm
+  POLICY_FILE_STATE=absent
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    return 0
+  fi
+  { [ -f "$f" ] && [ -r "$f" ]; } || policy_refuse "not a readable regular file"
+  if ! json=$(yq -o=json -I=0 '.' "$f" 2>&1); then
+    err=$(printf '%s\n' "$json" | head -n 1)
+    policy_refuse "not parseable YAML ($err)"
+  fi
+  [ "$(printf '%s\n' "$json" | wc -l | tr -d ' ')" = 1 ] || policy_refuse "more than one YAML document"
+  tag=$(yq 'tag' "$f") || policy_refuse "unreadable YAML"
+  case "$tag" in
+    '!!null') POLICY_FILE_STATE=present; return 0 ;;   # empty, or comments only: no keys set
+    '!!map') ;;
+    *) policy_refuse "the top level must be a mapping of policy keys (found $tag)" ;;
+  esac
+  keys=$(yq -o=json -I=0 'keys' "$f") || policy_refuse "unreadable keys"
+  jq -e 'length == (unique | length)' >/dev/null <<<"$keys" || policy_refuse "a key is set more than once"
+  k=$(jq -r --arg known "$(policy_keys | paste -sd ' ' -)" \
+        '.[] | tostring | select(. as $k | ($known | split(" ") | index($k)) == null)' <<<"$keys" | head -n 1)
+  [ -z "$k" ] || policy_refuse "unknown key '$k' (known: $(policy_keys | paste -sd ',' - | sed 's/,/, /g'))"
+  for k in $(jq -r '.[]' <<<"$keys"); do
+    # Known keys are plain identifiers, so they are safe in a yq path.
+    t=$(yq ".$k | tag" "$f") || policy_refuse "unreadable value of $k"
+    case "$t" in
+      '!!str'|'!!int'|'!!float'|'!!bool') ;;
+      *) policy_refuse "$k must be a single value, $(policy_expect "$k") (found ${t:-an alias})" ;;
+    esac
+    raw=$(yq ".$k" "$f") || policy_refuse "unreadable value of $k"
+    norm=$(policy_normalize "$k" "$raw") || policy_refuse "$k must be $(policy_expect "$k") (got '$raw')"
+    printf -v "POLICY_FILE_$k" '%s' "$norm"
+  done
+  POLICY_FILE_STATE=present
+}
+
+# Resolves every key: --set, then the environment, then the file, then the
+# built-in default. $1 is the --deep flag (1 when given). An invalid value
+# from any tier is refused; an invalid file is refused even where a higher
+# tier would override the key, so a broken file never goes unnoticed.
+policy_resolve() {
+  local deep_flag="${1:-}" k env v n line ck cv
+  policy_read_file
+  # Flags first, so an unknown or invalid --set fails before anything runs.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in *=*) ;; *) die "--set needs KEY=VALUE (got '$line')" ;; esac
+    ck=${line%%=*}; cv=${line#*=}
+    [ -n "$(policy_default "$ck")" ] || die "--set: unknown policy key '$ck' (known: $(policy_keys | paste -sd ',' - | sed 's/,/, /g'))"
+    policy_normalize "$ck" "$cv" >/dev/null || die "--set $ck must be $(policy_expect "$ck") (got '$cv')"
+  done <<<"$POLICY_CLI"
+  for k in $(policy_keys); do
+    policy_set "$k" "$(policy_default "$k")" default
+    n="POLICY_FILE_$k"
+    if [ -n "${!n-}" ]; then
+      policy_set "$k" "${!n}" "$PREPUSH_POLICY_FILE"
+    fi
+    env=$(policy_env_name "$k")
+    if [ -n "${!env-}" ]; then
+      v=$(policy_normalize "$k" "${!env}") || die "$env must be $(policy_expect "$k") (got '${!env}')"
+      policy_set "$k" "$v" "env $env"
+    fi
+    if [ "$k" = deep ] && [ "$deep_flag" = 1 ]; then
+      policy_set deep true "flag --deep"
+    fi
+    while IFS= read -r line; do
+      [ "${line%%=*}" = "$k" ] || continue
+      policy_set "$k" "$(policy_normalize "$k" "${line#*=}")" "flag --set $k"
+    done <<<"$POLICY_CLI"
+  done
+}
+
+# The effective policy in one line: each key's value and where it came from.
+policy_summary() {
+  local k out=''
+  for k in $(policy_keys); do
+    out="${out:+$out, }$k=$(policy_value "$k") ($(policy_source "$k"))"
+  done
+  printf '%s; %s %s' "$out" "$PREPUSH_POLICY_FILE" "$([ "$POLICY_FILE_STATE" = present ] && echo read || echo 'absent, built-in defaults')"
+}
+
 ORIGINAL_ARGS=("$@")
 SNAPSHOT=0
 TIMINGS_ROOT=''
@@ -430,11 +624,11 @@ HOOK_REMOTE=''
 BASE_REF=''
 PATHS_FROM=''
 PLAN=0
-DEEP="${MERGEPATH_PREPUSH_DEEP:-0}"
+DEEP=''   # the --deep flag; policy_resolve adds the env, file and default tiers (#2840)
 ALL_LIVE=0
 [ "${MERGEPATH_PREPUSH_LIVE:-selected}" = "all" ] && ALL_LIVE=1
 JOBS="${MERGEPATH_PREPUSH_JOBS:-}"
-NICE="${MERGEPATH_PREPUSH_NICE:-10}"
+NICE=''   # from the policy (#2840)
 EVENT=''
 HEAD_REF=''
 while [ "$#" -gt 0 ]; do
@@ -453,6 +647,7 @@ while [ "$#" -gt 0 ]; do
     --paths-from) [ "$#" -ge 2 ] || die "--paths-from needs a file or -"; MODE=paths; PATHS_FROM="$2"; shift 2 ;;
     --plan) PLAN=1; shift ;;
     --deep) DEEP=1; shift ;;
+    --set) [ "$#" -ge 2 ] || die "--set needs KEY=VALUE"; POLICY_CLI="${POLICY_CLI}$2"$'\n'; shift 2 ;;
     --all-live) ALL_LIVE=1; shift ;;
     --jobs) [ "$#" -ge 2 ] || die "--jobs needs a number"; JOBS="$2"; shift 2 ;;
     --event) [ "$#" -ge 2 ] || die "--event needs a name"; EVENT="$2"; shift 2 ;;
@@ -461,11 +656,11 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
-prepush_default_jobs
-[ -n "$JOBS" ] || JOBS="$DEFAULT_JOBS"
-case "$JOBS" in ''|*[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
-case "$NICE" in ''|*[!0-9]*) die "MERGEPATH_PREPUSH_NICE must be a non-negative integer (got '$NICE')" ;; esac
-case "$DEEP" in 1|true) DEEP=1 ;; *) DEEP=0 ;; esac
+# An explicit cap is checked now; the default, NICE and DEEP come from the
+# policy once the checked tree is known (#2840).
+if [ -n "$JOBS" ]; then
+  case "$JOBS" in *[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
+fi
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
 cd "$ROOT"
@@ -565,6 +760,23 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -q 'mikefarah/yq'; then
   die "mikefarah/yq is required (brew install yq); the lint checks need it too"
 fi
+
+# ── the effective policy (#2840): read here, in the checked tree ──
+policy_resolve "$DEEP"
+if [ "$PLAN" -eq 1 ]; then
+  printf 'policy\t%s\n' "$(policy_summary)"
+else
+  echo "$PREFIX: policy $(policy_summary)"
+  if [ "$(policy_value mode)" = off ]; then
+    echo "$PREFIX: skipped (mode=off from $(policy_source mode)); CI lint remains authoritative"
+    exit 0
+  fi
+fi
+DEEP=0
+[ "$(policy_value deep)" = true ] && DEEP=1
+NICE=$(policy_value nice)
+prepush_default_jobs "$(policy_value jobs_max)" "$(policy_value load_per_cpu_threshold)"
+[ -n "$JOBS" ] || JOBS="$DEFAULT_JOBS"
 
 ZERO=0000000000000000000000000000000000000000
 
@@ -927,6 +1139,10 @@ fi
 # check starts first and the concurrency cap is used evenly.
 TIMINGS="${TIMINGS_ROOT:-$ROOT}/.mergepath/prepush-timings.tsv"
 lanes='"live","selected"'
+# mode=selected (#2840): only the classifier's selected wrappers; CI runs the
+# live assertions.
+LIVE_RUN_N=$LIVE_N
+[ "$(policy_value mode)" != selected ] || { lanes='"selected"'; LIVE_RUN_N=0; }
 [ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"fallback\",\"unselected\""
 [ "$DEEP" -eq 1 ] && lanes="$lanes,\"deep\""
 [ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && lanes="$lanes,\"deep_fallback\""
@@ -945,12 +1161,19 @@ while IFS= read -r step; do
   fi
   printf '%s\t%s\n' "$prev" "$sid" >> "$RUN_DIR/order"
 done < <(printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))")
+if [ ! -s "$RUN_DIR/order" ]; then
+  # Only mode=selected can select nothing: the live lane is never empty.
+  echo "$PREFIX: PASS (mode=selected from $(policy_source mode), and the classifier selected no wrapper for this change: nothing to run here; CI lint still runs the $LIVE_N live assertions and remains authoritative)"
+  rm -rf "$RUN_DIR"
+  exit 0
+fi
 
 # One host reading per run (#2575, #2581): the load that sized the jobs
 # default is the one printed here; the verdict line reads it again at the end.
 LOAD_START="$LOAD_1"
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
 echo "$PREFIX: selection: $SELECTION_REASON"
+[ "$(policy_value mode)" != selected ] || echo "$PREFIX: mode=selected (from $(policy_source mode)): the $LIVE_N live assertions are not run here; CI runs them"
 undeclared_notice
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
