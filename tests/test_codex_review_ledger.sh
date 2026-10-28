@@ -430,6 +430,15 @@ stop_check "fixed: two fixed rounds before a third leave one runaway window" "$(
   '.stops == [] and .fixed_responses == ["w1.0","w2.0"] and .blocking_windows == 1'
 stop_check "fixed: the same three rounds with nothing fixed are a runaway" "$(fx_stops "$(inputs "$R3B" "$BBB3" '[]' '[]' '[]')" '[]' "$HC3" 3)" \
   '.stops == ["runaway"] and .blocking_windows == 3'
+# #2746: a fixed round leaves the request side of the comparison too. One
+# fixed round followed by two blocking rounds at a ceiling of 2 is a runaway;
+# before the fix the fixed round's request kept blocking_windows (2) below
+# counted_requests (3) forever, so only blocking-budget could stop the loop.
+stop_check "fixed: a fixed round then two blocking rounds at a ceiling of 2 are a runaway" \
+  "$(fx_stops "$(inputs "$R3B" "$BBB3" '[]' '[]' '[]')" '[100]' "$HC3" 2)" \
+  '.stops == ["runaway"] and .fixed_responses == ["w1.0"] and .blocking_windows == 2 and .counted_requests == 3'
+stop_check "fixed: a fixed round then one blocking round at a ceiling of 2 are no runaway" \
+  "$(fx_stops "$IN2" '[100]' "$HC_AB" 2)" '.stops == [] and .counted_requests == 2'
 # A request in the same second as the round's last signal is not later, even
 # when a fractional timestamp would sort it after ("00Z" > "00.5Z").
 L_FS=$(crl_ledger "$(printf '%s' "$IN2" | jq -c '.rebuttals = []')" \
@@ -1051,6 +1060,44 @@ for unresolved in ambiguous absent mixed provider malformed malformed-only; do
     fail "CLI anchors $unresolved: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
   fi
 done
+# #2772 item 1: two different full SHAs in one verdict anchor no single
+# commit. The verdict is excluded, so it cannot answer the pending request as
+# an anchorless response. Fails open before the fix.
+D="$WORK/anchor-conflicting"; anchor_case "$D" "$(printf 'Reviewed commit: %s\nReviewed commit: %s' "$HEAD_A" "$HEAD_B")"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: conflicting full-SHA anchor fields cannot answer a pending request"
+else
+  fail "CLI anchors conflicting: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# The same SHA twice, in either case, is one anchor and still answers.
+D="$WORK/anchor-repeated"; anchor_case "$D" "$(printf 'Reviewed commit: %s\nReviewed commit: %s' "$HEAD_A" "$HEAD_A")"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e --arg head "$HEAD_A" '.summary.responses == 1 and .responses[0].anchor == $head and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+  pass "CLI anchors: a repeated identical anchor field is the same single anchor"
+else
+  fail "CLI anchors repeated: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# #2772 item 2: prose that mentions reviewed commits is not an anchor field,
+# so an anchorless verdict stays an anchorless answer to its request instead
+# of being excluded as malformed. Fails closed before the fix.
+for prose in 'The reviewed commits look clean.' 'I reviewed commit history and found nothing.' 'Reviewed commits: all clean.'; do
+  D="$WORK/anchor-prose"; rm -rf "$D"; anchor_case "$D" "$prose"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && jq -e '.summary.responses == 1 and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+    pass "CLI anchors: prose '$prose' leaves an anchorless verdict attributable"
+  else
+    fail "CLI anchors prose '$prose': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+# A malformed field behind Markdown decoration is still a field.
+D="$WORK/anchor-decorated-malformed"; anchor_case "$D" '- **Reviewed commit:** `not-a-sha`'
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: a decorated malformed anchor field still excludes the verdict"
+else
+  fail "CLI anchors decorated malformed: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
 D="$WORK/anchor-error"; anchor_case "$D" 'Reviewed commit: aaaaaaa'
 printf 'raise RuntimeError("fixture resolver failure")\n' >"$D/scripts/workflow/resolve-codex-verdict-anchors.py"
 RC=$(run_cli "$D")

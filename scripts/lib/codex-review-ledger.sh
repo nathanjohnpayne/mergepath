@@ -470,6 +470,13 @@ crl_human_stops() {
     # not just as many windows as the current ceiling: a lowered ceiling or
     # concurrent near-cap callers can leave more requests than it (#1584).
     | ([ \$reqs[] | select(.counted == true and .ceiling_exempt != true) ] | length) as \$nr
+    # A fully fixed window leaves the request side too, or one fixed round
+    # keeps \$nw below \$nr forever and only blocking-budget can stop the
+    # loop (#2746). counted_requests still reports \$nr.
+    | ([ \$rs[] | select($__CRL_COUNTS) | .window ] - [ \$rs[] | select($__CRL_COUNTS)
+         | select(.rid as \$id | \$fixed | index(\$id) | not) | .window ] | unique) as \$fw
+    | ([ \$reqs | to_entries[] | select(.value.counted == true and .value.ceiling_exempt != true)
+         | select((.key + 1) as \$w | \$fw | index(\$w) | not) ] | length) as \$nr_open
     | [ .rebuttals[] | . as \$r
         # Only a response to a request posted AFTER the rebuttal can have read
         # it: a request already in flight may be answered later without
@@ -503,7 +510,7 @@ crl_human_stops() {
     | .fixed_responses = \$fixed
     | .counted_requests = \$nr
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
-                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr >= \$ceiling and \$nw >= \$nr then \"runaway\" else empty end),
+                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr_open >= \$ceiling and \$nw >= \$nr_open then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
                    (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
 }

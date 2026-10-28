@@ -672,14 +672,16 @@ if ! "$NODE_BIN" --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# The skip guard comes first (#2746): the focused hooks below require jq and
+# exit 1 without it, so a host without jq must skip before reaching them.
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
+
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
   bash "$0" --status-description-only
   bash "$0" --publication-summary-only
 fi
-
-command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 for f in "$LIB" "$ORCH" "$AD_CODEX" "$AD_CLAUDE"; do
   [ -e "$f" ] || { echo "missing required path: $f" >&2; exit 1; }
 done
@@ -6240,6 +6242,95 @@ if [ -z "$bad" ]; then
   pass "#1085: a durable current-head timeout opens Phase 4b; pending, superseded, stale, malformed, drift, and no-substitute remain distinct"
 else
   fail "#1085: Phase 4a timeout handoff routing wrong:$bad"
+fi
+
+# #2771: a byte-verified wave canary is never sent a Codex request, so its
+# barrier must not hold on a Codex arm that can never report. swipewatch#205
+# and #209 (CodeRabbit reported, no Codex request, no App auto-review) held
+# until "did not reach the current head within 1245s"; #207/#210/#211, which
+# drew an unsolicited Codex App review, passed. Only the posture flag differs
+# between the first two cases below.
+bad=""
+_wave_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_p4a_head.pending"
+_wave_reported="{\"head_sha\":\"$_p4a_head\"}"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad wave-no-request-held(rc=$rc)"
+[ "$(printf '%s' "$out" | jq -r '.codex + "/" + .codex_evidence')" = waived/wave-canary-no-request ] || bad="$bad wave-no-request-class"
+[ ! -f "$_wave_marker" ] || bad="$bad wave-no-request-started-budget"
+# Without the posture the same evidence keeps the ordinary bounded wait.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .codex)" = not-yet ] || bad="$bad non-wave-not-pending"
+# The swipewatch#209 shape: the retry lands after the budget with CodeRabbit
+# long reported. Without the posture that is exit 4 territory (escalate,
+# "did not reach the current head"); a wave canary opens.
+mkdir -p "$(dirname "$_wave_marker")"
+printf '%s\n' "$(( $(date +%s) - 5000 ))" >"$_wave_marker"
+out="$(P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.reason | test("did not reach the current head")' >/dev/null \
+  || bad="$bad non-wave-expired-not-escalated"
+printf '%s\n' "$(( $(date +%s) - 5000 ))" >"$_wave_marker"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad wave-expired-held(rc=$rc)"
+[ ! -f "$_wave_marker" ] || bad="$bad wave-expired-marker-kept"
+# A canary that DID draw a Codex request keeps the ordinary wait: Codex is
+# genuinely working, so waiting on it is not impossible.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON="$_trigger" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .codex)" = not-yet ] || bad="$bad wave-requested-not-pending(rc=$rc)"
+# A Codex REPORT on the canary (an App auto-review) is still a report.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 0 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = signal ] || bad="$bad wave-reported-class"
+# The substitute refusal is not weakened: a policy that forbids the Phase 4b
+# substitute cannot use a wave audit's approval for gate (c).
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$_p4a_nosub" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.codex == "escalate" and (.reason | test("wave canary"))' >/dev/null \
+  || bad="$bad wave-nosub-not-escalated(rc=$rc)"
+# CodeRabbit still owns its wait on a canary: not-yet stays pending, and the
+# trigger is no longer parked behind a Codex arm that will never move.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 7 'null' "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.codex == "waived" and .trigger != "awaiting-codex"' >/dev/null \
+  || bad="$bad wave-cr-notyet(rc=$rc)"
+# retry_after is the remaining budget: a 40 s old marker under a 100 s budget
+# reports 60, and the retry at that point is the final evaluation, which
+# opens when the provider has reported by then (asserted above).
+printf '%s\n' "$(( $(date +%s) - 40 ))" >"$_wave_marker"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 7 'null' "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+_ra="$(printf '%s' "$out" | jq -r '.retry_after // empty')"
+[ "$rc" = 1 ] && [ -n "$_ra" ] && [ "$_ra" -ge 58 ] && [ "$_ra" -le 60 ] || bad="$bad retry-after-not-remaining($_ra)"
+# The posture is the orchestrator's alone: sourcing the library resets it, so
+# an inherited environment value cannot reach the barrier.
+[ "$(P4B_BARRIER_WAVE_CANARY=true bash -c '. "$1"; printf %s "$P4B_BARRIER_WAVE_CANARY"' _ "$LIB")" = false ] \
+  || bad="$bad posture-inherited"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+if [ -z "$bad" ]; then
+  pass "#2771: a byte-verified wave canary with no Codex request is not held on the Codex arm; requests, reports, no-substitute and CodeRabbit keep their routes"
+else
+  fail "#2771: wave canary barrier routing wrong:$bad"
+fi
+# #2771 wiring: the orchestrator byte-verifies a wave canary BEFORE the
+# pre-adapter barrier and sets the posture only after that verification.
+_wv=$(grep -n 'immutable-input.sh" wave-verify' "$ORCH" | head -1 | cut -d: -f1)
+_wt=$(grep -n '^    P4B_BARRIER_WAVE_CANARY=true$' "$ORCH" | head -1 | cut -d: -f1)
+_wb=$(grep -n '^  run_same_head_barrier "pre-adapter"$' "$ORCH" | head -1 | cut -d: -f1)
+if [ -n "$_wv" ] && [ -n "$_wt" ] && [ -n "$_wb" ] && [ "$_wv" -lt "$_wt" ] && [ "$_wt" -lt "$_wb" ] \
+   && [ "$(grep -c 'P4B_BARRIER_WAVE_CANARY=true' "$ORCH")" = 1 ]; then
+  pass "#2771: the orchestrator sets the wave posture only after wave-verify, before the pre-adapter barrier"
+else
+  fail "#2771: wave posture wiring wrong (verify=$_wv set=$_wt barrier=$_wb)"
 fi
 
 # #1305: a spent governing request budget is a human-tiebreaker stop, never

@@ -341,7 +341,7 @@ LINKS
   DUPLICATE_RC=$?
   set -e
   if [ "$DUPLICATE_RC" -ne 0 ]; then
-    echo "gh-as-author: could not list open pull requests to check whether another one already links this issue; retry, or name that pull request in GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK (#2562)." >&2
+    echo "gh-as-author: could not list open pull requests to check whether another one already links this issue; retry once the list is readable. GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK cannot bypass this: it names a duplicate this check found, and none could be read (#2562)." >&2
     exit 1
   fi
   if [ -n "$DUPLICATE_LINKS" ]; then

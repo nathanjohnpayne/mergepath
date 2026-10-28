@@ -403,14 +403,26 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # reviewed_shas, which is indistinguishable from a genuinely anchorless
 # verdict (#2742). Only a comment with no raw anchor field at all may be
 # anchorless; one whose raw fields parsed to nothing is excluded too.
+#
+# A raw anchor FIELD is a line that opens with "Reviewed commit" (after
+# Markdown decoration) and does not continue the word, so "reviewed commits"
+# or a mid-sentence mention in an anchorless verdict's prose leaves it
+# anchorless, while a malformed field such as `Reviewed commit: not-a-sha`
+# is still caught (#2772 item 2).
 RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
   [ .[] | select((.user.login // "") == $bot)
-    | select([(.body // "") | ascii_downcase | scan("reviewed commit")] | length > 0)
+    | select((.body // "") | test("(?im)^[[:space:]>*_`#-]*reviewed commit(?![0-9a-z_])"))
     | .id ]' <<<"$ISSUE_COMMENTS")
+# A verdict that names two different full SHAs reviewed no single commit:
+# crqe_verdicts keeps both and consistent_anchor would read the pair as no
+# anchor, so the attribution sweep could take it as an anchorless answer to
+# the request (#2772 item 1). It is excluded before it reaches the ledger,
+# like a malformed or unresolved field, and its request stays unanswered.
 VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" '
   map(select(if (.reviewed_shas | length) == 0
              then (.comment_id as $id | $raw | any(.[]; . == $id) | not)
-             else all(.reviewed_shas[]; length == 40) end))
+             else all(.reviewed_shas[]; length == 40)
+                  and (.reviewed_shas | map(ascii_downcase) | unique | length) == 1 end))
   | unique_by(.comment_id)' <<<"$VERDICTS")
 # PR-level reactions cannot establish a response or test a rebuttal. Keep the
 # legacy input field empty; request eyes and finding feedback are independent.

@@ -840,10 +840,13 @@ p4b_reconcile_posted_review() {
 # Pure (#2663). Print phase_4b_automation.max_review_rounds from the PR's
 # GOVERNING base policy, so a PR cannot raise its own cap, or "none" when the
 # key is absent (the cap is then unenforced, as before). Returns 2 when the
-# value is present but is not a positive integer.
+# value is present but is not a positive integer, and when the block itself is
+# present but is not a mapping: a scalar or list there is a malformed policy,
+# not "no cap", the same as crqe_governing_budget treats `codex` (#2746).
 p4b_governing_round_cap() {
   printf '%s' "${1:-}" | jq -er '
-    if (.phase_4b_automation | type) != "object" then "none"
+    if .phase_4b_automation == null then "none"
+    elif (.phase_4b_automation | type) != "object" then error("invalid")
     elif (.phase_4b_automation | has("max_review_rounds") | not) then "none"
     elif (.phase_4b_automation.max_review_rounds | type) == "number"
          and .phase_4b_automation.max_review_rounds >= 1
@@ -2114,6 +2117,25 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 # #814 ships with no new review-policy keys. A provider disabled in policy is
 # simply not consulted — that, and not any rc, is the only route to
 # will-not-report, and it cannot flip mid-flight on a live PR.
+# Wave-audit posture (#2771). A wave canary is never sent a Codex request:
+# the wave's external review runs once, as the audit (propagation-ordering.md),
+# and CodeRabbit's advisory pass is its only bot leg. A Codex arm with no
+# request on the canary therefore has nothing to wait for, and holding it
+# not-yet spent the whole budget and ended the audit in exit 4 whenever the
+# Codex App happened not to auto-review the canary (swipewatch#205/#209 held;
+# #207/#210/#211, which drew an unsolicited App review, passed).
+#
+# Only scripts/phase-4b-review.sh sets this, and only after
+# immutable-input.sh wave-verify has byte-verified the canary against the
+# canonical range. It is reset here so an inherited environment value never
+# reaches the barrier. Under it, exactly one shape changes: Codex not-yet with
+# no trusted timeout, an `available` request budget, and ZERO request
+# attempts on the PR reads as waived (evidence wave-canary-no-request). A
+# canary that did draw a Codex request keeps the ordinary wait, and every
+# human stop, cap path, escalation and the allow_phase_4b_substitute=false
+# refusal is unchanged.
+P4B_BARRIER_WAVE_CANARY=false
+
 p4b_same_head_barrier() {
   # cap-only is the read-only GitHub guard for an unavailable adapter: it
   # shares the Codex decision and local final-request wait bound, but never
@@ -2228,6 +2250,17 @@ p4b_same_head_barrier() {
                   *) why="Phase 4a timeout evidence is unreadable; refusing to treat Codex as terminal" ;;
                 esac
               fi
+              # #2771: see P4B_BARRIER_WAVE_CANARY above. "No request" means
+              # zero counted attempts AND an empty request generation, which
+              # also holds a ceiling-exempt failover trigger. Both come from
+              # the budget snapshot whose generation the open path revalidates
+              # below, so a request posted meanwhile escalates.
+              if [ "$cls_cx" = not-yet ] && [ "$P4B_BARRIER_WAVE_CANARY" = true ] \
+                 && printf '%s' "$cx_budget_json" \
+                    | jq -e '.request_attempts == 0 and .request_generation == []' >/dev/null 2>&1; then
+                cls_cx="waived"
+                cx_evidence="wave-canary-no-request"
+              fi
               ;;
             0:final-request-pending)
               cap_exhausted=true
@@ -2296,6 +2329,8 @@ p4b_same_head_barrier() {
         why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
       elif [ "$cx_evidence" = request-ceiling ]; then
         why="The Codex request ceiling is spent on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c); a human must decide"
+      elif [ "$cx_evidence" = wave-canary-no-request ]; then
+        why="Codex was not asked on wave canary $head, but codex.allow_phase_4b_substitute=false, so the wave audit's Phase 4b review could not clear gate (c)"
       else
         why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
       fi

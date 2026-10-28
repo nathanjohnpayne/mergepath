@@ -227,7 +227,27 @@ else pass 'curated request cannot substitute a different canonical head'; fi
 if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-input" "$WORK/wave-policy.yml"; then
  fail 'failed live byte proof accepted'
 else pass 'curated input fails closed without live canary byte proof'; fi
+# #2771: the barrier's wave posture rests on this standalone verification.
+mkdir -p "$WORK/wave-verify"
+if p4b_verify_wave_canary fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-verify" "$WORK/wave-policy.yml"; then
+ fail 'wave-verify accepted a canary without live byte proof'
+else pass 'wave-verify fails closed without live canary byte proof'; fi
 rm "$WORK/proof-fails"
+if p4b_verify_wave_canary fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-verify" "$WORK/wave-policy.yml"; then
+ pass 'wave-verify accepts a byte-verified canary of the requested range'
+else fail 'wave-verify refused a byte-verified canary'; fi
+if p4b_verify_wave_canary fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/wrong-scope.json" "$WORK/wave-verify" "$WORK/wave-policy.yml"; then
+ fail 'wave-verify accepted a different canonical head'
+else pass 'wave-verify refuses a request naming a different canonical head'; fi
+# CLI dispatch: seven arguments reach the verifier (a missing request file is
+# its refusal, 1); any other count is the dispatcher's usage refusal (2).
+rc_seven=0; bash "$CANON/scripts/phase-4b/immutable-input.sh" wave-verify fixture/repo 1753 "$BASE" "$HEAD_A" \
+  "$WORK/no-such-request.json" "$WORK/wave-verify" "$WORK/wave-policy.yml" 2>/dev/null || rc_seven=$?
+rc_six=0; bash "$CANON/scripts/phase-4b/immutable-input.sh" wave-verify fixture/repo 1753 "$BASE" "$HEAD_A" \
+  "$WORK/scope-request.json" "$WORK/wave-verify" 2>/dev/null || rc_six=$?
+if [ "$rc_seven" = 1 ] && [ "$rc_six" = 2 ]; then
+ pass 'wave-verify CLI dispatches exactly seven arguments to the verifier'
+else fail "wave-verify CLI arity (seven=$rc_seven six=$rc_six)"; fi
 # Execute the production verifier for an enabled hub / opted-out consumer.
 # A refusal must happen before Git verification or curated regeneration.
 mkdir -p "$CANON/scripts/lib"

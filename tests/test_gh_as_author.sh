@@ -698,6 +698,12 @@ GH_API_PULLS_JSON='[[{"number":40,"body":"Closes #12"}]]' \
   $'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n\nRefs #12\n'
 GH_API_PULLS_RC=1 dup_case "an unreadable open-PR list refuses rather than passes" 1 no "$DUP_BODY"
 echo "$DUP_ERR" | grep -q 'could not list open pull requests' || fail "duplicate link: unreadable-list refusal lacks its diagnostic: $DUP_ERR"
+# #2746: the allowlist cannot help when no duplicate could be read, so the
+# refusal must not offer it as a remedy, and naming a number must not pass.
+echo "$DUP_ERR" | grep -q 'or name that pull request in GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK' \
+  && fail "duplicate link: unreadable-list refusal suggests the allowlist as a remedy: $DUP_ERR"
+GH_API_PULLS_RC=1 GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=40 \
+  dup_case "an unreadable open-PR list refuses even with an allowlisted number" 1 no "$DUP_BODY"
 GH_REPO_VIEW_RC=1 dup_case "a repository that cannot be resolved refuses rather than passes" 1 no "$DUP_BODY"
 GH_REPO_VIEW=not-a-slug dup_case "a resolved name that is not OWNER/REPO refuses" 1 no "$DUP_BODY"
 GH_API_PULLS_RC=1 GH_REPO_VIEW_RC=1 dup_case "a body with no link never reads the list" 0 yes \

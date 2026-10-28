@@ -1641,6 +1641,23 @@ if [ "$ADAPTER_MISSING" = true ]; then
 elif [ "$DRY_RUN" = true ]; then
   p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
 else
+  # #2771: a wave canary is never sent a Codex request, so the barrier must
+  # not wait on one. Only a canary the live byte verifier accepts takes that
+  # posture; a wave scope on anything else stops here, as wave-capture below
+  # would, before the barrier spends any provider allowance.
+  P4B_BARRIER_WAVE_CANARY=false
+  if [ -n "$WAVE_SCOPE_FILE" ]; then
+    WAVE_VERIFY_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-wave-verify.XXXXXX")" \
+      || p4b_die 3 "could not create the wave canary verification directory"
+    if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-verify \
+        "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+        "$WAVE_SCOPE_FILE" "$WAVE_VERIFY_DIR" "$(p4b_config)"; then
+      rm -rf "$WAVE_VERIFY_DIR"
+      p4b_die 3 "wave scope was supplied, but ${REPO}#${PR} is not a byte-verified canary of it"
+    fi
+    rm -rf "$WAVE_VERIFY_DIR"
+    P4B_BARRIER_WAVE_CANARY=true
+  fi
   run_same_head_barrier "pre-adapter"
   capture_authorized_request_generation
 fi
@@ -2106,6 +2123,9 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
     request-ceiling*)
       printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
+      ;;
+    wave-canary-no-request)
+      printf -- '- Provider ordering: this byte-verified wave canary was never sent a Codex request, so this review ran without a Codex report here; the wave audit is the single external review (#2771)\n'
       ;;
   esac
   # #2633: say which human stops the owner's admin override ran past. The
