@@ -672,14 +672,16 @@ if ! "$NODE_BIN" --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# The skip guard comes first (#2746): the focused hooks below require jq and
+# exit 1 without it, so a host without jq must skip before reaching them.
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
+
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
   bash "$0" --policy-tuple-only
   bash "$0" --status-description-only
   bash "$0" --publication-summary-only
 fi
-
-command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 for f in "$LIB" "$ORCH" "$AD_CODEX" "$AD_CLAUDE"; do
   [ -e "$f" ] || { echo "missing required path: $f" >&2; exit 1; }
 done

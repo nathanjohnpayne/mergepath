@@ -403,14 +403,39 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # reviewed_shas, which is indistinguishable from a genuinely anchorless
 # verdict (#2742). Only a comment with no raw anchor field at all may be
 # anchorless; one whose raw fields parsed to nothing is excluded too.
+#
+# A raw anchor field is any occurrence of the phrase "reviewed commit" that
+# does not continue the word (#2772 item 2); `_` ends it, as Markdown
+# emphasis (`_Reviewed commit_`) does. That frees the common anchorless
+# prose "the reviewed commits look clean" without enumerating Markdown: every
+# decorated spelling of a field (numbering, nested bullets, headings, bold,
+# code) still contains the bare phrase, so a malformed field anywhere still
+# excludes its verdict. Prose that uses the bare phrase ("I reviewed commit
+# history") is excluded too; that is the fail-closed side, leaving its
+# request unanswered rather than inventing a response (Phase 4b on #2859).
 RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
   [ .[] | select((.user.login // "") == $bot)
-    | select([(.body // "") | ascii_downcase | scan("reviewed commit")] | length > 0)
+    | select((.body // "") | test("(?i)reviewed commit(?![0-9a-z])"))
     | .id ]' <<<"$ISSUE_COMMENTS")
-VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" '
+# A verdict that names two different full SHAs reviewed no single commit:
+# crqe_verdicts keeps both and consistent_anchor would read the pair as no
+# anchor, so the attribution sweep could take it as an anchorless answer to
+# the request (#2772 item 1). It is excluded before it reaches the ledger,
+# like a malformed or unresolved field, and its request stays unanswered.
+# An anchorless verdict must also carry the legacy "Codex Review:" heading.
+# crqe_verdicts selects any comment whose body mentions "reviewed commit", so
+# prose alone ("The reviewed commits look clean.") would otherwise enter as an
+# unknown_tier response that spends blocking budget (Codex P2 on #2859).
+HEADED_IDS=$(jqx "headed verdict ids" -c --arg bot "$BOT" '
+  [ .[] | select((.user.login // "") == $bot)
+    | select((.body // "") | test("(?im)^\\s*codex review:"))
+    | .id ]' <<<"$ISSUE_COMMENTS")
+VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" --argjson headed "$HEADED_IDS" '
   map(select(if (.reviewed_shas | length) == 0
-             then (.comment_id as $id | $raw | any(.[]; . == $id) | not)
-             else all(.reviewed_shas[]; length == 40) end))
+             then (.comment_id as $id | ($raw | any(.[]; . == $id) | not)
+                                        and ($headed | any(.[]; . == $id)))
+             else all(.reviewed_shas[]; length == 40)
+                  and (.reviewed_shas | map(ascii_downcase) | unique | length) == 1 end))
   | unique_by(.comment_id)' <<<"$VERDICTS")
 # PR-level reactions cannot establish a response or test a rebuttal. Keep the
 # legacy input field empty; request eyes and finding feedback are independent.
