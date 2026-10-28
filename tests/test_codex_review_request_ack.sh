@@ -2164,6 +2164,31 @@ test_overlapping_requests_are_ambiguous() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; a late workflow run excludes nothing; nothing is retried"
 }
 
+# #2791: a newer author request lands while this run waits. The scan then
+# selects the newer request, and the row cannot be tied to the waited-on one,
+# so the diagnostic and the final state read ambiguous, not unknown. At the
+# end of the wait the waited-on request is superseded: no timeout marker is
+# minted (the newer request is still within its own wait), no request is
+# posted, and the run exits 3 with its JSON, codex_run included.
+test_newer_request_supersedes_the_waited_on_one() {
+  local dir rc before=$FAIL
+  dir=$(make_case "run-superseded" 0 0 1800)
+  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:40Z"
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] \
+    && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+    || fail "#2791 superseded: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")"
+  jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous"
+      and .codex_run.overlapping_request == true and .codex_run.handoff == "superseded"
+      and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded: $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+  grep -q 'superseded by newer author request 5000' "$dir/err.log" \
+    || fail "#2791 superseded: the log does not name the newer request; $(tail -3 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
+}
+
 # A restated provider window moves the reported not-before time by its
 # deadline, even with an unchanged duration.
 test_refreshed_provider_window() {
@@ -2270,6 +2295,7 @@ test_codex_run_diagnostic_and_report
 test_round4_head_tie_edges
 test_weak_tie_mints_no_timeout
 test_overlapping_requests_are_ambiguous
+test_newer_request_supersedes_the_waited_on_one
 test_refreshed_provider_window
 test_retry_window_parser
 test_uncertain_publication_is_held_on_rerun
