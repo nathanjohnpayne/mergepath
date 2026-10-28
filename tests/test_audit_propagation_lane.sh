@@ -22,11 +22,15 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # predating it. The marker literal must match the one in the REAL
 # synced workflow — assert that first so the audit can't silently
 # diverge from what pr-review-policy.yml actually ships.
+# Since #2727 slice 3b the workflow runs the lane from the classifier script,
+# so the marker lives there and the workflow names the script.
 MARKER='PROP_ENABLED=${PROP_ENABLED:-true}'
-if grep -qF "$MARKER" "$ROOT/.github/workflows/pr-review-policy.yml"; then
-  pass "lane default-ON marker present in the real pr-review-policy.yml"
+CLASSIFIER_PATH='scripts/workflow/external_review_classify.sh'
+if grep -qF "$CLASSIFIER_PATH" "$ROOT/.github/workflows/pr-review-policy.yml" \
+   && grep -qF "$MARKER" "$ROOT/$CLASSIFIER_PATH"; then
+  pass "the real pr-review-policy.yml delegates to $CLASSIFIER_PATH, which carries the default-ON marker"
 else
-  fail "lane default-ON marker missing from .github/workflows/pr-review-policy.yml — audit marker and workflow have diverged"
+  fail "the real workflow must name $CLASSIFIER_PATH and the script must carry the marker — audit and lane have diverged"
 fi
 
 WF_NEW="$WORKDIR/wf-new.yml"
@@ -51,12 +55,46 @@ printf 'propagation_prs:\n  enabled: true\nauthor_identity: nathanpayne-claude\n
 POLICY_CASED="$WORKDIR/policy-cased.yml"  # YAML-boolean-ish but not the lane's exact match
 printf 'propagation_prs:\n  enabled: TRUE\nauthor_identity: nathanjohnpayne\n' >"$POLICY_CASED"
 
-run_check() {  # <policy> <workflow> — sets OUT and RC
+run_check() {  # <policy> <workflow> [<classifier>] — sets OUT and RC
   set +e
-  OUT=$("$SCRIPT" --check-files "$1" "$2" 2>&1)
+  OUT=$("$SCRIPT" --check-files "$@" 2>&1)
   RC=$?
   set -e
 }
+
+# A delegating workflow (#2727 slice 3b): the marker is read from the
+# classifier script it runs, not from the workflow.
+WF_DELEGATING="$WORKDIR/wf-delegating.yml"
+printf 'jobs:\n  x:\n    run: bash %s\n' "$CLASSIFIER_PATH" >"$WF_DELEGATING"
+CLS_NEW="$WORKDIR/classify-new.sh"
+printf '%s\n' "$MARKER" >"$CLS_NEW"
+CLS_OLD="$WORKDIR/classify-old.sh"
+printf 'PROP_ENABLED=$(prop_field f propagation_prs enabled)\n' >"$CLS_OLD"
+
+run_check "$POLICY_BARE" "$WF_DELEGATING" "$CLS_NEW"
+if [ "$RC" = "0" ] && grep -q "default-ON" <<<"$OUT"; then
+  pass "a delegating workflow fires the lane when its classifier carries the marker"
+else
+  fail "delegating workflow with a default-ON classifier should fire; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_DELEGATING"
+if [ "$RC" = "1" ] && grep -q "$CLASSIFIER_PATH, which is ABSENT" <<<"$OUT"; then
+  pass "a delegating workflow without its classifier fails the audit"
+else
+  fail "delegating workflow without the classifier should fail as absent; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_DELEGATING" "$CLS_OLD"
+if [ "$RC" = "1" ] && grep -q "$CLASSIFIER_PATH predates the #434 default-ON lane" <<<"$OUT"; then
+  pass "a delegating workflow whose classifier lacks the marker fails the audit"
+else
+  fail "delegating workflow with a pre-#434 classifier should fail; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_NEW" "$CLS_OLD"
+if [ "$RC" = "0" ]; then
+  pass "an inline-lane workflow is judged by its own text, whatever the classifier file holds"
+else
+  fail "inline-lane workflow carrying the marker should fire; got rc=$RC, out: $OUT"
+fi
 
 run_check "$POLICY_BARE" "$WF_NEW"
 if [ "$RC" = "0" ] && grep -q "default-ON" <<<"$OUT"; then

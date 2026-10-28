@@ -142,6 +142,11 @@ OVERRIDE_SUMMARY="$WORK/override-summary.sh"
 awk '/^admin_override_summary\(\) \{$/{f=1} f{print} f && /^}$/{exit}' "$ROOT/scripts/phase-4b-review.sh" >"$OVERRIDE_SUMMARY"
 grep -q '^admin_override_summary()' "$OVERRIDE_SUMMARY" || { echo "FAIL: could not extract admin_override_summary" >&2; exit 1; }
 
+# Test the real publication boundary against the same atomic ledger fake.
+POST_REVIEW="$WORK/post-review.sh"
+awk '/^post_review\(\) \{$/{f=1} f{print} f && /^}$/{exit}' "${P4B_TEST_ROUND_POST_ORCH:-$ROOT/scripts/phase-4b-review.sh}" >"$POST_REVIEW"
+grep -q '^post_review()' "$POST_REVIEW" || { echo 'FAIL: missing production post_review' >&2; exit 1; }
+
 FAKE_BIN="$WORK/bin"; mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/gh" <<'GH'
 #!/usr/bin/env bash
@@ -218,6 +223,14 @@ case "$method:$endpoint" in
     # The write committed; the client may still see a timeout.
     if take lost_ref_writes; then echo "timeout: response lost" >&2; exit 1; fi
     printf '{"ref":"refs/mergepath/p4b-rounds/pr-7","object":{"sha":"%s"}}\n' "$sha" ;;
+  POST:repos/owner/repo/pulls/7/reviews)
+    bump review_posts >/dev/null
+    [ "$(knob review_unknown)" = 0 ] || { echo 'fixture unknown review outcome' >&2; exit 42; }
+    response=$(jq --arg login nathanpayne-codex '. + {id:99,user:{login:$login},state:"CHANGES_REQUESTED"}' "$input")
+    jq --argjson r "$response" '. + [$r]' "$S/reviews.json" >"$S/reviews.next"
+    mv "$S/reviews.next" "$S/reviews.json"
+    [ "$(knob review_lost_response)" = 0 ] || { echo 'fixture lost review response' >&2; exit 42; }
+    printf '%s\n' "$response" ;;
   GET:repos/owner/repo/pulls/7/reviews)
     n=$(bump review_reads)
     if [ -f "$S/reviews_late.json" ] && [ "$n" -gt "$(knob reviews_late_after)" ]; then
@@ -230,6 +243,11 @@ chmod +x "$FAKE_BIN/gh"
 cat >"$FAKE_BIN/as-reviewer" <<'W'
 #!/usr/bin/env bash
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+# Preserve the production wrapper's strict local refusal on the review write;
+# ledger writes remain the same atomic fake transport used by this suite.
+if [[ "$*" == *repos/owner/repo/pulls/7/reviews* ]] && [[ "$*" == *POST* ]]; then
+  python3 "$P4B_ROUND_TEST_GUARD" --role reviewer -- "$@" >/dev/null || exit 1
+fi
 exec "$@"
 W
 chmod +x "$FAKE_BIN/as-reviewer"
@@ -239,6 +257,7 @@ cat >"$WORK/harness.sh" <<'H'
 # Runs the production block. Args: <run-id> <steps...>; steps: reserve, prepost, attempt, release.
 set -euo pipefail
 . "$ROOT/scripts/phase-4b/lib.sh"
+export P4B_ROUND_TEST_GUARD="$ROOT/scripts/workflow/gh-comment-trigger-guard.py"
 PR=7 REPO=owner/repo HEAD=${H_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} DIRECTION=claude-\>codex
 REVIEWER=nathanpayne-codex ADAPTER=codex ENABLED_VIA=config GH_AS_REVIEWER="$FAKE_BIN/as-reviewer"
 P4B_ACCT_RUN_ID=$1; shift
@@ -246,14 +265,39 @@ p4b_warn() { echo "[warn] $*" >&2; }
 p4b_governing_policy_json() { cat "$FAKE_GH_STATE/policy.json"; }
 gh_api_array() { gh api --paginate "$1"; }
 cleanup_pre_post_refusal_side_effects() { echo "[cleanup] $1" >&2; }
+p4b_unposted_verdict_summary() { printf '{}\n'; }
 ADMIN_OVERRIDE_SET=${H_ADMIN_SET:-false} ADMIN_OVERRIDE_QUOTE=${H_ADMIN_QUOTE:-} ADMIN_OVERRIDDEN=${H_ADMIN_OVERRIDDEN:-[]}
 . "$H_OVERRIDE_SUMMARY"
 . "$H_TIEBREAK"
 . "$H_BLOCK"
+. "$H_POST"
+revalidate_codex_request_budget_authority() { :; }
+revalidate_phase4a_timeout_generation() { :; }
+gh_api_scalar() { printf '%s\n' "$HEAD"; }
+revalidate_pr_body_author() { :; }
+revalidate_expected_base() { :; }
+revalidate_immutable_input() { :; }
+p4b_acct_mark_unposted() { :; }
 for step in "$@"; do
   case "$step" in
     reserve) enforce_phase4b_round_cap pre-dispatch ;;
     prepost) enforce_phase4b_round_cap pre-post ;;
+    publish-refused|publish-unknown|publish-lost-response)
+      BODY_FILE="$FAKE_GH_STATE/body.$P4B_ACCT_RUN_ID"
+      if [ "$step" = publish-refused ]; then
+        printf 'TIEBREAK_RUNAWAY_ACCEPTED=https://github.com/owner/repo/pull/7@%s' "$HEAD" >"$BODY_FILE"
+      else
+        printf '**Automated Phase 4b review**\n\n<!-- mergepath-p4b-run: %s -->\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity._\n' "$P4B_ACCT_RUN_ID" >"$BODY_FILE"
+        if [ "$step" = publish-unknown ]; then echo 1 >"$FAKE_GH_STATE/knob.review_unknown"
+        else echo 1 >"$FAKE_GH_STATE/knob.review_lost_response"; fi
+      fi
+      # post_review's ROOT is the scripts directory; the harness uses the
+      # repo root elsewhere. Preserve its attempted flag in this same shell.
+      ROOT="$ROOT/scripts"
+      publish_rc=0
+      post_review --request-changes || publish_rc=$?
+      release_round_reservation publication-exit
+      exit "$publish_rc" ;;
     attempt) P4B_ROUND_POST_ATTEMPTED=true ;;
     release) release_round_reservation test ;;
     hook) bash "$H_HOOK" ;;
@@ -272,7 +316,7 @@ fresh() { # <name> <cap-or-none> -> sets S
 run() { # <run-id> <steps...> -> the last JSON document in OUT; RC set
   RC=0
   OUT=$(PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
-        H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" H_ADMIN_SET="${H_ADMIN_SET:-false}" H_ADMIN_QUOTE="${H_ADMIN_QUOTE:-}" \
+        H_POST="$POST_REVIEW" H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" H_ADMIN_SET="${H_ADMIN_SET:-false}" H_ADMIN_QUOTE="${H_ADMIN_QUOTE:-}" \
         H_ADMIN_OVERRIDDEN="${H_ADMIN_OVERRIDDEN:-[]}" \
         H_HOOK="${H_HOOK:-/dev/null}" TAMPER="${TAMPER:-}" \
         bash "$WORK/harness.sh" "$@" 2>"$S/err.$1") || RC=$?
@@ -331,7 +375,7 @@ run me reserve
 fresh p8 3; { review 1 x APPROVED "$HEAD_A"; review 2 x APPROVED "$HEAD_A"; } | arr >"$S/reviews.json"
 for i in 1 2 3 4 5; do
   ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
-    H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
+    H_POST="$POST_REVIEW" H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
       bash "$WORK/harness.sh" "racer$i" reserve >"$S/out.racer$i" 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait
@@ -344,7 +388,7 @@ for i in 1 2 3 4 5; do case "$(cat "$S/rc.racer$i")" in 0) zeros=$((zeros+1)) ;;
 fresh p9 3
 for i in $(seq 1 10); do
   ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
-    H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
+    H_POST="$POST_REVIEW" H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" \
       bash "$WORK/harness.sh" "racer$i" reserve >/dev/null 2>"$S/err.racer$i"; echo $? >"$S/rc.racer$i" ) &
 done
 wait
@@ -388,6 +432,30 @@ fresh p12 1
 run a reserve attempt release; run b reserve
 [ "$RC" = 6 ] && [ "$(reserved_runs)" = '["a"]' ] \
   && pass "P12: no release after a POST attempt — an uncertain publication keeps its slot and the next run holds" || fail "P12 rc=$RC $(ledger)"
+
+# #2790: cross the actual strict guard/transport boundary, not a simulated
+# attempt flag. Only definitive pre-transport refusal frees the writer slot.
+fresh publication-local-refusal 1
+run a reserve publish-refused; refusal_rc=$RC
+run b reserve
+[ "$refusal_rc" = 1 ] && [ "$RC" = 0 ] && [ "$(reserved_runs)" = '["b"]' ] \
+  && [ ! -f "$S/review_posts" ] && grep -q 'owner' "$S/err.a" \
+  && pass '#2790: real guard local refusal frees the owning writer slot; next dispatch reserves without a POST' \
+  || fail "#2790 local refusal rc=$refusal_rc next=$RC $(ledger)"
+fresh publication-unknown 1
+run a reserve publish-unknown; post_rc=$RC
+run b reserve
+[ "$post_rc" = 42 ] && [ "$RC" = 6 ] && [ "$(reserved_runs)" = '["a"]' ] \
+  && [ "$(cat "$S/review_posts")" = 1 ] \
+  && pass '#2790: actual unknown transport keeps its slot after an empty reconciliation read; next dispatch holds without repost' \
+  || fail "#2790 unknown rc=$post_rc next=$RC $(ledger)"
+fresh publication-lost-response 1
+run a reserve publish-lost-response; post_rc=$RC
+run b reserve
+[ "$post_rc" = 0 ] && [ "$RC" = 8 ] && [ "$(reserved_runs)" = '["a"]' ] \
+  && [ "$(cat "$S/review_posts")" = 1 ] && [ "$(jq length "$S/reviews.json")" = 1 ] \
+  && pass '#2790: actual lost-response POST reconciles exact run/head/reviewer once, remains consumed and never reposts' \
+  || fail "#2790 lost-response rc=$post_rc next=$RC $(ledger)"
 
 # P13: a review that commits after the client timed out and becomes visible late is never double-counted or lost.
 fresh p13 2

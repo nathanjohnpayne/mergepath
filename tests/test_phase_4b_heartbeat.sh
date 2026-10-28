@@ -209,6 +209,46 @@ codex:
   enabled: true
   max_review_rounds: 10
 EOF
+# Retained verdict paths vary per invocation. Validate their complete raw
+# evidence before normalizing only that metadata in late-refusal summaries.
+compare_unposted_summaries() {
+  python3 - "$1" "$2" <<'PY_COMPARE'
+from pathlib import Path
+import json
+import re
+import stat
+import sys
+
+
+def normalized(case):
+    case = Path(case)
+    summary = json.loads((case / "out").read_text())
+    if (not isinstance(summary, dict)
+            or "validated_verdict_retention_error" in summary
+            or not isinstance(summary.get("validated_verdict"), dict)
+            or not isinstance(summary.get("validated_verdict_path"), str)):
+        raise ValueError("missing complete retained-verdict evidence")
+    path = Path(summary["validated_verdict_path"])
+    directory = case / "accounting" / "unposted-verdicts"
+    if (not path.is_absolute() or path.parent != directory
+            or not re.fullmatch(r"pr-1589\.[A-Za-z0-9]+", path.name)
+            or path.resolve(strict=True) != case.resolve(strict=True) / "accounting" / "unposted-verdicts" / path.name
+            or not stat.S_ISREG(path.lstat().st_mode)):
+        raise ValueError("retained verdict is not this invocation's regular file")
+    raw = json.loads(path.read_text())
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if canonical(raw) != canonical(summary["validated_verdict"]):
+        raise ValueError("retained verdict differs from complete summary verdict")
+    summary["validated_verdict_path"] = "<validated-invocation-evidence>"
+    return canonical(summary)
+
+
+try:
+    sys.exit(0 if normalized(sys.argv[1]) == normalized(sys.argv[2]) else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY_COMPARE
+}
 run_case() {
   local mode="$1" expected="$2" stages="$3" storage="${4:-good}" rc=0 record id log
   export HB_MODE="$mode" HB_CASE="$WORK/$mode-$storage"
@@ -246,7 +286,11 @@ run_case() {
   case "$storage" in entropy-*)
     [ ! -e "$P4B_HEARTBEAT_DIR" ] && pass "$mode/$storage publishes no unavailable identity" || fail "$mode/$storage advertised heartbeat identity"
     cmp -s "$WORK/$mode-good/events" "$HB_CASE/events" \
-      && cmp -s "$WORK/$mode-good/out" "$HB_CASE/out" \
+      && { if [ "$mode" = late-feedback ]; then
+             compare_unposted_summaries "$WORK/$mode-good" "$HB_CASE"
+           else
+             cmp -s "$WORK/$mode-good/out" "$HB_CASE/out"
+           fi; } \
       && pass "$mode/$storage preserves boundary operations, order and summary" || fail "$mode/$storage changed review flow"
     log="$P4B_ACCT_STATE_DIR/phase-4b-loops/fixture-repo-pr1589.jsonl"
     [ "$mode" != approve ] || log="$log.archive"

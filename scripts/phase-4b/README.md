@@ -323,11 +323,13 @@ CODEX_BIN=/path/to/fake-codex \
 
 `--dry-run` reads and validates the PR body, then performs selection + adapter
 dispatch + verdict validation, and prints the intended action without posting.
-Its final JSON adds `validated_verdict` only for a dry run: the complete,
+Its final JSON adds `validated_verdict` for a dry run: the complete,
 schema-validated adapter verdict, including its summary, findings, and
 normalized usage. This lets a caller classify the result before any publisher
-acts. Real-run JSON retains its existing summary shape and never includes this
-field.
+acts. Successful real-run JSON retains its existing summary shape. A real run
+that cannot publish also includes the exact raw `validated_verdict` and its
+retained evidence path (or an explicit retention error); see
+[Unpublished verdict evidence](#unpublished-verdict-evidence-2790).
 The offline recipe explicitly replaces the live review-feedback accounting read
 with `true`; real dry-runs keep that gate enabled so they cannot spend a
 reviewer round while older feedback is unaccounted. Adapter CLIs are injectable
@@ -400,3 +402,9 @@ and does not refuse.
 | 7 | **feedback unaccounted** (#1000) — no manual handoff is rendered. The exit can mean the pre-dispatch accounting gate found an undispositioned finding, so no adapter ran; a fallback after adapter dispatch was stopped by its accounting gate before rendering; the handoff renderer's own accounting gate refused; the approval writer-boundary accounting check refused an `APPROVED` result before POST; or a posted approval's #1261 acknowledgment failed. If the run-summary JSON says `review_posted: true` and `review_acknowledgment: "failed"`, repair that approval's acknowledgment without repeating the review. Pre-dispatch and other early refusals may emit only accounting payload and error output; use that output to identify and disposition the finding. Then rerun the appropriate step. Do not treat every exit 7 as an adapter run or route it directly to manual fallback. |
 | 8 | **human tiebreaker required** (#1757; #1305, narrowed by #1560 slice 3): a deterministic egregious-case tripwire matched (`barrier.tripwire`), or the governing Codex request ceiling is spent and a human stop holds, named in `barrier.human_stops.stops`: `blocking-budget`, `runaway`, `untested-rebuttal` or `disagreement`. A spent ceiling with no human stop waives the Codex arm and the adapter runs instead, unless `codex.allow_phase_4b_substitute` is false, which escalates to the manual handoff (exit 4). No Phase 4b handoff was rendered. Wait for an explicit human decision. |
 | 10 | **request-budget authority error** (`stop_for_barrier_error`) — unreadable governing/request evidence or drift in the Codex reported-signal live-head check, initial timeout evidence, request-cap evaluation, exhausted-ceiling/final-request terminal resampling, or CodeRabbit probe head during a pending final-request wait (`p4b_same_head_barrier`, mapped by `run_same_head_barrier`). Also covers unreadable/changed authorized request generations (`capture_authorized_request_generation`, `refuse_approval_if_request_generation_moved`) and changed/unreadable available-budget or spent-ceiling tuple, policy, budget, generation or human-stop evidence (`revalidate_codex_request_budget_authority`, `revalidate_request_ceiling_authority`). These fences run before dispatch and at later publication/manual-handoff boundaries as applicable; late refusal corrects provisional accounting and closes this run’s filed issues. Actual human stops remain `exit 8` and a fresh pending final request can hold with `exit 6`. No review or manual handoff is published. Repair the read or rerun against the current head, base policy and request timeline. |
+
+### Unpublished verdict evidence (#2790)
+
+A validated adapter result is kept separately from its rendered review. Reserved Codex command quotes in adapter-authored presentation receive a zero-width break after `@`, including inside fences, before the unchanged strict payload guard runs. The exact raw findings stay available even when presentation changes.
+
+On publication refusal, terminal JSON carries `validated_verdict` and `validated_verdict_path`; stderr prints the retained private file under the accounting state directory's `unposted-verdicts/`. A retention failure is explicit (`validated_verdict_path: null`, `validated_verdict_retention_error`) and leaves the findings in terminal JSON. Successful publication removes that local copy. A local guard refusal precedes transport and lets only the owning writer release its unspent reservation. Any wrapper/transport attempt keeps the reservation occupied; reconciliation can adopt only the exact unique run/head/reviewer review, and never reposts it.

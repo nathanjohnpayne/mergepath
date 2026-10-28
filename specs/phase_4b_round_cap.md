@@ -31,6 +31,8 @@ The review read is taken twice and must agree. That is a consistency check again
 3. **Publish.** The posted review carries `<!-- mergepath-p4b-run: <invocation id> -->` on its own line directly before the footer. From the moment the POST is attempted, the slot stays occupied whatever the outcome.
 4. **Reconcile an uncertain POST.** If the POST call fails, `p4b_reconcile_posted_review` adopts a landed review only when exactly one review by the actual reviewer, on the exact head, carries this run's id. If none or several match, nothing is adopted and nothing is reposted, and the slot stays occupied.
 
+The writer runs the unchanged strict comment-payload guard locally before marking transport attempted (#2790). A definitive local refusal performs the usual pre-POST cleanup and exits, so only that writer may release its unspent reservation. Invoking the reviewer wrapper crosses the uncertainty boundary: even a wrapper failure keeps the slot occupied, and an empty reconciliation read never authorizes release.
+
 ## Release
 
 Only the owning writer releases its entry, only before any review POST attempt, and then it exits (`release_round_reservation`, run from `_p4b_on_exit`). Release runs after the result is out, so it never exits or prints a result: a ledger it cannot read or update only produces a warning, and the slot stays occupied. There is no owner release and no time-based reclamation: a POST can start before any deadline and land after it, so no client-side check proves that a potentially publishing run will not publish. A crashed or killed run's slot therefore stays occupied. The remedy is an owner decision, such as a higher governing cap or a reduced scope, never reuse of the slot.
@@ -72,3 +74,9 @@ The protocol: the extracted production block runs against a stateful fake GitHub
 - head changes.
 
 Mutation checks confirm that each of these fails the suite: forcing the update, releasing after a POST attempt, skipping the binding check, treating a conflict as success, dropping the parent, posting an empty tree, letting one reservation absorb surplus reviews, skipping the pre-POST cleanup, an exiting release, skipping review-record validation, parsing an unanchored marker and nesting the spent `round_cap` under `barrier` only.
+
+## Unpublished validated verdicts (#2790)
+
+Before presentation normalization or later publication fences, the orchestrator saves the exact validated, input-bound adapter JSON separately. Adapter-authored strings in the presentation insert a zero-width break after the leading `@` in each case-insensitive reserved Codex command, including quotes in code fences; the strict guard and writer-owned markers remain unchanged. Ordinary text is preserved. Accounting and the posted review consume the same normalized presentation.
+
+A run that cannot publish reports the raw result as `validated_verdict` in terminal JSON and retains its private file under the accounting state directory's `unposted-verdicts/`; `validated_verdict_path` and stderr name that file. Late structured refusals retain their existing status and reason while carrying the same evidence fields. If the file cannot be retained, the path is null and `validated_verdict_retention_error` plus stderr report that failure; terminal JSON still includes the raw verdict. Successful publication removes the local copy. Retained verdicts are evidence for disposition, never permission to retry an uncertain POST or bypass a fence.
