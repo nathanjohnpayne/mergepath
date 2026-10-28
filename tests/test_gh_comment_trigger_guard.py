@@ -38,6 +38,15 @@ def hold(name):
 read = re.fullmatch(r"repos/[^/]+/[^/]+/issues/comments/([0-9]+)", args[1]) if args[:1] == ["api"] and len(args) == 2 else None
 if read:
     hold("READBACK")
+    # READBACK_FAILURES=N fails the first N readbacks, as a transient 5xx or a
+    # read-after-write delay would (#2769).
+    failures = int(os.environ.get("READBACK_FAILURES", "0"))
+    if failures:
+        counter = timeline / "readback-failures.count"
+        seen = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(seen + 1))
+        if seen < failures:
+            sys.exit(1)
     for path in timeline.glob("*.jsonl"):
         for line in path.read_text().splitlines():
             comment = json.loads(line)
@@ -686,6 +695,22 @@ class TriggerGuardTests(unittest.TestCase):
                                         env=dict(env, **extra), capture_output=True, timeout=20)
                 self.assertEqual(5, result.returncode, result.stderr)
                 self.assertIn(b"without a confirmed comment id", result.stderr)
+
+    def test_claimed_write_retries_a_failed_readback(self):
+        # #2769: the POST landed but the first readbacks fail. A bounded retry
+        # confirms it; only readbacks that keep failing past the bound refuse.
+        fixture, env = self.claim_fixture()
+        (fixture / "release").touch()
+        env.update(MERGEPATH_CODEX_REQUEST_READBACK_DELAY_SECONDS="0", MERGEPATH_CODEX_REQUEST_READBACK_ATTEMPTS="3")
+        command = ["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"]
+        for failures, expected in ((2, 0), (3, 5)):
+            with self.subTest(failures=failures):
+                for path in (fixture / "timeline").iterdir():
+                    path.unlink()
+                result = subprocess.run(command, env=dict(env, READBACK_FAILURES=str(failures)), capture_output=True, timeout=20)
+                self.assertEqual(expected, result.returncode, result.stderr)
+                self.assertEqual(str(min(failures + 1, 3)), (fixture / "timeline/readback-failures.count").read_text())
+                self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()))
 
     def test_out_of_band_request_is_counted_never_blocked(self):
         # The claim governs guarded writes only. A request typed in the GitHub

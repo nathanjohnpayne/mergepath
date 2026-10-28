@@ -120,7 +120,7 @@ except OSError:
 # claim, before the next guarded requester may recount. Without a claim the
 # command runs unchanged.
 gh_comment_guard_run_write() { # <command...>
-  local out rc=0 id comment repo pr
+  local out rc=0 id comment repo pr attempt attempts delay
   if [ -z "${GH_COMMENT_GUARD_CLAIM:-}" ]; then
     "$@"
     return $?
@@ -135,10 +135,24 @@ gh_comment_guard_run_write() { # <command...>
   [ "$rc" -eq 0 ] || return "$rc"
   repo="${GH_COMMENT_GUARD_CLAIM%#*}" pr="${GH_COMMENT_GUARD_CLAIM##*#}"
   id=$(grep -oE 'issuecomment-[0-9]+' "$out" | tail -1 | sed 's/issuecomment-//') || id=""
+  # #2769: the POST has already landed, so a transient 5xx or a short
+  # read-after-write delay on the readback must not report it unposted (a
+  # polling rerun would then spend another slot). A failed read is retried a
+  # bounded number of times, still inside the claim; a read that returns a
+  # comment is final, so a mismatch is refused at once.
+  attempts="${MERGEPATH_CODEX_REQUEST_READBACK_ATTEMPTS:-4}"
+  delay="${MERGEPATH_CODEX_REQUEST_READBACK_DELAY_SECONDS:-1}"
+  [[ "$attempts" =~ ^[1-9][0-9]?$ ]] || attempts=4
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay=1
+  comment=""
   if [ -n "$id" ]; then
-    comment=$(unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
-      GH_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" GITHUB_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" \
-      gh api "repos/$repo/issues/comments/$id" 2>/dev/null) || comment=""
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+      comment=$(unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$TOKEN" \
+        GH_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" GITHUB_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-}" \
+        gh api "repos/$repo/issues/comments/$id" 2>/dev/null) || comment=""
+      [ -z "$comment" ] || break
+      [ "$attempt" -eq "$attempts" ] || sleep $((delay * attempt))
+    done
   fi
   if [ -z "$id" ] || ! printf '%s' "$comment" | jq -e --arg author "$AUTHOR" --arg pr "$pr" --arg id "$id" \
        '(.id | tostring) == $id and ((.user.login // "") | ascii_downcase) == ($author | ascii_downcase)
