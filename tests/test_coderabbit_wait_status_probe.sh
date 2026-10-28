@@ -1471,14 +1471,16 @@ Reviewing files that changed from the base of the PR and between $a and head-sha
   { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
     || bad="$bad toctou-refetch-fail(rc=$rc)"
   # 13. Control: an unchanged re-read keeps the evidence (the re-scan is not
-  #     a blanket refusal), and it is exactly ONE extra read.
+  #     a blanket refusal), and it is exactly ONE extra read for the re-scan.
+  #     The third read is the #2752 processing-error latch, which carry-forward
+  #     evidence now consults before it is emitted (Phase 4b P1 on #2857).
   dir=$(make_case probe-1335-rescan-stable 600 true 30 3 2)
   enable_trust_status_context "$dir"
   rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
     CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
     run_probe_case "$dir" carry_summary_changes)
   { [ "$rc" = 7 ] && jq -e --arg b "$b" '.probe.carryforward.reviewed_head == $b' "$dir/out.json" >/dev/null 2>&1 \
-      && [ "$(cat "$dir/state/comment-reads")" = 2 ]; } \
+      && [ "$(cat "$dir/state/comment-reads")" = 3 ]; } \
     || bad="$bad toctou-stable(rc=$rc reads=$(cat "$dir/state/comment-reads" 2>/dev/null))"
 
   # 14. A head-pinned review RUN landing in the gap (with the summary still
@@ -1528,6 +1530,13 @@ Reviewing files that changed from the base of the PR and between $a and head-sha
   _notice_case pause-aged "$pause_note" 1 2026-06-03T12:00:00Z 2026-06-03T06:00:00Z none none
   # 17. An in-progress notice landing in the gap.
   _notice_case progress-in-gap "$progress_note" 2 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none summary-without-head-review
+  # 17b. A processing-error notice after the clean prior-head summary sets the
+  #      #2752 latch, so the carry-forward rc-7 family must not carry either
+  #      (Phase 4b P1 on #2857): no evidence, observed=processing_error.
+  _notice_case processing-error '> [!WARNING]
+> ## Something unexpected happened
+>
+> We could not process this pull request right now. Please try again later.' 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none processing_error
   # 18. Control: a newer NARRATION reply (the barrier's own "Already reviewed
   #     the last commit" answer) is not provider state and must not block.
   _notice_case narration-control '<!-- This is an auto-generated reply by CodeRabbit -->

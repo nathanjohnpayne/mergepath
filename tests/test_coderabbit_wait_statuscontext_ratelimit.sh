@@ -1566,6 +1566,15 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   sed 's/\[ "\$row" != UNREADABLE \] || return 3/[ "$row" != UNREADABLE ] || continue/' "$snip" >"$mut"
   grep -q 'UNREADABLE \] || continue' "$mut" || bad="$bad mutation-not-applied"
   latch_case 1 mutant-non-string-body-reads-clear '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]' "$mut"
+  # A later summary or run reporting a FAILED publication supersedes nothing:
+  # `review` is the classifier's fallback, not proof of completion (4b P1 on
+  # #2857). The benign summarize/release-notes stanzas still supersede (above).
+  local fail_stanza='<!-- This is an auto-generated comment: failure by coderabbit.ai -->
+> Review failed.
+<!-- end of auto-generated comment: failure by coderabbit.ai -->'
+  latch_case 0 later-summary-failure-stanza "[$(ic $t5 "$summary
+$fail_stanza")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  latch_case 0 later-run-failure-stanza '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "$fail_stanza")]"
   # A long history is read, not unreadable (Codex P2 on #2857): ~1.5 MiB of
   # comments is past both Linux's 128 KiB per-argument limit and macOS's 1 MiB
   # ARG_MAX, so passing the lists on argv would fail E2BIG and read as rc 3.
@@ -1610,10 +1619,12 @@ PY
   done
   [ "$(grep -c 'crw_probe_withhold_on_processing_error "' "$ROOT/scripts/coderabbit-wait.sh")" = 2 ] \
     || bad="$bad probe-reported-sites"
-  # The per-path #2660 checks are gone. The three callers are the classifier,
-  # the latch, and the fast path's grading-only classification of a superseded
-  # notice comment (Codex P1 on #2857), which decides no clearance.
-  [ "$(grep -c 'crw_is_processing_error_notice "' "$ROOT/scripts/coderabbit-wait.sh")" = 3 ] \
+  # The per-path #2660 checks are gone. The four callers are the classifier,
+  # the latch, the fast path's grading-only classification of a superseded
+  # notice comment (Codex P1 on #2857), and the refusal arm's rule that a
+  # notice-only object is no releasing run (4b P1 on #2857). Neither of the
+  # last two decides a clearance the latch withholds.
+  [ "$(grep -c 'crw_is_processing_error_notice "' "$ROOT/scripts/coderabbit-wait.sh")" = 4 ] \
     || bad="$bad per-path-processing-error-checks-remain"
   if [ -z "$bad" ]; then
     pass "PE-edges: #2752 — all five clearance emits, the fast path, rc-7 evidence and the emitter backstop consult the one latch"
@@ -1760,6 +1771,29 @@ test_processing_error_recovery_run_is_graded() {
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
   [ "$rc" = "0" ] || fail "PE-recovery control: a clean recovery run should clear, got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "PE-recovery: Codex P1 on #2857 — a run that supersedes a processing-error comment is still graded, and its blocking marker surfaces findings"
+}
+
+# --- Phase 4b P1s on #2857: the latch is not the whole answer ---------------
+# (a) A set latch still grades the head-pinned run: a `_🟠 Major_` HEAD review
+#     at T2 under a later notice comment at T4 surfaces findings, not timeout.
+# (b) A cleared latch does not make a notice-only object a review: an
+#     error-only HEAD review at T0, a clean head-naming summary at T3 (clears
+#     the latch), a rate-limit notice at T5 and success at T6 must not clear on
+#     that object as the rate-limit refusal's releasing run.
+test_processing_error_latch_does_not_replace_run_grading() {
+  local dir rc before=$FAIL reviews
+  reviews='[{"id":8815,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":"Review completed.\n\n_🟠 Major_ | **A finding carried only by this review body.**"}]'
+  dir=$(make_case "pe-latch-set-run-major" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:04Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "2" ] && [ "$(jqf "$dir" '.status')" = findings ] \
+    || fail "PE-graded (a): a set latch dropped the head run's blocking marker, got rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null); err=$(tail -4 "$dir/err.log")"
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" --arg h "$HEAD_SHA_40" '[{"id":8816,"user":{"login":"coderabbitai[bot]"},"commit_id":$h,"submitted_at":"2026-06-04T00:00:00Z","body":$b}]')
+  dir=$(make_case "pe-notice-object-releases-refusal" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T00:00:06Z" "Review completed" "2026-06-04T00:00:05Z" 999999999 "$SUMMARY_NAMES_CURRENT_HEAD" "2026-06-04T00:00:03Z" "$HEAD_SHA_40")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE-graded (b): a notice-only review object released a rate-limit refusal and cleared; err=$(tail -4 "$dir/err.log")"
+  grep -q "is CodeRabbit's processing-error notice, not a review" "$dir/err.log" \
+    || fail "PE-graded (b): the refusal arm did not reject the notice-only object as its releasing run"
+  [ "$FAIL" -ne "$before" ] || pass "PE-graded: 4b P1s on #2857 — a set latch still grades the head run, and a cleared latch does not make a notice-only object a review"
 }
 
 test_completed_description_still_clears() {
@@ -3112,6 +3146,7 @@ test_processing_error_probe_evidence_withholds
 test_processing_error_probe_reported_withholds
 test_processing_error_superseded_by_later_summary_clears
 test_processing_error_recovery_run_is_graded
+test_processing_error_latch_does_not_replace_run_grading
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error

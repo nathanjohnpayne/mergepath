@@ -2912,6 +2912,39 @@ status_context_fast_path_blocked_by_comment() {
     0) : ;;
     1)
       STATUS_CONTEXT_CLEARANCE_REFUSAL=processing_error
+      # Grading-only still grades: a finding carried solely in the head-pinned
+      # run's body (no inline thread, no PR summary) is invisible to the
+      # verdict scanner, so the run is graded here before returning, as #2660
+      # did before the latch (#2857 4b). A grading failure suppresses the fast
+      # path rather than dropping the finding.
+      review_rc=0
+      head_run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") || review_rc=$?
+      if [ "$review_rc" != 0 ]; then
+        log "StatusContext success suppressed: the processing-error latch is set and the current-HEAD review run could not be derived for grading (#2857)"
+        return 0
+      fi
+      [ -n "$head_run" ] || return 1
+      run_id=$(printf '%s' "$head_run" | jq -er '.id') || {
+        log "StatusContext success suppressed: the processing-error latch is set and the current-HEAD review id could not be decoded (#2857)"
+        return 0
+      }
+      run_body=$(printf '%s' "$reviews" | jq -er --argjson id "$run_id" 'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)') || {
+        log "StatusContext success suppressed: the processing-error latch is set and the current-HEAD review body could not be read for grading (#2857)"
+        return 0
+      }
+      marker_rc=0
+      summary_blocking_marker_present "$run_body" || marker_rc=$?
+      case "$marker_rc" in
+        0)
+          STATUS_CONTEXT_HEAD_RUN_FINDING=true
+          log "StatusContext success is grading-only: the processing-error latch is set and current-HEAD review id=$run_id carries a blocking marker (#2857)"
+          ;;
+        1) : ;;
+        *)
+          log "StatusContext success suppressed: the processing-error latch is set and current-HEAD review id=$run_id could not be graded (#2857)"
+          return 0
+          ;;
+      esac
       return 1
       ;;
     *) return 0 ;;
@@ -2998,6 +3031,24 @@ status_context_fast_path_blocked_by_comment() {
             log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries provider-owned $run_class state (#956)"
             return 1
           fi
+          # The latch answers whether CodeRabbit's newest word is a notice, not
+          # whether THIS run is a review: a notice-only review object stays no
+          # review even after a later summary clears the latch, so it cannot
+          # release a rate-limit or pause refusal (#2857 4b; the #2657 rule).
+          pe_rc=0
+          crw_is_processing_error_notice "$run_body" || pe_rc=$?
+          case "$pe_rc" in
+            0)
+              STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+              log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id is CodeRabbit's processing-error notice, not a review (#2657)"
+              return 1
+              ;;
+            1) : ;;
+            *)
+              log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id could not be read for a processing-error notice (#2657)"
+              return 0
+              ;;
+          esac
           summary_blocking_marker_present "$run_body" || marker_rc=$?
           case "$marker_rc" in
             0)
@@ -3828,20 +3879,29 @@ probe_not_yet() {
   # it is reported as `processing_error`, which the barrier does not model and
   # so reads as not-yet. Unreadable, the probe stops with infra, like every
   # other unread probe surface.
+  #
+  # The carry-forward family is the barrier's other rc-7 opening (#1335): any
+  # observation carrying PROBE_CARRYFORWARD_JSON, typically
+  # summary-without-head-review, consults the latch too, and a set latch drops
+  # that evidence as well (#2857 4b).
+  local consult=false
   case "$observed" in
-    awaiting-summary|terminal)
-      crw_processing_error_latch_permits_clearance "probe rc-7 evidence" || latch_rc=$?
-      case "$latch_rc" in
-        0) : ;;
-        1)
-          observed=processing_error
-          PROBE_CONTEXT_STATE=""
-          PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
-          ;;
-        *) die 3 "could not read the processing-error latch for the probe evidence on $HEAD_SHA" ;;
-      esac
-      ;;
+    awaiting-summary|terminal) consult=true ;;
   esac
+  [ "${PROBE_CARRYFORWARD_JSON:-null}" = null ] || consult=true
+  if [ "$consult" = true ]; then
+    crw_processing_error_latch_permits_clearance "probe rc-7 evidence" || latch_rc=$?
+    case "$latch_rc" in
+      0) : ;;
+      1)
+        observed=processing_error
+        PROBE_CONTEXT_STATE=""
+        PROBE_CONTEXT_UPDATED_AT=""; PROBE_CONTEXT_DESCRIPTION_JSON=null
+        PROBE_CARRYFORWARD_JSON=null
+        ;;
+      *) die 3 "could not read the processing-error latch for the probe evidence on $HEAD_SHA" ;;
+    esac
+  fi
   PROBE_OBSERVED="$observed"
   log "probe: no CodeRabbit review on $HEAD_SHA yet (observed=$observed) — exiting $PROBE_EXIT_CODE without posting"
   emit_json_and_exit "no_review_yet" "$PROBE_EXIT_CODE" "$review_json" 0
@@ -4483,6 +4543,18 @@ crw_processing_error_latch_from() {
         fi
         ;;
       *) return 3 ;;
+    esac
+    # `review` is the classifier's generic fallback, not proof of a completed
+    # publication: a run or summary carrying any generated stanza other than
+    # the benign summarize/release-notes ones (a `failure by coderabbit.ai`
+    # stanza, say) reports a failed attempt and supersedes nothing (#2857 4b).
+    case "$kind" in
+      run|summary)
+        if grep -qiE 'auto-generated comment: ' <<<"$body" \
+           && ! summary_stanzas_all_benign "$body"; then
+          kind=""
+        fi
+        ;;
     esac
     [ -n "$kind" ] || continue
     events+=$(printf '%s' "$row" | base64 --decode | jq -c --arg kind "$kind" '{kind: $kind, src, id, commit_id, at}') || return 3
