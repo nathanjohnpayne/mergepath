@@ -2970,6 +2970,13 @@ run_trigger_ack_gate() {
       log "eyes-ack retry cap reached (${retries_used}/${MAX_ACK_RETRIES}) — continuing normal review poll"
       return 0
     fi
+    # #2791: a newer request seen during the ack wait supersedes this one.
+    # Re-posting would be refused as a duplicate of it, so continue into the
+    # poll, which reports the supersession.
+    if [ -n "$CODEX_RUN_SEEN_SUPERSEDING" ]; then
+      log "newer author request $CODEX_RUN_SEEN_SUPERSEDING landed during the eyes-ack wait — no acknowledgement retry; continuing normal review poll (#2791)"
+      return 0
+    fi
 
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
@@ -3721,9 +3728,14 @@ fi
 # minted, nothing is posted, and the wait is not extended onto a request this
 # run cannot attribute. The run reports codex_run (handoff "superseded",
 # superseded_by) and exits 3; a rerun holds or replaces the newer request by
-# the same-head hold's rules.
+# the same-head hold's rules. Supersession wins over a provider refusal too:
+# a refusal that predates the newer request is filtered out while that
+# request is selected, and resurfaces against the waited-on one if the newer
+# request is then deleted, so exit 4 with blocked_reason would hand Phase 4b a
+# fallback while the newer run may be active. blocked_reason is still
+# reported.
 CODEX_RUN_HANDOFF=""
-if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
+if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then
   CODEX_RUN_SUPERSEDED_BY=$(codex_run_superseding_request)
   [ -z "$CODEX_RUN_SUPERSEDED_BY" ] || CODEX_RUN_HANDOFF=superseded

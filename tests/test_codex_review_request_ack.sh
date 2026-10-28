@@ -411,12 +411,12 @@ case "$endpoint" in
       touch "$state_dir/injected"
       printf '%s\n' "$CODEX_TEST_INJECT_JSON" >>"$state_dir/comments.jsonl"
     fi
-    # #2791: delete the injected comment again once the fake clock is
+    # #2791: delete the (first) injected comment again once the fake clock is
     # CODEX_TEST_DELETE_AT seconds past the seeded request time.
     if [ -n "${CODEX_TEST_DELETE_AT:-}" ] && [ -f "$state_dir/injected" ] && [ ! -f "$state_dir/deleted" ] \
        && [ "$(cat "$state_dir/fake-time" 2>/dev/null || echo 0)" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + CODEX_TEST_DELETE_AT ))" ]; then
       touch "$state_dir/deleted"
-      jq -c --argjson id "$(printf '%s' "$CODEX_TEST_INJECT_JSON" | jq .id)" 'select(.id != $id)' "$state_dir/comments.jsonl" >"$state_dir/comments.tmp" \
+      jq -c --argjson id "$(printf '%s\n' "$CODEX_TEST_INJECT_JSON" | jq -s '.[0].id')" 'select(.id != $id)' "$state_dir/comments.jsonl" >"$state_dir/comments.tmp" \
         && mv "$state_dir/comments.tmp" "$state_dir/comments.jsonl"
     fi
     if [ "$scenario" = "resume-blocked" ]; then
@@ -2237,6 +2237,28 @@ test_newer_request_supersedes_the_waited_on_one() {
     && grep -q 'no Codex eyes acknowledgment' "$dir/err.log" \
     && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
     || fail "#2791 superseded in the ack window, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null); $(grep -c 'eyes acknowledgment' "$dir/err.log") ack log line(s)"
+  # An unacknowledged request is not re-posted once a newer request has been
+  # seen: the retry would be refused as a duplicate and the run would die
+  # without codex_run (Phase 4b on #2846).
+  dir=$(make_case "run-superseded-ack-retry" 120 1 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] && grep -q 'no acknowledgement retry' "$dir/err.log" \
+    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded in the ack window with a retry left: exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c .codex_run "$dir/out.json" 2>/dev/null); $(tail -2 "$dir/err.log")"
+  # A provider refusal posted before the newer request is filtered out while
+  # that request is selected. When the newer request is deleted, the refusal
+  # resurfaces against the waited-on one; the run stays superseded (exit 3),
+  # not blocked (exit 4), and still reports the refusal (Phase 4b on #2846).
+  dir=$(make_case "run-superseded-blocked" 0 0 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=300 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}
+{"id":901,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"You have reached your Codex usage limits for code reviews.","created_at":"2026-06-04T00:00:20Z"}')
+  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .blocked_reason == "usage_limit" and .terminal_determination == null' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded, then a refusal resurfaces: exit $rc, $(jq -c '{codex_run, blocked_reason, terminal_determination}' "$dir/out.json" 2>/dev/null)"
   [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
 }
 
