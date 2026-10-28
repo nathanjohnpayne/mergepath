@@ -1090,6 +1090,18 @@ for prose in 'The reviewed commits look clean.' 'I reviewed commit history and f
     fail "CLI anchors prose '$prose': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
   fi
 done
+# Phase 4b P1 on #2859: ordered-list numbering is Markdown decoration too, so a
+# numbered malformed field still excludes the verdict. Before the fix such a
+# verdict read as an anchorless clean response and could clear a human stop.
+for numbered in '1. Reviewed commit: not-a-sha' '2) **Reviewed commit:** `not-a-sha`' '+ Reviewed commit: not-a-sha'; do
+  D="$WORK/anchor-numbered"; rm -rf "$D"; anchor_case "$D" "$numbered"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && jq -e '.responses == [] and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+    pass "CLI anchors: a numbered or bulleted malformed field ('$numbered') still excludes the verdict"
+  else
+    fail "CLI anchors numbered '$numbered': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
 # Codex P2 on #2859: prose with no "Codex Review:" heading is not a verdict at
 # all. Before the heading requirement it entered as an unknown_tier response
 # and spent the blocking budget.

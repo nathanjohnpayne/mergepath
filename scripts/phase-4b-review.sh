@@ -1506,6 +1506,24 @@ revalidate_phase4a_timeout_generation() {
   esac
 }
 
+# #2771 (Phase 4b P1 on #2859): the wave-canary waiver rests on "no Codex run
+# is in flight on this head", read once at the barrier. An unsolicited App
+# auto-review can start during the barrier or the adapter run without
+# changing the author request generation, so the generation fences below
+# cannot see it. Re-read the provider state at each later authority boundary
+# and hold (exit 6) rather than approve over a live review.
+revalidate_wave_canary_waiver() {
+  local where="${1:-post-adapter}" why
+  [ "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" = wave-canary-no-request ] || return 0
+  p4b_codex_no_unsolicited_run "$REPO" "$PR" "$HEAD" && return 0
+  why="A Codex review of wave canary $HEAD is in flight or unreadable ($where); holding for it"
+  if [ "$where" = "pre-post" ]; then
+    cleanup_pre_post_refusal_side_effects "$why" true
+  fi
+  hold_for_external_review "$(jq -nc --arg ce "wave-canary-codex-run-in-flight" \
+    '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:$ce,trigger:"skipped",resume:"skipped"}')"
+}
+
 # --- #1143: the body can disagree with ITSELF, later ------------------------
 #
 # The identity fence at the top of this script reads the PR body exactly ONCE,
@@ -1645,7 +1663,7 @@ else
   # not wait on one. Only a canary the live byte verifier accepts takes that
   # posture; a wave scope on anything else stops here, as wave-capture below
   # would, before the barrier spends any provider allowance. The posture is
-  # read by p4b_same_head_barrier in the sourced library and deliberately not
+  # read by the same-head barrier in the sourced library and deliberately not
   # exported, so no child process can inherit it.
   # shellcheck disable=SC2034
   P4B_BARRIER_WAVE_CANARY=false
@@ -1673,6 +1691,7 @@ fi
 # gate stays the last read before dispatch.
 if [ "$DRY_RUN" != true ] && [ "$ADAPTER_MISSING" != true ]; then
   revalidate_request_ceiling_authority pre-dispatch
+  revalidate_wave_canary_waiver pre-dispatch
   # #2663: after the barrier (its Codex stops take precedence) and before the
   # accounting gate and the adapter, so a refused round spends no review.
   enforce_phase4b_round_cap pre-dispatch
@@ -1827,6 +1846,7 @@ VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
 # approval-side effect. Keep dry-runs offline.
 if [ "$DRY_RUN" != true ]; then
   revalidate_phase4a_timeout_generation post-adapter
+  revalidate_wave_canary_waiver post-adapter
 fi
 
 VERDICT="$(printf '%s' "$VERDICT_JSON" | jq -r '.verdict')"
@@ -2358,6 +2378,7 @@ post_review() {
   # this early one preserves cleanup before an intervening read can fail.
   revalidate_codex_request_budget_authority pre-post
   revalidate_phase4a_timeout_generation pre-post
+  revalidate_wave_canary_waiver pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
   # arrived as a JSON blob compared unequal to $HEAD and took the

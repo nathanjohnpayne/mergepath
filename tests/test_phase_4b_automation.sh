@@ -6359,6 +6359,42 @@ if [ -n "$_wv" ] && [ -n "$_wt" ] && [ -n "$_wb" ] && [ "$_wv" -lt "$_wt" ] && [
 else
   fail "#2771: wave posture wiring wrong (verify=$_wv set=$_wt barrier=$_wb)"
 fi
+# Phase 4b P1 on #2859: the waiver's "no Codex run in flight" condition is
+# re-read at every later authority boundary, so an unsolicited auto-review
+# that starts during the barrier or the adapter run holds instead of being
+# approved over. The function is exercised as extracted from the orchestrator.
+bad=""
+for _where in pre-dispatch post-adapter pre-post; do
+  grep -q "^  revalidate_wave_canary_waiver $_where\$" "$ORCH" || bad="$bad unwired-$_where"
+done
+_wfn="$(sed -n '/^revalidate_wave_canary_waiver() {/,/^}/p' "$ORCH")"
+[ -n "$_wfn" ] || bad="$bad no-function"
+_wave_reval() { # <evidence> <run-absent:0|1> <where>
+  (
+    eval "$_wfn"
+    # shellcheck disable=SC2034  # read by the eval'd orchestrator function
+    REPO=owner/repo PR=7 HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    # shellcheck disable=SC2034  # read by the eval'd orchestrator function
+    P4B_PRE_ADAPTER_CODEX_EVIDENCE="$1"
+    p4b_codex_no_unsolicited_run() { return "$_absent"; }
+    cleanup_pre_post_refusal_side_effects() { echo "cleanup:$1"; }
+    hold_for_external_review() { echo "hold:$(printf '%s' "$1" | jq -r .codex_evidence)"; exit 6; }
+    _absent="$2"
+    revalidate_wave_canary_waiver "$3"
+    echo continued
+  )
+}
+[ "$(_wave_reval wave-canary-no-request 0 post-adapter)" = continued ] || bad="$bad absent-held"
+_o="$(_wave_reval wave-canary-no-request 1 post-adapter)" && _r=0 || _r=$?
+[ "$_r" = 6 ] && [ "$_o" = "hold:wave-canary-codex-run-in-flight" ] || bad="$bad running-not-held($_r:$_o)"
+_o="$(_wave_reval wave-canary-no-request 1 pre-post)" && _r=0 || _r=$?
+[ "$_r" = 6 ] && printf '%s' "$_o" | grep -q '^cleanup:' || bad="$bad pre-post-no-cleanup($_r)"
+[ "$(_wave_reval signal 1 pre-post)" = continued ] || bad="$bad non-wave-evidence-consulted"
+if [ -z "$bad" ]; then
+  pass "#2771: a Codex run that starts after the wave waiver holds the run at dispatch, after the adapter, and before the POST"
+else
+  fail "#2771: wave waiver revalidation wrong:$bad"
+fi
 
 # #1305: a spent governing request budget is a human-tiebreaker stop, never
 # authority for the Phase 4b adapter. The candidate policy deliberately raises

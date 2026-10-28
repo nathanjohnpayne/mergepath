@@ -405,13 +405,14 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # anchorless; one whose raw fields parsed to nothing is excluded too.
 #
 # A raw anchor FIELD is a line that opens with "Reviewed commit" (after
-# Markdown decoration) and does not continue the word, so "reviewed commits"
+# Markdown decoration, ordered-list numbering included: `1. Reviewed commit:`,
+# Phase 4b P1 on #2859) and does not continue the word, so "reviewed commits"
 # or a mid-sentence mention in an anchorless verdict's prose leaves it
 # anchorless, while a malformed field such as `Reviewed commit: not-a-sha`
 # is still caught (#2772 item 2).
 RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
   [ .[] | select((.user.login // "") == $bot)
-    | select((.body // "") | test("(?im)^[[:space:]>*_`#-]*reviewed commit(?![0-9a-z_])"))
+    | select((.body // "") | test("(?im)^[[:space:]>*_`#+-]*(?:[0-9]+[.)][[:space:]>*_`]*)?reviewed commit(?![0-9a-z_])"))
     | .id ]' <<<"$ISSUE_COMMENTS")
 # A verdict that names two different full SHAs reviewed no single commit:
 # crqe_verdicts keeps both and consistent_anchor would read the pair as no
