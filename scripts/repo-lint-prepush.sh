@@ -121,9 +121,9 @@
 #                           (off: run nothing; selected: only the selected
 #                           wrappers, no live assertions; full: as above)
 #   full_suite              MERGEPATH_PREPUSH_FULL_SUITE              run
-#                           (run | defer; validated, consumed by #2841)
+#                           (run | defer; below)
 #   max_minutes             MERGEPATH_PREPUSH_MAX_MINUTES             0
-#                           (0 = no budget; validated, consumed by #2841)
+#                           (the check budget in minutes, 0 = none; below)
 #   deep                    MERGEPATH_PREPUSH_DEEP (or --deep)        false
 #   nice                    MERGEPATH_PREPUSH_NICE                    10
 #   jobs_max                MERGEPATH_PREPUSH_JOBS_MAX                2
@@ -134,6 +134,29 @@
 # A missing file is the defaults. A file that is not one YAML mapping of
 # known keys with valid values fails the run closed (exit 2), whatever the
 # environment overrides. An environment variable set to '' counts as unset.
+#
+# Deferral and budget (#2841). CI's lint runs every check whatever the hook
+# does, so the hook may leave the expensive part to it, but never silently:
+# every step it leaves is named as deferred to CI, and a run that deferred
+# anything says so on its last line.
+#   full_suite: defer  when the change selects the complete surface (a full
+#                      trigger, a push event, a propagation-lane head), run
+#                      the live assertions and the wrappers the changed paths
+#                      select on their own (a full trigger selects the
+#                      wrappers that declare it in the graph); every other
+#                      wrapper is deferred to CI. Needs the changed paths and
+#                      the graph: without a merge base, or when the
+#                      classifier rejects the graph, the complete selection
+#                      runs. MERGEPATH_PREPUSH_LIVE=all runs what it defers.
+#   max_minutes: N     do not start a check that its previous duration says
+#                      would end past N minutes after the first check, nor
+#                      any check once N minutes have passed; running checks
+#                      finish, the unstarted ones are deferred to CI, and the
+#                      run exits 0 unless a check failed (a failed check
+#                      blocks the push, budget or not). The wait for another
+#                      run's lock is not counted (MERGEPATH_PREPUSH_LOCK_WAIT
+#                      bounds it). A later --retry-failed runs what was not
+#                      started.
 
 set -euo pipefail
 
@@ -143,8 +166,12 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 die() { echo "$PREFIX: $*" >&2; exit 2; }
 
 # ── internal worker: run one prepared step (invoked through xargs -P) ──
+# running/<id> holds the worker's pid until its result is written, so the
+# scheduler can tell a worker that died without a result from a live one
+# (best effort: without it a worker only counts as running until it reports).
 if [ "${1:-}" = "--exec-step" ]; then
   run_dir="$2"; id="$3"
+  { printf '%s\n' "$$" > "$run_dir/running/$id"; } 2>/dev/null || true
   name=$(cat "$run_dir/steps/$id.name")
   start=$(date +%s)
   rc=0
@@ -171,6 +198,7 @@ if [ "${1:-}" = "--exec-step" ]; then
   ) < /dev/null > "$run_dir/logs/$id.log" 2>&1 || rc=$?
   secs=$(( $(date +%s) - start ))
   printf '%s\t%s\t%s\n' "$rc" "$secs" "$name" > "$run_dir/results/$id"
+  rm -f "$run_dir/running/$id"
   if [ "$rc" -eq 0 ]; then
     printf '  PASS  %-46s %4ss\n' "$name" "$secs"
   else
@@ -993,6 +1021,92 @@ if [ "$S_FULL" = true ]; then
     FULL_REASON='the complete-surface rule'
   fi
 fi
+
+# ── full_suite: defer (#2841) ──
+# The complete surface is every graph wrapper, and on a loaded host it ran 3
+# checks in 38 minutes (#2839) while CI runs the same checks as the
+# authoritative gate. Under `full_suite: defer` the hook keeps what the
+# changed paths select on their own and names every other wrapper as left to
+# CI's lint:
+#   - a full-trigger path selects the wrappers that declare it in the graph's
+#     `wrappers` map, and itself when it is a wrapper;
+#   - an undeclared path selects nothing, as in the fallback above;
+#   - every other path is classified as a pull request from an ordinary
+#     branch, which is how CI classifies it when nothing else selects all.
+# The live assertions always run. Deferral needs the changed paths and the
+# graph: with no merge base, or an unreadable graph, the complete selection
+# runs (max_minutes still bounds it). Deferred wrappers take the fallback
+# lanes, which MERGEPATH_PREPUSH_LIVE=all still runs.
+DEFER_REASON=''
+DEFER_UNDECLARED=''
+DEFER_NOTE=''
+scope_parse "$L_SCOPE"
+if [ "$P_FULL" = true ] && [ "$(policy_value full_suite)" = defer ]; then
+  GRAPH=scripts/ci/repo-lint-dependencies.json
+  defer_classify() { bash "$CLASSIFIER" --event pull_request --head-ref ''; }
+  if [ "$FAIL_CLOSED" -eq 1 ]; then
+    DEFER_NOTE='the changed paths are unknown (no merge base with the remote default branch)'
+  elif ! d_triggers=$(jq -r 'if (.full_triggers | type) == "array" then .full_triggers[] | select(type == "string") else error("no full_triggers") end' "$GRAPH" 2>/dev/null) \
+       || ! d_patterns=$(jq -r 'if (.wrappers | type) == "object" then .wrappers | to_entries[] | .key as $w | .value[] | select(type == "string") | [$w, .] | @tsv else error("no wrappers") end' "$GRAPH" 2>/dev/null); then
+    DEFER_NOTE='the dependency graph is unreadable'
+  else
+    d_owned=''
+    d_rest=''
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      trigger=0
+      while IFS= read -r glob; do
+        [ -n "$glob" ] || continue
+        # shellcheck disable=SC2254 # graph entries are case globs by design
+        case "$p" in $glob) trigger=1; break ;; esac
+      done <<<"$d_triggers"
+      if [ "$trigger" -eq 0 ]; then
+        d_rest="${d_rest}${p}
+"
+        continue
+      fi
+      case "$p" in scripts/ci/check_*) d_owned="${d_owned}${p##*/}
+" ;; esac
+      while IFS=$'\t' read -r w glob; do
+        [ -n "$w" ] || continue
+        # shellcheck disable=SC2254
+        case "$p" in $glob) d_owned="${d_owned}${w}
+" ;; esac
+      done <<<"$d_patterns"
+    done <<<"$PATHS"
+    d_scope=$(printf '%s' "$d_rest" | sed '/^$/d' | defer_classify) || die "$CLASSIFIER failed"
+    if [ "$(scope_get full "$d_scope")" = true ]; then
+      # Some path selects everything alone: it is undeclared. Leave it to CI,
+      # like the fallback above, and classify the others without it.
+      d_kept=''
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ "$(printf '%s\n' "$p" | defer_classify | sed -n 's/^full=//p')" = true ]; then
+          DEFER_UNDECLARED="${DEFER_UNDECLARED}${p}
+"
+        else
+          d_kept="${d_kept}${p}
+"
+        fi
+      done <<<"$d_rest"
+      d_scope=$(printf '%s' "$d_kept" | sed '/^$/d' | defer_classify) || die "$CLASSIFIER failed"
+    fi
+    if [ "$(scope_get full "$d_scope")" = true ]; then
+      DEFER_NOTE='the classifier still selects the complete surface without the full triggers and undeclared paths (it rejected the graph, or another rule applies)'
+    else
+      scope_parse "$d_scope"
+      d_checks=$( { jq -r '.[]' <<<"$P_CHECKS"; printf '%s' "$d_owned"; } | sed '/^$/d' | LC_ALL=C sort -u \
+        | jq -Rsc 'split("\n") | map(select(length > 0))')
+      d_deep=$P_DEEP
+      [ -z "$d_owned" ] || d_deep=true
+      # As the classifier decides it: a selected wrapper enrolled in the
+      # graph's self_tests list starts the self-test legs.
+      d_self=$(jq -r --argjson c "$d_checks" '[(.self_tests // [])[] | select(. as $w | $c | index($w))] | length > 0' "$GRAPH" 2>/dev/null) || d_self=$P_SELF
+      L_SCOPE=$(printf 'deep=%s\nfull=false\nchecks=%s\nconsumer_replay=%s\nself_tests=%s' "$d_deep" "$d_checks" "$P_REPLAY" "$d_self")
+      DEFER_REASON="${FULL_REASON:-the complete-surface rule}"
+    fi
+  fi
+fi
 scope_parse "$L_SCOPE"
 L_DEEP=$P_DEEP; L_FULL=$P_FULL; L_CHECKS=$P_CHECKS; L_REPLAY=$P_REPLAY; L_SELF=$P_SELF
 
@@ -1061,7 +1175,9 @@ FB_N=$(lane_count fallback); DEEPFB_N=$(lane_count deep_fallback)
 [ "$LIVE_N" -gt 0 ] || die "no live checks found in $WORKFLOW (extraction broken?)"
 
 # Why the graph wrappers are selected, printed beside the run line.
-if [ -n "$FULL_REASON" ]; then
+if [ -n "$DEFER_REASON" ]; then
+  SELECTION_REASON="$SEL_N wrappers selected by the changed paths, $FB_N deferred to CI (full_suite=defer from $(policy_source full_suite); the complete surface is selected by $DEFER_REASON)"
+elif [ -n "$FULL_REASON" ]; then
   SELECTION_REASON="$SEL_N wrappers selected by the complete-surface rule ($FULL_REASON)"
 else
   SELECTION_REASON="$SEL_N wrappers selected by path, $FB_N by undeclared-path fallback"
@@ -1083,11 +1199,37 @@ undeclared_notice() {
   fi
   echo "$PREFIX: UNDECLARED PATH: $list is in no wrapper's declared inputs in scripts/ci/repo-lint-dependencies.json. CI's lint runs the complete surface for it; $ran."
 }
+# Names every step full_suite=defer leaves to CI (#2841): the fallback
+# wrappers, and the fallback deep steps when the deep lane runs here.
+# MERGEPATH_PREPUSH_LIVE=all runs them, so then nothing is deferred.
+defer_notice() {
+  if [ -n "$DEFER_NOTE" ]; then
+    echo "$PREFIX: full_suite=defer (from $(policy_source full_suite)): $DEFER_NOTE, so nothing is deferred; the complete selection runs"
+  fi
+  [ -n "$DEFER_REASON" ] || return 0
+  if [ -n "$DEFER_UNDECLARED" ]; then
+    echo "$PREFIX: full_suite=defer: $(printf '%s' "$DEFER_UNDECLARED" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g') is in no wrapper's declared inputs; it selects no wrapper here"
+  fi
+  if [ "$ALL_LIVE" -eq 1 ]; then
+    echo "$PREFIX: full_suite=defer: MERGEPATH_PREPUSH_LIVE=all runs the $FB_N wrappers it would defer"
+    return 0
+  fi
+  echo "$PREFIX: full_suite=defer: the complete surface is selected by $DEFER_REASON; running the $SEL_N wrappers the changed paths select, and deferring $FB_N wrappers to CI (CI's lint runs them):"
+  printf '%s\n' "$PLAN_JSON" | jq -r 'select(.lane == "fallback") | "    \(.name)"'
+  if [ "$DEEP" -eq 1 ] && [ "$DEEPFB_N" -gt 0 ]; then
+    echo "$PREFIX: full_suite=defer: also deferring $DEEPFB_N deep-lane steps to CI:"
+    printf '%s\n' "$PLAN_JSON" | jq -r 'select(.lane == "deep_fallback") | "    \(.job): \(.name)"'
+  fi
+}
 
 if [ "$PLAN" -eq 1 ]; then
   printf 'scope\tdeep=%s full=%s checks=%s consumer_replay=%s self_tests=%s\n' \
     "$S_DEEP" "$S_FULL" "$S_CHECKS" "$S_REPLAY" "$S_SELF"
-  if [ -n "$UNDECLARED" ]; then
+  if [ -n "$DEFER_REASON" ]; then
+    printf 'local_scope\tdeep=%s full=%s checks=%s consumer_replay=%s self_tests=%s\n' \
+      "$L_DEEP" "$L_FULL" "$L_CHECKS" "$L_REPLAY" "$L_SELF"
+    printf 'defer\t%s\n' "$DEFER_REASON"
+  elif [ -n "$UNDECLARED" ]; then
     printf 'local_scope\tdeep=%s full=%s checks=%s consumer_replay=%s self_tests=%s\n' \
       "$L_DEEP" "$L_FULL" "$L_CHECKS" "$L_REPLAY" "$L_SELF"
     printf '%s' "$UNDECLARED" | sed '/^$/d' | sed 's/^/undeclared\t/'
@@ -1095,6 +1237,7 @@ if [ "$PLAN" -eq 1 ]; then
   printf 'selection\t%s\n' "$SELECTION_REASON"
   printf '%s\n' "$PLAN_JSON" | jq -r '[.lane, .job, .name] | @tsv'
   undeclared_notice >&2
+  defer_notice >&2
   exit 0
 fi
 
@@ -1148,7 +1291,7 @@ if ! command -v shellcheck >/dev/null 2>&1; then
 fi
 
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-prepush.XXXXXX")
-mkdir -p "$RUN_DIR/steps" "$RUN_DIR/logs" "$RUN_DIR/results"
+mkdir -p "$RUN_DIR/steps" "$RUN_DIR/logs" "$RUN_DIR/results" "$RUN_DIR/running"
 printf '%s\n' "$ROOT" > "$RUN_DIR/root"
 printf '%s\n' "$NICE" > "$RUN_DIR/nice"
 if [ -n "$PY_SHIM" ]; then
@@ -1327,10 +1470,13 @@ retry_write() {
 # One host reading per run (#2575, #2581): the load that sized the jobs
 # default is the one printed here; the verdict line reads it again at the end.
 LOAD_START="$LOAD_1"
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
+BUDGET_MIN=$(policy_value max_minutes)
+BUDGET_S=$((BUDGET_MIN * 60))
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
 echo "$PREFIX: selection: $SELECTION_REASON"
 [ "$(policy_value mode)" != selected ] || echo "$PREFIX: mode=selected (from $(policy_source mode)): the $LIVE_N live assertions are not run here; CI runs them"
 undeclared_notice
+defer_notice
 if [ "$ALL_LIVE" -ne 1 ] && [ "$UNSEL_N" -gt 0 ]; then
   echo "$PREFIX: $UNSEL_N graph-declared wrappers are unselected for this change and not run (MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane)"
 fi
@@ -1339,10 +1485,53 @@ if [ "$DEEP" -ne 1 ] && [ "$DEEP_N" -gt 0 ]; then
   printf '%s\n' "$PLAN_JSON" | jq -r 'select(.lane == "deep") | "    \(.job): \(.name)"'
 fi
 
+# ── run: feed steps to the workers, inside the max_minutes budget (#2841) ──
+# Steps start longest-first (previous timings). The feeder hands xargs one
+# step only when fewer than sched_jobs() are in flight (handed out, with no
+# result yet, and not a worker that died without one), so each start is
+# decided at the moment a slot frees: that is where the budget is checked
+# and where a concurrency decision can change mid-run. Under max_minutes
+# (0 = none) a step whose previous duration would carry the run past the
+# budget, and every step once the budget is spent, is not started; it is
+# named as deferred to CI. Steps already running always finish, and a failed
+# step still blocks the push. The budget counts from the first check; the
+# wait for another run's lock is bounded on its own (MERGEPATH_PREPUSH_LOCK_WAIT).
+# xargs stays the process that runs the workers, so an interrupt reaches
+# every check the way it always has.
+sched_jobs() { printf '%s' "$JOBS"; }
+sched_in_flight() {   # $1 = steps handed out so far
+  local done_n dead=0 f pid
+  done_n=$(find "$RUN_DIR/results" -type f | wc -l | tr -d ' ')
+  for f in "$RUN_DIR"/running/*; do
+    [ -f "$f" ] || continue
+    [ ! -f "$RUN_DIR/results/${f##*/}" ] || continue
+    pid=$(cat "$f" 2>/dev/null) || pid=''
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || dead=$((dead + 1))
+  done
+  printf '%s' "$(($1 - done_n - dead))"
+}
+sched_feed() {
+  local prev sid fed=0 el
+  while IFS=$'\t' read -r prev sid; do
+    while [ "$(sched_in_flight "$fed")" -ge "$(sched_jobs)" ]; do sleep 1; done
+    if [ "$BUDGET_S" -gt 0 ]; then
+      el=$(( $(date +%s) - T0 ))
+      if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then
+        printf '%s\t%s\n' "$sid" "$prev" >> "$RUN_DIR/deferred"
+        continue
+      fi
+    fi
+    printf '%s\n' "$sid"
+    fed=$((fed + 1))
+  done < <(sort -t "$(printf '\t')" -k1,1nr -k2,2 "$RUN_DIR/order")
+}
+
 expected=$(wc -l < "$RUN_DIR/order" | tr -d ' ')
+: > "$RUN_DIR/deferred"
 prepush_lock_progress 0 "$expected"
 T0=$(date +%s)
-sort -t "$(printf '\t')" -k1,1nr -k2,2 "$RUN_DIR/order" | cut -f2 \
+sched_feed \
   | xargs -P "$JOBS" -n 1 bash "$SELF" --exec-step "$RUN_DIR" \
   | while IFS= read -r line; do
       # Each worker prints one result line; the lock record follows them so a
@@ -1351,6 +1540,8 @@ sort -t "$(printf '\t')" -k1,1nr -k2,2 "$RUN_DIR/order" | cut -f2 \
       prepush_lock_progress "$(find "$RUN_DIR/results" -type f | wc -l | tr -d ' ')" "$expected"
     done
 ELAPSED=$(( $(date +%s) - T0 ))
+BUDGET_N=$(wc -l < "$RUN_DIR/deferred" | tr -d ' ')
+started=$((expected - BUDGET_N))
 
 failed=0
 total=0
@@ -1360,9 +1551,25 @@ for f in "$RUN_DIR"/results/*; do
   rc=$(cut -f1 "$f")
   [ "$rc" = "0" ] || failed=$((failed + 1))
 done
-if [ "$total" -ne "$expected" ]; then
-  echo "$PREFIX: only $total of $expected checks reported a result; treating the run as failed" >&2
+if [ "$total" -ne "$started" ]; then
+  echo "$PREFIX: only $total of $started started checks reported a result; treating the run as failed" >&2
   failed=$((failed + 1))
+fi
+
+# Everything this run left to CI, for the last line (#2841): a run that
+# deferred anything never ends on a bare PASS.
+DEFERRED_SUMMARY=''
+if [ -n "$DEFER_REASON" ] && [ "$ALL_LIVE" -ne 1 ]; then
+  d_n=$FB_N
+  [ "$DEEP" -ne 1 ] || d_n=$((d_n + DEEPFB_N))
+  [ "$d_n" -eq 0 ] || DEFERRED_SUMMARY="$d_n by full_suite=defer"
+fi
+if [ "$BUDGET_N" -gt 0 ]; then
+  echo "$PREFIX: max_minutes=$BUDGET_MIN (from $(policy_source max_minutes)): $BUDGET_N checks were not started within the budget and are deferred to CI (CI's lint runs them):"
+  while IFS=$'\t' read -r sid _; do
+    [ -n "$sid" ] && echo "    $(cat "$RUN_DIR/steps/$sid.name")"
+  done < "$RUN_DIR/deferred"
+  DEFERRED_SUMMARY="${DEFERRED_SUMMARY:+$DEFERRED_SUMMARY, }$BUDGET_N by the ${BUDGET_MIN}-minute budget"
 fi
 RETRY_RECORDED=0
 if [ -n "$RETRY_FILE" ]; then
@@ -1384,11 +1591,15 @@ fi
 mins=$((ELAPSED / 60)); secs=$((ELAPSED % 60))
 LOAD_NOTE="host load $LOAD_START at start, $(host_load) at end"
 if [ "$failed" -eq 0 ]; then
-  echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s; $LOAD_NOTE). CI lint still runs and remains authoritative."
   if [ "${MERGEPATH_PREPUSH_KEEP_LOGS:-0}" = "1" ]; then
     echo "$PREFIX: logs kept in $RUN_DIR"
   else
     rm -rf "$RUN_DIR"
+  fi
+  if [ -n "$DEFERRED_SUMMARY" ]; then
+    echo "$PREFIX: PASS with checks DEFERRED TO CI ($total checks passed in ${mins}m${secs}s; $LOAD_NOTE; deferred: $DEFERRED_SUMMARY, named above). CI lint runs them and remains authoritative."
+  else
+    echo "$PREFIX: PASS ($total checks in ${mins}m${secs}s; $LOAD_NOTE). CI lint still runs and remains authoritative."
   fi
   exit 0
 fi
@@ -1403,9 +1614,10 @@ for f in "$RUN_DIR"/results/*; do
   tail -n 30 "$RUN_DIR/logs/$sid.log" >&2
   echo "" >&2
 done
-echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s; $LOAD_NOTE); the push is blocked. Logs: $RUN_DIR" >&2
+echo "$PREFIX: FAIL ($failed of $started checks failed in ${mins}m${secs}s; $LOAD_NOTE); the push is blocked. Logs: $RUN_DIR" >&2
 echo "$PREFIX: fix and push again. Bypass only in an emergency: git push --no-verify, or MERGEPATH_PREPUSH_SKIP=1 git push (CI lint still gates the merge)." >&2
 if [ "$RETRY_RECORDED" -eq 1 ]; then
   echo "$PREFIX: to re-run only the checks that did not pass (same commit, same selection): MERGEPATH_PREPUSH_RETRY_FAILED=1 git push" >&2
 fi
+[ -z "$DEFERRED_SUMMARY" ] || echo "$PREFIX: this run also DEFERRED checks TO CI ($DEFERRED_SUMMARY, named above); they did not run here" >&2
 exit 1
