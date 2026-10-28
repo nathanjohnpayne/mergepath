@@ -1644,7 +1644,10 @@ else
   # #2771: a wave canary is never sent a Codex request, so the barrier must
   # not wait on one. Only a canary the live byte verifier accepts takes that
   # posture; a wave scope on anything else stops here, as wave-capture below
-  # would, before the barrier spends any provider allowance.
+  # would, before the barrier spends any provider allowance. The posture is
+  # read by p4b_same_head_barrier in the sourced library and deliberately not
+  # exported, so no child process can inherit it.
+  # shellcheck disable=SC2034
   P4B_BARRIER_WAVE_CANARY=false
   if [ -n "$WAVE_SCOPE_FILE" ]; then
     WAVE_VERIFY_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-wave-verify.XXXXXX")" \
@@ -1656,6 +1659,7 @@ else
       p4b_die 3 "wave scope was supplied, but ${REPO}#${PR} is not a byte-verified canary of it"
     fi
     rm -rf "$WAVE_VERIFY_DIR"
+    # shellcheck disable=SC2034
     P4B_BARRIER_WAVE_CANARY=true
   fi
   run_same_head_barrier "pre-adapter"
