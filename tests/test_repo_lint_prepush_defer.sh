@@ -289,6 +289,12 @@ assert_budget_defers_unstarted() {   # $1 runner
   expect_has "budget: the unstarted step is listed" "$OUT" "$(printf 'not started within the budget and are deferred to CI (CI'"'"'s lint runs them):\n    check_unrelated')"
   expect_has "budget: the last line says the run deferred" "$(last_line "$OUT")" "PASS with checks DEFERRED TO CI"
   expect_has "budget: the last line counts the budget deferral" "$(last_line "$OUT")" "1 by the 1-minute budget"
+  # A garbled timing cache predicts nothing and never changes the outcome.
+  seed_timings "$(printf 'check_unrelated\tabc')" "$(printf 'check_owner\t1e9')"
+  run_paths "$r" "$GRAPH_PATH" --set max_minutes=1
+  expect "budget, garbled timings: the run passes" "$RC" "0"
+  expect "budget, garbled timings: every check runs" "$(ran check_unrelated)$(ran check_owner)" "ranran"
+  expect_lacks "budget, garbled timings: nothing is deferred" "$OUT" "DEFERRED"
 }
 
 # ── property 3: a failed step still blocks the push ──────────────────────
@@ -411,6 +417,10 @@ mutation_check assert_defer_selects_changed_paths silent-pass \
 mutation_check assert_budget_defers_unstarted budget-ignored \
   $'    if [ "$BUDGET_S" -gt 0 ]; then\n      el=' \
   $'    if false; then\n      el='
+# A garbled timing cache aborts the budget arithmetic.
+mutation_check assert_budget_defers_unstarted garbled-timing-trusted \
+  "    case \"\$prev\" in ''|*[!0-9]*) prev=0 ;; esac" \
+  '    :'
 # A budget deferral masks a failure.
 mutation_check assert_failure_blocks_after_budget failure-masked \
   $'if [ "$failed" -eq 0 ]; then\n  if [ "${MERGEPATH_PREPUSH_KEEP_LOGS' \

@@ -1515,6 +1515,8 @@ sched_feed() {
   local prev sid fed=0 el
   while IFS=$'\t' read -r prev sid; do
     while [ "$(sched_in_flight "$fed")" -ge "$(sched_jobs)" ]; do sleep 1; done
+    # The timing cache is advisory: a value it cannot vouch for predicts nothing.
+    case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
     if [ "$BUDGET_S" -gt 0 ]; then
       el=$(( $(date +%s) - T0 ))
       if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then
