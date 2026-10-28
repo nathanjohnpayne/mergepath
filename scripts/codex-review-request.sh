@@ -2918,6 +2918,9 @@ wait_for_trigger_ack() {
     # observable via REST, do not re-trigger. The terminal signal wins;
     # eyes is only an acknowledgment, never a clearance signal.
     rescan_codex_state "eyes-ack Codex scan"
+    # #2791: a newer request seen here stays seen, even if it is gone by the
+    # main poll.
+    codex_run_latch_superseding
     # An account-/connection-level block during the ack window is terminal
     # too (#722): re-posting `@codex review` cannot help a quota-exhausted or
     # not-connected account, so stop the ack gate (no re-trigger) and let the
@@ -3489,6 +3492,33 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
   exit 0
 fi
 
+# #2791: the id of a newer exact author request the scan selected in place of
+# the waited-on one, else empty. The selector takes the latest request, so a
+# larger id is a request posted during this wait (by another requester or by
+# hand). The row read since that newer request is also since the waited-on
+# one, so it is reported, but as ambiguous: it names neither. Once any scan
+# has seen a newer request (CODEX_RUN_SEEN_SUPERSEDING, latched by
+# codex_run_latch_superseding after every eyes-ack and poll scan), it stays
+# the answer: if that request is later edited away or deleted, the scan
+# selects the waited-on one again, but the newer run may still be active.
+# Defined here, ahead of run_trigger_ack_gate, because the ack wait scans too.
+codex_run_superseding_request() {
+  local scan_request watched
+  watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
+  scan_request=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty' 2>/dev/null) || scan_request=""
+  if [[ "$watched" =~ ^[0-9]+$ ]] && [[ "$scan_request" =~ ^[0-9]+$ ]] && [ "$scan_request" -gt "$watched" ]; then
+    printf '%s' "$scan_request"
+  else
+    printf '%s' "$CODEX_RUN_SEEN_SUPERSEDING"
+  fi
+}
+
+codex_run_latch_superseding() {
+  local superseding
+  superseding=$(codex_run_superseding_request)
+  [ -z "$superseding" ] || CODEX_RUN_SEEN_SUPERSEDING=$superseding
+}
+
 if [ "$TRIGGER_POSTED" = "true" ]; then
   # We just posted a trigger. The INITIAL_SCAN data is now stale by
   # definition — Codex will respond with something new. Skip the
@@ -3510,25 +3540,6 @@ fi
 # provider states is reported as a not-before time; a restated window moves
 # it when its deadline is later, whatever its duration.
 CODEX_RUN_DIAGNOSTIC_SECONDS=300
-# #2791: the id of a newer exact author request the scan selected in place of
-# the waited-on one, else empty. The selector takes the latest request, so a
-# larger id is a request posted during this wait (by another requester or by
-# hand). The row read since that newer request is also since the waited-on
-# one, so it is reported, but as ambiguous: it names neither. Once a poll has
-# seen a newer request (CODEX_RUN_SEEN_SUPERSEDING, set by codex_run_tick), it
-# stays the answer: if that request is later edited away or deleted, the scan
-# selects the waited-on one again, but the newer run may still be active.
-codex_run_superseding_request() {
-  local scan_request watched
-  watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
-  scan_request=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty' 2>/dev/null) || scan_request=""
-  if [[ "$watched" =~ ^[0-9]+$ ]] && [[ "$scan_request" =~ ^[0-9]+$ ]] && [ "$scan_request" -gt "$watched" ]; then
-    printf '%s' "$scan_request"
-  else
-    printf '%s' "$CODEX_RUN_SEEN_SUPERSEDING"
-  fi
-}
-
 codex_run_state_now() { # the waited-on request's reported state
   local scan_request watched state superseded
   watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
@@ -3549,14 +3560,13 @@ codex_run_state_now() { # the waited-on request's reported state
 
 codex_run_tick() {
   [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ] || return 0
-  local state window observed not_before superseding
+  local state window observed not_before
   # Set here, not in codex_run_state_now, which runs in a subshell. Once seen,
   # an overlap and a superseding request stay reported.
-  superseding=$(codex_run_superseding_request)
-  [ -z "$superseding" ] || CODEX_RUN_SEEN_SUPERSEDING=$superseding
+  codex_run_latch_superseding
   state=$(codex_run_state_now)
   if [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ] \
-     || [ -n "$superseding" ]; then
+     || [ -n "$CODEX_RUN_SEEN_SUPERSEDING" ]; then
     CODEX_RUN_OVERLAP=true
   fi
   if [ "$CODEX_RUN_DIAGNOSTIC_JSON" = null ] && [ "$ELAPSED" -ge "$CODEX_RUN_DIAGNOSTIC_SECONDS" ]; then

@@ -2226,6 +2226,17 @@ test_newer_request_supersedes_the_waited_on_one() {
   [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
     && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
     || fail "#2791 superseded, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+  # The same inside the eyes-ack window: the newer request lands and is
+  # deleted before the main poll starts, and the run still remembers it
+  # (Phase 4b on #2846).
+  dir=$(make_case "run-superseded-ack-deleted" 120 0 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=90 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+    && grep -q 'no Codex eyes acknowledgment' "$dir/err.log" \
+    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded in the ack window, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null); $(grep -c 'eyes acknowledgment' "$dir/err.log") ack log line(s)"
   [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
 }
 
