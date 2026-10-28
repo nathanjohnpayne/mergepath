@@ -64,6 +64,10 @@ unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGE
   MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
   MERGEPATH_PREPUSH_LOCK_TOOL GITHUB_OUTPUT 2>/dev/null || true
 unset MERGEPATH_PREPUSH_RETRY_FAILED 2>/dev/null || true
+# And every other MERGEPATH_PREPUSH_* control present, the per-repository
+# policy's overrides included (#2840: MERGEPATH_PREPUSH_MODE=selected would
+# drop the live checks these fixtures assert on), plus any added later.
+for v in $(env | sed -n 's/^\(MERGEPATH_PREPUSH_[A-Z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid

@@ -13,6 +13,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_prepush.sh"
+# The per-repository policy, .github/prepush.yml (#2840).
+POLICY_TEST="$REPO_ROOT/tests/test_repo_lint_prepush_policy.sh"
 
 # Consumer-safety guard (#601), marker-FIRST: the scripts/ci kit travels to
 # every consumer, but the pre-push mirror and its suite are hub-only (not
@@ -24,10 +26,13 @@ if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
   echo "check_repo_lint_prepush: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push mirror is hub-only)"
   exit 0
 fi
-if [ ! -f "$TEST_SCRIPT" ]; then
-  echo "check_repo_lint_prepush: ERROR (missing $TEST_SCRIPT)" >&2
-  exit 1
-fi
+for t in "$TEST_SCRIPT" "$POLICY_TEST"; do
+  if [ ! -f "$t" ]; then
+    echo "check_repo_lint_prepush: ERROR (missing $t)" >&2
+    exit 1
+  fi
+done
 
 bash "$TEST_SCRIPT"
+bash "$POLICY_TEST"
 echo "check_repo_lint_prepush: PASS"
