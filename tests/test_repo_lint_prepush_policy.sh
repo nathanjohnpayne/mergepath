@@ -17,7 +17,7 @@
 #                    environment overrides the offending key;
 #   which copy     - a hook run reads the pushed commit's copy, not an
 #                    uncommitted edit, and a committed invalid file blocks
-#                    the push;
+#                    the push, and so does a committed symlink at the path;
 #   shipped file   - mergepath's own .github/prepush.yml resolves to exactly
 #                    the built-in defaults, so the hub's behaviour is unchanged.
 # Each of the first three is then re-run against a mutated copy of the runner
@@ -363,6 +363,15 @@ assert_invalid_file_refused() {   # $1 runner
   run_real "$r" other/input.txt
   expect "invalid file: a dangling symlink is refused, not read as absent" "$RC" "2"
   rm -f "$POLICY"
+  # A symlink to a valid policy is refused too: its target can lie outside
+  # the checked tree, where an uncommitted edit would change the policy.
+  printf 'mode: full\n' > "$TMP/outside-policy.yml"
+  ln -s "$TMP/outside-policy.yml" "$POLICY"
+  run_real "$r" other/input.txt
+  expect "invalid file: a symlink to a valid policy is refused" "$RC" "2"
+  expect_has "invalid file: the symlink refusal names the reason" "$OUT" "invalid .github/prepush.yml: a symlink"
+  expect "invalid file: a symlink to a valid policy runs no check" "$(ran_count)" "0"
+  rm -f "$POLICY" "$TMP/outside-policy.yml"
 }
 
 # A mutated copy of the runner: $2 must occur exactly once in it, so a
@@ -439,6 +448,18 @@ if [ "$RC" -ne 0 ]; then ok "hook: a committed invalid policy blocks the push"; 
 expect_has "hook: the refusal names the file and the bad value" "$OUT" "invalid .github/prepush.yml: mode must be one of off, selected, full (got 'sometimes')"
 expect "hook: the remote did not receive the invalid policy" "$(git -C "$FIXREMOTE" rev-parse -q --verify refs/heads/feat/policy-invalid || echo none)" "none"
 git -C "$FIX" checkout -q -- .github/prepush.yml
+# A committed in-tree symlink at the policy path blocks the push, even though
+# its target is a valid policy in the same commit.
+rm -f "$POLICY"
+printf 'mode: full\n' > "$FIX/.github/prepush-target.yml"
+ln -s prepush-target.yml "$POLICY"
+git -C "$FIX" add -A
+git -C "$FIX" commit -q -m 'policy: symlink'
+reset_probe
+RC=0; OUT=$(cd "$FIX" && git push origin feat/policy:refs/heads/feat/policy-symlink 2>&1) || RC=$?
+if [ "$RC" -ne 0 ]; then ok "hook: a committed symlink policy blocks the push"; else bad "hook: a committed symlink policy was pushed: $OUT"; fi
+expect_has "hook: the refusal names the symlink" "$OUT" "invalid .github/prepush.yml: a symlink"
+expect "hook: the remote did not receive the symlink policy" "$(git -C "$FIXREMOTE" rev-parse -q --verify refs/heads/feat/policy-symlink || echo none)" "none"
 git -C "$FIX" checkout -q main
 
 echo "Part 5: mergepath's own .github/prepush.yml keeps today's behaviour"
@@ -477,6 +498,10 @@ mutation_check assert_missing_file_default missing-means-off \
 mutation_check assert_missing_file_default missing-means-invalid \
   $'  if [ ! -e "$f" ] && [ ! -L "$f" ]; then\n    return 0' \
   $'  if [ ! -e "$f" ] && [ ! -L "$f" ]; then\n    policy_refuse "absent"'
+# A symlink at the policy path is followed instead of refused.
+mutation_check assert_invalid_file_refused symlink-followed \
+  '  [ ! -L "$f" ] || policy_refuse "a symlink' \
+  '  true || policy_refuse "a symlink'
 # An invalid file falls back to the defaults with a warning.
 mutation_check assert_invalid_file_refused invalid-falls-back \
   '  die "invalid $PREPUSH_POLICY_FILE: $*.' \

@@ -551,6 +551,10 @@ policy_read_file() {
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
     return 0
   fi
+  # A symlink is refused before -f/-r follow it: its target can lie outside
+  # the hook's committed snapshot, so an uncommitted edit there would change
+  # the policy a push runs under.
+  [ ! -L "$f" ] || policy_refuse "a symlink (the policy must be a regular file in the checked tree)"
   { [ -f "$f" ] && [ -r "$f" ]; } || policy_refuse "not a readable regular file"
   if ! json=$(yq -o=json -I=0 '.' "$f" 2>&1); then
     err=$(printf '%s\n' "$json" | head -n 1)
