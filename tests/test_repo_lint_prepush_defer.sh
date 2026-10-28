@@ -289,6 +289,19 @@ assert_budget_defers_unstarted() {   # $1 runner
   expect_has "budget: the unstarted step is listed" "$OUT" "$(printf 'not started within the budget and are deferred to CI (CI'"'"'s lint runs them):\n    check_unrelated')"
   expect_has "budget: the last line says the run deferred" "$(last_line "$OUT")" "PASS with checks DEFERRED TO CI"
   expect_has "budget: the last line counts the budget deferral" "$(last_line "$OUT")" "1 by the 1-minute budget"
+  # A budget that defers every step hands the workers nothing: the run still
+  # passes and lists them all (GNU xargs runs its command once on empty
+  # input, so the worker must accept no step id).
+  seed_timings "$(printf 'check_live\t9999')" "$(printf 'check_live2\t9999')" "$(printf 'check_graphed\t9999')"
+  run_paths "$r" other/input.txt --set max_minutes=1
+  expect "budget, all deferred: the run passes" "$RC" "0"
+  expect "budget, all deferred: nothing ran" "$(ran check_live)$(ran check_live2)$(ran check_graphed)" "not runnot runnot run"
+  expect_has "budget, all deferred: the last line counts all three" "$(last_line "$OUT")" "3 by the 1-minute budget"
+  mkdir -p "$TMP/emptyrun/results"
+  RC=0; bash "$r" --exec-step "$TMP/emptyrun" >/dev/null 2>&1 || RC=$?
+  expect "worker with no step id (GNU xargs on empty input): exits 0" "$RC" "0"
+  expect "worker with no step id: writes no result" "$(find "$TMP/emptyrun/results" -type f | wc -l | tr -d ' ')" "0"
+  rm -rf "$TMP/emptyrun"
   # A garbled timing cache predicts nothing and never changes the outcome.
   seed_timings "$(printf 'check_unrelated\tabc')" "$(printf 'check_owner\t1e9')"
   run_paths "$r" "$GRAPH_PATH" --set max_minutes=1
@@ -421,6 +434,10 @@ mutation_check assert_budget_defers_unstarted budget-ignored \
 mutation_check assert_budget_defers_unstarted garbled-timing-trusted \
   "    case \"\$prev\" in ''|*[!0-9]*) prev=0 ;; esac" \
   '    :'
+# The worker trips over GNU xargs's empty invocation.
+mutation_check assert_budget_defers_unstarted empty-invocation-fails \
+  '  [ -n "${3:-}" ] || exit 0' \
+  '  :'
 # A budget deferral masks a failure.
 mutation_check assert_failure_blocks_after_budget failure-masked \
   $'if [ "$failed" -eq 0 ]; then\n  if [ "${MERGEPATH_PREPUSH_KEEP_LOGS' \
