@@ -139,6 +139,9 @@ feedback_archive:
 # shape is otherwise indistinguishable from an absent key.
 non_reviewer_identities:
   - nathanpayne-robot
+  # The hosted Octo STS app's bot (#2727 / #2732): the CI app identity that
+  # resolves threads below. Never a reviewer.
+  - octo-sts[bot]
 
 # ---------------------------------------------------------------------------
 # CI App Thread-Resolution Identity (#2726)
@@ -158,9 +161,11 @@ non_reviewer_identities:
 # otherwise the mode refuses to run. github-actions[bot] and the review bots
 # are refused. scripts/merge-clearance-gate.sh treats the configured login as
 # a non-reviewer even if it is missing above. The app itself is specified in
-# #2727; leave this unset until it exists. Example:
-#
-#   thread_resolution_ci_app_identity: "<app-slug>[bot]"
+# #2727. The #2732 pilot sets it to the hosted Octo STS app's bot. That login is
+# Chainguard's shared bot, so on this repository it acts only through this
+# repository's installation and the thread-resolution trust policy in
+# .github/chainguard/ (docs/audits/ci-app-credentials-2026-10.md § Hosting).
+thread_resolution_ci_app_identity: "octo-sts[bot]"
 
 # ---------------------------------------------------------------------------
 # Default External Reviewer

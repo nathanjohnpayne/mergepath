@@ -156,6 +156,13 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.github/templates/required-workflows/'
   'scripts/build/materialize-merge-queue-policy-source.sh'
 
+  # Octo STS trust policies (#2727 / #2732, ADR 0004). Each policy names ONE
+  # repository by name and numeric ID, so the hub's never fit a new repo:
+  # check_ci_app_trust rejects a policy for another repository, and the
+  # thread-resolution lane would route to the CI app on a policy no exchange
+  # can satisfy. A repository's policies are generated for it at rollout.
+  '.github/chainguard/'
+
   # Local operator state under .claude/
   '.claude/worktrees/'
   '.claude/settings.local.json'
