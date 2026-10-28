@@ -183,6 +183,9 @@ die() { echo "$PREFIX: $*" >&2; exit 2; }
 # scheduler can tell a worker that died without a result from a live one
 # (best effort: without it a worker only counts as running until it reports).
 if [ "${1:-}" = "--exec-step" ]; then
+  # GNU xargs runs the command once even on empty input (BSD xargs does
+  # not): when the budget defers every step there is nothing to run.
+  [ -n "${3:-}" ] || exit 0
   run_dir="$2"; id="$3"
   { printf '%s\n' "$$" > "$run_dir/running/$id"; } 2>/dev/null || true
   name=$(cat "$run_dir/steps/$id.name")
@@ -736,7 +739,11 @@ done
 # An explicit cap is checked now; the default, NICE and DEEP come from the
 # policy once the checked tree is known (#2840).
 if [ -n "$JOBS" ]; then
-  case "$JOBS" in *[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
+  # Normalized like the policy's integer keys: the feeder compares against
+  # it, so a zero spelled 00 would wait forever rather than fail.
+  case "$JOBS" in *[!0-9]*) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
+  [ "${#JOBS}" -le 9 ] && [ $((10#$JOBS)) -gt 0 ] || die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')"
+  JOBS=$((10#$JOBS))
 fi
 case "$RETRY" in 1|true) RETRY=1 ;; *) RETRY=0 ;; esac
 
@@ -1584,6 +1591,8 @@ sched_feed() {
       [ "$in_flight" -ge "$SCHED_CUR" ] || break
       sleep 1
     done
+    # The timing cache is advisory: a value it cannot vouch for predicts nothing.
+    case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
     if [ "$BUDGET_S" -gt 0 ]; then
       el=$(( $(date +%s) - T0 ))
       if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then

@@ -1,0 +1,203 @@
+name: Trusted policy mutations
+
+# ADR 0004's trusted consumer for callers C6 and C7 (#2727 slice 3c;
+# docs/audits/ci-app-credentials-2026-10.md). pr-review-policy.yml's External
+# Review Check is the producer: a candidate-triggered `pull_request` run that
+# today makes two label writes with the CI-actor PAT.
+#
+#   C6  Retract a `needs-external-review` the policy workflow applied itself
+#       after a fail-closed read, once the classification is `under-threshold`
+#       or `carried-forward` (#1321).
+#   C7  For a verified propagation mirror, remove `needs-external-review` and
+#       nudge merge-clearance-gate.yml with a `merge-clearance-recheck`
+#       dispatch (#620, #658).
+#
+# This workflow re-derives both decisions from default-branch code, so the
+# credential moves off the candidate-triggered run. Every field of the
+# workflow_run event is an untrusted nomination: admission
+# (scripts/workflow/trusted-consumer-admission.sh) re-reads all of it live,
+# and the classifier is the default branch's copy of
+# scripts/workflow/external_review_classify.sh, the same file the producer
+# runs (#2727 slice 3b).
+#
+# INERT until cutover (#2730). Every job is gated on the repository variable
+# CI_APP_POLICY_MUTATIONS == 'true', which the owner sets together with
+# committing .github/chainguard/policy-mutations.sts.yaml and removing the
+# producer's PAT writes. Without the variable every run is skipped. With the
+# variable but without the trust policy, the exchange fails and the run fails:
+# there is no fallback to a PAT.
+
+on:
+  workflow_run:
+    workflows: [PR Review Policy]
+    types: [completed]
+
+permissions: {}
+
+# One run per head at a time. A newer pending run replaces an older pending
+# one, which is safe: every run re-derives the live state of its PR.
+concurrency:
+  group: trusted-policy-mutations-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  # Admission and classification. Holds only the read-only GITHUB_TOKEN. It
+  # checks out the candidate head as DATA for the classifier (its diff and the
+  # propagation byte compare) and executes nothing from it: every script runs
+  # from the trusted checkout at github.workflow_sha.
+  classify:
+    name: Admit and classify
+    if: vars.CI_APP_POLICY_MUTATIONS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      pr: ${{ steps.admit.outputs.pr }}
+      head_sha: ${{ steps.admit.outputs.head_sha }}
+      base_sha: ${{ steps.admit.outputs.base_sha }}
+      classification: ${{ steps.classify.outputs.classification }}
+      propagation_lane: ${{ steps.classify.outputs.propagation_lane }}
+    steps:
+      - name: Checkout the trusted scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Admit the producer run
+        id: admit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rc=0
+          ADMITTED=$(trusted/scripts/workflow/trusted-consumer-admission.sh admit \
+            --producer pr-review-policy.yml --events pull_request) || rc=$?
+          # 3 is a decline: a fork, a borrowed name, a moved or ambiguous PR.
+          # It is a no-op, never a failure of the PR.
+          if [ "$rc" -eq 3 ]; then
+            echo "Declined; nothing to do."
+            exit 0
+          fi
+          [ "$rc" -eq 0 ] || exit "$rc"
+          jq -r '"pr=\(.pr)", "head_sha=\(.head_sha)", "base_sha=\(.base_sha)", "base_ref=\(.base_ref)"' \
+            <<<"$ADMITTED" >>"$GITHUB_OUTPUT"
+
+      - name: Read the PR's live branch and author
+        id: live
+        if: steps.admit.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.admit.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '"head_ref=\(.head.ref)", "author=\(.user.login)"' >>"$GITHUB_OUTPUT"
+
+      - name: Checkout the candidate as data
+        if: steps.admit.outputs.pr != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ steps.admit.outputs.head_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The producer's classification, re-derived. EVENT_ACTION is this
+      # event's name, never `labeled`/`unlabeled`, so the classifier never
+      # takes its external-cleared branch; neither C6 nor C7 acts on that
+      # outcome.
+      - name: Classify with the default branch's classifier
+        id: classify
+        if: steps.admit.outputs.pr != ''
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.admit.outputs.pr }}
+          EVENT_ACTION: workflow_run
+          BASE_SHA: ${{ steps.admit.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          HEAD_REF: ${{ steps.live.outputs.head_ref }}
+          PR_AUTHOR: ${{ steps.live.outputs.author }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ steps.admit.outputs.base_ref }}
+        run: bash "$GITHUB_WORKSPACE/trusted/scripts/workflow/external_review_classify.sh"
+
+  # The only job that holds the app token. ADR 0004's execution rules apply to
+  # all of it (scripts/ci/ci_app_trust.py allow-lists exactly this job): a
+  # checkout at github.workflow_sha, SHA-pinned actions, default-branch
+  # scripts, no environment. Every write is preceded by the admission recheck
+  # fence on the classified pair.
+  mutate:
+    name: Apply the policy label mutation (CI app)
+    needs: classify
+    if: >-
+      vars.CI_APP_POLICY_MUTATIONS == 'true' && needs.classify.outputs.pr != '' &&
+      (needs.classify.outputs.propagation_lane == 'true' ||
+       needs.classify.outputs.classification == 'under-threshold' ||
+       needs.classify.outputs.classification == 'carried-forward')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Exchange the OIDC token for the policy-mutations app token
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: policy-mutations
+
+      - name: Apply C6 or C7
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LABEL_REMOVAL_TOKEN: ${{ steps.sts.outputs.token }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          EXPECTED_BASE_SHA: ${{ needs.classify.outputs.base_sha }}
+          CLASSIFICATION: ${{ needs.classify.outputs.classification }}
+          PROPAGATION_LANE: ${{ needs.classify.outputs.propagation_lane }}
+          REPO: ${{ github.repository }}
+        run: scripts/workflow/policy_mutations_apply.sh
+
+  # C7's dispatch. GITHUB_TOKEN may send a repository_dispatch, and that
+  # event does start workflow runs (the no-trigger rule exempts it), so the
+  # nudge needs no app token, only contents: write, kept off the app job.
+  # Best-effort, as in the producer: merge-clearance-gate.yml re-verifies the
+  # live pair itself and its scheduled sweep recovers a lost nudge.
+  recheck-dispatch:
+    name: Nudge the Merge clearance gate
+    needs: [classify, mutate]
+    if: >-
+      always() && vars.CI_APP_POLICY_MUTATIONS == 'true' &&
+      needs.classify.result == 'success' && needs.classify.outputs.propagation_lane == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Dispatch merge-clearance-recheck
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$PR_NUMBER" in ''|*[!0-9]*) echo "::error::no admitted PR" >&2; exit 1 ;; esac
+          # Keep the event type in sync with merge-clearance-gate.yml.
+          gh api -X POST "repos/$REPO/dispatches" \
+            -f event_type=merge-clearance-recheck -F "client_payload[pr]=$PR_NUMBER" \
+            || echo "note: merge-clearance-recheck dispatch failed (#658); the scheduled sweep will recover the Merge clearance gate."
