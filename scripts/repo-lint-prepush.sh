@@ -717,7 +717,11 @@ done
 # An explicit cap is checked now; the default, NICE and DEEP come from the
 # policy once the checked tree is known (#2840).
 if [ -n "$JOBS" ]; then
-  case "$JOBS" in *[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
+  # Normalized like the policy's integer keys: the feeder compares against
+  # it, so a zero spelled 00 would wait forever rather than fail.
+  case "$JOBS" in *[!0-9]*) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
+  [ "${#JOBS}" -le 9 ] && [ $((10#$JOBS)) -gt 0 ] || die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')"
+  JOBS=$((10#$JOBS))
 fi
 case "$RETRY" in 1|true) RETRY=1 ;; *) RETRY=0 ;; esac
 

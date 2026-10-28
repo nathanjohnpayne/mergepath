@@ -356,6 +356,18 @@ expect "spent budget: the long check ran to the end" "$(ran check_graphed)" "ran
 expect "spent budget: the later checks were not started" "$(ran check_live)$(ran check_live2)" "not runnot run"
 expect_has "spent budget: the last line counts them" "$(last_line "$OUT")" "2 by the 1-minute budget"
 
+# A zero concurrency, however it is spelled, is refused rather than left to
+# a feeder that would wait for a free slot forever.
+for j in 0 00 000 1x; do
+  plan_paths "$RUNNER" other/input.txt --jobs "$j"
+  expect "--jobs $j is refused" "$RC" "2"
+done
+RC=0; OUT=$(cd "$FIX" && printf 'other/input.txt\n' | MERGEPATH_PREPUSH_JOBS=000 bash "$RUNNER" --paths-from - --plan 2>&1) || RC=$?
+expect "MERGEPATH_PREPUSH_JOBS=000 is refused" "$RC" "2"
+expect_has "the refusal names the value" "$OUT" "must be a positive integer (got '000')"
+plan_paths "$RUNNER" other/input.txt --jobs 02
+expect "--jobs 02 is accepted" "$RC" "0"
+
 echo "Part 3: a failed step still blocks the push"
 assert_failure_blocks_after_budget "$RUNNER"
 
