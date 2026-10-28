@@ -309,7 +309,8 @@
       "tests/test_disagreement_detector.sh",
       "scripts/ci/fixtures/disagreement-detector/*",
       "scripts/disagreement-detector.cjs",
-      "scripts/codex-review-check.sh"
+      "scripts/codex-review-check.sh",
+      ".github/workflows/agent-review.yml"
     ],
     "check_doc_ownership": [
       "scripts/lib/ci-check-modes.sh",
@@ -648,6 +649,7 @@
       "scripts/merge-clearance-gate.sh",
       "scripts/self-approval-detector.cjs",
       "scripts/render-self-approval-bootstrap.cjs",
+      "scripts/workflow/review-triage.cjs",
       "scripts/workflow/approval-independence-check.sh",
       "scripts/workflow/approval-merge-continuation.sh",
       "scripts/lib/gh-api-array.sh",

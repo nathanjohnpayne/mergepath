@@ -17,6 +17,7 @@ COMMAND_CLASSIFIER="scripts/lib/gh-command-classifier.sh"
 for file in \
   "$DETECTOR" \
   "$RENDERER" \
+  scripts/workflow/review-triage.cjs \
   "$TEST_SCRIPT" \
   "$INDEPENDENCE_TEST" \
   "$COMMAND_CLASSIFIER" \

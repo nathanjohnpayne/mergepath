@@ -168,6 +168,88 @@ else
   fail "COMMENTED + APPROVED expected noop, got $COMMENTED"
 fi
 
+# --- resolveDisagreement: the job's whole decision (#2727 3d) ---
+# Cases: a proven allow-list, then every unproven form (#975), which must
+# classify every reviewer on the PR and never remove the label.
+RESOLVE_OUT=$(DETECTOR_PATH="$DETECTOR" node -e '
+  const { resolveDisagreement } = require(process.env.DETECTOR_PATH);
+  const conflict = [
+    { user:{login:"random-human"}, state:"APPROVED", commit_id:"HEAD", submitted_at:"2026-05-12T10:00:00Z" },
+    { user:{login:"random-other"}, state:"CHANGES_REQUESTED", commit_id:"HEAD", submitted_at:"2026-05-12T11:00:00Z" },
+  ];
+  const cases = [
+    ["proven list ignores outsiders", { reviews: conflict, reviewersJson: "[\"nathanpayne-claude\"]", headSha: "HEAD", hasLabel: false }, "noop", true],
+    ["proven list clears a resolved escalation", { reviews: [], reviewersJson: "[\"nathanpayne-claude\"]", headSha: "HEAD", hasLabel: true }, "remove", true],
+    ["missing list classifies every reviewer", { reviews: conflict, headSha: "HEAD", hasLabel: false }, "apply", false],
+    ["empty list classifies every reviewer", { reviews: conflict, reviewersJson: "[]", headSha: "HEAD", hasLabel: false }, "apply", false],
+    ["malformed list never removes", { reviews: [], reviewersJson: "{nope", headSha: "HEAD", hasLabel: true }, "noop", false],
+    ["non-array list never removes", { reviews: [], reviewersJson: "{\"a\":1}", headSha: "HEAD", hasLabel: true }, "noop", false],
+    ["list without a usable name never removes", { reviews: [], reviewersJson: "[\"\", 7, null]", headSha: "HEAD", hasLabel: true }, "noop", false],
+  ];
+  for (const [name, input, decision, proven] of cases) {
+    const got = resolveDisagreement(input);
+    const ok = got.decision === decision && got.allowListProven === proven;
+    process.stdout.write(`${ok ? "PASS" : "FAIL"}\t${name}\t${JSON.stringify(got)}\n`);
+  }
+')
+while IFS=$'\t' read -r verdict name got; do
+  if [[ "$verdict" == "PASS" ]]; then pass "resolveDisagreement: $name"; else fail "resolveDisagreement: $name (got $got)"; fi
+done <<<"$RESOLVE_OUT"
+
+# --- The real detect-disagreement step ---
+# Runs the workflow's "Check for conflicting reviews" script with fake GitHub
+# APIs, once against the current module and once against a default-branch
+# module that predates resolveDisagreement (the bootstrap case), which must
+# treat the allow-list as unproven: no removal, and a failed run.
+STEP_OUT=$(ROOT="$ROOT" node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const source = fs.readFileSync(path.join(process.env.ROOT, ".github/workflows/agent-review.yml"), "utf8");
+  const step = source.slice(source.indexOf("      - name: Check for conflicting reviews"));
+  const lines = step.slice(step.indexOf("          script: |\n") + "          script: |\n".length).split("\n");
+  const script = [];
+  for (const line of lines) {
+    if (line && !line.startsWith("            ")) break;
+    script.push(line.replace(/^ {12}/, ""));
+  }
+  const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+  const run = new AsyncFunction("github", "context", "core", "require", script.join("\n"));
+  const real = require(path.join(process.env.ROOT, "scripts/disagreement-detector.cjs"));
+  async function attempt(detector) {
+    const calls = []; let failed = null;
+    const github = {
+      paginate: async () => [],
+      rest: {
+        pulls: { listReviews() {} },
+        issues: {
+          listLabelsOnIssue: async () => ({ data: [{ name: "needs-human-review" }] }),
+          addLabels: async () => calls.push("addLabels"),
+          removeLabel: async () => calls.push("removeLabel"),
+          createComment: async () => calls.push("createComment"),
+        },
+      },
+    };
+    const context = { repo: { owner: "o", repo: "r" }, payload: { pull_request: { number: 7, head: { sha: "HEAD" } } } };
+    const core = { setFailed: message => { failed = message; } };
+    const fakeRequire = name => name.endsWith("disagreement-detector.cjs") ? detector : require(name);
+    process.env.GITHUB_WORKSPACE = process.env.ROOT;
+    process.env.REVIEWERS_JSON = "[\"nathanpayne-claude\"]";
+    await run(github, context, core, fakeRequire);
+    return { calls: calls.join(","), failed: Boolean(failed) };
+  }
+  (async () => {
+    const current = await attempt(real);
+    const ok1 = current.calls === "removeLabel,createComment" && current.failed === false;
+    process.stdout.write(`${ok1 ? "PASS" : "FAIL"}\tcurrent module clears a resolved escalation\t${JSON.stringify(current)}\n`);
+    const legacy = await attempt({ decide: real.decide });
+    const ok2 = legacy.calls === "" && legacy.failed === true;
+    process.stdout.write(`${ok2 ? "PASS" : "FAIL"}\ta module without resolveDisagreement fails closed\t${JSON.stringify(legacy)}\n`);
+  })().catch(error => { process.stdout.write(`FAIL\tstep runner threw\t${error.message}\n`); });
+')
+while IFS=$'\t' read -r verdict name got; do
+  if [[ "$verdict" == "PASS" ]]; then pass "workflow step: $name"; else fail "workflow step: $name (got $got)"; fi
+done <<<"$STEP_OUT"
+
 echo
 echo "test_disagreement_detector: $PASS PASS / $FAIL FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
