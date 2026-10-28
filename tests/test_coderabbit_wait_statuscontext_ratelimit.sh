@@ -1566,6 +1566,12 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   sed 's/\[ "\$row" != UNREADABLE \] || return 3/[ "$row" != UNREADABLE ] || continue/' "$snip" >"$mut"
   grep -q 'UNREADABLE \] || continue' "$mut" || bad="$bad mutation-not-applied"
   latch_case 1 mutant-non-string-body-reads-clear '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]' "$mut"
+  # A long history is read, not unreadable (Codex P2 on #2857): ~1.5 MiB of
+  # comments is past both Linux's 128 KiB per-argument limit and macOS's 1 MiB
+  # ARG_MAX, so passing the lists on argv would fail E2BIG and read as rc 3.
+  local big
+  big=$(jq -cn '[range(30) | {id: ., user: {login: "someone"}, created_at: "2026-06-04T00:00:00Z", body: ("x" * 50000)}]')
+  latch_case 1 large-history-reads-clear "$big" "$big"
   if [ -z "$bad" ]; then
     pass "PE-latch: #2752 — the latch is set by a comment or head-pinned notice, superseded only by a strictly later run or head-naming summary (#2751), and every unreadable input fails closed"
   else
@@ -1604,8 +1610,10 @@ PY
   done
   [ "$(grep -c 'crw_probe_withhold_on_processing_error "' "$ROOT/scripts/coderabbit-wait.sh")" = 2 ] \
     || bad="$bad probe-reported-sites"
-  # The per-path #2660 checks are gone: the classifier is the only other caller.
-  [ "$(grep -c 'crw_is_processing_error_notice "' "$ROOT/scripts/coderabbit-wait.sh")" = 2 ] \
+  # The per-path #2660 checks are gone. The three callers are the classifier,
+  # the latch, and the fast path's grading-only classification of a superseded
+  # notice comment (Codex P1 on #2857), which decides no clearance.
+  [ "$(grep -c 'crw_is_processing_error_notice "' "$ROOT/scripts/coderabbit-wait.sh")" = 3 ] \
     || bad="$bad per-path-processing-error-checks-remain"
   if [ -z "$bad" ]; then
     pass "PE-edges: #2752 — all five clearance emits, the fast path, rc-7 evidence and the emitter backstop consult the one latch"
@@ -1731,6 +1739,27 @@ test_processing_error_superseded_by_later_summary_clears() {
   rc=$(run_case "$dir")
   [ "$rc" = "0" ] || fail "PE-2751 comment: a later head-naming summary should supersede a notice comment, got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "PE-2751: #2751 — a strictly later head-naming summary supersedes a processing-error notice (review object or comment), an earlier one does not"
+}
+
+# --- Codex P1 on #2857: the run that supersedes a notice is still graded -------
+# A notice comment at T, a current-head review carrying `_🟠 Major_` at T+3, and
+# the success status at T+5. The latch is clear (the run supersedes the
+# comment), but the run is not therefore clean: its body must still be graded
+# by the fast path's refusal arm, or the head clears over a blocking finding.
+test_processing_error_recovery_run_is_graded() {
+  local dir rc before=$FAIL reviews
+  reviews='[{"id":8813,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:03Z","body":"Review completed.\n\n_🟠 Major_ | **A blocking finding in the recovery run.**"}]'
+  dir=$(make_case "pe-recovery-run-major" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "2" ] && [ "$(jqf "$dir" '.status')" = findings ] \
+    || fail "PE-recovery: a recovery run carrying a blocking marker must surface findings (2), got rc=$rc status=$(jqf "$dir" '.status' 2>/dev/null); err=$(tail -4 "$dir/err.log")"
+  grep -q 'carries a blocking marker' "$dir/err.log" || fail "PE-recovery: the refusal arm did not grade the recovery run's body"
+  # Control: the same recovery run without the marker clears.
+  reviews='[{"id":8814,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:03Z","body":"Review completed. No actionable comments."}]'
+  dir=$(make_case "pe-recovery-run-clean" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "PE-recovery control: a clean recovery run should clear, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "PE-recovery: Codex P1 on #2857 — a run that supersedes a processing-error comment is still graded, and its blocking marker surfaces findings"
 }
 
 test_completed_description_still_clears() {
@@ -3082,6 +3111,7 @@ test_processing_error_verdict_edge_withholds
 test_processing_error_probe_evidence_withholds
 test_processing_error_probe_reported_withholds
 test_processing_error_superseded_by_later_summary_clears
+test_processing_error_recovery_run_is_graded
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error

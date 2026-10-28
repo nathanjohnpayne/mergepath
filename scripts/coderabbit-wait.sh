@@ -2877,7 +2877,7 @@ status_context_fast_path_blocked_by_comment() {
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
   local current_length
   local current_class current_rc reviews head_run review_rc run_id run_body run_class run_class_rc marker_rc
-  local run_submitted_at accepted_after_rc latch_rc
+  local run_submitted_at accepted_after_rc latch_rc pe_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
@@ -2953,8 +2953,25 @@ status_context_fast_path_blocked_by_comment() {
     elif [ "$current_rc" != "0" ]; then
       current_class=review
     fi
+    # A current processing-error comment reaches here only once the latch above
+    # has found it superseded. That says a later run exists, not that the run
+    # is clean, so the notice takes the refusal arm and the head-pinned run's
+    # body is still graded (Codex P1 on #2857). This is grading, not a
+    # clearance decision: ordering stays the latch's.
+    if [ "$current_class" = review ]; then
+      pe_rc=0
+      crw_is_processing_error_notice "$comment_body" || pe_rc=$?
+      case "$pe_rc" in
+        0) current_class=processing_error ;;
+        1) : ;;
+        *)
+          log "StatusContext success suppressed: the newest CodeRabbit comment could not be read for a processing-error notice, so the run that superseded it cannot be graded (#2752)"
+          return 0
+          ;;
+      esac
+    fi
     case "$current_class" in
-      rate_limit|paused)
+      rate_limit|paused|processing_error)
         review_rc=0
         head_run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") || review_rc=$?
         if [ "$review_rc" != "0" ]; then
@@ -4410,8 +4427,12 @@ crw_processing_error_latch_from() {
   # One row per bot item: issue comments, and review objects with a body
   # (body-less objects are conversational acknowledgements, #900). A bot item
   # whose body is not a string, or whose time is not a string, is unreadable.
-  rows=$(jq -nr --argjson c "$issue_comments" --argjson r "$reviews" --arg bot "$bot" '
-    ( [ $c[] | select(type == "object" and (.user.login? == $bot))
+  # Both lists arrive on stdin, never argv: a paginated history past the
+  # per-argument limit (128 KiB on Linux) would fail `--argjson` with E2BIG,
+  # and every clearance would then read the latch as unreadable.
+  rows=$(printf '%s\n%s\n' "$issue_comments" "$reviews" | jq -nr --arg bot "$bot" '
+    input as $c | input as $r
+    | ( [ $c[] | select(type == "object" and (.user.login? == $bot))
         | {src: "comment", id, commit_id: null, body,
            at: ([.created_at, (.updated_at // .created_at)] | map(select(type == "string")) | max)} ]
     + [ $r[] | select(type == "object" and (.user.login? == $bot))
