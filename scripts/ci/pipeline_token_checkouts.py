@@ -179,12 +179,14 @@ TRUSTED_CHECKOUT_INPUTS = {
 # prints.
 REVIEWED_CANDIDATE_CHECKOUTS = {
     ("pr-review-policy.yml", "external-review-labeling"): {
-        "sha256": "5f374a06d88e3b8585c2f3efdc86c9e74acac8718ca0b5f71842711a6af32c09",
+        "sha256": "f24a52ef2b6a1eabe5949712dd79e0f60853d4ba1ae1d157c8a0a9b5831e2cad",
         "reason": (
             "#2725 C6/C7: the candidate tree is diffed and byte-verified as data; "
-            "every helper runs from a base-SHA or default-branch git worktree, and "
-            "the CI-actor PAT is used only for the label removal and the "
-            "recheck dispatch."
+            "the classifier runs from the default branch's blob of "
+            "scripts/workflow/external_review_classify.sh (#2727 3b) and fails "
+            "closed without one, every helper runs from a base-SHA or "
+            "default-branch git worktree, and the CI-actor PAT is used only for "
+            "the label removal and the recheck dispatch."
         ),
     },
 }

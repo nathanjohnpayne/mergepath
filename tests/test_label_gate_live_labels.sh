@@ -15,6 +15,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="${LABEL_GATE_TEST_WORKFLOW:-$ROOT/.github/workflows/pr-review-policy.yml}"
+# The External Review Check's `check` step runs this script (#2727 slice 3b).
+CLASSIFIER_SCRIPT="${LABEL_GATE_TEST_CLASSIFIER:-$ROOT/scripts/workflow/external_review_classify.sh}"
 AGENT_WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
 
 for tool in yq node; do
@@ -98,7 +100,53 @@ fi
 # The classifier body itself has no label-event early exit: even the
 # needs-external-review lifecycle gets a fresh classification. Only the label
 # APPLY step suppresses re-adding a PAT-cleared label (#969).
-CLASSIFIER_BODY=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$WORKFLOW")
+CLASSIFIER_RUN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$WORKFLOW")
+CLASSIFIER_BODY=$(cat "$CLASSIFIER_SCRIPT")
+
+# #2727 slice 3b: the check step runs the DEFAULT BRANCH's classifier blob,
+# never the candidate checkout's copy (#2775: this job holds the CI-actor
+# PAT), and fails closed when the default branch has none. Executed, not
+# grepped: a fixture clone whose origin/main does or does not carry a stub
+# classifier, while the candidate tree always carries a hostile one.
+STEP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/label-gate-step.XXXXXX")
+step_git() { git -c init.defaultBranch=main -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
+run_check_step() { # <with-default-copy: yes|no> -> prints "<rc>|<output file>|<log>"
+  local d="$STEP_WORK/$1" rc=0
+  step_git init -q "$d/upstream"
+  mkdir -p "$d/upstream/scripts/workflow"
+  if [ "$1" = yes ]; then
+    printf '%s\n' 'echo "classification=from-default-branch" >> "$GITHUB_OUTPUT"' \
+      >"$d/upstream/scripts/workflow/external_review_classify.sh"
+  else
+    printf 'x\n' >"$d/upstream/README"
+  fi
+  step_git -C "$d/upstream" add -A && step_git -C "$d/upstream" commit -q -m base
+  step_git clone -q "$d/upstream" "$d/checkout"
+  step_git -C "$d/checkout" checkout -q -b candidate
+  mkdir -p "$d/checkout/scripts/workflow"
+  printf '%s\n' 'echo "classification=from-candidate" >> "$GITHUB_OUTPUT"' 'touch "$CANDIDATE_RAN"' \
+    >"$d/checkout/scripts/workflow/external_review_classify.sh"
+  printf '%s\n' "$CLASSIFIER_RUN" >"$d/step.sh"
+  ( cd "$d/checkout" && env DEFAULT_BRANCH=main GITHUB_OUTPUT="$d/output" CANDIDATE_RAN="$d/candidate-ran" \
+      bash --noprofile --norc -eo pipefail "$d/step.sh" ) >"$d/log" 2>&1 || rc=$?
+  printf '%s|%s|%s' "$rc" "$d/output" "$d/candidate-ran"
+}
+IFS='|' read -r step_rc step_out step_cand <<<"$(run_check_step yes)"
+if [ "$step_rc" = 0 ] && grep -qx 'classification=from-default-branch' "$step_out" \
+   && ! grep -q 'from-candidate' "$step_out" && [ ! -e "$step_cand" ]; then
+  pass "the check step runs the default branch's classifier, not the candidate's (#2727 3b / #2775)"
+else
+  fail "the check step must run origin/main's classifier only (rc=$step_rc output=$(cat "$step_out" 2>/dev/null))"
+fi
+IFS='|' read -r step_rc step_out step_cand <<<"$(run_check_step no)"
+if [ "$step_rc" = 0 ] && grep -qx 'needs_review=true' "$step_out" \
+   && grep -qx 'classification=fail-closed' "$step_out" \
+   && ! grep -q 'from-candidate' "$step_out" && [ ! -e "$step_cand" ]; then
+  pass "without a default-branch classifier the check step fails closed and runs no candidate copy"
+else
+  fail "a missing default-branch classifier must fail closed without the candidate copy (rc=$step_rc output=$(cat "$step_out" 2>/dev/null))"
+fi
+rm -rf "$STEP_WORK"
 APPLY_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Apply label and comment") | .if' "$WORKFLOW")
 if [[ "$CLASSIFIER_BODY" != *'label_lifecycle_event=true'* ]] \
    && [[ "$APPLY_IF" == *"github.event.action == 'unlabeled'"* ]] \
@@ -109,9 +157,11 @@ else
 fi
 
 # GitHub compiles any run scalar containing an expression as one format
-# expression, which has a 21,000-character registration limit. Keep the large
-# classifier body expression-free by moving event values into its step env.
-CLASSIFIER_RUN_BYTES=$(printf '%s' "$CLASSIFIER_BODY" | LC_ALL=C wc -c | tr -d ' ')
+# expression, which has a 21,000-character registration limit. Event values
+# reach the classifier through its step env. Since the body moved into a
+# script (#2727 slice 3b), an expression in it would also never be expanded,
+# so the script must contain none.
+CLASSIFIER_RUN_BYTES=$(printf '%s' "$CLASSIFIER_RUN" | LC_ALL=C wc -c | tr -d ' ')
 CLASSIFIER_ENV=$(yq -o=json -I=0 '.jobs."external-review-labeling".steps[] | select(.id == "check") | .env' "$WORKFLOW")
 if jq -e '
         .BASE_SHA == "${{ github.event.pull_request.base.sha }}"
@@ -121,7 +171,7 @@ if jq -e '
         and .REPO == "${{ github.repository }}"
         and .DEFAULT_BRANCH == "${{ github.event.repository.default_branch }}"
       ' <<<"$CLASSIFIER_ENV" >/dev/null \
-   && { [ "$CLASSIFIER_RUN_BYTES" -le 21000 ] || [[ "$CLASSIFIER_BODY" != *'${{'* ]]; }; then
+   && [ "$CLASSIFIER_RUN_BYTES" -le 21000 ] && [[ "$CLASSIFIER_BODY" != *'${{'* ]]; then
   pass "oversized classifier body keeps GitHub expressions in step env"
 else
   fail "classifier run scalar can exceed GitHub's expression limit (bytes=$CLASSIFIER_RUN_BYTES)"
@@ -753,8 +803,7 @@ git -C "$CLASSIFIER_REPO" add src/example.sh
 git -C "$CLASSIFIER_REPO" commit --quiet -m 'fixture head'
 EVENT_HEAD=$(git -C "$CLASSIFIER_REPO" rev-parse HEAD)
 
-yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
-  "$WORKFLOW" >"$WORK/classifier.sh"
+cp "$CLASSIFIER_SCRIPT" "$WORK/classifier.sh"
 
 run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [clearance-rc]
   local dir=$1 fingerprint_rc=$2 carry_rc=$3 carry_json=$4 clearance_rc=${5:-1} rc=0

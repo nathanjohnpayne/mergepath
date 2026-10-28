@@ -25,9 +25,10 @@
 # Usage:
 #   scripts/audit-propagation-lane.sh                 # all consumers
 #   scripts/audit-propagation-lane.sh --repos r1,r2   # subset
-#   scripts/audit-propagation-lane.sh --check-files <review-policy.yml> <pr-review-policy.yml>
+#   scripts/audit-propagation-lane.sh --check-files <review-policy.yml> <pr-review-policy.yml> [<external_review_classify.sh>]
 #       Offline single-pair mode for tests: prints the same status line
 #       a live consumer would get, using local files instead of the API.
+#       The third file is the classifier script a delegating workflow runs.
 #
 # Exit codes:
 #   0  lane fires on every audited consumer (explicit opt-outs included
@@ -48,9 +49,15 @@ err() { echo "ERROR: $*" >&2; }
 MANIFEST=".mergepath-sync.yml"
 
 # The marker that proves the default-ON lane code is present in a
-# consumer's synced workflow. Single-sourced here; the workflow carries
+# consumer's synced workflow. Single-sourced here; the lane code carries
 # the literal.
 LANE_DEFAULT_MARKER='PROP_ENABLED=${PROP_ENABLED:-true}'
+
+# Since #2727 slice 3b the lane code lives in this script, which the
+# workflow's External Review Check runs. A workflow that names it delegates
+# the lane there, so the marker is looked for in the script; an older
+# workflow still carries the lane inline.
+LANE_CLASSIFIER_PATH='scripts/workflow/external_review_classify.sh'
 
 # The branch prefix scripts/sync-to-downstream.sh actually uses for the
 # PRs it opens. A consumer whose review-policy.yml overrides
@@ -109,16 +116,26 @@ policy_top_scalar() {  # <file> <key>
 # Evaluate the lane preconditions for one (review-policy, workflow)
 # file pair. Prints a status line; returns 0 if the lane fires, 1 if
 # not.
-lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-empty>
-  local label=$1 policy=$2 workflow=$3
-  local enabled author_id prefix
+lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-empty> [<classifier-file-or-empty>]
+  local label=$1 policy=$2 workflow=$3 classifier=${4:-}
+  local enabled author_id prefix lane_file lane_name
 
   if [ -z "$workflow" ] || [ ! -f "$workflow" ]; then
     echo "  ✗ $label: pr-review-policy.yml ABSENT on the live default branch — lane cannot fire"
     return 1
   fi
-  if ! grep -qF "$LANE_DEFAULT_MARKER" "$workflow"; then
-    echo "  ✗ $label: pr-review-policy.yml predates the #434 default-ON lane (marker '$LANE_DEFAULT_MARKER' missing) — lane requires an explicit enabled: true the consumer does not get; re-sync the workflow"
+  lane_file=$workflow
+  lane_name=pr-review-policy.yml
+  if grep -qF "$LANE_CLASSIFIER_PATH" "$workflow"; then
+    if [ -z "$classifier" ] || [ ! -f "$classifier" ]; then
+      echo "  ✗ $label: pr-review-policy.yml runs $LANE_CLASSIFIER_PATH, which is ABSENT on the live default branch — the External Review Check cannot run; re-sync the scripts/workflow/ kit"
+      return 1
+    fi
+    lane_file=$classifier
+    lane_name=$LANE_CLASSIFIER_PATH
+  fi
+  if ! grep -qF "$LANE_DEFAULT_MARKER" "$lane_file"; then
+    echo "  ✗ $label: $lane_name predates the #434 default-ON lane (marker '$LANE_DEFAULT_MARKER' missing) — lane requires an explicit enabled: true the consumer does not get; re-sync the workflow"
     return 1
   fi
 
@@ -172,8 +189,8 @@ lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-em
 # --- offline test mode ------------------------------------------------------
 
 if [ "${1:-}" = "--check-files" ]; then
-  [ $# -eq 3 ] || { err "--check-files needs exactly two file arguments"; exit 2; }
-  if lane_status_for_files "check-files" "$2" "$3"; then
+  { [ $# -eq 3 ] || [ $# -eq 4 ]; } || { err "--check-files needs two or three file arguments"; exit 2; }
+  if lane_status_for_files "check-files" "$2" "$3" "${4:-}"; then
     exit 0
   fi
   exit 1
@@ -296,6 +313,7 @@ while IFS=$'\t' read -r consumer_name consumer_repo; do
 
   policy_file="$WORKDIR/$consumer_name-policy.yml"
   workflow_file="$WORKDIR/$consumer_name-workflow.yml"
+  classifier_file="$WORKDIR/$consumer_name-classifier.sh"
 
   rc=0
   fetch_live_file "$consumer_repo" ".github/review-policy.yml" "$policy_file" || rc=$?
@@ -307,7 +325,12 @@ while IFS=$'\t' read -r consumer_name consumer_repo; do
   if [ "$rc" -eq 3 ]; then FETCH_ERROR=1; continue; fi
   [ "$rc" -eq 1 ] && workflow_file=""
 
-  if ! lane_status_for_files "$consumer_name" "$policy_file" "$workflow_file"; then
+  rc=0
+  fetch_live_file "$consumer_repo" "$LANE_CLASSIFIER_PATH" "$classifier_file" || rc=$?
+  if [ "$rc" -eq 3 ]; then FETCH_ERROR=1; continue; fi
+  [ "$rc" -eq 1 ] && classifier_file=""
+
+  if ! lane_status_for_files "$consumer_name" "$policy_file" "$workflow_file" "$classifier_file"; then
     LANE_BROKEN=1
   fi
 done <<EOF
