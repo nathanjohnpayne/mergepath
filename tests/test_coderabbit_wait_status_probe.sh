@@ -2369,6 +2369,9 @@ test_869_probe_summary_landing_mid_probe_is_scanned() {
   # success with the summary unseen, the probe re-fetches the comments
   # exactly once; a summary found on the re-scan takes the normal
   # rc-0/rc-2 verdict, with the rc-7-only context fields cleared to null.
+  # The clean verdict makes three issue-comment reads: the probe's snapshot,
+  # its one bounded re-fetch, and the #2752 emitter backstop's fresh latch
+  # read. The findings case below never reaches the backstop, so it stays at 2.
   local dir rc status observed id ctx fetches
   dir=$(make_case probe-869-toctou-clean 600 true 30 3 2)
   enable_trust_status_context "$dir"
@@ -2380,7 +2383,7 @@ test_869_probe_summary_landing_mid_probe_is_scanned() {
   ctx=$(jq -r '.probe.context_state | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   fetches=$(cat "$dir/state/issues-fetch-count" 2>/dev/null || echo 0)
   if [ "$rc" = "0" ] && [ "$status" = "reported" ] && [ "$observed" = "terminal" ] \
-     && [ "$id" = "9998" ] && [ "$ctx" = "null" ] && [ "$fetches" = "2" ] \
+     && [ "$id" = "9998" ] && [ "$ctx" = "null" ] && [ "$fetches" = "3" ] \
      && jq -e '.probe.context_description == null and (.probe | has("context_description"))' "$dir/out.json" >/dev/null \
      && [ "$(probe_count "$dir")" = "0" ]; then
     pass "#869 probe: a clean summary landing mid-probe is re-scanned and reported rc 0 (one bounded re-fetch, context fields null)"
@@ -3180,6 +3183,16 @@ test_1005_classifier_pipe_buffer_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # classify_comment calls cr_strip_vendor_header (#2734) and the
+  # processing-error predicate's unfenced read (#2657), so the case sources
+  # their definitions itself rather than relying on an earlier case having
+  # left them in this shell (#2746 item 5). The mutant subshell below inherits
+  # them.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
+  # shellcheck disable=SC1090
+  . <(awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh")
   # shellcheck disable=SC1090
   . "$snip"
 

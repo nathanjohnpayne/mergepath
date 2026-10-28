@@ -693,10 +693,27 @@ run_case() {
       CODERABBIT_TEST_FAIL_STRUCTURAL_ON="${CODERABBIT_TEST_FAIL_STRUCTURAL_ON:-}" \
       CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
       CODEX_STUB_LOG="$dir/state/codex-stub.log" \
-      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      ./scripts/coderabbit-wait.sh ${CRW_TEST_PROBE:+--probe} 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
   ) || rc=$?
   printf '%s\n' "$rc"
+}
+
+# #2752: replace one processing-error latch consult in a fixture copy with a
+# no-op, so a case can show that the edge it names is what withholds
+# clearance. The label is the edge argument the waiter passes to
+# crw_processing_error_latch_permits_clearance.
+neutralize_latch_edge() {
+  local dir=$1 label=$2
+  python3 - "$dir/scripts/coderabbit-wait.sh" "$label" <<'PY2'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+code = p.read_text()
+old = 'crw_processing_error_latch_permits_clearance "' + sys.argv[2] + '"'
+assert code.count(old) == 1, "latch edge %r is not a unique call site" % sys.argv[2]
+p.write_text(code.replace(old, 'true "' + sys.argv[2] + '"', 1))
+PY2
 }
 
 jqf() { jq -r "$2" "$1/out.json"; }
@@ -779,7 +796,10 @@ test_refusal_run_is_revalidated_before_clearance() {
   dir=$(make_case "headref-stable-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="$clean" run_case "$dir")
   [ "$rc" = "0" ] || fail "3b0 stable: unchanged selected review should clear, got $rc; err=$(tail -5 "$dir/err.log")"
-  [ "$(cat "$dir/state/reviews-read-count")" = "2" ] || fail "3b0 stable: expected selector revalidation read"
+  # Read 1 is the fast path's shared snapshot (refusal grading and the #2752
+  # latch), read 2 the revalidation, and reads 3-4 the latch at the verdict
+  # edge and at the emitter backstop.
+  [ "$(cat "$dir/state/reviews-read-count")" = "4" ] || fail "3b0 stable: expected selector revalidation read plus the two #2752 latch reads, got $(cat "$dir/state/reviews-read-count")"
 
   dir=$(make_case "headref-superseded-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="$superseding" run_case "$dir")
@@ -1421,7 +1441,7 @@ test_processing_error_older_run_does_not_release() {
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
   [ "$rc" != "0" ] || fail "PE4: a clean run older than the processing-error notice released it; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE4: status=cleared from a run that predates the notice"
-  grep -q 'is not newer than CodeRabbit' "$dir/err.log" || fail "PE4: expected the run-ordering refusal log"
+  grep -q 'no later review run or head-naming summary supersedes it' "$dir/err.log" || fail "PE4: expected the processing-error latch refusal log (#2752)"
   [ "$FAIL" -ne "$before" ] || pass "PE4: #2657 — a current-HEAD run older than the processing-error notice cannot release it"
 }
 
@@ -1437,17 +1457,280 @@ test_processing_error_review_object_only_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "PE5: #2657 — a processing-error notice published only as the review object never clears (rc=$rc)"
 }
 
-# --- #2657: an unreadable processing-error notice fails closed ----------------
-# Structural-read call 4 is the predicate's read of the notice on the fast
-# path. Collapsing that failure to "not a notice" (the earlier behaviour)
-# cleared the head; it must fail closed instead.
+# --- #2657 / #2769: an unreadable processing-error notice fails closed --------
+# The injection targets the latch's own structural read of each bot body, by a
+# site tag in the fixture copy rather than by an awk call ordinal, so the case
+# cannot pass on a read that never happened. The fixture carries a clean
+# current-HEAD run newer than the notice, so the CONTROL run (no injection)
+# clears: the non-cleared result under injection is caused by the injection.
+tag_latch_structural_site() {
+  python3 - "$1/scripts/coderabbit-wait.sh" <<'PY2'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+code = p.read_text()
+start = code.index("# BEGIN coderabbit_processing_error_latch\n")
+end = code.index("# END coderabbit_processing_error_latch\n", start)
+block = code[start:end]
+old = 'crw_is_processing_error_notice "$body" || pe_rc=$?'
+assert block.count(old) == 1, "latch processing-error read is not a unique call site"
+block = block.replace(old, 'CODERABBIT_TEST_STRUCTURAL_SITE=pe_latch crw_is_processing_error_notice "$body" || pe_rc=$?', 1)
+p.write_text(code[:start] + block + code[end:])
+PY2
+}
+
 test_processing_error_unreadable_fails_closed() {
-  local dir rc before=$FAIL
-  dir=$(make_case "processing-error-unreadable" "$PROCESSING_ERROR_BODY" "$STATUS_TIME" "Review completed")
-  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=4 run_case "$dir")
+  local dir rc before=$FAIL reviews
+  reviews='[{"id":8812,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:03Z","body":"Review completed. No actionable comments."}]'
+  dir=$(make_case "processing-error-unreadable-control" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed")
+  tag_latch_structural_site "$dir" || { fail "PE6: could not tag the latch read in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] && [ "$(jqf "$dir" '.status')" = cleared ] \
+    || fail "PE6 control: a clean run newer than the notice should clear without injection, got rc=$rc; err=$(tail -4 "$dir/err.log")"
+  [ ! -f "$dir/state/structural-awk-failure-site" ] || fail "PE6 control: an injection fired with none requested"
+  dir=$(make_case "processing-error-unreadable" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed")
+  tag_latch_structural_site "$dir" || { fail "PE6: could not tag the latch read in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_SITE=pe_latch CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$(cat "$dir/state/structural-awk-failure-site" 2>/dev/null)" = pe_latch ] \
+    || fail "PE6: the injected latch read failure was never observed, so the result below proves nothing"
   [ "$rc" != "0" ] || fail "PE6: an unreadable processing-error notice cleared; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status' 2>/dev/null)" != "cleared" ] || fail "PE6: status=cleared from an unreadable processing-error notice"
-  [ "$FAIL" -ne "$before" ] || pass "PE6: #2657 — an unreadable processing-error notice fails closed (rc=$rc)"
+  grep -q 'the processing-error latch could not be read' "$dir/err.log" || fail "PE6: expected the latch's fail-closed log"
+  [ "$FAIL" -ne "$before" ] || pass "PE6: #2657/#2769 — the same fixture clears without injection and fails closed (rc=$rc) when the latch cannot read the notice"
+}
+
+# --- #2752: the processing-error latch, unit ----------------------------------
+# Driven directly from the sentinel block, because its three return codes are
+# the whole contract: 0 set, 1 clear, 3 unreadable.
+test_processing_error_latch_unit() {
+  local bad="" snip="$WORKDIR/pe-latch-unit.sh" mut="$WORKDIR/pe-latch-unit-mut.sh"
+  local h=f9c7847139881a1004e796d4ab8967b23e083baa summary
+  {
+    grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' "$ROOT/scripts/coderabbit-wait.sh"
+    for b in coderabbit_comment_classifier coderabbit_summary_helpers coderabbit_processing_error_latch; do
+      awk -v b="$b" '$0 == "# BEGIN " b {f=1; next} $0 == "# END " b {f=0} f' "$ROOT/scripts/coderabbit-wait.sh"
+    done
+  } >"$snip"
+  summary="<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+
+**Actionable comments posted: 0**
+
+Reviewing files that changed from the base of the PR and between $BASE_SHA_40 and $h."
+  # latch_case <want-rc> <name> <issue-comments> <reviews> [<snippet>]
+  latch_case() {
+    local want=$1 name=$2 got=0
+    (
+      set -euo pipefail
+      # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+      . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+      # shellcheck source=../scripts/lib/coderabbit-fence.sh
+      . "$ROOT/scripts/lib/coderabbit-fence.sh"
+      # shellcheck disable=SC1090
+      . "${5:-$snip}"
+      crw_processing_error_latch_from "$3" "$4" 'coderabbitai[bot]' "$h" >/dev/null
+    ) || got=$?
+    [ "$got" = "$want" ] || bad="$bad $name(rc=$got,want=$want)"
+  }
+  ic() { jq -cn --arg t "$1" --arg b "$2" '{id:1,user:{login:"coderabbitai[bot]"},created_at:$t,updated_at:$t,body:$b}'; }
+  rv() { jq -cn --arg t "$1" --arg s "$2" --arg b "$3" '{id:2,user:{login:"coderabbitai[bot]"},commit_id:$s,submitted_at:$t,body:$b}'; }
+  local t0=2026-06-04T00:00:00Z t5=2026-06-04T00:00:05Z
+  latch_case 1 empty '[]' '[]'
+  latch_case 0 comment-notice "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" '[]'
+  latch_case 0 review-notice '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  latch_case 1 review-notice-other-commit '[]' "[$(rv $t0 other "$PROCESSING_ERROR_BODY")]"
+  latch_case 1 human-notice "[$(ic $t0 "$PROCESSING_ERROR_BODY" | jq -c '.user.login = "someone"')]" '[]'
+  # #2751: a later head-naming summary supersedes; the same second does not,
+  # and an earlier one does not.
+  latch_case 1 later-summary "[$(ic $t5 "$summary")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  latch_case 0 same-second-summary "[$(ic $t0 "$summary")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  latch_case 0 earlier-summary "[$(ic $t0 "$summary")]" "[$(rv $t5 $h "$PROCESSING_ERROR_BODY")]"
+  latch_case 0 later-summary-other-head "[$(ic $t5 "${summary/$h/$PREV_HEAD_SHA_40}")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  # A later run supersedes an issue-comment notice from any head, but a
+  # head-pinned notice only from the same head.
+  latch_case 1 comment-notice-later-run "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" "[$(rv $t5 other "Review completed. No actionable comments.")]"
+  latch_case 1 review-notice-later-head-run '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "Review completed. No actionable comments.")]"
+  latch_case 0 review-notice-later-other-run '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 other "Review completed. No actionable comments.")]"
+  # An ordinary later reply is not a review (#2752 polling false clearance).
+  latch_case 0 later-chat-reply "[$(ic $t0 "$PROCESSING_ERROR_BODY"),$(ic $t5 "Thanks for the feedback.")]" '[]'
+  # Unreadable inputs fail closed.
+  latch_case 3 comments-not-array '{}' '[]'
+  latch_case 3 reviews-not-array '[]' 'null'
+  latch_case 3 bad-timestamp "[$(ic nope "$PROCESSING_ERROR_BODY")]" '[]'
+  latch_case 3 non-string-body '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]'
+  # A body that cannot be structurally read is unreadable, not "no notice".
+  { cat "$snip"; printf '%s\n' 'crw_unfenced_body() { return 3; }'; } >"$mut"
+  latch_case 3 structural-read-failure "[$(ic $t0 "Thanks for the feedback.")]" '[]' "$mut"
+  # MUTATION: collapse the unreadable-row branch into "skip", and the
+  # non-string body must read as clear. That is the false clearance the
+  # fail-closed branch exists to prevent.
+  sed 's/\[ "\$row" != UNREADABLE \] || return 3/[ "$row" != UNREADABLE ] || continue/' "$snip" >"$mut"
+  grep -q 'UNREADABLE \] || continue' "$mut" || bad="$bad mutation-not-applied"
+  latch_case 1 mutant-non-string-body-reads-clear '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]' "$mut"
+  if [ -z "$bad" ]; then
+    pass "PE-latch: #2752 — the latch is set by a comment or head-pinned notice, superseded only by a strictly later run or head-naming summary (#2751), and every unreadable input fails closed"
+  else
+    fail "PE-latch unit:$bad"
+  fi
+}
+
+# --- #2752: every clearance emit site consults the latch ----------------------
+# The edges are enumerated here so a new `cleared` or `reported` emit cannot be
+# added without one. Each must be preceded, within its own block, by the latch
+# consult; the emitter backstop is asserted separately.
+test_processing_error_latch_edges_enumerated() {
+  local bad="" sites
+  sites=$(python3 - "$ROOT/scripts/coderabbit-wait.sh" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+out = []
+for i, line in enumerate(lines):
+    if re.search(r'emit_json_and_exit "(cleared|reported)" 0', line) and not line.lstrip().startswith("#"):
+        window = "\n".join(lines[max(0, i - 12):i])
+        ok = ("crw_processing_error_latch_permits_clearance" in window
+              or "crw_probe_withhold_on_processing_error" in window
+              or "PE_LATCH_RC" in window)
+        out.append("%d:%s" % (i + 1, "ok" if ok else "MISSING"))
+print(" ".join(out))
+PY
+)
+  [ "$(wc -w <<<"$sites" | tr -d ' ')" = 5 ] || bad="$bad expected-5-clearance-emits(got:$sites)"
+  case " $sites " in *MISSING*) bad="$bad unguarded-emit($sites)" ;; esac
+  local label
+  for label in '"StatusContext fast path"' '"$verdict_label"' '"polling review arm"' \
+               '"post-probe terminal-review check"' '"probe reported verdict"' \
+               '"probe rc-7 evidence"' '"clearance emitter"'; do
+    [ "$(grep -cF "crw_processing_error_latch_permits_clearance $label" "$ROOT/scripts/coderabbit-wait.sh")" = 1 ] \
+      || bad="$bad edge-$label-not-unique"
+  done
+  [ "$(grep -c 'crw_probe_withhold_on_processing_error "' "$ROOT/scripts/coderabbit-wait.sh")" = 2 ] \
+    || bad="$bad probe-reported-sites"
+  # The per-path #2660 checks are gone: the classifier is the only other caller.
+  [ "$(grep -c 'crw_is_processing_error_notice "' "$ROOT/scripts/coderabbit-wait.sh")" = 2 ] \
+    || bad="$bad per-path-processing-error-checks-remain"
+  if [ -z "$bad" ]; then
+    pass "PE-edges: #2752 — all five clearance emits, the fast path, rc-7 evidence and the emitter backstop consult the one latch"
+  else
+    fail "PE-edges:$bad"
+  fi
+}
+
+# --- #2752: polling arm and post-probe upgrade withhold over a notice-only run --
+# The second Codex P1 on #2660: an ordinary bot reply above a processing-error
+# review object reaches the polling review arm, whose fallback rung permits on
+# the success status the failed attempt left. Before the latch this cleared.
+test_processing_error_polling_and_terminal_edges_withhold() {
+  local dir rc before=$FAIL reviews
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" '[{"id":8806,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":$b}]')
+  dir=$(make_case "pe-polling-edge" "Thanks for the feedback." "2026-06-04T00:00:05Z" "Review completed")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "4" ] || fail "PE-poll: expected the advisory timeout (4), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'StatusContext fast path: clearance withheld' "$dir/err.log" || fail "PE-poll: the fast path did not consult the latch"
+  grep -q 'polling review arm: clearance withheld' "$dir/err.log" || fail "PE-poll: the polling review arm did not consult the latch"
+  grep -q 'post-probe terminal-review check: clearance withheld' "$dir/err.log" || fail "PE-poll: the post-probe terminal upgrade did not consult the latch"
+  # Each edge is what withholds: neutralized, the next guard is the emitter
+  # backstop, which stops with infra rather than clearing.
+  dir=$(make_case "pe-polling-edge-mut" "Thanks for the feedback." "2026-06-04T00:00:05Z" "Review completed")
+  neutralize_latch_edge "$dir" "polling review arm" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "3" ] && grep -q 'reached the emitter' "$dir/err.log" \
+    || fail "PE-poll mutation: without the polling edge the backstop should stop with 3, got $rc"
+  dir=$(make_case "pe-terminal-edge-mut" "Thanks for the feedback." "2026-06-04T00:00:05Z" "Review completed")
+  neutralize_latch_edge "$dir" "post-probe terminal-review check" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "3" ] && grep -q 'reached the emitter' "$dir/err.log" \
+    || fail "PE-terminal mutation: without the post-probe edge the backstop should stop with 3, got $rc"
+  # And with the edge and the backstop both gone, the fixture clears: the case
+  # reaches the clearance it guards.
+  dir=$(make_case "pe-polling-edge-mut2" "Thanks for the feedback." "2026-06-04T00:00:05Z" "Review completed")
+  neutralize_latch_edge "$dir" "polling review arm" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  neutralize_latch_edge "$dir" "clearance emitter" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "PE-poll control: with the edge and backstop removed the fixture should clear (proving it reaches the edge), got $rc"
+  [ "$FAIL" -ne "$before" ] || pass "PE-poll: #2752 — the polling review arm and the post-probe upgrade withhold over a notice-only review object, and each edge is load-bearing"
+}
+
+# --- #2752: the fast-path verdict emitter consults the latch too --------------
+test_processing_error_verdict_edge_withholds() {
+  local dir rc before=$FAIL reviews
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" '[{"id":8807,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":$b}]')
+  dir=$(make_case "pe-verdict-edge" "" "$STATUS_TIME" "Review completed")
+  neutralize_latch_edge "$dir" "StatusContext fast path" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "4" ] || fail "PE-verdict: expected the advisory timeout (4) with the fast-path guard removed, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'StatusContext success: clearance withheld' "$dir/err.log" || fail "PE-verdict: emit_status_context_verdict did not consult the latch"
+  dir=$(make_case "pe-verdict-edge-mut" "" "$STATUS_TIME" "Review completed")
+  neutralize_latch_edge "$dir" "StatusContext fast path" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  neutralize_latch_edge "$dir" '$verdict_label' || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "3" ] && grep -q 'reached the emitter' "$dir/err.log" \
+    || fail "PE-verdict mutation: without both fast-path edges the backstop should stop with 3, got $rc"
+  [ "$FAIL" -ne "$before" ] || pass "PE-verdict: #2752 — emit_status_context_verdict withholds on the latch independently of the fast-path refusal"
+}
+
+# --- #2752: --probe rc-7 evidence over a notice-only review object ------------
+# The first Codex P1 on #2660: a processing-error review object, no issue
+# comments, and a success status updated after it. The probe emitted rc 7
+# observed=awaiting-summary with context_state=success, which the Phase 4b
+# barrier accepts as reported.
+test_processing_error_probe_evidence_withholds() {
+  local dir rc before=$FAIL reviews
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" '[{"id":8808,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":$b}]')
+  dir=$(make_case "pe-probe-evidence" "" "2026-06-04T00:00:05Z" "Review completed")
+  rc=$(CRW_TEST_PROBE=1 CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "7" ] || fail "PE-probe: expected rc 7, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.probe.observed')" = processing_error ] || fail "PE-probe: observed=$(jqf "$dir" '.probe.observed'), expected processing_error"
+  [ "$(jqf "$dir" '.probe.context_state')" = null ] || fail "PE-probe: context_state=$(jqf "$dir" '.probe.context_state') still carries barrier evidence"
+  dir=$(make_case "pe-probe-evidence-mut" "" "2026-06-04T00:00:05Z" "Review completed")
+  neutralize_latch_edge "$dir" "probe rc-7 evidence" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CRW_TEST_PROBE=1 CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = 7 ] && [ "$(jqf "$dir" '.probe.observed')" = awaiting-summary ] && [ "$(jqf "$dir" '.probe.context_state')" = success ] \
+    || fail "PE-probe mutation: without the rc-7 edge the fixture should emit the barrier-opening evidence, got rc=$rc observed=$(jqf "$dir" '.probe.observed')"
+  [ "$FAIL" -ne "$before" ] || pass "PE-probe: #2752 — --probe reports observed=processing_error, not barrier-opening awaiting-summary evidence, over a notice-only review object"
+}
+
+# --- #2752: the probe's two clean `reported` verdicts ------------------------
+test_processing_error_probe_reported_withholds() {
+  local dir rc before=$FAIL reviews
+  # Review-object branch: a clean run, its summary, then the notice.
+  reviews='[{"id":8809,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:02Z","body":"Review completed. No actionable comments."}]'
+  dir=$(make_case "pe-probe-reported-run" "$REVIEW_BODY_CLEAN" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:03Z" 999999999 "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:04Z")
+  rc=$(CRW_TEST_PROBE=1 CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = 7 ] && [ "$(jqf "$dir" '.probe.observed')" = processing_error ] \
+    || fail "PE-probe-run: expected rc 7 observed=processing_error, got rc=$rc observed=$(jqf "$dir" '.probe.observed' 2>/dev/null); err=$(tail -4 "$dir/err.log")"
+  dir=$(make_case "pe-probe-reported-run-mut" "$REVIEW_BODY_CLEAN" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:03Z" 999999999 "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:04Z")
+  neutralize_latch_edge "$dir" "probe reported verdict" || { fail "${FUNCNAME[0]}: could not neutralize a latch edge in the fixture copy"; return 0; }
+  rc=$(CRW_TEST_PROBE=1 CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = 3 ] && grep -q 'reached the emitter' "$dir/err.log" \
+    || fail "PE-probe-run mutation: without the reported edge the backstop should stop with 3, got $rc"
+  # No-review-object branch: a head-naming summary, then the notice.
+  dir=$(make_case "pe-probe-reported-summary" "$SUMMARY_NAMES_CURRENT_HEAD" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:03Z" 999999999 "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:04Z" "$HEAD_SHA_40")
+  rc=$(CRW_TEST_PROBE=1 run_case "$dir")
+  [ "$rc" = 7 ] && [ "$(jqf "$dir" '.probe.observed')" = processing_error ] \
+    || fail "PE-probe-summary: expected rc 7 observed=processing_error, got rc=$rc observed=$(jqf "$dir" '.probe.observed' 2>/dev/null); err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "PE-probe-reported: #2752 — neither probe 'reported' verdict is emitted beneath a newer processing-error notice"
+}
+
+# --- #2751: a later clean summary supersedes a processing-error review object --
+# CodeRabbit's clean incremental retry on an unchanged SHA updates only its
+# summary and status. The summary is outside the freshness window by the time
+# the status lands; it must still release the notice.
+test_processing_error_superseded_by_later_summary_clears() {
+  local dir rc before=$FAIL reviews
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" --arg h "$HEAD_SHA_40" '[{"id":8810,"user":{"login":"coderabbitai[bot]"},"commit_id":$h,"submitted_at":"2033-05-18T02:50:00Z","body":$b}]')
+  dir=$(make_case "pe-superseded-summary" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_AFTER_NOTICE" "Review completed" "$SUMMARY_AGED_TIME" 1800 "" "$HEAD_TIME" "$HEAD_SHA_40")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] && [ "$(jqf "$dir" '.status')" = cleared ] \
+    || fail "PE-2751: a later head-naming summary should supersede the notice and clear, got rc=$rc; err=$(tail -4 "$dir/err.log")"
+  # The same summary BEFORE the notice is the failed attempt's predecessor.
+  reviews=$(jq -cn --arg b "$PROCESSING_ERROR_BODY" --arg h "$HEAD_SHA_40" '[{"id":8811,"user":{"login":"coderabbitai[bot]"},"commit_id":$h,"submitted_at":"2033-05-18T03:00:00Z","body":$b}]')
+  dir=$(make_case "pe-earlier-summary" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_AFTER_NOTICE" "Review completed" "$SUMMARY_AGED_TIME" 1800 "" "$HEAD_TIME" "$HEAD_SHA_40")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" != "0" ] || fail "PE-2751 control: a summary older than the notice released it"
+  # Issue-comment direction: a notice comment, then a later head-naming summary.
+  dir=$(make_case "pe-comment-superseded-summary" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:10Z" "Review completed" "$HEAD_TIME" 999999999 "$SUMMARY_NAMES_CURRENT_HEAD" "2026-06-04T00:00:05Z" "$HEAD_SHA_40")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "PE-2751 comment: a later head-naming summary should supersede a notice comment, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "PE-2751: #2751 — a strictly later head-naming summary supersedes a processing-error notice (review object or comment), an earlier one does not"
 }
 
 test_completed_description_still_clears() {
@@ -2379,6 +2662,9 @@ SKIP_REASON=""; FEEDBACK_POLICY_PRESENT=false; BLOCKING_TIER_UNRESOLVED=null
 PROBE_MODE=false; PROBE_JSON=null; STATUS_PROBE_JSON='{"enabled":false}'
 RATE_LIMIT_RETRIES=0; RESUME_RETRIES=0; CODEX_FAILOVER_REQUESTED=false
 START_EPOCH=\$(date +%s)
+# #2752 backstop: the emitter consults the processing-error latch on every
+# exit-0 clearance. Stubbed by CRW_TEST_LATCH_RC (default 0, permit).
+crw_processing_error_latch_permits_clearance() { return "\${CRW_TEST_LATCH_RC:-0}"; }
 . "$snip"
 emit_json_and_exit "\$1" "\$2" "\$3" "\$4"
 HARNESS
@@ -2424,7 +2710,21 @@ HARNESS
   [ "$rc" = "4" ] || fail "32: the literal null review object exited $rc, expected 4 — a JSON null is a legal emission, not a violation"
   [ "$(printf '%s' "$out" | jq -r '.review')" = "null" ] || fail "32: review should emit as null, got $(printf '%s' "$out" | jq -c '.review')"
 
-  [ "$FAIL" -ne "$before" ] || pass "32: #985 — emit_json_and_exit refuses an empty/unparseable review object with exit 3 and no stdout, and emits well-formed values (null included) unchanged"
+  # 4. #2752 backstop: a clearance the latch withholds (set or unreadable)
+  #    stops with infra and writes nothing, for both clearance statuses; a
+  #    non-clearance emission does not consult it.
+  local latch status
+  for latch in 1 3; do
+    for status in cleared reported; do
+      rc=0; out=$(CRW_TEST_LATCH_RC=$latch bash "$harness" "$status" 0 '{"id":7701}' 0 2>"$WORKDIR/emit-latch.err") || rc=$?
+      [ "$rc" = "3" ] && [ -z "$out" ] && grep -q 'processing-error latch withheld clearance' "$WORKDIR/emit-latch.err" \
+        || fail "32: $status with latch rc $latch exited $rc (expected 3, no stdout); err=$(cat "$WORKDIR/emit-latch.err")"
+    done
+  done
+  rc=0; out=$(CRW_TEST_LATCH_RC=1 bash "$harness" findings 2 '{"id":7701}' 1 2>/dev/null) || rc=$?
+  [ "$rc" = "2" ] || fail "32: a findings emission consulted the latch backstop, exited $rc"
+
+  [ "$FAIL" -ne "$before" ] || pass "32: #985 — emit_json_and_exit refuses an empty/unparseable review object with exit 3 and no stdout, and emits well-formed values (null included) unchanged; a latch-withheld clearance also exits 3 (#2752)"
 }
 
 # --- Test 33: #968 AC1 — a later chat reply must not restore the false clear -
@@ -2775,6 +3075,13 @@ test_processing_error_review_body_does_not_release
 test_processing_error_older_run_does_not_release
 test_processing_error_review_object_only_does_not_clear
 test_processing_error_unreadable_fails_closed
+test_processing_error_latch_unit
+test_processing_error_latch_edges_enumerated
+test_processing_error_polling_and_terminal_edges_withhold
+test_processing_error_verdict_edge_withholds
+test_processing_error_probe_evidence_withholds
+test_processing_error_probe_reported_withholds
+test_processing_error_superseded_by_later_summary_clears
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error
