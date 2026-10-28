@@ -6338,6 +6338,20 @@ out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON="$(_wave_summary Comp
   || bad="$bad wave-helper-running-absent"
 ( gh_api_array() { printf '[]'; }; p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) \
   || bad="$bad wave-helper-empty-not-absent"
+# Absence must be proven (Phase 4b P1 on #2859, round 2): a marked summary
+# whose row does not parse (here, Running without the trailing table pipe)
+# is unreadable provider state and holds; a parseable row naming an OLDER
+# commit says this head's run has not started.
+_wave_marked() { # <row-line>
+  jq -nc --arg row "$1" '[{id:7102,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-08-30T00:01:00Z",
+    body:("<!-- codex-pull-request-review-summary -->\n" + $row)}]'
+}
+( gh_api_array() { _wave_marked "| 📝 **Code Review** | **Running** | \`${_p4a_head:0:7}\` | auto"; }
+  ! p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) || bad="$bad wave-helper-unparseable-waived"
+( gh_api_array() { _wave_marked "garbled summary"; }
+  ! p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) || bad="$bad wave-helper-garbled-waived"
+( gh_api_array() { _wave_marked "| 📝 **Code Review** | **Running** | \`1111111\` | auto |"; }
+  p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) || bad="$bad wave-helper-other-commit-held"
 # The posture is the orchestrator's alone: sourcing the library resets it, so
 # an inherited environment value cannot reach the barrier.
 [ "$(P4B_BARRIER_WAVE_CANARY=true bash -c '. "$1"; printf %s "$P4B_BARRIER_WAVE_CANARY"' _ "$LIB")" = false ] \
@@ -6367,6 +6381,14 @@ bad=""
 for _where in pre-dispatch post-adapter pre-post; do
   grep -q "^  revalidate_wave_canary_waiver $_where\$" "$ORCH" || bad="$bad unwired-$_where"
 done
+# The last check sits after every other pre-POST authority read, immediately
+# before the payload is built (Phase 4b P1 on #2859, round 2).
+_wfinal=$(grep -n '^  \[ "\$event" != "APPROVE" \] || revalidate_wave_canary_waiver pre-post$' "$ORCH" | cut -d: -f1)
+_gfinal=$(grep -n '^  \[ "\$event" != "APPROVE" \] || refuse_approval_if_request_generation_moved final$' "$ORCH" | cut -d: -f1)
+_pfinal=$(grep -n '^  payload_file="\$(mktemp ' "$ORCH" | cut -d: -f1)
+[ -n "$_wfinal" ] && [ -n "$_gfinal" ] && [ -n "$_pfinal" ] && [ "$_gfinal" -lt "$_wfinal" ] \
+  && [ "$_pfinal" = "$((_wfinal + 1))" ] \
+  || bad="$bad final-recheck-not-last(gen=$_gfinal wave=$_wfinal payload=$_pfinal)"
 _wfn="$(sed -n '/^revalidate_wave_canary_waiver() {/,/^}/p' "$ORCH")"
 [ -n "$_wfn" ] || bad="$bad no-function"
 _wave_reval() { # <evidence> <run-absent:0|1> <where>

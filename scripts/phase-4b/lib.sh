@@ -2137,12 +2137,19 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 P4B_BARRIER_WAVE_CANARY=false
 
 # p4b_codex_no_unsolicited_run <repo> <pr> <head>
-# True only when the Codex App has no review of <head> in flight. An
+# True only when the Codex App provably has no review of <head> in flight. An
 # unsolicited App auto-review (no author request, so no request generation)
-# shows as a Review Summary row for the head; Running, or any status other
-# than Completed, is a live review the wave posture must not waive (Codex P1
-# on #2859, AGENTS.md's in-flight review stop). An unreadable timeline is not
-# proof of absence, so it returns false and the ordinary wait holds.
+# shows as a Review Summary comment; Running, or any status other than
+# Completed, is a live review the wave posture must not waive (Codex P1 on
+# #2859, AGENTS.md's in-flight review stop).
+#
+# Absence must be PROVEN (Phase 4b P1 on #2859): crqe_select_codex_review_summary
+# returns null both when there is no summary and when a summary's row does not
+# parse, so null alone is not evidence. This passes only when no bot comment
+# carries the summary marker, or the selected row for this head is Completed,
+# or every marked comment parses to a row naming a DIFFERENT commit (the
+# summary is edited in place, so an older head's row says this head's run has
+# not started). Anything else, including an unreadable timeline, holds.
 p4b_codex_no_unsolicited_run() {
   local comments bot summary
   command -v gh_api_array crqe_select_codex_review_summary >/dev/null 2>&1 || return 1
@@ -2150,7 +2157,22 @@ p4b_codex_no_unsolicited_run() {
   bot="${bot:-chatgpt-codex-connector[bot]}"
   comments="$(gh_api_array "repos/$1/issues/$2/comments" "Codex unsolicited-run evidence" 2>/dev/null)" || return 1
   summary="$(crqe_select_codex_review_summary "$comments" "$bot" "$3" 2>/dev/null)" || return 1
-  printf '%s' "$summary" | jq -e '. == null or .status == "completed"' >/dev/null 2>&1
+  if [ "$summary" != null ]; then
+    printf '%s' "$summary" | jq -e '.status == "completed"' >/dev/null 2>&1
+    return
+  fi
+  # No row for this head. Every marked comment must still parse to a row for
+  # another commit; a marked comment with no parseable row is unreadable
+  # provider state, not absence. The row grammar is the selector's.
+  printf '%s' "$comments" | jq -e --arg bot "$bot" --arg sha "$3" '
+    ($sha | ascii_downcase) as $head
+    | all(.[]
+          | select((.user.login // "") == $bot)
+          | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"));
+          ((.body // "")
+           | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+           // null) as $row
+          | $row != null and ($head | startswith($row.commit | ascii_downcase) | not))' >/dev/null 2>&1
 }
 
 p4b_same_head_barrier() {

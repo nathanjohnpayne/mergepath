@@ -404,15 +404,18 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # verdict (#2742). Only a comment with no raw anchor field at all may be
 # anchorless; one whose raw fields parsed to nothing is excluded too.
 #
-# A raw anchor FIELD is a line that opens with "Reviewed commit" (after
-# Markdown decoration, ordered-list numbering included: `1. Reviewed commit:`,
-# Phase 4b P1 on #2859) and does not continue the word, so "reviewed commits"
-# or a mid-sentence mention in an anchorless verdict's prose leaves it
-# anchorless, while a malformed field such as `Reviewed commit: not-a-sha`
-# is still caught (#2772 item 2).
+# A raw anchor field is any occurrence of the phrase "reviewed commit" that
+# does not continue the word (#2772 item 2); `_` ends it, as Markdown
+# emphasis (`_Reviewed commit_`) does. That frees the common anchorless
+# prose "the reviewed commits look clean" without enumerating Markdown: every
+# decorated spelling of a field (numbering, nested bullets, headings, bold,
+# code) still contains the bare phrase, so a malformed field anywhere still
+# excludes its verdict. Prose that uses the bare phrase ("I reviewed commit
+# history") is excluded too; that is the fail-closed side, leaving its
+# request unanswered rather than inventing a response (Phase 4b on #2859).
 RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
   [ .[] | select((.user.login // "") == $bot)
-    | select((.body // "") | test("(?im)^[[:space:]>*_`#+-]*(?:[0-9]+[.)][[:space:]>*_`]*)?reviewed commit(?![0-9a-z_])"))
+    | select((.body // "") | test("(?i)reviewed commit(?![0-9a-z])"))
     | .id ]' <<<"$ISSUE_COMMENTS")
 # A verdict that names two different full SHAs reviewed no single commit:
 # crqe_verdicts keeps both and consistent_anchor would read the pair as no

@@ -2462,6 +2462,10 @@ post_review() {
   # generation with the original authorization; never rebuild the ledger or
   # treat that late request as covered. Drift/unreadability uses pre-POST cleanup.
   [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved final
+  # #2771 (Phase 4b P1 on #2859): the reads above can outlast the earlier
+  # waiver check, and an unsolicited Codex run that starts meanwhile moves no
+  # request generation. Re-read it as the last authority read before the POST.
+  [ "$event" != "APPROVE" ] || revalidate_wave_canary_waiver pre-post
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
