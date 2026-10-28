@@ -268,6 +268,13 @@ assert_precedence() {   # $1 runner
     run_plan_env "$r" "$e=$(env_value "$k")" --set "$k=$(flag_value "$k")"; line=$(policy_line "$OUT")
     expect "precedence: --set $k beats $e" "$(policy_entry "$line" "$k")" "$k=$(flag_value "$k") (flag --set $k)"
   done
+  # retry_failed (#2843) is reported with its source but has no file key.
+  run_plan "$r"; line=$(policy_line "$OUT")
+  expect "precedence: retry_failed is reported, default false" "$(policy_entry "$line" retry_failed)" "retry_failed=false (default)"
+  run_plan_env "$r" MERGEPATH_PREPUSH_RETRY_FAILED=1; line=$(policy_line "$OUT")
+  expect "precedence: retry_failed names its environment source" "$(policy_entry "$line" retry_failed)" "retry_failed=true (env MERGEPATH_PREPUSH_RETRY_FAILED)"
+  run_plan_env "$r" MERGEPATH_PREPUSH_RETRY_FAILED=0 --retry-failed; line=$(policy_line "$OUT")
+  expect "precedence: --retry-failed beats the environment" "$(policy_entry "$line" retry_failed)" "retry_failed=true (flag --retry-failed)"
   # --deep is the deep key's own flag.
   run_plan_env "$r" MERGEPATH_PREPUSH_DEEP=0 --deep; line=$(policy_line "$OUT")
   expect "precedence: --deep beats MERGEPATH_PREPUSH_DEEP" "$(policy_entry "$line" deep)" "deep=true (flag --deep)"

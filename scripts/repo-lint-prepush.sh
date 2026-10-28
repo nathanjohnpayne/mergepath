@@ -71,6 +71,8 @@
 #                   remote default branch is classified as `push`, like CI)
 #   --head-ref REF  branch name handed to the classifier (mergepath-sync/*
 #                   selects the complete surface, as in CI)
+#   --retry-failed  re-run only the checks that did not pass in the recorded
+#                   run of the same commit and selection (hook runs; below)
 # Environment:
 #   MERGEPATH_PREPUSH_SKIP=1    bypass entirely (as does git push --no-verify)
 #   MERGEPATH_PREPUSH_DEEP=1    run the selected deep-lane steps too
@@ -87,6 +89,7 @@
 #                               on this machine to finish (default 3600)
 #   MERGEPATH_PREPUSH_LOCK_TOOL=T  take the lock with flock(1) or python3's
 #                               fcntl (default: flock(1) if present, else python3)
+#   MERGEPATH_PREPUSH_RETRY_FAILED=1  --retry-failed, from git push
 # Hook checks run in tool-owned detached worktrees of each pushed tip, so
 # working-tree modifications and untracked files cannot affect their result.
 # Python package metadata must equal the committed workflow pins.
@@ -97,6 +100,13 @@
 # holder's branch, pid, start time and progress every 30 s, and gives up
 # after the bound above; a snapshot left by a killed run is retired under
 # that lock. A host with neither tool fails closed (exit 2).
+# Retry (#2843): every hook run records each selected check's result for the
+# pushed branch in ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush-results/,
+# with the pushed commit and a fingerprint of the selection. After a failed
+# push, MERGEPATH_PREPUSH_RETRY_FAILED=1 git push re-runs only the checks that
+# did not pass, when the commit and the selection are unchanged, and passes
+# when they all pass. Any other case (no record, an unreadable one, another
+# commit or selection, a manual run) runs the full selection and says why.
 # Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment
 # (including missing or mismatched CI packages).
 #
@@ -104,7 +114,8 @@
 # run checks (the pushed commit's snapshot in a hook run, the checkout in a
 # manual run; never uncommitted edits during a push). Each key resolves as
 # --set KEY=VALUE (repeatable) > environment > the file > built-in default,
-# and the `policy` line names every effective value and its source.
+# and the `policy` line names every effective value and its source (plus
+# retry_failed, a per-push action with no file key).
 #   key                     environment                               default
 #   mode                    MERGEPATH_PREPUSH_MODE                    full
 #                           (off: run nothing; selected: only the selected
@@ -613,6 +624,7 @@ policy_summary() {
   for k in $(policy_keys); do
     out="${out:+$out, }$k=$(policy_value "$k") ($(policy_source "$k"))"
   done
+  out="$out, retry_failed=$([ "${RETRY:-0}" = 1 ] && echo true || echo false) (${RETRY_SRC:-default})"
   printf '%s; %s %s' "$out" "$PREPUSH_POLICY_FILE" "$([ "$POLICY_FILE_STATE" = present ] && echo read || echo 'absent, built-in defaults')"
 }
 
@@ -631,6 +643,11 @@ JOBS="${MERGEPATH_PREPUSH_JOBS:-}"
 NICE=''   # from the policy (#2840)
 EVENT=''
 HEAD_REF=''
+RETRY="${MERGEPATH_PREPUSH_RETRY_FAILED:-0}"
+# --retry-failed is a per-push action, not repo policy: no .github/prepush.yml
+# key, but the policy line reports it with its source like the keys (#2840).
+RETRY_SRC=default
+[ -z "${MERGEPATH_PREPUSH_RETRY_FAILED:-}" ] || RETRY_SRC='env MERGEPATH_PREPUSH_RETRY_FAILED'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --hook)
@@ -652,6 +669,7 @@ while [ "$#" -gt 0 ]; do
     --jobs) [ "$#" -ge 2 ] || die "--jobs needs a number"; JOBS="$2"; shift 2 ;;
     --event) [ "$#" -ge 2 ] || die "--event needs a name"; EVENT="$2"; shift 2 ;;
     --head-ref) [ "$#" -ge 2 ] || die "--head-ref needs a ref"; HEAD_REF="$2"; shift 2 ;;
+    --retry-failed) RETRY=1; RETRY_SRC='flag --retry-failed'; shift ;;
     -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -661,6 +679,7 @@ done
 if [ -n "$JOBS" ]; then
   case "$JOBS" in *[!0-9]*|0) die "--jobs / MERGEPATH_PREPUSH_JOBS must be a positive integer (got '$JOBS')" ;; esac
 fi
+case "$RETRY" in 1|true) RETRY=1 ;; *) RETRY=0 ;; esac
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
 cd "$ROOT"
@@ -1168,6 +1187,134 @@ if [ ! -s "$RUN_DIR/order" ]; then
   exit 0
 fi
 
+# ── --retry-failed: re-run only what did not pass for this commit and selection (#2843) ──
+# Under concurrent pushes a check that passes standalone can fail here (#2569,
+# #2575), and re-running everything costs as long as the first run. Every
+# hook run therefore records, per pushed branch, the commit it checked, a
+# fingerprint of its selection (both scope readings, the lanes it ran, and
+# every selected step's lane, job, name, run body and env, which is what the
+# step numbers below index) and each step's result, in a file beside the
+# machine-wide lock. Only hook runs record: they alone check a committed
+# snapshot of exactly that commit. A retry builds on that record only when it
+# is complete and names the same commit and selection; then it runs the
+# steps the record does not show passing (failed, or never reported) and
+# rewrites the record with their new results. Everything else runs the full
+# selection and says why. A missing, unreadable or malformed record is never
+# read as "nothing failed".
+RETRY_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush-results"
+RETRY_FILE=''     # the record this run reads and writes (hook runs only)
+RETRY_COMMIT=''
+RETRY_ACTIVE=0    # 1: this run re-runs only the recorded failures
+RETRY_NOTE=''     # why a requested retry runs the full selection instead
+SEL_TOTAL=$id
+SELECTION_FP=$({
+  printf 'scope\n%s\nlocal_scope\n%s\nlanes\t%s\n' "$SCOPE" "$L_SCOPE" "$lanes"
+  printf '%s\n' "$PLAN_JSON" | jq -c "select(.lane == ($lanes))"
+} | git hash-object --stdin) || die "cannot fingerprint the selection"
+if [ "$MODE" = hook ] && [ "$SNAPSHOT" -eq 1 ]; then
+  retry_branch=$(printf '%s' "${PUSHED:-}" | sed -n '1s#^[^ ]* refs/heads/##p')
+  RETRY_COMMIT=$(git rev-parse HEAD)
+  # One record per branch; a name collision only ever refuses a retry.
+  [ -z "$retry_branch" ] || RETRY_FILE="$RETRY_DIR/$(printf '%s' "$retry_branch" | tr -c 'A-Za-z0-9._-' '_').tsv"
+fi
+
+# Reads $RETRY_FILE into $RUN_DIR/retry.prior (sid<TAB>rc lines) when it is a
+# complete record of $RETRY_COMMIT under $SELECTION_FP with $SEL_TOTAL steps.
+# Status 1 with RETRY_NOTE set otherwise.
+retry_read() {
+  local verdict
+  if [ ! -f "$RETRY_FILE" ]; then
+    RETRY_NOTE="no recorded run of this branch to retry"
+    return 1
+  fi
+  if ! verdict=$(awk -F'\t' -v commit="$RETRY_COMMIT" -v fp="$SELECTION_FP" -v n="$SEL_TOTAL" \
+       -v prior="$RUN_DIR/retry.prior" '
+    NR == 1 { if ($0 != "mergepath-prepush-results\tv1") bad = 1; next }
+    $1 == "commit" && NF == 2 { c = $2; next }
+    $1 == "selection" && NF == 2 { s = $2; next }
+    $1 == "recorded" { next }
+    $1 == "steps" && NF == 2 { k = $2; next }
+    $1 == "step" && NF >= 3 {
+      if ($2 !~ /^[0-9][0-9][0-9]+$/ || ($2 in rc) || ($3 !~ /^[0-9]+$/ && $3 != "none")) bad = 1
+      rc[$2] = $3; m++; next }
+    $1 == "end" && NF == 1 { e = 1; next }
+    { bad = 1 }
+    END {
+      if (NR == 0 || bad || !e || c == "" || s == "" || k == "" || k != m) { print "malformed"; exit }
+      if (c != commit) { print "commit " c; exit }
+      if (s != fp || k != n + 0) { print "selection"; exit }
+      for (i = 1; i <= n; i++) if (!(sprintf("%03d", i) in rc)) { print "malformed"; exit }
+      for (i = 1; i <= n; i++) printf "%03d\t%s\n", i, rc[sprintf("%03d", i)] > prior
+      print "ok"
+    }' "$RETRY_FILE" 2>/dev/null); then
+    RETRY_NOTE="the recorded run ($RETRY_FILE) cannot be read"
+    return 1
+  fi
+  case "$verdict" in
+    ok) return 0 ;;
+    commit\ *) RETRY_NOTE="the commit changed since the recorded run (recorded ${verdict#commit }, pushing $RETRY_COMMIT)" ;;
+    selection) RETRY_NOTE="the selection changed since the recorded run of $RETRY_COMMIT" ;;
+    *) RETRY_NOTE="the recorded run ($RETRY_FILE) is incomplete or malformed" ;;
+  esac
+  return 1
+}
+
+if [ "$RETRY" -eq 1 ]; then
+  if [ -z "$RETRY_FILE" ]; then
+    RETRY_NOTE="a manual run checks the working tree, not a committed snapshot, so it has no recorded run to retry (MERGEPATH_PREPUSH_RETRY_FAILED=1 git push retries a hook run)"
+  elif retry_read; then
+    RETRY_ACTIVE=1
+  fi
+  if [ "$RETRY_ACTIVE" -eq 1 ]; then
+    awk -F'\t' 'NR == FNR { if ($2 != "0") redo[$1] = 1; next } ($2 in redo)' \
+      "$RUN_DIR/retry.prior" "$RUN_DIR/order" > "$RUN_DIR/order.retry"
+    mv "$RUN_DIR/order.retry" "$RUN_DIR/order"
+    redo_n=$(wc -l < "$RUN_DIR/order" | tr -d ' ')
+    echo "$PREFIX: --retry-failed: re-running the $redo_n of $SEL_TOTAL checks that did not pass in the recorded run of $RETRY_COMMIT with this selection; the other $((SEL_TOTAL - redo_n)) passed there"
+    if [ "$redo_n" -eq 0 ]; then
+      echo "$PREFIX: PASS (nothing to re-run; every check passed in the recorded run). CI lint still runs and remains authoritative."
+      rm -rf "$RUN_DIR"
+      exit 0
+    fi
+  else
+    echo "$PREFIX: --retry-failed: $RETRY_NOTE; running the full selection"
+  fi
+fi
+
+# Writes this run's record: a step keeps its prior pass when a retry did not
+# re-run it, takes its new result when it ran, and is `none` (not passed)
+# when it never reported. Best effort, like the timing cache: a record that
+# cannot be written makes the next retry run the full selection.
+retry_write() {
+  local i sid rc tmp
+  [ -n "$RETRY_FILE" ] || return 0
+  mkdir -p "$RETRY_DIR" 2>/dev/null || return 1
+  tmp=$(mktemp "$RETRY_DIR/.record.XXXXXX" 2>/dev/null) || return 1
+  if {
+    printf 'mergepath-prepush-results\tv1\ncommit\t%s\nselection\t%s\nrecorded\t%s\nsteps\t%s\n' \
+      "$RETRY_COMMIT" "$SELECTION_FP" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SEL_TOTAL"
+    for ((i = 1; i <= SEL_TOTAL; i++)); do
+      sid=$(printf '%03d' "$i")
+      if [ -f "$RUN_DIR/results/$sid" ]; then
+        rc=$(cut -f1 "$RUN_DIR/results/$sid")
+      elif [ "$RETRY_ACTIVE" -eq 1 ]; then
+        rc=$(awk -F'\t' -v s="$sid" '$1 == s { print $2 }' "$RUN_DIR/retry.prior")
+      else
+        rc=none
+      fi
+      case "$rc" in ''|*[!0-9]*) rc=none ;; esac
+      printf 'step\t%s\t%s\t%s\n' "$sid" "$rc" "$(cat "$RUN_DIR/steps/$sid.name")"
+    done
+    printf 'end\n'
+  } > "$tmp" && mv "$tmp" "$RETRY_FILE"; then
+    # Records of branches not pushed for 30 days are dropped.
+    find "$RETRY_DIR" -maxdepth 1 -type f -name '*.tsv' -mtime +30 -exec rm -f {} + 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # One host reading per run (#2575, #2581): the load that sized the jobs
 # default is the one printed here; the verdict line reads it again at the end.
 LOAD_START="$LOAD_1"
@@ -1208,6 +1355,14 @@ if [ "$total" -ne "$expected" ]; then
   echo "$PREFIX: only $total of $expected checks reported a result; treating the run as failed" >&2
   failed=$((failed + 1))
 fi
+RETRY_RECORDED=0
+if [ -n "$RETRY_FILE" ]; then
+  if retry_write; then
+    RETRY_RECORDED=1
+  else
+    echo "$PREFIX: could not record this run's results in $RETRY_DIR; a later --retry-failed runs the full selection" >&2
+  fi
+fi
 
 # Remember durations for the next run's ordering (best effort).
 if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
@@ -1241,4 +1396,7 @@ for f in "$RUN_DIR"/results/*; do
 done
 echo "$PREFIX: FAIL ($failed of $expected checks failed in ${mins}m${secs}s; $LOAD_NOTE); the push is blocked. Logs: $RUN_DIR" >&2
 echo "$PREFIX: fix and push again. Bypass only in an emergency: git push --no-verify, or MERGEPATH_PREPUSH_SKIP=1 git push (CI lint still gates the merge)." >&2
+if [ "$RETRY_RECORDED" -eq 1 ]; then
+  echo "$PREFIX: to re-run only the checks that did not pass (same commit, same selection): MERGEPATH_PREPUSH_RETRY_FAILED=1 git push" >&2
+fi
 exit 1
