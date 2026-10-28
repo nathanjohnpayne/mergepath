@@ -219,7 +219,9 @@
 #     # a held request without a strong head tie records no determination.
 #     # It is "superseded" when a newer author request landed during the
 #     # wait (#2791): superseded_by names it, no determination is recorded,
-#     # and the run exits 3 with this JSON.
+#     # and the run exits 3 with this JSON. A Codex signal on HEAD that
+#     # arrives with a newer request present still exits 0, reported as
+#     # final_state "ambiguous" with superseded_by set.
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
 #   }
@@ -3528,8 +3530,11 @@ codex_run_state_now() { # the waited-on request's reported state
   state=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.state // "none"' 2>/dev/null) || state=unknown
   superseded=$(codex_run_superseding_request)
   if [ -z "$superseded" ] && { [ -z "$watched" ] || [ "$scan_request" != "$watched" ]; }; then state=none; fi
-  if [ -n "$superseded" ] \
-     || [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ]; then
+  if [ -n "$superseded" ]; then
+    # Whatever the row says, or with no row yet, it may follow the newer
+    # request: nothing ties it to the waited-on one.
+    state=ambiguous
+  elif [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ]; then
     case "$state" in failed|canceled|completed|running) state=ambiguous ;; esac
   fi
   case "$state" in running) state=active ;; none) state=unknown ;; esac
@@ -3663,9 +3668,19 @@ BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order th
 # --diagnostic-signal-only probe maps them to its Phase 4b exit-2 waiver.
 PHASE4A_TERMINAL_RECORDED=false
 PHASE4A_TERMINAL_COMMENT_ID=""
+CODEX_RUN_SUPERSEDED_BY=""
 if [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; then
   if has_post_trigger_signal "$FINAL_SCAN"; then
     CODEX_RUN_FINAL_STATE=answered
+    # #2791: a HEAD-anchored Codex signal is still this run's result (exit 0
+    # reports Codex's signal on HEAD, whichever request prompted it), but with
+    # a newer request present the report cannot say it answered this one.
+    CODEX_RUN_SUPERSEDED_BY=$(codex_run_superseding_request)
+    if [ -n "$CODEX_RUN_SUPERSEDED_BY" ]; then
+      CODEX_RUN_FINAL_STATE=ambiguous
+      CODEX_RUN_OVERLAP=true
+      log "Codex signal on HEAD received, but newer author request $CODEX_RUN_SUPERSEDED_BY landed during the wait — reported as ambiguous, not answered (#2791)"
+    fi
   else
     codex_run_tick
     CODEX_RUN_FINAL_STATE=$(codex_run_state_now)
@@ -3690,13 +3705,12 @@ fi
 # superseded_by) and exits 3; a rerun holds or replaces the newer request by
 # the same-head hold's rules.
 CODEX_RUN_HANDOFF=""
-CODEX_RUN_SUPERSEDED_BY=""
 if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then
   CODEX_RUN_SUPERSEDED_BY=$(codex_run_superseding_request)
+  [ -z "$CODEX_RUN_SUPERSEDED_BY" ] || CODEX_RUN_HANDOFF=superseded
 fi
-if [ -n "$CODEX_RUN_SUPERSEDED_BY" ]; then
-  CODEX_RUN_HANDOFF=superseded
+if [ "$CODEX_RUN_HANDOFF" = superseded ]; then
   log "request ${TERMINAL_TRIGGER_COMMENT_ID:-?} was superseded by newer author request $CODEX_RUN_SUPERSEDED_BY during its wait — no timeout determination is recorded; exit 3 (#2791)"
 elif { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then

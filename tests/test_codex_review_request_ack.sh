@@ -308,6 +308,9 @@ case "$endpoint" in
       # An older P1 review on HEAD that the pending request asked Codex to
       # reconsider; it predates the request, so it is not its answer.
       printf '[{"id":98,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-03T23:59:30Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"older findings"}]\n' "$bot"
+    elif [ "$scenario" = "review-after-inject" ] && [ -f "$state_dir/injected" ]; then
+      # #2791: Codex reviews HEAD only after the injected newer request.
+      printf '[{"id":97,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:45Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"review after the newer request"}]\n' "$bot"
     elif [ "$scenario" = "answered-running" ]; then
       printf '[{"id":96,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:20Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"findings on the pending request"}]\n' "$bot"
     elif [ "$scenario" = "resume-running" ] && [ "$reads" -gt 1 ]; then
@@ -2186,6 +2189,24 @@ test_newer_request_supersedes_the_waited_on_one() {
     || fail "#2791 superseded: $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
   grep -q 'superseded by newer author request 5000' "$dir/err.log" \
     || fail "#2791 superseded: the log does not name the newer request; $(tail -3 "$dir/err.log")"
+  # With no Review Summary row at all, a superseded request still reads
+  # ambiguous, not unknown (CodeRabbit on #2846).
+  dir=$(make_case "run-superseded-no-row" 0 0 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 3 ] && jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous" and .codex_run.handoff == "superseded"' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded, no row: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  # A Codex review of HEAD after the newer request is still this run's
+  # result (exit 0), but it is not reported as this request's answer.
+  dir=$(make_case "run-superseded-answered" 0 0 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" review-after-inject CODEX_TEST_INJECT_AT=30 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 1 ] \
+    && jq -e '.codex_run.final_state == "ambiguous" and .codex_run.superseded_by == 5000 and .codex_run.overlapping_request == true
+        and .codex_run.handoff == null and .review.id == 97' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded, answered: exit $rc, $(jq -c '{codex_run, review: .review.id}' "$dir/out.json" 2>/dev/null)"
   [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
 }
 

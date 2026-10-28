@@ -142,8 +142,9 @@ gh_comment_guard_run_write() { # <command...>
   # comment is final, so a mismatch is refused at once.
   attempts="${MERGEPATH_CODEX_REQUEST_READBACK_ATTEMPTS:-4}"
   delay="${MERGEPATH_CODEX_REQUEST_READBACK_DELAY_SECONDS:-1}"
+  # Decimal only: a leading zero ("08") is not octal arithmetic here.
   [[ "$attempts" =~ ^[1-9][0-9]?$ ]] || attempts=4
-  [[ "$delay" =~ ^[0-9]+$ ]] || delay=1
+  [[ "$delay" =~ ^(0|[1-9][0-9]?)$ ]] || delay=1
   comment=""
   if [ -n "$id" ]; then
     for ((attempt = 1; attempt <= attempts; attempt++)); do

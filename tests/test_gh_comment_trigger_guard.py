@@ -47,6 +47,14 @@ if read:
         counter.write_text(str(seen + 1))
         if seen < failures:
             sys.exit(1)
+    # READBACK_EMPTY=N answers the first N readbacks with success and no body.
+    empty = int(os.environ.get("READBACK_EMPTY", "0"))
+    if empty:
+        counter = timeline / "readback-empty.count"
+        seen = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(seen + 1))
+        if seen < empty:
+            sys.exit(0)
     for path in timeline.glob("*.jsonl"):
         for line in path.read_text().splitlines():
             comment = json.loads(line)
@@ -703,14 +711,21 @@ class TriggerGuardTests(unittest.TestCase):
         (fixture / "release").touch()
         env.update(MERGEPATH_CODEX_REQUEST_READBACK_DELAY_SECONDS="0", MERGEPATH_CODEX_REQUEST_READBACK_ATTEMPTS="3")
         command = ["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "@codex review"]
-        for failures, expected in ((2, 0), (3, 5)):
-            with self.subTest(failures=failures):
+        for mode, failures, expected in (("FAILURES", 2, 0), ("FAILURES", 3, 5), ("EMPTY", 2, 0)):
+            with self.subTest(mode=mode, failures=failures):
                 for path in (fixture / "timeline").iterdir():
                     path.unlink()
-                result = subprocess.run(command, env=dict(env, READBACK_FAILURES=str(failures)), capture_output=True, timeout=20)
+                result = subprocess.run(command, env=dict(env, **{"READBACK_" + mode: str(failures)}), capture_output=True, timeout=20)
                 self.assertEqual(expected, result.returncode, result.stderr)
-                self.assertEqual(str(min(failures + 1, 3)), (fixture / "timeline/readback-failures.count").read_text())
+                self.assertEqual(str(min(failures + 1, 3)), (fixture / f"timeline/readback-{mode.lower()}.count").read_text())
                 self.assertEqual(1, len((fixture / "timeline/123.jsonl").read_text().splitlines()))
+        # A zero-padded delay is not read as octal arithmetic (CodeRabbit on #2846).
+        for path in (fixture / "timeline").iterdir():
+            path.unlink()
+        result = subprocess.run(command, env=dict(env, READBACK_FAILURES="1", MERGEPATH_CODEX_REQUEST_READBACK_DELAY_SECONDS="08",
+                                                  MERGEPATH_CODEX_REQUEST_READBACK_ATTEMPTS="2"), capture_output=True, timeout=20)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn(b"value too great for base", result.stderr)
 
     def test_out_of_band_request_is_counted_never_blocked(self):
         # The claim governs guarded writes only. A request typed in the GitHub
