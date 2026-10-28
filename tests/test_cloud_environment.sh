@@ -419,7 +419,7 @@ SBIN="$WORKDIR/setup-bin"
 mkdir -p "$SBIN"
 # gzip: GNU tar runs it from PATH for -z (bsdtar on macOS does not), so a
 # hermetic PATH without it fails every unpack on Linux (Codex on #1552).
-for tool in bash awk tar gzip mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname cmp stat; do
+for tool in bash awk tar gzip mkdir cp chmod mktemp mv rm head sha256sum shasum perl sed tr cat env jq dirname cmp stat; do
   real="$(command -v "$tool" 2>/dev/null || true)"
   case "$real" in /*) ln -sf "$real" "$SBIN/$tool" ;; esac
 done
@@ -874,6 +874,86 @@ if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4" "$WORKDIR/setup.
 else
   fail "setup yq not v4: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
+
+# #2754 / #2772: validation runs where the binary will run. The fixture models
+# a noexec filesystem hermetically: it refuses to run (status 126, as exec
+# does) when its own path is under YQ_FIXTURE_NOEXEC. Staging files are
+# `.yq-stage.*` in the prefix's bin directory and must never outlive a run.
+cat >"$REL/yq/yq_linux_amd64" <<'NOEXEC_FIXTURE'
+#!/usr/bin/env bash
+case "$0" in "${YQ_FIXTURE_NOEXEC:-/nonexistent-2754}"/*) echo "$0: Permission denied" >&2; exit 126 ;; esac
+echo "yq (https://github.com/mikefarah/yq/) version v4.99.0"
+NOEXEC_FIXTURE
+nxsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
+[ -n "$nxsum" ] || nxsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
+no_stage() { ! ls -A "$1/bin" 2>/dev/null | grep -q '^\.yq-stage\.'; }
+
+mkdir -p "$WORKDIR/noexec-tmp" "$WORKDIR/y-noexec-tmp/bin"
+printf 'existing yq replaced only after validation\n' >"$WORKDIR/y-noexec-tmp/bin/yq"
+set +e
+run_setup "$WORKDIR/y-noexec-tmp" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$nxsum" \
+  TMPDIR="$WORKDIR/noexec-tmp" YQ_FIXTURE_NOEXEC="$WORKDIR/noexec-tmp" \
+  PATH="$WORKDIR/y-noexec-tmp/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q "installed yq $YQVER" "$WORKDIR/setup.err" \
+   && cmp -s "$REL/yq/yq_linux_amd64" "$WORKDIR/y-noexec-tmp/bin/yq" \
+   && no_stage "$WORKDIR/y-noexec-tmp" && [ -z "$(ls -A "$WORKDIR/noexec-tmp")" ]; then
+  pass "setup, noexec TMPDIR with an executable prefix: validates the staged yq in the prefix and installs it"
+else
+  fail "setup noexec TMPDIR: rc=$rc err=$(cat "$WORKDIR/setup.err") bin=$(ls -A "$WORKDIR/y-noexec-tmp/bin")"
+fi
+
+# The ordinary case still installs, and leaves no staging file.
+set +e
+run_setup "$WORKDIR/y-exec-tmp" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$nxsum" \
+  PATH="$WORKDIR/y-exec-tmp/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && cmp -s "$REL/yq/yq_linux_amd64" "$WORKDIR/y-exec-tmp/bin/yq" && no_stage "$WORKDIR/y-exec-tmp"; then
+  pass "setup, executable TMPDIR: installs from the prefix staging file and leaves none behind"
+else
+  fail "setup exec TMPDIR: rc=$rc err=$(cat "$WORKDIR/setup.err") bin=$(ls -A "$WORKDIR/y-exec-tmp/bin")"
+fi
+
+# A non-executable destination still fails closed, keeping the prior binary.
+mkdir -p "$WORKDIR/y-noexec-dest/bin"
+printf 'existing yq must survive a noexec prefix\n' >"$WORKDIR/y-noexec-dest/bin/yq"
+set +e
+run_setup "$WORKDIR/y-noexec-dest" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$nxsum" \
+  YQ_FIXTURE_NOEXEC="$WORKDIR/y-noexec-dest/bin" \
+  PATH="$WORKDIR/y-noexec-dest/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4" "$WORKDIR/setup.err" \
+   && ! grep -q "installed yq" "$WORKDIR/setup.err" \
+   && [ "$(cat "$WORKDIR/y-noexec-dest/bin/yq")" = "existing yq must survive a noexec prefix" ] \
+   && no_stage "$WORKDIR/y-noexec-dest"; then
+  pass "setup, non-executable prefix: fails closed, keeps the prior yq, removes the staging file"
+else
+  fail "setup noexec prefix: rc=$rc err=$(cat "$WORKDIR/setup.err") bin=$(ls -A "$WORKDIR/y-noexec-dest/bin")"
+fi
+
+# A bad checksum never stages anything and keeps the prior binary.
+mkdir -p "$WORKDIR/y-badsum/bin"
+printf 'existing yq must survive a bad checksum\n' >"$WORKDIR/y-badsum/bin/yq"
+set +e
+run_setup "$WORKDIR/y-badsum" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$(printf '0%.0s' $(seq 64))" \
+  PATH="$WORKDIR/y-badsum/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "checksum mismatch for yq $YQVER" "$WORKDIR/setup.err" \
+   && [ "$(cat "$WORKDIR/y-badsum/bin/yq")" = "existing yq must survive a bad checksum" ] \
+   && no_stage "$WORKDIR/y-badsum"; then
+  pass "setup, bad yq checksum: keeps the prior yq and stages nothing"
+else
+  fail "setup yq bad checksum: rc=$rc err=$(cat "$WORKDIR/setup.err") bin=$(ls -A "$WORKDIR/y-badsum/bin")"
+fi
+
+# The earlier unsuitable-binary cases left no staging file either.
+for d in y-oldinstall y-notv4; do
+  if no_stage "$WORKDIR/$d"; then
+    pass "setup, $d: the refused download left no staging file in the prefix"
+  else
+    fail "setup $d: staging file left behind: $(ls -A "$WORKDIR/$d/bin")"
+  fi
+done
 
 echo
 echo "test_cloud_environment: $PASS passed, $FAIL failed"

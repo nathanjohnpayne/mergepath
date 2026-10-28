@@ -977,6 +977,8 @@ cat > "$YQBOOT_BIN/uname" <<'UNAME_STUB'
 #!/bin/sh
 if [ "${1:-}" = -m ]; then
   printf '%s\n' "${YQBOOT_ARCH:-x86_64}"
+elif [ "${1:-}" = -s ]; then
+  printf '%s\n' "${YQBOOT_OS:-Linux}"
 else
   exec /usr/bin/uname "$@"
 fi
@@ -1212,6 +1214,28 @@ for omission in x86_64 aarch64; do
   else
     fail=$((fail + 1)); echo "  FAIL: #2685 omission mutation for $omission was not detected safely (rc=$mutation_rc)" >&2
     echo "$mutation_out" >&2; cat "$YQBOOT_LOG" >&2
+  fi
+done
+
+# #2748: the pinned assets are Linux builds; macOS reports arm64 too, so a
+# non-Linux OS must refuse before the arch mapping picks yq_linux_arm64.
+for yq_os in Darwin FreeBSD; do
+  : > "$YQBOOT_LOG"
+  set +e
+  os_out=$(env GITHUB_ACTIONS=true YQBOOT_OS="$yq_os" YQBOOT_ARCH=arm64 PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/os-$yq_os/yq" \
+    "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+  os_rc=$?
+  set -e
+  if [ "$os_rc" -ne 0 ] \
+     && grep -q "unsupported OS: $yq_os" <<<"$os_out" \
+     && ! grep -q 'WGET:' "$YQBOOT_LOG" \
+     && ! grep -q 'SUDO:' "$YQBOOT_LOG" \
+     && [ ! -e "$SCRATCH/yqboot-dest/os-$yq_os/yq" ]; then
+    pass=$((pass + 1)); echo "  PASS: #2748 non-Linux OS ($yq_os arm64) refuses before download or sudo"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2748 non-Linux OS ($yq_os arm64) reached an installer step (rc=$os_rc)" >&2
+    echo "$os_out" >&2; cat "$YQBOOT_LOG" >&2
   fi
 done
 

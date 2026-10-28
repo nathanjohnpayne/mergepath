@@ -37,7 +37,11 @@ PART A: WHO MAY REQUEST `id-token: write` (ADR "Who may request")
         would run checkout under another spelling) pinned to a full 40-hex
         commit SHA;
       * no artifact download and no cache restore (`actions/cache*`, or a
-        `cache` input on any action).
+        `cache` / `package-manager-cache` input on any action whose value is
+        not the literal `false`). A setup action that caches by default
+        (CACHE_DEFAULT_ON: `actions/setup-go` `cache`, `actions/setup-node`
+        `package-manager-cache`) must turn it off explicitly; an absent input,
+        or no `with:` block at all, restores a cache.
 
     An allow-list entry whose job no longer exists, or no longer requests the
     grant, fails as stale.
@@ -369,6 +373,21 @@ def action_ref(uses):
     return m.group(1).lower(), m.group(2)
 
 
+# Inputs that restore a cache when set, and the setup actions whose cache is
+# on by default: those must name the input with a literal `false`, since
+# leaving it out (or the whole `with:` block) restores the action's cache.
+CACHE_INPUTS = ("cache", "package-manager-cache")
+CACHE_DEFAULT_ON = {
+    "actions/setup-go": "cache",
+    "actions/setup-node": "package-manager-cache",
+}
+
+
+def _off(value):
+    """True only for a literal false (YAML boolean or the string)."""
+    return str(value).strip().lower() == "false"
+
+
 def action_violations(uses, where):
     """Violations for one step `uses:` value; also returns its canonical name."""
     low = uses.lower()
@@ -415,8 +434,12 @@ def execution_violations(job, events, identity):
         inputs = _with(step)
         if name in ("actions/download-artifact",) or name.startswith("actions/cache"):
             out.append("%s: artifacts and caches are not allowed" % where)
-        if "cache" in inputs:
-            out.append("%s: a cache input is not allowed" % where)
+        for key in CACHE_INPUTS:
+            if key in inputs and not _off(inputs[key]):
+                out.append("%s: a %s input other than false is not allowed" % (where, key))
+        default_on = CACHE_DEFAULT_ON.get(name)
+        if default_on and default_on not in inputs:
+            out.append("%s: caches by default; set %s: false" % (where, default_on))
         if name == "actions/checkout":
             unknown = sorted(set(inputs) - TRUSTED_CHECKOUT_INPUTS)
             if unknown:
@@ -628,8 +651,36 @@ WORKFLOW_CASES = [
     ("a cache restore fails", WF,
      _wf(GOOD_CHECKOUT + "      - uses: actions/cache/restore@%s\n" % SHA + EXCHANGE), ALLOW, 1),
     ("a setup cache input fails", WF,
-     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-node@%s\n        with:\n          cache: npm\n" % SHA
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-node@%s\n        with:\n          cache: npm\n"
+         "          package-manager-cache: false\n" % SHA + EXCHANGE), ALLOW, 1),
+    ("setup-go with no with: block fails (cache defaults on)", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-go@%s\n" % SHA + EXCHANGE), ALLOW, 1),
+    ("setup-go without a cache input fails", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-go@%s\n        with:\n          go-version: '1.22'\n" % SHA
          + EXCHANGE), ALLOW, 1),
+    ("setup-go with cache: true fails", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-go@%s\n        with:\n          cache: true\n" % SHA
+         + EXCHANGE), ALLOW, 1),
+    ("setup-go with an expression cache fails", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-go@%s\n        with:\n          cache: ${{ false }}\n" % SHA
+         + EXCHANGE), ALLOW, 1),
+    ("setup-go with cache: false passes", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-go@%s\n        with:\n          cache: false\n" % SHA
+         + EXCHANGE), ALLOW, 0),
+    ("mixed-case setup-go with Cache: 'False' passes", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: Actions/Setup-Go@%s\n        with:\n          Cache: 'False'\n" % SHA
+         + EXCHANGE), ALLOW, 0),
+    ("setup-node with no with: block fails (package-manager-cache defaults on)", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-node@%s\n" % SHA + EXCHANGE), ALLOW, 1),
+    ("setup-node with package-manager-cache: true fails", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-node@%s\n        with:\n"
+         "          package-manager-cache: true\n" % SHA + EXCHANGE), ALLOW, 1),
+    ("setup-node with package-manager-cache: false passes", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: actions/setup-node@%s\n        with:\n"
+         "          node-version: 22\n          package-manager-cache: false\n" % SHA + EXCHANGE), ALLOW, 0),
+    ("a package-manager-cache input on another action fails", WF,
+     _wf(GOOD_CHECKOUT + "      - uses: example/setup-x@%s\n        with:\n"
+         "          package-manager-cache: yes\n" % SHA + EXCHANGE), ALLOW, 1),
     ("a reusable-workflow call fails", WF,
      "on: workflow_run\njobs:\n  consume:\n    permissions:\n      id-token: write\n"
      "    uses: ./.github/workflows/x.yml\n", ALLOW, 1),

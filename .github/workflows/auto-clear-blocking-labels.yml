@@ -125,10 +125,13 @@ permissions:
   # #310 for the full repro + permission scope rationale.
   actions: read
   # `issues: read` is required because codex-review-check.sh reads
-  # issues-scoped endpoints: /issues/{pr}/reactions (Codex 👍
-  # clearance) and /issues/{pr}/timeline (force-push anchor). On a
-  # restricted-default GITHUB_TOKEN an omitted scope defaults to
-  # `none`, so those reads 403 and the gate aborts with rc=3,
+  # the issues-scoped /issues/{pr}/timeline (force-push anchor). PR
+  # reactions are not a Codex-clearance input; comment reactions are
+  # read only by the opt-in request diagnostics
+  # (CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1), which these jobs
+  # do not enable. On a restricted-default GITHUB_TOKEN an omitted
+  # scope defaults to `none`, so the timeline read 403s and the gate
+  # aborts with rc=3,
   # leaving `needs-external-review` stuck even after Codex clears.
   # Same class as the merge-clearance-gate.yml fix on PR #429; see
   # #431.

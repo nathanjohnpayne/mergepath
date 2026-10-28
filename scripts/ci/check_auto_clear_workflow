@@ -1573,9 +1573,12 @@ perm_block=$(
 # `checks: read` fails this check instead of silently breaking the
 # workflow at runtime.
 # `issues: read` added in #431 — codex-review-check.sh reads
-# /issues/{pr}/timeline for the force-push anchor and
-# /issues/comments/{id}/reactions for trigger-ack observation only. On restricted-default
-# GITHUB_TOKEN repos an omitted scope is `none`, those reads 403,
+# /issues/{pr}/timeline for the force-push anchor; that is the issues-scoped
+# read the auto-clear jobs depend on. PR reactions are not a Codex-clearance
+# input, and /issues/comments/{id}/reactions is read only by the opt-in
+# request diagnostics (CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1), which
+# these jobs do not enable. On restricted-default
+# GITHUB_TOKEN repos an omitted scope is `none`, the timeline read 403s,
 # and the gate aborts rc=3 with `needs-external-review` stuck. Same
 # class as the merge-clearance-gate.yml `issues: read` fix (#429).
 # `security-events: read` added in #1101 (CodeRabbit on PR #1106) —
