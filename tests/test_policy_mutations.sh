@@ -59,7 +59,12 @@ start = script.index("set -euo pipefail\n")
 def norm(text):
     # The only permitted difference (#2727 3c): the helper joins the label
     # DELETE onto one line to carry its NO_BARE_GH_WRITE_EXEMPT reason.
-    text = re.sub(r"[ \t]*\\\n[ \t]*", " ", text)
+    # Only that continuation is joined; every other line must match as is.
+    text = re.sub(
+        r'(gh api -X DELETE[ \t]+)\\\n[ \t]*("repos/\$REPO/issues/\$PR_NUMBER/labels/needs-external-review")',
+        r'\1\2',
+        text,
+    )
     return re.sub(r"[ \t]+# NO_BARE_GH_WRITE_EXEMPT: [^\n]*", "", text)
 sys.exit(0 if norm(script[start:]) == norm(body) else 1)
 PY
