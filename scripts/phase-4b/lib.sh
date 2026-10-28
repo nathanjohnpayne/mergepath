@@ -2136,6 +2136,23 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 # refusal is unchanged.
 P4B_BARRIER_WAVE_CANARY=false
 
+# p4b_codex_no_unsolicited_run <repo> <pr> <head>
+# True only when the Codex App has no review of <head> in flight. An
+# unsolicited App auto-review (no author request, so no request generation)
+# shows as a Review Summary row for the head; Running, or any status other
+# than Completed, is a live review the wave posture must not waive (Codex P1
+# on #2859, AGENTS.md's in-flight review stop). An unreadable timeline is not
+# proof of absence, so it returns false and the ordinary wait holds.
+p4b_codex_no_unsolicited_run() {
+  local comments bot summary
+  command -v gh_api_array crqe_select_codex_review_summary >/dev/null 2>&1 || return 1
+  bot="$(p4b_policy_block_field codex bot_login)"
+  bot="${bot:-chatgpt-codex-connector[bot]}"
+  comments="$(gh_api_array "repos/$1/issues/$2/comments" "Codex unsolicited-run evidence" 2>/dev/null)" || return 1
+  summary="$(crqe_select_codex_review_summary "$comments" "$bot" "$3" 2>/dev/null)" || return 1
+  printf '%s' "$summary" | jq -e '. == null or .status == "completed"' >/dev/null 2>&1
+}
+
 p4b_same_head_barrier() {
   # cap-only is the read-only GitHub guard for an unavailable adapter: it
   # shares the Codex decision and local final-request wait bound, but never
@@ -2257,7 +2274,8 @@ p4b_same_head_barrier() {
               # below, so a request posted meanwhile escalates.
               if [ "$cls_cx" = not-yet ] && [ "$P4B_BARRIER_WAVE_CANARY" = true ] \
                  && printf '%s' "$cx_budget_json" \
-                    | jq -e '.request_attempts == 0 and .request_generation == []' >/dev/null 2>&1; then
+                    | jq -e '.request_attempts == 0 and .request_generation == []' >/dev/null 2>&1 \
+                 && p4b_codex_no_unsolicited_run "$repo" "$pr" "$head"; then
                 cls_cx="waived"
                 cx_evidence="wave-canary-no-request"
               fi

@@ -6311,6 +6311,33 @@ out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HE
   _barrier 1 7 'null' "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
 _ra="$(printf '%s' "$out" | jq -r '.retry_after // empty')"
 [ "$rc" = 1 ] && [ -n "$_ra" ] && [ "$_ra" -ge 58 ] && [ "$_ra" -le 60 ] || bad="$bad retry-after-not-remaining($_ra)"
+# Codex P1 on #2859: an unsolicited App auto-review of the canary that is
+# still Running (no author request, so no request generation) is a live
+# review, and the posture must not waive it. A Completed summary row, or none,
+# leaves nothing in flight. An unreadable timeline is not proof of absence.
+_wave_summary() { # <status>
+  jq -nc --arg s "$1" --arg h "${_p4a_head:0:7}" '[{id:7101,user:{login:"chatgpt-codex-connector[bot]"},
+    created_at:"2026-08-30T00:01:00Z",updated_at:"2026-08-30T00:02:00Z",
+    body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **" + $s + "** | `" + $h + "` | auto |")}]'
+}
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON="$(_wave_summary Running)" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .codex)" = not-yet ] || bad="$bad wave-running-autoreview-waived(rc=$rc)"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON="$(_wave_summary Queued)" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad wave-unknown-autoreview-waived(rc=$rc)"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CANARY=true P4B_TEST_COMMENTS_JSON="$(_wave_summary Completed)" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "$_wave_reported" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = wave-canary-no-request ] || bad="$bad wave-completed-autoreview-held(rc=$rc)"
+( gh_api_array() { return 1; }; ! p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) \
+  || bad="$bad wave-unreadable-timeline-waived"
+( gh_api_array() { printf '%s' "$(_wave_summary Running)"; }; ! p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) \
+  || bad="$bad wave-helper-running-absent"
+( gh_api_array() { printf '[]'; }; p4b_codex_no_unsolicited_run owner/repo 7 "$_p4a_head" ) \
+  || bad="$bad wave-helper-empty-not-absent"
 # The posture is the orchestrator's alone: sourcing the library resets it, so
 # an inherited environment value cannot reach the barrier.
 [ "$(P4B_BARRIER_WAVE_CANARY=true bash -c '. "$1"; printf %s "$P4B_BARRIER_WAVE_CANARY"' _ "$LIB")" = false ] \

@@ -1090,6 +1090,17 @@ for prose in 'The reviewed commits look clean.' 'I reviewed commit history and f
     fail "CLI anchors prose '$prose': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
   fi
 done
+# Codex P2 on #2859: prose with no "Codex Review:" heading is not a verdict at
+# all. Before the heading requirement it entered as an unknown_tier response
+# and spent the blocking budget.
+D="$WORK/anchor-headless-prose"; anchor_case "$D" ignored
+jq '.[1].body = "The reviewed commits look clean."' "$D/issue_comments.json" >"$D/ic.tmp" && mv "$D/ic.tmp" "$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: heading-less prose that mentions reviewed commits is no response"
+else
+  fail "CLI anchors headless prose: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
 # A malformed field behind Markdown decoration is still a field.
 D="$WORK/anchor-decorated-malformed"; anchor_case "$D" '- **Reviewed commit:** `not-a-sha`'
 RC=$(run_cli "$D")

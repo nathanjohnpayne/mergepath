@@ -418,9 +418,18 @@ RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
 # anchor, so the attribution sweep could take it as an anchorless answer to
 # the request (#2772 item 1). It is excluded before it reaches the ledger,
 # like a malformed or unresolved field, and its request stays unanswered.
-VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" '
+# An anchorless verdict must also carry the legacy "Codex Review:" heading.
+# crqe_verdicts selects any comment whose body mentions "reviewed commit", so
+# prose alone ("The reviewed commits look clean.") would otherwise enter as an
+# unknown_tier response that spends blocking budget (Codex P2 on #2859).
+HEADED_IDS=$(jqx "headed verdict ids" -c --arg bot "$BOT" '
+  [ .[] | select((.user.login // "") == $bot)
+    | select((.body // "") | test("(?im)^\\s*codex review:"))
+    | .id ]' <<<"$ISSUE_COMMENTS")
+VERDICTS=$(jqx "verdicts" -c --argjson raw "$RAW_ANCHOR_IDS" --argjson headed "$HEADED_IDS" '
   map(select(if (.reviewed_shas | length) == 0
-             then (.comment_id as $id | $raw | any(.[]; . == $id) | not)
+             then (.comment_id as $id | ($raw | any(.[]; . == $id) | not)
+                                        and ($headed | any(.[]; . == $id)))
              else all(.reviewed_shas[]; length == 40)
                   and (.reviewed_shas | map(ascii_downcase) | unique | length) == 1 end))
   | unique_by(.comment_id)' <<<"$VERDICTS")
