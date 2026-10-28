@@ -1,0 +1,39 @@
+# THROWAWAY (#2732 pilot steps 3 and 4). Never merged; the branch is deleted
+# after the pilot. Each run asks Octo STS for the thread-resolution identity
+# from a context the default branch's policy refuses (push, pull_request and
+# workflow_dispatch on a non-default branch, an unpinned action ref). The
+# exchange steps continue on error so the job records each outcome.
+name: zz pilot 2732 probe
+on:
+  push:
+    branches: [claude/2732-pilot-throwaway]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Claims
+        run: |
+          tok=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=octo-sts.dev" | jq -r .value)
+          echo "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{sub, event_name, ref, workflow_ref, job_workflow_ref}' || true
+      - id: pinned
+        name: Exchange (pinned action)
+        continue-on-error: true
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05
+        with:
+          scope: nathanjohnpayne/mergepath
+          identity: thread-resolution
+      - id: unpinned
+        name: Exchange (unpinned action ref)
+        continue-on-error: true
+        uses: octo-sts/action@main
+        with:
+          scope: nathanjohnpayne/mergepath
+          identity: thread-resolution
+      - name: Outcomes
+        run: |
+          echo "PROBE event=${{ github.event_name }} ref=${{ github.ref }} pinned=${{ steps.pinned.outcome }} unpinned=${{ steps.unpinned.outcome }}"
