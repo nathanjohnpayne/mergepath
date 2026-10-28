@@ -411,6 +411,14 @@ case "$endpoint" in
       touch "$state_dir/injected"
       printf '%s\n' "$CODEX_TEST_INJECT_JSON" >>"$state_dir/comments.jsonl"
     fi
+    # #2791: delete the injected comment again once the fake clock is
+    # CODEX_TEST_DELETE_AT seconds past the seeded request time.
+    if [ -n "${CODEX_TEST_DELETE_AT:-}" ] && [ -f "$state_dir/injected" ] && [ ! -f "$state_dir/deleted" ] \
+       && [ "$(cat "$state_dir/fake-time" 2>/dev/null || echo 0)" -ge "$(( $(jq -rn '"2026-06-04T00:00:00Z" | fromdateiso8601') + CODEX_TEST_DELETE_AT ))" ]; then
+      touch "$state_dir/deleted"
+      jq -c --argjson id "$(printf '%s' "$CODEX_TEST_INJECT_JSON" | jq .id)" 'select(.id != $id)' "$state_dir/comments.jsonl" >"$state_dir/comments.tmp" \
+        && mv "$state_dir/comments.tmp" "$state_dir/comments.jsonl"
+    fi
     if [ "$scenario" = "resume-blocked" ]; then
       # Reads 1-2 are the pre-flight scan and the resume check; the account
       # block lands while the resumed request is being polled.
@@ -2207,6 +2215,17 @@ test_newer_request_supersedes_the_waited_on_one() {
     && jq -e '.codex_run.final_state == "ambiguous" and .codex_run.superseded_by == 5000 and .codex_run.overlapping_request == true
         and .codex_run.handoff == null and .review.id == 97' "$dir/out.json" >/dev/null \
     || fail "#2791 superseded, answered: exit $rc, $(jq -c '{codex_run, review: .review.id}' "$dir/out.json" 2>/dev/null)"
+  # A newer request seen during the wait and then deleted still supersedes
+  # the waited-on one: the final scan selects the older request again, but
+  # the newer run may still be active, so no marker is minted (CodeRabbit on
+  # #2846).
+  dir=$(make_case "run-superseded-deleted" 0 0 1800)
+  set_clock_after_request "$dir" 0
+  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=900 \
+    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+    || fail "#2791 superseded, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
   [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
 }
 

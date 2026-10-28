@@ -3377,6 +3377,7 @@ CODEX_RUN_DIAGNOSTIC_JSON=null
 CODEX_RUN_WINDOW_JSON=null
 CODEX_RUN_FINAL_STATE=""
 CODEX_RUN_OVERLAP=false
+CODEX_RUN_SEEN_SUPERSEDING=""
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
@@ -3513,13 +3514,18 @@ CODEX_RUN_DIAGNOSTIC_SECONDS=300
 # the waited-on one, else empty. The selector takes the latest request, so a
 # larger id is a request posted during this wait (by another requester or by
 # hand). The row read since that newer request is also since the waited-on
-# one, so it is reported, but as ambiguous: it names neither.
+# one, so it is reported, but as ambiguous: it names neither. Once a poll has
+# seen a newer request (CODEX_RUN_SEEN_SUPERSEDING, set by codex_run_tick), it
+# stays the answer: if that request is later edited away or deleted, the scan
+# selects the waited-on one again, but the newer run may still be active.
 codex_run_superseding_request() {
   local scan_request watched
   watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
   scan_request=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty' 2>/dev/null) || scan_request=""
   if [[ "$watched" =~ ^[0-9]+$ ]] && [[ "$scan_request" =~ ^[0-9]+$ ]] && [ "$scan_request" -gt "$watched" ]; then
     printf '%s' "$scan_request"
+  else
+    printf '%s' "$CODEX_RUN_SEEN_SUPERSEDING"
   fi
 }
 
@@ -3543,12 +3549,14 @@ codex_run_state_now() { # the waited-on request's reported state
 
 codex_run_tick() {
   [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ] || return 0
-  local state window observed not_before
-  state=$(codex_run_state_now)
+  local state window observed not_before superseding
   # Set here, not in codex_run_state_now, which runs in a subshell. Once seen,
-  # an overlap stays reported.
+  # an overlap and a superseding request stay reported.
+  superseding=$(codex_run_superseding_request)
+  [ -z "$superseding" ] || CODEX_RUN_SEEN_SUPERSEDING=$superseding
+  state=$(codex_run_state_now)
   if [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ] \
-     || [ -n "$(codex_run_superseding_request)" ]; then
+     || [ -n "$superseding" ]; then
     CODEX_RUN_OVERLAP=true
   fi
   if [ "$CODEX_RUN_DIAGNOSTIC_JSON" = null ] && [ "$ELAPSED" -ge "$CODEX_RUN_DIAGNOSTIC_SECONDS" ]; then
