@@ -4512,6 +4512,20 @@ crw_processing_error_latch_from() {
     | if .bad == true or (.body | type) != "string" or (.at | type) != "string" then "UNREADABLE"
       else @base64 end
   ' 2>/dev/null) || return 3
+  ! grep -qx UNREADABLE <<<"$rows" || return 3
+  # Only a body with a raw line matching the notice's sentence can be the
+  # notice: unfencing and the vendor-header strip drop whole lines, never
+  # rewrite one. With no such line no row can set the latch, so the latch is
+  # clear without classifying every historical run (Codex P2 on #2857: ~54 s
+  # for 100 reviews, and a clearance reads the latch three times).
+  local candidates grep_rc=0
+  candidates=$(jq -Rr 'select(length > 0 and . != "UNREADABLE") | @base64d | fromjson | .body' <<<"$rows" 2>/dev/null) || return 3
+  grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$candidates" || grep_rc=$?
+  case "$grep_rc" in
+    0) : ;;
+    1) return 1 ;;
+    *) return 3 ;;
+  esac
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     [ "$row" != UNREADABLE ] || return 3

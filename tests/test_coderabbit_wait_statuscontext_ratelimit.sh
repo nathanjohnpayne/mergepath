@@ -1564,13 +1564,17 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   latch_case 3 comment-no-login "[$(ic $t0 "$PROCESSING_ERROR_BODY" | jq -c 'del(.user)')]" '[]'
   latch_case 3 review-null-login '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY" | jq -c '.user.login = null')]"
   # A body that cannot be structurally read is unreadable, not "no notice".
+  # The body carries the notice's sentence, so the early exit cannot answer
+  # for it and the structural reader must.
   { cat "$snip"; printf '%s\n' 'crw_unfenced_body() { return 3; }'; } >"$mut"
-  latch_case 3 structural-read-failure "[$(ic $t0 "Thanks for the feedback.")]" '[]' "$mut"
-  # MUTATION: collapse the unreadable-row branch into "skip", and the
-  # non-string body must read as clear. That is the false clearance the
-  # fail-closed branch exists to prevent.
-  sed 's/\[ "\$row" != UNREADABLE \] || return 3/[ "$row" != UNREADABLE ] || continue/' "$snip" >"$mut"
+  latch_case 3 structural-read-failure "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" '[]' "$mut"
+  # MUTATION: collapse both unreadable-row branches (the upfront check and the
+  # loop's) into "skip", and the non-string body must read as clear. That is
+  # the false clearance the fail-closed branches exist to prevent.
+  sed -e 's/\[ "\$row" != UNREADABLE \] || return 3/[ "$row" != UNREADABLE ] || continue/' \
+    -e 's/^  ! grep -qx UNREADABLE <<<"\$rows" || return 3$/  :/' "$snip" >"$mut"
   grep -q 'UNREADABLE \] || continue' "$mut" || bad="$bad mutation-not-applied"
+  ! grep -q 'grep -qx UNREADABLE' "$mut" || bad="$bad upfront-mutation-not-applied"
   latch_case 1 mutant-non-string-body-reads-clear '[{"id":1,"user":{"login":"coderabbitai[bot]"},"created_at":"2026-06-04T00:00:00Z","body":5}]' '[]' "$mut"
   # A later summary or run reporting a FAILED publication supersedes nothing:
   # `review` is the classifier's fallback, not proof of completion (4b P1 on
@@ -1581,6 +1585,20 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   latch_case 0 later-summary-failure-stanza "[$(ic $t5 "$summary
 $fail_stanza")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
   latch_case 0 later-run-failure-stanza '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "$fail_stanza")]"
+  # With no body line that could be the notice's sentence, the latch is clear
+  # without classifying any run (Codex P2 on #2857: a long history cost ~54 s
+  # per read). A classifier that always fails proves which path ran: the
+  # notice-free history still reads clear, and a history with the notice
+  # still reaches the classifier and fails closed.
+  { cat "$snip"; printf '%s\n' 'crw_classify_selected_comment() { return 3; }'; } >"$mut"
+  latch_case 1 no-candidate-skips-classifier "[$(ic $t0 "$summary"),$(ic $t5 "we could not process this pull request")]" "[$(rv $t0 $h "Review completed. No actionable comments."),$(rv $t5 $h "Review completed. No actionable comments.")]" "$mut"
+  latch_case 3 candidate-reaches-classifier '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "Review completed. No actionable comments.")]" "$mut"
+  # MUTATION (production side): without the early exit the notice-free
+  # history reaches the failing classifier, so the case above is what pins it.
+  awk '/^  case "\$grep_rc" in$/{print "  grep_rc=0"} {print}' "$snip" >"$mut.noprefilter"
+  grep -q '^  grep_rc=0$' "$mut.noprefilter" || bad="$bad prefilter-mutation-not-applied"
+  { cat "$mut.noprefilter"; printf '%s\n' 'crw_classify_selected_comment() { return 3; }'; } >"$mut"
+  latch_case 3 mutant-no-prefilter-classifies "[$(ic $t0 "$summary")]" "[$(rv $t0 $h "Review completed. No actionable comments.")]" "$mut"
   # A long history is read, not unreadable (Codex P2 on #2857): ~1.5 MiB of
   # comments is past both Linux's 128 KiB per-argument limit and macOS's 1 MiB
   # ARG_MAX, so passing the lists on argv would fail E2BIG and read as rc 3.
