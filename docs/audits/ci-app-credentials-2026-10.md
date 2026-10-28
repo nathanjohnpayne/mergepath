@@ -91,7 +91,12 @@ ADR 0004 hands #2727 two confirmations per caller: that its writes still start t
    - **3b. Policy classifier.** The classifier in `pr-review-policy.yml` (`external-review-labeling`, step `check`) is extracted verbatim into `scripts/workflow/external_review_classify.sh`, which the producer and the C6/C7 consumer both run. Its classification logic does not change. Two things about how the producer runs it do change, and both are stricter:
      - **Source.** The producer runs the default branch's copy, read with `git show origin/<default>:...`, never the merge ref's copy. The job holds the CI-actor PAT, and `check_pipeline_token_checkouts` (#2775) admits it only as a job that runs no candidate code. A PR that edits the classifier is therefore judged by the merged version.
      - **Bootstrap.** A default branch without the script, as on the PR that introduces it and each consumer's first sync, gets a fail-closed classification (`needs-external-review`). Each consumer's first sync PR therefore misses the propagation lane one time; later sync PRs use it again, because the script is then on the default branch.
-   - **3c. `trusted-policy-mutations.yml`** for C6 and C7. It is inert until the owner enables it at cutover. Without a trust policy its exchange fails closed, so it is gated by a repository variable rather than left to fail on every PR.
+   - **3c. `trusted-policy-mutations.yml`** for C6 and C7. Every job is gated on the repository variable `CI_APP_POLICY_MUTATIONS == 'true'`, so the workflow is inert until the owner enables it at cutover. Without the variable every run is skipped; with it but without the trust policy, the exchange fails and the run fails, with no fallback to a PAT. It runs on `workflow_run` of PR Review Policy, in three jobs:
+     - **`classify`** holds only a read-only `GITHUB_TOKEN`. It admits the producer run with `trusted-consumer-admission.sh admit --producer pr-review-policy.yml --events pull_request`, then runs the classifier from its checkout at `github.workflow_sha` over a credential-free checkout of the admitted head, read as data. `EVENT_ACTION` is `workflow_run`, so the classifier never takes its `external-cleared` branch, which neither caller acts on.
+     - **`mutate`** is the only job that requests `id-token: write`, and the only new `ALLOWED_ID_TOKEN_JOBS` entry. It exchanges for the `policy-mutations` identity and runs `scripts/workflow/policy_mutations_apply.sh`. That script refuses anything but an installation token and re-runs the admission `recheck` fence on the classified pair. It then runs C7's removal (`propagation_lane_label_remove.sh`) or C6's reconcile (`external_review_label_reconcile.sh`), each of which fences the live pair again immediately before its one write. The C6 helper is the producer's inline step, copied verbatim. Until cutover deletes the inline step, `check_policy_mutations` fails if the two differ.
+     - **`recheck-dispatch`** sends C7's `merge-clearance-recheck` dispatch with `GITHUB_TOKEN` and `contents: write`, held apart from the app token. It is best-effort, as in the producer.
+
+     The producer keeps its PAT writes until cutover. The C7 diagnostic marker stays in the producer for good, because it is a `GITHUB_TOKEN` comment that grants nothing. Advisory #2819 (stale event nominations) was already addressed in the admission helper by #2823, whose tests cover it.
    - **3d and 3e. `trusted-review-mutations.yml`** for C2, C4 and C5, after the same extraction for `agent-review.yml`'s triage, disagreement and self-approval decisions.
 4. **Auto-clear split.** The `pull_request_target` path becomes the credential-free nominator, and evaluation runs on `repository_dispatch`, `workflow_run` and `schedule` with the `auto-clear` identity. This slice extends the gate's event rule for a mixed-trigger file, with its own review.
 5. **Pilot (#2732).** Records the evidence below, sets `APP_PIN`, commits the hub's policies, and adds the bot login to `non_reviewer_identities` and `thread_resolution_ci_app_identity`.
@@ -161,6 +166,16 @@ The owner's merge of the pilot PR is the acceptance of the pin. A row that fails
 1. Decide fleet hosting at the pilot review, citing the pilot record.
 2. Install on the remaining seven repositories, or extend the selection.
 3. Policies for each repository arrive by propagation PRs, generated with `--render` from each repository's readback IDs.
+
+### Enabling a trusted consumer (cutover, per #2730)
+
+For `trusted-policy-mutations.yml` (C6, C7), in one owner-merged sequence:
+
+1. An agent-prepared PR commits `.github/chainguard/policy-mutations.sts.yaml`, generated with `scripts/ci/check_ci_app_trust --render policy-mutations --repository nathanjohnpayne/<repo> --repository-id <id> --owner-id 23488723 --app 801323` (the hosted pin; another pin if fleet hosting changes), and deletes the producer's two PAT writes: the "Reconcile a policy-owned fail-closed label" step, and the label removal and dispatch in "Propagation PR review lane".
+2. The owner sets the repository variable `CI_APP_POLICY_MUTATIONS` to `true` in that repository's Actions settings, after the merge.
+3. Verify on the next fail-closed reconcile or propagation PR: the label removal is by `octo-sts[bot]`, its `unlabeled` event starts the settle re-arm and the Label Gate, and the Merge clearance gate re-runs after the dispatch.
+
+Clearing the variable turns the consumer off again. Do not set the variable before step 1 merges: the producer and the consumer would then both write.
 
 ### Fallback, only if approved
 

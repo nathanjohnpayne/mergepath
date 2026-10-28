@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# check_policy_mutations
+#
+# Runs tests/test_policy_mutations.sh, the hermetic suite for #2727 slice 3c:
+# trusted-policy-mutations.yml, ADR 0004's trusted consumer for callers C6 and
+# C7. It asserts that the C6 helper is pr-review-policy.yml's reconcile step
+# verbatim, that policy_mutations_apply.sh writes only with an installation
+# token after the admission recheck holds, that the C7 removal fences its pair,
+# and that the workflow is inert without CI_APP_POLICY_MUTATIONS and keeps the
+# app token and contents: write in separate jobs. Travels with the kit to every
+# consumer. No token, no network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_policy_mutations.sh"
+HELPERS=(
+  "$REPO_ROOT/scripts/workflow/policy_mutations_apply.sh"
+  "$REPO_ROOT/scripts/workflow/propagation_lane_label_remove.sh"
+  "$REPO_ROOT/scripts/workflow/external_review_label_reconcile.sh"
+)
+
+for f in "$TEST_SCRIPT" "${HELPERS[@]}"; do
+  if [ ! -f "$f" ]; then
+    echo "check_policy_mutations: ERROR (missing $f)" >&2
+    exit 1
+  fi
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_policy_mutations: ERROR (jq is required)" >&2
+  exit 1
+fi
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  for f in "${HELPERS[@]}"; do bash -n "$f"; done
+  echo "check_policy_mutations: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_policy_mutations: PASS"

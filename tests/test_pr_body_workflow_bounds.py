@@ -34,6 +34,9 @@ ROUTES = (
     Route(WORKFLOWS+'pr-audit.yml', 'audit', 'Audit merged PRs for review policy compliance', 1, 'audit', ('parser',)),
     Route(WORKFLOWS+'pr-review-policy.yml', 'self-review-check', 'Validate the PR body against the contract', 1, signature=('validate',)),
     Route(WORKFLOWS+'pr-review-policy.yml', 'external-review-labeling', 'Check for external review triggers from review-policy.yml', 2, signature=('checker',)),
+    # The C6/C7 trusted consumer runs the same classifier (#2727 slice 3c). Its
+    # EVENT_ACTION never takes the checker branch, but the route is counted.
+    Route(WORKFLOWS+'trusted-policy-mutations.yml', 'classify', "Classify with the default branch's classifier", 2, signature=('checker',)),
     Route(WORKFLOWS+'auto-clear-blocking-labels.yml', 'evaluate-and-clear', 'Re-evaluate gate per PR + remove label on pass', 2, 'batch', ('checker', 'continuation')),
     Route(WORKFLOWS+'auto-clear-blocking-labels.yml', 'evaluate-and-clear', 'Continue approved PRs after completed checks', 4, 'batch', ('continuation', 'continuation')),
     Route(WORKFLOWS+'auto-clear-blocking-labels.yml', 'scheduled-sweep', 'Re-evaluate gate per PR', 2, 'batch', ('checker', 'continuation')),
