@@ -159,6 +159,7 @@
       ".github/workflows/required-check-publisher.yml",
       ".github/workflows/thread-resolution-lane.yml",
       ".github/workflows/token-output-oracle-macos.yml",
+      ".github/workflows/trusted-policy-mutations.yml",
       ".github/workflows/weekly-drift-audit.yml",
       ".github/workflows/weekly-feedback-sweep.yml"
     ],
@@ -350,6 +351,7 @@
       ".github/workflows/auto-clear-blocking-labels.yml",
       ".github/workflows/merge-clearance-gate.yml",
       ".github/workflows/required-check-publisher.yml",
+      ".github/workflows/trusted-policy-mutations.yml",
       ".github/templates/required-workflows/*",
       "scripts/workflow/merge-group-required-checks.sh",
       "scripts/workflow/approval-merge-continuation.sh",
@@ -537,6 +539,7 @@
       ".github/workflows/required-check-publisher.yml",
       ".github/workflows/thread-resolution-lane.yml",
       ".github/workflows/token-output-oracle-macos.yml",
+      ".github/workflows/trusted-policy-mutations.yml",
       ".github/workflows/weekly-drift-audit.yml",
       ".github/workflows/weekly-feedback-sweep.yml"
     ],
@@ -698,6 +701,16 @@
     "check_template_substitution": [
       "tests/test_template_substitution.sh",
       "scripts/lib/template-substitution.sh"
+    ],
+    "check_policy_mutations": [
+      ".github/workflows/pr-review-policy.yml",
+      ".github/workflows/trusted-policy-mutations.yml",
+      "scripts/lib/credential-class.sh",
+      "scripts/workflow/external_review_label_reconcile.sh",
+      "scripts/workflow/policy_mutations_apply.sh",
+      "scripts/workflow/propagation_lane_label_remove.sh",
+      "scripts/workflow/trusted-consumer-admission.sh",
+      "tests/test_policy_mutations.sh"
     ],
     "check_trusted_consumer_admission": [
       "scripts/workflow/trusted-consumer-admission.sh",

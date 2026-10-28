@@ -905,6 +905,18 @@ paths:
     requires:
       - "scripts/workflow/"
       - "scripts/ci/check_trusted_consumer_admission"
+  - path: tests/test_policy_mutations.sh
+    # Hermetic suite for trusted-policy-mutations.yml and its helpers (#2727
+    # slice 3c, ADR 0004 callers C6/C7); check_policy_mutations runs it. It
+    # reads both workflows, so they travel with it.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/ci/check_policy_mutations"
+      - "scripts/lib/credential-class.sh"
+      - ".github/workflows/pr-review-policy.yml"
+      - ".github/workflows/trusted-policy-mutations.yml"
   - path: tests/test_pull_request_target_policy.sh
     # Hermetic suite for the pull_request_target event-policy tool (#2733).
     # It lints this checkout's three pull_request_target workflows and copies
@@ -1994,6 +2006,16 @@ paths:
   # CI lane for the GraphQL-only residue (#1057 item G): resolves a PR's
   # demonstrably-actioned bot threads on a real runner, dispatched by a
   # session whose proxy refuses GraphQL.
+  # ADR 0004's trusted consumer for C6/C7 (#2727 slice 3c). Inert on every
+  # repository until its owner sets CI_APP_POLICY_MUTATIONS at cutover (#2730).
+  # It travels everywhere because scripts/ci/ci_app_trust.py, which does,
+  # allow-lists its `mutate` job and fails a stale entry.
+  - path: .github/workflows/trusted-policy-mutations.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"                  # admission, classifier and the C6/C7 helpers
+      - "scripts/lib/credential-class.sh"    # policy_mutations_apply.sh installation-token check
   - path: .github/workflows/thread-resolution-lane.yml
     type: canonical
     consumers: all
@@ -2776,6 +2798,8 @@ paths:
       - "tests/test_stalled_pr_resume.sh"         # check_stalled_pr_resume (#2165)
       - "tests/test_pull_request_target_policy.sh"  # check_pull_request_target_policy (#2733)
       - "tests/test_trusted_consumer_admission.sh"  # check_trusted_consumer_admission (#2727)
+      - "tests/test_policy_mutations.sh"  # check_policy_mutations (#2727 3c)
+      - ".github/workflows/trusted-policy-mutations.yml"  # ci_app_trust.py allow-lists its mutate job (#2727 3c)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)

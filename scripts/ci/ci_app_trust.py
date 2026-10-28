@@ -176,6 +176,10 @@ ALLOWED_ID_TOKEN_JOBS = {
     # C17, the #2732 pilot vehicle: runs only once the lane's trust policy is
     # committed (its `route` job keys on the file), which needs APP_PIN.
     ("thread-resolution-lane.yml", "resolve-app"): "thread-resolution",
+    # C6 and C7 (#2727 slice 3c): inert until the owner sets the repository
+    # variable CI_APP_POLICY_MUTATIONS and commits the policy-mutations trust
+    # policy at cutover (#2730).
+    ("trusted-policy-mutations.yml", "mutate"): "policy-mutations",
 }
 
 # OIDC jobs that are not CI app consumers, reviewed one by one:
