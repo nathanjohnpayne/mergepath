@@ -468,6 +468,9 @@ ALLOW_LIST=(
   # kit and SKIPs on consumers via the both-absent marker idiom, so its
   # parity suite never needs to travel.
   "tests/test_repo_lint_prepush.sh"
+  # Its per-repository policy suite (#2840), run by the same wrapper behind
+  # the same hub marker, is hub-only for the same reason.
+  "tests/test_repo_lint_prepush_policy.sh"
 )
 
 is_allow_listed() {
