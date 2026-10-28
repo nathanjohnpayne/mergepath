@@ -1,0 +1,48 @@
+# .github/prepush.yml
+#
+# Per-repository policy for the repo-lint pre-push hook
+# (scripts/git-hooks/pre-push -> scripts/repo-lint-prepush.sh, #2840).
+# Full reference: docs/agents/testing-requirements.md § Pre-push hook.
+#
+# The hook reads this file from the commit being pushed (its own snapshot of
+# that tip), never from uncommitted edits, so a change here takes effect on
+# the push that commits it. Each key resolves as:
+#   --set KEY=VALUE  >  environment variable  >  this file  >  built-in default
+# and the hook's `policy` line prints every effective value and its source.
+# Without this file the hook uses the built-in defaults. A file it cannot
+# read as one mapping of the keys below, with valid values, blocks the push
+# (fails closed); it never falls back to running less.
+#
+# CI's `lint` check stays authoritative whatever this file says: the policy
+# only decides how much of it runs locally before a push.
+#
+# Every value below equals the built-in default, so mergepath's hook behaves
+# exactly as it did before this file existed. #2841 changes full_suite and
+# max_minutes here once it implements them.
+
+# off: run nothing. selected: only the wrappers the classifier selects for
+# the change (no live assertions). full: the live assertions plus the
+# selected wrappers. Env: MERGEPATH_PREPUSH_MODE.
+mode: full
+
+# run | defer: what to do when the classifier selects the complete surface.
+# Validated now; deferral arrives with #2841. Env: MERGEPATH_PREPUSH_FULL_SUITE.
+full_suite: run
+
+# Wall-clock budget in minutes, 0 for none. Validated now; enforced from
+# #2841. Env: MERGEPATH_PREPUSH_MAX_MINUTES.
+max_minutes: 0
+
+# Also run the selected deep-lane steps (same as --deep).
+# Env: MERGEPATH_PREPUSH_DEEP.
+deep: false
+
+# nice level for every check. Env: MERGEPATH_PREPUSH_NICE.
+nice: 10
+
+# Default concurrency: jobs_max checks at once while the one-minute load
+# average per CPU is below load_per_cpu_threshold, one once it is not.
+# MERGEPATH_PREPUSH_JOBS (or --jobs) still pins the concurrency outright.
+# Env: MERGEPATH_PREPUSH_JOBS_MAX, MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD.
+jobs_max: 2
+load_per_cpu_threshold: 1
