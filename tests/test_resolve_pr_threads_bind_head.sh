@@ -5,8 +5,9 @@
 #   * it refuses (exit 5) a PR that is not open against the default branch;
 #   * it captures the live head and base SHAs before any evidence is read;
 #   * evidence must apply to that pair: the fix-commit list must end at the
-#     captured head, a reply's cited commits must be in that list, and local
-#     ledger rows (which name no head) are not accepted;
+#     captured head, and local ledger rows (which name no head) are not
+#     accepted. A reply's cited commits are NOT checked against that list:
+#     that binding is unimplemented, a recorded residual that Test 9 pins;
 #   * it re-reads the pair before every write. A pair that moves before any
 #     write re-runs against a fresh capture (at most twice); after a write it
 #     stops every remaining resolution (exit 5); a failed re-read stops too

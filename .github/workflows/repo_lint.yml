@@ -898,7 +898,9 @@ jobs:
       - name: check_ci_app_trust
         if: matrix.shard == 1
         # #2727 / ADR 0004: only allow-listed trusted jobs may request
-        # `id-token: write` (none yet), and every .github/chainguard/*.sts.yaml
+        # `id-token: write` (ALLOWED_ID_TOKEN_JOBS in ci_app_trust.py; the
+        # first is thread-resolution-lane.yml `resolve-app`, the #2732
+        # pilot), and every .github/chainguard/*.sts.yaml
         # Octo STS trust policy must equal the ADR template and the app pin the
         # #2732 pilot records. Embedded self-test, then a scan. Soft-pass only
         # when the launcher AND its payload are both absent (bootstrap skew); a

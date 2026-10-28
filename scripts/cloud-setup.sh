@@ -90,7 +90,11 @@ esac
 log() { echo "cloud-setup: $*" >&2; }
 
 CLEANUP_DIR=""
-cleanup_tmp() { [ -z "$CLEANUP_DIR" ] || rm -rf "$CLEANUP_DIR"; }
+CLEANUP_STAGE=""
+cleanup_tmp() {
+  [ -z "$CLEANUP_DIR" ] || rm -rf "$CLEANUP_DIR"
+  [ -z "$CLEANUP_STAGE" ] || rm -f "$CLEANUP_STAGE"
+}
 
 choose_prefix() {
   if [ -n "${MERGEPATH_TOOL_PREFIX:-}" ]; then
@@ -272,7 +276,7 @@ yq_meets_minimum() { # <path>
 }
 
 install_yq() {
-  local arch asset base tmp expected actual prefix
+  local arch asset base tmp expected actual prefix stage
   [ "$(uname -s)" = "Linux" ] || { log "yq (mikefarah/yq $YQ_MIN_VERSION or later) is missing on $(uname -s); install it with the platform's package manager (brew install yq)"; return 1; }
   case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
@@ -311,14 +315,34 @@ install_yq() {
     log "checksum mismatch for yq $YQ_VERSION $asset (expected $expected, got $actual); refusing to install"
     return 1
   fi
-  chmod 755 "$tmp/$asset" || { log "could not make verified yq download executable"; return 1; }
-  if ! yq_meets_minimum "$tmp/$asset"; then
-    log "verified download for yq $YQ_VERSION does not run as mikefarah/yq v4 at $YQ_MIN_VERSION or later; refusing to install"
+  # Validate the verified bytes where they will run, not in $tmp: a noexec
+  # TMPDIR cannot execute them even when the prefix can (#2754, #2772). They
+  # are staged under a fresh name in $prefix/bin, so the existing yq is
+  # replaced only by a rename after validation, and every failure removes the
+  # staging file and leaves the prior binary in place.
+  mkdir -p "$prefix/bin" || { log "could not create $prefix/bin"; return 1; }
+  if [ -d "$prefix/bin/yq" ] && [ ! -L "$prefix/bin/yq" ]; then
+    log "$prefix/bin/yq is a directory; refusing to install over it"
     return 1
   fi
-  mkdir -p "$prefix/bin" || { log "could not create $prefix/bin"; return 1; }
-  cp "$tmp/$asset" "$prefix/bin/yq" || { log "could not copy yq into $prefix/bin"; return 1; }
-  chmod 755 "$prefix/bin/yq" || { log "could not make $prefix/bin/yq executable"; return 1; }
+  stage="$(mktemp "$prefix/bin/.yq-stage.XXXXXX")" || { log "could not stage yq in $prefix/bin"; return 1; }
+  CLEANUP_STAGE="$stage"
+  if ! cp "$tmp/$asset" "$stage" || ! chmod 755 "$stage"; then
+    log "could not stage verified yq download in $prefix/bin"
+    rm -f "$stage"; CLEANUP_STAGE=""
+    return 1
+  fi
+  if ! yq_meets_minimum "$stage"; then
+    log "verified download for yq $YQ_VERSION does not run as mikefarah/yq v4 at $YQ_MIN_VERSION or later; refusing to install"
+    rm -f "$stage"; CLEANUP_STAGE=""
+    return 1
+  fi
+  if ! mv -f "$stage" "$prefix/bin/yq"; then
+    log "could not move the validated yq into $prefix/bin/yq"
+    rm -f "$stage"; CLEANUP_STAGE=""
+    return 1
+  fi
+  CLEANUP_STAGE=""
   yq_meets_minimum "$prefix/bin/yq" || { log "$prefix/bin/yq does not run as mikefarah/yq v4 at $YQ_MIN_VERSION or later (yq --version failed, named another program, or an older version)"; return 1; }
   log "installed yq $YQ_VERSION to $prefix/bin/yq (sha256 verified)"
   resolves_to_installed yq "$prefix"

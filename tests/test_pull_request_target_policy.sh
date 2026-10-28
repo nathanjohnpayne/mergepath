@@ -305,6 +305,8 @@ case "$path" in
     printf '{"sha":"%040d"}\n' 1 ;;
   repos/*/contents/*)
     rel="${path#repos/*/*/contents/}"; rel="${rel%%\?*}"
+    # A raw override is served verbatim: a corrupt contents response.
+    [ ! -f "$GH_FIXTURE/raw/$rel" ] || { cat "$GH_FIXTURE/raw/$rel"; exit 0; }
     [ -f "$GH_FIXTURE/contents/$rel" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     # --rawfile, not --arg: a large workflow's base64 exceeds Linux's
     # per-argument limit (MAX_ARG_STRLEN), which macOS does not have.
@@ -449,6 +451,19 @@ verify_expect "verify checks the repo's own trigger list, not only REGISTRY" "$F
 
 F="$(fixture bad-ref)"; owner_policies "$F"; touch "$F/no-ref"
 verify_expect "an unresolvable ref is an API error, not three absences" "$F" 3 'repos/octo/demo/commits/main failed'
+
+# #2769: a contents response that does not decode is an API error (exit 3),
+# never a traceback that exits 1 and reads as a policy finding.
+corrupt() { # corrupt <name> <raw response body> <pattern>
+  local F; F="$(fixture "corrupt-$1")"; owner_policies "$F"
+  mkdir -p "$F/raw/.github/workflows"
+  printf '%s' "$2" > "$F/raw/.github/workflows/$DA"
+  verify_expect "a contents response that is $1 exits 3" "$F" 3 "$3"
+}
+corrupt "not JSON" 'this is not json' 'returned non-JSON'
+corrupt "not an object" '[{"name":"x"}]' 'returned no file content'
+corrupt "bad base64" '{"content":"abc","encoding":"base64"}' 'does not decode as base64 UTF-8'
+corrupt "not UTF-8" "{\"content\":\"$(printf '\377\376' | base64)\",\"encoding\":\"base64\"}" 'does not decode as base64 UTF-8'
 
 F="$(fixture odd-ref)"; owner_policies "$F"
 out="$(GH_FIXTURE="$F" PATH="$SHIM:$PATH" python3 "$TOOL" verify --repo "$REPO" --ref 'release&candidate#1' 2>&1)" || true
