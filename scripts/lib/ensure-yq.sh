@@ -60,6 +60,14 @@ fi
 
 YQ_VERSION="${ENSURE_YQ_VERSION:-v4.53.6}"
 YQ_DEST="${ENSURE_YQ_DEST:-/usr/local/bin/yq}"
+# The release assets below are Linux builds, and `uname -m` alone cannot tell
+# Linux from macOS/BSD (both can report arm64), so refuse any other OS before
+# the architecture mapping, any download, or sudo (#2748).
+YQ_OS=$(uname -s)
+if [ "$YQ_OS" != Linux ]; then
+  echo "ensure-yq.sh: unsupported OS: $YQ_OS (only Linux release assets are pinned); refusing install. Install mikefarah/yq v4+ another way (e.g. brew install yq)." >&2
+  exit 1
+fi
 YQ_MACHINE=$(uname -m)
 case "$YQ_MACHINE" in
   x86_64)

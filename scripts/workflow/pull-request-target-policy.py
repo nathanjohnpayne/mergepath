@@ -26,6 +26,7 @@ allowed); 2 usage; 3 an API or parse error.
 """
 import argparse
 import base64
+import binascii
 import json
 import os
 from pathlib import Path
@@ -272,8 +273,20 @@ def repo_workflow_events(repo, ref, path):
         if 'HTTP 404' in out.stderr or '"status":"404"' in out.stdout:
             return None
         raise ApiError('reading %s@%s from %s failed: %s' % (path, ref, repo, out.stderr.strip()))
-    content = json.loads(out.stdout).get('content', '')
-    return trigger_events(load_yaml(base64.b64decode(content).decode(), '%s:%s' % (repo, path)))
+    # Exit 3 is an API or parse error and exit 1 a finding, so a body that
+    # does not decode must raise ApiError, never escape as a traceback (#2769).
+    where = '%s@%s from %s' % (path, ref, repo)
+    try:
+        doc = json.loads(out.stdout)
+    except json.JSONDecodeError as exc:
+        raise ApiError('reading %s returned non-JSON: %s' % (where, exc))
+    if not isinstance(doc, dict) or not isinstance(doc.get('content', ''), str):
+        raise ApiError('reading %s returned no file content (is it a directory?)' % where)
+    try:
+        text = base64.b64decode(doc.get('content', '')).decode()
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise ApiError('reading %s: content does not decode as base64 UTF-8: %s' % (where, exc))
+    return trigger_events(load_yaml(text, '%s:%s' % (repo, path)))
 
 
 # --- policy evaluation ------------------------------------------------------

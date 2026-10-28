@@ -145,6 +145,27 @@ if (process.env.PR_BODY_FIXTURE_THROW && process.argv[1] === process.env.PR_BODY
                     self.assertNotIn('missing', result.stderr)
                     self.assertNotIn('must contain', result.stderr)
 
+    def test_outer_node_failure_is_not_semantic_absence(self):
+        # #2772: the outer `node -e` fails before the wrapper runs (a missing
+        # NODE_OPTIONS preload exits 1). That status must not read as a
+        # completed "no Self-Review heading" answer at either boundary.
+        missing = "--require=" + json.dumps(str(Path(self.temp.name)/'absent-preload-2772.cjs'))
+        for body in (VALID, MISSING):
+            for helper in ('pr_body_authoring_agent', 'pr_body_authoring_agent_count', 'pr_body_has_self_review'):
+                with self.subTest(helper=helper, missing_heading=body is MISSING):
+                    result = self.helper(helper, body, NODE_OPTIONS=missing)
+                    self.assertEqual(result.returncode, 126, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('did not complete', result.stderr)
+        for flags in ([], ['--self-review-only']):
+            with self.subTest(flags=flags):
+                result = self.run_process(['bash', str(ROOT/'scripts/validate-pr-body.sh'), *flags],
+                                          NODE_OPTIONS=missing)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('execution failed', result.stderr)
+                self.assertNotIn("missing a '## Self-Review'", result.stderr)
+
     def test_actual_cli_exception_is_not_semantic_absence(self):
         runtime = str(ROOT/'scripts/lib/pr-body-contract.mjs')
         extra = dict(PR_BODY_FIXTURE_THROW='1', PR_BODY_FIXTURE_RUNTIME=runtime)

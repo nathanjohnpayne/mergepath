@@ -16,7 +16,8 @@
 # secret, an unresolvable or wrong identity, self-approval, human-hold, a
 # changed head (the approval reads back on another SHA, or the head moved
 # before the merge), a base retargeted off the default branch, an empty head
-# read, a dismissed approval (also across review pages), and the happy paths.
+# read, a dismissed approval (also across review pages), an exact-head
+# approval held only by another allowlisted login, and the happy paths.
 
 set -euo pipefail
 
@@ -481,6 +482,21 @@ if [ "$rc" -eq 1 ] && [[ "$out" != *CONTINUED* ]] && [ ! -s "$WORK/rgh.log" ]; t
   pass "merge: an approver outside available_reviewers fails closed"
 else
   fail "merge: non-allowlisted approver rc=$rc: $out"
+fi
+
+# The approval is bound to APPROVED_BY, not to any allowlisted login (#2822
+# item 4): when the approve job reported nathanpayne-claude, an exact-head
+# APPROVED held only by nathanpayne-codex (also in available_reviewers) must
+# not stand in for it.
+set +e
+out=$(run_exact "$HEAD_SHA" nathanpayne-claude \
+  "[$(review nathanpayne-codex APPROVED "$HEAD_SHA"),$(review nathanpayne-claude COMMENTED "$HEAD_SHA")]" 2>&1); rc=$?
+set -e
+if [ "$rc" -eq 1 ] && [[ "$out" != *CONTINUED* ]] \
+   && [[ "$out" == *"nathanpayne-claude's latest review reads ' ', expected 'APPROVED $HEAD_SHA'"* ]]; then
+  pass "merge: another allowlisted login's exact-head approval does not satisfy APPROVED_BY"
+else
+  fail "merge: APPROVED_BY mismatch rc=$rc: $out"
 fi
 
 set +e

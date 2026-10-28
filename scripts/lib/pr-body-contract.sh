@@ -45,7 +45,18 @@ PR_BODY_CONTRACT_TIMEOUT_SECONDS=120
 #      must not be. This is why the production watchdog suppresses stdout on
 #      expiry where `run_with_timeout` in the parity suite does not: the suite
 #      asserts on output, a gate acts on it.
-pr_body_contract_run() { # mode, body -> stdout; 124 timeout, 125 start, 126 execution
+#
+# Status 1 is reserved for a completed parser answer at BOTH process
+# boundaries (#2772). The outer `node -e` can itself exit 1 before this
+# wrapper's code runs (a `NODE_OPTIONS=--require=` module that is missing or
+# throws, an uncaught exception), and that must not read as "no Self-Review
+# heading". So the wrapper reports a completed absent answer as status 64, a
+# status Node itself never uses, and only that status maps back to 1; any
+# other unreserved outer status, 1 included, becomes 126. Residual: a
+# preload that calls process.exit(0) before the wrapper runs still reads as
+# status 0 with no output, which every caller treats as an empty answer.
+pr_body_contract_run() { # mode, body -> stdout; 1 absent, 124 timeout, 125 start, 126 execution
+  local rc=0
   # Node owns these template expressions; the shell must not expand them.
   # shellcheck disable=SC2016
   printf '%s\n' "$2" | node -e '
@@ -76,9 +87,20 @@ pr_body_contract_run() { # mode, body -> stdout; 124 timeout, 125 start, 126 exe
       process.stderr.write(`PR-body parser execution failed (${result.signal ?? result.status ?? "no exit status"}).\n`);
       process.exit(126);
     }
-    if (result.status === 0 && result.stdout) process.stdout.write(result.stdout);
-    process.exit(result.status);
-  ' "$PR_BODY_CONTRACT_TIMEOUT_SECONDS" node "$PR_BODY_CONTRACT_PARSER" "$1"
+    // A completed absent answer; the case below maps 64 back to 1.
+    if (absent) process.exit(64);
+    if (result.stdout) process.stdout.write(result.stdout);
+    process.exit(0);
+  ' "$PR_BODY_CONTRACT_TIMEOUT_SECONDS" node "$PR_BODY_CONTRACT_PARSER" "$1" \
+    || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    64) return 1 ;;
+    124|125|126) return "$rc" ;;
+    *)
+      echo "PR-body parser wrapper did not complete (node status $rc)." >&2
+      return 126 ;;
+  esac
 }
 
 pr_body_authoring_agent() {

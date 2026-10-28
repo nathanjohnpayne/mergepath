@@ -63,6 +63,7 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
   MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
   MERGEPATH_PREPUSH_LOCK_TOOL GITHUB_OUTPUT 2>/dev/null || true
+unset MERGEPATH_PREPUSH_RETRY_FAILED 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -1334,6 +1335,135 @@ rc=0; out=$(cd "$FIX" && PATH="$FAKEBIN:$PATH" FAKE_LOAD=512.25 MERGEPATH_PREPUS
 check "MERGEPATH_PREPUSH_JOBS overrides the load-derived default" "$rc" "0"
 case "$out" in *"(jobs=2, nice=10, host load 512.25 on 4 CPUs)"*) ok "the override is printed beside the load" ;; *) bad "override running line: $out" ;; esac
 check "override: two checks run at once" "$(peak_concurrency)" "2"
+
+echo "Part 4: --retry-failed re-runs only what failed for the same commit and selection (#2843)"
+
+RESULTS_DIR="$XDG_CACHE_HOME/mergepath/prepush-results"
+REC="$RESULTS_DIR/feat_retry.tsv"
+help_out=$(bash "$RUNNER" --help)
+for want in --retry-failed MERGEPATH_PREPUSH_RETRY_FAILED prepush-results; do
+  case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
+done
+ran_set() { for c in check_env check_flag check_graphed check_ok; do [ ! -f "$PROBE_DIR/ran.$c" ] || printf '%s ' "$c"; done; }
+rec_rc() { awk -F'\t' -v n="$1" '$1 == "step" && $4 == n { print $3 }' "$REC" 2>/dev/null; }
+retry_push() { (cd "$FIX" && MERGEPATH_PREPUSH_RETRY_FAILED=1 "$@" git push origin feat/retry 2>&1); }
+
+# A failing push records every selected check's result for its branch,
+# with the commit it checked, and says how to retry.
+reset_probe; touch "$PROBE_DIR/FLAG"
+commit_change feat/retry README.md
+rc=0; out=$(cd "$FIX" && git push origin feat/retry 2>&1) || rc=$?
+check "retry: the recorded push fails on check_flag" "$rc" "1"
+if [ -f "$REC" ]; then ok "a hook run records its results under the cache directory"; else bad "no record at $REC"; fi
+check "the record names the pushed commit" "$(awk -F'\t' '$1 == "commit" { print $2 }' "$REC" 2>/dev/null)" "$(git -C "$FIX" rev-parse HEAD)"
+check "the record holds each check's result" "$(rec_rc check_ok) $(rec_rc check_flag) $(rec_rc check_env)" "0 1 0"
+case "$out" in *"MERGEPATH_PREPUSH_RETRY_FAILED=1 git push"*) ok "a failed push names the retry" ;; *) bad "no retry hint: $out" ;; esac
+
+# Same commit and selection: only the failed check runs, and the push passes
+# once it does.
+rm -f "$PROBE_DIR/FLAG"; reset_probe
+rc=0; out=$(retry_push) || rc=$?
+check "retry: the push passes once the failed check passes" "$rc" "0"
+check "retry: only the failed check ran" "$(ran_set)" "check_flag "
+check "retry: the remote has the commit" "$(remote_tip feat/retry)" "$(git -C "$FIX" rev-parse HEAD)"
+case "$out" in *"--retry-failed: re-running the 1 of 3 checks that did not pass in the recorded run of $(git -C "$FIX" rev-parse HEAD)"*) ok "the retry names what it re-runs and what it builds on" ;; *) bad "retry output: $out" ;; esac
+check "the retry rewrites the record with the new result" "$(rec_rc check_ok) $(rec_rc check_flag) $(rec_rc check_env)" "0 0 0"
+
+# Every check passed in the record: nothing is re-run, and the run passes.
+# (git skips the hook when the remote already has the commit, so the hook
+# is invoked directly with git's pre-push line.)
+reset_probe
+sha=$(git -C "$FIX" rev-parse HEAD)
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_RETRY_FAILED=1 bash scripts/repo-lint-prepush.sh --hook origin <<<"refs/heads/feat/retry $sha refs/heads/feat/retry $ZERO" 2>&1) || rc=$?
+check "retry of an all-pass record passes" "$rc" "0"
+check "retry of an all-pass record runs nothing" "$(ran_set)" ""
+
+# A recorded failure that still fails still blocks the push.
+reset_probe; touch "$PROBE_DIR/FLAG"
+git -C "$FIX" commit -q --allow-empty -m retry-still-failing
+rc=0; out=$(cd "$FIX" && git push origin feat/retry 2>&1) || rc=$?
+check "retry: a second recorded push fails" "$rc" "1"
+reset_probe; touch "$PROBE_DIR/FLAG"
+rc=0; out=$(retry_push) || rc=$?
+check "retry: a still-failing check blocks the push" "$rc" "1"
+check "retry: only the failed check ran again" "$(ran_set)" "check_flag "
+check "retry: a blocked retry leaves the remote unchanged" "$(remote_tip feat/retry)" "$(git -C "$FIX" rev-parse HEAD~1)"
+
+# The commit changed since the recorded run: the retry is refused and the
+# full selection runs.
+recorded=$(git -C "$FIX" rev-parse HEAD)
+git -C "$FIX" commit -q --allow-empty -m retry-new-commit
+rm -f "$PROBE_DIR/FLAG"; reset_probe
+rc=0; out=$(retry_push) || rc=$?
+check "changed commit: the full selection passes the push" "$rc" "0"
+check "changed commit: every live check ran" "$(ran_set)" "check_env check_flag check_ok "
+case "$out" in *"--retry-failed: the commit changed since the recorded run (recorded $recorded, pushing $(git -C "$FIX" rev-parse HEAD)); running the full selection"*) ok "changed commit: the refusal names both commits" ;; *) bad "changed-commit output: $out" ;; esac
+
+# The selection changed (MERGEPATH_PREPUSH_LIVE=all adds the unselected
+# wrapper): the retry is refused and the full, new selection runs.
+reset_probe; touch "$PROBE_DIR/FLAG"
+git -C "$FIX" commit -q --allow-empty -m retry-selection
+rc=0; out=$(cd "$FIX" && git push origin feat/retry 2>&1) || rc=$?
+check "changed selection: the recorded push fails" "$rc" "1"
+rm -f "$PROBE_DIR/FLAG"; reset_probe
+rc=0; out=$(retry_push env MERGEPATH_PREPUSH_LIVE=all) || rc=$?
+check "changed selection: the full selection passes the push" "$rc" "0"
+check "changed selection: every check of the new selection ran" "$(ran_set)" "check_env check_flag check_graphed check_ok "
+case "$out" in *"--retry-failed: the selection changed since the recorded run of "*"; running the full selection"*) ok "changed selection: the refusal says so" ;; *) bad "changed-selection output: $out" ;; esac
+
+# An incomplete record (a run cut short mid-write) is not a pass.
+reset_probe; touch "$PROBE_DIR/FLAG"
+git -C "$FIX" commit -q --allow-empty -m retry-malformed
+rc=0; out=$(cd "$FIX" && git push origin feat/retry 2>&1) || rc=$?
+sed -i.bak '/^end$/d' "$REC" && rm -f "$REC.bak"
+reset_probe; touch "$PROBE_DIR/FLAG"
+rc=0; out=$(retry_push) || rc=$?
+check "malformed record: the push is still blocked" "$rc" "1"
+check "malformed record: the full selection ran" "$(ran_set)" "check_env check_flag check_ok "
+case "$out" in *"is incomplete or malformed; running the full selection"*) ok "malformed record: the refusal says so" ;; *) bad "malformed-record output: $out" ;; esac
+
+# A manual run checks the working tree, so it has nothing to retry.
+rm -f "$PROBE_DIR/FLAG"; reset_probe
+rc=0; out=$(cd "$FIX" && bash scripts/repo-lint-prepush.sh --retry-failed 2>&1) || rc=$?
+check "manual --retry-failed: the full selection passes" "$rc" "0"
+check "manual --retry-failed: every live check ran" "$(ran_set)" "check_env check_flag check_ok "
+case "$out" in *"--retry-failed: a manual run checks the working tree"*) ok "manual --retry-failed: the refusal says why" ;; *) bad "manual retry output: $out" ;; esac
+
+# A missing record runs the full selection, and a still-failing check still
+# blocks. The scenario runs once with the runner and once with a mutant that
+# reads a missing record as "nothing failed"; the mutant must pass the push,
+# so the assertions on the real runner discriminate that defect.
+missing_record_retry() {  # $1 = runner, $2 = label; prints the exit status
+  local sha rc=0
+  git -C "$FIX" commit -q --allow-empty -m "retry-missing-$2"
+  sha=$(git -C "$FIX" rev-parse HEAD)
+  rm -f "$REC"
+  reset_probe; touch "$PROBE_DIR/FLAG"
+  (cd "$FIX" && MERGEPATH_PREPUSH_RETRY_FAILED=1 bash "$1" --hook origin <<<"refs/heads/feat/retry $sha refs/heads/feat/retry $ZERO") \
+    > "$TMP/missing-$2.out" 2>&1 || rc=$?
+  printf '%s\n' "$rc"
+}
+rc=$(missing_record_retry "$FIX/scripts/repo-lint-prepush.sh" real)
+check "missing record: a failing check still blocks the push" "$rc" "1"
+check "missing record: the full selection ran" "$(ran_set)" "check_env check_flag check_ok "
+case "$(cat "$TMP/missing-real.out")" in *"--retry-failed: no recorded run of this branch to retry; running the full selection"*) ok "missing record: the refusal says so" ;; *) bad "missing-record output: $(cat "$TMP/missing-real.out")" ;; esac
+MUTANT="$TMP/mutant/repo-lint-prepush.sh"
+mkdir -p "$TMP/mutant"
+python3 - "$RUNNER" "$MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+old = '    RETRY_NOTE="no recorded run of this branch to retry"\n    return 1\n'
+new = ('    awk -v n="$SEL_TOTAL" \'BEGIN { for (i = 1; i <= n; i++) printf "%03d\\t0\\n", i }\' > "$RUN_DIR/retry.prior"\n'
+       '    return 0\n')
+open(sys.argv[2], 'w').write(src.replace(old, new, 1))
+PY
+rc=$(missing_record_retry "$MUTANT" mutant)
+if ! cmp -s "$MUTANT" "$RUNNER" && [ "$rc" = 0 ] && [ -z "$(ran_set)" ]; then
+  ok "mutation: reading a missing record as a pass lets the failing push through, so the assertions above discriminate"
+else
+  bad "mutation: expected the mutant to pass the push without running anything (rc=$rc, ran: $(ran_set))"
+fi
+git -C "$FIX" checkout -q main
 
 echo ""
 echo "test_repo_lint_prepush: $PASS passed, $FAIL failed"
