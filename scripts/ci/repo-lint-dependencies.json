@@ -287,7 +287,8 @@
       "scripts/lib/codex-failure-markers.sh",
       "scripts/lib/gh-api-array.sh",
       "scripts/lib/gh-comment-trigger-guard.sh",
-      "scripts/lib/gh-retry-helpers.sh"
+      "scripts/lib/gh-retry-helpers.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_daily_feedback_rollup": [
       "tests/test_daily_feedback_rollup.sh",
@@ -376,7 +377,8 @@
       "scripts/validate-pr-body.sh",
       "scripts/lib/codex-review-ledger.sh",
       "scripts/lib/gh-command-classifier.sh",
-      "scripts/lib/reviewers-helpers.sh"
+      "scripts/lib/reviewers-helpers.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_gh_projects_move_item": [
       "scripts/gh-projects/move-item.sh",
@@ -402,7 +404,8 @@
       "scripts/codex-review-request.sh",
       "scripts/daily-feedback-rollup.sh",
       "scripts/lib/gh-retry-helpers.sh",
-      "scripts/lib/reviewers-helpers.sh"
+      "scripts/lib/reviewers-helpers.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_merge_group_required_checks": [
       "scripts/lib/credential-class.sh",
@@ -551,7 +554,8 @@
       "scripts/gh-as-author.sh",
       "scripts/validate-pr-body.sh",
       "scripts/lib/pr-body-contract.sh",
-      "scripts/lib/reviewers-helpers.sh"
+      "scripts/lib/reviewers-helpers.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_project_doc_sync": [
       "tests/test_project_doc_sync.sh",
@@ -559,7 +563,8 @@
     ],
     "check_propagation_lane_audit": [
       "tests/test_audit_propagation_lane.sh",
-      "scripts/audit-propagation-lane.sh"
+      "scripts/audit-propagation-lane.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_repo_lint_latency_report": [
       "tests/test_repo_lint_latency_report.sh",
@@ -725,7 +730,8 @@
       "scripts/lib/dependabot-commit-provenance.sh",
       "scripts/lib/gh-api-array.sh",
       "scripts/lib/gh-command-classifier.sh",
-      "scripts/lib/review-policy-scalar.sh"
+      "scripts/lib/review-policy-scalar.sh",
+      "scripts/workflow/external_review_classify.sh"
     ],
     "check_workflow_verify_propagation_templated": [
       "tests/test_verify_propagation_pr_templated.sh",
