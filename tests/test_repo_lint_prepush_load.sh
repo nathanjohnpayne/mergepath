@@ -207,7 +207,7 @@ run_load() {
   echo "$start" > "$FAKE_LOADFILE"
   seed_order
   RC=0
-  OUT=$(cd "$FIX" && printf 'other/input.txt\n' | env MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS=1 ${envs[@]+"${envs[@]}"} bash "$r" --paths-from - "$@" 2>&1) || RC=$?
+  OUT=$(cd "$FIX" && printf 'other/input.txt\n' | env ${envs[@]+"${envs[@]}"} bash "$r" --paths-from - "$@" 2>&1) || RC=$?
 }
 seen() { awk -v n="$1" '$1 == n { print $2 }' "$PROBE_DIR/samples"; }   # probes running when $1 started
 reads() { wc -l < "$FAKE_SYSCTL_COUNT" | tr -d ' '; }
@@ -218,7 +218,7 @@ reads() { wc -l < "$FAKE_SYSCTL_COUNT" | tr -d ' '; }
 # starts, so s4 and s5 start beside it (jobs=2).
 assert_falls_and_rises() {   # $1 runner
   local r="$1"
-  run_load "$r" "$LOW" LOAD_AT_END_s1="$HIGH" SECS_s1=1 SECS_s2=3 LOAD_AT_START_s3="$LOW" SECS_s3=5 --
+  run_load "$r" "$LOW" LOAD_AT_END_s1="$HIGH" SECS_s1=1 SECS_s2=3 LOAD_AT_START_s3="$LOW" SECS_s3=12 --
   expect "falls and rises: the run passes" "$RC" "0"
   expect_has "falls and rises: starts at jobs=2" "$OUT" "(jobs=2, nice=10, host load 0.50 on 4 CPUs)"
   expect_has "falls and rises: the run says the concurrency follows the load" "$OUT" "follows the host load between 1 and 2"
@@ -235,7 +235,7 @@ assert_falls_and_rises() {   # $1 runner
 # ── property 2: a run that starts loaded speeds up when the load falls ───
 assert_loaded_start_rises() {   # $1 runner
   local r="$1"
-  run_load "$r" "$HIGH" LOAD_AT_START_s1="$LOW" SECS_s1=4 --
+  run_load "$r" "$HIGH" LOAD_AT_START_s1="$LOW" SECS_s1=8 --
   expect "loaded start: the run passes" "$RC" "0"
   expect_has "loaded start: starts at jobs=1" "$OUT" "(jobs=1, nice=10, host load 9.00 on 4 CPUs)"
   expect_has "loaded start: the rise is logged" "$OUT" "repo-lint pre-push: concurrency 1 -> 2 (host load 0.50 on 4 CPUs)"
@@ -261,15 +261,16 @@ assert_pinned_holds() {   # $1 runner
 }
 
 # ── property 4: a long wait does not read the load every second ──────────
-# Loaded throughout, with an hour-long interval: s1 runs for 6 s while the
-# feeder waits for its slot. Reading every second would add about ten reads
-# to the ten or so a throttled run makes (the start, one per check, the end).
+# Loaded throughout: s1 runs for 12 s while the feeder waits for its slot.
+# The fixed 5 s interval allows two extra reads there; reading every second
+# would add twelve to the eight or so a run makes (the start, one per check,
+# the end).
 assert_reads_throttled() {   # $1 runner
   local r="$1" n
-  run_load "$r" "$HIGH" MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS=3600 SECS_s1=6 --
+  run_load "$r" "$HIGH" SECS_s1=12 --
   expect "throttled: the run passes" "$RC" "0"
   n=$(reads)
-  expect "throttled: a 6-second wait adds no per-second reads (got $n)" "$([ "$n" -le 11 ] && echo ok || echo "too many: $n")" "ok"
+  expect "throttled: a 12-second wait adds no per-second reads (got $n)" "$([ "$n" -le 12 ] && echo ok || echo "too many: $n")" "ok"
 }
 
 echo "Part 1: the concurrency falls and rises with the load"
@@ -285,7 +286,7 @@ echo "Part 4: the load is not read every second while waiting"
 assert_reads_throttled "$RUNNER"
 
 help_out=$(bash "$RUNNER" --help)
-for want in 'MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS' 'Live load (#2842)' 'pin the concurrency'; do
+for want in 'at most every 5 seconds' 'Live load (#2842)' 'pin the concurrency'; do
   case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
 done
 

@@ -84,8 +84,6 @@
 #                               re-sizing, said in the output); default 2 below
 #                               one CPU's worth of load per core, 1 at or above
 #                               it, re-read during the run (below)
-#   MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS=S  the most often the load is re-read
-#                               while a run waits for a free slot (default 5)
 #   MERGEPATH_PREPUSH_NICE=N    nice level for every check, default 10
 #   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
 #                               and markdown-it-py for the deep lane)
@@ -142,7 +140,7 @@
 # environment overrides. An environment variable set to '' counts as unset.
 #
 # Live load (#2842). The one-minute load is not read once at start: before
-# each check starts, and at most every few seconds while the run waits for a
+# each check starts, and at most every 5 seconds while the run waits for a
 # free slot, it is read again and the concurrency is sized from it (jobs_max
 # or 1, by load_per_cpu_threshold, as at start). Each change is logged
 # (`concurrency 1 -> 2 (host load 3.10 on 10 CPUs)`); running checks are never
@@ -1540,14 +1538,13 @@ fi
 # only the upper bound (JOBS_CAP); SCHED_CUR, kept by the feeder, is the
 # number of checks allowed at once. A read happens when a slot is free (the
 # decision to start a check) and otherwise at most every
-# MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS (default 5) while the feeder waits, so
+# SCHED_REREAD_S (a fixed 5 seconds, not a setting) while the feeder waits, so
 # a long queue does not ask the host every second. A reading that is
 # unavailable leaves the concurrency as it is. Each change is logged to
 # stderr (stdout feeds xargs). Checks already running are never stopped.
 SCHED_CUR="$JOBS"
 SCHED_READ_AT=0
-SCHED_REREAD_S="${MERGEPATH_PREPUSH_LOAD_REREAD_SECONDS:-5}"
-case "$SCHED_REREAD_S" in ''|*[!0-9]*) SCHED_REREAD_S=5 ;; esac
+readonly SCHED_REREAD_S=5
 SCHED_THRESHOLD=$(policy_value load_per_cpu_threshold)
 sched_resize() {   # $1 = force: read now whatever the interval
   local now load n
