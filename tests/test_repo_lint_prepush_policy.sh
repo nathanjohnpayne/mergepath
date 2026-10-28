@@ -18,8 +18,9 @@
 #   which copy     - a hook run reads the pushed commit's copy, not an
 #                    uncommitted edit, and a committed invalid file blocks
 #                    the push, and so does a committed symlink at the path;
-#   shipped file   - mergepath's own .github/prepush.yml resolves to exactly
-#                    the built-in defaults, so the hub's behaviour is unchanged.
+#   shipped file   - mergepath's own .github/prepush.yml sets every key and
+#                    resolves to the built-in defaults except full_suite=defer
+#                    and max_minutes=15 (#2841).
 # Each of the first three is then re-run against a mutated copy of the runner
 # that breaks the property, and must fail there: a test that passes against
 # the mutant proves nothing.
@@ -197,6 +198,7 @@ export PATH="$FAKEBIN:$PATH"
 POLICY="$FIX/.github/prepush.yml"
 KEYS='mode full_suite max_minutes deep nice jobs_max load_per_cpu_threshold'
 DEFAULTS='mode=full full_suite=run max_minutes=0 deep=false nice=10 jobs_max=2 load_per_cpu_threshold=1'
+SHIPPED='mode=full full_suite=defer max_minutes=15 deep=false nice=10 jobs_max=2 load_per_cpu_threshold=1'
 reset_probe() { rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"; }
 ran() { [ -f "$PROBE_DIR/ran.$1" ] && echo ran || echo 'not run'; }
 ran_count() { local f n=0; for f in "$PROBE_DIR"/ran.*; do [ -e "$f" ] && n=$((n + 1)); done; echo "$n"; }
@@ -462,12 +464,13 @@ expect_has "hook: the refusal names the symlink" "$OUT" "invalid .github/prepush
 expect "hook: the remote did not receive the symlink policy" "$(git -C "$FIXREMOTE" rev-parse -q --verify refs/heads/feat/policy-symlink || echo none)" "none"
 git -C "$FIX" checkout -q main
 
-echo "Part 5: mergepath's own .github/prepush.yml keeps today's behaviour"
+echo "Part 5: mergepath's own .github/prepush.yml"
 if [ -f "$SHIPPED_POLICY" ]; then
   cp "$SHIPPED_POLICY" "$POLICY"
   run_plan "$RUNNER"
   expect "the shipped policy is valid" "$RC" "0"
-  expect "the shipped policy equals the built-in defaults" "$(policy_values "$(policy_line "$OUT")")" "$DEFAULTS"
+  # Every key but the two #2841 turned on keeps its built-in default.
+  expect "the shipped policy is the defaults plus full_suite=defer and max_minutes=15" "$(policy_values "$(policy_line "$OUT")")" "$SHIPPED"
   for k in $KEYS; do
     expect_has "the shipped policy sets $k explicitly" "$(policy_entry "$(policy_line "$OUT")" "$k")" "(.github/prepush.yml)"
   done
