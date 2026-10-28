@@ -331,6 +331,8 @@ INVALID_BODIES=(
   'jobs_max: 0'
   'load_per_cpu_threshold: 0'
   'full_suite: skip'
+  ''
+  '# comments only'
 )
 assert_invalid_file_refused() {   # $1 runner
   local r="$1" body

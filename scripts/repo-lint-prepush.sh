@@ -559,7 +559,9 @@ policy_read_file() {
   [ "$(printf '%s\n' "$json" | wc -l | tr -d ' ')" = 1 ] || policy_refuse "more than one YAML document"
   tag=$(yq 'tag' "$f") || policy_refuse "unreadable YAML"
   case "$tag" in
-    '!!null') POLICY_FILE_STATE=present; return 0 ;;   # empty, or comments only: no keys set
+    # Present but empty (or comments only): absence is the only way to ask
+    # for the defaults, so a truncated or mis-edited file never passes.
+    '!!null') policy_refuse "the file holds no policy (empty or comments only); delete it to use the built-in defaults" ;;
     '!!map') ;;
     *) policy_refuse "the top level must be a mapping of policy keys (found $tag)" ;;
   esac
