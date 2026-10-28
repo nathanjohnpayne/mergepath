@@ -473,6 +473,8 @@ ALLOW_LIST=(
   "tests/test_repo_lint_prepush_policy.sh"
   # Its full-suite deferral and budget suite (#2841), likewise.
   "tests/test_repo_lint_prepush_defer.sh"
+  # Its live host-load suite (#2842), likewise.
+  "tests/test_repo_lint_prepush_load.sh"
 )
 
 is_allow_listed() {

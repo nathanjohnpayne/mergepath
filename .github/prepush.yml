@@ -45,9 +45,11 @@ deep: false
 # nice level for every check. Env: MERGEPATH_PREPUSH_NICE.
 nice: 10
 
-# Default concurrency: jobs_max checks at once while the one-minute load
-# average per CPU is below load_per_cpu_threshold, one once it is not.
-# MERGEPATH_PREPUSH_JOBS (or --jobs) still pins the concurrency outright.
+# Concurrency: jobs_max checks at once while the one-minute load average per
+# CPU is below load_per_cpu_threshold, one once it is not. The load is read
+# again before each check (#2842), so a run follows the host as it gets busy
+# or quiet, and each change is logged. MERGEPATH_PREPUSH_JOBS (or --jobs)
+# pins the concurrency for the whole run instead, with no re-sizing.
 # Env: MERGEPATH_PREPUSH_JOBS_MAX, MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD.
 jobs_max: 2
 load_per_cpu_threshold: 1

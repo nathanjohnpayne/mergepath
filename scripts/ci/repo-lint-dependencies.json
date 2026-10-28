@@ -577,6 +577,7 @@
       ".github/prepush.yml",
       "tests/test_repo_lint_prepush_policy.sh",
       "tests/test_repo_lint_prepush_defer.sh",
+      "tests/test_repo_lint_prepush_load.sh",
       "scripts/install-git-hooks.sh",
       "scripts/git-hooks/*",
       "tests/test_repo_lint_prepush.sh",
