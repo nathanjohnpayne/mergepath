@@ -939,7 +939,14 @@ fi
 PRP_WORKFLOW="${PRP_WORKFLOW:-$ROOT/.github/workflows/pr-review-policy.yml}"
 AUTO_CLEAR_WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_WORKFLOW" ]; then
-  CLASSIFIER=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$PRP_WORKFLOW")
+  # The `check` step runs the extracted classifier (#2727 slice 3b).
+  CLASSIFIER_RUN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$PRP_WORKFLOW")
+  if grep -Fq 'git show "origin/$DEFAULT_BRANCH:scripts/workflow/external_review_classify.sh"' <<<"$CLASSIFIER_RUN"; then
+    pass "labeler's check step runs the default branch's external_review_classify.sh"
+  else
+    fail "labeler's check step must run origin/\$DEFAULT_BRANCH's external_review_classify.sh, got: $CLASSIFIER_RUN"
+  fi
+  CLASSIFIER=$(cat "${PRP_CLASSIFIER:-$ROOT/scripts/workflow/external_review_classify.sh}")
   if grep -Fq 'PIN_HELPER="$TRUSTED_HELPER_DIR/dependabot_pin_bump_exemption.sh"' <<<"$CLASSIFIER" \
      && grep -Fq -- '--config "$TRUSTED_CONFIG"' <<<"$CLASSIFIER" \
      && grep -Fq -- '--files-json "$FILES_JSON"' <<<"$CLASSIFIER" \

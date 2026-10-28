@@ -51,6 +51,23 @@ class InventoryError(ValueError):
     pass
 
 
+# Scripts a step runs whose text the inventory must see as the step's own.
+# The External Review Check runs the default branch's copy of the classifier
+# (#2727 slice 3b); its codex-review-check.sh call is still the step's route.
+DELEGATED_STEP_SCRIPTS = ('scripts/workflow/external_review_classify.sh',)
+
+
+def delegated_text(text, root=ROOT):
+    """Append the source of every reviewed script the step text names."""
+    for path in DELEGATED_STEP_SCRIPTS:
+        if path in text:
+            source = root / path
+            if not source.is_file():
+                raise InventoryError(f'{path}: a step runs it but it is missing')
+            text += '\n' + source.read_text()
+    return text
+
+
 def code_lines(text):
     """Discard standalone shell/JS comments; this is not a language parser."""
     return '\n'.join(line for line in text.splitlines()
@@ -146,7 +163,7 @@ def audit_documents(documents, routes, seconds):
             if not isinstance(job, dict):
                 raise InventoryError(f'{file}/{job_id}: unsupported job')
             for step in job.get('steps', []):
-                text = step.get('run', '') + '\n' + step.get('with', {}).get('script', '')
+                text = delegated_text(step.get('run', '') + '\n' + step.get('with', {}).get('script', ''))
                 signature = invocation_signature(text)
                 identity = (file, job_id, step.get('name', ''))
                 route = expected.get(identity)
