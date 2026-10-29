@@ -38,8 +38,11 @@ INSTALLER="$REPO_ROOT/scripts/install-git-hooks.sh"
 HOOK="$REPO_ROOT/scripts/git-hooks/pre-push"
 SHIPPED_POLICY="$REPO_ROOT/.github/prepush.yml"
 
-if [ ! -f "$RUNNER" ] && [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-  echo "test_repo_lint_prepush_policy: SKIP (consumer checkout: the pre-push mirror is hub-only)"
+# Marker-first (#2844): consumers now receive the runner, but not this
+# suite's hub-shaped fixtures and expectations, so the runner's presence no
+# longer tells a consumer from the hub.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "test_repo_lint_prepush_policy: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push suites are hub-only)"
   exit 0
 fi
 for tool in jq python3 git shellcheck; do

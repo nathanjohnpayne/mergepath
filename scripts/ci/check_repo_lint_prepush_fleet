@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_repo_lint_prepush_fleet
+#
+# Runs tests/test_repo_lint_prepush_fleet.sh (#2844): the repo-lint pre-push
+# hook, its runner and its installer propagate to every consumer, with a
+# per-consumer policy rendered from examples/prepush.yml. The suite proves the
+# manifest entries and their requires: closure, that the closure check's
+# hub-only allow-list names the suites and none of the propagated pieces, that
+# every consumer's rendered policy is one the runner accepts with the intended
+# values, and how the runner behaves on a consumer-shaped checkout.
+#
+# A wrapper of its own, rather than a fifth suite under check_repo_lint_prepush,
+# because it reads .mergepath-sync.yml: declaring the manifest under that
+# wrapper would run its four slow suites on every manifest change.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_prepush_fleet.sh"
+
+# Consumer-safety guard (#601), marker-FIRST, as check_repo_lint_prepush: the
+# scripts/ci kit travels to every consumer, but the suite reads the hub-only
+# manifest and is not propagated. A consumer carrying it as bootstrap residue
+# still SKIPs. On the hub, a missing suite is a hard error.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_repo_lint_prepush_fleet: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the fleet suite reads the hub-only manifest)"
+  exit 0
+fi
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_repo_lint_prepush_fleet: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_repo_lint_prepush_fleet: PASS"

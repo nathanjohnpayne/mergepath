@@ -9,8 +9,8 @@
 #   MERGEPATH_PREPUSH_SKIP=1 git push
 #
 # A checkout without the runner (an older branch, or a consumer repository
-# that never received this hub-only tooling) passes without checking, and
-# says so.
+# that has not yet received it through propagation, #2844) passes without
+# checking, and says so.
 #
 # Every path prints at least one line, starting with the unconditional
 # "hook invoked" line below, so a push log without it means git never ran

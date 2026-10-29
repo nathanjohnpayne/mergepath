@@ -124,11 +124,18 @@ consumers:
     repo: nathanjohnpayne/matchline
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react, typescript]
   - name: nathanpaynedotcom
     repo: nathanjohnpayne/nathanpaynedotcom
     visibility: public
     facts:
+      # Repo-lint pre-push policy (#2844, examples/prepush.yml): off, because
+      # this repo already runs its own pre-push hook (.githooks/pre-push, the
+      # unit and end-to-end suites, wired with core.hooksPath=.githooks), and
+      # git runs one hooks directory per clone; installing ours would replace
+      # it. Revisit if the two are ever chained into one hook.
+      prepush_mode: "off"
       frameworks: [astro, typescript]
   # overridebroadway is CJS + TypeScript (React 19 + TypeScript, root
   # package.json, ~81 .ts/.tsx files). The prior "zero lintable surface"
@@ -140,11 +147,13 @@ consumers:
     repo: nathanjohnpayne/overridebroadway
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react, typescript]
   - name: friends-and-family-billing
     repo: nathanjohnpayne/friends-and-family-billing
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react]
       # ffb hand-added a vitest globals block during the Phase D
       # fanout (#250); folding it into the template removes the
@@ -161,11 +170,13 @@ consumers:
     repo: nathanjohnpayne/swipewatch
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: []
   - name: tadlockpsychiatry
     repo: nathanjohnpayne/tadlockpsychiatry
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react, typescript]
   # fiveacross uses React + TypeScript and runs Vitest (verified from its root
   # package.json). The `testing: vitest` fact keeps the generated ESLint
@@ -176,6 +187,7 @@ consumers:
     repo: nathanjohnpayne/fiveacross
     visibility: public
     facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react, typescript]
       testing: vitest
 
@@ -2639,6 +2651,41 @@ paths:
       - "scripts/ci/"   # every run: step executes a kit check — must travel together (#601)
       - "tests/test_repo_lint_optimization.sh"  # parsed trigger/lane/aggregator contract (#1062)
 
+  # The repo-lint pre-push hook (#2221), fleet adoption (#2844, epic #2839).
+  # Three canonical scripts and one templated policy travel together:
+  #   - scripts/git-hooks/pre-push   the hook git runs; it execs the runner;
+  #   - scripts/repo-lint-prepush.sh the runner; it reads the classifier, the
+  #     dependency graph and repo_lint.yml from the pushed commit, all three
+  #     already delivered (scripts/ci/ kit, the canonical workflow above);
+  #   - scripts/install-git-hooks.sh the per-clone installer (core.hooksPath).
+  # Receiving them changes nothing on its own: git runs the hook only in a
+  # clone where someone ran the installer. Each consumer's policy is the
+  # templated .github/prepush.yml (examples/prepush.yml, below), rendered from
+  # its `prepush_mode` fact. The runner reads that file but does not require
+  # it (a missing file is the built-in defaults), so it is not a `requires:`
+  # edge: a consumer may own its copy through .sync-overrides.yml skip_paths
+  # without also skipping the hook. The hook's suites stay hub-only
+  # (check_propagation_closure's allow-list): the runner is byte-identical
+  # everywhere, and tests/test_repo_lint_prepush_fleet.sh proves these four
+  # entries and the runner's consumer-mode behaviour on the hub.
+  - path: scripts/git-hooks/pre-push
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/repo-lint-prepush.sh"   # exec'd by the hook (absent, the hook soft-passes)
+  - path: scripts/repo-lint-prepush.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/ci/repo-lint-scope.sh"          # the scope classifier it runs
+      - "scripts/ci/repo-lint-dependencies.json" # the graph its lanes and deferral read
+      - ".github/workflows/repo_lint.yml"        # the step list and run: bodies it mirrors
+  - path: scripts/install-git-hooks.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/git-hooks/pre-push"   # it refuses to install without the hook
+
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
   # would read it in-repo — but the lane's redesign (after the Codex
@@ -2979,6 +3026,25 @@ paths:
       - friends-and-family-billing
       - overridebroadway
       - swipewatch
+
+  # Repo-lint pre-push policy (#2844). .github/prepush.yml is per-repository
+  # policy, so it is never a verbatim mirror: the hub's own copy (mode: full,
+  # a 15-minute budget) is not what a consumer should run. It renders from
+  # each consumer's `prepush_mode` fact, which every consumer declares:
+  #   selected - only the wrappers the classifier selects (no live
+  #              assertions), full_suite: defer, a 5-minute check budget;
+  #   off      - the hook runs nothing and says so: a recorded decision.
+  # tests/test_repo_lint_prepush_fleet.sh requires the fact on every
+  # consumer with one of those two values, and runs the hub runner against
+  # every rendered copy. A consumer changes its policy by changing its fact
+  # here (reviewed on the hub, delivered by the next sync); one that must own
+  # the file locally lists .github/prepush.yml under skip_paths in its
+  # .sync-overrides.yml, with a reason (docs/sync-overrides.md).
+  - path: examples/prepush.yml
+    source: examples/prepush.yml
+    dest: .github/prepush.yml
+    type: templated
+    consumers: all
 
 # Per-consumer exclusions. Use sparingly — drift exceptions become
 # audit noise over time. Each entry must list a `reason:` so future

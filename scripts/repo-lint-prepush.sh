@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # repo-lint-prepush.sh — run, before a push, the repo-lint checks CI would
-# select for it (#2221). Hub-only local tooling: it is not in
-# .mergepath-sync.yml, so no consumer receives it.
+# select for it (#2221). Local tooling, propagated to every consumer as a
+# canonical .mergepath-sync.yml entry (#2844); each repository sets how much
+# of it runs in its .github/prepush.yml (below).
 #
 # The required `lint` context stays authoritative. This only moves a failure
 # that CI would report about ten minutes after the push to before the push,
@@ -517,9 +518,9 @@ retire_stale_snapshots() {   # $1 = the snapshots directory; called under the lo
 # Location: .github/prepush.yml, a file of its own, beside the other per-repo
 # policy (review-policy.yml) but not inside it: review-policy.yml is merged
 # into every consumer by the propagation engine and read by the review
-# tooling, while this hook is hub-only local tooling; and a file of its own
-# lets a consumer adopt the hook (the epic's fleet slice) without touching
-# review configuration.
+# tooling, while this hook is local tooling; and a file of its own lets a
+# consumer adopt the hook without touching review configuration (#2844
+# renders each consumer's copy from the hub's examples/prepush.yml).
 #
 # Which copy: the one in the tree this run checks, which in a hook run is the
 # pushed commit's own snapshot (the cwd here), the same tree the workflow,

@@ -587,6 +587,17 @@
       "scripts/coderabbit-wait.sh",
       "scripts/merge-clearance-gate.sh"
     ],
+    "check_repo_lint_prepush_fleet": [
+      "tests/test_repo_lint_prepush_fleet.sh",
+      "examples/prepush.yml",
+      ".mergepath-sync.yml",
+      "scripts/repo-lint-prepush.sh",
+      "scripts/install-git-hooks.sh",
+      "scripts/git-hooks/*",
+      "scripts/ci/check_propagation_closure",
+      "scripts/ci/check_repo_lint_prepush",
+      "scripts/lib/template-substitution.sh"
+    ],
     "check_required_check_publisher": [
       ".github/workflows/auto-clear-blocking-labels.yml",
       ".github/workflows/required-check-publisher.yml",

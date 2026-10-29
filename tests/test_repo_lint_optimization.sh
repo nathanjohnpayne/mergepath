@@ -162,11 +162,13 @@ else
   # Consumer-shape inputs select the complete consumer replay (the sharded
   # deep_consumer_replay job) without forcing every self-test; a change to
   # the bootstrap exclusion list also selects its own wrapper (and, since
-  # #2580, every other wrapper whose suites name it).
+  # #2580, every other wrapper whose suites name it). The manifest selects
+  # exactly one wrapper, the pre-push fleet suite that reads its consumer
+  # facts and hook entries (#2844), which is not an enrolled self-test.
   manifest_scope=$(classify pull_request .mergepath-sync.yml | LC_ALL=C sort | tr '\n' ' ')
   mirror_scope=$(classify pull_request scripts/bootstrap/template-mirror.sh | LC_ALL=C sort | tr '\n' ' ')
   mirror_checks=$(scope_value checks pull_request scripts/bootstrap/template-mirror.sh)
-  if [ "$manifest_scope" = "checks=[] consumer_replay=true deep=true full=false self_tests=false " ] \
+  if [ "$manifest_scope" = 'checks=["check_repo_lint_prepush_fleet"] consumer_replay=true deep=true full=false self_tests=false ' ] \
      && case "$mirror_scope" in *"consumer_replay=true deep=true full=false "*) true ;; *) false ;; esac \
      && jq -e 'index("check_bootstrap_template_mirror") != null' <<<"$mirror_checks" >/dev/null 2>&1; then
     pass "consumer-shape inputs select the complete consumer replay without the full surface"
