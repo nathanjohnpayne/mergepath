@@ -11,6 +11,22 @@ INPUT_BASE_PATH="$PATH"
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS+1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+# Native CLI is hub-only. The propagated consumer closure below deliberately
+# omits it, so exercise these assertions only when the orchestrator is present.
+if [ -f "$ROOT/scripts/phase-4b-review.sh" ]; then
+  # Native CLI help must advertise both existing input modes. The supplied
+  # live --head equality guard is a hard stop before capture, adapter setup,
+  # or the reviewer wrapper can create a POST.
+  help_rc=0
+  help_output="$(bash "$ROOT/scripts/phase-4b-review.sh" --help 2>&1)" || help_rc=$?
+  if [ "$help_rc" = 3 ] \
+    && grep -Fq -- '--wave-scope-file <path>' <<<"$help_output" \
+    && grep -Fq -- '--offline-diff' <<<"$help_output"; then
+    pass 'native Phase 4b help lists canonical wave scope and offline preview flags'
+  else
+    fail "native Phase 4b help flags (rc=$help_rc): $help_output"
+  fi
+fi
 # Hooks may export redirects to their own repository. Fixture writes must not.
 for input_variable in $(compgen -e); do
   case "$input_variable" in GIT_*) unset "$input_variable" ;; esac
@@ -94,6 +110,69 @@ exit 99
 SH
 chmod +x "$WORK/bin/git" "$WORK/bin/gh"
 export PATH="$WORK/bin:$PATH"
+
+# Exercise the hub-only orchestrator's supplied-head fence with one hermetic
+# coherent-tuple read. Every other gh call, Git capture, adapter, or reviewer
+# write is logged/refused so the mismatch must stop before those boundaries.
+if [ -f "$ROOT/scripts/phase-4b-review.sh" ]; then
+mkdir -p "$WORK/mismatch-bin" "$WORK/mismatch-home" \
+  "$WORK/mismatch-adapters" "$WORK/empty-preflight-cache"
+cat > "$WORK/mismatch-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$INPUT_WORK/mismatch-gh-calls"
+if [ "$#" = 4 ] && [ "$1" = api ] \
+  && [ "$2" = repos/fixture/repo/pulls/1939 ] && [ "$3" = --jq ] \
+  && [ "$4" = '[.head.sha, .base.sha] | join(" ")' ]; then
+  printf '%s %s\n' "$HEAD_A" "$BASE"
+  exit 0
+fi
+exit 97
+SH
+cat > "$WORK/mismatch-bin/reviewer-tripwire" <<'SH'
+#!/usr/bin/env bash
+printf 'reviewer wrapper invoked\n' >> "$INPUT_WORK/mismatch-side-effects"
+exit 95
+SH
+chmod +x "$WORK/mismatch-bin/gh" "$WORK/mismatch-bin/reviewer-tripwire"
+cat > "$WORK/mismatch-policy.yml" <<'YAML'
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+cat > "$WORK/mismatch-adapters/review-via-codex.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'adapter invoked\n' >> "$INPUT_WORK/mismatch-side-effects"
+exit 96
+SH
+chmod +x "$WORK/mismatch-adapters/review-via-codex.sh"
+: > "$WORK/mismatch-gh-calls"
+: > "$WORK/mismatch-side-effects"
+[ -f "$INPUT_WORK/git-calls" ] || : > "$INPUT_WORK/git-calls"
+cp "$INPUT_WORK/git-calls" "$WORK/mismatch-git-before"
+mismatch_rc=0
+env -i HOME="$WORK/mismatch-home" PATH="$WORK/mismatch-bin:$WORK/bin:$INPUT_BASE_PATH" \
+  TMPDIR="$WORK" INPUT_WORK="$WORK" HEAD_A="$HEAD_A" BASE="$BASE" \
+  MERGEPATH_REVIEW_POLICY_PATH="$WORK/mismatch-policy.yml" GH_TOKEN=fixture-token \
+  OP_PREFLIGHT_CACHE_DIR="$WORK/empty-preflight-cache" \
+  P4B_ADAPTER_DIR="$WORK/mismatch-adapters" \
+  P4B_GH_AS_REVIEWER="$WORK/mismatch-bin/reviewer-tripwire" \
+  bash "$ROOT/scripts/phase-4b-review.sh" 1939 --repo fixture/repo \
+    --head ffffffffffffffffffffffffffffffffffffffff \
+    >"$WORK/mismatch.stdout" 2>"$WORK/mismatch.stderr" || mismatch_rc=$?
+if [ "$mismatch_rc" = 3 ] \
+  && grep -Fq 'supplied head differs from live PR head' "$WORK/mismatch.stderr" \
+  && [ "$(wc -l < "$WORK/mismatch-gh-calls" | tr -d ' ')" = 1 ] \
+  && grep -Fq 'repos/fixture/repo/pulls/1939' "$WORK/mismatch-gh-calls" \
+  && cmp -s "$INPUT_WORK/git-calls" "$WORK/mismatch-git-before" \
+  && [ ! -s "$WORK/mismatch-side-effects" ] \
+  && [ ! -s "$WORK/mismatch.stdout" ]; then
+  pass 'supplied live-head mismatch exits 3 after only the tuple read, before capture, adapter, or reviewer POST'
+else
+  fail "supplied live-head mismatch (rc=$mismatch_rc; gh=$(cat "$WORK/mismatch-gh-calls"); stderr=$(cat "$WORK/mismatch.stderr"))"
+fi
+fi
+
 mkdir "$WORK/input"
 if p4b_capture_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/input"; then pass 'capture succeeds from exact real Git objects'; else fail 'capture'; fi
 "$INPUT_REAL_GIT" -C "$INPUT_FIXTURE" diff --binary --full-index --no-ext-diff --no-textconv "$BASE" "$HEAD_A" -- > "$WORK/expected.diff"
