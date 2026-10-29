@@ -10,7 +10,7 @@ This runbook sets up the credential that approves Dependabot pull requests, per 
 
 | Job | Environment | Secret | Uses it for |
 |---|---|---|---|
-| `approve` | `dependabot-reviewer` | `DEPENDABOT_REVIEWER_TOKEN` | Two calls only: `GET /user` (the identity must be in `available_reviewers` and must not be the PR author) and the `APPROVE` review bound to the head's `commit_id` |
+| `approve` | `dependabot-reviewer` | `DEPENDABOT_REVIEWER_TOKEN` | Two calls only: `GET /user` (the identity must be in `available_reviewers` or `dependabot_reviewer_identities` and must not be the PR author) and the `APPROVE` review bound to the head's `commit_id` |
 | `merge` | `merge-queue-policy` | `AUTHOR_MERGE_TOKEN` | Unchanged: the identity check and the merge calls ([#2728](https://github.com/nathanjohnpayne/mergepath/issues/2728) owns this token) |
 
 Every other call in both jobs runs under `GITHUB_TOKEN`. Both jobs run only when the PR's base is the default branch, which makes their `pull_request.base.sha` checkout a default-branch commit. Each job also re-reads the live base before it writes, so a PR retargeted after the event is neither approved nor merged.
@@ -26,7 +26,7 @@ Until a repository's `dependabot-reviewer` environment holds `DEPENDABOT_REVIEWE
 
 ## Residual risk (accepted)
 
-The token is a **classic** PAT on a reviewer account. GitHub does not confine a classic PAT to one job, one repository or Dependabot approvals. A stolen copy reaches every repository the reviewer account can access, within the token's scopes. The dedicated name, the single job and the environment reduce **exposure** (fewer places the token is loaded) and allow rotating or revoking it on its own. They do not shrink its **blast radius**. The owner accepted this residual with option 1.
+The token is a **classic** PAT on a reviewer account. GitHub does not confine a classic PAT to one job, one repository or Dependabot approvals. A stolen copy reaches every repository the reviewer account can access, within the token's scopes. The dedicated name, the single job and the environment reduce **exposure** (fewer places the token is loaded) and allow rotating or revoking it on its own. They do not shrink its **blast radius**. The owner accepted this residual with option 1. Since [#2874](https://github.com/nathanjohnpayne/mergepath/issues/2874) the account is `nathanpayne-deps`, which narrows what a stolen copy can **approve**: its review counts only on Dependabot PRs. It is still a write collaborator, so the copy can push branches and post comments on the fleet repositories; branch protection and the Dependabot commit-provenance check (a pushed commit takes a PR out of the Dependabot lane) are what bound that.
 
 Classic is required because reviewer accounts are collaborators on user-owned repositories. A fine-grained PAT cannot contribute to a repository where its user is an outside or repository collaborator (it can still read public ones), and only a classic PAT has write access, which submitting a review needs, to public repositories its user does not own.
 
@@ -34,10 +34,10 @@ Record this paragraph in the 1Password item's notes and in the PAT's GitHub note
 
 ## The token
 
-- **Account:** `nathanpayne-claude` (any `available_reviewers` identity works; the workflow checks the allowlist at run time).
+- **Account:** `nathanpayne-deps`, a dedicated Dependabot-only approver ([#2874](https://github.com/nathanjohnpayne/mergepath/issues/2874)). It is a write collaborator on each fleet repository and is listed under `dependabot_reviewer_identities`, never under `available_reviewers`, in each repository's `.github/review-policy.yml` ([REVIEW_POLICY.md § Dependabot-only approver identities](https://github.com/nathanjohnpayne/mergepath/blob/main/REVIEW_POLICY.md#dependabot-only-approver-identities-2874)). Its approval counts on the Dependabot lane only, so a stolen copy of this token cannot clear an agent or human PR, and its approvals are distinguishable from agent reviews. Add the key to a repository's policy before its environment receives this token, or the `approve` job fails closed. Do not use `nathanpayne-robot` (a non-reviewer identity, so the gate fails any PR it approves) or `nathanjohnpayne` (the merge identity).
 - **Separate from the reviewer PAT that local sessions read** (1Password item `pvbq24vl2h6gl7yjclxy2hbote`). Issue a new token and store it as a new 1Password item, so it can be rotated or revoked alone. Record the new item's ID, not its title, in [Token record](#token-record).
 - **Scopes: `public_repo` only.** All eight fleet repositories were `PUBLIC` in a GraphQL `visibility` read on 2026-10-22 ([inventory](../audits/pipeline-token-callers-2026-10.md), "Private consumers"). `public_repo` covers submitting a pull request review on a public repository; `GET /user` returns the login with any classic scope. No `workflow`, `read:org` or `user` scope is needed. If any fleet repository becomes private, this token needs `repo` instead. Re-issue it, and update this section and the [Token record](#token-record) before that repository's environment receives it.
-- **Expiration:** set one, and put the rotation date on the calendar. A lapsed token fails closed: the `approve` job fails and Dependabot PRs wait.
+- **Expiration: none, by owner decision (2026-10-29).** The token was first issued with a 30-day expiry and regenerated without one, so Dependabot approvals never lapse unattended. Nothing therefore forces a rotation: revoke and regenerate it on any suspicion of exposure, when the `nathanpayne-deps` account's access changes, and when this runbook's scope changes. Regenerating keeps the 1Password item; update its value, then re-run the per-repository secret step below. If an expiry is ever set again, a lapsed token fails closed: the `approve` job fails and Dependabot PRs wait.
 - **Note on the PAT:** `mergepath dependabot-reviewer: approval job only` plus the residual-risk paragraph above.
 
 ## Order: issue before anything is revoked
@@ -111,9 +111,9 @@ Fill in when the token is issued:
 
 | Field | Value |
 |---|---|
-| Account | `nathanpayne-claude` |
-| 1Password item ID | *(owner fills in)* |
+| Account | `nathanpayne-deps` |
+| 1Password item ID | `5zkizdhgekgkhpayhvcfkckn5a` (title `GitHub PAT (dependabot-reviewer-deps)`) |
 | Scopes | `public_repo` |
-| Issued | *(date)* |
-| Expires | *(date)* |
-| Environments holding it | *(repositories, as each passes the readback)* |
+| Issued | 2026-10-29 (regenerated the same day without an expiry) |
+| Expires | Never (owner decision; see [The token](#the-token)) |
+| Environments holding it | All eight, readback 2026-10-29: environment-only secret, `main`-only rule, administrator bypass off, no reviewers or wait timer, no repository shadow. Remaining drift is only the expected #2730 repository-scoped secrets. |

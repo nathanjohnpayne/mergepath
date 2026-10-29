@@ -68,6 +68,16 @@ An absent or empty key is a legitimate configuration meaning "no such identity h
 
 The current CI service account is `nathanpayne-robot`. It holds no reviewer standing and must never post a review — review state is what the no-self-approve and same-agent gates read. It is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT.
 
+### Dependabot-only approver identities (#2874)
+
+`dependabot_reviewer_identities` in `.github/review-policy.yml` names the accounts that may approve a Dependabot PR and nothing else: the account behind `DEPENDABOT_REVIEWER_TOKEN` (fleet default `nathanpayne-deps`; owner runbook [`docs/agents/dependabot-reviewer-environment.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/dependabot-reviewer-environment.md)). The Dependabot lane accepts `available_reviewers` plus this list in exactly five places: the `approve` job's identity check, the `merge` job's approval re-read, the Merge clearance gate's Dependabot arm, `scripts/codex-review-check.sh` (so the automated approval can clear `needs-external-review`) and pr-audit Check 2's Dependabot rule. The last three accept it only when the PR's commit provenance proves it is a Dependabot PR. Every other approval check reads `available_reviewers` alone, and outside the Dependabot lane the Merge clearance gate blocks on a standing approval from one of these identities, as it does for `non_reviewer_identities`.
+
+The identities are deliberately **not** in `available_reviewers`. An approval from one on any other PR counts for nothing, so a leaked copy of the classic PAT cannot clear an agent or human PR. Keeping the account separate also makes an automated dependency approval visibly distinct from an agent review in PR history. It is neither the CI service account (the one-credential-clears-two-controls hazard above) nor the author identity (the approval and merge credentials must stay apart, #2729).
+
+- **Block form only.** An absent or empty key is inert, and the lane then accepts `available_reviewers` only. A flow list or bare scalar makes the gate exit 2 rather than read as absent.
+- **Never list an identity here that is also in `non_reviewer_identities`.** The lane-wide deny-list would then fail every approved Dependabot PR.
+- **`review-policy.yml` is not propagated.** Each consumer declares the key in its own policy before its `DEPENDABOT_REVIEWER_TOKEN` resolves to a Dependabot-only identity; until then the `approve` job fails closed with `NOT in … available_reviewers or dependabot_reviewer_identities`.
+
 ### CI app thread-resolution identity (#2726)
 
 One GitHub App identity may resolve demonstrably-actioned review threads from CI, and do nothing else. A repo names it in `thread_resolution_ci_app_identity` in `.github/review-policy.yml`, as the app's `<app-slug>[bot]` login. The key is absent by default, and absent, empty, `~` or `null` make the mode inert: no app is accepted.
@@ -1300,6 +1310,9 @@ code_scanning:
 dependabot:
   reviewer_gate:
     enabled: true
+# Accounts that may approve a Dependabot PR and nothing else (#2874).
+dependabot_reviewer_identities:
+  - nathanpayne-deps
 ```
 
 > **Note on `enabled` flags (`coderabbit`, `codex`, and `code_scanning`).** These flags govern **agent behavior only**—whether the authoring agent dispositions (and, where a wait is configured, waits for) the corresponding review in its phase. They do NOT control whether the underlying GitHub App or platform feature runs. All three run based on their own install/enable state, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. `code_scanning.enabled` is not read by `scripts/review-feedback-accounting.sh` at all (#1101)—code scanning is a repo Security-settings feature, not something this file controls, so gating the tracking on this flag would let a still-arriving `github-advanced-security[bot]` finding go untracked whenever the flag and the repo's actual setting disagree, reintroducing the accounting gap #1101 exists to close. To fully disable an integration, uninstall/disable it at its own source (the GitHub App, or the repo's code scanning setting)—not this flag.

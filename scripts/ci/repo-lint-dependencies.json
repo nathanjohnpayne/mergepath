@@ -760,6 +760,7 @@
       "scripts/required-head-checks.sh",
       "scripts/lib/blocking-labels.sh",
       "scripts/lib/dependabot-commit-provenance.sh",
+      "scripts/lib/reviewers-helpers.sh",
       "scripts/lib/gh-api-array.sh",
       "scripts/lib/gh-command-classifier.sh",
       "scripts/lib/review-policy-scalar.sh",
