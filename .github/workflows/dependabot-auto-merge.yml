@@ -293,7 +293,7 @@ jobs:
           if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then
             echo "::error::DEPENDABOT_REVIEWER_TOKEN resolves to '$ACTING_AS', the PR's own author."
             echo "::error::GitHub blocks self-approval, so the approve call would silently fail and the merge would proceed without an approval recorded."
-            echo "::error::Replace the secret with a distinct reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
+            echo "::error::Replace the secret with a PAT for the Dependabot approver identity (dependabot_reviewer_identities, e.g. nathanpayne-deps) or another listed reviewer."
             exit 1
           fi
 
@@ -313,17 +313,24 @@ jobs:
           # Same awk extractor used by scripts/codex-review-check.sh
           # (in-block list parser; sed strips list-marker + optional
           # quotes). Outputs one reviewer login per line.
-          ALLOWED=$(awk '
-            /^available_reviewers:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^ *-/ {print}
-          ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          # available_reviewers plus the Dependabot-only approver identities
+          # (#2874). The second list is honoured on this lane only; every
+          # other approval check reads available_reviewers alone.
+          policy_list() {
+            awk -v key="$1" '
+              index($0, key ":") == 1 {in_block=1; next}
+              in_block && /^[^[:space:]#]/ {in_block=0}
+              in_block && /^ *-/ {print}
+            ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
+          }
+          ALLOWED=$(policy_list available_reviewers)
+          [ -z "$ALLOWED" ] || ALLOWED=$(printf '%s\n%s\n' "$ALLOWED" "$(policy_list dependabot_reviewer_identities)" | sed '/^$/d')
           if [ -z "$ALLOWED" ]; then
             echo "::error::$POLICY has no available_reviewers list. Add reviewer identities under available_reviewers: before this workflow can approve."
             exit 1
           fi
           if ! printf '%s\n' "$ALLOWED" | grep -Fxq "$ACTING_AS"; then
-            echo "::error::DEPENDABOT_REVIEWER_TOKEN resolves to '$ACTING_AS', which is NOT in $POLICY available_reviewers:"
+            echo "::error::DEPENDABOT_REVIEWER_TOKEN resolves to '$ACTING_AS', which is NOT in $POLICY available_reviewers or dependabot_reviewer_identities:"
             printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
             echo "::error::Even if this identity has write access to the repo, an approval from it would fail the next weekly audit ('approval not from a recognized reviewer identity')."
             echo "::error::Replace the secret with a PAT for one of the listed reviewers."
@@ -720,11 +727,18 @@ jobs:
             echo "::error::$POLICY not found — cannot validate the merge identity against available_reviewers."
             exit 1
           fi
-          ALLOWED=$(awk '
-            /^available_reviewers:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^ *-/ {print}
-          ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          # available_reviewers plus the Dependabot-only approver identities
+          # (#2874). The second list is honoured on this lane only; every
+          # other approval check reads available_reviewers alone.
+          policy_list() {
+            awk -v key="$1" '
+              index($0, key ":") == 1 {in_block=1; next}
+              in_block && /^[^[:space:]#]/ {in_block=0}
+              in_block && /^ *-/ {print}
+            ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
+          }
+          ALLOWED=$(policy_list available_reviewers)
+          [ -z "$ALLOWED" ] || ALLOWED=$(printf '%s\n%s\n' "$ALLOWED" "$(policy_list dependabot_reviewer_identities)" | sed '/^$/d')
           if [ -z "$ALLOWED" ]; then
             echo "::error::$POLICY has no available_reviewers list; refusing to merge."
             exit 1
@@ -737,7 +751,7 @@ jobs:
           # split and producing the same mergedBy=reviewer attribution
           # the split is meant to fix.
           if printf '%s\n' "$ALLOWED" | grep -Fxq "$MERGE_AS"; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', which IS in $POLICY available_reviewers:"
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', which IS in $POLICY available_reviewers or dependabot_reviewer_identities:"
             printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
             echo "::error::AUTHOR_MERGE_TOKEN must be a PAT for the documented author identity (nathanjohnpayne), not a reviewer-identity bot account."
             exit 1
@@ -847,7 +861,7 @@ jobs:
               exit 0
             fi
             if [ -z "$APPROVED_BY" ] || ! printf '%s\n' "$ALLOWED" | grep -Fxq "$APPROVED_BY"; then
-              echo "::error::The approve job reported approver '$APPROVED_BY', which is not in $POLICY available_reviewers; refusing to merge."
+              echo "::error::The approve job reported approver '$APPROVED_BY', which is not in $POLICY available_reviewers or dependabot_reviewer_identities; refusing to merge."
               exit 1
             fi
             if ! base=$(gh pr view "$PR_URL" --json baseRefName --jq .baseRefName) || [ "$base" != "$DEFAULT_BRANCH" ]; then

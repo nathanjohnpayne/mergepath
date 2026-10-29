@@ -618,6 +618,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 5f–5i (#2874): dependabot_reviewer_identities is honoured on the
+# Dependabot arm only. An approval from a listed identity clears a
+# Dependabot PR; the general allow-list never includes it; a flow list,
+# which the block reader cannot parse, exits 2 instead of looking absent.
+# ---------------------------------------------------------------------------
+make_scratch_dependabot_ids() {  # <dependabot_reviewer_identities line(s), verbatim>
+  local dir
+  dir=$(make_scratch true false)
+  printf '\n%s\n' "$1" >>"$dir/.github/review-policy.yml"
+  echo "$dir"
+}
+DEPS_APPROVAL=$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-deps"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')
+
+echo; echo "--- Test 5f (#2874): Dependabot-only approver clears a Dependabot PR"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS" && echo "$OUT" | grep -q "nathanpayne-deps"; then
+  pass "#2874: listed Dependabot-only approver clears a Dependabot PR"
+else
+  fail "#2874: expected rc=0 PASS naming nathanpayne-deps; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5g (#2874): the same approval without the key still blocks"
+SCRATCH=$(make_scratch true false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "#2874: an unlisted identity's approval does not clear a Dependabot PR"
+else
+  fail "#2874: expected rc=1 BLOCKED; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5h (#2874): flow-list dependabot_reviewer_identities → exit 2"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities: [nathanpayne-deps]')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "dependabot_reviewer_identities"; then
+  pass "#2874: unparseable dependabot_reviewer_identities → exit 2 naming the key"
+else
+  fail "#2874: expected rc=2 naming the key; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5i (#2874): the general allow-list never includes the Dependabot-only identity"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+HELPERS="$ROOT/scripts/lib/reviewers-helpers.sh"
+POLICY_FILE="$SCRATCH/.github/review-policy.yml"
+# shellcheck source=/dev/null
+general=$( . "$HELPERS" && read_available_reviewers "$POLICY_FILE" )
+# shellcheck source=/dev/null
+lane=$( . "$HELPERS" && read_dependabot_approvers "$POLICY_FILE" )
+# shellcheck source=/dev/null
+if ! printf '%s\n' "$general" | grep -Fxq nathanpayne-deps \
+   && ! ( . "$HELPERS" && login_is_available_reviewer nathanpayne-deps "$POLICY_FILE" ) \
+   && printf '%s\n' "$lane" | grep -Fxq nathanpayne-deps \
+   && printf '%s\n' "$lane" | grep -Fxq nathanpayne-claude; then
+  pass "#2874: read_available_reviewers excludes it; read_dependabot_approvers is the union"
+else
+  fail "#2874: general='$(echo $general)' lane='$(echo $lane)'"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 6: External-review, gate disabled → exit 0.
 # ---------------------------------------------------------------------------
 echo; echo "--- Test 6: external-review, gate disabled"

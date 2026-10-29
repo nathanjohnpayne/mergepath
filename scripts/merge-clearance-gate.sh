@@ -1197,10 +1197,17 @@ if [ "$DEPENDABOT_LANE" = "true" ]; then
   # half-threaded state the #767 review flagged. Passed explicitly rather than
   # left to the helper's $CONFIG fallback, which would resolve to the
   # default-branch path and silently reintroduce that split.
-  REVIEWERS=$(read_available_reviewers "$POLICY_CONFIG")
-  if [ -z "$REVIEWERS" ]; then
+  if [ -z "$(read_available_reviewers "$POLICY_CONFIG")" ]; then
     die 2 "no available_reviewers found in $POLICY_CONFIG"
   fi
+  # #2874: this lane, and only this lane, also accepts the Dependabot-only
+  # approver identities. A flow list or scalar would parse to nothing; fail
+  # loudly rather than let a declared identity look absent.
+  if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
+     && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "dependabot_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line)."
+  fi
+  REVIEWERS=$(read_dependabot_approvers "$POLICY_CONFIG")
   REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 
   REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")

@@ -147,6 +147,7 @@ jobs:
             // the bot identity decision and #36 for the audit-side
             // allow-list change.
             let reviewerAccounts;
+            let dependabotReviewerAccounts;
             let authorIdentity;
             let codexBotLogin;
             let reactionFreshnessWindowSeconds;
@@ -154,6 +155,10 @@ jobs:
             try {
               const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
               reviewerAccounts = config.available_reviewers || [];
+              // #2874: Dependabot-only approvers count for Check 2's
+              // Dependabot rule and nowhere else.
+              dependabotReviewerAccounts = Array.isArray(config.dependabot_reviewer_identities)
+                ? config.dependabot_reviewer_identities : [];
               authorIdentity = config.author_identity || 'nathanjohnpayne';
               codexBotLogin = (config.codex && config.codex.bot_login) || 'chatgpt-codex-connector[bot]';
               reactionFreshnessWindowSeconds =
@@ -163,6 +168,7 @@ jobs:
             } catch (e) {
               console.log('WARNING: Could not read review-policy.yml, using defaults');
               reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+              dependabotReviewerAccounts = [];
               authorIdentity = 'nathanjohnpayne';
               codexBotLogin = 'chatgpt-codex-connector[bot]';
               reactionFreshnessWindowSeconds = 1800;
@@ -951,7 +957,12 @@ jobs:
                 // also carrying `needs-external-review` will trip
                 // both pushes on the same iteration. By design — the
                 // two pushes report independent policy conditions.
-                if (dependabotNeedsApproval && cliApprovedReviews.length === 0) {
+                const dependabotApprovedReviews = reviews.filter(
+                  r => r.state === 'APPROVED' &&
+                       (reviewerAccounts.includes(r.user.login) ||
+                        dependabotReviewerAccounts.includes(r.user.login))
+                );
+                if (dependabotNeedsApproval && dependabotApprovedReviews.length === 0) {
                   prViolations.push(
                     'Dependabot PR merged with no reviewer identity approval (auto-merge approval missing or removed)'
                   );
