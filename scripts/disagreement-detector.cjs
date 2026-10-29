@@ -122,4 +122,39 @@ function decide(input) {
   return hasLabel ? 'remove' : 'noop';
 }
 
-module.exports = { decide };
+// The detect-disagreement job's whole decision (#2727 3d), so the producer
+// step and the trusted consumer run one copy. `reviewersJson` is the governing
+// available_reviewers list as JSON. An unproven list (missing, malformed,
+// empty or without a usable name) must neither hide a live conflict nor clear
+// an escalation (#975): every reviewer on the PR is classified instead, and a
+// `remove` becomes `noop`. The caller fails its run when allowListProven is
+// false, so the policy failure is visible.
+//
+// Input:  { reviews, reviewersJson, headSha, hasLabel }
+// Output: { decision: 'apply' | 'remove' | 'noop', allowListProven: boolean }
+function resolveDisagreement(input) {
+  const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
+  let reviewerAccounts = [];
+  try {
+    const parsed = JSON.parse((input && input.reviewersJson) || '[]');
+    if (Array.isArray(parsed)) {
+      reviewerAccounts = parsed.filter(r => typeof r === 'string' && r);
+    }
+  } catch (e) {
+    reviewerAccounts = [];
+  }
+  const allowListProven = reviewerAccounts.length > 0;
+  if (!allowListProven) {
+    reviewerAccounts = [...new Set(reviews.map(r => r && r.user && r.user.login).filter(Boolean))];
+  }
+  let decision = decide({
+    reviews,
+    reviewerAccounts,
+    headSha: input && input.headSha,
+    hasLabel: input && input.hasLabel,
+  });
+  if (!allowListProven && decision === 'remove') decision = 'noop';
+  return { decision, allowListProven };
+}
+
+module.exports = { decide, resolveDisagreement };

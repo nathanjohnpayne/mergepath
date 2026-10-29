@@ -29,6 +29,7 @@ trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHO
 mkdir -p "$RENDER_FIXTURE/scripts/workflow" "$RENDER_FIXTURE/.github/workflows"
 cp "$DETECTOR" "$RENDER_FIXTURE/scripts/self-approval-detector.cjs"
 cp "$ROOT/scripts/workflow/approval-triage.cjs" "$RENDER_FIXTURE/scripts/workflow/approval-triage.cjs"
+cp "$ROOT/scripts/workflow/review-triage.cjs" "$RENDER_FIXTURE/scripts/workflow/review-triage.cjs"
 cp "$RENDERER" "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs"
 cp "$WORKFLOW" "$RENDER_FIXTURE/.github/workflows/agent-review.yml"
 RENDER_DETECTOR="$RENDER_FIXTURE/scripts/self-approval-detector.cjs" node <<'NODE'
@@ -1313,15 +1314,54 @@ async function productionStepCases() {
     THRESHOLD: '300', PROTECTED_PATHS: '[".github/**"]'});
   const allHelpers = ['git', 'resolve_base_policy.sh', 'load_review_config.sh',
     'external_review_fingerprint.sh', 'verify-live-propagation.sh', 'external_review_carryforward.sh'];
+  // #2727 3d: the step runs the default branch's review-triage.cjs, and its
+  // generated copy only where that module is absent. Two workspaces stand in
+  // for such default branches: one whose workflow predates the selection (the
+  // copy must run), and one whose workflow selects the module but lacks the
+  // file (the step must fail closed, before any read).
+  const workspace = name => {
+    const dir = fs.mkdtempSync(path.join(process.env.TRIAGE_STEP_TMP, `${name}-`));
+    fs.mkdirSync(path.join(dir, 'scripts/workflow'), {recursive: true});
+    fs.mkdirSync(path.join(dir, '.github/workflows'), {recursive: true});
+    fs.copyFileSync(path.join(root, 'scripts/workflow/approval-triage.cjs'),
+      path.join(dir, 'scripts/workflow/approval-triage.cjs'));
+    return dir;
+  };
+  const bootstrapWorkspace = workspace('bootstrap');
+  fs.writeFileSync(path.join(bootstrapWorkspace, '.github/workflows/agent-review.yml'),
+    source.replace(/const reviewTriagePath = path\.resolve\(/g, 'const legacyTriage = ('));
+  const brokenWorkspace = workspace('broken');
+  fs.copyFileSync(process.env.TRIAGE_WORKFLOW, path.join(brokenWorkspace, '.github/workflows/agent-review.yml'));
+  // A default-branch module that differs from the workflow's copy: the step
+  // must run it, with the step's require and mutate true.
+  const moduleWorkspace = workspace('module');
+  fs.copyFileSync(process.env.TRIAGE_WORKFLOW, path.join(moduleWorkspace, '.github/workflows/agent-review.yml'));
+  fs.writeFileSync(path.join(moduleWorkspace, 'scripts/workflow/review-triage.cjs'),
+    "module.exports = {evaluateReviewTriage: async ({core, require, mutate}) => " +
+    "core.setOutput('ran', `default-branch module, mutate=${mutate}, require=${typeof require}`)};\n");
+  const triageModule = require(path.join(root, 'scripts/workflow/review-triage.cjs'));
+  const classifyOnly = (github, context, core, require) =>
+    triageModule.evaluateReviewTriage({github, context, core, require, mutate: false});
   const scenarios = [
-    {name: 'socket closed once', labelFailures: [socketClosed], resolves: true, labelCalls: 2, needsExternal: 'true'},
+    {name: 'socket closed once', labelFailures: [socketClosed], resolves: true, labelCalls: 2, needsExternal: 'true',
+      addsLabel: 'true'},
     {name: 'approved review, socket closed once', event: 'pull_request_review', labelFailures: [socketClosed],
-      resolves: true, labelCalls: 2, needsExternal: 'true'},
+      resolves: true, labelCalls: 2, needsExternal: 'true', addsLabel: 'true'},
     {name: 'socket closed twice', labelFailures: [socketClosed, socketClosed], resolves: false, labelCalls: 2},
     {name: 'forbidden', labelFailures: [() => httpError(403)], resolves: false, labelCalls: 1},
-    {name: 'carried forward', carried: true, labelFailures: [], resolves: true, labelCalls: 0, needsExternal: 'false'},
+    {name: 'carried forward', carried: true, labelFailures: [], resolves: true, labelCalls: 0, needsExternal: 'false',
+      addsLabel: 'false'},
+    {name: 'generated copy where the module is not on the default branch', workspace: bootstrapWorkspace,
+      labelFailures: [], resolves: true, labelCalls: 1, needsExternal: 'true', addsLabel: 'true'},
+    {name: 'classify only (mutate false) decides the label without writing it', run: classifyOnly,
+      labelFailures: [], resolves: true, labelCalls: 0, needsExternal: 'true', addsLabel: 'true'},
+    {name: 'the default branch module runs instead of the copy', workspace: moduleWorkspace, labelFailures: [],
+      resolves: true, labelCalls: 0, ran: 'default-branch module, mutate=true, require=function'},
+    {name: 'module missing where the default branch selects it', workspace: brokenWorkspace,
+      labelFailures: [], resolves: false, labelCalls: 0, rejects: /requires the missing scripts\/workflow\/review-triage\.cjs/},
   ];
   for (const scenario of scenarios) {
+    process.env.GITHUB_WORKSPACE = scenario.workspace || root;
     const record = {sync: 0, helpers: [], verifierInput: null, labelCalls: 0};
     const outputs = {}; const warnings = [];
     const childProcess = {
@@ -1380,13 +1420,25 @@ async function productionStepCases() {
     console.log = () => {};
     let rejection = null;
     try {
-      await triage(github, context, core, fakeRequire);
+      await (scenario.run || triage)(github, context, core, fakeRequire);
     } catch (error) {
       rejection = error;
     } finally {
       console.log = log;
     }
     assert.equal(rejection === null, scenario.resolves, `${scenario.name}: ${rejection && rejection.message}`);
+    if (scenario.ran) {
+      assert.deepEqual(outputs, {ran: scenario.ran}, scenario.name);
+      assert.deepEqual(record.helpers, [], `${scenario.name}: the copy ran`);
+      continue;
+    }
+    if (scenario.rejects) {
+      assert.match(rejection.message, scenario.rejects, scenario.name);
+      assert.deepEqual(record.helpers, [], `${scenario.name}: no helper may run before the refusal`);
+      assert.equal(record.labelCalls, 0, scenario.name);
+      assert.deepEqual(outputs, {}, `${scenario.name}: a refusal must not export a result`);
+      continue;
+    }
     assert.equal(record.sync, 0, `${scenario.name}: triage called execFileSync`);
     assert.deepEqual(record.helpers, allHelpers, `${scenario.name}: every helper must run through execFile`);
     assert.equal(JSON.parse(record.verifierInput).number, 2178, `${scenario.name}: verifier input`);
@@ -1397,6 +1449,7 @@ async function productionStepCases() {
       assert.equal(outputs.needs_external, scenario.needsExternal, scenario.name);
       assert.equal(outputs.phase_4_intrinsic_required, 'true', scenario.name);
       assert.equal(outputs.reviewers, '["nathanpayne-claude","nathanpayne-codex"]', scenario.name);
+      assert.equal(outputs.adds_external_label, scenario.addsLabel, scenario.name);
     } else {
       assert.equal(outputs.needs_external, undefined, `${scenario.name}: a failed label write must not export a result`);
     }

@@ -1016,6 +1016,15 @@ paths:
     # source. Generated workflow mirrors allow only the first atomic rollout.
     type: canonical
     consumers: all
+  - path: scripts/workflow/review-triage.cjs
+    # The triage job's decision (#2727 3d): the job runs this default-branch
+    # module, and the renderer mirrors it into agent-review.yml for the first
+    # rollout. Its two nested mirrors come from the modules below.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/approval-triage.cjs"
+      - "scripts/self-approval-detector.cjs"
   - path: scripts/self-approval-detector.cjs
     # Runtime dependency of .github/workflows/agent-review.yml's
     # block-self-approval job and the shared final approval continuation. It
@@ -1032,6 +1041,7 @@ paths:
     requires:
       - "scripts/self-approval-detector.cjs"
       - "scripts/workflow/approval-triage.cjs"
+      - "scripts/workflow/review-triage.cjs"
       - ".github/workflows/agent-review.yml"
   - path: scripts/resolve-pr-threads.sh
     type: canonical
@@ -1806,11 +1816,17 @@ paths:
   - path: tests/test_disagreement_detector.sh
     type: canonical
     consumers: all
+    # #2727 3d: it runs the workflow's detect-disagreement step against the
+    # module, so it reads both at run time.
+    requires:
+      - "scripts/disagreement-detector.cjs"
+      - ".github/workflows/agent-review.yml"
   - path: tests/test_self_approval_detector.sh
     type: canonical
     consumers: all
     requires:
       - "scripts/workflow/approval-triage.cjs"
+      - "scripts/workflow/review-triage.cjs"
       - "scripts/self-approval-detector.cjs"
       - ".github/workflows/agent-review.yml"
   # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
@@ -2273,6 +2289,7 @@ paths:
     # consumer's load-config step.
     requires:
       - "scripts/workflow/approval-triage.cjs"
+      - "scripts/workflow/review-triage.cjs"
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/disagreement-detector.cjs"

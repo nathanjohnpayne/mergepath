@@ -14,10 +14,16 @@ const labelSourceBegin = '// BEGIN STABLE PR LABEL NAMES';
 const labelSourceEnd = '// END STABLE PR LABEL NAMES';
 const targetBegin = '            // BEGIN SELF-APPROVAL BOOTSTRAP';
 const targetEnd = '            // END SELF-APPROVAL BOOTSTRAP';
-const labelTargetBegin =
-  '            // BEGIN STABLE PR LABEL NAMES BOOTSTRAP';
-const labelTargetEnd =
-  '            // END STABLE PR LABEL NAMES BOOTSTRAP';
+const labelTargetBegin = '// BEGIN STABLE PR LABEL NAMES BOOTSTRAP';
+const labelTargetEnd = '// END STABLE PR LABEL NAMES BOOTSTRAP';
+// The triage decision is a module (#2727 3d). Its two nested mirrors are
+// rendered into the module, and the whole implementation is then mirrored
+// into the workflow, so the workflow's nested copies stay current through it.
+const triagePath = path.join(root, 'scripts/workflow/review-triage.cjs');
+const triageSourceBegin = '// BEGIN REVIEW TRIAGE IMPLEMENTATION';
+const triageSourceEnd = '// END REVIEW TRIAGE IMPLEMENTATION';
+const triageTargetBegin = '            // BEGIN REVIEW TRIAGE BOOTSTRAP';
+const triageTargetEnd = '            // END REVIEW TRIAGE BOOTSTRAP';
 
 function fail(message) {
   process.stderr.write(`render-self-approval-bootstrap: ${message}\n`);
@@ -74,31 +80,48 @@ const generated = [
 ].join('\n');
 const labelGenerated = [
   labelTargetBegin,
-  '            // Generated from scripts/self-approval-detector.cjs. Do not edit.',
-  ...labelImplementation.split(/\r?\n/).map(
-    line => (line ? `            ${line}` : ''),
-  ),
+  '// Generated from scripts/self-approval-detector.cjs. Do not edit.',
+  ...labelImplementation.split(/\r?\n/),
   labelTargetEnd,
 ].join('\n');
 const approvalPath = path.join(root, 'scripts/workflow/approval-triage.cjs');
 const approvalImplementation = between(fs.readFileSync(approvalPath, 'utf8'),
   '// BEGIN APPROVAL TRIAGE IMPLEMENTATION', '// END APPROVAL TRIAGE IMPLEMENTATION', approvalPath);
-const approvalBlocks = ['TRIAGE READ BOOTSTRAP', 'APPROVAL TRIAGE BOOTSTRAP'].map(label => {
-  const begin = `            // BEGIN ${label}`;
-  const end = `            // END ${label}`;
-  const current = markedBlock(workflow, begin, end, workflowPath);
+function approvalBlock(text, label, indent, file) {
+  const begin = `${indent}// BEGIN ${label}`;
+  const end = `${indent}// END ${label}`;
+  const current = markedBlock(text, begin, end, file);
   const generated = [begin,
-    '            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.',
-    '            function bootstrapApprovalTriage() {',
-    ...approvalImplementation.split(/\r?\n/).map(line => line ? `              ${line}` : ''),
-    '              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};',
-    '            }', end].join('\n');
+    `${indent}// Generated from scripts/workflow/approval-triage.cjs. Do not edit.`,
+    `${indent}function bootstrapApprovalTriage() {`,
+    ...approvalImplementation.split(/\r?\n/).map(line => line ? `${indent}  ${line}` : ''),
+    `${indent}  return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};`,
+    `${indent}}`, end].join('\n');
   return {current, generated};
-});
+}
+const triage = fs.readFileSync(triagePath, 'utf8');
+const triageBlocks = [
+  approvalBlock(triage, 'TRIAGE READ BOOTSTRAP', '', triagePath),
+  {current: markedBlock(triage, labelTargetBegin, labelTargetEnd, triagePath), generated: labelGenerated},
+];
+let renderedTriage = triage;
+for (const block of triageBlocks) {
+  renderedTriage = renderedTriage.replace(block.current, () => block.generated);
+}
+const triageImplementation = between(renderedTriage, triageSourceBegin, triageSourceEnd, triagePath);
+const triageGenerated = [
+  triageTargetBegin,
+  '            // Generated from scripts/workflow/review-triage.cjs. Do not edit.',
+  ...triageImplementation.split(/\r?\n/).map(line => (line ? `            ${line}` : '')),
+  triageTargetEnd,
+].join('\n');
+const approvalBlocks = [
+  approvalBlock(workflow, 'APPROVAL TRIAGE BOOTSTRAP', '            ', workflowPath),
+  {current: markedBlock(workflow, triageTargetBegin, triageTargetEnd, workflowPath), generated: triageGenerated},
+];
 const current = markedBlock(workflow, targetBegin, targetEnd, workflowPath);
-const labelCurrent = markedBlock(workflow, labelTargetBegin, labelTargetEnd, workflowPath);
 
-if (current === generated && labelCurrent === labelGenerated &&
+if (current === generated && triageBlocks.every(block => block.current === block.generated) &&
     approvalBlocks.every(block => block.current === block.generated)) {
   process.stdout.write(
     'render-self-approval-bootstrap: PASS (generated mirrors are current)\n',
@@ -110,14 +133,18 @@ if (mode === '--check') {
   fail('generated workflow bootstrap is stale; run scripts/render-self-approval-bootstrap.cjs --write');
 }
 
-let updated = workflow
-  .replace(current, () => generated)
-  .replace(labelCurrent, () => labelGenerated);
+let updated = workflow.replace(current, () => generated);
 for (const block of approvalBlocks) {
   updated = updated.replace(block.current, () => block.generated);
 }
-if (updated === workflow) {
-  fail('could not replace the workflow bootstrap blocks');
+if (updated === workflow && renderedTriage === triage) {
+  fail('could not replace the generated bootstrap blocks');
 }
-fs.writeFileSync(workflowPath, updated);
-process.stdout.write('render-self-approval-bootstrap: updated .github/workflows/agent-review.yml\n');
+if (renderedTriage !== triage) {
+  fs.writeFileSync(triagePath, renderedTriage);
+  process.stdout.write('render-self-approval-bootstrap: updated scripts/workflow/review-triage.cjs\n');
+}
+if (updated !== workflow) {
+  fs.writeFileSync(workflowPath, updated);
+  process.stdout.write('render-self-approval-bootstrap: updated .github/workflows/agent-review.yml\n');
+}
