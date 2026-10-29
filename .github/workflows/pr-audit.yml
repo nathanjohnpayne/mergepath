@@ -957,10 +957,50 @@ jobs:
                 // also carrying `needs-external-review` will trip
                 // both pushes on the same iteration. By design — the
                 // two pushes report independent policy conditions.
+                // #2874: a Dependabot-only approver counts only when the
+                // merged PR passes the same commit-provenance rule as the
+                // gate's Dependabot arm (scripts/lib/dependabot-commit-
+                // provenance.sh): every listed commit authored by
+                // dependabot[bot], committed by web-flow or dependabot[bot]
+                // and signature-verified, the head among them, under the
+                // endpoint's 250-commit ceiling. Opened-by-Dependabot alone
+                // is not proof. An unreadable list fails closed.
+                let dependabotLaneVerified = false;
+                const hasDependabotOnlyApproval = dependabotNeedsApproval &&
+                  reviews.some(r => r.state === 'APPROVED' &&
+                                    dependabotReviewerAccounts.includes(r.user.login));
+                if (hasDependabotOnlyApproval) {
+                  try {
+                    const prCommits = await auditPaginate(
+                      github.rest.pulls.listCommits,
+                      {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: pr.number,
+                        per_page: 100,
+                      }
+                    );
+                    const mergedHead = pr.head && pr.head.sha;
+                    dependabotLaneVerified =
+                      prCommits.length > 0 && prCommits.length < 250 &&
+                      prCommits.some(c => c.sha === mergedHead) &&
+                      prCommits.every(c =>
+                        c.author && c.author.login === 'dependabot[bot]' &&
+                        c.committer && ['web-flow', 'dependabot[bot]'].includes(c.committer.login) &&
+                        c.commit && c.commit.verification && c.commit.verification.verified === true);
+                  } catch (e) {
+                    if (e && e.code === 'AUDIT_DEADLINE') throw e;
+                    console.log(
+                      `WARNING: could not read commits for PR #${pr.number}; ` +
+                      `not counting Dependabot-only approvers for safety. Error: ${e.message}`
+                    );
+                  }
+                }
                 const dependabotApprovedReviews = reviews.filter(
                   r => r.state === 'APPROVED' &&
                        (reviewerAccounts.includes(r.user.login) ||
-                        dependabotReviewerAccounts.includes(r.user.login))
+                        (dependabotLaneVerified &&
+                         dependabotReviewerAccounts.includes(r.user.login)))
                 );
                 if (dependabotNeedsApproval && dependabotApprovedReviews.length === 0) {
                   prViolations.push(
