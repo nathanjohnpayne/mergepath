@@ -140,7 +140,7 @@ function resolveDisagreement(input) {
     if (Array.isArray(parsed)) {
       reviewerAccounts = parsed.filter(r => typeof r === 'string' && r);
     }
-  } catch (e) {
+  } catch {
     reviewerAccounts = [];
   }
   const allowListProven = reviewerAccounts.length > 0;

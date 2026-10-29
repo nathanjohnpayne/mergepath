@@ -21,8 +21,10 @@
 //   core     setOutput, warning, notice
 //   require  the caller's require; tests inject child_process through it
 //   mutate   false decides without writing (the consumer's classify job)
-//   env      THRESHOLD, PROTECTED_PATHS, GITHUB_WORKSPACE; the cwd is the
-//            trusted checkout, whose scripts/workflow helpers it runs
+//   env      GITHUB_WORKSPACE (passed through to the helpers); the cwd is
+//            the trusted checkout, whose scripts/workflow helpers it runs.
+//            Threshold and protected paths come from the governing base
+//            policy through external_review_fingerprint.sh, not the env.
 // Outputs (core.setOutput): needs_external, phase_4_required,
 //   phase_4_intrinsic_required, classified_head, classified_base_ref,
 //   classified_base_sha, reviewers, author_identity, adds_external_label.
@@ -168,7 +170,7 @@ function parseReviewerList(raw, label) {
   try {
     reviewers = JSON.parse(raw || '[]');
   } catch (error) {
-    throw new Error(`${label} reviewer allow-list is malformed`);
+    throw new Error(`${label} reviewer allow-list is malformed`, {cause: error});
   }
   if (
     !Array.isArray(reviewers) ||
@@ -284,11 +286,18 @@ async function loadGoverningIdentities(pr, policyConfigPath) {
     }
     return {reviewers, authorIdentity};
   } finally {
-    try {
-      fs.unlinkSync(outputPath);
-    } catch (error) {
-      if (error && error.code !== 'ENOENT') throw error;
-    }
+    removeOutputFile(outputPath);
+  }
+}
+
+// A cleanup failure other than ENOENT still surfaces from the finally block
+// above, exactly as the inline throw it replaces did; the helper only keeps
+// the throw out of the finally clause itself (no-unsafe-finally).
+function removeOutputFile(outputPath) {
+  try {
+    fs.unlinkSync(outputPath);
+  } catch (error) {
+    if (error && error.code !== 'ENOENT') throw error;
   }
 }
 const eventPr = context.payload.pull_request;
@@ -317,16 +326,11 @@ const isForceOnLabelEvent =
   context.eventName === 'pull_request' &&
   context.payload.action === 'labeled' &&
   eventLabelName === 'needs-external-review';
-const isUnlabeledSettleEvent =
-  context.eventName === 'pull_request' &&
-  context.payload.action === 'unlabeled';
 const mayMutateLabels = triageMayMutateLabels({
   eventName: context.eventName,
   action: context.payload.action,
   labelName: eventLabelName,
 });
-const threshold = parseInt(process.env.THRESHOLD, 10);
-const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
 const files = await retryGithubRead(() => github.paginate(
   github.rest.pulls.listFiles,
@@ -428,43 +432,12 @@ if (!policyReadFailed) {
   }
 }
 
-// Exclude lockfiles, minified, and generated files from line count
-// to match REVIEW_POLICY.md threshold definition
-const excludePatterns = [
-  /\.lock$/, /lock\.json$/, /\.min\.js$/, /\.min\.css$/,
-  /\.generated\./, /\.g\.dart$/, /\.freezed\.dart$/,
-];
-const countedFiles = files.filter(
-  f => !excludePatterns.some(p => p.test(f.filename))
-);
-const totalChanges = countedFiles.reduce(
-  (sum, f) => sum + f.additions + f.deletions, 0
-);
-
-// Convert glob patterns to regex for matching
-function globToRegex(pattern) {
-  let re = pattern
-    .replace(/\./g, '\\.')
-    .replace(/\*\*/g, '___GLOBSTAR___')
-    .replace(/\*/g, '[^/]*')
-    .replace(/___GLOBSTAR___/g, '.*');
-  return new RegExp('^' + re + '$');
-}
-
-// Both sides of a rename (#763): GitHub reports the destination in
-// .filename and the source in .previous_filename, so matching only
-// .filename would let a PR move a protected file to an unprotected
-// path without tripping this. Same fix as
-// external_review_fingerprint.sh, applied to this inline twin.
-const touchesProtected = files.some(f =>
-  [f.filename, f.previous_filename]
-    .filter(Boolean)
-    .some(name => protectedPaths.some(p => globToRegex(p).test(name)))
-);
-
-// Use >= to match REVIEW_POLICY.md definition
-let needsExternal = totalChanges >= threshold || touchesProtected;
-let externalReviewFingerprint = '';
+// Threshold and protected-path requiredness (rename sources included, #763)
+// come only from scripts/workflow/external_review_fingerprint.sh, judged by
+// the governing base policy. Every branch below assigns both values; the
+// former inline threshold/glob twin was always overwritten and is gone.
+let needsExternal;
+let externalReviewFingerprint;
 let filesPath = '';
 const repo = `${context.repo.owner}/${context.repo.repo}`;
 if (policyReadFailed) {
