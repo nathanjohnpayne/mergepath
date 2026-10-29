@@ -198,9 +198,15 @@ case "$*" in
     else
       printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}"
     fi ;;
-  *"/commits/"*)
-    [ "${FAKE_COMMIT_READ_EXIT:-0}" = 0 ] || exit "$FAKE_COMMIT_READ_EXIT"
-    printf '%s\n' "${FAKE_HEAD_COMMITTED:-2026-10-29T11:00:00Z}" ;;
+  *"/timeline"*)
+    # head_ref_force_pushed events at FAKE_FORCE_PUSHES (space-separated).
+    [ "${FAKE_TIMELINE_EXIT:-0}" = 0 ] || exit "$FAKE_TIMELINE_EXIT"
+    jq -nc --arg t "${FAKE_FORCE_PUSHES:-}" \
+      '[[ $t | split(" ")[] | select(. != "") | {event:"head_ref_force_pushed",created_at:.} ]]' ;;
+  *"/pulls/"*)
+    # GitHub's clock for when the PR was opened. The pusher-set committer
+    # date is never read (no /commits/ route here).
+    printf '%s\n' "${FAKE_PR_CREATED:-2026-10-29T11:00:00Z}" ;;
   *) exit 1 ;;
 esac
 FAKE
@@ -1457,13 +1463,22 @@ FAKE_CODEX_CHECK_EXIT=0 FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
 [ ! -e "$CAPTURE/codex-check" ] \
   && pass "#2771: with an outstanding request the rc-0 shortcut is never consulted" \
   || fail "#2771: the signal check ran despite an outstanding request"
-# Codex on #2875: a request older than the head's commit belongs to an
-# earlier canary head, so it is not bound; a fresh request is sent and bound.
-FAKE_HEAD_COMMITTED=2026-10-29T13:00:00Z FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
+# Codex on #2875: a request before the head's last transition (here a
+# force-push, by GitHub's clock) belongs to an earlier canary head, so it is
+# not bound; a fresh request is sent and bound.
+FAKE_FORCE_PUSHES=2026-10-29T13:00:00Z FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
 FAKE_CANARY_COMMENTS_AFTER="[[$(_author_req 501),$(jq -nc '{id:9003,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-10-29T13:05:00Z"}')]]" \
   _bind_case "a request from an earlier head is not bound; a fresh one is sent and bound" 4 1 9003 --base "$C1" --head-sha "$C2"
-FAKE_COMMIT_READ_EXIT=1 \
-  _bind_case "an unreadable head commit time fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_TIMELINE_EXIT=1 \
+  _bind_case "an unreadable head-transition timeline fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_PR_CREATED=yesterday \
+  _bind_case "a malformed PR creation time fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+# Phase 4b on #2875: freshness never reads the pusher-set committer date, so a
+# future-dated head cannot discard the audit's real request. Only GitHub's
+# clock is consulted: a request after the PR opened and after the last
+# force-push stays bound even when the rc-0 shortcut would otherwise apply.
+FAKE_CODEX_CHECK_EXIT=0 FAKE_FORCE_PUSHES="2026-10-29T11:30:00Z" FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
+  _bind_case "only GitHub's clock decides freshness: the audit's request after the last force-push stays bound" 4 0 501 --base "$C1" --head-sha "$C2"
 WAVE_AUDIT_TEST_CANARY_HEAD=not-a-sha \
   _bind_case "no verified canary head fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CODEX_CHECK_EXIT=3 \

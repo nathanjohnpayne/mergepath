@@ -6266,7 +6266,7 @@ _wb_sum() { # <json-status> <cell-word> <trigger> <run-time> [commit]
 _WB_R="$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z)"
 _wb_case() { # <label> <want-state> <comments-json> [binding-fn]
   local got
-  got="$(${4:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 | jq -r .state)"
+  got="$(${4:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 1800 | jq -r .state)"
   [ "$got" = "$2" ] || bad="$bad [$1: want $2 got $got]"
 }
 # The windows, as fixtures (label|want|comments).
@@ -6279,7 +6279,11 @@ _wb_fixtures() {
     w2-manual-run-completed-before-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T11:59:00Z)]" \
     w2-manual-run-same-second-as-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:00:00.900Z)]" \
     w3-unsolicited-appears-after-snapshot hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:00:30Z)]" \
-    w4-superseded-by-newer-author-request clear "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-superseded-by-newer-author-request hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-overlap-501-running-502-queued hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:03:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:04:00Z)]" \
+    w4-foreign-manual-run-before-request-finishes-after hold "[$(_wb_req 600 someone 2026-10-29T11:50:00Z),$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-foreign-request-same-second-as-bound hold "[$_WB_R,$(_wb_req 602 someone 2026-10-29T12:00:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-earlier-author-request-outside-window clear "[$(_wb_req 400 nathanjohnpayne 2026-10-29T10:00:00Z),$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
     w4-superseded-after-the-run-completed hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z),$(_wb_req 502 nathanjohnpayne 2026-10-29T12:06:00Z)]" \
     w4-foreign-trigger-after-request hold "[$_WB_R,$(_wb_req 600 someone 2026-10-29T12:01:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
     w4-author-prose-mention-after-request hold "[$_WB_R,$(_wb_req 601 nathanjohnpayne 2026-10-29T12:01:00Z 'please @codex review again'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
@@ -6311,16 +6315,18 @@ _wb_mutant() { # <label> <python-replace-old> <python-replace-new> <window-that-
     eval "${m/p4b_wave_codex_binding_eval()/_wb_mutant_eval()}"
     _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c; do
       [ "$l" = "$4" ] || continue
-      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 | jq -r .state
+      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 1800 | jq -r .state
     done)"
   [ "$got" = clear ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
 }
 _wb_mutant trigger '!= "manual request"' '== "never"' w1-that-review-completes-after-request
-_wb_mutant run-time 'elif $run <= $t then' 'elif false then' w2-manual-run-completed-before-request
+_wb_mutant run-time 'elif $run <= $rt then' 'elif false then' w2-manual-run-completed-before-request
 _wb_mutant status 'elif ($sj.code_review.status // "") != "completed"' 'elif false' w2-our-run-running
-_wb_mutant foreign 'elif ($foreign | length) > 0 then' 'elif false then' w4-foreign-trigger-after-request
+_wb_mutant other-request 'elif ($others | length) > 0 then' 'elif false then' w4-foreign-trigger-after-request
+_wb_mutant window-start '$c >= ($rt - $w)' '$c > $rt' w4-foreign-manual-run-before-request-finishes-after
+_wb_mutant same-second-tie '$c >= ($rt - $w)' '$c > ($rt - $w) and $c != $rt' w4-foreign-request-same-second-as-bound
 _wb_mutant commit 'elif $jc != $h then' 'elif false then' other-commit
-_wb_mutant latest-request '| max // $rt) as $t' '| $rt) as $t' w4-superseded-after-the-run-completed
+_wb_mutant supersede '$c >= ($rt - $w)' '$c >= ($rt - $w) and ((.user.login // "") != $author)' w4-superseded-after-the-run-completed
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens.
@@ -6337,8 +6343,9 @@ out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
   P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
-[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.codex == "reported" and .codex_evidence == "wave-request-answered"' >/dev/null \
-  || bad="$bad [bound-answer-not-open:$rc]"
+[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.codex == "reported" and .codex_evidence == "wave-request-answered"
+    and .request_budget.request_generation == [501]' >/dev/null \
+  || bad="$bad [bound-answer-not-open-or-no-generation:$rc:$(printf '%s' "$out" | jq -c .request_budget 2>/dev/null)]"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=777 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
   _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?

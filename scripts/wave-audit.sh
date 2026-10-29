@@ -245,6 +245,25 @@ canary_author_requests() {
   printf '%s\n' "$requests"
 }
 
+# canary_head_transition — the time of the canary head's last transition by
+# GitHub's clock: the later of the PR's creation and its latest
+# head_ref_force_pushed event. Unreadable or malformed evidence fails closed.
+canary_head_transition() {
+  local created timeline
+  created="$("$WA_GH" api "repos/$REPO/pulls/$PR" --jq '.created_at' 2>/dev/null)" \
+    || die 3 "cannot read when ${REPO}#${PR} was opened (#2771)"
+  timeline="$("$WA_GH" api --paginate --slurp "repos/$REPO/issues/$PR/timeline" 2>/dev/null \
+    | jq -ce 'if type == "array" then (add // []) else error("shape") end' 2>/dev/null)" \
+    || die 3 "cannot read the ${REPO}#${PR} timeline for head transitions (#2771)"
+  jq -nr --arg created "$created" --argjson t "$timeline" '
+    def stamp: test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+    if ($created | stamp | not) then error("created")
+    else ([$created] + [ $t[] | select(.event == "head_ref_force_pushed") | .created_at ]) as $all
+      | if all($all[]; type == "string" and stamp) then ($all | max) else error("event") end
+    end' 2>/dev/null \
+    || die 3 "unreadable head-transition evidence on ${REPO}#${PR} (#2771)"
+}
+
 # bind_canary_codex_review — #2771. Sets WAVE_CODEX_BOUND to the request
 # comment the barrier must see answered, or leaves it empty when the barrier
 # keeps its unbound behaviour. See the header.
@@ -252,15 +271,18 @@ canary_author_requests() {
 # Order matters (Codex on #2875). An outstanding author request for this head
 # is bound FIRST, before the rc-0 shortcut: a rerun after an unsolicited App
 # review completed must still wait for the audit's own request, not open on
-# that review. "For this head" means created at or after the head's committer
-# time; an older request belongs to an earlier canary head and is not bound,
-# so a fresh one is sent. That time is pusher-controlled, and both directions
-# fail safe: a future-dated head only sends another (counted) request, and a
-# backdated one can only bind an older request the barrier will not see
-# answered on this head, which holds into the fail-open exit 4.
+# that review. "For this head" means created at or after the head's last
+# transition, read from GitHub's own clock: the PR's creation and any
+# head_ref_force_pushed event. The pusher-set committer date is never used: a
+# future-dated head discarded the audit's real request and dispatched unbound
+# (Phase 4b on #2875). A request before the last transition belongs to an
+# earlier canary head, so a fresh one is sent. A fast-forward push leaves no
+# server-timed event; it can only make an older request look fresh, which the
+# barrier will not see answered on this head, so it holds into the fail-open
+# exit 4 rather than clearing.
 WAVE_CODEX_BOUND=""
 bind_canary_codex_review() {
-  local check_rc=0 rc=0 head committed before after new out posted fresh
+  local check_rc=0 rc=0 head transition before after new out posted fresh
   # shellcheck source=lib/codex-request-evidence.sh
   . "$ROOT/scripts/lib/codex-request-evidence.sh" \
     || die 3 "cannot load the Codex request-evidence library"
@@ -272,13 +294,10 @@ bind_canary_codex_review() {
   fi
   [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] \
     || die 3 "no verified canary head for ${REPO}#${PR} to bind a Codex request to (#2771)"
-  committed="$("$WA_GH" api "repos/$REPO/commits/$head" --jq '.commit.committer.date' 2>/dev/null)" \
-    || die 3 "cannot read the canary head commit time on ${REPO}#${PR} (#2771)"
-  [[ "$committed" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
-    || die 3 "unreadable canary head commit time '$committed' on ${REPO}#${PR} (#2771)"
+  transition="$(canary_head_transition)" || exit "$?"
   # die inside a command substitution exits only the subshell; carry it out.
   before="$(canary_author_requests)" || exit "$?"
-  fresh="$(printf '%s' "$before" | jq -r --arg c "$committed" '[.[] | select(.created_at >= $c) | .id] | max // empty')"
+  fresh="$(printf '%s' "$before" | jq -r --arg c "$transition" '[.[] | select(.created_at >= $c) | .id] | max // empty')"
   if [ -n "$fresh" ]; then
     WAVE_CODEX_BOUND="$fresh"
     log "binding the barrier to the existing Codex request $WAVE_CODEX_BOUND for the ${REPO}#${PR} head (#2771)"

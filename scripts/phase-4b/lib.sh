@@ -2129,8 +2129,11 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 # this library resets it so an inherited environment value is ignored.
 P4B_BARRIER_WAVE_CODEX_REQUEST=""
 
-# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id>
-# Pure. Prints {state, reason}: state is "clear", "hold" or "unreadable".
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> [<window-seconds>]
+# Pure. Prints {state, reason, generation}: state is "clear", "hold" or
+# "unreadable"; generation is the author request generation the decision was
+# made on (crqe_trigger_generation's grammar), so a clear can hand that exact
+# snapshot to the run's later request-generation fences.
 #
 # The evidence that names a run is Codex's Review Summary: one bot comment,
 # edited in place, carrying `codex-review-state:v1` JSON (full commit sha and
@@ -2139,19 +2142,29 @@ P4B_BARRIER_WAVE_CODEX_REQUEST=""
 # whose status cell stamps the run time. Codex writes both; the pusher
 # cannot.
 #
-#   clear       the bound request R is the author's exact request, and the
+#   clear       the bound request R is the author's exact request; NO other
+#               non-bot comment mentioning Codex's handle exists from
+#               <window-seconds> before R onward (ties included); and the
 #               LATEST summary is a Completed "Manual request" run on exactly
-#               <head> whose run time is strictly after R and after every
-#               later author request (one that supersedes R must itself be
-#               answered), and no other
-#               comment mentioning Codex's handle appeared after R (a foreign
-#               or ambiguous trigger means the manual run cannot be tied to
-#               R). A newer author request that supersedes R clears on the
-#               same rule; the request-generation fence then sees it.
-#   hold        anything short of that: no summary, another commit, Running /
-#               Failed / Canceled / unknown, an automatic trigger, a run that
-#               predates R, or a foreign mention. The barrier's budget then
-#               ends in the existing fail-open exit 4.
+#               <head> whose run time is strictly after R.
+#
+# Why the window and not a timestamp race (Phase 4b on #2875). Codex's
+# outputs name no request: the verdict and review do not reference the
+# trigger, and its eyes reaction is removed when a run ends. A completion time
+# therefore cannot say which request started a run. A run that answers a
+# different request (an overlapping author request, a foreign request, or an
+# earlier manual run still in flight when R was posted) is excluded only by
+# requiring that no such request exists near R. The window is
+# codex.review_timeout_seconds (default 1800): a run older than that is one
+# the requester itself treats as timed out. A superseding request therefore
+# holds, as does a same-second foreign request; the barrier waits for ours or
+# times out, as designed.
+#
+#   hold        anything short of that, including no summary, another
+#               commit, Running / Failed / Canceled / unknown, an automatic
+#               trigger, a run that predates R, or any other request near R.
+#               The barrier's budget then ends in the existing fail-open
+#               exit 4.
 #   unreadable  R missing, not the author's or not an exact request; the
 #               latest summary's state JSON or row does not parse; the JSON
 #               and the row disagree on the commit. Fail closed.
@@ -2168,28 +2181,26 @@ p4b_wave_codex_binding_state() {
 
 p4b_wave_codex_binding_eval() {
   printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
-    --arg head "${4:-}" --arg rid "${5:-}" '
+    --arg head "${4:-}" --arg rid "${5:-}" --argjson w "${6:-1800}" '
     def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
     def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
     ($head | ascii_downcase) as $h
     | if type != "array" then {state: "unreadable", reason: "comments-not-array"} else
-      ([ .[] | select((.id | tostring) == $rid) ] | first) as $r
+      . as $comments
+      | ([ .[] | select((.id | tostring) == $rid) ] | first) as $r
       | if $r == null then {state: "unreadable", reason: "bound-request-missing"}
         elif ($r | exact_request | not) then {state: "unreadable", reason: "bound-request-not-author-request"}
         elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
         else
           ($r.created_at | secs) as $rt
-          # The run must answer the LATEST author request at or after R: a
-          # request that supersedes R after a run completed is unanswered,
-          # and clearing then would approve ahead of it (Codex on #2875).
-          | ([ .[] | select(exact_request) | (.created_at // "" | secs)
-               | select(. != null and . >= $rt) ] | max // $rt) as $t
-          | [ .[] | select((.id | tostring) != $rid)
+          | ([ $comments[] | select(exact_request) | .id ] | unique) as $generation
+          # Any other request near R, ties included, may be the one a
+          # completed run answered.
+          | [ $comments[] | select((.id | tostring) != $rid)
               | select((.user.login // "") != $bot)
-              | select(exact_request | not)
-              | select(((.created_at // "") | secs) as $c | $c != null and $c > $rt)
-              | select((.body // "") | test("@codex"; "i")) ] as $foreign
-          | [ .[] | select((.user.login // "") == $bot)
+              | select(((.created_at // "") | secs) as $c | $c == null or $c >= ($rt - $w))
+              | select((.body // "") | test("@codex"; "i")) ] as $others
+          | [ $comments[] | select((.user.login // "") == $bot)
               | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->")) ]
             as $marked
           | if ($marked | length) == 0 then {state: "hold", reason: "no-summary"}
@@ -2215,9 +2226,9 @@ p4b_wave_codex_binding_eval() {
                     else
                       (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) as $run
                       | if $run == null then {state: "unreadable", reason: "summary-time-unreadable"}
-                        elif $run <= $t then {state: "hold", reason: "summary-before-request"}
-                        elif ($foreign | length) > 0 then {state: "hold", reason: "foreign-codex-mention"}
-                        else {state: "clear", reason: "bound-request-answered"} end
+                        elif $run <= $rt then {state: "hold", reason: "summary-before-request"}
+                        elif ($others | length) > 0 then {state: "hold", reason: "other-codex-request-near-bound-request"}
+                        else {state: "clear", reason: "bound-request-answered", generation: $generation} end
                     end
                 end
             end
@@ -2401,12 +2412,14 @@ p4b_same_head_barrier() {
     if [ -n "$P4B_BARRIER_WAVE_CODEX_REQUEST" ] && [ -z "$why" ] && [ "$cap_exhausted" != true ]; then
       case "$cls_cx:$cx_evidence" in
         reported:*|waived:timeout|not-yet:*)
-          local wb_comments="" wb_json wb_state wb_reason wb_author wb_bot
+          local wb_comments="" wb_json wb_state wb_reason wb_author wb_bot wb_window
           wb_author="$(p4b_top_field author_identity)"; wb_author="${wb_author:-nathanjohnpayne}"
           wb_bot="$(p4b_policy_block_field codex bot_login)"; wb_bot="${wb_bot:-chatgpt-codex-connector[bot]}"
           if command -v gh_api_array >/dev/null 2>&1 \
              && wb_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
-            wb_json="$(p4b_wave_codex_binding_state "$wb_comments" "$wb_author" "$wb_bot" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
+            wb_window="$(p4b_policy_block_field codex review_timeout_seconds)"
+            case "$wb_window" in ''|*[!0-9]*) wb_window=1800 ;; esac
+            wb_json="$(p4b_wave_codex_binding_state "$wb_comments" "$wb_author" "$wb_bot" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST" "$wb_window")"
           else
             wb_json='{"state":"unreadable","reason":"comments-read-failed"}'
           fi
@@ -2423,6 +2436,13 @@ p4b_same_head_barrier() {
               ;;
             reported:clear)
               cx_evidence="wave-request-answered"
+              # Hand the generation this decision verified to the run's
+              # later fences (capture_authorized_request_generation adopts
+              # request_budget.request_generation); a request that arrives
+              # after this read then reads as a moved generation, not as
+              # authorized (Phase 4b on #2875).
+              cx_budget_json="$(printf '%s' "$wb_json" | jq -c --arg id "$P4B_BARRIER_WAVE_CODEX_REQUEST" \
+                '{state:"wave-request-answered",wave_codex_request:$id,request_generation:.generation}')"
               ;;
             *)
               cls_cx="not-yet"
