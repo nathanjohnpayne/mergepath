@@ -64,9 +64,11 @@
 #   --plan          print the scope and the selected steps; run nothing
 #   --deep          also run the selected deep-lane steps
 #   --all-live      run CI's whole fast lane, unselected wrappers included
-#   --jobs N        concurrency cap (default MERGEPATH_PREPUSH_JOBS, else 2
-#                   while the one-minute load average is below the CPU
-#                   count and 1 once it is not)
+#   --jobs N        pin the concurrency (default MERGEPATH_PREPUSH_JOBS, else
+#                   sized from the host load: jobs_max while the one-minute
+#                   load average per CPU is below load_per_cpu_threshold and
+#                   1 once it is not, and re-sized before each check during
+#                   the run)
 #   --event NAME    classifier event (default pull_request; a push to the
 #                   remote default branch is classified as `push`, like CI)
 #   --head-ref REF  branch name handed to the classifier (mergepath-sync/*
@@ -79,8 +81,10 @@
 #   MERGEPATH_PREPUSH_LIVE=all  run the unselected and undeclared-path fallback
 #                               graph wrappers too (CI's whole fast lane, and
 #                               with DEEP=1 CI's exact deep selection)
-#   MERGEPATH_PREPUSH_JOBS=N    concurrency cap; default 2 below one CPU's
-#                               worth of load per core, 1 at or above it
+#   MERGEPATH_PREPUSH_JOBS=N    pin the concurrency to N for the whole run (no
+#                               re-sizing, said in the output); default 2 below
+#                               one CPU's worth of load per core, 1 at or above
+#                               it, re-read during the run (below)
 #   MERGEPATH_PREPUSH_NICE=N    nice level for every check, default 10
 #   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
 #                               and markdown-it-py for the deep lane)
@@ -128,12 +132,22 @@
 #   nice                    MERGEPATH_PREPUSH_NICE                    10
 #   jobs_max                MERGEPATH_PREPUSH_JOBS_MAX                2
 #   load_per_cpu_threshold  MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD  1
-#                           (the default concurrency is jobs_max while the
-#                           load per CPU is below the threshold, else 1;
-#                           MERGEPATH_PREPUSH_JOBS / --jobs still pin it)
+#                           (the concurrency is jobs_max while the load per
+#                           CPU is below the threshold, else 1, re-read
+#                           before each check; MERGEPATH_PREPUSH_JOBS /
+#                           --jobs pin it for the whole run)
 # A missing file is the defaults. A file that is not one YAML mapping of
 # known keys with valid values fails the run closed (exit 2), whatever the
 # environment overrides. An environment variable set to '' counts as unset.
+#
+# Live load (#2842). The one-minute load is not read once at start: before
+# each check starts, and at most every 5 seconds while the run waits for a
+# free slot, it is read again and the concurrency is sized from it (jobs_max
+# or 1, by load_per_cpu_threshold, as at start). Each change is logged
+# (`concurrency 1 -> 2 (host load 3.10 on 10 CPUs)`); running checks are never
+# stopped, and an unreadable load leaves the setting alone. MERGEPATH_PREPUSH_JOBS
+# or --jobs pins the concurrency instead, and the run says so. The lock that
+# makes hook runs on a machine take turns (#2581) is unchanged.
 #
 # Deferral and budget (#2841). CI's lint runs every check whatever the hook
 # does, so the hook may leave the expensive part to it, but never silently:
@@ -385,16 +399,21 @@ host_cpus() {
 LOAD_1=''
 CPU_N=''
 DEFAULT_JOBS=2
+# The one sizing rule (#2842 applies it again before each check): jobs_max
+# while the load per CPU is below the threshold, else 1; either reading
+# unavailable gives jobs_max.
+prepush_size_jobs() {   # $1 jobs_max, $2 load_per_cpu_threshold, $3 load, $4 CPUs
+  if [ "$3" != unknown ] && [ "$4" != '?' ] \
+     && awk -v l="$3" -v c="$4" -v t="$2" 'BEGIN { exit !(l + 0 >= (c + 0) * (t + 0)) }'; then
+    printf 1
+  else
+    printf '%s' "$1"
+  fi
+}
 prepush_default_jobs() {   # $1 jobs_max, $2 load_per_cpu_threshold (policy; 2 and 1 by default)
-  local jmax="${1:-2}" thr="${2:-1}"
   LOAD_1=$(host_load)
   CPU_N=$(host_cpus)
-  if [ "$LOAD_1" != unknown ] && [ "$CPU_N" != '?' ] \
-     && awk -v l="$LOAD_1" -v c="$CPU_N" -v t="$thr" 'BEGIN { exit !(l + 0 >= (c + 0) * (t + 0)) }'; then
-    DEFAULT_JOBS=1
-  else
-    DEFAULT_JOBS=$jmax
-  fi
+  DEFAULT_JOBS=$(prepush_size_jobs "${1:-2}" "${2:-1}" "$LOAD_1" "$CPU_N")
 }
 
 # Snapshot hygiene. A snapshot is positively identified before anything is
@@ -680,6 +699,10 @@ DEEP=''   # the --deep flag; policy_resolve adds the env, file and default tiers
 ALL_LIVE=0
 [ "${MERGEPATH_PREPUSH_LIVE:-selected}" = "all" ] && ALL_LIVE=1
 JOBS="${MERGEPATH_PREPUSH_JOBS:-}"
+# What pinned the concurrency, if anything: an explicit cap is not re-sized
+# from the host load during the run (#2842).
+JOBS_SRC=''
+[ -z "$JOBS" ] || JOBS_SRC='env MERGEPATH_PREPUSH_JOBS'
 NICE=''   # from the policy (#2840)
 EVENT=''
 HEAD_REF=''
@@ -706,7 +729,7 @@ while [ "$#" -gt 0 ]; do
     --deep) DEEP=1; shift ;;
     --set) [ "$#" -ge 2 ] || die "--set needs KEY=VALUE"; POLICY_CLI="${POLICY_CLI}$2"$'\n'; shift 2 ;;
     --all-live) ALL_LIVE=1; shift ;;
-    --jobs) [ "$#" -ge 2 ] || die "--jobs needs a number"; JOBS="$2"; shift 2 ;;
+    --jobs) [ "$#" -ge 2 ] || die "--jobs needs a number"; JOBS="$2"; JOBS_SRC='flag --jobs'; shift 2 ;;
     --event) [ "$#" -ge 2 ] || die "--event needs a name"; EVENT="$2"; shift 2 ;;
     --head-ref) [ "$#" -ge 2 ] || die "--head-ref needs a ref"; HEAD_REF="$2"; shift 2 ;;
     --retry-failed) RETRY=1; RETRY_SRC='flag --retry-failed'; shift ;;
@@ -840,6 +863,10 @@ DEEP=0
 NICE=$(policy_value nice)
 prepush_default_jobs "$(policy_value jobs_max)" "$(policy_value load_per_cpu_threshold)"
 [ -n "$JOBS" ] || JOBS="$DEFAULT_JOBS"
+# The most the run may ever start at once (xargs -P; the feeder decides the
+# actual number): the pinned value, else jobs_max.
+JOBS_CAP="$JOBS"
+[ -n "$JOBS_SRC" ] || JOBS_CAP=$(policy_value jobs_max)
 
 ZERO=0000000000000000000000000000000000000000
 
@@ -1474,12 +1501,18 @@ retry_write() {
   return 1
 }
 
-# One host reading per run (#2575, #2581): the load that sized the jobs
-# default is the one printed here; the verdict line reads it again at the end.
+# The load that sized the starting concurrency (#2575, #2581) is the one
+# printed here; the run re-reads it before each check (#2842, sched_resize)
+# and the verdict line reads it once more at the end.
 LOAD_START="$LOAD_1"
 BUDGET_MIN=$(policy_value max_minutes)
 BUDGET_S=$((BUDGET_MIN * 60))
 echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
+if [ -n "$JOBS_SRC" ]; then
+  echo "$PREFIX: concurrency pinned to $JOBS by $JOBS_SRC; it is not re-sized from the host load during the run"
+else
+  echo "$PREFIX: concurrency starts at $JOBS and follows the host load between 1 and $JOBS_CAP (re-read before each check; $(policy_value load_per_cpu_threshold) load per CPU is the threshold)"
+fi
 echo "$PREFIX: selection: $SELECTION_REASON"
 [ "$(policy_value mode)" != selected ] || echo "$PREFIX: mode=selected (from $(policy_source mode)): the $LIVE_N live assertions are not run here; CI runs them"
 undeclared_notice
@@ -1494,7 +1527,7 @@ fi
 
 # ── run: feed steps to the workers, inside the max_minutes budget (#2841) ──
 # Steps start longest-first (previous timings). The feeder hands xargs one
-# step only when fewer than sched_jobs() are in flight (handed out, with no
+# step only when fewer than SCHED_CUR are in flight (handed out, with no
 # result yet, and not a worker that died without one), so each start is
 # decided at the moment a slot frees: that is where the budget is checked
 # and where a concurrency decision can change mid-run. Under max_minutes
@@ -1505,7 +1538,38 @@ fi
 # wait for another run's lock is bounded on its own (MERGEPATH_PREPUSH_LOCK_WAIT).
 # xargs stays the process that runs the workers, so an interrupt reaches
 # every check the way it always has.
-sched_jobs() { printf '%s' "$JOBS"; }
+#
+# Live load (#2842). Unless MERGEPATH_PREPUSH_JOBS / --jobs pinned the
+# concurrency, sched_resize re-reads the one-minute load and applies
+# prepush_size_jobs (between 1 and jobs_max), so a run that started on a busy
+# host speeds up when the load falls and slows down when it rises. xargs -P is
+# only the upper bound (JOBS_CAP); SCHED_CUR, kept by the feeder, is the
+# number of checks allowed at once. A read happens when a slot is free (the
+# decision to start a check) and otherwise at most every
+# SCHED_REREAD_S (a fixed 5 seconds, not a setting) while the feeder waits, so
+# a long queue does not ask the host every second. A reading that is
+# unavailable leaves the concurrency as it is. Each change is logged to
+# stderr (stdout feeds xargs). Checks already running are never stopped.
+SCHED_CUR="$JOBS"
+SCHED_READ_AT=0
+readonly SCHED_REREAD_S=5
+SCHED_THRESHOLD=$(policy_value load_per_cpu_threshold)
+sched_resize() {   # $1 = force: read now whatever the interval
+  local now load n
+  [ -z "$JOBS_SRC" ] || return 0
+  now=$(date +%s)
+  if [ "${1:-}" != force ] && [ $((now - SCHED_READ_AT)) -lt "$SCHED_REREAD_S" ]; then
+    return 0
+  fi
+  SCHED_READ_AT=$now
+  load=$(host_load)
+  { [ "$load" != unknown ] && [ "$CPU_N" != '?' ]; } || return 0
+  n=$(prepush_size_jobs "$JOBS_CAP" "$SCHED_THRESHOLD" "$load" "$CPU_N")
+  if [ "$n" != "$SCHED_CUR" ]; then
+    echo "$PREFIX: concurrency $SCHED_CUR -> $n (host load $load on $CPU_N CPUs)" >&2
+    SCHED_CUR="$n"
+  fi
+}
 sched_in_flight() {   # $1 = steps handed out so far
   local done_n dead=0 f pid
   done_n=$(find "$RUN_DIR/results" -type f | wc -l | tr -d ' ')
@@ -1519,9 +1583,15 @@ sched_in_flight() {   # $1 = steps handed out so far
   printf '%s' "$(($1 - done_n - dead))"
 }
 sched_feed() {
-  local prev sid fed=0 el
+  local prev sid fed=0 el in_flight
   while IFS=$'\t' read -r prev sid; do
-    while [ "$(sched_in_flight "$fed")" -ge "$(sched_jobs)" ]; do sleep 1; done
+    while :; do
+      in_flight=$(sched_in_flight "$fed")
+      # A free slot under the last reading is confirmed with a fresh one.
+      if [ "$in_flight" -lt "$SCHED_CUR" ]; then sched_resize force; else sched_resize; fi
+      [ "$in_flight" -ge "$SCHED_CUR" ] || break
+      sleep 1
+    done
     # The timing cache is advisory: a value it cannot vouch for predicts nothing.
     case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
     if [ "$BUDGET_S" -gt 0 ]; then
@@ -1541,7 +1611,7 @@ expected=$(wc -l < "$RUN_DIR/order" | tr -d ' ')
 prepush_lock_progress 0 "$expected"
 T0=$(date +%s)
 sched_feed \
-  | xargs -P "$JOBS" -n 1 bash "$SELF" --exec-step "$RUN_DIR" \
+  | xargs -P "$JOBS_CAP" -n 1 bash "$SELF" --exec-step "$RUN_DIR" \
   | while IFS= read -r line; do
       # Each worker prints one result line; the lock record follows them so a
       # push waiting on this run can report its progress.
