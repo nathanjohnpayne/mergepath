@@ -16,9 +16,10 @@
 # CI's `lint` check stays authoritative whatever this file says: the policy
 # only decides how much of it runs locally before a push.
 #
-# Every value below equals the built-in default, so mergepath's hook behaves
-# exactly as it did before this file existed. #2841 changes full_suite and
-# max_minutes here once it implements them.
+# Every value below equals the built-in default except full_suite and
+# max_minutes (#2841): a change that selects the complete surface runs only
+# what its paths select and leaves the rest to CI, and no check starts that
+# would end past 15 minutes. Both name every step they leave to CI.
 
 # off: run nothing. selected: only the wrappers the classifier selects for
 # the change (no live assertions). full: the live assertions plus the
@@ -26,12 +27,16 @@
 mode: full
 
 # run | defer: what to do when the classifier selects the complete surface.
-# Validated now; deferral arrives with #2841. Env: MERGEPATH_PREPUSH_FULL_SUITE.
-full_suite: run
+# defer runs the live assertions and the wrappers the changed paths select,
+# and names every other wrapper as deferred to CI. On 2026-10-28 the full
+# run managed 3 checks in 38 minutes on a loaded host (#2839).
+# Env: MERGEPATH_PREPUSH_FULL_SUITE.
+full_suite: defer
 
-# Wall-clock budget in minutes, 0 for none. Validated now; enforced from
-# #2841. Env: MERGEPATH_PREPUSH_MAX_MINUTES.
-max_minutes: 0
+# Check budget in minutes, 0 for none: a check that would end past it is not
+# started and is deferred to CI; a failed check still blocks the push.
+# Env: MERGEPATH_PREPUSH_MAX_MINUTES.
+max_minutes: 15
 
 # Also run the selected deep-lane steps (same as --deep).
 # Env: MERGEPATH_PREPUSH_DEEP.

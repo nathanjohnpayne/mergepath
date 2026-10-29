@@ -205,7 +205,8 @@
 #     # counts from the resumed request's posting, so it includes time before
 #     # this run started.
 #     "codex_run": {request_comment_id, diagnostic, final_state,
-#                   overlapping_request, handoff, provider_window},
+#                   overlapping_request, handoff, superseded_by,
+#                   provider_window},
 #     # #2664, polling runs only: what Codex's Review Summary row said about
 #     # the waited-on request. diagnostic is the state recorded at 300 s (or
 #     # null); final_state is the state at the end of the wait (active,
@@ -216,6 +217,11 @@
 #     # state here posts, retries, cancels or clears anything. handoff is
 #     # "timeout-recorded" or "unattributed" when the wait ended unanswered:
 #     # a held request without a strong head tie records no determination.
+#     # It is "superseded" when a newer author request landed during the
+#     # wait (#2791): superseded_by names it, no determination is recorded,
+#     # and the run exits 3 with this JSON. A Codex signal on HEAD that
+#     # arrives with a newer request present still exits 0, reported as
+#     # final_state "ambiguous" with superseded_by set.
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
 #   }
@@ -2912,6 +2918,9 @@ wait_for_trigger_ack() {
     # observable via REST, do not re-trigger. The terminal signal wins;
     # eyes is only an acknowledgment, never a clearance signal.
     rescan_codex_state "eyes-ack Codex scan"
+    # #2791: a newer request seen here stays seen, even if it is gone by the
+    # main poll.
+    codex_run_latch_superseding
     # An account-/connection-level block during the ack window is terminal
     # too (#722): re-posting `@codex review` cannot help a quota-exhausted or
     # not-connected account, so stop the ack gate (no re-trigger) and let the
@@ -2959,6 +2968,13 @@ run_trigger_ack_gate() {
 
     if [ "$retries_used" -ge "$MAX_ACK_RETRIES" ]; then
       log "eyes-ack retry cap reached (${retries_used}/${MAX_ACK_RETRIES}) — continuing normal review poll"
+      return 0
+    fi
+    # #2791: a newer request seen during the ack wait supersedes this one.
+    # Re-posting would be refused as a duplicate of it, so continue into the
+    # poll, which reports the supersession.
+    if [ -n "$CODEX_RUN_SEEN_SUPERSEDING" ]; then
+      log "newer author request $CODEX_RUN_SEEN_SUPERSEDING landed during the eyes-ack wait — no acknowledgement retry; continuing normal review poll (#2791)"
       return 0
     fi
 
@@ -3371,6 +3387,7 @@ CODEX_RUN_DIAGNOSTIC_JSON=null
 CODEX_RUN_WINDOW_JSON=null
 CODEX_RUN_FINAL_STATE=""
 CODEX_RUN_OVERLAP=false
+CODEX_RUN_SEEN_SUPERSEDING=""
 RESUMED_TRIGGER_ID=""
 REQUEST_BLOCK_TRIGGER_JSON=null
 
@@ -3482,6 +3499,33 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
   exit 0
 fi
 
+# #2791: the id of a newer exact author request the scan selected in place of
+# the waited-on one, else empty. The selector takes the latest request, so a
+# larger id is a request posted during this wait (by another requester or by
+# hand). The row read since that newer request is also since the waited-on
+# one, so it is reported, but as ambiguous: it names neither. Once any scan
+# has seen a newer request (CODEX_RUN_SEEN_SUPERSEDING, latched by
+# codex_run_latch_superseding after every eyes-ack and poll scan), it stays
+# the answer: if that request is later edited away or deleted, the scan
+# selects the waited-on one again, but the newer run may still be active.
+# Defined here, ahead of run_trigger_ack_gate, because the ack wait scans too.
+codex_run_superseding_request() {
+  local scan_request watched
+  watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
+  scan_request=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty' 2>/dev/null) || scan_request=""
+  if [[ "$watched" =~ ^[0-9]+$ ]] && [[ "$scan_request" =~ ^[0-9]+$ ]] && [ "$scan_request" -gt "$watched" ]; then
+    printf '%s' "$scan_request"
+  else
+    printf '%s' "$CODEX_RUN_SEEN_SUPERSEDING"
+  fi
+}
+
+codex_run_latch_superseding() {
+  local superseding
+  superseding=$(codex_run_superseding_request)
+  [ -z "$superseding" ] || CODEX_RUN_SEEN_SUPERSEDING=$superseding
+}
+
 if [ "$TRIGGER_POSTED" = "true" ]; then
   # We just posted a trigger. The INITIAL_SCAN data is now stale by
   # definition — Codex will respond with something new. Skip the
@@ -3504,12 +3548,17 @@ fi
 # it when its deadline is later, whatever its duration.
 CODEX_RUN_DIAGNOSTIC_SECONDS=300
 codex_run_state_now() { # the waited-on request's reported state
-  local scan_request watched state
+  local scan_request watched state superseded
   watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
   scan_request=$(printf '%s' "$FINAL_SCAN" | jq -r '.request.id // empty' 2>/dev/null) || scan_request=""
   state=$(printf '%s' "$FINAL_SCAN" | jq -r '.run.state // "none"' 2>/dev/null) || state=unknown
-  if [ -z "$watched" ] || [ "$scan_request" != "$watched" ]; then state=none; fi
-  if [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ]; then
+  superseded=$(codex_run_superseding_request)
+  if [ -z "$superseded" ] && { [ -z "$watched" ] || [ "$scan_request" != "$watched" ]; }; then state=none; fi
+  if [ -n "$superseded" ]; then
+    # Whatever the row says, or with no row yet, it may follow the newer
+    # request: nothing ties it to the waited-on one.
+    state=ambiguous
+  elif [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ]; then
     case "$state" in failed|canceled|completed|running) state=ambiguous ;; esac
   fi
   case "$state" in running) state=active ;; none) state=unknown ;; esac
@@ -3519,10 +3568,12 @@ codex_run_state_now() { # the waited-on request's reported state
 codex_run_tick() {
   [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ] || return 0
   local state window observed not_before
-  state=$(codex_run_state_now)
   # Set here, not in codex_run_state_now, which runs in a subshell. Once seen,
-  # an overlap stays reported.
-  if [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ]; then
+  # an overlap and a superseding request stay reported.
+  codex_run_latch_superseding
+  state=$(codex_run_state_now)
+  if [ "$(printf '%s' "$FINAL_SCAN" | jq -r '.run.overlapping_request // false' 2>/dev/null)" = true ] \
+     || [ -n "$CODEX_RUN_SEEN_SUPERSEDING" ]; then
     CODEX_RUN_OVERLAP=true
   fi
   if [ "$CODEX_RUN_DIAGNOSTIC_JSON" = null ] && [ "$ELAPSED" -ge "$CODEX_RUN_DIAGNOSTIC_SECONDS" ]; then
@@ -3544,13 +3595,14 @@ codex_run_tick() {
 codex_run_json() {
   local watched=${TERMINAL_TRIGGER_COMMENT_ID:-${RESUMED_TRIGGER_ID:-}}
   jq -nc --arg id "$watched" --argjson diagnostic "$CODEX_RUN_DIAGNOSTIC_JSON" --arg final "$CODEX_RUN_FINAL_STATE" \
-    --arg handoff "${CODEX_RUN_HANDOFF:-}" \
+    --arg handoff "${CODEX_RUN_HANDOFF:-}" --arg superseded_by "${CODEX_RUN_SUPERSEDED_BY:-}" \
     --argjson overlap "$CODEX_RUN_OVERLAP" --argjson window "$CODEX_RUN_WINDOW_JSON" '
     { request_comment_id: (if $id == "" then null else ($id | tonumber? // null) end),
       diagnostic: $diagnostic,
       final_state: (if $final == "" then null else $final end),
       overlapping_request: $overlap,
       handoff: (if $handoff == "" then null else $handoff end),
+      superseded_by: (if $superseded_by == "" then null else ($superseded_by | tonumber? // null) end),
       provider_window: $window }'
 }
 
@@ -3641,9 +3693,19 @@ BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN") || die 3 "cannot order th
 # --diagnostic-signal-only probe maps them to its Phase 4b exit-2 waiver.
 PHASE4A_TERMINAL_RECORDED=false
 PHASE4A_TERMINAL_COMMENT_ID=""
+CODEX_RUN_SUPERSEDED_BY=""
 if [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; then
   if has_post_trigger_signal "$FINAL_SCAN"; then
     CODEX_RUN_FINAL_STATE=answered
+    # #2791: a HEAD-anchored Codex signal is still this run's result (exit 0
+    # reports Codex's signal on HEAD, whichever request prompted it), but with
+    # a newer request present the report cannot say it answered this one.
+    CODEX_RUN_SUPERSEDED_BY=$(codex_run_superseding_request)
+    if [ -n "$CODEX_RUN_SUPERSEDED_BY" ]; then
+      CODEX_RUN_FINAL_STATE=ambiguous
+      CODEX_RUN_OVERLAP=true
+      log "Codex signal on HEAD received, but newer author request $CODEX_RUN_SUPERSEDED_BY landed during the wait — reported as ambiguous, not answered (#2791)"
+    fi
   else
     codex_run_tick
     CODEX_RUN_FINAL_STATE=$(codex_run_state_now)
@@ -3659,8 +3721,28 @@ fi
 # well enough to hand this head to Phase 4b (#2779 Phase 4b P1s). Without a
 # strong tie the run exits 4 with no marker and reports the request as
 # unattributed, and a rerun posts a new counted request.
+#
+# #2791: a newer author request that landed during the wait supersedes the
+# waited-on one. That newer request is still within its own wait, so a
+# timeout for this head would hand off active work: no determination is
+# minted, nothing is posted, and the wait is not extended onto a request this
+# run cannot attribute. The run reports codex_run (handoff "superseded",
+# superseded_by) and exits 3; a rerun holds or replaces the newer request by
+# the same-head hold's rules. Supersession wins over a provider refusal too:
+# a refusal that predates the newer request is filtered out while that
+# request is selected, and resurfaces against the waited-on one if the newer
+# request is then deleted, so exit 4 with blocked_reason would hand Phase 4b a
+# fallback while the newer run may be active. blocked_reason is still
+# reported.
 CODEX_RUN_HANDOFF=""
-if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
+if { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } \
+   && ! has_post_trigger_signal "$FINAL_SCAN"; then
+  CODEX_RUN_SUPERSEDED_BY=$(codex_run_superseding_request)
+  [ -z "$CODEX_RUN_SUPERSEDED_BY" ] || CODEX_RUN_HANDOFF=superseded
+fi
+if [ "$CODEX_RUN_HANDOFF" = superseded ]; then
+  log "request ${TERMINAL_TRIGGER_COMMENT_ID:-?} was superseded by newer author request $CODEX_RUN_SUPERSEDED_BY during its wait — no timeout determination is recorded; exit 3 (#2791)"
+elif { [ "$TRIGGER_POSTED" = true ] || [ "$RESUMED_TRIGGER" = true ]; } && [ -z "$BLOCKED_REASON" ] \
    && ! has_post_trigger_signal "$FINAL_SCAN"; then
   strong_tie=$TRIGGER_POSTED
   if [ "$strong_tie" != true ] && [ "$RESUMED_TRIGGER" = true ] && [ "$RESUME_STRONG_TIE" = true ]; then
@@ -3726,7 +3808,9 @@ jq -n \
 # after the resumed trigger counts. Otherwise a resumed poll that breaks on a
 # provider block would fall to has_signal and exit 0 on an older review the
 # resumed request was asking Codex to reconsider.
-if [ "$TRIGGER_POSTED" = "true" ] || [ "$RESUMED_TRIGGER" = "true" ]; then
+if [ "$CODEX_RUN_HANDOFF" = superseded ]; then
+  exit 3
+elif [ "$TRIGGER_POSTED" = "true" ] || [ "$RESUMED_TRIGGER" = "true" ]; then
   if has_post_trigger_signal "$FINAL_SCAN"; then
     exit 0
   else

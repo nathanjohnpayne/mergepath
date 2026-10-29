@@ -15,6 +15,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_prepush.sh"
 # The per-repository policy, .github/prepush.yml (#2840).
 POLICY_TEST="$REPO_ROOT/tests/test_repo_lint_prepush_policy.sh"
+# Its full-suite deferral and check budget (#2841).
+DEFER_TEST="$REPO_ROOT/tests/test_repo_lint_prepush_defer.sh"
 
 # Consumer-safety guard (#601), marker-FIRST: the scripts/ci kit travels to
 # every consumer, but the pre-push mirror and its suite are hub-only (not
@@ -26,7 +28,7 @@ if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
   echo "check_repo_lint_prepush: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push mirror is hub-only)"
   exit 0
 fi
-for t in "$TEST_SCRIPT" "$POLICY_TEST"; do
+for t in "$TEST_SCRIPT" "$POLICY_TEST" "$DEFER_TEST"; do
   if [ ! -f "$t" ]; then
     echo "check_repo_lint_prepush: ERROR (missing $t)" >&2
     exit 1
@@ -35,4 +37,5 @@ done
 
 bash "$TEST_SCRIPT"
 bash "$POLICY_TEST"
+bash "$DEFER_TEST"
 echo "check_repo_lint_prepush: PASS"
