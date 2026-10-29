@@ -438,8 +438,9 @@ crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
 }
 
 # Select the newest marker-tagged Codex Review Summary whose Code Review row
-# names the given head, as `{status, commit, observed_at, trigger, comment_id}`
-# or `null` (#1157).
+# names the given head, as
+# `{status, commit, observed_at, trigger, trigger_kind, comment_id}` or `null`
+# (#1157).
 #
 # Codex creates this issue comment when a review starts and edits it in place
 # as the review advances, so `updated_at` — not `created_at` — is the signal
@@ -449,6 +450,14 @@ crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
 # diagnostic caller. Neither status is an affirmative merge verdict. The row
 # names no trigger comment, so it can show that a review of a head is in
 # flight but never which request started it.
+#
+# `trigger` is the row's Review trigger cell verbatim (trimmed). `trigger_kind`
+# classifies it (specs/codex_request_evidence.md § Codex provider surfaces):
+# "manual" for `Manual request` (an `@codex review` run), "unsolicited" for
+# `PR opened` or `New commits` (an App run nobody asked for), and "unknown"
+# for any other text, which a caller must treat as a hold. "manual" still
+# names no request; attributing the run to one needs the caller to rule out
+# every other configured-author request in the window.
 #
 # Pure: jq over the passed strings only, no globals and no I/O. Shared by
 # codex-review-check.sh (gate diagnostics) and codex-review-request.sh (#1550
@@ -474,6 +483,11 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
           commit: $commit,
           observed_at: ($comment.updated_at // $comment.created_at // ""),
           trigger: ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
+          trigger_kind:
+            ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "") | ascii_downcase
+             | if . == "manual request" then "manual"
+               elif . == "pr opened" or . == "new commits" then "unsolicited"
+               else "unknown" end),
           comment_id: ($comment.id // 0) }
     ]
     | max_by([.observed_at, .comment_id]) // null
