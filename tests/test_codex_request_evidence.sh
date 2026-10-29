@@ -1047,4 +1047,38 @@ else
   cat "$DIR/flag-out"; echo 'FAIL: #1512 reviews API failure did not remain infrastructure exit 3'; exit 1
 fi
 
+# Review trigger column (specs/codex_request_evidence.md § Codex provider
+# surfaces). The rows copy the live Summary shape: a relative-time status cell,
+# a Failed cell carrying its retry hint, and the trigger cell last. Only
+# `Manual request` is a requested run; `PR opened` and `New commits` are App
+# runs nobody asked for; any other text, or a row without the trigger cell, is
+# never classified as manual.
+summary_trigger_case() { # name trigger-cell status-cell expected-kind|null
+  local body comments got
+  # shellcheck disable=SC2016 # Literal Markdown commit cell, not shell substitution.
+  body=$(printf '<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {} -->\n\n## Codex Review Summary\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `abcdef0` |%s\n' "$3" "$2")
+  comments=$(jq -nc --arg b "$body" '[{id:9001,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-10-29T00:51:58Z",updated_at:"2026-10-29T00:58:07Z",body:$b}]')
+  got=$(crqe_select_codex_review_summary "$comments" 'chatgpt-codex-connector[bot]' abcdef0123456789000000000000000000000000) \
+    || { echo "FAIL: summary trigger $1: selector failed" >&2; exit 1; }
+  if [ "$(printf '%s' "$got" | jq -r 'if . == null then "null" else .trigger_kind end')" = "$4" ]; then
+    PASS=$((PASS + 1)); echo "PASS: summary trigger $1 -> $4"
+  else
+    echo "FAIL: summary trigger $1: $got" >&2; exit 1
+  fi
+}
+SUMMARY_DONE='✅ **Completed** <relative-time datetime="2026-10-29T16:46:28.410836Z">2026-10-29T16:46:28.410836Z</relative-time>'
+SUMMARY_RUNNING='🔄 **Running** since <relative-time datetime="2026-10-29T00:58:05.173856Z">2026-10-29T00:58:05.173856Z</relative-time>'
+# shellcheck disable=SC2016 # The provider's own backticked retry hint.
+SUMMARY_FAILED='⚠️ **Failed** <relative-time datetime="2026-10-28T15:36:42.021653Z">2026-10-28T15:36:42.021653Z</relative-time><br/>We couldn’t complete this review. Comment `@codex review` to try again.'
+summary_trigger_case manual-completed ' Manual request |' "$SUMMARY_DONE" manual
+summary_trigger_case manual-running ' Manual request |' "$SUMMARY_RUNNING" manual
+summary_trigger_case manual-case-and-space '   manual REQUEST   |' "$SUMMARY_DONE" manual
+summary_trigger_case pr-opened ' PR opened |' "$SUMMARY_DONE" unsolicited
+summary_trigger_case pr-opened-failed ' PR opened |' "$SUMMARY_FAILED" unsolicited
+summary_trigger_case new-commits ' New commits |' "$SUMMARY_RUNNING" unsolicited
+summary_trigger_case unseen-value ' Ready for review |' "$SUMMARY_DONE" unknown
+summary_trigger_case near-miss-manual ' Manual requests |' "$SUMMARY_DONE" unknown
+summary_trigger_case manual-prose ' Manual request by @someone |' "$SUMMARY_DONE" unknown
+summary_trigger_case missing-column '' "$SUMMARY_DONE" null
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
