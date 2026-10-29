@@ -1357,11 +1357,28 @@ async function productionStepCases() {
       labelFailures: [], resolves: true, labelCalls: 0, needsExternal: 'true', addsLabel: 'true'},
     {name: 'the default branch module runs instead of the copy', workspace: moduleWorkspace, labelFailures: [],
       resolves: true, labelCalls: 0, ran: 'default-branch module, mutate=true, require=function'},
+    // #2844: threshold and protected paths come only from the governing
+    // policy through external_review_fingerprint.sh. The removed inline
+    // threshold/glob twin parsed PROTECTED_PATHS from the env and was always
+    // overwritten; with it gone, an absent or malformed env cannot change or
+    // break the classification, in the module or in its generated copy.
+    {name: 'module ignores an absent or malformed THRESHOLD/PROTECTED_PATHS env', run: classifyOnly,
+      env: {THRESHOLD: undefined, PROTECTED_PATHS: 'not json ['}, labelFailures: [], resolves: true,
+      labelCalls: 0, needsExternal: 'true', addsLabel: 'true'},
+    {name: 'generated copy ignores an absent or malformed THRESHOLD/PROTECTED_PATHS env',
+      workspace: bootstrapWorkspace, env: {THRESHOLD: undefined, PROTECTED_PATHS: 'not json ['},
+      labelFailures: [], resolves: true, labelCalls: 1, needsExternal: 'true', addsLabel: 'true'},
     {name: 'module missing where the default branch selects it', workspace: brokenWorkspace,
       labelFailures: [], resolves: false, labelCalls: 0, rejects: /requires the missing scripts\/workflow\/review-triage\.cjs/},
   ];
   for (const scenario of scenarios) {
     process.env.GITHUB_WORKSPACE = scenario.workspace || root;
+    process.env.THRESHOLD = '300';
+    process.env.PROTECTED_PATHS = '[".github/**"]';
+    for (const [key, value] of Object.entries(scenario.env || {})) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     const record = {sync: 0, helpers: [], verifierInput: null, labelCalls: 0};
     const outputs = {}; const warnings = [];
     const childProcess = {
