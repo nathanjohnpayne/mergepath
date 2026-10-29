@@ -604,3 +604,175 @@ crqe_review_approval_time() { # selected-review-json comments-json bot head
       then $review.submitted_at else "" end
   '
 }
+
+# #2881: Codex findings in review format posted as a PR-level issue comment.
+# Codex normally files findings as a review with inline comments, but it also
+# posts the same `### 💡 Codex Review` body (priority badges and blob
+# permalinks) as an issue comment, either right after a review or on its own
+# (mergepath#1120 issuecomment-5447842730, five minutes after merge). The
+# cloud-task reply format (`## Review Findings` / `### [P1] ...`) carries
+# findings the same way. Neither has a `Codex review:` header or a
+# `Reviewed commit` line, so crqe_verdicts does not see them.
+#
+# A comment qualifies only when the configured bot wrote it (a GitHub App bot
+# login; a present `user.type` must be `Bot`), it is not the Review Summary,
+# and it carries a priority marker: a `![Pn Badge]` image or a `[Pn]` heading
+# or bold label, n in 0-3. It is never a clean signal. Its anchor is every
+# commit named by a `/blob/<40-hex>/` permalink or a `Reviewed commit`
+# field: `exact` when all of them equal <head>, `other` when all are valid
+# and none does, `none` when there is no anchor, and `mixed` otherwise. A
+# caller may drop only `other`; `none` and `mixed` are ambiguous negatives.
+#
+# Emits [{comment_id, created_at, updated_at, anchor}], oldest first.
+# Pure: jq over the passed strings only, no globals and no I/O.
+crqe_review_format_findings() { # issue-comments-json bot-login head-sha
+  printf '%s\n' "${1:-[]}" | jq -c --arg bot "${2:-}" --arg sha "${3:-}" '
+    ($sha | ascii_downcase) as $head
+    | [ .[]
+      | select((.user.login // "") == $bot and $bot != "")
+      | select((.user.type // "Bot") == "Bot")
+      | (.body // "") as $body
+      | select($body | startswith("<!-- codex-pull-request-review-summary -->") | not)
+      | select($body | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]"))
+      | ([ $body | ascii_downcase | scan("/blob/([0-9a-f]{40})/") | .[0] ]
+         + [ $body | ascii_downcase
+             | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+             | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "") ]) as $anchors
+      | { comment_id: .id, created_at: (.created_at // ""),
+          updated_at: (.updated_at // .created_at // ""),
+          anchor: (if ($anchors | length) == 0 then "none"
+                   elif all($anchors[]; . == $head) then "exact"
+                   elif all($anchors[]; test("^[0-9a-f]{40}$")) and all($anchors[]; . != $head) then "other"
+                   else "mixed" end) }
+    ]
+    | sort_by(.created_at, .comment_id)
+  '
+}
+
+# #2881 option (c): is a Codex review still owed on <head>, and has the
+# bounded wait for it run out? Emits one object:
+#
+#   {state, reason, request, terminal_at, running_since, anchor_at, expires_at}
+#
+#   none       no configured-author request, and no run in flight
+#   answered   Codex produced a terminal outcome on <head> strictly after the
+#              latest configured-author request (whole PR), and no Code
+#              Review run on <head> started after that outcome
+#   pending    otherwise, and the bounded wait has not run out
+#   timed-out  otherwise, and now >= anchor + <timeout-seconds>. This is a
+#              fallback to the independent Phase 4b approval, never a Codex
+#              outcome: Codex may still be running and may post findings
+#              after merge.
+#   unreadable an author request lacks a positive id or a readable created_at
+#
+# The latest request counts across the whole PR. Using head transitions to
+# exclude requests made on earlier heads would need ordinary-push evidence,
+# which crqe_latest_head_transition does not have, so an earlier-head request
+# simply waits for an exact-head outcome or its own timeout.
+#
+# Terminal outcomes on <head>, each timed by the object's own server field:
+#   - a configured-bot review whose commit_id is <head> (submitted_at);
+#   - a verdict comment whose every Reviewed commit anchor is <head>, and a
+#     `Codex review:` comment with no anchor, such as "Something went wrong"
+#     (created_at: a reply without a review still answers the request);
+#   - a usage-limit or not-connected refusal (created_at);
+#   - an exact-head review-format findings comment (created_at);
+#   - a Review Summary whose `codex-review-state:v1` code_review names <head>
+#     in full with status `completed`, timed by the run timestamp Codex
+#     writes into the status cell (`<relative-time datetime=...>`). The
+#     comment's own updated_at is not used: an unrelated edit must not make
+#     an old completion look new. A row whose commit disagrees with the JSON,
+#     or whose run time is unreadable or later than the comment's updated_at
+#     plus 300 seconds, is not evidence.
+# A Summary on <head> with status `running` contributes its run time as
+# running_since.
+#
+# Ordering uses whole seconds, and an outcome must be strictly later than the
+# request: a same-second outcome does not answer it. Different object types
+# are ordered by time only, never by id. The timeout anchor is the latest
+# request's server created_at, or, when only a run is in flight, that run's
+# provider-written start time. A rerun of the gate cannot move either.
+#
+# Pure: jq over the passed strings only (on stdin, so a large PR cannot hit
+# the argument-size limit); the caller supplies now.
+crqe_codex_pending_state() { # comments-json reviews-json author bot head timeout-seconds now-epoch [usage-re] [not-connected-re]
+  printf '%s\n' "${1:-null}" "${2:-null}" | jq -sc \
+    --arg author "${3:-}" --arg bot "${4:-}" --arg sha "${5:-}" \
+    --arg timeout "${6:-}" --arg now "${7:-}" \
+    --arg usage_re "${8:-}" --arg nc_re "${9:-}" '
+    def secs: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
+              then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) else null end;
+    def iso: if . == null then null else todate end;
+    def is_bot: (.user.login // "") == $bot and $bot != "" and ((.user.type // "Bot") == "Bot");
+    (if length == 2 then .[0] else null end) as $comments
+    | (if length == 2 then .[1] else null end) as $reviews
+    | ($sha | ascii_downcase) as $head
+    | if ($comments | type) != "array" or ($reviews | type) != "array"
+         or ($head | test("^[0-9a-f]{40}$") | not)
+         or ($timeout | test("^[0-9]+$") | not) or ($now | test("^[0-9]+$") | not)
+      then {state: "unreadable", reason: "invalid-input"}
+      else
+      ($timeout | tonumber) as $window | ($now | tonumber) as $t_now
+      | [ $comments[]
+          | select((.user.login // "") == $author)
+          | select((.body // "") | test("\\A@codex review\\z"; "i")) ] as $requests
+      | if any($requests[]; ((.id | type) != "number") or .id <= 0 or (.id | floor) != .id
+                            or ((.created_at | secs) == null))
+        then {state: "unreadable", reason: "request-unreadable"}
+        else
+        ($requests | max_by([(.created_at | secs), .id])) as $req
+        | ($req.created_at | if . == null then null else secs end) as $req_at
+        | [ $comments[] | select(is_bot) ] as $botc
+        | [ $botc[]
+            | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+            | . as $c
+            | ((.body // "") | (try (capture("<!-- codex-review-state:v1 (?<j>\\{[^\\n]*\\}) -->").j | fromjson) catch null)) as $sj
+            | ((.body // "") | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")? // null) as $row
+            | select($sj != null and ($sj.code_review | type) == "object" and $row != null)
+            | (($sj.code_review.commit_sha // "") | tostring | ascii_downcase) as $jc
+            | select($jc == $head and ($jc | startswith($row.commit | ascii_downcase)))
+            | (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) as $run
+            | (($c.updated_at // $c.created_at) | secs) as $edited
+            | select($run != null and $edited != null and $run <= $edited + 300)
+            | {status: ($sj.code_review.status // ""), at: $run} ] as $summaries
+        | ( [ $reviews[] | select(is_bot) | select((.commit_id // "" | ascii_downcase) == $head) | (.submitted_at | secs) ]
+          + [ $botc[] | . as $c
+              | ((.body // "") | ascii_downcase) as $b
+              | [ $b | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)") | .[0]
+                  | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "") ] as $shas
+              | select((($shas | length) > 0 and all($shas[]; . == $head))
+                       or (($shas | length) == 0 and ((.body // "") | test("(?im)^\\s*codex review:"))))
+              | (.created_at | secs) ]
+          + [ $botc[]
+              | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
+              | select(($usage_re != "" and ((.body // "") | test($usage_re; "i")))
+                       or ($nc_re != "" and ((.body // "") | test($nc_re; "i"))))
+              | (.created_at | secs) ]
+          + [ $botc[]
+              | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->") | not)
+              | select((.body // "") | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]"))
+              | ([ (.body // "") | ascii_downcase | scan("/blob/([0-9a-f]{40})/") | .[0] ]) as $a
+              | select(($a | length) > 0 and all($a[]; . == $head))
+              | (.created_at | secs) ]
+          + [ $summaries[] | select(.status == "completed") | .at ]
+          | map(select(. != null)) | max ) as $terminal
+        | ([ $summaries[] | select(.status == "running") | .at ] | max) as $running
+        | (if $req_at != null and ($terminal == null or $terminal <= $req_at) then
+             {anchor: $req_at, reason: "request-unanswered"}
+           elif $running != null and ($terminal == null or $running > $terminal) then
+             {anchor: $running, reason: "review-running"}
+           else null end) as $owed
+        | {request: (if $req == null then null else {id: $req.id, created_at: $req.created_at} end),
+           terminal_at: ($terminal | iso), running_since: ($running | iso)} as $base
+        | if $owed == null then
+            $base + {state: (if $req == null then "none" else "answered" end),
+                     reason: (if $req == null then "no-request" else "request-answered" end),
+                     anchor_at: null, expires_at: null}
+          else
+            ($owed.anchor + $window) as $exp
+            | $base + {state: (if $t_now >= $exp then "timed-out" else "pending" end),
+                       reason: $owed.reason, anchor_at: ($owed.anchor | iso), expires_at: ($exp | iso)}
+          end
+        end
+      end'
+}

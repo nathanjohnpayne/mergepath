@@ -216,6 +216,23 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
+  # #2881: a configured-author Codex request now holds a Phase 4b substitute,
+  # and a Codex answer can be only an issue comment (a verdict, a refusal, a
+  # findings comment or a Review Summary edit). Require the issue_comment
+  # trigger with all three activity types, so a request that is created,
+  # edited or deleted, and an answer that arrives or changes, re-run the gate
+  # instead of leaving a stale verdict until the scheduled sweep. Which job
+  # handles it is pinned by the #850 producer-eligibility allowlist below.
+  if ! awk '
+      /^  issue_comment:[[:space:]]*$/ { on = 1; next }
+      on && /^    types:/ { t = $0; ok = (t ~ /created/ && t ~ /edited/ && t ~ /deleted/); exit }
+      on && /^  [^ ]/ { exit }
+      END { exit !ok }' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW is missing the issue_comment trigger with types [created, edited, deleted]."
+    echo "      Codex requests and Codex answers are PR-level issue comments; without the trigger a green check stays green after a new request, and a hold stays red after Codex answers, until the scheduled sweep (#2881)."
+    FAILED=1
+  fi
+
   # The required-check display name (job name) must match the name the
   # scheduled-sweep posts AND the entry in audit-branch-protection.sh's
   # CANONICAL_REQUIRED_CHECKS. Branch protection keys on the job name, so
@@ -752,10 +769,21 @@ HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
 # is precisely the loud coupling a fence wants.
 JOB_IF_ALLOWED = {
     "merge-clearance-gate": (
-        "github.event_name != 'schedule' && github.event_name != 'repository_dispatch'",
+        "github.event_name != 'schedule' && github.event_name != 'repository_dispatch'"
+        " && github.event_name != 'issue_comment'",
     ),
     "scheduled-sweep": ("github.event_name == 'schedule'",),
-    "dispatch-recheck": ("github.event_name == 'repository_dispatch'",),
+    # #2881: dispatch-recheck also re-evaluates open PRs on a Codex request or
+    # a Codex App comment, resolving the PR head itself.
+    "dispatch-recheck": (
+        "github.event_name == 'repository_dispatch'"
+        " || (github.event_name == 'issue_comment'"
+        " && github.event.issue.pull_request"
+        " && github.event.issue.state == 'open'"
+        " && (github.event.comment.user.login == 'chatgpt-codex-connector[bot]'"
+        " || contains(github.event.comment.body, '@codex review')"
+        " || contains(github.event.changes.body.from, '@codex review')))",
+    ),
 }
 
 

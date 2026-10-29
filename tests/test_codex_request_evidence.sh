@@ -1047,4 +1047,164 @@ else
   cat "$DIR/flag-out"; echo 'FAIL: #1512 reviews API failure did not remain infrastructure exit 3'; exit 1
 fi
 
+
+# #2881 option (c): a Phase 4b substitute waits while Codex still owes HEAD a
+# review, bounded by codex.review_timeout_seconds from a server-derived
+# anchor; past the bound it is an explicit timed-out/substitute-used
+# fallback. Timestamps are relative to a fixed now so the pure helper is
+# deterministic; the end-to-end cases below use the real clock.
+P_HEAD=abcdef0123456789000000000000000000000000
+P_OTHER=1111111111111111111111111111111111111111
+P_BOT='chatgpt-codex-connector[bot]'
+P_NOW=1792800000 # 2026-10-23T00:00:00Z
+p_at() { jq -nr --argjson s "$1" '$s | todate'; } # epoch -> ISO second
+p_req() { jq -nc --argjson id "$1" --arg at "$(p_at "$2")" --arg who "${3:-nathanjohnpayne}" \
+  '{id:$id,user:{login:$who,type:"User"},created_at:$at,body:"@codex review"}'; }
+p_review() { jq -nc --arg at "$(p_at "$1")" --arg sha "${2:-$P_HEAD}" --arg type "${3:-Bot}" --arg bot "$P_BOT" \
+  '{id:700,user:{login:$bot,type:$type},commit_id:$sha,submitted_at:$at,state:"COMMENTED"}'; }
+p_comment() { jq -nc --argjson id "$1" --arg at "$(p_at "$2")" --arg up "$(p_at "${4:-$2}")" --arg body "$3" --arg bot "$P_BOT" \
+  '{id:$id,user:{login:$bot,type:"Bot"},created_at:$at,updated_at:$up,body:$body}'; }
+# A Review Summary: status, run time (epoch, may carry a fraction), JSON commit,
+# row commit, comment created/updated.
+p_summary() {
+  local status=$1 run=$2 jsha=$3 rsha=$4 created=$5 updated=$6 cell
+  case "$status" in completed) cell='✅ **Completed**' ;; running) cell='⏳ **Running**' ;; *) cell="**$status**" ;; esac
+  jq -nc --arg status "$status" --arg run "$run" --arg jsha "$jsha" --arg rsha "${rsha:0:7}" --arg cell "$cell" \
+    --arg created "$(p_at "$created")" --arg updated "$(p_at "$updated")" --arg bot "$P_BOT" '
+    {id:900,user:{login:$bot,type:"Bot"},created_at:$created,updated_at:$updated,
+     body:("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 "
+       + ({code_review:{commit_sha:$jsha,status:$status},security_review:{status:null}} | tojson)
+       + " -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | "
+       + $cell + " <relative-time datetime=\"" + $run + "\">" + $run + "</relative-time> | `" + $rsha + "` | Manual request |\n")}'
+}
+P_T0=$((P_NOW - 600))      # the request, ten minutes before now
+P_OLD=$((P_NOW - 4000))    # a request past the 1800 s bound
+p_check() { # name comments reviews expected-state [expected-reason] [timeout]
+  local got
+  got=$(crqe_codex_pending_state "$2" "$3" nathanjohnpayne "$P_BOT" "$P_HEAD" "${6:-1800}" "$P_NOW" \
+    "$CODEX_USAGE_LIMIT_MARKER_RE" "$CODEX_NOT_CONNECTED_MARKER_RE") \
+    || { echo "FAIL #2881 $1: helper exited nonzero"; exit 1; }
+  if [ "$(printf '%s' "$got" | jq -r .state)" != "$4" ] \
+     || { [ -n "${5:-}" ] && [ "$(printf '%s' "$got" | jq -r .reason)" != "$5" ]; }; then
+    echo "FAIL #2881 $1: want $4${5:+/$5}, got $got"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 pending-state $1 -> $4"
+}
+# shellcheck source=../scripts/lib/codex-failure-markers.sh
+. "$ROOT/scripts/lib/codex-failure-markers.sh"
+R0=$(p_req 501 "$P_T0")
+p_check no-request '[]' '[]' none no-request
+p_check foreign-request-only "[$(p_req 501 "$P_T0" someone-else)]" '[]' none
+p_check running-no-response "[$R0]" '[]' pending request-unanswered
+p_check no-response-past-bound "[$(p_req 501 "$P_OLD")]" '[]' timed-out request-unanswered
+p_check review-after-request "[$R0]" "[$(p_review $((P_T0 + 60)))]" answered
+p_check review-same-second "[$R0]" "[$(p_review "$P_T0")]" pending request-unanswered
+p_check review-before-request "[$R0]" "[$(p_review $((P_T0 - 60)))]" pending
+p_check review-other-head "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_OTHER")]" pending
+p_check review-impersonated-user-type "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_HEAD" User)]" pending
+p_check new-request-after-answer "[$R0,$(p_req 502 $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 60)))]" pending request-unanswered
+p_check new-head-old-answer "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_OTHER")]" pending
+p_check affirmative-verdict "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_HEAD\`")]" '[]' answered
+p_check verdict-other-head "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_OTHER\`")]" '[]' pending
+p_check something-went-wrong "[$R0,$(p_comment 601 $((P_T0 + 60)) 'Codex Review: Something went wrong. Try again later by commenting “@codex review”.')]" '[]' answered
+p_check usage-limit-refusal "[$R0,$(p_comment 601 $((P_T0 + 60)) 'You have reached your Codex usage limits for code reviews.')]" '[]' answered
+p_check summary-completed-after "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' answered
+# An unrelated later edit moves updated_at but not the run time Codex wrote.
+p_check summary-unrelated-edit "[$R0,$(p_summary completed "$(p_at $((P_T0 - 300)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 400)) $((P_T0 + 200)))]" '[]' pending
+p_check summary-fraction-same-second "[$R0,$(p_summary completed "$(p_at "$P_T0" | sed 's/Z$/.900000Z/')" "$P_HEAD" "$P_HEAD" $((P_T0 - 10)) $((P_T0 + 5)))]" '[]' pending
+p_check summary-run-after-edit "[$R0,$(p_summary completed "$(p_at $((P_T0 + 500)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 10)) $((P_T0 + 60)))]" '[]' pending
+p_check summary-other-head "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_OTHER" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
+p_check summary-json-row-disagree "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
+p_check summary-running-after-answer "[$R0,$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 60)))]" pending review-running
+p_check running-no-request "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending review-running
+p_check running-past-bound "[$(p_summary running "$(p_at "$P_OLD")" "$P_HEAD" "$P_HEAD" "$P_OLD" "$P_OLD")]" '[]' timed-out review-running
+p_check review-format-exact "[$R0,$(p_comment 601 $((P_T0 + 60)) "### 💡 Codex Review
+
+https://github.com/o/r/blob/$P_HEAD/a.sh#L1
+**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  A finding**")]" '[]' answered
+p_check review-format-unanchored "[$R0,$(p_comment 601 $((P_T0 + 60)) '## Review Findings
+
+### [P1] A finding without a permalink')]" '[]' pending
+p_check bounded-by-policy-window "[$R0]" '[]' timed-out request-unanswered 300
+if [ "$(crqe_codex_pending_state "[$(p_req 501 "$P_T0" | jq -c 'del(.created_at)')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ] \
+   && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 18x00 "$P_NOW" | jq -r .state)" = unreadable ] \
+   && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" abc 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
+  PASS=$((PASS + 1)); echo 'PASS: #2881 pending-state unreadable request, window or head refuse'
+else
+  echo 'FAIL: #2881 unreadable pending-state input was accepted'; exit 1
+fi
+# The anchor is the request's server time: a later evaluation of the same
+# evidence reports the same bound, so a rerun cannot extend or reset it.
+_e1=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .expires_at)
+_e2=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 $((P_NOW + 900)) | jq -r .expires_at)
+[ "$_e1" = "$_e2" ] && [ "$_e1" = "$(p_at $((P_T0 + 1800)))" ] \
+  || { echo "FAIL: #2881 the bound moved between evaluations ($_e1 vs $_e2)"; exit 1; }
+PASS=$((PASS + 1)); echo 'PASS: #2881 the timeout bound is anchored to the request, not to the evaluation'
+
+# Review-format findings issue comments (#2881). The canonical fixture is the
+# late P2 Codex posted on mergepath#1120 five minutes after merge.
+F1120=$(jq -c '.comment' "$ROOT/tests/fixtures/codex_late_review_format_1120.json")
+F1120_HEAD=$(jq -r '.merge_head' "$ROOT/tests/fixtures/codex_late_review_format_1120.json")
+f_anchor() { crqe_review_format_findings "$1" "$P_BOT" "$2" | jq -r 'map(.anchor) | join(",")'; }
+while IFS='|' read -r name comments head want; do
+  got=$(f_anchor "$comments" "$head") || { echo "FAIL #2881 format $name: selector failed"; exit 1; }
+  [ "$got" = "$want" ] || { echo "FAIL #2881 format $name: want '$want', got '$got'"; exit 1; }
+  PASS=$((PASS + 1)); echo "PASS: #2881 review-format $name -> ${want:-ignored}"
+done <<CASES
+1120-merge-head|[$F1120]|$F1120_HEAD|exact
+1120-other-head|[$F1120]|$P_HEAD|other
+1120-posted-by-user|[$(printf '%s' "$F1120" | jq -c '.user.type = "User"')]|$F1120_HEAD|
+1120-other-login|[$(printf '%s' "$F1120" | jq -c '.user.login = "chatgpt-codex-connector"')]|$F1120_HEAD|
+task-reply-p1|[$(p_comment 610 "$P_T0" '## Review Findings
+
+### [P1] The lede retains a universal claim')]|$P_HEAD|none
+clean-task-reply|[$(p_comment 611 "$P_T0" '## Review Result
+
+No blocking findings.')]|$P_HEAD|
+mixed-anchors|[$(p_comment 612 "$P_T0" "https://github.com/o/r/blob/$P_HEAD/a#L1 ![P1 Badge](x) https://github.com/o/r/blob/$P_OTHER/b#L2")]|$P_HEAD|mixed
+CASES
+
+# The Review Summary is never a finding, even with a badge in it (its table
+# pipes keep it out of the delimited table above).
+[ "$(f_anchor "[$(p_summary completed "$(p_at "$P_T0")" "$P_HEAD" "$P_HEAD" "$P_T0" "$P_T0" | jq -c '.body += "\n![P1 Badge](x)"')]" "$P_HEAD")" = "" ] \
+  || { echo 'FAIL: #2881 the Review Summary was classified as a findings comment'; exit 1; }
+PASS=$((PASS + 1)); echo 'PASS: #2881 review-format summary-is-not-a-finding -> ignored'
+
+# End-to-end through the production checker. A Phase 4b approval that is
+# newer than every Codex signal on HEAD, under a substitute-enabled policy.
+e_iso() { date -u -r $(( $(date -u +%s) - $1 )) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ; }
+e_run() { # name comments reviews expected-rc pattern
+  printf '%s\n' "$2" >"$DIR/comments"
+  printf '%s\n' "$3" >"$DIR/reviews"
+  printf '[]\n' >"$DIR/ack"
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$1" \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$4" ] || ! grep -qF -- "$5" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #2881 e2e $1 rc=$rc (want $4, '$5')"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 e2e $1"
+}
+E_REQ_RECENT="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 300)\",\"body\":\"@codex review\"}"
+E_REQ_OLD="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 4000)\",\"body\":\"@codex review\"}"
+E_APPROVAL="[{\"user\":{\"login\":\"nathanpayne-codex\"},\"state\":\"APPROVED\",\"commit_id\":\"$P_HEAD\",\"submitted_at\":\"$(e_iso 60)\",\"body\":\"Manual Phase 4b approval\"}]"
+E_FINDING_ANSWER="{\"id\":140,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 200)\",\"updated_at\":\"$(e_iso 200)\",\"body\":\"### 💡 Codex Review\\n\\nhttps://github.com/o/r/blob/$P_HEAD/a.sh#L1\\n**<sub><sub>![P2 Badge](x)</sub></sub> A finding**\"}"
+E_FINDING_LATE="{\"id\":141,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"### 💡 Codex Review\\n\\nhttps://github.com/o/r/blob/$P_HEAD/a.sh#L1\\n**<sub><sub>![P1 Badge](x)</sub></sub> A finding**\"}"
+E_RUNNING=$(p_summary running "$(e_iso 20)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg at "$(e_iso 20)" '.created_at = $at | .updated_at = $at')
+e_run request-pending "[$E_REQ_RECENT]" "$E_APPROVAL" 1 'Codex still owes abcdef0123456789000000000000000000000000 a review'
+e_run request-timed-out "[$E_REQ_OLD]" "$E_APPROVAL" 0 'codex-review-outcome: timed-out/substitute-used'
+e_run request-answered-before-approval "[$E_REQ_RECENT,$E_FINDING_ANSWER]" "$E_APPROVAL" 0 'cleared — Phase 4b substitute'
+e_run finding-newer-than-approval "[$E_REQ_OLD,$E_FINDING_LATE]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+e_run run-in-flight-no-request "[$E_RUNNING]" "$E_APPROVAL" 1 'review-running'
+if grep -q 'timed-out/substitute-used' "$DIR/out"; then
+  echo 'FAIL: #2881 a pending run was reported as a timeout'; exit 1
+fi
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

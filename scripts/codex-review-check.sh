@@ -2379,6 +2379,28 @@ if [ "$CODEX_ENABLED" = "true" ]; then
       ]
     | max_by(.created_at) // null
   ')
+  # #2881: Codex also posts review-format findings (priority badges, blob
+  # permalinks, no `Codex review:` header) as an issue comment, sometimes with
+  # no companion review. The selector above cannot see them. Each one is a
+  # negative signal: unless its anchors name only other heads, a newer one
+  # replaces the latest verdict as non-affirmative, wins a timestamp tie, and
+  # is timed by its latest edit so an edit that adds findings stays newest.
+  # It never clears. A missing or unreadable selector fails the run.
+  declare -F crqe_review_format_findings >/dev/null 2>&1 \
+    || die 3 "codex-request-evidence helper missing crqe_review_format_findings (#2881)"
+  CODEX_FORMAT_FINDING_JSON=$(crqe_review_format_findings "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA" \
+    | jq -c '[ .[] | select(.anchor != "other")
+               | . + {at: ([.created_at, .updated_at] | max)} ] | max_by([.at, .comment_id]) // null') \
+    || die 3 "cannot classify review-format Codex issue comments (#2881)"
+  if [ "$CODEX_FORMAT_FINDING_JSON" != null ]; then
+    __format_at=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.at')
+    __verdict_at=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
+    if [ -z "$__verdict_at" ] || ! [[ "$__verdict_at" > "$__format_at" ]]; then
+      CODEX_VERDICT_JSON=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" \
+        | jq -c '{created_at: .at, exact: (.anchor == "exact"), affirmative: false}')
+      log "codex verdict: review-format Codex findings comment #$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.comment_id') @ $__format_at (anchor: $(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.anchor')) is the latest verdict signal — NON-affirmative (#2881)"
+    fi
+  fi
   CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
   if [ "$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "false" else (.affirmative | tostring) end')" = "true" ]; then
     CODEX_HEAD_VERDICT_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
@@ -3069,11 +3091,55 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
         PHASE_4B_SUPERSEDED="a Codex request by $AUTHOR_IDENTITY @ $LATEST_AUTHOR_REQUEST_TIME is not older than it (no recorded request generation)"
       fi
     fi
+    # #2881 option (c): the approval also waits while Codex still owes this
+    # head a review, meaning the configured author's latest request has no
+    # exact-head Codex outcome after it, or a Code Review run on HEAD started
+    # after the last outcome (crqe_codex_pending_state). The wait is bounded
+    # by codex.review_timeout_seconds from the request's server created_at, or
+    # from the run's own start time, so a rerun can neither reset nor extend
+    # it. Past the bound the approval is accepted as an explicit
+    # `timed-out/substitute-used` fallback: Codex may still be running and may
+    # post findings after merge (the late-finding detector, #2881, surfaces
+    # those). The approval, accounting and every other gate still apply.
+    # Requests come from the fresh re-read above; outcome evidence also uses
+    # the earlier anchor-resolved comments. Unreadable evidence refuses.
+    PHASE_4B_CODEX_OWED=""
+    PHASE_4B_TIMEOUT_NOTE=""
+    if [ -z "$PHASE_4B_SUPERSEDED" ] && [ "$CODEX_ENABLED" = "true" ]; then
+      PENDING_WINDOW=$(codex_field review_timeout_seconds)
+      PENDING_WINDOW=${PENDING_WINDOW:-1800}
+      if ! declare -F crqe_codex_pending_state >/dev/null 2>&1; then
+        PHASE_4B_CODEX_OWED="the Codex pending-review helper is unavailable"
+      elif ! [[ "$PENDING_WINDOW" =~ ^[0-9]+$ ]]; then
+        PHASE_4B_CODEX_OWED="codex.review_timeout_seconds is not a whole number of seconds ('$PENDING_WINDOW')"
+      elif ! PENDING_COMMENTS=$(printf '%s\n' "${ISSUE_COMMENTS_JSON:-[]}" "$REQUEST_COMMENTS_JSON" \
+               | jq -sc 'if length == 2 and (.[0] | type) == "array" and (.[1] | type) == "array"
+                         then .[0] + .[1] | group_by(.id) | map(.[0]) else error("comments") end' 2>/dev/null) \
+           || ! PENDING_JSON=$(crqe_codex_pending_state "$PENDING_COMMENTS" "$REVIEWS_JSON" "$AUTHOR_IDENTITY" \
+               "$BOT_LOGIN" "$HEAD_SHA" "$PENDING_WINDOW" "$(date -u +%s)" \
+               "${CODEX_USAGE_LIMIT_MARKER_RE:-}" "${CODEX_NOT_CONNECTED_MARKER_RE:-}" 2>/dev/null); then
+        PHASE_4B_CODEX_OWED="Codex pending-review evidence is unreadable"
+      else
+        PENDING_STATE=$(printf '%s' "$PENDING_JSON" | jq -r '.state // "unreadable"')
+        PENDING_DETAIL=$(printf '%s' "$PENDING_JSON" | jq -r '"\(.reason // "unknown"); request \(.request.id // "none") @ \(.request.created_at // "none"); last exact-head Codex outcome \(.terminal_at // "none"); run in flight since \(.running_since // "none"); anchor \(.anchor_at // "none"); bound \(.expires_at // "none")"')
+        case "$PENDING_STATE" in
+          none|answered) log "gate (c): Codex owes HEAD no review ($PENDING_STATE: $PENDING_DETAIL) (#2881)" ;;
+          pending) PHASE_4B_CODEX_OWED="Codex still owes $HEAD_SHA a review ($PENDING_DETAIL); the approval waits for Codex or for the bound" ;;
+          timed-out)
+            PHASE_4B_TIMEOUT_NOTE="; codex-review-outcome: timed-out/substitute-used — no Codex outcome within codex.review_timeout_seconds=${PENDING_WINDOW}s ($PENDING_DETAIL); this is a fallback, not a Codex result, and a running review may still report after merge (#2881)"
+            log "gate (c): codex-review-outcome: timed-out/substitute-used ($PENDING_DETAIL) (#2881)"
+            ;;
+          *) PHASE_4B_CODEX_OWED="Codex pending-review evidence is unreadable ($PENDING_DETAIL)" ;;
+        esac
+      fi
+    fi
     if [ -n "$PHASE_4B_SUPERSEDED" ]; then
       log "gate (c): Phase 4b substitute candidate $PHASE_4B_LOGIN @ $PHASE_4B_TIME is not accepted: $PHASE_4B_SUPERSEDED (#1598)"
+    elif [ -n "$PHASE_4B_CODEX_OWED" ]; then
+      log "gate (c): Phase 4b substitute candidate $PHASE_4B_LOGIN @ $PHASE_4B_TIME is not accepted: $PHASE_4B_CODEX_OWED (#2881)"
     elif [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
       CLEARED=true
-      CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true; newer than any Codex bot signal on HEAD: ${LATEST_CODEX_SIGNAL_TIME:-none})"
+      CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true; newer than any Codex bot signal on HEAD: ${LATEST_CODEX_SIGNAL_TIME:-none})$PHASE_4B_TIMEOUT_NOTE"
     else
       log "gate (c): Phase 4b substitute candidate $PHASE_4B_LOGIN @ $PHASE_4B_TIME is older than newest Codex bot signal @ $LATEST_CODEX_SIGNAL_TIME; latest-signal-wins guard rejects substitute"
     fi
