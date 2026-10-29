@@ -462,11 +462,13 @@ ALLOW_LIST=(
   # still SKIP. Its own reasoning is in the wrapper's header.
   "tests/test_consumer_residue_safety.sh"
 
-  # The #2221 git pre-push mirror of repo-lint is hub-only first: no
-  # consumer receives the hook, its runner or its installer until a
-  # propagation decision is made. check_repo_lint_prepush ships in the CI
-  # kit and SKIPs on consumers via the both-absent marker idiom, so its
-  # parity suite never needs to travel.
+  # The suites of the #2221 git pre-push mirror of repo-lint. Since #2844
+  # the hook, its runner and its installer propagate to every consumer (they
+  # are manifest entries, so they are NOT listed here), with a templated
+  # .github/prepush.yml; the suites stay hub-only. check_repo_lint_prepush
+  # ships in the CI kit and SKIPs on consumers behind the
+  # scripts/sync-to-downstream.sh marker, so its parity suite never needs to
+  # travel: the runner it proves is byte-identical in every consumer.
   "tests/test_repo_lint_prepush.sh"
   # Its per-repository policy suite (#2840), run by the same wrapper behind
   # the same hub marker, is hub-only for the same reason.
@@ -475,6 +477,10 @@ ALLOW_LIST=(
   "tests/test_repo_lint_prepush_defer.sh"
   # Its live host-load suite (#2842), likewise.
   "tests/test_repo_lint_prepush_load.sh"
+  # Its fleet suite (#2844), run by check_repo_lint_prepush_fleet behind the
+  # same marker: it reads the hub-only manifest, so it cannot run on a
+  # consumer. It also asserts that the propagated pieces stay off this list.
+  "tests/test_repo_lint_prepush_fleet.sh"
 )
 
 is_allow_listed() {

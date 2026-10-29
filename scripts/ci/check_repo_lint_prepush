@@ -3,8 +3,8 @@ set -euo pipefail
 
 # check_repo_lint_prepush
 #
-# Runs tests/test_repo_lint_prepush.sh (#2221): the hub-only git pre-push
-# mirror of repo-lint must select, for any changed-path list, exactly the
+# Runs tests/test_repo_lint_prepush.sh (#2221): the git pre-push mirror of
+# repo-lint must select, for any changed-path list, exactly the
 # wrappers and self-tests the CI scope job and the workflow's `if:`
 # expressions select, and must block a push on a failing selected check.
 # Wired in lint_fast so a workflow or classifier change that the mirror does
@@ -21,13 +21,16 @@ DEFER_TEST="$REPO_ROOT/tests/test_repo_lint_prepush_defer.sh"
 LOAD_TEST="$REPO_ROOT/tests/test_repo_lint_prepush_load.sh"
 
 # Consumer-safety guard (#601), marker-FIRST: the scripts/ci kit travels to
-# every consumer, but the pre-push mirror and its suite are hub-only (not
-# manifest-propagated). Gating on the hub marker alone keeps the verdict a
+# every consumer, and since #2844 so do the hook, the runner and the
+# installer, but these suites stay hub-only (not manifest-propagated): the
+# runner is byte-identical everywhere, and check_repo_lint_prepush_fleet
+# covers its consumer-mode behaviour on the hub. Gating on the hub marker
+# alone, not on the runner's presence, keeps the verdict a
 # SKIP on a consumer that carries the suite as bootstrap residue, which the
 # both-absent pair would run instead (the residue-invariance net toggles
 # exactly that file). On the hub, a missing suite is a hard error.
 if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-  echo "check_repo_lint_prepush: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push mirror is hub-only)"
+  echo "check_repo_lint_prepush: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push mirror's suites are hub-only)"
   exit 0
 fi
 for t in "$TEST_SCRIPT" "$POLICY_TEST" "$DEFER_TEST" "$LOAD_TEST"; do

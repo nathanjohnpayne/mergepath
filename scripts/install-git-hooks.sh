@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # install-git-hooks.sh — point this clone's git hooks at scripts/git-hooks/
-# (#2221), which enables the repo-lint pre-push hook. Hub-only tooling.
+# (#2221), which enables the repo-lint pre-push hook. Propagated to every
+# consumer with the hook and its runner (#2844); docs/agents/testing-
+# requirements.md § Pre-push hook in the hub has the full reference.
 #
 # Idempotent and local: it writes exactly one key, `core.hooksPath`, to this
 # repository's own config (`git config --local`); global and system config
