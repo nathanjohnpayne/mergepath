@@ -675,13 +675,21 @@ jobs:
         if: matrix.shard == 4
         run: ./scripts/ci/check_repo_lint_latency_report || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_latency_report ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_latency_report not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
-      # The hub-only git pre-push mirror of this workflow (#2221) must
-      # select what the scope job and the if: expressions here select; its
-      # suite evaluates them, so it reads this file and needs yq. The
-      # wrapper SKIPs on consumers, which do not receive the mirror.
+      # The git pre-push mirror of this workflow (#2221) must select what
+      # the scope job and the if: expressions here select; its suite
+      # evaluates them, so it reads this file and needs yq. The mirror
+      # propagates to consumers (#2844), but its suites are hub-only, so the
+      # wrapper SKIPs there.
       - name: check_repo_lint_prepush
         if: matrix.shard == 2
         run: ./scripts/ci/check_repo_lint_prepush || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      # The mirror's fleet adoption (#2844): its manifest entries, the
+      # rendered consumer policies, and the runner on a consumer-shaped
+      # checkout. Reads the hub-only manifest, so it SKIPs on consumers.
+      - name: check_repo_lint_prepush_fleet
+        if: matrix.shard == 4
+        run: ./scripts/ci/check_repo_lint_prepush_fleet || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush_fleet ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush_fleet not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Hermetic suite for the stalled-PR finder + resume entry point
       # (scripts/workflow/stalled-prs.sh, resume-stalled-pr.sh; #2165).

@@ -1,0 +1,57 @@
+# .github/prepush.yml
+#
+# Per-repository policy for the repo-lint pre-push hook
+# (scripts/git-hooks/pre-push -> scripts/repo-lint-prepush.sh).
+#
+# This file is rendered by mergepath's propagation engine from
+# examples/prepush.yml in the mergepath hub, using this repository's
+# `prepush_mode` fact in the hub's .mergepath-sync.yml (#2844). Change the
+# policy by changing that fact in the hub; a local edit here is drift that the
+# next sync overwrites. A repository that must own this file lists
+# .github/prepush.yml under skip_paths in its .sync-overrides.yml, with a
+# reason.
+#
+# The hook runs only in a clone where scripts/install-git-hooks.sh has set
+# core.hooksPath; `scripts/install-git-hooks.sh --check` says whether it has.
+# It reads this file from the commit being pushed. Each key resolves as
+#   --set KEY=VALUE  >  environment variable  >  this file  >  built-in default
+# and the hook's `policy` line prints every effective value and its source. A
+# file it cannot read as one mapping of the keys below, with valid values,
+# blocks the push.
+#
+# CI's `lint` check stays authoritative whatever this file says: the policy
+# only decides how much of it runs locally before a push.
+
+# off: run nothing. selected: only the wrappers the classifier selects for the
+# change; the live assertions are left to CI. full: the live assertions plus
+# the selected wrappers. Env: MERGEPATH_PREPUSH_MODE.
+# >>> if prepush_mode == off
+mode: off
+# <<<
+# >>> if prepush_mode != off
+mode: selected
+# <<<
+
+# run | defer: when the change selects the complete surface, defer runs only
+# the wrappers its changed paths select and names every other wrapper as
+# deferred to CI. Env: MERGEPATH_PREPUSH_FULL_SUITE.
+full_suite: defer
+
+# Check budget in minutes, 0 for none: a check that its last recorded duration
+# says would end past it is not started and is deferred to CI, and none starts
+# once it has passed; a failed check still blocks the push.
+# Env: MERGEPATH_PREPUSH_MAX_MINUTES.
+max_minutes: 5
+
+# Also run the selected deep-lane steps (same as --deep).
+# Env: MERGEPATH_PREPUSH_DEEP.
+deep: false
+
+# nice level for every check. Env: MERGEPATH_PREPUSH_NICE.
+nice: 10
+
+# Concurrency: jobs_max checks at once while the one-minute load average per
+# CPU is below load_per_cpu_threshold, one once it is not, re-read before each
+# check. Env: MERGEPATH_PREPUSH_JOBS_MAX, MERGEPATH_PREPUSH_LOAD_PER_CPU_THRESHOLD.
+jobs_max: 2
+load_per_cpu_threshold: 1
