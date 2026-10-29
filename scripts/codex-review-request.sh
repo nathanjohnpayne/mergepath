@@ -9,6 +9,9 @@
 # Usage:
 #   scripts/codex-review-request.sh [--trigger-only] [--failover] [--allow-moving-head] <PR_NUMBER> [REPO]
 #
+# Internal wrapper mode (not an operator entry point):
+#   scripts/codex-review-request.sh --authorize-trigger-write [--allow-moving-head] <PR_NUMBER> [REPO]
+#
 # Flags:
 #   --trigger-only       Post (or confirm) the `@codex review` trigger and
 #                        exit 0 without polling for clearance (#489).
@@ -23,6 +26,17 @@
 #                        not declared final: the CodeRabbit rate-limit
 #                        failover in scripts/coderabbit-wait.sh, or an agent
 #                        that has verified by hand that the head is final.
+#   --authorize-trigger-write
+#                        INTERNAL: implies --trigger-only; called only by
+#                        scripts/lib/gh-comment-trigger-guard.sh while it
+#                        holds the per-PR request claim. Applies the
+#                        requester's ordinary no-write decisions and governing
+#                        budget, feedback, expected-head, live-head and
+#                        observed request-generation fences, then reports
+#                        whether the guarded trigger write is authorized. This
+#                        mode never posts a trigger, spends a request, polls,
+#                        or establishes review clearance; callers must use
+#                        the wrapper for the actual write.
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
