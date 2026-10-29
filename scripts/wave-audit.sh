@@ -28,8 +28,9 @@
 #
 # Codex on the canary (#2771): before dispatch the helper sends the canary
 # exactly ONE Codex request (scripts/codex-review-request.sh --trigger-only)
-# unless an author request already exists, and the orchestrator's same-head
-# barrier then waits on that request's own outcome. Before this, the canary
+# unless an author request or a current-head Codex Review Summary already
+# exists. The orchestrator's same-head barrier waits on the existing review
+# or the new request. Before this, the canary
 # was never asked, so the barrier's Codex arm could finish only if the Codex
 # App happened to auto-review it; otherwise it held until the budget ran out
 # and the audit exited 4. A Codex request that never answers still ends in
@@ -274,20 +275,21 @@ request_canary_codex_review() {
   # "not yet" to the signal check above, yet the barrier opens as soon as it
   # completes, so a request sent now could still be unanswered when the
   # approval posts (Phase 4b P1 on #2868, round 2). Reuse that review instead:
-  # a Review Summary row for this head that is Running or of unknown status
-  # sends no request, and the barrier waits on that review. A Completed row
-  # with no qualifying result is inactive and does not block the request.
+  # any Review Summary row for this head sends no request. Completed must
+  # count too: the review can finish between the diagnostic probe and this
+  # newer comments snapshot (round 3), and the barrier would accept that
+  # completion before a newly posted request was answered.
   head="$pr_head"
   if [ -z "$head" ] && [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" = 1 ]; then
     head="${WAVE_AUDIT_TEST_CANARY_HEAD:-}"   # hermetic tests only
   fi
   [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] \
-    || die 3 "no verified canary head for ${REPO}#${PR} to check for a running Codex review (#2771)"
+    || die 3 "no verified canary head for ${REPO}#${PR} to check for a Codex review (#2771)"
   bot="$(block_field codex bot_login)"
   bot="${bot:-chatgpt-codex-connector[bot]}"
   summary="$(crqe_select_codex_review_summary "$comments" "$bot" "$head" 2>/dev/null)" \
     || die 3 "cannot read the Codex Review Summary on ${REPO}#${PR} (#2771)"
-  if printf '%s' "$summary" | jq -e '. != null and .status != "completed"' >/dev/null 2>&1; then
+  if printf '%s' "$summary" | jq -e '. != null' >/dev/null 2>&1; then
     log "a Codex review of the ${REPO}#${PR} head is $(printf '%s' "$summary" | jq -r .status) (unsolicited); no request — the barrier waits on that review (#2771)"
     return 0
   fi

@@ -179,6 +179,15 @@ cat > "$FAKE_CODEX_CHECK" <<'FAKE'
 printf '%s skip_ci=%s require=%s sub=%s\n' "$*" "${CODEX_REVIEW_CHECK_SKIP_CI:-unset}" \
   "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-unset}" "${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-unset}" \
   >> "$CAPTURE/codex-check"
+# Model completion after the diagnostic observed Running but before the
+# caller reads comments. The same summary comment is edited in place.
+if [ -n "${FAKE_CODEX_SUMMARY_TRANSITION_FILE:-}" ]; then
+  grep -q '\*\*Running\*\*' "$FAKE_CODEX_SUMMARY_TRANSITION_FILE" || exit 3
+  cp "$FAKE_CODEX_SUMMARY_TRANSITION_FILE" "$CAPTURE/running-summary"
+  sed 's/\*\*Running\*\*/**Completed**/g' "$FAKE_CODEX_SUMMARY_TRANSITION_FILE" > "$CAPTURE/completed-summary"
+  cp "$CAPTURE/completed-summary" "$FAKE_CODEX_SUMMARY_TRANSITION_FILE"
+  exit 1
+fi
 exit "${FAKE_CODEX_CHECK_EXIT:-1}"
 FAKE
 chmod +x "$FAKE_CODEX_CHECK"
@@ -187,7 +196,12 @@ cat > "$FAKE_COMMENTS_GH" <<'FAKE'
 #!/usr/bin/env bash
 [ "${FAKE_COMMENTS_EXIT:-0}" = 0 ] || exit "$FAKE_COMMENTS_EXIT"
 case "$*" in
-  *"/comments"*) printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}" ;;
+  *"/comments"*)
+    if [ -n "${FAKE_CODEX_SUMMARY_TRANSITION_FILE:-}" ]; then
+      cat "$FAKE_CODEX_SUMMARY_TRANSITION_FILE"
+    else
+      printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}"
+    fi ;;
   *) exit 1 ;;
 esac
 FAKE
@@ -1464,7 +1478,7 @@ FAKE_CODEX_CHECK_EXIT=3 \
 # is still Running reads as "not yet" to the signal check (rc 1), but the
 # barrier opens the moment it completes (Running -> Completed), so a request
 # sent now could still be unanswered when the approval posts. That review is
-# reused instead: Running or unknown status on THIS head sends no request.
+# reused instead: every summary status on THIS head sends no request.
 _wave_summary_comments() { # <status> <commit>
   jq -nc --arg s "$1" --arg c "$2" '[[{id:7201,user:{login:"chatgpt-codex-connector[bot]"},
     created_at:"2026-10-28T00:01:00Z",updated_at:"2026-10-28T00:02:00Z",
@@ -1478,7 +1492,19 @@ grep -q 'Codex review of the owner/consumer#91 head is running' "$WORK/codex-cas
 FAKE_CANARY_COMMENTS="$(_wave_summary_comments Queued ccccccc)" \
   _codex_case "an unknown-status summary for this head sends no request" 4 0 yes --base "$C1" --head-sha "$C2"
 FAKE_CANARY_COMMENTS="$(_wave_summary_comments Completed ccccccc)" \
-  _codex_case "a Completed summary with no qualifying result does not block the request" 4 1 yes --base "$C1" --head-sha "$C2"
+  _codex_case "a Completed summary with no qualifying result sends no request" 4 0 yes --base "$C1" --head-sha "$C2"
+# Round 3: completion between the diagnostic and the comments snapshot must
+# not leave a new request pending behind an already-terminal barrier signal.
+_wave_summary_comments Running ccccccc > "$WORK/codex-transition.json"
+FAKE_CODEX_SUMMARY_TRANSITION_FILE="$WORK/codex-transition.json" \
+  _codex_case "Running to Completed between reads reuses the review without requesting" 4 0 yes --base "$C1" --head-sha "$C2"
+if grep -q '\*\*Running\*\*' "$CAPTURE/running-summary" \
+   && grep -q '\*\*Completed\*\*' "$WORK/codex-transition.json" \
+   && grep -q 'head is completed' "$WORK/codex-case.err"; then
+  pass "#2771: the diagnostic observed Running before the comments read observed Completed"
+else
+  fail "#2771: Running-to-Completed transition was not exercised"
+fi
 FAKE_CANARY_COMMENTS="$(_wave_summary_comments Running 1111111)" \
   _codex_case "a Running summary for another commit does not block the request" 4 1 yes --base "$C1" --head-sha "$C2"
 WAVE_AUDIT_TEST_CANARY_HEAD=not-a-sha \
