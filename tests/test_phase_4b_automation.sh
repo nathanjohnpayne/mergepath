@@ -6280,6 +6280,7 @@ _wb_fixtures() {
     w2-manual-run-same-second-as-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:00:00.900Z)]" \
     w3-unsolicited-appears-after-snapshot hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:00:30Z)]" \
     w4-superseded-by-newer-author-request clear "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-superseded-after-the-run-completed hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z),$(_wb_req 502 nathanjohnpayne 2026-10-29T12:06:00Z)]" \
     w4-foreign-trigger-after-request hold "[$_WB_R,$(_wb_req 600 someone 2026-10-29T12:01:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
     w4-author-prose-mention-after-request hold "[$_WB_R,$(_wb_req 601 nathanjohnpayne 2026-10-29T12:01:00Z 'please @codex review again'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
     other-commit hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)]" \
@@ -6319,6 +6320,7 @@ _wb_mutant run-time 'elif $run <= $t then' 'elif false then' w2-manual-run-compl
 _wb_mutant status 'elif ($sj.code_review.status // "") != "completed"' 'elif false' w2-our-run-running
 _wb_mutant foreign 'elif ($foreign | length) > 0 then' 'elif false then' w4-foreign-trigger-after-request
 _wb_mutant commit 'elif $jc != $h then' 'elif false then' other-commit
+_wb_mutant latest-request '| max // $rt) as $t' '| $rt) as $t' w4-superseded-after-the-run-completed
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens.

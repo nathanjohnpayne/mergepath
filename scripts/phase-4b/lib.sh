@@ -2141,7 +2141,9 @@ P4B_BARRIER_WAVE_CODEX_REQUEST=""
 #
 #   clear       the bound request R is the author's exact request, and the
 #               LATEST summary is a Completed "Manual request" run on exactly
-#               <head> whose run time is strictly after R, and no other
+#               <head> whose run time is strictly after R and after every
+#               later author request (one that supersedes R must itself be
+#               answered), and no other
 #               comment mentioning Codex's handle appeared after R (a foreign
 #               or ambiguous trigger means the manual run cannot be tied to
 #               R). A newer author request that supersedes R clears on the
@@ -2176,11 +2178,16 @@ p4b_wave_codex_binding_eval() {
         elif ($r | exact_request | not) then {state: "unreadable", reason: "bound-request-not-author-request"}
         elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
         else
-          ($r.created_at | secs) as $t
+          ($r.created_at | secs) as $rt
+          # The run must answer the LATEST author request at or after R: a
+          # request that supersedes R after a run completed is unanswered,
+          # and clearing then would approve ahead of it (Codex on #2875).
+          | ([ .[] | select(exact_request) | (.created_at // "" | secs)
+               | select(. != null and . >= $rt) ] | max // $rt) as $t
           | [ .[] | select((.id | tostring) != $rid)
               | select((.user.login // "") != $bot)
               | select(exact_request | not)
-              | select(((.created_at // "") | secs) as $c | $c != null and $c > $t)
+              | select(((.created_at // "") | secs) as $c | $c != null and $c > $rt)
               | select((.body // "") | test("@codex"; "i")) ] as $foreign
           | [ .[] | select((.user.login // "") == $bot)
               | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->")) ]

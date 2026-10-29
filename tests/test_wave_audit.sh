@@ -198,6 +198,9 @@ case "$*" in
     else
       printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}"
     fi ;;
+  *"/commits/"*)
+    [ "${FAKE_COMMIT_READ_EXIT:-0}" = 0 ] || exit "$FAKE_COMMIT_READ_EXIT"
+    printf '%s\n' "${FAKE_HEAD_COMMITTED:-2026-10-29T11:00:00Z}" ;;
   *) exit 1 ;;
 esac
 FAKE
@@ -239,6 +242,7 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -254,6 +258,7 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -321,6 +326,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
@@ -1443,6 +1449,23 @@ FAKE_CODEX_CHECK_EXIT=0 \
   _bind_case "Codex already spoke on the head: no request, barrier unbound (today's behaviour)" 4 0 none --base "$C1" --head-sha "$C2"
 FAKE_CODEX_CHECK_EXIT=2 \
   _bind_case "Codex cannot report: no request, barrier unbound" 4 0 none --base "$C1" --head-sha "$C2"
+# Codex on #2875: an outstanding author request for this head is bound before
+# the rc-0 shortcut. A rerun after an unsolicited App review completed must
+# still wait for the audit's own request instead of opening on that review.
+FAKE_CODEX_CHECK_EXIT=0 FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
+  _bind_case "rerun after an unsolicited review: the outstanding request stays bound" 4 0 501 --base "$C1" --head-sha "$C2"
+[ ! -e "$CAPTURE/codex-check" ] \
+  && pass "#2771: with an outstanding request the rc-0 shortcut is never consulted" \
+  || fail "#2771: the signal check ran despite an outstanding request"
+# Codex on #2875: a request older than the head's commit belongs to an
+# earlier canary head, so it is not bound; a fresh request is sent and bound.
+FAKE_HEAD_COMMITTED=2026-10-29T13:00:00Z FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
+FAKE_CANARY_COMMENTS_AFTER="[[$(_author_req 501),$(jq -nc '{id:9003,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-10-29T13:05:00Z"}')]]" \
+  _bind_case "a request from an earlier head is not bound; a fresh one is sent and bound" 4 1 9003 --base "$C1" --head-sha "$C2"
+FAKE_COMMIT_READ_EXIT=1 \
+  _bind_case "an unreadable head commit time fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+WAVE_AUDIT_TEST_CANARY_HEAD=not-a-sha \
+  _bind_case "no verified canary head fails closed before any request" 3 0 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CODEX_CHECK_EXIT=3 \
   _bind_case "an unreadable Codex signal fails closed before any request or review" 3 0 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
