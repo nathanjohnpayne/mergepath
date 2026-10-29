@@ -401,7 +401,8 @@ done <<<"$CASES"
 # fails here even if CI drifted the same way).
 check "docs case is fast-lane only" "$(grep -c '^deep' "$TMP/plan.docs" || true)" "0"
 check "docs case selects no graph wrapper" "$(grep -c '^selected' "$TMP/plan.docs" || true)" "0"
-check "self case selects the mirror's own wrapper" "$(awk -F'\t' '$1 == "selected" { print $3 }' "$TMP/plan.self")" "check_repo_lint_prepush"
+# The runner is also an input of the fleet suite's wrapper (#2844).
+check "self case selects the mirror's own wrappers" "$(awk -F'\t' '$1 == "selected" { print $3 }' "$TMP/plan.self" | LC_ALL=C sort | tr '\n' ' ')" "check_repo_lint_prepush check_repo_lint_prepush_fleet "
 # coderabbit-wait.sh is declared under both enrolled wrappers whose suites
 # name it (#2580), so exactly those two self-tests run.
 check "script case selects exactly its self-tests" \
