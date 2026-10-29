@@ -1544,6 +1544,11 @@ revalidate_phase4a_timeout_generation() {
 revalidate_wave_binding() {
   local where="${1:-post-adapter}" out state why
   [ -n "${P4B_BARRIER_WAVE_CODEX_REQUEST:-}" ] || return 0
+  # Only a dispatch the answered binding authorized is re-checked. The barrier
+  # keeps its account-block waiver for a bound wave (no request can then be
+  # answered); fencing that path would turn the retained fallback into a
+  # repeated exit 6 (Codex on #2888).
+  [ "${P4B_PRE_ADAPTER_CODEX_EVIDENCE:-}" = wave-request-answered ] || return 0
   out="$(p4b_wave_binding_evaluate "$REPO" "$PR" "$HEAD" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
   state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
   [ "$state" != clear ] || return 0

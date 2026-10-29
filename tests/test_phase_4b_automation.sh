@@ -6396,6 +6396,15 @@ _wbh() { # <graphql-reply|FAIL> -> p4b_comment_mention_history output
 [ "$(_wbh FAIL)" = null ] || bad="$bad [edit-history-failed-read-not-null]"
 [ "$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":150,"nodes":[{"editedAt":"x","diff":"v"}]}}}}')" = null ] \
   || bad="$bad [edit-history-truncated-not-null]"
+# Codex on #2888: a withheld or deleted revision (diff null) is an unknown
+# body, not "no mention"; the history is unreadable, so the binding holds.
+[ "$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":2,"nodes":[{"editedAt":"x","diff":"v"},{"editedAt":"y","diff":null}]}}}}')" = null ] \
+  || bad="$bad [edit-history-withheld-revision-not-null]"
+# The summary-history reader treats a withheld revision the same way.
+[ "$( (
+    gh() { printf '%s\n' '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":null}]}}}}'; }
+    p4b_codex_summary_versions "$(jq -nc '[{id:9000,node_id:"IC_s",user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-10-29T11:00:00Z",updated_at:"2026-10-29T12:00:00Z",body:"<!-- codex-pull-request-review-summary -->"}]')" 'chatgpt-codex-connector[bot]'
+  ) )" = null ] || bad="$bad [summary-history-withheld-revision-not-null]"
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens. The
@@ -6479,6 +6488,8 @@ _wbf() { # <bound-id> <evaluate-state> <where>
     REPO=owner/repo PR=7 HEAD="$_wb_H"
     # shellcheck disable=SC2034  # read by the eval'd orchestrator function
     P4B_BARRIER_WAVE_CODEX_REQUEST="$1"
+    # shellcheck disable=SC2034  # read by the eval'd orchestrator function
+    P4B_PRE_ADAPTER_CODEX_EVIDENCE="${_wbf_evidence:-wave-request-answered}"
     p4b_wave_binding_evaluate() { jq -nc --arg s "$_wbf_state" '{state:$s,reason:"request-after-bound-request",requests:[{id:501},{id:600}]}'; }
     cleanup_pre_post_refusal_side_effects() { echo "cleanup"; }
     hold_for_external_review() { printf 'hold:%s\n' "$(printf '%s' "$1" | jq -c '{codex_evidence,n:(.wave_binding.requests | length)}')"; exit 6; }
@@ -6493,6 +6504,11 @@ _o="$(_wbf 501 hold post-adapter)" && _r=0 || _r=$?
 [ "$_r" = 6 ] && [ "$_o" = 'hold:{"codex_evidence":"wave-request-request-after-bound-request","n":2}' ] || bad="$bad [fence-hold-wrong:$_r:$_o]"
 _o="$(_wbf 501 hold pre-post)" && _r=0 || _r=$?
 [ "$_r" = 6 ] && printf '%s' "$_o" | grep -q '^cleanup$' || bad="$bad [fence-pre-post-no-cleanup:$_r]"
+# Codex on #2888: a bound wave whose barrier opened on the account-block
+# waiver (no request can be answered) is not fenced; only a dispatch the
+# answered binding authorized is.
+[ "$(_wbf_evidence=account-or-connection-block _wbf 501 hold post-adapter)" = continued ] \
+  || bad="$bad [fence-blocks-account-waiver]"
 # The account-block waiver is unchanged: no request can be answered.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R]" P4B_TEST_LIVE_HEAD="$_wb_H" \

@@ -2146,8 +2146,9 @@ p4b_codex_summary_versions() {
     [ -n "$nid" ] || continue
     edits="$(gh api graphql -f query="$query" -f id="$nid" 2>/dev/null \
       | jq -ce '.data.node.userContentEdits
-          | select(type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length))
-          | [ .nodes[] | {at: (.editedAt // ""), body: (.diff // "")} ]' 2>/dev/null)" \
+          | select(type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length)
+                   and all(.nodes[]; (.diff | type) == "string"))
+          | [ .nodes[] | {at: (.editedAt // ""), body: .diff} ]' 2>/dev/null)" \
       || { printf 'null\n'; return 0; }
     all="$(jq -nc --argjson a "$all" --argjson e "$edits" '$a + $e')"
   done < <(printf '%s' "$marked" | jq -r '.[] | .node_id // "missing"')
@@ -2158,7 +2159,9 @@ p4b_codex_summary_versions() {
 # Ids of edited non-bot comments any of whose earlier versions mentioned
 # Codex's handle, read from each comment's GraphQL edit history. A comment
 # never edited (updated_at == created_at) has no earlier version. Prints
-# `null` when any history cannot be read in full.
+# `null` when any history cannot be read in full, including a withheld or
+# deleted revision whose diff is null: an unknown body is not "no mention"
+# (Codex on #2888; review-feedback-accounting.sh reads that shape the same).
 p4b_comment_mention_history() {
   local edited row nid id hist out='[]' query
   edited="$(printf '%s' "${1:-[]}" | jq -c --arg bot "${2:-}" '[ .[]
@@ -2174,7 +2177,8 @@ p4b_comment_mention_history() {
     hist="$(gh api graphql -f query="$query" -f id="$nid" 2>/dev/null \
       | jq -c '.data.node.userContentEdits
           | if type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length)
-            then any(.nodes[]; (.diff // "") | test("@codex"; "i")) else "unreadable" end' 2>/dev/null)" || hist=""
+               and all(.nodes[]; (.diff | type) == "string")
+            then any(.nodes[]; .diff | test("@codex"; "i")) else "unreadable" end' 2>/dev/null)" || hist=""
     case "$hist" in true|false) ;; *) printf 'null\n'; return 0 ;; esac
     [ "$hist" != true ] || out="$(jq -nc --argjson o "$out" --argjson i "$id" '$o + [$i]')"
   done < <(printf '%s' "$edited" | jq -c '.[]')
