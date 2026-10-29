@@ -2154,7 +2154,52 @@ p4b_codex_summary_versions() {
   jq -nc --argjson a "$all" --argjson m "$marked" '$a + [ $m[] | {at, body} ]'
 }
 
-# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json>
+# p4b_comment_mention_history <comments-json> <bot>
+# Ids of edited non-bot comments any of whose earlier versions mentioned
+# Codex's handle, read from each comment's GraphQL edit history. A comment
+# never edited (updated_at == created_at) has no earlier version. Prints
+# `null` when any history cannot be read in full.
+p4b_comment_mention_history() {
+  local edited row nid id hist out='[]' query
+  edited="$(printf '%s' "${1:-[]}" | jq -c --arg bot "${2:-}" '[ .[]
+    | select((.user.login // "") != $bot)
+    | select((.updated_at // "") != "" and (.updated_at // "") != (.created_at // ""))
+    | {id, node_id: (.node_id // "missing")} ]' 2>/dev/null)" || { printf 'null\n'; return 0; }
+  query='query($id:ID!){node(id:$id){... on IssueComment{userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}'
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    id="$(printf '%s' "$row" | jq -r .id)"; nid="$(printf '%s' "$row" | jq -r .node_id)"
+    # Not `jq -e`: a `false` answer (no earlier mention) is a valid result,
+    # and -e would read it as a failed read.
+    hist="$(gh api graphql -f query="$query" -f id="$nid" 2>/dev/null \
+      | jq -c '.data.node.userContentEdits
+          | if type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length)
+            then any(.nodes[]; (.diff // "") | test("@codex"; "i")) else "unreadable" end' 2>/dev/null)" || hist=""
+    case "$hist" in true|false) ;; *) printf 'null\n'; return 0 ;; esac
+    [ "$hist" != true ] || out="$(jq -nc --argjson o "$out" --argjson i "$id" '$o + [$i]')"
+  done < <(printf '%s' "$edited" | jq -c '.[]')
+  printf '%s\n' "$out"
+}
+
+# p4b_wave_binding_evaluate <repo> <pr> <head> <request-id>
+# All the reads the binding needs, then p4b_wave_codex_binding_state. Shared
+# by the barrier and the orchestrator's publication fence, so both decide on
+# identical evidence. An unreadable comment list is `unreadable`.
+p4b_wave_binding_evaluate() {
+  local repo="$1" pr="$2" head="$3" rid="$4" comments author bot versions historic
+  author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
+  bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
+  if ! command -v gh_api_array >/dev/null 2>&1 \
+     || ! comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
+    jq -nc '{state:"unreadable",reason:"comments-read-failed"}'
+    return 0
+  fi
+  versions="$(p4b_codex_summary_versions "$comments" "$bot")"
+  historic="$(p4b_comment_mention_history "$comments" "$bot")"
+  p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "$historic"
+}
+
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>
 # Pure. Prints {state, reason, bound_request, requests, runs[, generation]}:
 # state is "clear", "hold" or "unreadable"; requests and runs are the
 # evidence the decision paired (machine-readable for whoever surfaces a hold);
@@ -2164,6 +2209,9 @@ p4b_codex_summary_versions() {
 # <summary-versions-json> is every version of Codex's Review Summary comment,
 # [{at, body}], from its GraphQL edit history plus the live body (it is
 # edited in place), or `null` when that history could not be read in full.
+# <historic-request-ids-json> lists edited non-bot comments whose EARLIER
+# versions mentioned Codex's handle (p4b_comment_mention_history), or `null`
+# when an edit history could not be read.
 #
 # Evidence, and what it does NOT prove. Each version carries
 # `codex-review-state:v1` JSON (full commit, status) and a row whose Review
@@ -2190,9 +2238,12 @@ p4b_codex_summary_versions() {
 # Codex serves review requests on a PR in the order they were posted, one run
 # per request. A provider that reordered queued requests, or coalesced two
 # into one run, would break the pairing; coalescing makes R hold (no run left
-# for it), and reordering is the residual.
+# for it), and reordering is the residual. A request comment DELETED outright
+# leaves no trace in the API and is the other residual.
 #
-#   hold        any of the above unmet, an unreadable / incomplete history,
+#   hold        any of the above unmet, runs that overlap (a new run opening
+#               before the previous one ended), an unreadable / incomplete
+#               history or request edit history,
 #               an unparseable version, an inconsistent history (a terminal
 #               version with no Running start, or a commit or trigger change
 #               inside one run), or a request time that does not parse. The
@@ -2213,7 +2264,8 @@ p4b_wave_codex_binding_state() {
 
 p4b_wave_codex_binding_eval() {
   printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
-    --arg head "${4:-}" --arg rid "${5:-}" --argjson versions "${6:-null}" '
+    --arg head "${4:-}" --arg rid "${5:-}" --argjson versions "${6:-null}" \
+    --argjson historic "${7:-[]}" '
     def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
     def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
     # One summary version -> {at, commit, status, trigger, time} or null.
@@ -2241,11 +2293,16 @@ p4b_wave_codex_binding_eval() {
         elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
         else
           ([ $comments[] | select(exact_request) | .id ] | unique) as $generation
+          # A comment is a request if its body mentions the Codex handle now
+          # OR in any earlier version: removing a mention does not cancel a
+          # job Codex already queued (Phase 4b on #2875).
           | ([ $comments[] | select((.user.login // "") != $bot)
-               | select((.body // "") | test("@codex"; "i"))
+               | select(((.body // "") | test("@codex"; "i"))
+                        or (($historic | type) == "array" and (.id as $i | $historic | index($i))))
                | {id, at: (.created_at // ""), t: ((.created_at // "") | secs)} ] | sort_by(.t, .id)) as $reqs
           | {bound_request: $r.id, requests: [ $reqs[] | {id, at} ], runs: []} as $base
-          | if any($reqs[]; .t == null) then $base + {state: "hold", reason: "request-time-unreadable"}
+          | if ($historic | type) != "array" then $base + {state: "hold", reason: "request-edit-history-unreadable"}
+            elif any($reqs[]; .t == null) then $base + {state: "hold", reason: "request-time-unreadable"}
             elif ($versions | type) != "array" then $base + {state: "hold", reason: "summary-history-unreadable"}
             else
               [ $versions[] | version ] as $parsed
@@ -2255,11 +2312,18 @@ p4b_wave_codex_binding_eval() {
                   # version opens a run (repeats of the same run are edits);
                   # a terminal version updates the open run.
                   ($parsed | sort_by(.at)
-                    | reduce .[] as $x ({runs: [], cur: null, bad: false};
+                    | reduce .[] as $x ({runs: [], cur: null, bad: false, overlap: false};
                         if $x.status == "running" then
                           if .cur != null and .cur.status == "running" and .cur.start == $x.time
                              and .cur.commit == $x.commit and .cur.trigger == $x.trigger then .
-                          else (if .cur != null then .runs += [.cur] else . end)
+                          else
+                            # A new run opening while the previous one is
+                            # still Running overlaps it: a later terminal
+                            # version cannot then say which run it ended,
+                            # since FIFO starts do not imply FIFO completion
+                            # (Phase 4b on #2875).
+                            (if .cur != null and .cur.status == "running" then .overlap = true else . end)
+                            | (if .cur != null then .runs += [.cur] else . end)
                             | .cur = {start: $x.time, commit: $x.commit, trigger: $x.trigger, status: "running"}
                           end
                         elif .cur == null or .cur.commit != $x.commit or .cur.trigger != $x.trigger then .bad = true
@@ -2269,6 +2333,7 @@ p4b_wave_codex_binding_eval() {
                   | ($base + {runs: [ $manual[] | {start: (.start | if . == null then null else todate end), commit: .commit[0:12], trigger, status} ]}) as $detail
                   | if $built.bad or any($built.runs[]; .start == null)
                     then $detail + {state: "hold", reason: "summary-history-inconsistent"}
+                    elif $built.overlap then $detail + {state: "hold", reason: "summary-runs-overlap"}
                     else
                       # FIFO pairing: oldest request first, each takes the
                       # earliest manual run starting at or after it and after
@@ -2475,16 +2540,8 @@ p4b_same_head_barrier() {
     if [ -n "$P4B_BARRIER_WAVE_CODEX_REQUEST" ] && [ -z "$why" ] && [ "$cap_exhausted" != true ]; then
       case "$cls_cx:$cx_evidence" in
         reported:*|waived:timeout|not-yet:*)
-          local wb_comments="" wb_json wb_state wb_reason wb_author wb_bot wb_versions
-          wb_author="$(p4b_top_field author_identity)"; wb_author="${wb_author:-nathanjohnpayne}"
-          wb_bot="$(p4b_policy_block_field codex bot_login)"; wb_bot="${wb_bot:-chatgpt-codex-connector[bot]}"
-          if command -v gh_api_array >/dev/null 2>&1 \
-             && wb_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
-            wb_versions="$(p4b_codex_summary_versions "$wb_comments" "$wb_bot")"
-            wb_json="$(p4b_wave_codex_binding_state "$wb_comments" "$wb_author" "$wb_bot" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST" "$wb_versions")"
-          else
-            wb_json='{"state":"unreadable","reason":"comments-read-failed"}'
-          fi
+          local wb_json wb_state wb_reason
+          wb_json="$(p4b_wave_binding_evaluate "$repo" "$pr" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
           wb_state="$(printf '%s' "$wb_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
           # Every outcome carries the binding's evidence (#2771, liveness): a
           # hold that runs out the budget is surfaced with its reason, the

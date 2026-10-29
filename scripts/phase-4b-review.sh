@@ -1535,6 +1535,27 @@ revalidate_phase4a_timeout_generation() {
   esac
 }
 
+# #2771 (Phase 4b on #2875): the barrier's wave binding is decided on every
+# request on the PR, not only the configured author's exact commands, so the
+# request-generation fences below cannot see a foreign or prose request that
+# lands during the adapter run. Re-run the same evaluation after the adapter
+# and as the last read before the POST, and hold (exit 6) unless it still
+# clears.
+revalidate_wave_binding() {
+  local where="${1:-post-adapter}" out state why
+  [ -n "${P4B_BARRIER_WAVE_CODEX_REQUEST:-}" ] || return 0
+  out="$(p4b_wave_binding_evaluate "$REPO" "$PR" "$HEAD" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
+  state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  [ "$state" != clear ] || return 0
+  why="The wave audit's Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST no longer binds on $HEAD ($where: $(printf '%s' "$out" | jq -r '.reason // "unknown"' 2>/dev/null)); holding"
+  if [ "$where" = "pre-post" ]; then
+    cleanup_pre_post_refusal_side_effects "$why" true
+  fi
+  hold_for_external_review "$(printf '%s' "$out" | jq -c '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",
+    codex_evidence:("wave-request-" + (.reason // "unknown")),trigger:"skipped",resume:"skipped",wave_binding:(del(.generation))}' 2>/dev/null \
+    || jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"wave-request-unreadable",trigger:"skipped",resume:"skipped"}')"
+}
+
 # --- #1143: the body can disagree with ITSELF, later ------------------------
 #
 # The identity fence at the top of this script reads the PR body exactly ONCE,
@@ -1835,6 +1856,7 @@ VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
 # approval-side effect. Keep dry-runs offline.
 if [ "$DRY_RUN" != true ]; then
   revalidate_phase4a_timeout_generation post-adapter
+  revalidate_wave_binding post-adapter
 fi
 
 VERDICT="$(printf '%s' "$VERDICT_JSON" | jq -r '.verdict')"
@@ -2446,6 +2468,8 @@ post_review() {
   # generation with the original authorization; never rebuild the ledger or
   # treat that late request as covered. Drift/unreadability uses pre-POST cleanup.
   [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved final
+  # #2771: the last authority read before the POST (see revalidate_wave_binding).
+  [ "$event" != "APPROVE" ] || revalidate_wave_binding pre-post
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

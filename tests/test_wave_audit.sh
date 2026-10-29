@@ -180,7 +180,11 @@ cat > "$FAKE_CODEX_REQ" <<'FAKE'
 #!/usr/bin/env bash
 : "${CAPTURE:?}"
 printf '%s GATED=%s\n' "$*" "${MERGEPATH_PHASE_4A_GATED:-unset}" >> "$CAPTURE/codex-request"
-printf '{"trigger_posted":%s}\n' "${FAKE_TRIGGER_POSTED:-true}"
+if [ -n "${FAKE_CAP_KIND:-}" ]; then
+  printf '{"trigger_posted":false,"cap_exhausted":{"kind":"%s"}}\n' "$FAKE_CAP_KIND"
+else
+  printf '{"trigger_posted":%s}\n' "${FAKE_TRIGGER_POSTED:-true}"
+fi
 exit "${FAKE_CODEX_REQUEST_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_CODEX_REQ"
@@ -1497,8 +1501,16 @@ FAKE_TRIGGER_POSTED=true FAKE_CANARY_COMMENTS_AFTER='[[]]' \
 _bind_case "a dry run sends no request and binds nothing" 4 0 none --base "$C1" --head-sha "$C2" --dry-run
 FAKE_CODEX_REQUEST_EXIT=5 \
   _bind_case "Codex not enabled (requester exit 5): barrier unbound" 4 1 none --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=7 FAKE_CAP_KIND=request-ceiling \
+  _bind_case "a spent request ceiling (requester exit 7): barrier unbound, its cap path decides" 4 1 none --base "$C1" --head-sha "$C2"
+# Phase 4b on #2875: a spent blocking-review budget is a human stop. Left
+# unbound it could run out into exit 4 and fan out, so it stops with exit 8.
+FAKE_CODEX_REQUEST_EXIT=7 FAKE_CAP_KIND=blocking-reviews \
+  _bind_case "a spent blocking-review budget (requester exit 7) is a no-fan-out stop (exit 8)" 8 1 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=7 FAKE_CAP_KIND=mystery \
+  _bind_case "an unknown cap kind on requester exit 7 fails closed" 3 1 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CODEX_REQUEST_EXIT=7 \
-  _bind_case "a spent request cap (requester exit 7): barrier unbound, its cap path decides" 4 1 none --base "$C1" --head-sha "$C2"
+  _bind_case "a requester exit 7 naming no cap kind fails closed" 3 1 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CODEX_REQUEST_EXIT=6 \
   _bind_case "unaccounted feedback (requester exit 6) stops with exit 7 before review" 7 1 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CODEX_REQUEST_EXIT=3 \

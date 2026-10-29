@@ -6286,12 +6286,19 @@ _wb_run() { # <start> <end> [trigger] [commit] [terminal-status] -> Running then
   _wb_ver "${5:-completed}" "${3:-Manual request}" "$2" "$2" "${4:-$_wb_H}"
 }
 _WB_ANSWER="$(_wb_run 2026-10-29T12:00:15.5Z 2026-10-29T12:04:00.1Z | _vs)"
-_wb_case() { # <label> <want-state> <comments-json> <versions-json> [binding-fn]
+_wb_case() { # <label> <want-state> <comments-json> <versions-json> [historic-json]
   local got
-  got="$(${5:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$4" | jq -r .state)"
+  got="$(p4b_wave_codex_binding_state "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$4" "${5:-[]}" | jq -r .state)"
   [ "$got" = "$2" ] || bad="$bad [$1: want $2 got $got]"
 }
-_wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions
+_wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions [<TAB> historic, default []]
+  # Phase 4b on #2875: overlapping runs, and an older request edited to drop
+  # its mention (its queued job is not cancelled), hold.
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    h-runs-overlap-running-a-running-b-completed hold "[$(_wb_req 500 nathanjohnpayne 2026-10-29T11:59:50Z),$_WB_R]" \
+      "$( { _wb_ver running 'Manual request' 2026-10-29T11:59:59Z 2026-10-29T12:00:00Z; _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" '[]' \
+    w6-older-request-edited-to-drop-its-mention hold "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z 'thanks' | jq -c '.updated_at = "2026-10-29T08:30:00Z"'),$_WB_R]" "$_WB_ANSWER" '[400]' \
+    w6-request-edit-history-unreadable hold "$_WB_C" "$_WB_ANSWER" null
   printf '%s\t%s\t%s\t%s\n' \
     answered clear "$_WB_C" "$_WB_ANSWER" \
     w1-app-review-running-at-check hold "$_WB_C" "$(_wb_ver running 'PR opened' 2026-10-29T11:58:00Z 2026-10-29T11:58:01Z | _vs)" \
@@ -6329,7 +6336,7 @@ _wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions
     request-not-exact unreadable "[$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z 'please @codex review')]" "$_WB_ANSWER" \
     comments-not-array unreadable '{"not":"an array"}' "$_WB_ANSWER"
 }
-while IFS="$(printf '\t')" read -r _l _w _c _v; do _wb_case "$_l" "$_w" "$_c" "$_v"; done < <(_wb_fixtures)
+while IFS="$(printf '\t')" read -r _l _w _c _v _h; do _wb_case "$_l" "$_w" "$_c" "$_v" "${_h:-[]}"; done < <(_wb_fixtures)
 # A clear carries the generation it verified; every outcome carries its
 # evidence (reason, the requests with the run each took, the runs seen).
 _wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 \
@@ -6353,9 +6360,9 @@ _wb_mutant() { # <label> <replace-old> <replace-new> <window> [flipped-state]
     || { bad="$bad [mutant-$1-did-not-apply]"; return; }
   got="$(
     eval "${m/p4b_wave_codex_binding_eval()/_wb_mutant_eval()}"
-    _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c v; do
+    _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c v h; do
       [ "$l" = "$4" ] || continue
-      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$v" | jq -r .state
+      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$v" "${h:-[]}" | jq -r .state
     done)"
   [ "$got" = "${5:-clear}" ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
 }
@@ -6366,6 +6373,29 @@ _wb_mutant run-commit 'if $run.commit != $h then' 'if false then' other-commit
 _wb_mutant fifo-pairing '(reduce $reqs[] as $q ({next: 0, out: []};' '(reduce ($reqs[] | select((.id | tostring) == $rid)) as $q ({next: 0, out: []};' w5-older-request-queued-hours-before
 _wb_mutant request-after 'elif ($ri + 1) < ($paired | length) then' 'elif false then' w4-superseded-after-the-run-completed
 _wb_mutant same-run-merge 'and .cur.commit == $x.commit and .cur.trigger == $x.trigger then .' 'and false then .' h-running-version-edited-twice hold
+_wb_mutant run-overlap 'elif $built.overlap then' 'elif false then' h-runs-overlap-running-a-running-b-completed
+_wb_mutant historic-mentions 'or (($historic | type) == "array" and (.id as $i | $historic | index($i))))' ')' w6-older-request-edited-to-drop-its-mention
+
+# The request edit-history reader, against a shimmed gh. An edited comment
+# whose earlier versions never mentioned Codex is a valid "no" ([]), not an
+# unreadable history: `jq -e` read that false as a failed read, which held
+# every binding on a PR with any edited comment (caught on live #2875).
+_wbh_comments="$(jq -nc '[{id:700,node_id:"IC_700",user:{login:"coderabbitai[bot]"},created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:05:00Z",body:"summary"},
+  {id:701,node_id:"IC_701",user:{login:"nathanjohnpayne"},created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:00:00Z",body:"never edited"}]')"
+_wbh() { # <graphql-reply|FAIL> -> p4b_comment_mention_history output
+  (
+    gh() { [ "$_wbh_reply" != FAIL ] || return 1; printf '%s\n' "$_wbh_reply"; }
+    _wbh_reply="$1"
+    p4b_comment_mention_history "$_wbh_comments" 'chatgpt-codex-connector[bot]'
+  )
+}
+[ "$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":"summary v1"}]}}}}')" = '[]' ] \
+  || bad="$bad [edit-history-no-mention-not-empty:$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":"summary v1"}]}}}}')]"
+[ "$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":"ping @codex review"}]}}}}')" = '[700]' ] \
+  || bad="$bad [edit-history-mention-missed]"
+[ "$(_wbh FAIL)" = null ] || bad="$bad [edit-history-failed-read-not-null]"
+[ "$(_wbh '{"data":{"node":{"userContentEdits":{"totalCount":150,"nodes":[{"editedAt":"x","diff":"v"}]}}}}')" = null ] \
+  || bad="$bad [edit-history-truncated-not-null]"
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens. The
@@ -6433,6 +6463,36 @@ out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=777 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B
   _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
 [ "$rc" = 4 ] && printf '%s' "$out" | jq -e '.decision == "error" and .codex_evidence == "wave-request-bound-request-missing"' >/dev/null \
   || bad="$bad [bound-missing-request-not-fail-closed:$rc]"
+# Phase 4b on #2875: the publication fence re-runs the whole binding after the
+# adapter and as the last read before the POST, so a foreign or prose request
+# that lands during the adapter run (invisible to the author-only generation
+# fences) holds instead of being approved over. Exercised as extracted.
+grep -q '^  revalidate_wave_binding post-adapter$' "$ORCH" || bad="$bad [fence-unwired-post-adapter]"
+_wbf_final=$(grep -n '^  \[ "\$event" != "APPROVE" \] || revalidate_wave_binding pre-post$' "$ORCH" | cut -d: -f1)
+_wbf_payload=$(grep -n '^  payload_file="\$(mktemp ' "$ORCH" | cut -d: -f1)
+[ -n "$_wbf_final" ] && [ "$_wbf_payload" = "$((_wbf_final + 1))" ] || bad="$bad [fence-not-last-before-payload:$_wbf_final/$_wbf_payload]"
+_wbf_src="$(sed -n '/^revalidate_wave_binding() {/,/^}/p' "$ORCH")"
+_wbf() { # <bound-id> <evaluate-state> <where>
+  (
+    eval "$_wbf_src"
+    # shellcheck disable=SC2034  # read by the eval'd orchestrator function
+    REPO=owner/repo PR=7 HEAD="$_wb_H"
+    # shellcheck disable=SC2034  # read by the eval'd orchestrator function
+    P4B_BARRIER_WAVE_CODEX_REQUEST="$1"
+    p4b_wave_binding_evaluate() { jq -nc --arg s "$_wbf_state" '{state:$s,reason:"request-after-bound-request",requests:[{id:501},{id:600}]}'; }
+    cleanup_pre_post_refusal_side_effects() { echo "cleanup"; }
+    hold_for_external_review() { printf 'hold:%s\n' "$(printf '%s' "$1" | jq -c '{codex_evidence,n:(.wave_binding.requests | length)}')"; exit 6; }
+    _wbf_state="$2"
+    revalidate_wave_binding "$3"
+    echo continued
+  )
+}
+[ "$(_wbf 501 clear post-adapter)" = continued ] || bad="$bad [fence-clear-held]"
+[ "$(_wbf '' hold post-adapter)" = continued ] || bad="$bad [fence-unbound-consulted]"
+_o="$(_wbf 501 hold post-adapter)" && _r=0 || _r=$?
+[ "$_r" = 6 ] && [ "$_o" = 'hold:{"codex_evidence":"wave-request-request-after-bound-request","n":2}' ] || bad="$bad [fence-hold-wrong:$_r:$_o]"
+_o="$(_wbf 501 hold pre-post)" && _r=0 || _r=$?
+[ "$_r" = 6 ] && printf '%s' "$_o" | grep -q '^cleanup$' || bad="$bad [fence-pre-post-no-cleanup:$_r]"
 # The account-block waiver is unchanged: no request can be answered.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R]" P4B_TEST_LIVE_HEAD="$_wb_H" \
