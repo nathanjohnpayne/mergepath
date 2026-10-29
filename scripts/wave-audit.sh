@@ -111,6 +111,8 @@
 #   WAVE_AUDIT_ORCHESTRATOR   orchestrator (default: scripts/phase-4b-review.sh)
 #   WAVE_AUDIT_CODEX_REQUEST  Codex requester (default:
 #                             scripts/codex-review-request.sh)
+#   WAVE_AUDIT_CODEX_CHECK    Codex signal check (default:
+#                             scripts/codex-review-check.sh)
 #   WAVE_AUDIT_GH             gh used for the canary request read (default: gh)
 #   WAVE_AUDIT_LANE_VERIFIED_OK=1  skip the canary lane precondition —
 #                             hermetic tests only, never operational runs
@@ -124,6 +126,7 @@ MANIFEST_RELPATH="${WAVE_AUDIT_MANIFEST_RELPATH:-.mergepath-sync.yml}"
 POLICY="${MERGEPATH_REVIEW_POLICY_PATH:-$REPO_DIR/.github/review-policy.yml}"
 ORCH="${WAVE_AUDIT_ORCHESTRATOR:-$ROOT/scripts/phase-4b-review.sh}"
 CODEX_REQUEST="${WAVE_AUDIT_CODEX_REQUEST:-$ROOT/scripts/codex-review-request.sh}"
+CODEX_CHECK="${WAVE_AUDIT_CODEX_CHECK:-$ROOT/scripts/codex-review-check.sh}"
 WA_GH="${WAVE_AUDIT_GH:-gh}"
 TAG_PREFIX="wave-audit-pass"
 PREFIX_TAG_PREFIX="wave-audit-prefix"
@@ -222,11 +225,30 @@ top_field() {
 # unreadable timeline fails closed (exit 3): posting blind could double-spend
 # the request ceiling.
 #
+# No request when Codex has already spoken on this head (Phase 4b P1 on
+# #2868). The barrier opens on any current-head Codex signal, an unsolicited
+# App review included, so a request posted on top of one would still be
+# unanswered when the approval posts. The question is asked exactly as the
+# barrier asks it: codex-review-check.sh --diagnostic-signal-only with the
+# barrier's three overrides (p4b_barrier_class_codex). rc 0 means Codex spoke
+# on this head; rc 2 means it cannot report (account or connection block),
+# which no request can change. Either way the barrier decides without one.
+#
 # The canary is byte-verified and is never amended, so --allow-moving-head is
 # sound here, and MERGEPATH_PHASE_4A_GATED marks the wave audit as the
 # canary's Phase 4 review.
 request_canary_codex_review() {
-  local author comments generation rc=0
+  local author comments generation rc=0 check_rc=0
+  CODEX_REVIEW_CHECK_SKIP_CI=1 \
+  CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+  CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+    "$CODEX_CHECK" --diagnostic-signal-only "$PR" "$REPO" >/dev/null 2>&1 || check_rc=$?
+  case "$check_rc" in
+    0) log "Codex already spoke on the ${REPO}#${PR} head; no request (#2771)"; return 0 ;;
+    1) ;;
+    2) log "Codex cannot report on ${REPO}#${PR} (account or connection block); no request — the barrier decides (#2771)"; return 0 ;;
+    *) die 3 "cannot read the Codex signal on ${REPO}#${PR} (codex-review-check.sh exit $check_rc) (#2771)" ;;
+  esac
   # shellcheck source=lib/codex-request-evidence.sh
   . "$ROOT/scripts/lib/codex-request-evidence.sh" \
     || die 3 "cannot load the Codex request-evidence library"
@@ -987,6 +1009,10 @@ fi
 # #2771: only a run that can publish asks Codex. Dry runs, capture runs and
 # historical chunks force --dry-run, post nothing, and need no Codex answer.
 if [ "$DRY_RUN" = false ] && [ -z "$HISTORICAL_END" ]; then
+  # The requester resolves the live head itself, so the verified pair is
+  # rechecked first; the recheck before dispatch below still stands (Phase 4b
+  # P2 on #2868).
+  revalidate_canary_pair "requesting the canary Codex review"
   request_canary_codex_review
 fi
 revalidate_canary_pair "dispatching external review"

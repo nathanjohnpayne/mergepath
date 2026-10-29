@@ -170,6 +170,18 @@ printf '%s GATED=%s\n' "$*" "${MERGEPATH_PHASE_4A_GATED:-unset}" >> "$CAPTURE/co
 exit "${FAKE_CODEX_REQUEST_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_CODEX_REQ"
+# The Codex signal check is asked exactly as the barrier asks it; the stub
+# records the overrides and exits FAKE_CODEX_CHECK_EXIT (default 1: not yet).
+FAKE_CODEX_CHECK="$WORK/fake-codex-check.sh"
+cat > "$FAKE_CODEX_CHECK" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+printf '%s skip_ci=%s require=%s sub=%s\n' "$*" "${CODEX_REVIEW_CHECK_SKIP_CI:-unset}" \
+  "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-unset}" "${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-unset}" \
+  >> "$CAPTURE/codex-check"
+exit "${FAKE_CODEX_CHECK_EXIT:-1}"
+FAKE
+chmod +x "$FAKE_CODEX_CHECK"
 FAKE_COMMENTS_GH="$WORK/fake-comments-gh"
 cat > "$FAKE_COMMENTS_GH" <<'FAKE'
 #!/usr/bin/env bash
@@ -216,6 +228,7 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -230,6 +243,7 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -296,6 +310,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
@@ -542,9 +557,22 @@ run_wa_lane good 69 --repo owner/consumer --base "$C6" --head-sha "$RACE_EMPTY_H
   && pass "empty-scope pair movement cannot advance the watermark" \
   || fail "empty-scope pair movement wrote authority"
 
+# #2771 (Phase 4b P2 on #2868): a publishing run rechecks the verified pair
+# before it asks Codex, because the requester resolves the live head itself.
+# Read 2 is that recheck; drift there sends no request and runs no review.
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=2 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
+  > "$WORK/prerequest-pair-drift.json" 2> "$WORK/prerequest-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] && [ ! -e "$CAPTURE/codex-request" ] \
+  && grep -q 'before requesting the canary Codex review' "$WORK/prerequest-pair-drift.err" \
+  && pass "#2771: pair movement before the Codex request sends no request and runs no review" \
+  || fail "#2771: pair movement before the Codex request was not caught (rc=$rc)"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/post-review-pair-drift.json" 2> "$WORK/post-review-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
@@ -556,7 +584,7 @@ run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "
 
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=5 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/prepublish-pair-drift.json" 2> "$WORK/prepublish-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
@@ -568,7 +596,7 @@ run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "
 
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/local-watermark-pair-drift.json" 2> "$WORK/local-watermark-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -n "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_REVIEW_HEAD")" ] \
@@ -1138,7 +1166,7 @@ remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark befo
   || pass "complete prefix chain alone grants no full-wave clearance"
 rc=0
 FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 84 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
   --finalize-historical > "$WORK/finalize-pair-drift.json" \
   2> "$WORK/finalize-pair-drift.err" || rc=$?
@@ -1416,6 +1444,19 @@ FAKE_CODEX_REQUEST_EXIT=3 \
   _codex_case "a failed request stops with exit 3 before review" 3 1 no --base "$C1" --head-sha "$C2"
 FAKE_CODEX_REQUEST_EXIT=8 \
   _codex_case "any other requester exit fails closed before review" 3 1 no --base "$C1" --head-sha "$C2"
+# Phase 4b P1 on #2868: the barrier opens on any current-head Codex signal,
+# so a request on top of one would still be pending when approval posts. The
+# check is asked with the barrier's own flag and overrides first.
+_codex_case "a request is preceded by the barrier's own Codex signal check" 4 1 yes --base "$C1" --head-sha "$C2"
+grep -qx -- "--diagnostic-signal-only 91 owner/consumer skip_ci=1 require=1 sub=false" "$CAPTURE/codex-check" \
+  && pass "#2771: the signal check uses the barrier's flag and three overrides" \
+  || fail "#2771: signal check argv/env wrong: $(cat "$CAPTURE/codex-check" 2>/dev/null)"
+FAKE_CODEX_CHECK_EXIT=0 \
+  _codex_case "Codex already spoke on the head (an unsolicited review): no request, dispatch" 4 0 yes --base "$C1" --head-sha "$C2"
+FAKE_CODEX_CHECK_EXIT=2 \
+  _codex_case "Codex cannot report (account block): no request, the barrier decides" 4 0 yes --base "$C1" --head-sha "$C2"
+FAKE_CODEX_CHECK_EXIT=3 \
+  _codex_case "an unreadable Codex signal fails closed before any request or review" 3 0 no --base "$C1" --head-sha "$C2"
 FAKE_COMMENTS_EXIT=1 \
   _codex_case "an unreadable canary timeline fails closed without requesting" 3 0 no --base "$C1" --head-sha "$C2"
 FAKE_CANARY_COMMENTS='{"not":"an array"}' \
