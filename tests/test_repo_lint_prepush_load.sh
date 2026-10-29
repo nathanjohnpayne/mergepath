@@ -97,12 +97,18 @@ cat > "$FIX/scripts/ci/repo-lint-dependencies.json" <<'JSON'
 JSON
 # A probe records how many probes are running when it starts, may rewrite the
 # fake load at its start (LOAD_AT_START_<name>) or its end (LOAD_AT_END_<name>),
-# and runs for SECS_<name> seconds (default 1).
+# and runs for SECS_<name> seconds (default 1). PEER_<name> names probes this
+# one is meant to overlap: after creating its marker it waits (at most 5 s)
+# until each peer's marker exists, so a sample never races a peer's start.
 cat > "$FIX/scripts/ci/probe.sh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 n=$1
 touch "$PROBE_DIR/active.$n"
+v="PEER_$n"
+for peer in ${!v:-}; do
+  for _ in $(seq 1 50); do [ -e "$PROBE_DIR/active.$peer" ] && break; sleep 0.1; done
+done
 echo "$n $(find "$PROBE_DIR" -name 'active.*' | wc -l | tr -d ' ')" >> "$PROBE_DIR/samples"
 v="LOAD_AT_START_$n"; [ -z "${!v:-}" ] || echo "${!v}" > "$FAKE_LOADFILE"
 v="SECS_$n"; sleep "${!v:-1}"
@@ -218,7 +224,7 @@ reads() { wc -l < "$FAKE_SYSCTL_COUNT" | tr -d ' '; }
 # starts, so s4 and s5 start beside it (jobs=2).
 assert_falls_and_rises() {   # $1 runner
   local r="$1"
-  run_load "$r" "$LOW" LOAD_AT_END_s1="$HIGH" SECS_s1=1 SECS_s2=3 LOAD_AT_START_s3="$LOW" SECS_s3=12 --
+  run_load "$r" "$LOW" LOAD_AT_END_s1="$HIGH" SECS_s1=1 SECS_s2=3 PEER_s2=s1 LOAD_AT_START_s3="$LOW" SECS_s3=12 PEER_s4=s3 --
   expect "falls and rises: the run passes" "$RC" "0"
   expect_has "falls and rises: starts at jobs=2" "$OUT" "(jobs=2, nice=10, host load 0.50 on 4 CPUs)"
   expect_has "falls and rises: the run says the concurrency follows the load" "$OUT" "follows the host load between 1 and 2"
@@ -235,7 +241,7 @@ assert_falls_and_rises() {   # $1 runner
 # ── property 2: a run that starts loaded speeds up when the load falls ───
 assert_loaded_start_rises() {   # $1 runner
   local r="$1"
-  run_load "$r" "$HIGH" LOAD_AT_START_s1="$LOW" SECS_s1=8 --
+  run_load "$r" "$HIGH" LOAD_AT_START_s1="$LOW" SECS_s1=8 PEER_s2=s1 --
   expect "loaded start: the run passes" "$RC" "0"
   expect_has "loaded start: starts at jobs=1" "$OUT" "(jobs=1, nice=10, host load 9.00 on 4 CPUs)"
   expect_has "loaded start: the rise is logged" "$OUT" "repo-lint pre-push: concurrency 1 -> 2 (host load 0.50 on 4 CPUs)"
@@ -252,7 +258,7 @@ assert_pinned_holds() {   # $1 runner
   expect_has "pinned by env: the output says so" "$OUT" "concurrency pinned to 1 by env MERGEPATH_PREPUSH_JOBS; it is not re-sized from the host load"
   expect_lacks "pinned by env: no concurrency change is logged" "$OUT" "pre-push: concurrency 1 ->"
   # Two jobs pinned by the flag while the load is high and never recovers.
-  run_load "$r" "$HIGH" -- --jobs 2
+  run_load "$r" "$HIGH" PEER_s2=s1 -- --jobs 2
   expect "pinned by flag: the run passes" "$RC" "0"
   expect "pinned by flag: stays at two under load" "$(seen s2)" "2"
   expect_has "pinned by flag: the output says so" "$OUT" "concurrency pinned to 2 by flag --jobs; it is not re-sized from the host load"

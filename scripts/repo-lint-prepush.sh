@@ -66,8 +66,9 @@
 #   --all-live      run CI's whole fast lane, unselected wrappers included
 #   --jobs N        pin the concurrency (default MERGEPATH_PREPUSH_JOBS, else
 #                   sized from the host load: jobs_max while the one-minute
-#                   load average is below the CPU count and 1 once it is not,
-#                   and re-sized before each check during the run)
+#                   load average per CPU is below load_per_cpu_threshold and
+#                   1 once it is not, and re-sized before each check during
+#                   the run)
 #   --event NAME    classifier event (default pull_request; a push to the
 #                   remote default branch is classified as `push`, like CI)
 #   --head-ref REF  branch name handed to the classifier (mergepath-sync/*
