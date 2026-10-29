@@ -229,6 +229,7 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -244,6 +245,7 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -311,6 +313,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
+  WAVE_AUDIT_TEST_CANARY_HEAD="${WAVE_AUDIT_TEST_CANARY_HEAD:-cccccccccccccccccccccccccccccccccccccccc}" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
@@ -1457,6 +1460,29 @@ FAKE_CODEX_CHECK_EXIT=2 \
   _codex_case "Codex cannot report (account block): no request, the barrier decides" 4 0 yes --base "$C1" --head-sha "$C2"
 FAKE_CODEX_CHECK_EXIT=3 \
   _codex_case "an unreadable Codex signal fails closed before any request or review" 3 0 no --base "$C1" --head-sha "$C2"
+# Phase 4b P1 on #2868 (round 2): an unsolicited App review of this head that
+# is still Running reads as "not yet" to the signal check (rc 1), but the
+# barrier opens the moment it completes (Running -> Completed), so a request
+# sent now could still be unanswered when the approval posts. That review is
+# reused instead: Running or unknown status on THIS head sends no request.
+_wave_summary_comments() { # <status> <commit>
+  jq -nc --arg s "$1" --arg c "$2" '[[{id:7201,user:{login:"chatgpt-codex-connector[bot]"},
+    created_at:"2026-10-28T00:01:00Z",updated_at:"2026-10-28T00:02:00Z",
+    body:("<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **" + $s + "** | `" + $c + "` | auto |")}]]'
+}
+FAKE_CANARY_COMMENTS="$(_wave_summary_comments Running ccccccc)" \
+  _codex_case "a Running unsolicited review of this head is reused, not requested over" 4 0 yes --base "$C1" --head-sha "$C2"
+grep -q 'Codex review of the owner/consumer#91 head is running' "$WORK/codex-case.err" \
+  && pass "#2771: the running-review skip names the state it reused" \
+  || fail "#2771: running-review skip message missing: $(tail -n 2 "$WORK/codex-case.err")"
+FAKE_CANARY_COMMENTS="$(_wave_summary_comments Queued ccccccc)" \
+  _codex_case "an unknown-status summary for this head sends no request" 4 0 yes --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS="$(_wave_summary_comments Completed ccccccc)" \
+  _codex_case "a Completed summary with no qualifying result does not block the request" 4 1 yes --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS="$(_wave_summary_comments Running 1111111)" \
+  _codex_case "a Running summary for another commit does not block the request" 4 1 yes --base "$C1" --head-sha "$C2"
+WAVE_AUDIT_TEST_CANARY_HEAD=not-a-sha \
+  _codex_case "no verified canary head fails closed before requesting" 3 0 no --base "$C1" --head-sha "$C2"
 FAKE_COMMENTS_EXIT=1 \
   _codex_case "an unreadable canary timeline fails closed without requesting" 3 0 no --base "$C1" --head-sha "$C2"
 FAKE_CANARY_COMMENTS='{"not":"an array"}' \

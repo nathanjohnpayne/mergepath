@@ -114,6 +114,9 @@
 #   WAVE_AUDIT_CODEX_CHECK    Codex signal check (default:
 #                             scripts/codex-review-check.sh)
 #   WAVE_AUDIT_GH             gh used for the canary request read (default: gh)
+#   WAVE_AUDIT_TEST_CANARY_HEAD  canary head for the running-review check when
+#                             WAVE_AUDIT_LANE_VERIFIED_OK=1 leaves no verified
+#                             head — hermetic tests only
 #   WAVE_AUDIT_LANE_VERIFIED_OK=1  skip the canary lane precondition —
 #                             hermetic tests only, never operational runs
 #   MERGEPATH_REVIEW_POLICY_PATH  policy file override (p4b convention)
@@ -150,10 +153,14 @@ parse_title() {
 # audit_field <field> — scalar under the top-level `propagation_audit:`
 # block. Same nesting-aware walk as p4b_automation_field (only direct
 # children match; deeper keys are skipped), same quote/comment stripping.
-audit_field() {
+audit_field() { block_field propagation_audit "$1"; }
+
+# block_field <block> <field> — the same walk under any top-level block
+# (`codex.bot_login` for the canary request, #2771).
+block_field() {
   [ -f "$POLICY" ] || return 0
-  awk -v field="$1" '
-    /^propagation_audit:/ { inblk=1; child_indent=-1; next }
+  awk -v block="$1" -v field="$2" '
+    $0 ~ ("^" block ":") { inblk=1; child_indent=-1; next }
     inblk && /^[^[:space:]#]/ { inblk=0 }
     inblk {
       if ($0 ~ /^[[:space:]]*(#|$)/) next
@@ -238,7 +245,7 @@ top_field() {
 # sound here, and MERGEPATH_PHASE_4A_GATED marks the wave audit as the
 # canary's Phase 4 review.
 request_canary_codex_review() {
-  local author comments generation rc=0 check_rc=0
+  local author comments generation rc=0 check_rc=0 head bot summary
   CODEX_REVIEW_CHECK_SKIP_CI=1 \
   CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
   CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
@@ -261,6 +268,27 @@ request_canary_codex_review() {
     || die 3 "cannot read the Codex request generation on ${REPO}#${PR} (#2771)"
   if [ "$generation" != "[]" ]; then
     log "Codex already requested on ${REPO}#${PR} (request comments $generation) — not requesting again"
+    return 0
+  fi
+  # An unsolicited App review of this head that is still running reads as
+  # "not yet" to the signal check above, yet the barrier opens as soon as it
+  # completes, so a request sent now could still be unanswered when the
+  # approval posts (Phase 4b P1 on #2868, round 2). Reuse that review instead:
+  # a Review Summary row for this head that is Running or of unknown status
+  # sends no request, and the barrier waits on that review. A Completed row
+  # with no qualifying result is inactive and does not block the request.
+  head="$pr_head"
+  if [ -z "$head" ] && [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" = 1 ]; then
+    head="${WAVE_AUDIT_TEST_CANARY_HEAD:-}"   # hermetic tests only
+  fi
+  [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die 3 "no verified canary head for ${REPO}#${PR} to check for a running Codex review (#2771)"
+  bot="$(block_field codex bot_login)"
+  bot="${bot:-chatgpt-codex-connector[bot]}"
+  summary="$(crqe_select_codex_review_summary "$comments" "$bot" "$head" 2>/dev/null)" \
+    || die 3 "cannot read the Codex Review Summary on ${REPO}#${PR} (#2771)"
+  if printf '%s' "$summary" | jq -e '. != null and .status != "completed"' >/dev/null 2>&1; then
+    log "a Codex review of the ${REPO}#${PR} head is $(printf '%s' "$summary" | jq -r .status) (unsolicited); no request — the barrier waits on that review (#2771)"
     return 0
   fi
   MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST" --trigger-only --allow-moving-head "$PR" "$REPO" >/dev/null || rc=$?
