@@ -3122,8 +3122,10 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # `timed-out/substitute-used` fallback: Codex may still be running and may
     # post findings after merge (the late-finding detector, #2881, surfaces
     # those). The approval, accounting and every other gate still apply.
-    # Requests come from the fresh re-read above; outcome evidence also uses
-    # the earlier anchor-resolved comments. Unreadable evidence refuses.
+    # Both requests and outcomes come from the fresh re-read above, with its
+    # verdict anchors resolved again: an earlier snapshot must not win, or a
+    # Summary that went from Completed to Running between the two reads would
+    # read as answered (Codex P1 on #2886). Unreadable evidence refuses.
     PHASE_4B_CODEX_OWED=""
     PHASE_4B_TIMEOUT_NOTE=""
     if [ -z "$PHASE_4B_SUPERSEDED" ] && [ "$CODEX_ENABLED" = "true" ]; then
@@ -3133,9 +3135,8 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
         PHASE_4B_CODEX_OWED="the Codex pending-review helper is unavailable"
       elif ! [[ "$PENDING_WINDOW" =~ ^[0-9]+$ ]]; then
         PHASE_4B_CODEX_OWED="codex.review_timeout_seconds is not a whole number of seconds ('$PENDING_WINDOW')"
-      elif ! PENDING_COMMENTS=$(printf '%s\n' "${ISSUE_COMMENTS_JSON:-[]}" "$REQUEST_COMMENTS_JSON" \
-               | jq -sc 'if length == 2 and (.[0] | type) == "array" and (.[1] | type) == "array"
-                         then .[0] + .[1] | group_by(.id) | map(.[0]) else error("comments") end' 2>/dev/null) \
+      elif ! PENDING_COMMENTS=$(crqe_resolve_verdict_anchors "$REQUEST_COMMENTS_JSON" "$REPO" "$BOT_LOGIN" 2>/dev/null) \
+           || ! printf '%s' "$PENDING_COMMENTS" | jq -e 'type == "array"' >/dev/null 2>&1 \
            || ! PENDING_JSON=$(crqe_codex_pending_state "$PENDING_COMMENTS" "$REVIEWS_JSON" "$AUTHOR_IDENTITY" \
                "$BOT_LOGIN" "$HEAD_SHA" "$PENDING_WINDOW" "$(date -u +%s)" \
                "${CODEX_USAGE_LIMIT_MARKER_RE:-}" "${CODEX_NOT_CONNECTED_MARKER_RE:-}" 2>/dev/null); then

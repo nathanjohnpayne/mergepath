@@ -198,15 +198,19 @@ process_pr() { # pr
     rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
   else
     state=$(printf '%s' "$issue" | jq -r .state)
+    # Reopen BEFORE recording the item: the item marker is what makes a rerun
+    # skip it, so a reopen that failed after the comment landed would never be
+    # retried and the finding would sit on a closed issue (Codex P2 on #2886).
+    # A failed comment after a successful reopen is retried by the next run.
+    if [ "$state" = closed ]; then
+      gh api -X PATCH "repos/$REPO/issues/$num" -f state=open >/dev/null \
+        || { echo "late-codex-findings: cannot reopen #$num; the finding is not recorded, so the next run retries" >&2; exit 3; }
+    fi
     jq -n --arg items "$body" '{body: ("More Codex findings arrived after merge:\n\n" + $items + "\n")}' \
       >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
     gh api -X POST "repos/$REPO/issues/$num/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .html_url \
       || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: cannot comment on #$num" >&2; exit 3; }
     rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-    if [ "$state" = closed ]; then
-      gh api -X PATCH "repos/$REPO/issues/$num" -f state=open >/dev/null \
-        || { echo "late-codex-findings: recorded the finding but cannot reopen #$num" >&2; exit 3; }
-    fi
   fi
 }
 

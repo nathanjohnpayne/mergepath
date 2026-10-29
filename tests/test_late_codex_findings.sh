@@ -88,7 +88,8 @@ case "$method:$endpoint" in
   POST:repos/o/r/issues/*/comments) n=${endpoint#repos/o/r/issues/}; n=${n%%/*}; b=$(cat "$input")
     printf '%s' "$s" | jq -c --argjson n "$n" --argjson b "$b" '(.issues[] | select(.number == $n) | .comments) += [$b.body]' >"$STATE"
     out '{"html_url":"https://example.test/c"}' ;;
-  PATCH:repos/o/r/issues/*) n=${endpoint#repos/o/r/issues/}
+  PATCH:repos/o/r/issues/*) [ "$(printf '%s' "$s" | jq -r '.fail_reopen // false')" != true ] || { echo "HTTP 502" >&2; exit 1; }
+    n=${endpoint#repos/o/r/issues/}
     printf '%s' "$s" | jq -c --argjson n "$n" '(.issues[] | select(.number == $n) | .state) = "open"' >"$STATE"
     echo '{}' ;;
   *) echo "unexpected $method $endpoint" >&2; exit 99 ;;
@@ -115,6 +116,16 @@ run || { cat "$DIR/out"; die "the edit run failed"; }
   && jq -r '.issues[0].comments[0]' "$STATE" | grep -q 'mergepath-late-codex-item: issue-comment:5447842730:' \
   || { cat "$DIR/out"; jq . "$STATE"; die "a post-merge edit did not add one item and reopen the issue"; }
 ok "an edit that changes the body after merge adds one item and reopens the closed issue"
+# A reopen that fails records nothing, so the next run retries both writes.
+jq -c '.issues[0].state = "closed" | .fail_reopen = true | .comments[0].body += "\n\n**[P2]** a second post-merge edit" | .comments[0].updated_at = "2026-08-28T05:00:00Z"' "$STATE" >"$DIR/s2" && mv "$DIR/s2" "$STATE"
+if run; then die "a failed reopen was reported as success"; fi
+[ "$(jq '.issues[0].comments | length' "$STATE")" = 1 ] && [ "$(jq -r '.issues[0].state' "$STATE")" = closed ] \
+  || { jq . "$STATE"; die "a failed reopen still recorded the item"; }
+jq -c '.fail_reopen = false' "$STATE" >"$DIR/s2" && mv "$DIR/s2" "$STATE"
+run || { cat "$DIR/out"; die "the retry after a failed reopen failed"; }
+[ "$(jq '.issues[0].comments | length' "$STATE")" = 2 ] && [ "$(jq -r '.issues[0].state' "$STATE")" = open ] \
+  || { jq . "$STATE"; die "the retry did not reopen and record the item"; }
+ok "a failed reopen records nothing, and the next run reopens and records the item"
 jq -nc --argjson c "$C1120" '{pr: {merged_at: null}, comments: [$c], reviews: [], inline: [], issues: []}' >"$STATE"
 run || die "the unmerged run failed"
 [ "$(jq '.issues | length' "$STATE")" = 0 ] && grep -q 'is not merged' "$DIR/out" || die "an unmerged PR was recorded"

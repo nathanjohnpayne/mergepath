@@ -43,6 +43,11 @@ case "$1" in
        && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge "$COMMENTS_FAIL_FROM" ]; then
       exit 1
     fi
+    # #2881: a later read may see newer comment bodies than the first.
+    if [ -f "$FIXTURES/comments-reread" ] \
+       && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge 2 ]; then
+      cat "$FIXTURES/comments-reread"; exit 0
+    fi
     cat "$FIXTURES/comments" ;;
   repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }; cat "$FIXTURES/reviews" ;;
   repos/owner/repo/pulls/99/files) printf '%s\n' '[]' ;;
@@ -1239,5 +1244,15 @@ e_run run-in-flight-no-request "[$E_RUNNING]" "$E_APPROVAL" 1 'review-running'
 if grep -q 'timed-out/substitute-used' "$DIR/out"; then
   echo 'FAIL: #2881 a pending run was reported as a timeout'; exit 1
 fi
+# Codex P1 on #2886: a recent request answered by a completed run in the first
+# comments read, then a newer run Running in the #1598 re-read, must hold. The fresh copy wins;
+# with the earlier copy winning the head would read as answered and clear.
+E_SUM_DONE=$(p_summary completed "$(e_iso 200)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg c "$(e_iso 300)" --arg u "$(e_iso 200)" '.created_at = $c | .updated_at = $u')
+E_SUM_RUN=$(p_summary running "$(e_iso 30)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg c "$(e_iso 300)" --arg u "$(e_iso 30)" '.created_at = $c | .updated_at = $u')
+printf '%s\n' "[$E_REQ_RECENT,$E_SUM_RUN]" >"$DIR/comments-reread"
+e_run summary-flips-to-running-between-reads "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 1 'Codex still owes abcdef0123456789000000000000000000000000 a review'
+rm -f "$DIR/comments-reread"
+e_run summary-completed-control "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 0 'Codex owes HEAD no review (answered'
+
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
