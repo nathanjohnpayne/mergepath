@@ -25,8 +25,10 @@ export FAKE_POLICY_ARGS_LOG="$WORK/policy-args"
 
 # Wave dispatch models the trusted verifier boundary. The actual Git byte
 # comparison is exercised by test_marker_provenance.py, not duplicated here.
-mkdir -p "$WORK/trusted/scripts/workflow"
+mkdir -p "$WORK/trusted/scripts/workflow" "$WORK/trusted/scripts/lib"
 cp "$WA" "$WORK/trusted/scripts/wave-audit.sh"
+# #2771: the canary Codex request counts existing requests with this library.
+cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$WORK/trusted/scripts/lib/"
 WA="$WORK/trusted/scripts/wave-audit.sh"
 cat > "$WORK/trusted/scripts/workflow/resolve_base_policy.sh" <<'SH'
 #!/bin/sh
@@ -156,6 +158,29 @@ exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
 
+# --- fake Codex requester and canary-comment reader (#2771) -------------------
+# The requester records its argv and the gate env; FAKE_CODEX_REQUEST_EXIT
+# picks its exit. The reader serves FAKE_CANARY_COMMENTS (paginated, slurped)
+# for the existing-request check; FAKE_COMMENTS_EXIT fails the read.
+FAKE_CODEX_REQ="$WORK/fake-codex-request.sh"
+cat > "$FAKE_CODEX_REQ" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+printf '%s GATED=%s\n' "$*" "${MERGEPATH_PHASE_4A_GATED:-unset}" >> "$CAPTURE/codex-request"
+exit "${FAKE_CODEX_REQUEST_EXIT:-0}"
+FAKE
+chmod +x "$FAKE_CODEX_REQ"
+FAKE_COMMENTS_GH="$WORK/fake-comments-gh"
+cat > "$FAKE_COMMENTS_GH" <<'FAKE'
+#!/usr/bin/env bash
+[ "${FAKE_COMMENTS_EXIT:-0}" = 0 ] || exit "$FAKE_COMMENTS_EXIT"
+case "$*" in
+  *"/comments"*) printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}" ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$FAKE_COMMENTS_GH"
+
 # --- policy fixtures -----------------------------------------------------------
 POLICY_GOOD="$WORK/policy-good.yml"
 cat > "$POLICY_GOOD" <<'YAML'
@@ -190,6 +215,7 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -203,6 +229,7 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -268,6 +295,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   AGE_METADATA_CASE="${AGE_METADATA_CASE:-invalid}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
@@ -1345,6 +1373,53 @@ if [ "$(git -C "$CANON" tag -l)" = "$capture_tags_before" ] \
    && [ "$(git ls-remote --tags "$REMOTE")" = "$capture_remote_before" ]; then
   pass "all capture modes leave local and remote publication state unchanged"
 else fail "capture mode published a receipt or watermark"; fi
+
+# ===========================================================================
+echo "wave-audit.sh — one Codex request on the canary (#2771)"
+# ===========================================================================
+# The barrier's Codex arm can only finish on a request it can wait for. A
+# publishing run sends exactly one, before dispatch; a rerun never sends a
+# second; dry runs send none; a refusal or an unreadable timeline stops the
+# audit before any review runs. FAKE_ORCH_EXIT=4 keeps the watermark still.
+_codex_case() { # <label> <want-rc> <want-requests> <want-dispatch:yes|no> <args...>
+  local label="$1" want_rc="$2" want_req="$3" want_disp="$4" rc=0 n=0; shift 4
+  FAKE_ORCH_EXIT="${FAKE_ORCH_EXIT:-4}" run_wa "$POLICY_GOOD" reset 91 --repo owner/consumer "$@" \
+    >/dev/null 2>"$WORK/codex-case.err" || rc=$?
+  [ ! -f "$CAPTURE/codex-request" ] || n=$(wc -l < "$CAPTURE/codex-request" | tr -d ' ')
+  local disp=no
+  [ ! -e "$CAPTURE/args" ] || disp=yes
+  if [ "$rc" = "$want_rc" ] && [ "$n" = "$want_req" ] && [ "$disp" = "$want_disp" ]; then
+    pass "#2771: $label"
+  else
+    fail "#2771: $label (rc=$rc want $want_rc; requests=$n want $want_req; dispatched=$disp want $want_disp): $(tail -n 2 "$WORK/codex-case.err")"
+  fi
+}
+_codex_case "a publishing run requests Codex once, then dispatches" 4 1 yes --base "$C1" --head-sha "$C2"
+grep -qx -- "--trigger-only --allow-moving-head 91 owner/consumer GATED=true" "$CAPTURE/codex-request" \
+  && pass "#2771: the request is trigger-only, Phase 4a gated, and names the canary" \
+  || fail "#2771: request argv/env wrong: $(cat "$CAPTURE/codex-request")"
+_author_req='[[{"id":501,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-10-28T00:00:00Z"}]]'
+FAKE_CANARY_COMMENTS="$_author_req" \
+  _codex_case "an existing author request is not repeated (rerun after exit 6)" 4 0 yes --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS='[[{"id":502,"user":{"login":"someone-else"},"body":"@codex review","created_at":"2026-10-28T00:00:00Z"}]]' \
+  _codex_case "a foreign mention is not the author's request, so one is sent" 4 1 yes --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS='[[{"id":503,"user":{"login":"nathanjohnpayne"},"body":"please @codex review this later","created_at":"2026-10-28T00:00:00Z"}]]' \
+  _codex_case "prose that mentions the trigger is not a request" 4 1 yes --base "$C1" --head-sha "$C2"
+_codex_case "a dry run sends no request" 4 0 yes --base "$C1" --head-sha "$C2" --dry-run
+FAKE_CODEX_REQUEST_EXIT=5 \
+  _codex_case "Codex not enabled (requester exit 5) proceeds to dispatch" 4 1 yes --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=7 \
+  _codex_case "a spent request cap (requester exit 7) leaves the decision to the barrier" 4 1 yes --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=6 \
+  _codex_case "unaccounted feedback (requester exit 6) stops with exit 7 before review" 7 1 no --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=3 \
+  _codex_case "a failed request stops with exit 3 before review" 3 1 no --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=8 \
+  _codex_case "any other requester exit fails closed before review" 3 1 no --base "$C1" --head-sha "$C2"
+FAKE_COMMENTS_EXIT=1 \
+  _codex_case "an unreadable canary timeline fails closed without requesting" 3 0 no --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS='{"not":"an array"}' \
+  _codex_case "a malformed comments read fails closed without requesting" 3 0 no --base "$C1" --head-sha "$C2"
 
 echo "Summary: $PASS passed, $FAIL failed"
 if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \
