@@ -92,6 +92,22 @@ read_non_reviewer_identities() {
   read_policy_list non_reviewer_identities "$@"
 }
 
+# Identities that may approve a Dependabot PR and nothing else (#2874): the
+# account behind DEPENDABOT_REVIEWER_TOKEN. They are deliberately NOT in
+# available_reviewers, so every other approval check ignores them, and a
+# leaked copy of that token cannot clear an agent or human PR. Absent or
+# empty is inert: the Dependabot lane then accepts available_reviewers only.
+read_dependabot_reviewer_identities() {
+  read_policy_list dependabot_reviewer_identities "$@"
+}
+
+# The approver set for the Dependabot lane only: available_reviewers plus
+# dependabot_reviewer_identities, one login per line, de-duplicated.
+read_dependabot_approvers() {
+  { read_available_reviewers "$@"; read_dependabot_reviewer_identities "$@"; } \
+    | sed '/^$/d' | awk '!seen[$0]++'
+}
+
 # Return 0 iff <login> is a non-empty, exact member of the allow-list.
 # Fail-closed: an empty login or an unreadable config returns 1.
 login_is_available_reviewer() {

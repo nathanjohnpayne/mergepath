@@ -618,6 +618,135 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 5f–5i (#2874): dependabot_reviewer_identities is honoured on the
+# Dependabot arm only. An approval from a listed identity clears a
+# Dependabot PR; the general allow-list never includes it; a flow list,
+# which the block reader cannot parse, exits 2 instead of looking absent.
+# ---------------------------------------------------------------------------
+make_scratch_dependabot_ids() {  # <dependabot_reviewer_identities line(s), verbatim>
+  local dir
+  dir=$(make_scratch true false)
+  printf '\n%s\n' "$1" >>"$dir/.github/review-policy.yml"
+  echo "$dir"
+}
+DEPS_APPROVAL=$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-deps"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')
+
+echo; echo "--- Test 5f (#2874): Dependabot-only approver clears a Dependabot PR"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS" && echo "$OUT" | grep -q "nathanpayne-deps"; then
+  pass "#2874: listed Dependabot-only approver clears a Dependabot PR"
+else
+  fail "#2874: expected rc=0 PASS naming nathanpayne-deps; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5g (#2874): the same approval without the key still blocks"
+SCRATCH=$(make_scratch true false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "#2874: an unlisted identity's approval does not clear a Dependabot PR"
+else
+  fail "#2874: expected rc=1 BLOCKED; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5h (#2874): flow-list dependabot_reviewer_identities → exit 2"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities: [nathanpayne-deps]')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "dependabot_reviewer_identities"; then
+  pass "#2874: unparseable dependabot_reviewer_identities → exit 2 naming the key"
+else
+  fail "#2874: expected rc=2 naming the key; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5i (#2874): the general allow-list never includes the Dependabot-only identity"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+HELPERS="$ROOT/scripts/lib/reviewers-helpers.sh"
+POLICY_FILE="$SCRATCH/.github/review-policy.yml"
+# shellcheck source=/dev/null
+general=$( . "$HELPERS" && read_available_reviewers "$POLICY_FILE" )
+# shellcheck source=/dev/null
+lane=$( . "$HELPERS" && read_dependabot_approvers "$POLICY_FILE" )
+# shellcheck source=/dev/null
+if ! printf '%s\n' "$general" | grep -Fxq nathanpayne-deps \
+   && ! ( . "$HELPERS" && login_is_available_reviewer nathanpayne-deps "$POLICY_FILE" ) \
+   && printf '%s\n' "$lane" | grep -Fxq nathanpayne-deps \
+   && printf '%s\n' "$lane" | grep -Fxq nathanpayne-claude; then
+  pass "#2874: read_available_reviewers excludes it; read_dependabot_approvers is the union"
+else
+  fail "#2874: general='$(echo $general)' lane='$(echo $lane)'"
+fi
+
+# Test 5j/5k (#2874, Codex P1 on #2877): outside the Dependabot lane the
+# Dependabot-only approver is a non-reviewer. Its standing approval blocks an
+# ordinary PR (GitHub's native required-review count would otherwise accept
+# it); the identical PR without that approval still passes.
+echo; echo "--- Test 5j (#2874): Dependabot-only approval on an ordinary PR → BLOCKED"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -q "Dependabot-only approver"; then
+  pass "#2874: a Dependabot-only approval blocks a non-Dependabot PR"
+else
+  fail "#2874: expected rc=1 BLOCKED naming the Dependabot-only approver; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5k (#2874): same ordinary PR, no such approval → PASS"
+FIXTURE_REVIEWS=$(make_reviews_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "#2874: the deny check is inert without a Dependabot-only approval"
+else
+  fail "#2874: expected rc=0 PASS; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Test 5l (#2874, Codex P2 on #2877): an identity in BOTH lists keeps its
+# general standing. With it as the last (here only) entry, filtering it out
+# must not end the gate under set -e: the ordinary PR it approved passes.
+echo; echo "--- Test 5l (#2874): overlapping identity keeps general standing, gate survives"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-claude')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-claude"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "#2874: an identity also in available_reviewers is filtered without ending the gate"
+else
+  fail "#2874: expected rc=0 PASS for an overlapping identity; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 6: External-review, gate disabled → exit 0.
 # ---------------------------------------------------------------------------
 echo; echo "--- Test 6: external-review, gate disabled"

@@ -745,7 +745,8 @@
     ],
     "check_wave_audit": [
       "tests/test_wave_audit.sh",
-      "scripts/wave-audit.sh"
+      "scripts/wave-audit.sh",
+      "scripts/lib/codex-request-evidence.sh"
     ],
     "check_workflow_parsers": [
       "tests/test_dependabot_auto_merge_check_wait.sh",
@@ -763,6 +764,7 @@
       "scripts/required-head-checks.sh",
       "scripts/lib/blocking-labels.sh",
       "scripts/lib/dependabot-commit-provenance.sh",
+      "scripts/lib/reviewers-helpers.sh",
       "scripts/lib/gh-api-array.sh",
       "scripts/lib/gh-command-classifier.sh",
       "scripts/lib/review-policy-scalar.sh",

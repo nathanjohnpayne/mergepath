@@ -1168,6 +1168,51 @@ if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
   esac
 fi
 
+# #2874: a Dependabot-only approver (dependabot_reviewer_identities) holds
+# standing on the provenance-verified Dependabot lane and nowhere else. It is a
+# write collaborator, so GitHub's native required-review count accepts its
+# approval on ANY PR; leaving it out of available_reviewers does not stop that.
+# Outside the lane it is therefore a non-reviewer: the same latest-state,
+# whole-PR (not HEAD-pinned) deny check as non_reviewer_identities above, for
+# the same dismiss_stale_reviews reason. An identity also listed in
+# available_reviewers is a misconfiguration the docs warn against; it keeps its
+# general standing rather than blocking every PR it approves. Query modes are
+# exempt for the reason given above.
+if [ "$DEPENDABOT_LANE" != "true" ] && [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  # An `if`, not an `&&` chain: a chain whose last entry is filtered out ends
+  # the loop with status 1, which set -euo pipefail turns into a gate exit.
+  DEPENDABOT_ONLY=$(read_dependabot_reviewer_identities "$POLICY_CONFIG" | while IFS= read -r _id; do
+    if [ -n "$_id" ] && ! login_is_available_reviewer "$_id" "$POLICY_CONFIG"; then
+      printf '%s\n' "$_id"
+    fi
+  done)
+  if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
+     && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "dependabot_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line)."
+  fi
+  if [ -n "$DEPENDABOT_ONLY" ]; then
+    DEPENDABOT_ONLY_JSON=$(echo "$DEPENDABOT_ONLY" | jq -R . | jq -s .)
+    DO_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+    DO_APPROVERS=$(echo "$DO_REVIEWS_JSON" | jq -r \
+      --argjson deny "$DEPENDABOT_ONLY_JSON" '
+        [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login as $u | $deny | index($u))
+        ]
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | map(select(.state == "APPROVED"))
+        | map(.user.login)
+        | unique
+        | join(", ")
+      ')
+    if [ -n "$DO_APPROVERS" ]; then
+      block "standing APPROVED review from a Dependabot-only approver ($DO_APPROVERS) on a PR outside the provenance-verified Dependabot lane. That identity may approve Dependabot PRs only (dependabot_reviewer_identities, mergepath#2874); its approval must not satisfy branch protection here. Dismiss the review, then find out why that token approved a non-Dependabot PR."
+    fi
+    log "Dependabot-only approver check: no standing approval on this non-Dependabot PR from [$(echo "$DEPENDABOT_ONLY" | tr '\n' ' ' | sed 's/ $//')]"
+  fi
+fi
+
 if [ "$DEPENDABOT_LANE" = "true" ]; then
   if [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
     # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
@@ -1197,10 +1242,17 @@ if [ "$DEPENDABOT_LANE" = "true" ]; then
   # half-threaded state the #767 review flagged. Passed explicitly rather than
   # left to the helper's $CONFIG fallback, which would resolve to the
   # default-branch path and silently reintroduce that split.
-  REVIEWERS=$(read_available_reviewers "$POLICY_CONFIG")
-  if [ -z "$REVIEWERS" ]; then
+  if [ -z "$(read_available_reviewers "$POLICY_CONFIG")" ]; then
     die 2 "no available_reviewers found in $POLICY_CONFIG"
   fi
+  # #2874: this lane, and only this lane, also accepts the Dependabot-only
+  # approver identities. A flow list or scalar would parse to nothing; fail
+  # loudly rather than let a declared identity look absent.
+  if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
+     && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "dependabot_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line)."
+  fi
+  REVIEWERS=$(read_dependabot_approvers "$POLICY_CONFIG")
   REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 
   REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")

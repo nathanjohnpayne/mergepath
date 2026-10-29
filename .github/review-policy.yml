@@ -144,6 +144,29 @@ non_reviewer_identities:
   - octo-sts[bot]
 
 # ---------------------------------------------------------------------------
+# Dependabot-Only Approver Identities (#2874)
+# ---------------------------------------------------------------------------
+# The account behind DEPENDABOT_REVIEWER_TOKEN (dependabot-auto-merge.yml's
+# `approve` job, docs/agents/dependabot-reviewer-environment.md). An approval
+# from an identity listed here counts on the Dependabot lane only: the
+# approve job's identity check, the merge job's approval re-read, the Merge
+# clearance gate's Dependabot arm, scripts/codex-review-check.sh (so it can
+# clear needs-external-review) and pr-audit Check 2's Dependabot rule; the
+# last three require proven Dependabot commit provenance. Outside that lane
+# the gate blocks on its standing approval, as for non_reviewer_identities.
+# These identities are deliberately absent from available_reviewers, so every
+# other approval check ignores them and a leaked copy of the token cannot
+# clear an agent or human PR. It also keeps automated dependency approvals
+# visibly separate from agent reviews in the PR history.
+#
+# Absent or empty is legitimate: the Dependabot lane then accepts
+# available_reviewers only. Use the dash-prefixed block form; the gate exits 2
+# on a flow list or bare scalar. Never list an identity here that is also in
+# non_reviewer_identities (that gate would fail every approved Dependabot PR).
+dependabot_reviewer_identities:
+  - nathanpayne-deps
+
+# ---------------------------------------------------------------------------
 # CI App Thread-Resolution Identity (#2726)
 # ---------------------------------------------------------------------------
 # The ONE GitHub App bot login that may resolve demonstrably-actioned review

@@ -262,9 +262,19 @@ case "$endpoint" in
     if [ "$scenario" = reply-only ]; then
       printf '%s\n' '[{"id":92,"pull_request_review_id":91,"in_reply_to_id":90,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Review Result: Verified commit resolves the reported issue."}]'
     else printf '[]\n'; fi ;;
-  repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
+  repos/owner/repo/issues/999/reactions)
+    # #2882: Codex's PR-open auto-review leaves a 👍 on the PR itself.
+    if [ "$scenario" = pr_open_reaction ]; then
+      jq -cn --arg t "$t" '[{id:9301,user:{login:"chatgpt-codex-connector[bot]"},content:"+1",created_at:$t}]'
+    else printf '[]\n'; fi ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      # #2882: the rest of that auto-review, as tadlockpsychiatry#206 showed
+      # it: a Completed, findings-free Review Summary row naming HEAD, and no
+      # review object, verdict comment or author trigger.
+      pr_open_reaction)
+        jq -cn --arg t "$t" --arg h "$head_sha" '[{id:9300,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,updated_at:$t,
+           body:("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"" + $h + "\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"}} -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** | `" + $h[0:10] + "` | Pull request opened |\n")}]' ;;
       freshness_author)
         [ -z "${CODEX_TEST_FRESHNESS_TRANSITION:-}" ] || touch "$CODEX_TEST_STATE_DIR/freshness-scan-complete"
         jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
@@ -402,6 +412,22 @@ test_fresh_posts_once_no_poll() {
     || fail "A: terminal_determination must be present and null"
   [ "$(jqf "$dir" '.rounds_waited_seconds')" = "0" ] || fail "A: rounds_waited_seconds=$(jqf "$dir" '.rounds_waited_seconds'), expected 0 (no poll)"
   [ "$FAIL" -ne "$before" ] || pass "A: fresh HEAD posts one @codex trigger, exits 0 without polling/ack-retry"
+}
+
+# #2882: Codex's PR-open auto-review (a 👍 on the PR plus a clean Completed
+# summary row, with no review object or verdict) is not clearance. The merge
+# gate's same-agent branch 2 accepts only commit-anchored evidence (#1751), so
+# a requester that counted this as cleared would refuse the trigger the gate
+# needs and deadlock the PR, as a pre-#1855 copy did on tadlockpsychiatry#206.
+test_pr_open_reaction_still_posts() {
+  local dir rc before=$FAIL
+  dir=$(make_case "pr-open-reaction")
+  rc=$(CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa run_trigger_only "$dir" pr_open_reaction)
+  [ "$rc" = "0" ] || fail "#2882: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "#2882: a PR-open 👍 must not suppress the trigger → expected 1 post, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "#2882: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
+  ! grep -q 'already cleared' "$dir/err.log" || fail "#2882: requester treated the PR-open 👍 as clearance"
+  [ "$FAIL" -ne "$before" ] || pass "#2882: PR-open 👍 + clean summary row, no trigger → requester posts the trigger branch 2 needs"
 }
 
 # B: existing AUTHOR trigger on HEAD → idempotent skip
@@ -2044,6 +2070,7 @@ test_write_boundary_authorization
 test_write_boundary_authorization_caller_mode
 
 test_fresh_posts_once_no_poll
+test_pr_open_reaction_still_posts
 test_dup_author_skips
 test_uppercase_author_command_skips
 test_author_containment_posts
