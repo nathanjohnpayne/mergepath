@@ -430,6 +430,15 @@ stop_check "fixed: two fixed rounds before a third leave one runaway window" "$(
   '.stops == [] and .fixed_responses == ["w1.0","w2.0"] and .blocking_windows == 1'
 stop_check "fixed: the same three rounds with nothing fixed are a runaway" "$(fx_stops "$(inputs "$R3B" "$BBB3" '[]' '[]' '[]')" '[]' "$HC3" 3)" \
   '.stops == ["runaway"] and .blocking_windows == 3'
+# #2746: a fixed round leaves the request side of the comparison too. One
+# fixed round followed by two blocking rounds at a ceiling of 2 is a runaway;
+# before the fix the fixed round's request kept blocking_windows (2) below
+# counted_requests (3) forever, so only blocking-budget could stop the loop.
+stop_check "fixed: a fixed round then two blocking rounds at a ceiling of 2 are a runaway" \
+  "$(fx_stops "$(inputs "$R3B" "$BBB3" '[]' '[]' '[]')" '[100]' "$HC3" 2)" \
+  '.stops == ["runaway"] and .fixed_responses == ["w1.0"] and .blocking_windows == 2 and .counted_requests == 3'
+stop_check "fixed: a fixed round then one blocking round at a ceiling of 2 are no runaway" \
+  "$(fx_stops "$IN2" '[100]' "$HC_AB" 2)" '.stops == [] and .counted_requests == 2'
 # A request in the same second as the round's last signal is not later, even
 # when a fractional timestamp would sort it after ("00Z" > "00.5Z").
 L_FS=$(crl_ledger "$(printf '%s' "$IN2" | jq -c '.rebuttals = []')" \
@@ -1051,6 +1060,71 @@ for unresolved in ambiguous absent mixed provider malformed malformed-only; do
     fail "CLI anchors $unresolved: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
   fi
 done
+# #2772 item 1: two different full SHAs in one verdict anchor no single
+# commit. The verdict is excluded, so it cannot answer the pending request as
+# an anchorless response. Fails open before the fix.
+D="$WORK/anchor-conflicting"; anchor_case "$D" "$(printf 'Reviewed commit: %s\nReviewed commit: %s' "$HEAD_A" "$HEAD_B")"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: conflicting full-SHA anchor fields cannot answer a pending request"
+else
+  fail "CLI anchors conflicting: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# The same SHA twice, in either case, is one anchor and still answers.
+D="$WORK/anchor-repeated"; anchor_case "$D" "$(printf 'Reviewed commit: %s\nReviewed commit: %s' "$HEAD_A" "$HEAD_A")"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e --arg head "$HEAD_A" '.summary.responses == 1 and .responses[0].anchor == $head and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+  pass "CLI anchors: a repeated identical anchor field is the same single anchor"
+else
+  fail "CLI anchors repeated: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# #2772 item 2: prose that mentions reviewed commits is not an anchor field,
+# so an anchorless verdict stays an anchorless answer to its request instead
+# of being excluded as malformed. Fails closed before the fix.
+for prose in 'The reviewed commits look clean.' 'Reviewed commits: all clean.' 'All REVIEWED COMMITS are clean.'; do
+  D="$WORK/anchor-prose"; rm -rf "$D"; anchor_case "$D" "$prose"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && jq -e '.summary.responses == 1 and .requests[0].outcome == "attributed"' "$D/out" >/dev/null; then
+    pass "CLI anchors: prose '$prose' leaves an anchorless verdict attributable"
+  else
+    fail "CLI anchors prose '$prose': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+# Phase 4b P1 on #2859: ordered-list numbering is Markdown decoration too, so a
+# numbered malformed field still excludes the verdict. Before the fix such a
+# verdict read as an anchorless clean response and could clear a human stop.
+for numbered in '1. Reviewed commit: not-a-sha' '2) **Reviewed commit:** `not-a-sha`' '+ Reviewed commit: not-a-sha' \
+    '1. - **Reviewed commit:** `not-a-sha`' '1. ### Reviewed commit: not-a-sha' '> 1. * _Reviewed commit_: not-a-sha' \
+    'I reviewed commit history and found nothing.' \
+    "Reviewed commit$(printf 'a%.0s' $(seq 41))" "Reviewed commit$(printf '1%.0s' $(seq 41))" \
+    'Reviewed commitsdeadbeef'; do
+  D="$WORK/anchor-numbered"; rm -rf "$D"; anchor_case "$D" "$numbered"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && jq -e '.responses == [] and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+    pass "CLI anchors: a decorated malformed field or bare phrase ('$numbered') still excludes the verdict"
+  else
+    fail "CLI anchors numbered '$numbered': rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+# Codex P2 on #2859: prose with no "Codex Review:" heading is not a verdict at
+# all. Before the heading requirement it entered as an unknown_tier response
+# and spent the blocking budget.
+D="$WORK/anchor-headless-prose"; anchor_case "$D" ignored
+jq '.[1].body = "The reviewed commits look clean."' "$D/issue_comments.json" >"$D/ic.tmp" && mv "$D/ic.tmp" "$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .summary.responses == 0 and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: heading-less prose that mentions reviewed commits is no response"
+else
+  fail "CLI anchors headless prose: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+# A malformed field behind Markdown decoration is still a field.
+D="$WORK/anchor-decorated-malformed"; anchor_case "$D" '- **Reviewed commit:** `not-a-sha`'
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.responses == [] and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
+  pass "CLI anchors: a decorated malformed anchor field still excludes the verdict"
+else
+  fail "CLI anchors decorated malformed: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
 D="$WORK/anchor-error"; anchor_case "$D" 'Reviewed commit: aaaaaaa'
 printf 'raise RuntimeError("fixture resolver failure")\n' >"$D/scripts/workflow/resolve-codex-verdict-anchors.py"
 RC=$(run_cli "$D")
