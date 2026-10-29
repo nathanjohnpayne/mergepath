@@ -4463,10 +4463,10 @@ crw_select_summary_comment() {
 #   - A SUPERSEDING event is a later real review: a body-bearing bot review run
 #     whose body classifies `review` and is not the notice, or a clean
 #     PR-level summary that names this head in its commits range and carries no
-#     processing-error sentence (#2751). A run supersedes a head-pinned notice
-#     only when it is pinned to the same head; it supersedes an issue-comment
-#     notice from any head, because an issue comment is CodeRabbit's word on its
-#     latest attempt, and a later completed run is a later attempt.
+#     processing-error sentence (#2751). A run supersedes any notice only when
+#     it is pinned to this head: a run on an older commit finishing after a
+#     failed attempt on this one says nothing about this head (4b round 3 on
+#     #2857). A summary is ordered by when it was posted, not edited.
 #   - The latch is SET while any processing-error event has no superseding
 #     event strictly after it. Equal times do not supersede.
 #
@@ -4485,7 +4485,7 @@ crw_select_summary_comment() {
 # crw_processing_error_latch_from <issue-comments-json> <reviews-json> <bot-login> <head-sha>
 crw_processing_error_latch_from() {
   local issue_comments=${1-} reviews=${2-} bot=${3:?} head=${4:?}
-  local rows row body kind pe_rc class class_rc names_rc unfenced events=""
+  local rows row body kind pe_rc class class_rc names_rc unfenced grep_rc events=""
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$issue_comments" || return 3
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$reviews" || return 3
   # One row per bot item: issue comments, and review objects with a body
@@ -4528,7 +4528,7 @@ crw_processing_error_latch_from() {
   # that could set the latch count: a review object pinned to another commit
   # never does, so an old failure there must not defeat the exit on every
   # later head (4b P2 on #2857).
-  local candidates grep_rc=0
+  local candidates; grep_rc=0
   candidates=$(jq -Rr --arg head "$head" '
     select(length > 0 and . != "UNREADABLE") | @base64d | fromjson
     | select(.src == "comment" or .commit_id == $head) | .body
@@ -4567,9 +4567,16 @@ crw_processing_error_latch_from() {
                   0)
                     # A summary still carrying the notice's sentence is the
                     # failed attempt's own edit, not a later completed one.
+                    # grep exit 1 is "no match"; any other status is unread,
+                    # never permission to supersede (4b round 3 on #2857).
                     unfenced=$(crw_unfenced_body "$(cr_strip_vendor_header "$body")") || return 3
-                    grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$unfenced" \
-                      || kind=summary
+                    grep_rc=0
+                    grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$unfenced" || grep_rc=$?
+                    case "$grep_rc" in
+                      0) : ;;
+                      1) kind=summary ;;
+                      *) return 3 ;;
+                    esac
                     ;;
                   1) : ;;
                   *) return 3 ;;
@@ -4585,12 +4592,18 @@ crw_processing_error_latch_from() {
     # publication: a run or summary carrying any generated stanza other than
     # the benign summarize/release-notes ones (a `failure by coderabbit.ai`
     # stanza, say) reports a failed attempt and supersedes nothing (#2857 4b).
+    # A grep that cannot answer is unread, not "no stanza" (4b round 3 on
+    # #2857); summary_stanzas_all_benign already reads its own failures as
+    # "not benign", which supersedes nothing.
     case "$kind" in
       run|summary)
-        if grep -qiE 'auto-generated comment: ' <<<"$body" \
-           && ! summary_stanzas_all_benign "$body"; then
-          kind=""
-        fi
+        grep_rc=0
+        grep -qiE 'auto-generated comment: ' <<<"$body" || grep_rc=$?
+        case "$grep_rc" in
+          0) summary_stanzas_all_benign "$body" || kind="" ;;
+          1) : ;;
+          *) return 3 ;;
+        esac
         ;;
     esac
     [ -n "$kind" ] || continue
@@ -4607,7 +4620,7 @@ crw_processing_error_latch_from() {
     | [ $pe[] as $p
         | select([ $e[] | select(.t > $p.t)
                    | select(.kind == "summary"
-                            or (.kind == "run" and ($p.src == "comment" or .commit_id == $head))) ]
+                            or (.kind == "run" and .commit_id == $head)) ]
                  | length == 0)
         | $p ]
     | sort_by(.t) | last

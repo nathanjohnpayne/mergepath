@@ -1545,9 +1545,12 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
   latch_case 0 same-second-summary "[$(ic $t0 "$summary")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
   latch_case 0 earlier-summary "[$(ic $t0 "$summary")]" "[$(rv $t5 $h "$PROCESSING_ERROR_BODY")]"
   latch_case 0 later-summary-other-head "[$(ic $t5 "${summary/$h/$PREV_HEAD_SHA_40}")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
-  # A later run supersedes an issue-comment notice from any head, but a
-  # head-pinned notice only from the same head.
-  latch_case 1 comment-notice-later-run "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" "[$(rv $t5 other "Review completed. No actionable comments.")]"
+  # A later run supersedes a notice only when pinned to this head, whether the
+  # notice is a comment or a head-pinned object: a run on an older commit that
+  # finishes after this head's failed attempt reviewed nothing here (4b round 3
+  # on #2857).
+  latch_case 1 comment-notice-later-head-run "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" "[$(rv $t5 $h "Review completed. No actionable comments.")]"
+  latch_case 0 comment-notice-later-other-run "[$(ic $t0 "$PROCESSING_ERROR_BODY")]" "[$(rv $t5 other "Review completed. No actionable comments.")]"
   latch_case 1 review-notice-later-head-run '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "Review completed. No actionable comments.")]"
   latch_case 0 review-notice-later-other-run '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 other "Review completed. No actionable comments.")]"
   # An ordinary later reply is not a review (#2752 polling false clearance).
@@ -1609,6 +1612,27 @@ $fail_stanza")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
   local t4=2026-06-04T00:00:04Z t6=2026-06-04T00:00:06Z
   latch_case 0 earlier-summary-edited-later "[$(ic $t0 "$summary" | jq -c --arg u "$t6" '.updated_at = $u')]" "[$(rv $t4 $h "$PROCESSING_ERROR_BODY")]"
   latch_case 3 summary-created-unreadable "[$(ic $t5 "$summary" | jq -c 'del(.created_at)')]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]"
+  # A grep that errors (exit 2) is unread, never "no match" (4b round 3 on
+  # #2857). The fault is injected only for the two supersession greps, keyed
+  # on their patterns, so the candidate scan and the notice predicate still
+  # run: an errored stanza check must not let a failure-only run supersede,
+  # and an errored notice-sentence check must not let a summary supersede.
+  {
+    cat "$snip"
+    printf '%s\n' 'grep() { case "$*" in *"auto-generated comment: "*) [ "${CRW_GREP_FAULT:-}" = stanza ] && return 2 ;; esac; case "$*" in *"we could not process this pull request"*) if [ "${CRW_GREP_FAULT_ARMED:-}" = 1 ]; then unset CRW_GREP_FAULT_ARMED; return 2; fi ;; esac; command grep "$@"; }'
+  } >"$mut"
+  latch_case 1 grep-fault-control '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "Review completed. No actionable comments.")]" "$mut"
+  CRW_GREP_FAULT=stanza latch_case 3 grep-fault-stanza '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "$fail_stanza")]" "$mut"
+  CRW_GREP_FAULT=stanza latch_case 3 grep-fault-stanza-clean-run '[]' "[$(rv $t0 $h "$PROCESSING_ERROR_BODY"),$(rv $t5 $h "Review completed. No actionable comments.")]" "$mut"
+  # The sentence fault is one-shot and arms only once summary_names_head has
+  # accepted the summary, so the candidate scan and the notice predicate (which
+  # share the pattern) read normally and only the summary check's grep errors.
+  {
+    cat "$mut"
+    printf '%s\n' 'eval "orig_$(declare -f summary_names_head)"' 'summary_names_head() { local r=0; orig_summary_names_head "$@" || r=$?; [ "$r" = 0 ] && [ "${CRW_GREP_FAULT:-}" = sentence ] && CRW_GREP_FAULT_ARMED=1; return "$r"; }'
+  } >"$mut.sentence"
+  CRW_GREP_FAULT=sentence latch_case 3 grep-fault-summary-sentence "[$(ic $t5 "$summary")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]" "$mut.sentence"
+  latch_case 1 grep-fault-summary-control "[$(ic $t5 "$summary")]" "[$(rv $t0 $h "$PROCESSING_ERROR_BODY")]" "$mut.sentence"
   # A long history is read, not unreadable (Codex P2 on #2857): ~1.5 MiB of
   # comments is past both Linux's 128 KiB per-argument limit and macOS's 1 MiB
   # ARG_MAX, so passing the lists on argv would fail E2BIG and read as rc 3.
@@ -1871,6 +1895,27 @@ test_processing_error_not_superseded_by_summary_edit() {
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
   [ "$rc" = "0" ] || fail "PE-edit control: a summary posted after the notice should supersede it and clear, got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "PE-edit: 4b P1 on #2857 — only a summary posted after a processing-error notice supersedes it; an in-place edit to an older one does not"
+}
+
+# --- 4b round 3 on #2857: a run on an older commit is not this head's review --
+# A processing-error comment at T0 (this head's attempt failed), a clean run on
+# an older commit finishing at T2, a benign bot reply at T3 and the success
+# status at T5. Nothing reviewed this head. The control pins the same run to
+# this head, which is a later review of it and clears.
+test_processing_error_not_superseded_by_other_commit_run() {
+  local dir rc before=$FAIL reviews commit
+  for commit in other-sha head-sha; do
+    reviews=$(jq -cn --arg c "$commit" '[{"id":8820,"user":{"login":"coderabbitai[bot]"},"commit_id":$c,"submitted_at":"2026-06-04T00:00:02Z","body":"Review completed. No actionable comments."}]')
+    dir=$(make_case "pe-run-on-$commit" "$PROCESSING_ERROR_BODY" "2026-06-04T00:00:05Z" "Review completed" "2026-06-04T00:00:00Z" 999999999 "Thanks for the update." "2026-06-04T00:00:03Z")
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+    if [ "$commit" = other-sha ]; then
+      [ "$rc" != "0" ] && ! grep -q 'emitting cleared' "$dir/err.log" \
+        || fail "PE-other-run: a run on an older commit superseded this head's processing-error comment and cleared (rc=$rc); err=$(tail -4 "$dir/err.log")"
+    else
+      [ "$rc" = "0" ] || fail "PE-other-run control: a later run pinned to this head should supersede the notice and clear, got $rc; err=$(tail -4 "$dir/err.log")"
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass "PE-other-run: 4b round 3 on #2857 — only a run pinned to this head supersedes a processing-error comment"
 }
 
 test_completed_description_still_clears() {
@@ -3229,6 +3274,7 @@ test_processing_error_recovery_run_is_graded
 test_processing_error_latch_does_not_replace_run_grading
 test_processing_error_review_object_recovery_run_is_graded
 test_processing_error_not_superseded_by_summary_edit
+test_processing_error_not_superseded_by_other_commit_run
 test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error
