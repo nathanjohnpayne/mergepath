@@ -47,6 +47,12 @@
 #                    trusted wave code regenerates curated bytes after live
 #                    canary byte verification. Do not replace its canonical
 #                    bases with the moving live PR base.
+#   --wave-codex-request <comment-id>
+#                    with --wave-scope-file only: the Codex request comment
+#                    scripts/wave-audit.sh created or bound on the canary. The
+#                    barrier's Codex arm then clears only on the answer to
+#                    that request (#2771; p4b_wave_codex_binding_state). It
+#                    only removes ways to clear, never adds one.
 #   --offline-diff   display-only preview of supplied bytes. Requires
 #                    --dry-run, --diff-file, and --head; never posts and has
 #                    no live immutable-input binding.
@@ -289,7 +295,7 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; RETAIN_EVIDENCE=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; RETAIN_EVIDENCE=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE="" ; WAVE_CODEX_REQUEST=""
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
@@ -303,7 +309,7 @@ case "${P4B_FORCE_ENABLED:-}" in
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--wave-codex-request <comment-id>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
   exit 3
 }
 
@@ -318,6 +324,7 @@ while [ $# -gt 0 ]; do
       EXPECTED_BASE_SHA_SET=true; EXPECTED_BASE_SHA="$2"; shift 2 ;;
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
     --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
+    --wave-codex-request) WAVE_CODEX_REQUEST="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
     --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
@@ -349,6 +356,18 @@ fi
 if [ "$RETAIN_EVIDENCE" = true ]; then
   [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
     || p4b_die 3 "--retain-evidence requires a bound, non-offline --dry-run"
+fi
+
+# #2771: the wave audit's Codex arm is bound to the request it created. The
+# library resets the posture when sourced (above), so only this assignment,
+# after validation, can set it.
+if [ -n "$WAVE_CODEX_REQUEST" ]; then
+  [[ "$WAVE_CODEX_REQUEST" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || p4b_die 3 "--wave-codex-request must be a positive comment id; got '$WAVE_CODEX_REQUEST'"
+  [ -n "$WAVE_SCOPE_FILE" ] || p4b_die 3 "--wave-codex-request requires --wave-scope-file"
+  # Read by the sourced library's barrier; deliberately not exported.
+  # shellcheck disable=SC2034
+  P4B_BARRIER_WAVE_CODEX_REQUEST="$WAVE_CODEX_REQUEST"
 fi
 
 if [ "$OFFLINE_DIFF" = true ]; then

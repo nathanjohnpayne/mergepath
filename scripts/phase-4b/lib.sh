@@ -2117,6 +2117,188 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 # #814 ships with no new review-policy keys. A provider disabled in policy is
 # simply not consulted — that, and not any rc, is the only route to
 # will-not-report, and it cannot flip mid-flight on a live PR.
+# --- same-head provider barrier: wave-audit request binding (#2771) ----------
+#
+# A wave audit binds its Codex arm to the request it created
+# (phase-4b-review.sh --wave-codex-request <comment-id>). The unbound arm
+# clears on ANY current-head Codex signal, so an unsolicited App review could
+# clear it while the audit's own request was still unanswered; narrowing that
+# window did not converge over four review rounds. Binding only ever removes
+# ways to clear (an answer still needs today's rc 0), so the flag needs no
+# authority of its own. Only scripts/phase-4b-review.sh sets it, and sourcing
+# this library resets it so an inherited environment value is ignored.
+P4B_BARRIER_WAVE_CODEX_REQUEST=""
+
+# p4b_codex_summary_versions <comments-json> <bot>
+# Every version of Codex's Review Summary comment(s) as [{at, body}]: each
+# GraphQL userContentEdits entry (its diff is the full body at that edit,
+# #2598) plus the live body. Prints `null` when any history cannot be read in
+# full (a failed query, or more edits than one page returns), which the
+# binding treats as a hold, never as an empty history.
+p4b_codex_summary_versions() {
+  local marked nid edits all='[]' query
+  marked="$(printf '%s' "${1:-[]}" | jq -c --arg bot "${2:-}" '[ .[]
+    | select((.user.login // "") == $bot)
+    | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+    | {node_id, at: (.updated_at // .created_at // ""), body} ]' 2>/dev/null)" || { printf 'null\n'; return 0; }
+  query='query($id:ID!){node(id:$id){... on IssueComment{userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}'
+  while IFS= read -r nid; do
+    [ -n "$nid" ] || continue
+    edits="$(gh api graphql -f query="$query" -f id="$nid" 2>/dev/null \
+      | jq -ce '.data.node.userContentEdits
+          | select(type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length))
+          | [ .nodes[] | {at: (.editedAt // ""), body: (.diff // "")} ]' 2>/dev/null)" \
+      || { printf 'null\n'; return 0; }
+    all="$(jq -nc --argjson a "$all" --argjson e "$edits" '$a + $e')"
+  done < <(printf '%s' "$marked" | jq -r '.[] | .node_id // "missing"')
+  jq -nc --argjson a "$all" --argjson m "$marked" '$a + [ $m[] | {at, body} ]'
+}
+
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json>
+# Pure. Prints {state, reason, bound_request, requests, runs[, generation]}:
+# state is "clear", "hold" or "unreadable"; requests and runs are the
+# evidence the decision paired (machine-readable for whoever surfaces a hold);
+# generation, on a clear, is the author request generation the decision read
+# (crqe_trigger_generation's grammar), handed to the run's later fences.
+#
+# <summary-versions-json> is every version of Codex's Review Summary comment,
+# [{at, body}], from its GraphQL edit history plus the live body (it is
+# edited in place), or `null` when that history could not be read in full.
+#
+# Evidence, and what it does NOT prove. Each version carries
+# `codex-review-state:v1` JSON (full commit, status) and a row whose Review
+# trigger cell reads "PR opened" / "New commits" for the App's automatic runs
+# and "Manual request" for a review-request comment; a Running version stamps
+# the run's start. Across the full edit histories of swipewatch#205-#213 and
+# mergepath#2868/#2875 no automatic run was "Manual request" and all five
+# manual runs started 10-17 s after an author request. That is a strong
+# observed correlation, not a provider-guaranteed request id: "Manual request"
+# never says WHICH request, and nothing documents a maximum queue age.
+#
+# So runs are tied to requests by order, never by a time window. Every
+# non-bot comment mentioning Codex's handle is a request (any age, any
+# author: Codex may treat it as one). Oldest first, each request takes the
+# earliest Manual-request run that started at or after it and after the run
+# the previous request took (FIFO). R clears only when:
+#   - no request comes after R (a superseding, overlapping or same-second
+#     later request would make R's run ambiguous);
+#   - every request before R has a run of its own (an older request still
+#     queued would take the run that starts after R: the owner's adversarial
+#     case, closed structurally rather than by a longer window);
+#   - R's own run is on exactly <head> and reached Completed.
+# Residual assumption (an owner decision, specs/codex_request_evidence.md):
+# Codex serves review requests on a PR in the order they were posted, one run
+# per request. A provider that reordered queued requests, or coalesced two
+# into one run, would break the pairing; coalescing makes R hold (no run left
+# for it), and reordering is the residual.
+#
+#   hold        any of the above unmet, an unreadable / incomplete history,
+#               an unparseable version, an inconsistent history (a terminal
+#               version with no Running start, or a commit or trigger change
+#               inside one run), or a request time that does not parse. The
+#               barrier's bounded budget then ends in the existing fail-open
+#               exit 4; nothing retries on its own.
+#   unreadable  R missing, not the author's, not an exact request, or its
+#               time unreadable. Fail closed.
+p4b_wave_codex_binding_state() {
+  local out
+  # A jq path that ends in `empty` prints nothing; nothing is never a state,
+  # so it is unreadable rather than silently read as a hold.
+  out="$(p4b_wave_codex_binding_eval "$@")"
+  case "$out" in
+    *'"state":"clear"'*|*'"state":"hold"'*|*'"state":"unreadable"'*) printf '%s\n' "$out" ;;
+    *) jq -nc '{state: "unreadable", reason: "binding-evaluation-failed"}' ;;
+  esac
+}
+
+p4b_wave_codex_binding_eval() {
+  printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
+    --arg head "${4:-}" --arg rid "${5:-}" --argjson versions "${6:-null}" '
+    def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
+    def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
+    # One summary version -> {at, commit, status, trigger, time} or null.
+    def version:
+      ((try ((.body // "") | capture("<!-- codex-review-state:v1 (?<j>\\{.*\\}) -->").j | fromjson) catch null) // null) as $sj
+      | ((.body // "")
+          | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+          // null) as $row
+      | if $sj == null or ($sj.code_review | type) != "object" or $row == null then null
+        else
+          (($sj.code_review.commit_sha // "") | ascii_downcase) as $jc
+          | if ($jc | test("^[0-9a-f]{40}$") | not) or ($jc | startswith($row.commit | ascii_downcase) | not) then null
+            else {at: (.at // ""), commit: $jc,
+                  status: ($sj.code_review.status // "unknown" | tostring),
+                  trigger: ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "") | ascii_downcase),
+                  time: (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end)}
+            end
+        end;
+    ($head | ascii_downcase) as $h
+    | if type != "array" then {state: "unreadable", reason: "comments-not-array"} else
+      . as $comments
+      | ([ .[] | select((.id | tostring) == $rid) ] | first) as $r
+      | if $r == null then {state: "unreadable", reason: "bound-request-missing"}
+        elif ($r | exact_request | not) then {state: "unreadable", reason: "bound-request-not-author-request"}
+        elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
+        else
+          ([ $comments[] | select(exact_request) | .id ] | unique) as $generation
+          | ([ $comments[] | select((.user.login // "") != $bot)
+               | select((.body // "") | test("@codex"; "i"))
+               | {id, at: (.created_at // ""), t: ((.created_at // "") | secs)} ] | sort_by(.t, .id)) as $reqs
+          | {bound_request: $r.id, requests: [ $reqs[] | {id, at} ], runs: []} as $base
+          | if any($reqs[]; .t == null) then $base + {state: "hold", reason: "request-time-unreadable"}
+            elif ($versions | type) != "array" then $base + {state: "hold", reason: "summary-history-unreadable"}
+            else
+              [ $versions[] | version ] as $parsed
+              | if any($parsed[]; . == null) then $base + {state: "hold", reason: "summary-version-unparseable"}
+                else
+                  # Rebuild runs from the versions in edit order: a Running
+                  # version opens a run (repeats of the same run are edits);
+                  # a terminal version updates the open run.
+                  ($parsed | sort_by(.at)
+                    | reduce .[] as $x ({runs: [], cur: null, bad: false};
+                        if $x.status == "running" then
+                          if .cur != null and .cur.status == "running" and .cur.start == $x.time
+                             and .cur.commit == $x.commit and .cur.trigger == $x.trigger then .
+                          else (if .cur != null then .runs += [.cur] else . end)
+                            | .cur = {start: $x.time, commit: $x.commit, trigger: $x.trigger, status: "running"}
+                          end
+                        elif .cur == null or .cur.commit != $x.commit or .cur.trigger != $x.trigger then .bad = true
+                        else .cur.status = $x.status end)
+                    | (if .cur != null then .runs += [.cur] else . end)) as $built
+                  | ([ $built.runs[] | select(.trigger == "manual request") ]) as $manual
+                  | ($base + {runs: [ $manual[] | {start: (.start | if . == null then null else todate end), commit: .commit[0:12], trigger, status} ]}) as $detail
+                  | if $built.bad or any($built.runs[]; .start == null)
+                    then $detail + {state: "hold", reason: "summary-history-inconsistent"}
+                    else
+                      # FIFO pairing: oldest request first, each takes the
+                      # earliest manual run starting at or after it and after
+                      # the previous request s run.
+                      (reduce $reqs[] as $q ({next: 0, out: []};
+                         . as $acc
+                         | ([ range($acc.next; ($manual | length)) as $j
+                              | select($manual[$j].start >= $q.t) | $j ] | first) as $j
+                         | if $j == null then .out += [{id: $q.id, run: null}]
+                           else .out += [{id: $q.id, run: $j}] | .next = $j + 1 end)).out as $paired
+                      | ($detail + {requests: [ range(0; $reqs | length) as $k | {id: $reqs[$k].id, at: $reqs[$k].at, run: $paired[$k].run} ]}) as $detail
+                      | ([ range(0; $paired | length) | select(($paired[.].id | tostring) == $rid) ] | first) as $ri
+                      | if $ri == null then {state: "unreadable", reason: "bound-request-missing"}
+                        elif ($ri + 1) < ($paired | length) then $detail + {state: "hold", reason: "request-after-bound-request"}
+                        elif any($paired[0:$ri][]; .run == null) then $detail + {state: "hold", reason: "older-request-without-its-own-run"}
+                        elif $paired[$ri].run == null then $detail + {state: "hold", reason: "no-run-for-bound-request"}
+                        else
+                          $manual[$paired[$ri].run] as $run
+                          | if $run.commit != $h then $detail + {state: "hold", reason: "bound-run-on-another-commit"}
+                            elif $run.status == "completed"
+                            then $detail + {state: "clear", reason: "bound-request-answered", generation: $generation}
+                            else $detail + {state: "hold", reason: ("bound-run-" + $run.status)} end
+                        end
+                    end
+                end
+            end
+        end
+      end' 2>/dev/null
+}
+
 p4b_same_head_barrier() {
   # cap-only is the read-only GitHub guard for an unavailable adapter: it
   # shares the Codex decision and local final-request wait bound, but never
@@ -2129,6 +2311,7 @@ p4b_same_head_barrier() {
   local cx_terminal_json="" cx_terminal_rc=0 cx_terminal_state="" live_report_head=""
   local initial_cls_cx="" initial_cx_evidence=""
   local pending=false why="" coderabbit_cause="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
+  local wave_binding_json=null
   local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
   local cap_exhausted=false final_request_pending=false human_tiebreaker=false
   local cx_human_stops_json="null"
@@ -2285,6 +2468,56 @@ p4b_same_head_barrier() {
         fi
         ;;
     esac
+    # #2771: a wave audit's Codex arm clears only on the answer to its own
+    # request (p4b_wave_codex_binding_state). Applied to the reported arm and
+    # to a Phase 4a timeout waiver; the account-block waiver (rc 2: no request
+    # can be answered) and every request-cap path are unchanged.
+    if [ -n "$P4B_BARRIER_WAVE_CODEX_REQUEST" ] && [ -z "$why" ] && [ "$cap_exhausted" != true ]; then
+      case "$cls_cx:$cx_evidence" in
+        reported:*|waived:timeout|not-yet:*)
+          local wb_comments="" wb_json wb_state wb_reason wb_author wb_bot wb_versions
+          wb_author="$(p4b_top_field author_identity)"; wb_author="${wb_author:-nathanjohnpayne}"
+          wb_bot="$(p4b_policy_block_field codex bot_login)"; wb_bot="${wb_bot:-chatgpt-codex-connector[bot]}"
+          if command -v gh_api_array >/dev/null 2>&1 \
+             && wb_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
+            wb_versions="$(p4b_codex_summary_versions "$wb_comments" "$wb_bot")"
+            wb_json="$(p4b_wave_codex_binding_state "$wb_comments" "$wb_author" "$wb_bot" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST" "$wb_versions")"
+          else
+            wb_json='{"state":"unreadable","reason":"comments-read-failed"}'
+          fi
+          wb_state="$(printf '%s' "$wb_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+          # Every outcome carries the binding's evidence (#2771, liveness): a
+          # hold that runs out the budget is surfaced with its reason, the
+          # requests and the runs it paired, not just "did not reach".
+          wave_binding_json="$(printf '%s' "$wb_json" | jq -c 'del(.generation)' 2>/dev/null || printf null)"
+          wb_reason="$(printf '%s' "$wb_json" | jq -r '.reason // "unknown"' 2>/dev/null || printf unknown)"
+          case "$cls_cx:$wb_state" in
+            *:unreadable)
+              cls_cx="escalate"
+              budget_unsafe=true
+              cx_evidence="wave-request-$wb_reason"
+              cx_budget_json="$(jq -nc --arg r "$wb_reason" --arg id "$P4B_BARRIER_WAVE_CODEX_REQUEST" \
+                '{state:"unreadable",reason:("wave-request-" + $r),wave_codex_request:$id}')"
+              why="The wave audit's Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST cannot be bound on $head ($wb_reason); refusing to infer that it was answered"
+              ;;
+            reported:clear)
+              cx_evidence="wave-request-answered"
+              # Hand the generation this decision verified to the run's
+              # later fences (capture_authorized_request_generation adopts
+              # request_budget.request_generation); a request that arrives
+              # after this read then reads as a moved generation, not as
+              # authorized (Phase 4b on #2875).
+              cx_budget_json="$(printf '%s' "$wb_json" | jq -c --arg id "$P4B_BARRIER_WAVE_CODEX_REQUEST" \
+                '{state:"wave-request-answered",wave_codex_request:$id,request_generation:.generation}')"
+              ;;
+            *)
+              cls_cx="not-yet"
+              cx_evidence="wave-request-$wb_reason"
+              ;;
+          esac
+          ;;
+      esac
+    fi
     # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
     # actually clear gate (c). With codex.allow_phase_4b_substitute: false the
     # merge gate rejects that review by design, so opening the barrier would
@@ -2518,6 +2751,10 @@ p4b_same_head_barrier() {
         esac
       else
         why="external review did not reach the current head within ${budget}s"
+        # A bound wave arm that held for its whole budget says why (#2771).
+        if [ "$wave_binding_json" != null ]; then
+          why="$why (wave Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST held: $(printf '%s' "$wave_binding_json" | jq -r '.reason // "unknown"' 2>/dev/null))"
+        fi
       fi
       # Name the REFUSAL, not just the clock (#1178). This exhaustion is
       # reachable with cls_cr=rate-limited whenever Codex stayed not-yet for
@@ -2605,30 +2842,31 @@ p4b_same_head_barrier() {
     fi
     if [ "$budget_unsafe" = true ]; then
       jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
-        --arg cc "$coderabbit_cause" --argjson b "${cx_budget_json:-null}" \
-        '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,coderabbit_cause:$cc,request_budget:$b}'
+        --arg cc "$coderabbit_cause" --argjson b "${cx_budget_json:-null}" --argjson wb "${wave_binding_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,coderabbit_cause:$cc,request_budget:$b,wave_binding:$wb}'
       return 4
     fi
     # The request budget and human stops travel on an escalation too (#1579):
     # a spent-ceiling waiver that escalates (CodeRabbit refusal, no substitute)
     # still needs its recheck before the manual handoff is rendered.
     jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" \
-      --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" \
+      --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" --argjson wb "${wave_binding_json:-null}" \
       '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs,
-        request_budget:$b, human_stops:$hs}'
+        request_budget:$b, human_stops:$hs, wave_binding:$wb}'
     return 2
   fi
   if [ "$pending" = true ]; then
     jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs}'
+      --argjson wb "${wave_binding_json:-null}" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs, wave_binding:$wb}'
     return 1
   fi
   # `coderabbit_carryforward` is present only on an open barrier and is null
   # unless the CodeRabbit arm carried (#1335): the orchestrator records the
   # source commit and fingerprint in the approval it posts.
   jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --argjson cf "$cr_carry_json" \
-    --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" \
-    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf,request_budget:$b,human_stops:$hs}'
+    --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" --argjson wb "${wave_binding_json:-null}" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf,request_budget:$b,human_stops:$hs,wave_binding:$wb}'
   return 0
 }
 
