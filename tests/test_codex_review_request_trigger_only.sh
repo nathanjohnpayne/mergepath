@@ -1983,12 +1983,13 @@ test_write_boundary_authorization() {
 # HEAD by design, so only its own refusals apply; an absent or trigger-only
 # mode keeps the #489 duplicate refusal, and an unknown mode fails closed.
 test_write_boundary_authorization_caller_mode() {
-  local label scenario mode auto want dir rc gate before=$FAIL
-  while IFS='|' read -r label scenario mode auto want; do
+  local label scenario mode auto want timeout dir rc gate before=$FAIL
+  while IFS='|' read -r label scenario mode auto want timeout; do
     dir=$(make_case "authorize-mode-$label")
     gate=$(write_gate_stub "$dir" false)
-    # The Running case needs a request still inside its own reply deadline.
-    sed -i.bak 's/^  review_timeout_seconds: 0$/  review_timeout_seconds: 999999999/' "$dir/.github/review-policy.yml"
+    # The Running case needs a request still inside its own reply deadline;
+    # a case may name a short timeout to put it past that deadline.
+    sed -i.bak "s/^  review_timeout_seconds: 0\$/  review_timeout_seconds: ${timeout:-999999999}/" "$dir/.github/review-policy.yml"
     cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
     rc=0
     (
@@ -2019,12 +2020,16 @@ test_write_boundary_authorization_caller_mode() {
   # #2664: a same-head duplicate with no strong tie (no force-push put HEAD in
   # place before it) and no Running summary is not held, so polling mode
   # authorizes a new counted request; a workflow run is no tie.
+  # #2793: a request held only on a Running summary is released once it is
+  # past its own wait (it ended unattributed), so polling mode authorizes the
+  # deliberate new counted request; within its wait it is still refused.
   done <<'CASES'
 poll-dup|dup_author|poll|false|authorized
 poll-older-head-dup|dup_author_older|poll|false|authorized
 poll-fresh|fresh|poll|false|authorized
 poll-content-free|fresh|poll|true|authorized
 poll-running|dup_author_running|poll|false|pending-request-running
+poll-running-expired|dup_author_running|poll|false|authorized|600
 poll-cleared|body-P2|poll|false|already-cleared
 explicit-trigger-only-dup|dup_author|trigger-only|false|existing-trigger
 absent-dup|dup_author||false|existing-trigger
