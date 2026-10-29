@@ -4491,6 +4491,12 @@ crw_processing_error_latch_from() {
   # One row per bot item: issue comments, and review objects with a body
   # (body-less objects are conversational acknowledgements, #900). A bot item
   # whose body is not a string, or whose time is not a string, is unreadable.
+  # A comment carries two times: `at` (its newest write, which orders a notice
+  # comment as late as it can be) and `created` (which orders a summary). An
+  # in-place edit is no evidence of a new review: ticking a checkbox in an old
+  # summary bumps its updated_at, and over REST that edit looks the same as an
+  # in-place re-review (4b P1 on #2857). Only a summary POSTED after the notice
+  # supersedes it; an edited one leaves the latch set, the fail-closed side.
   # Both lists arrive on stdin, never argv: a paginated history past the
   # per-argument limit (128 KiB on Linux) would fail `--argjson` with E2BIG,
   # and every clearance would then read the latch as unreadable.
@@ -4501,15 +4507,16 @@ crw_processing_error_latch_from() {
     | def authored: type == "object" and ((try .user.login catch null) | type) == "string";
       ( [ $c[] | if authored | not then {bad: true}
                  elif .user.login == $bot then
-                   {src: "comment", id, commit_id: null, body,
+                   {src: "comment", id, commit_id: null, body, created: .created_at,
                     at: ([.created_at, (.updated_at // .created_at)] | map(select(type == "string")) | max)}
                  else empty end ]
       + [ $r[] | if authored | not then {bad: true}
                  elif .user.login == $bot and (.body // "") != "" then
-                   {src: "review", id, commit_id, body, at: .submitted_at}
+                   {src: "review", id, commit_id, body, created: .submitted_at, at: .submitted_at}
                  else empty end ] )
     | .[]
-    | if .bad == true or (.body | type) != "string" or (.at | type) != "string" then "UNREADABLE"
+    | if .bad == true or (.body | type) != "string" or (.at | type) != "string"
+         or (.created | type) != "string" then "UNREADABLE"
       else @base64 end
   ' 2>/dev/null) || return 3
   ! grep -qx UNREADABLE <<<"$rows" || return 3
@@ -4517,9 +4524,15 @@ crw_processing_error_latch_from() {
   # notice: unfencing and the vendor-header strip drop whole lines, never
   # rewrite one. With no such line no row can set the latch, so the latch is
   # clear without classifying every historical run (Codex P2 on #2857: ~54 s
-  # for 100 reviews, and a clearance reads the latch three times).
+  # for 100 reviews, and a clearance reads the latch three times). Only rows
+  # that could set the latch count: a review object pinned to another commit
+  # never does, so an old failure there must not defeat the exit on every
+  # later head (4b P2 on #2857).
   local candidates grep_rc=0
-  candidates=$(jq -Rr 'select(length > 0 and . != "UNREADABLE") | @base64d | fromjson | .body' <<<"$rows" 2>/dev/null) || return 3
+  candidates=$(jq -Rr --arg head "$head" '
+    select(length > 0 and . != "UNREADABLE") | @base64d | fromjson
+    | select(.src == "comment" or .commit_id == $head) | .body
+  ' <<<"$rows" 2>/dev/null) || return 3
   grep -qiE '^>[[:space:]]*we could not process this pull request' <<<"$candidates" || grep_rc=$?
   case "$grep_rc" in
     0) : ;;
@@ -4581,7 +4594,7 @@ crw_processing_error_latch_from() {
         ;;
     esac
     [ -n "$kind" ] || continue
-    events+=$(printf '%s' "$row" | base64 --decode | jq -c --arg kind "$kind" '{kind: $kind, src, id, commit_id, at}') || return 3
+    events+=$(printf '%s' "$row" | base64 --decode | jq -c --arg kind "$kind" '{kind: $kind, src, id, commit_id, at: (if $kind == "summary" then .created else .at end)}') || return 3
     events+=$'\n'
   done <<<"$rows"
   # Order the events. A timestamp that does not parse is unreadable, never
