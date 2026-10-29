@@ -17,7 +17,8 @@
 #   scripts/phase-4b-review.sh <PR#> [--repo owner/repo]
 #       [--reviewer nathanpayne-<agent>] [--author <agent>]
 #       [--head <sha>] [--expected-base-sha <sha>] [--diff-file <path>]
-#       [--dry-run] [--force-enabled]
+#       [--wave-scope-file <path>] [--offline-diff] [--dry-run]
+#       [--force-enabled]
 #
 # Overrides (mostly for tests / non-git contexts):
 #   --author         PR's authoring agent (claude|codex|...). NOT an override
@@ -29,7 +30,11 @@
 #                    make Phase 4b act on an identity the body does not carry.
 #   --reviewer       force the external reviewer login (skips selection, but
 #                    still must differ from the authoring agent).
-#   --head           HEAD sha. Default: gh api pulls/<n> .head.sha.
+#   --head           expected live PR HEAD sha. Default: gh api pulls/<n>
+#                    .head.sha. A supplied SHA must equal the live PR head;
+#                    mismatch fails closed with exit 3 before capture,
+#                    adapter dispatch, or review POST. For --offline-diff it
+#                    is display context only and carries no posting authority.
 #   --expected-base-sha
 #                    Optional 40-hex base SHA fence for a caller that already
 #                    captured the PR's base with its head. When supplied, the
@@ -37,9 +42,14 @@
 #                    before post-review issue filing, and immediately before
 #                    the review POST. A moved or unreadable base fails closed.
 #   --diff-file      compatibility assertion of the object-derived diff bytes.
-#   --wave-scope-file structured canonical range; trusted wave code regenerates
-#                    the curated bytes after live canary byte verification.
-#   --offline-diff   preview supplied bytes with --dry-run; never posts.
+#   --wave-scope-file <path>
+#                    structured canonical range pinned by the operator;
+#                    trusted wave code regenerates curated bytes after live
+#                    canary byte verification. Do not replace its canonical
+#                    bases with the moving live PR base.
+#   --offline-diff   display-only preview of supplied bytes. Requires
+#                    --dry-run, --diff-file, and --head; never posts and has
+#                    no live immutable-input binding.
 #   --retain-evidence require tripwires for a bound --dry-run whose verdict
 #                     the caller will retain (historical prefix receipts).
 #   --dry-run        do everything EXCEPT post the review; print intended
@@ -293,7 +303,7 @@ case "${P4B_FORCE_ENABLED:-}" in
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
   exit 3
 }
 
