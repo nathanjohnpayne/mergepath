@@ -2195,15 +2195,18 @@ p4b_comment_mention_history() {
 # What two comment reads must agree on for the evidence between them to
 # stand: every non-bot comment id (a new comment of any body may have
 # carried a mention it no longer shows), and the edit time of each comment
-# that mentions Codex's handle now or has a mention history. CodeRabbit
-# re-editing a comment that never mentioned Codex changes neither.
+# that mentions Codex's handle now or has a mention history (a non-null
+# entry; null means edited but never mentioned). CodeRabbit re-editing a
+# comment that never mentioned Codex changes neither. The comment id is
+# captured before switching to the history map (Codex on #2888).
 p4b_wave_binding_request_view() {
   local historic="${3:-}"
   [ -n "$historic" ] || historic='{}'
   printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" --argjson h "$historic" '
     [ .[] | select((.user.login // "") != $bot) ] as $c
     | {ids: ([ $c[].id ] | sort),
-       requests: ([ $c[] | select(((.body // "") | test("@codex"; "i")) or ($h | has(.id | tostring)))
+       requests: ([ $c[] | (.id | tostring) as $k
+                    | select(((.body // "") | test("@codex"; "i")) or (($h[$k] // null) != null))
                     | {id, updated_at} ] | sort_by(.id))}' 2>/dev/null
 }
 

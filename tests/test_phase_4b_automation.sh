@@ -6475,6 +6475,26 @@ _wbs_cr800='{"id":800,"user":{"login":"coderabbitai[bot]"},"body":"summary","cre
 # shows (posted with a mention, edited before the history read).
 [ "$(_wbs "[$_WB_R,$_wbs_cr800,$(_wb_req 901 someone 2026-10-29T12:10:00Z 'thanks')]")" = hold/requests-changed-during-evaluation ] \
   || bad="$bad [stability-new-plain-comment-missed]"
+# Codex on #2888: a historical request (mention since removed) that is
+# edited again between the reads changes the evidence, so the clear holds.
+# The view once read its id against the history map instead of the comment
+# and never saw it.
+_wbs_hist701='{"id":701,"user":{"login":"someone"},"body":"thanks","created_at":"2026-10-29T11:00:00Z","updated_at":"2026-10-29T11:30:00Z"}'
+[ "$( (
+    _wbs_count="$(mktemp "${TMPDIR:-/tmp}/wbs-count.XXXXXX")"
+    gh_api_array() {
+      local n; n=$(( $(cat "$_wbs_count" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$_wbs_count"
+      if [ "$n" = 1 ]; then printf '%s' "[$_WB_R,$_wbs_hist701]"
+      else printf '%s' "[$_WB_R,$(printf '%s' "$_wbs_hist701" | jq -c '.updated_at = "2026-10-29T12:10:00Z"')]"; fi
+    }
+    p4b_codex_summary_versions() { printf '[]\n'; }
+    p4b_comment_mention_history() { printf '%s\n' '{"701":"2026-10-29T11:00:00Z"}'; }
+    p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
+    p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r '"\(.state)/\(.reason)"'
+    rm -f "$_wbs_count"
+  ) )" = hold/requests-changed-during-evaluation ] || bad="$bad [stability-historical-request-edit-missed]"
+[ "$(p4b_wave_binding_request_view "[$_wbs_hist701]" 'chatgpt-codex-connector[bot]' '{"701":"x"}' | jq -c '.requests')" = '[{"id":701,"updated_at":"2026-10-29T11:30:00Z"}]' ] \
+  || bad="$bad [view-drops-historical-request]"
 # A comment with a mention history that the first read did not contain.
 [ "$(_wbs "[$_WB_R,$_wbs_cr800]" '{"800":null,"902":"2026-10-29T12:10:00Z"}')" = hold/requests-changed-during-evaluation ] \
   || bad="$bad [stability-historic-request-outside-snapshot]"
