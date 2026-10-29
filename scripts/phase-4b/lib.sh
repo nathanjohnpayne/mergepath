@@ -2155,42 +2155,60 @@ p4b_codex_summary_versions() {
   jq -nc --argjson a "$all" --argjson m "$marked" '$a + [ $m[] | {at, body} ]'
 }
 
-# p4b_comment_mention_history <comments-json> <bot>
-# Ids of edited non-bot comments any of whose earlier versions mentioned
-# Codex's handle, read from each comment's GraphQL edit history. A comment
-# never edited (updated_at == created_at) has no earlier version. Prints
-# `null` when any history cannot be read in full, including a withheld or
-# deleted revision whose diff is null: an unknown body is not "no mention"
-# (Codex on #2888; review-feedback-accounting.sh reads that shape the same).
+# p4b_comment_mention_history <repo> <pr> <bot>
+# Ids (databaseId) of non-bot PR comments any of whose EARLIER versions
+# mentioned Codex's handle. One paginated GraphQL read of every comment with
+# its edit metadata: whether a comment was edited comes from its
+# userContentEdits, not from REST timestamps, which have second precision and
+# miss an edit inside the creation second (Phase 4b on #2888). Prints `null`
+# when any page, or any edited comment's history, cannot be read in full,
+# including a withheld or deleted revision whose diff is null (an unknown
+# body is not "no mention"; review-feedback-accounting.sh reads that shape
+# the same way). GraphQL logins drop the "[bot]" suffix, so the bot is
+# compared without it.
 p4b_comment_mention_history() {
-  local edited row nid id hist out='[]' query
-  edited="$(printf '%s' "${1:-[]}" | jq -c --arg bot "${2:-}" '[ .[]
+  local repo="$1" pr="$2" bot="${3:-}" owner name pages query
+  owner="${repo%%/*}"; name="${repo#*/}"
+  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{databaseId author{login} lastEditedAt userContentEdits(first:100){totalCount nodes{diff}}}}}}}'
+  pages="$(gh api graphql --paginate -f query="$query" -f owner="$owner" -f name="$name" -F pr="$pr" 2>/dev/null)" \
+    || { printf 'null\n'; return 0; }
+  # Not `jq -e`: an empty list or a `false` answer is a valid result.
+  printf '%s\n' "$pages" | jq -sc --arg bot "${bot%\[bot\]}" '
+    [ .[] | .data.repository.pullRequest.comments | if type == "object" then . else error("page") end
+      | .nodes[] ]
+    | if all(.[]; (.databaseId | type) == "number") | not then error("ids") else . end
+    | [ .[] | select(((.author.login // "") | sub("\\[bot\\]$"; "")) != $bot)
+        | select(.lastEditedAt != null or ((.userContentEdits.totalCount // 0) > 0))
+        | .userContentEdits as $e
+        | if ($e | type) != "object" or ($e.nodes | type) != "array" or $e.totalCount != ($e.nodes | length)
+             or any($e.nodes[]; (.diff | type) != "string")
+          then error("history")
+          elif any($e.nodes[]; .diff | test("@codex"; "i")) then .databaseId
+          else empty end ]' 2>/dev/null \
+    || printf 'null\n'
+}
+
+# p4b_wave_binding_request_view <comments-json> <bot>
+# The request-relevant projection of a comment list: each non-bot comment
+# that mentions Codex's handle, with its edit time. Two reads with the same
+# projection saw the same requests.
+p4b_wave_binding_request_view() {
+  printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" '[ .[]
     | select((.user.login // "") != $bot)
-    | select((.updated_at // "") != "" and (.updated_at // "") != (.created_at // ""))
-    | {id, node_id: (.node_id // "missing")} ]' 2>/dev/null)" || { printf 'null\n'; return 0; }
-  query='query($id:ID!){node(id:$id){... on IssueComment{userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}'
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    id="$(printf '%s' "$row" | jq -r .id)"; nid="$(printf '%s' "$row" | jq -r .node_id)"
-    # Not `jq -e`: a `false` answer (no earlier mention) is a valid result,
-    # and -e would read it as a failed read.
-    hist="$(gh api graphql -f query="$query" -f id="$nid" 2>/dev/null \
-      | jq -c '.data.node.userContentEdits
-          | if type == "object" and (.nodes | type) == "array" and .totalCount == (.nodes | length)
-               and all(.nodes[]; (.diff | type) == "string")
-            then any(.nodes[]; .diff | test("@codex"; "i")) else "unreadable" end' 2>/dev/null)" || hist=""
-    case "$hist" in true|false) ;; *) printf 'null\n'; return 0 ;; esac
-    [ "$hist" != true ] || out="$(jq -nc --argjson o "$out" --argjson i "$id" '$o + [$i]')"
-  done < <(printf '%s' "$edited" | jq -c '.[]')
-  printf '%s\n' "$out"
+    | select((.body // "") | test("@codex"; "i"))
+    | {id, updated_at} ] | sort_by(.id)' 2>/dev/null
 }
 
 # p4b_wave_binding_evaluate <repo> <pr> <head> <request-id>
 # All the reads the binding needs, then p4b_wave_codex_binding_state. Shared
 # by the barrier and the orchestrator's publication fence, so both decide on
-# identical evidence. An unreadable comment list is `unreadable`.
+# identical evidence. The comment list is read again after the GraphQL
+# history reads: a request that arrived (or a mention that changed) while
+# they ran was not in the evidence, so the result is a hold rather than a
+# clear decided on a stale request set (Phase 4b on #2888). An unreadable
+# comment list is `unreadable`.
 p4b_wave_binding_evaluate() {
-  local repo="$1" pr="$2" head="$3" rid="$4" comments author bot versions historic
+  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   if ! command -v gh_api_array >/dev/null 2>&1 \
@@ -2199,8 +2217,18 @@ p4b_wave_binding_evaluate() {
     return 0
   fi
   versions="$(p4b_codex_summary_versions "$comments" "$bot")"
-  historic="$(p4b_comment_mention_history "$comments" "$bot")"
-  p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "$historic"
+  historic="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
+  result="$(p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "$historic")"
+  if ! after="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding recheck" 2>/dev/null)"; then
+    jq -nc '{state:"unreadable",reason:"comments-reread-failed"}'
+    return 0
+  fi
+  if [ "$(p4b_wave_binding_request_view "$comments" "$bot")" != "$(p4b_wave_binding_request_view "$after" "$bot")" ] \
+     && printf '%s' "$result" | jq -e '.state == "clear"' >/dev/null 2>&1; then
+    printf '%s' "$result" | jq -c 'del(.generation) + {state:"hold",reason:"requests-changed-during-evaluation"}'
+    return 0
+  fi
+  printf '%s\n' "$result"
 }
 
 # p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>
