@@ -73,6 +73,8 @@ s=$(cat "$STATE")
 out() { if [ -n "$jqf" ]; then printf '%s' "$1" | jq -r "$jqf"; else printf '%s\n' "$1"; fi; }
 case "$method:$endpoint" in
   GET:repos/o/r/pulls/7) out "$(printf '%s' "$s" | jq -c .pr)" ;;
+  GET:repos/o/r/pulls/6) echo "HTTP 502" >&2; exit 1 ;;
+  GET:repos/o/r/issues\?state=closed*) out "$(printf '%s' "$s" | jq -c '.closed // []')" ;;
   GET:repos/o/r/issues/7/comments*) out "$(printf '%s' "$s" | jq -c .comments)" ;;
   GET:repos/o/r/pulls/7/reviews*) out "$(printf '%s' "$s" | jq -c .reviews)" ;;
   GET:repos/o/r/pulls/7/comments*) out "$(printf '%s' "$s" | jq -c .inline)" ;;
@@ -121,6 +123,17 @@ jq -nc --arg m "$MERGED" --argjson c "$C1120" '{pr: {merged_at: $m}, comments: [
 run --dry-run || die "the dry run failed"
 [ "$(jq '.issues | length' "$STATE")" = 0 ] && grep -q 'dry run, would record' "$DIR/out" || die "a dry run wrote"
 ok "--dry-run reports the finding and writes nothing"
+# The sweep isolates a failing PR: #6 cannot be read, #7 is still recorded,
+# and the sweep exits 3 after the loop.
+jq -nc --arg m "$MERGED" --argjson c "$C1120" '{pr: {merged_at: $m}, comments: [$c], reviews: [], inline: [], issues: [],
+  closed: [{number: 6, pull_request: {merged_at: $m}}, {number: 7, pull_request: {merged_at: $m}}, {number: 5}]}' >"$STATE"
+: >"$CALLS"
+rc=0
+PATH="$DIR/bin:$PATH" TMPDIR="$DIR" "$SCRIPT" --repo o/r --sweep --since 2026-08-27T00:00:00Z >"$DIR/out" 2>&1 || rc=$?
+[ "$rc" = 3 ] && [ "$(jq '.issues | length' "$STATE")" = 1 ] && grep -q 'sweep failed on o/r#6; continuing' "$DIR/out" \
+  && ! grep -q 'repos/o/r/pulls/5$' "$CALLS" \
+  || { cat "$DIR/out"; cat "$CALLS"; die "the sweep did not isolate the failing PR (rc=$rc)"; }
+ok "the sweep records #7 although #6 fails, skips unmerged issues, and exits 3"
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r >/dev/null 2>&1; then die "a missing --pr/--sweep was accepted"; fi
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r --pr 7 --touched comment:1 >/dev/null 2>&1; then die "a malformed --touched was accepted"; fi
 ok "usage errors exit nonzero"

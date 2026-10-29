@@ -185,12 +185,12 @@ process_pr() { # pr
   fi
   if [ "$issue" = null ]; then
     gh api -X POST "repos/$REPO/labels" -f name="$LABEL" -f color=d93f0b \
-      -f description="Codex reported findings after the PR merged (#2881)" >/dev/null 2>&1 || true
+      -f description="Codex reported findings after the PR merged (nathanjohnpayne/mergepath#2881)" >/dev/null 2>&1 || true
     jq -n --arg repo "$REPO" --arg pr "$pr" --arg merged "$merged_at" --arg items "$body" --arg label "$LABEL" '{
       title: "Late Codex findings on merged PR #\($pr)",
       labels: [$label],
       body: ("<!-- mergepath-late-codex-finding: \($repo)#\($pr) -->\n"
-        + "Codex reported findings on #\($pr) after it merged at \($merged). No merge gate can block a finding that arrives after the merge, so each one is recorded here for triage (#2881).\n\n"
+        + "Codex reported findings on #\($pr) after it merged at \($merged). No merge gate can block a finding that arrives after the merge, so each one is recorded here for triage (nathanjohnpayne/mergepath#2881).\n\n"
         + "This can follow a `timed-out/substitute-used` merge, where the gate stopped waiting for a requested Codex review and accepted the independent Phase 4b approval, or a findings comment Codex posted late. Triage each item: fix it in a follow-up PR, or record why it needs no change, then close this issue. A later finding on the same PR reopens it.\n\n"
         + $items + "\n")}' >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
     gh api -X POST "repos/$REPO/issues" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .html_url \
@@ -213,10 +213,19 @@ process_pr() { # pr
 if [ "$SWEEP" = 1 ]; then
   candidates=$(read_array "repos/$REPO/issues?state=closed&since=$SINCE&per_page=100" \
     | jq -r '.[] | select(.pull_request != null and .pull_request.merged_at != null) | .number')
+  # One PR's read or write failure must not hide the others' findings, and
+  # the next run would hit the same PR first. Each PR runs in its own
+  # invocation (wrapping the function in `|| ...` would disable `set -e`
+  # inside it), and any failure makes the sweep exit 3 after the loop.
+  sweep_rc=0
+  dry=()
+  [ "$DRY_RUN" = 0 ] || dry=(--dry-run)
   for pr in $candidates; do
-    TOUCHED="" process_pr "$pr"
+    LATE_CODEX_BOT_LOGIN="$BOT" "$0" --repo "$REPO" --pr "$pr" ${dry[@]+"${dry[@]}"} \
+      || { echo "late-codex-findings: sweep failed on $REPO#$pr; continuing" >&2; sweep_rc=3; }
   done
   echo "late-codex-findings: sweep since $SINCE checked $(printf '%s\n' "$candidates" | grep -c . || true) merged PR(s)"
+  exit "$sweep_rc"
 else
   process_pr "$PR"
 fi
