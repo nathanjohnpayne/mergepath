@@ -40,6 +40,9 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# Callers stop their case with `|| return 0`: fail() has already counted the
+# failure, and a non-zero return from a case function aborts the whole run
+# under `set -e` before the remaining cases and the summary (#2746).
 assert_private_file_mode() {
   local file="$1" description="$2" mode
   mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file")
@@ -1821,14 +1824,14 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
   # degraded slot -- the next deploy's cache purge depends on it.
   local sess="$cache_dir/op-preflight-claude.env" cf_out
   grep -v '^CF_API_TOKEN=' "$sess" > "$sess.tmp"; mv "$sess.tmp" "$sess"; chmod 600 "$sess"
-  assert_private_file_mode "$sess" "all-degraded session rewrite" || return
+  assert_private_file_mode "$sess" "all-degraded session rewrite" || return 0
   sed "s/^OP_PREFLIGHT_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)/" "$sess" > "$sess.tmp"; mv "$sess.tmp" "$sess"; chmod 600 "$sess"
-  assert_private_file_mode "$sess" "all-degraded session timestamp rewrite" || return
+  assert_private_file_mode "$sess" "all-degraded session timestamp rewrite" || return 0
   printf 'CF_API_TOKEN=pre-slot-cf-token\n' >> "$sess"
-  assert_private_file_mode "$sess" "all-degraded session append" || return
+  assert_private_file_mode "$sess" "all-degraded session append" || return 0
   sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=$(( $(date +%s) - 5 ))/" \
     "$cache_dir/op-preflight-claude-deploy-adc.slot" > "$cache_dir/slot.tmp" && mv "$cache_dir/slot.tmp" "$cache_dir/op-preflight-claude-deploy-adc.slot" && chmod 600 "$cache_dir/op-preflight-claude-deploy-adc.slot"
-  assert_private_file_mode "$cache_dir/op-preflight-claude-deploy-adc.slot" "all-degraded slot rewrite" || return
+  assert_private_file_mode "$cache_dir/op-preflight-claude-deploy-adc.slot" "all-degraded slot rewrite" || return 0
   cf_out=$(cd "$case_dir" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     "$SCRIPT" --agent claude --mode all --skip-ssh 2>/dev/null || true)
   if ! grep -q '^export CF_API_TOKEN=pre-slot-cf-token$' <<<"$cf_out"; then
@@ -2073,7 +2076,7 @@ EOF
   # the main session file is still fresh: age only the slot's own epoch.
   local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.slot"
   sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=1/" "$slot" > "$slot.tmp" && mv "$slot.tmp" "$slot" && chmod 600 "$slot"
-  assert_private_file_mode "$slot" "all-alternating expired-slot rewrite" || return
+  assert_private_file_mode "$slot" "all-alternating expired-slot rewrite" || return 0
   injects_before=$(count_lines "$op_log" '^inject')
   if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-ttl; then
     fail "all-alternating: TTL=0 run failed; stderr=$(cat "$case_dir/proj-alpha/run-ttl.err")"
@@ -2518,7 +2521,7 @@ test_newer_pre_slot_write_supersedes_slot() {
     printf "OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\nOP_PREFLIGHT_DEPLOY_CONTEXT=''\nOP_PREFLIGHT_DEPLOY_DEGRADED=1\nOP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH=%s\n" \
       "$(( $(date +%s) - slot_age ))" "$(( $(date +%s) - slot_age ))" > "$slot"
     chmod 600 "$slot"
-    assert_private_file_mode "$slot" "legacy-vs-slot fixture" || return
+    assert_private_file_mode "$slot" "legacy-vs-slot fixture" || return 0
     rc=0
     out=$(cd "$case_dir/repo" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       "$SCRIPT" --agent claude --mode all --skip-ssh 2>"$case_dir/$label.err") || rc=$?
@@ -2554,7 +2557,7 @@ test_newer_pre_slot_write_supersedes_slot() {
     printf "OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\nOP_PREFLIGHT_DEPLOY_CONTEXT=proj-kappa\nGOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-kappa\n" \
       "$(( $(date +%s) - 300 ))" "$sa_file" "$sa_file" > "$fb_slot"
     chmod 600 "$fb_slot"
-    assert_private_file_mode "$fb_slot" "legacy-vs-slot Firebase fixture" || return
+    assert_private_file_mode "$fb_slot" "legacy-vs-slot Firebase fixture" || return 0
     rc=0
     out=$(cd "$case_dir/kappa" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       "$SCRIPT" --agent claude --mode all --skip-ssh 2>"$case_dir/kappa-$variant.err") || rc=$?
@@ -2636,7 +2639,7 @@ EOF
   sed "s/^OP_PREFLIGHT_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_CREATED_AT_EPOCH=$(( $(date +%s) + 5 ))/" \
     "$cache_dir/op-preflight-claude.env" > "$cache_dir/s.tmp" && mv "$cache_dir/s.tmp" "$cache_dir/op-preflight-claude.env"
   chmod 600 "$cache_dir/op-preflight-claude.env"
-  assert_private_file_mode "$cache_dir/op-preflight-claude.env" "pre-slot session rewrite" || return
+  assert_private_file_mode "$cache_dir/op-preflight-claude.env" "pre-slot session rewrite" || return 0
   printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-a\n' "$shared" "$shared" \
     >> "$cache_dir/op-preflight-claude.env"
   # 3. Updated checkout of A runs again.

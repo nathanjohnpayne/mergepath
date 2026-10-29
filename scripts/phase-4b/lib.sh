@@ -840,10 +840,13 @@ p4b_reconcile_posted_review() {
 # Pure (#2663). Print phase_4b_automation.max_review_rounds from the PR's
 # GOVERNING base policy, so a PR cannot raise its own cap, or "none" when the
 # key is absent (the cap is then unenforced, as before). Returns 2 when the
-# value is present but is not a positive integer.
+# value is present but is not a positive integer, and when the block itself is
+# present but is not a mapping: a scalar or list there is a malformed policy,
+# not "no cap", the same as crqe_governing_budget treats `codex` (#2746).
 p4b_governing_round_cap() {
   printf '%s' "${1:-}" | jq -er '
-    if (.phase_4b_automation | type) != "object" then "none"
+    if .phase_4b_automation == null then "none"
+    elif (.phase_4b_automation | type) != "object" then error("invalid")
     elif (.phase_4b_automation | has("max_review_rounds") | not) then "none"
     elif (.phase_4b_automation.max_review_rounds | type) == "number"
          and .phase_4b_automation.max_review_rounds >= 1

@@ -83,6 +83,13 @@ for c in 0 -1 2.5 '"3"' null true; do
   p4b_governing_round_cap "{\"phase_4b_automation\":{\"max_review_rounds\":$c}}" >/dev/null \
     && fail "cap: $c was accepted" || pass "cap: $c is refused (exit 10 at the orchestrator)"
 done
+# #2746: a present block that is not a mapping is malformed policy, not "no cap".
+for c in '3' '"x"' '[]' 'true'; do
+  p4b_governing_round_cap "{\"phase_4b_automation\":$c}" >/dev/null \
+    && fail "cap: a non-object phase_4b_automation ($c) read as no cap" || pass "cap: a non-object phase_4b_automation ($c) is refused"
+done
+got=$(p4b_governing_round_cap '{"phase_4b_automation":null}') && [ "$got" = none ] \
+  && pass "cap: a null phase_4b_automation block is absent -> none" || fail "cap: null block gave '${got:-}'"
 
 # ===========================================================================
 # Pure: ledger parse/message and occupancy
@@ -525,6 +532,34 @@ run b reserve
 [ "$RC" = 8 ] && [ "$(jq -c '[.round_cap.occupied, .round_cap.in_flight]' <<<"$OUT")" = '[3,0]' ] && [ "$(reserved_runs)" = '["a"]' ] \
   && pass "P19: a surplus review under one reserved run id counts; the cap is spent and b is refused (exit 8)" \
   || fail "P19 rc=$RC $OUT $(reserved_runs)"
+
+# ===========================================================================
+# #2746 item 2: the REST transport passes the ledger's git-data writes through
+# ===========================================================================
+# round_api runs `gh api <endpoint> --method <M> --input <file>` through
+# gh-as-reviewer.sh, which hands it to gh_rest_run under REST transport. The
+# canary review claimed that dispatcher refuses a wrapped `gh api`; it passes
+# each of the ledger's four shapes through under the verified token.
+mkdir -p "$WORK/rest-bin"
+cat >"$WORK/rest-bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s|%s\n' "${GH_TOKEN:-}" "$*" >>"$REST_PROBE_LOG"
+printf '{"sha":"deadbeef"}\n'
+SH
+chmod +x "$WORK/rest-bin/gh"
+printf '{"sha":"x","force":false}' >"$WORK/rest-payload.json"
+rest_bad=""
+for spec in "POST repos/o/r/git/trees" "POST repos/o/r/git/commits" "POST repos/o/r/git/refs" "PATCH repos/o/r/git/refs/heads/x"; do
+  set -- $spec
+  : >"$WORK/rest.log"
+  out=$(REST_PROBE_LOG="$WORK/rest.log" bash -c '. "$1"; shift; gh_rest_run gh-as-reviewer nathanpayne-claude verified-token "$@"' _ \
+    "$ROOT/scripts/lib/gh-rest-transport.sh" "$WORK/rest-bin/gh" api "$2" --method "$1" --input "$WORK/rest-payload.json" 2>&1) \
+    || rest_bad="$rest_bad $1:$2(rc)"
+  [ "$out" = '{"sha":"deadbeef"}' ] || rest_bad="$rest_bad $1:$2(out)"
+  grep -qxF "verified-token|api $2 --method $1 --input $WORK/rest-payload.json" "$WORK/rest.log" || rest_bad="$rest_bad $1:$2(call)"
+done
+[ -z "$rest_bad" ] && pass "#2746: the REST transport runs every round-ledger git-data write under the verified token" \
+  || fail "#2746: REST transport refused or altered a round-ledger write:$rest_bad"
 
 echo
 echo "test_phase_4b_round_cap: $PASS passed, $FAIL failed"
