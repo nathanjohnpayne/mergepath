@@ -5905,6 +5905,19 @@ set -eu
 shift
 endpoint=${1:-}
 [ "$endpoint" = --paginate ] && { shift; endpoint=${1:-}; }
+# (#2771) Codex Review Summary edit history: P4B_TEST_SUMMARY_EDITS is the
+# userContentEdits connection (default: no edits, so only the live body).
+# Only that query: other GraphQL reads (force-push heads, #2591) keep their
+# own handling below.
+_summary_query=false
+for a in "$@"; do case "$a" in *userContentEdits*) _summary_query=true ;; esac; done
+if [ "$endpoint" = graphql ] && [ "$_summary_query" = true ]; then
+  [ "${P4B_TEST_SUMMARY_EDITS_FAIL:-false}" != true ] || exit 1
+  # A brace inside ${var:-word} would end the expansion early.
+  edits_default='{"totalCount":0,"nodes":[]}'
+  printf '{"data":{"node":{"userContentEdits":%s}}}\n' "${P4B_TEST_SUMMARY_EDITS:-$edits_default}"
+  exit 0
+fi
 # (#1143) The orchestrator reads the PR body on every run; the one orchestrator
 # case that runs with this bin on PATH needs a contract-valid one. Barrier
 # reads never carry a `.body` filter, so this cannot shadow them.
@@ -6245,107 +6258,176 @@ else
 fi
 
 # #2771: a wave audit binds the barrier's Codex arm to the request it created
-# (phase-4b-review.sh --wave-codex-request). The arm clears only on the answer
-# to that request: a Completed "Manual request" Review Summary run on exactly
-# this head, timed after the request, with no foreign trigger after it. The
-# four review rounds on #2859/#2868 each named a window in which an unsolicited
-# App review cleared the unbound arm ahead of the audit's own request; each is
-# a row below, and each guard is mutation-checked against the window it
-# closes.
+# (phase-4b-review.sh --wave-codex-request). Runs are tied to requests by
+# order: every Codex-mentioning request on the PR, oldest first, takes the
+# earliest "Manual request" run (from the Review Summary's edit history) that
+# started at or after it and after the previous request's run. The bound
+# request clears only when no request follows it, every older request has its
+# own run, and its own run completed on exactly this head. Every window the
+# review rounds on #2859/#2868/#2875 and the owner named is a row below; each
+# guard is mutation-checked against the window it closes.
 bad=""
 _wb_H="$_p4a_head"
 _wb_req() { # <id> <login> <created_at> [body]
   jq -nc --argjson id "$1" --arg who "$2" --arg t "$3" --arg b "${4:-@codex review}" \
     '{id:$id,user:{login:$who},body:$b,created_at:$t,updated_at:$t}'
 }
-_wb_sum() { # <json-status> <cell-word> <trigger> <run-time> [commit]
-  jq -nc --arg st "$1" --arg w "$2" --arg tr "$3" --arg rt "$4" --arg c "${5:-$_wb_H}" \
-    '{id:9000,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-10-29T10:00:00Z",updated_at:$rt,
-      body:("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"" + $c + "\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"" + $st + "\"},\"security_review\":{\"commit_sha\":null}} -->\n| 📝 **Code Review** | **" + $w + "** <relative-time datetime=\"" + $rt + "\">t</relative-time> | `" + $c[0:7] + "` | " + $tr + " |")}'
+_wb_ver() { # <status> <trigger> <row-time> <edited-at> [commit] -> one summary version {at, body}
+  jq -nc --arg st "$1" --arg tr "$2" --arg rt "$3" --arg at "$4" --arg c "${5:-$_wb_H}" '
+    ({running: "🔄 **Running** since ", completed: "✅ **Completed** ", failed: "⚠️ **Failed** "}[$st] // ("**" + $st + "** ")) as $cell
+    | {at: $at,
+       body: ("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"" + $c + "\",\"status\":\"" + $st + "\"},\"security_review\":{\"commit_sha\":null}} -->\n| 📝 **Code Review** | " + $cell + "<relative-time datetime=\"" + $rt + "\">t</relative-time> | `" + $c[0:7] + "` | " + $tr + " |")}'
 }
+_vs() { jq -sc '.' ; } # versions from one-per-line
 _WB_R="$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z)"
-_wb_case() { # <label> <want-state> <comments-json> [binding-fn]
+_WB_C="[$_WB_R]"
+_wb_run() { # <start> <end> [trigger] [commit] [terminal-status] -> Running then terminal version lines
+  _wb_ver running "${3:-Manual request}" "$1" "$1" "${4:-$_wb_H}"
+  _wb_ver "${5:-completed}" "${3:-Manual request}" "$2" "$2" "${4:-$_wb_H}"
+}
+_WB_ANSWER="$(_wb_run 2026-10-29T12:00:15.5Z 2026-10-29T12:04:00.1Z | _vs)"
+_wb_case() { # <label> <want-state> <comments-json> <versions-json> [binding-fn]
   local got
-  got="$(${4:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 1800 | jq -r .state)"
+  got="$(${5:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$4" | jq -r .state)"
   [ "$got" = "$2" ] || bad="$bad [$1: want $2 got $got]"
 }
-# The windows, as fixtures (label|want|comments).
-_wb_fixtures() {
-  printf '%s\t%s\t%s\n' \
-    answered clear "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00.123456Z)]" \
-    w1-app-review-running-at-check hold "[$_WB_R,$(_wb_sum running Running 'PR opened' 2026-10-29T11:58:00Z)]" \
-    w1-that-review-completes-after-request hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:03:00Z)]" \
-    w2-our-run-running hold "[$_WB_R,$(_wb_sum running Running 'Manual request' 2026-10-29T12:01:00Z)]" \
-    w2-manual-run-completed-before-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T11:59:00Z)]" \
-    w2-manual-run-same-second-as-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:00:00.900Z)]" \
-    w3-unsolicited-appears-after-snapshot hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:00:30Z)]" \
-    w4-superseded-by-newer-author-request hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    w4-overlap-501-running-502-queued hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:03:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:04:00Z)]" \
-    w4-foreign-manual-run-before-request-finishes-after hold "[$(_wb_req 600 someone 2026-10-29T11:50:00Z),$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    w4-foreign-request-same-second-as-bound hold "[$_WB_R,$(_wb_req 602 someone 2026-10-29T12:00:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    w4-earlier-author-request-outside-window clear "[$(_wb_req 400 nathanjohnpayne 2026-10-29T10:00:00Z),$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    w4-superseded-after-the-run-completed hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z),$(_wb_req 502 nathanjohnpayne 2026-10-29T12:06:00Z)]" \
-    w4-foreign-trigger-after-request hold "[$_WB_R,$(_wb_req 600 someone 2026-10-29T12:01:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    w4-author-prose-mention-after-request hold "[$_WB_R,$(_wb_req 601 nathanjohnpayne 2026-10-29T12:01:00Z 'please @codex review again'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    other-commit hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)]" \
-    failed-run hold "[$_WB_R,$(_wb_sum failed Failed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    no-summary hold "[$_WB_R]" \
-    request-missing unreadable "[$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    request-not-author unreadable "[$(_wb_req 501 someone 2026-10-29T12:00:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    request-not-exact unreadable "[$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z 'please @codex review'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
-    summary-garbled unreadable "[$_WB_R,{\"id\":9001,\"user\":{\"login\":\"chatgpt-codex-connector[bot]\"},\"created_at\":\"2026-10-29T12:05:00Z\",\"updated_at\":\"2026-10-29T12:05:00Z\",\"body\":\"<!-- codex-pull-request-review-summary -->\\nnot a table\"}]" \
-    summary-commit-disagrees unreadable "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z | jq -c '.body |= sub("`aaaaaaa`"; "`bbbbbbb`")')]" \
-    comments-not-array unreadable '{"not":"an array"}'
+_wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions
+  printf '%s\t%s\t%s\t%s\n' \
+    answered clear "$_WB_C" "$_WB_ANSWER" \
+    w1-app-review-running-at-check hold "$_WB_C" "$(_wb_ver running 'PR opened' 2026-10-29T11:58:00Z 2026-10-29T11:58:01Z | _vs)" \
+    w1-that-review-completes-after-request hold "$_WB_C" "$(_wb_run 2026-10-29T11:58:00Z 2026-10-29T12:03:00Z 'PR opened' | _vs)" \
+    w1-new-commits-auto-run-after-request hold "$_WB_C" "$(_wb_run 2026-10-29T12:01:00Z 2026-10-29T12:03:00Z 'New commits' | _vs)" \
+    w2-our-run-still-running hold "$_WB_C" "$(_wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z | _vs)" \
+    w2-completion-overwritten-by-a-later-run clear "$_WB_C" "$( { _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; _wb_ver running 'New commits' 2026-10-29T12:10:00Z 2026-10-29T12:10:01Z; } | _vs)" \
+    w2-manual-run-started-before-request hold "$_WB_C" "$(_wb_run 2026-10-29T11:59:00Z 2026-10-29T12:03:00Z | _vs)" \
+    w3-unsolicited-appears-after-snapshot hold "$_WB_C" "$(_wb_run 2026-10-29T12:00:30Z 2026-10-29T12:02:00Z 'PR opened' | _vs)" \
+    w4-superseded-by-newer-author-request hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z)]" "$_WB_ANSWER" \
+    w4-superseded-after-the-run-completed hold "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:06:00Z)]" "$_WB_ANSWER" \
+    w4-foreign-trigger-after-request hold "[$_WB_R,$(_wb_req 600 someone 2026-10-29T12:01:00Z)]" "$_WB_ANSWER" \
+    w4-author-prose-mention-after-request hold "[$_WB_R,$(_wb_req 601 nathanjohnpayne 2026-10-29T12:01:00Z 'please @codex review again')]" "$_WB_ANSWER" \
+    w4-same-second-foreign-request-lower-id hold "[$(_wb_req 499 someone 2026-10-29T12:00:00Z),$_WB_R]" "$_WB_ANSWER" \
+    w4-same-second-foreign-request-higher-id hold "[$_WB_R,$(_wb_req 602 someone 2026-10-29T12:00:00Z)]" "$_WB_ANSWER" \
+    w5-older-request-queued-hours-before hold "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" "$_WB_ANSWER" \
+    w5-older-foreign-request-queued hold "[$(_wb_req 401 someone 2026-10-28T08:00:00Z),$_WB_R]" "$_WB_ANSWER" \
+    w5-older-request-with-its-own-run clear "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" "$( { _wb_run 2026-10-29T08:00:12Z 2026-10-29T08:04:00Z; _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; } | _vs)" \
+    w5-older-request-run-on-older-commit clear "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" "$( { _wb_run 2026-10-29T08:00:12Z 2026-10-29T08:04:00Z 'Manual request' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; } | _vs)" \
+    h-running-version-edited-twice clear "$_WB_C" "$( { _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:01:00Z; _wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" \
+    h-two-running-versions-first-never-completes hold "$_WB_C" "$( { _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_run 2026-10-29T12:01:30Z 2026-10-29T12:05:00Z; } | _vs)" \
+    h-completed-then-running-again clear "$_WB_C" "$( { _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; _wb_ver running 'PR opened' 2026-10-29T12:06:00Z 2026-10-29T12:06:01Z; } | _vs)" \
+    h-terminal-without-a-running-start hold "$_WB_C" "$(_wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z | _vs)" \
+    h-trigger-changes-inside-a-run hold "$_WB_C" "$( { _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_ver completed 'PR opened' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" \
+    h-commit-changes-inside-a-run hold "$_WB_C" "$( { _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; _wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" \
+    other-commit hold "$_WB_C" "$(_wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z 'Manual request' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb | _vs)" \
+    failed-run hold "$_WB_C" "$(_wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z 'Manual request' "$_wb_H" failed | _vs)" \
+    unknown-trigger-value hold "$_WB_C" "$(_wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z 'Webhook' | _vs)" \
+    a-garbled-version-alongside-an-answer hold "$_WB_C" "$(printf '%s' "$_WB_ANSWER" | jq -c '. + [{at:"2026-10-29T12:05:00Z",body:"<!-- codex-pull-request-review-summary -->\nnot a table"}]')" \
+    version-commit-disagrees hold "$_WB_C" "$(printf '%s' "$_WB_ANSWER" | jq -c '.[1].body |= sub("`aaaaaaa`"; "`bbbbbbb`")')" \
+    history-unreadable hold "$_WB_C" null \
+    no-summary hold "$_WB_C" '[]' \
+    request-missing unreadable '[]' "$_WB_ANSWER" \
+    request-not-author unreadable "[$(_wb_req 501 someone 2026-10-29T12:00:00Z)]" "$_WB_ANSWER" \
+    request-not-exact unreadable "[$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z 'please @codex review')]" "$_WB_ANSWER" \
+    comments-not-array unreadable '{"not":"an array"}' "$_WB_ANSWER"
 }
-while IFS="$(printf '\t')" read -r _l _w _c; do _wb_case "$_l" "$_w" "$_c"; done < <(_wb_fixtures)
-# The latest summary decides: an older Completed manual row cannot outlive a
-# newer automatic run reported in its place.
-_wb_case latest-summary-wins hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:04:00Z),$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:06:00Z | jq -c '.id = 9002')]"
+while IFS="$(printf '\t')" read -r _l _w _c _v; do _wb_case "$_l" "$_w" "$_c" "$_v"; done < <(_wb_fixtures)
+# A clear carries the generation it verified; every outcome carries its
+# evidence (reason, the requests with the run each took, the runs seen).
+_wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 \
+  "$( { _wb_run 2026-10-29T08:00:12Z 2026-10-29T08:04:00Z; _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; } | _vs)")"
+printf '%s' "$_wb_out" | jq -e '.generation == [400,501] and .bound_request == 501
+  and ([.requests[] | "\(.id):\(.run)"] == ["400:0","501:1"]) and (.runs | length) == 2' >/dev/null \
+  || bad="$bad [clear-evidence:$_wb_out]"
+_wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER")"
+printf '%s' "$_wb_out" | jq -e '.state == "hold" and .reason == "no-run-for-bound-request"
+  and ([.requests[] | "\(.id):\(.run)"] == ["400:0","501:null"]) and has("generation") == false' >/dev/null \
+  || bad="$bad [hold-evidence:$_wb_out]"
 
-# Mutation checks: disable each guard in an extracted copy and require the
-# window it closes to flip to "clear". A guard whose removal flips nothing is
-# not tested by the table above.
+# Mutation checks: disable each guard in an extracted copy; the window it
+# closes must flip to the named state (default "clear"). A guard whose
+# removal flips nothing is not tested by the table above.
 _wb_src="$(sed -n '/^p4b_wave_codex_binding_eval() {/,/^}/p' "$LIB")"
 [ -n "$_wb_src" ] || bad="$bad [no-binding-eval-source]"
-_wb_mutant() { # <label> <python-replace-old> <python-replace-new> <window-that-must-flip>
+_wb_mutant() { # <label> <replace-old> <replace-new> <window> [flipped-state]
   local m got
   m="$(python3 -c 'import sys; s=sys.stdin.read(); o,n=sys.argv[1],sys.argv[2]; assert s.count(o)==1, o; print(s.replace(o,n))' "$2" "$3" <<<"$_wb_src")" \
     || { bad="$bad [mutant-$1-did-not-apply]"; return; }
   got="$(
     eval "${m/p4b_wave_codex_binding_eval()/_wb_mutant_eval()}"
-    _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c; do
+    _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c v; do
       [ "$l" = "$4" ] || continue
-      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 1800 | jq -r .state
+      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$v" | jq -r .state
     done)"
-  [ "$got" = clear ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
+  [ "$got" = "${5:-clear}" ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
 }
-_wb_mutant trigger '!= "manual request"' '== "never"' w1-that-review-completes-after-request
-_wb_mutant run-time 'elif $run <= $rt then' 'elif false then' w2-manual-run-completed-before-request
-_wb_mutant status 'elif ($sj.code_review.status // "") != "completed"' 'elif false' w2-our-run-running
-_wb_mutant other-request 'elif ($others | length) > 0 then' 'elif false then' w4-foreign-trigger-after-request
-_wb_mutant window-start '$c >= ($rt - $w)' '$c > $rt' w4-foreign-manual-run-before-request-finishes-after
-_wb_mutant same-second-tie '$c >= ($rt - $w)' '$c > ($rt - $w) and $c != $rt' w4-foreign-request-same-second-as-bound
-_wb_mutant commit 'elif $jc != $h then' 'elif false then' other-commit
-_wb_mutant supersede '$c >= ($rt - $w)' '$c >= ($rt - $w) and ((.user.login // "") != $author)' w4-superseded-after-the-run-completed
+_wb_mutant trigger 'trigger: ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "") | ascii_downcase),' 'trigger: "manual request",' w1-new-commits-auto-run-after-request
+_wb_mutant run-start '| select($manual[$j].start >= $q.t) | $j ] | first) as $j' '| $j ] | first) as $j' w2-manual-run-started-before-request
+_wb_mutant completed-status 'elif $run.status == "completed"' 'elif true' failed-run
+_wb_mutant run-commit 'if $run.commit != $h then' 'if false then' other-commit
+_wb_mutant fifo-pairing '(reduce $reqs[] as $q ({next: 0, out: []};' '(reduce ($reqs[] | select((.id | tostring) == $rid)) as $q ({next: 0, out: []};' w5-older-request-queued-hours-before
+_wb_mutant request-after 'elif ($ri + 1) < ($paired | length) then' 'elif false then' w4-superseded-after-the-run-completed
+_wb_mutant same-run-merge 'and .cur.commit == $x.commit and .cur.trigger == $x.trigger then .' 'and false then .' h-running-version-edited-twice hold
 
 # Barrier integration through the production arm. The diagnostic stub exits
-# 0 (Codex spoke on this head) throughout: unbound, that alone opens.
+# 0 (Codex spoke on this head) throughout: unbound, that alone opens. The
+# summary comment's live body rides in the comments; its earlier versions
+# come from the edit-history query (P4B_TEST_SUMMARY_EDITS).
+_wb_live() { # <version-json> -> the summary comment carrying it as its live body
+  printf '%s' "$1" | jq -c '{id:9000,node_id:"IC_summary",user:{login:"chatgpt-codex-connector[bot]"},
+    created_at:"2026-10-29T11:00:00Z",updated_at:.at,body}'
+}
+_wb_edits() { # <versions-json> -> userContentEdits connection
+  printf '%s' "$1" | jq -c '{totalCount:length,nodes:[ .[] | {editedAt:.at,diff:.body} ]}'
+}
+_wb_auto_v="$( { _wb_ver running 'PR opened' 2026-10-29T11:58:00Z 2026-10-29T11:58:01Z; _wb_ver completed 'PR opened' 2026-10-29T12:03:00Z 2026-10-29T12:03:01Z; } | _vs)"
+_wb_auto="[$_WB_R,$(_wb_live "$(printf '%s' "$_wb_auto_v" | jq -c '.[1]')")]"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-_wb_auto="[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:03:00Z)]"
 out="$(P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
   _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
 [ "$rc" = 0 ] || bad="$bad [unbound-auto-review-no-longer-opens:$rc]"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
-  _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.codex == "not-yet" and .codex_evidence == "wave-request-summary-not-manual-request"' >/dev/null \
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_SUMMARY_EDITS="$(_wb_edits "$_wb_auto_v")" \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.codex == "not-yet" and .codex_evidence == "wave-request-no-run-for-bound-request"
+    and .wave_binding.reason == "no-run-for-bound-request" and .wave_binding.bound_request == 501' >/dev/null \
   || bad="$bad [bound-auto-review-not-held:$rc:$(printf '%s' "$out" | jq -c '{codex,codex_evidence}' 2>/dev/null)]"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_live "$(printf '%s' "$_WB_ANSWER" | jq -c '.[1]')")]" \
+  P4B_TEST_SUMMARY_EDITS="$(_wb_edits "$_WB_ANSWER")" \
   P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
 [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.codex == "reported" and .codex_evidence == "wave-request-answered"
     and .request_budget.request_generation == [501]' >/dev/null \
-  || bad="$bad [bound-answer-not-open-or-no-generation:$rc:$(printf '%s' "$out" | jq -c .request_budget 2>/dev/null)]"
+  || bad="$bad [bound-answer-not-open-or-no-generation:$rc:$(printf '%s' "$out" | jq -c '{codex,codex_evidence,request_budget}' 2>/dev/null)]"
+# The live body alone (Completed) is not enough: without the Running version
+# that dates the run's start, the binding holds.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_live "$(printf '%s' "$_WB_ANSWER" | jq -c '.[1]')")]" \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad [bound-live-body-only-opened:$rc]"
+# An unreadable edit history holds; it never reads as an empty history.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_live "$(printf '%s' "$_WB_ANSWER" | jq -c '.[1]')")]" \
+  P4B_TEST_SUMMARY_EDITS_FAIL=true \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.codex_evidence == "wave-request-summary-history-unreadable"' >/dev/null \
+  || bad="$bad [bound-unreadable-history-not-held:$rc]"
+# A truncated history page (more edits than returned) is unreadable too.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_live "$(printf '%s' "$_WB_ANSWER" | jq -c '.[1]')")]" \
+  P4B_TEST_SUMMARY_EDITS="$(_wb_edits "$_WB_ANSWER" | jq -c '.totalCount = 150')" \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad [bound-truncated-history-opened:$rc]"
+# Liveness: a bound hold that outlives the budget does not retry forever. It
+# ends in today's escalation (exit 4 at the orchestrator), and that result
+# names the binding and carries its evidence for whoever surfaces it.
+mkdir -p "$WORK/barrier-state/phase-4b-barrier"
+printf '%s\n' "$(( $(date +%s) - 5000 ))" >"$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_wb_H.pending"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_SUMMARY_EDITS="$(_wb_edits "$_wb_auto_v")" \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.decision == "escalate"
+    and (.reason | test("wave Codex request 501 held: no-run-for-bound-request"))
+    and .wave_binding.reason == "no-run-for-bound-request" and (.wave_binding.requests | length) == 1' >/dev/null \
+  || bad="$bad [bound-hold-expiry-not-surfaced:$rc:$(printf '%s' "$out" | jq -c '{decision,reason}' 2>/dev/null)]"
+[ ! -f "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_wb_H.pending" ] || bad="$bad [bound-hold-expiry-kept-marker]"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=777 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
   _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
