@@ -112,7 +112,8 @@
 # above does not queue behind the holder's whole run. It runs only the live
 # assertions, one at a time and without the lock, names every other step it
 # would have run as DEFERRED TO CI (contention), and pushes; CI's lint runs
-# them. The time spent waiting is printed on the running and summary lines.
+# them. The time spent waiting is printed on the running and summary lines;
+# it is not counted against max_minutes.
 # Retry (#2843): every hook run records each selected check's result for the
 # pushed branch in ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush-results/,
 # with the pushed commit and a fingerprint of the selection. After a failed
@@ -176,10 +177,10 @@
 #                      any check once N minutes have passed; running checks
 #                      finish, the unstarted ones are deferred to CI, and the
 #                      run exits 0 unless a check failed (a failed check
-#                      blocks the push, budget or not). The time this push
-#                      waited for another run's lock counts against the N
-#                      minutes (#2878; the grace above bounds it). A later
-#                      --retry-failed runs what was not started.
+#                      blocks the push, budget or not). The wait for another
+#                      run's lock is not counted (the grace above bounds it,
+#                      #2878). A later --retry-failed runs what was not
+#                      started.
 
 set -euo pipefail
 
@@ -1617,13 +1618,25 @@ elif [ "$MODE" = hook ] && [ "$SNAPSHOT" -eq 1 ]; then
   QUEUE_NOTE="queued ${LOCK_QUEUED}s for the machine lock"
 fi
 
+# What the running line says runs: a contended run runs only the live lane.
+if [ -n "$LOCK_CONTENDED" ]; then
+  RUN_BREAKDOWN="$(wc -l < "$RUN_DIR/order" | tr -d ' ') live assertions only (contended; $CONTENDED_N other checks deferred to CI, named below)"
+else
+  # Plain ifs: an assignment takes the status of its last substitution, so a
+  # `$([ ... ] && echo)` that is false would end the run under set -e.
+  RUN_BREAKDOWN="$LIVE_RUN_N live assertions, $SEL_N selected wrappers"
+  if [ "$ALL_LIVE" -eq 1 ]; then RUN_BREAKDOWN="$RUN_BREAKDOWN, $FB_N fallback wrappers, $UNSEL_N unselected wrappers"; fi
+  if [ "$DEEP" -eq 1 ]; then RUN_BREAKDOWN="$RUN_BREAKDOWN, $DEEP_N deep-lane steps"; fi
+  if [ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ]; then RUN_BREAKDOWN="$RUN_BREAKDOWN, $DEEPFB_N fallback deep-lane steps"; fi
+fi
+
 # The load that sized the starting concurrency (#2575, #2581) is the one
 # printed here; the run re-reads it before each check (#2842, sched_resize)
 # and the verdict line reads it once more at the end.
 LOAD_START="$LOAD_1"
 BUDGET_MIN=$(policy_value max_minutes)
 BUDGET_S=$((BUDGET_MIN * 60))
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")${QUEUE_NOTE:+; $QUEUE_NOTE}"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $RUN_BREAKDOWN${QUEUE_NOTE:+; $QUEUE_NOTE}"
 if [ "$CONTENDED_N" -gt 0 ]; then
   echo "$PREFIX: CONTENDED: $CONTENDED_N checks are DEFERRED TO CI because $LOCK_CONTENDED holds the machine lock (CI's lint runs them; MERGEPATH_PREPUSH_LOCK_GRACE=<seconds> waits longer):"
   while IFS= read -r sid; do
@@ -1656,9 +1669,9 @@ fi
 # (0 = none) a step whose previous duration would carry the run past the
 # budget, and every step once the budget is spent, is not started; it is
 # named as deferred to CI. Steps already running always finish, and a failed
-# step still blocks the push. The budget counts from the first check plus
-# the time the push waited for another run's lock (#2878), which the grace
-# (MERGEPATH_PREPUSH_LOCK_GRACE) bounds.
+# step still blocks the push. The budget counts from the first check; the
+# wait for another run's lock is bounded on its own, by the grace
+# (MERGEPATH_PREPUSH_LOCK_GRACE, #2878).
 # xargs stays the process that runs the workers, so an interrupt reaches
 # every check the way it always has.
 #
@@ -1718,7 +1731,7 @@ sched_feed() {
     # The timing cache is advisory: a value it cannot vouch for predicts nothing.
     case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
     if [ "$BUDGET_S" -gt 0 ]; then
-      el=$(( $(date +%s) - T0 + LOCK_QUEUED ))
+      el=$(( $(date +%s) - T0 ))
       if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then
         printf '%s\t%s\n' "$sid" "$prev" >> "$RUN_DIR/deferred"
         continue

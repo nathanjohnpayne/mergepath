@@ -1254,7 +1254,7 @@ if [ "$t_took" -lt 60 ]; then ok "contended: the push did not queue behind the h
 case "$out" in *"CONTENDED: the run of feat/busy (pid $HOLDER, started 00:00 UTC, 3 of 41 checks) still holds the machine lock after "*" s (MERGEPATH_PREPUSH_LOCK_GRACE=2)"*) ok "contended: the holder and the grace are named" ;; *) bad "contended holder output: $out" ;; esac
 check "contended: every live assertion ran, the selected wrapper did not" "$(ran_set_lock)" "check_env check_flag check_ok "
 case "$out" in *"CONTENDED: 1 checks are DEFERRED TO CI because the run of feat/busy"*"    check_graphed"*) ok "contended: the deferred wrapper is named" ;; *) bad "contended deferral output: $out" ;; esac
-case "$out" in *"running 3 checks ("*"; queued "*"s for the machine lock, then ran contended beside the run of feat/busy"*) ok "contended: the running line shows the queue time" ;; *) bad "contended running line: $out" ;; esac
+case "$out" in *"running 3 checks ("*"): 3 live assertions only (contended; 1 other checks deferred to CI, named below); queued "*"s for the machine lock, then ran contended beside the run of feat/busy"*) ok "contended: the running line says only the live assertions run, and shows the queue time" ;; *) bad "contended running line: $out" ;; esac
 case "$out" in *"PASS with checks DEFERRED TO CI ("*"queued "*"s for the machine lock, then ran contended"*"deferred: 1 by contention for the machine lock, named above)"*) ok "contended: the verdict line names the deferral and the queue time" ;; *) bad "contended verdict: $out" ;; esac
 case "$out" in *"concurrency pinned to 1 by contention"*) ok "contended: the concurrency is pinned to 1" ;; *) bad "contended concurrency: $out" ;; esac
 check "contended: its checks ran one at a time" "$(peak_concurrency)" "1"
@@ -1292,6 +1292,55 @@ if ! cmp -s "$CMUTANT" "$RUNNER" && [ "$rc" = waiting ] && [ -z "$(ran_set_lock)
 else
   bad "mutation: expected the waiting mutant to be still queued (got '$rc', ran: $(ran_set_lock))"
 fi
+# A real contended run holds the snapshot guard while its checks run, and
+# retires nothing itself: a stale snapshot planted beside it survives. Two
+# mutants must fail this: one that never takes the guard, and one that runs
+# the stale-snapshot pass while contended (it would retire without the lock).
+cat > "$TMP/guard-probe.py" <<'PY2'
+import fcntl, sys
+f = open(sys.argv[1], "a")
+try:
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("free")
+except OSError:
+    print("held")
+PY2
+contended_guard_run() {  # $1 = runner, $2 = a 6-character label; prints "<guard> <stale snapshot>"
+  local snaps m12 stale sha pid i=0 guard=unseen
+  snaps=$(cd "$TMP/.fix-worktrees" && pwd -P)
+  m12=$(git -C "$FIX" rev-parse main | cut -c1-12)
+  stale="$snaps/prepush-$m12.$2"
+  git -C "$FIX" worktree add -q --detach "$stale" main
+  reset_probe; slow_all
+  git -C "$FIX" commit -q --allow-empty -m "contended-guard-$2"
+  sha=$(git -C "$FIX" rev-parse feat/contended)
+  (cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=2 bash "$1" --hook origin \
+    <<<"refs/heads/feat/contended $sha refs/heads/feat/contended $ZERO") > "$TMP/contended-guard-$2.out" 2>&1 &
+  pid=$!
+  until [ -n "$(ls "$PROBE_DIR/running" 2>/dev/null)" ] || ! kill -0 "$pid" 2>/dev/null || [ "$i" -ge 300 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -z "$(ls "$PROBE_DIR/running" 2>/dev/null)" ] || guard=$(python3 -I "$TMP/guard-probe.py" "$LOCK_DIR/prepush-snapshots.lock")
+  wait "$pid" 2>/dev/null || true
+  if [ -d "$stale" ]; then printf '%s survived\n' "$guard"; else printf '%s removed\n' "$guard"; fi
+  git -C "$FIX" worktree remove --force "$stale" 2>/dev/null || true
+}
+check "contended: the run holds the snapshot guard during its checks and retires nothing" \
+  "$(contended_guard_run "$FIX/scripts/repo-lint-prepush.sh" real00)" "held survived"
+mk_mutant() {  # $1 = name, $2 = old text, $3 = new text; prints the mutant's path
+  mkdir -p "$TMP/mutant-$1"
+  python3 - "$RUNNER" "$TMP/mutant-$1/repo-lint-prepush.sh" "$2" "$3" <<'PY2'
+import sys
+src = open(sys.argv[1]).read()
+assert src.count(sys.argv[3]) == 1, sys.argv[3]
+open(sys.argv[2], 'w').write(src.replace(sys.argv[3], sys.argv[4], 1))
+PY2
+  printf '%s\n' "$TMP/mutant-$1/repo-lint-prepush.sh"
+}
+GMUTANT=$(mk_mutant no-guard $'      prepush_snapshot_guard_share\n' '')
+got=$(contended_guard_run "$GMUTANT" nogrd0)
+if ! cmp -s "$GMUTANT" "$RUNNER" && [ "${got%% *}" = free ]; then ok "mutation: a contended run without the guard is caught (guard $got)"; else bad "mutation: the guard-less mutant was not caught ($got)"; fi
+RMUTANT=$(mk_mutant retire-contended '[ "$LOCK_HELD" -ne 1 ] || prepush_retire_guarded "$snapshots"' 'prepush_retire_guarded "$snapshots"')
+got=$(contended_guard_run "$RMUTANT" retir0)
+if ! cmp -s "$RMUTANT" "$RUNNER" && [ "${got#* }" = removed ]; then ok "mutation: a contended run that retires snapshots is caught ($got)"; else bad "mutation: the retiring mutant was not caught ($got)"; fi
 kill "$HOLDER" 2>/dev/null || true
 i=0; while kill -0 "$HOLDER" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 : > "$LOCK_FILE"
