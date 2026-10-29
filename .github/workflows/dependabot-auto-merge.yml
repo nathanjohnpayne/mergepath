@@ -314,17 +314,19 @@ jobs:
           # (in-block list parser; sed strips list-marker + optional
           # quotes). Outputs one reviewer login per line.
           # available_reviewers plus the Dependabot-only approver identities
-          # (#2874). The second list is honoured on this lane only; every
-          # other approval check reads available_reviewers alone.
-          policy_list() {
-            awk -v key="$1" '
-              index($0, key ":") == 1 {in_block=1; next}
-              in_block && /^[^[:space:]#]/ {in_block=0}
-              in_block && /^ *-/ {print}
-            ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
-          }
-          ALLOWED=$(policy_list available_reviewers)
-          [ -z "$ALLOWED" ] || ALLOWED=$(printf '%s\n%s\n' "$ALLOWED" "$(policy_list dependabot_reviewer_identities)" | sed '/^$/d')
+          # (#2874), parsed by the shared reader the Merge clearance gate and
+          # codex-review-check.sh use, so a quoted or commented entry the gate
+          # accepts is accepted here too. The second list is honoured on this
+          # lane only; every other approval check reads available_reviewers
+          # alone.
+          if [ ! -r scripts/lib/reviewers-helpers.sh ]; then
+            echo "::error::scripts/lib/reviewers-helpers.sh is missing from the base checkout; cannot read the reviewer allowlist. Propagate the scripts/lib kit, then rerun."
+            exit 1
+          fi
+          # shellcheck source=/dev/null
+          . scripts/lib/reviewers-helpers.sh
+          ALLOWED=""
+          [ -z "$(read_available_reviewers "$POLICY")" ] || ALLOWED=$(read_dependabot_approvers "$POLICY")
           if [ -z "$ALLOWED" ]; then
             echo "::error::$POLICY has no available_reviewers list. Add reviewer identities under available_reviewers: before this workflow can approve."
             exit 1
@@ -728,17 +730,19 @@ jobs:
             exit 1
           fi
           # available_reviewers plus the Dependabot-only approver identities
-          # (#2874). The second list is honoured on this lane only; every
-          # other approval check reads available_reviewers alone.
-          policy_list() {
-            awk -v key="$1" '
-              index($0, key ":") == 1 {in_block=1; next}
-              in_block && /^[^[:space:]#]/ {in_block=0}
-              in_block && /^ *-/ {print}
-            ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
-          }
-          ALLOWED=$(policy_list available_reviewers)
-          [ -z "$ALLOWED" ] || ALLOWED=$(printf '%s\n%s\n' "$ALLOWED" "$(policy_list dependabot_reviewer_identities)" | sed '/^$/d')
+          # (#2874), parsed by the shared reader the Merge clearance gate and
+          # codex-review-check.sh use, so a quoted or commented entry the gate
+          # accepts is accepted here too. The second list is honoured on this
+          # lane only; every other approval check reads available_reviewers
+          # alone.
+          if [ ! -r scripts/lib/reviewers-helpers.sh ]; then
+            echo "::error::scripts/lib/reviewers-helpers.sh is missing from the base checkout; cannot read the reviewer allowlist. Propagate the scripts/lib kit, then rerun."
+            exit 1
+          fi
+          # shellcheck source=/dev/null
+          . scripts/lib/reviewers-helpers.sh
+          ALLOWED=""
+          [ -z "$(read_available_reviewers "$POLICY")" ] || ALLOWED=$(read_dependabot_approvers "$POLICY")
           if [ -z "$ALLOWED" ]; then
             echo "::error::$POLICY has no available_reviewers list; refusing to merge."
             exit 1

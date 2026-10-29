@@ -698,6 +698,7 @@ paths:
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
+      - "scripts/lib/dependabot-commit-provenance.sh"   # #2874, Dependabot-only approvers count only on proven Dependabot commits
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/branch-requirements.sh"   # #1064, hard-sourced gate (a) required-check resolution
@@ -2357,6 +2358,9 @@ paths:
       # The merge step sources it once the base-SHA policy sets
       # author_merge_token_class (#2728), and refuses the merge without it.
       - "scripts/lib/credential-class.sh"
+      # Both jobs read available_reviewers plus dependabot_reviewer_identities
+      # through the shared reader and fail closed without it (#2874).
+      - "scripts/lib/reviewers-helpers.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

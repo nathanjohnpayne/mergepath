@@ -695,6 +695,37 @@ else
   fail "#2874: general='$(echo $general)' lane='$(echo $lane)'"
 fi
 
+# Test 5j/5k (#2874, Codex P1 on #2877): outside the Dependabot lane the
+# Dependabot-only approver is a non-reviewer. Its standing approval blocks an
+# ordinary PR (GitHub's native required-review count would otherwise accept
+# it); the identical PR without that approval still passes.
+echo; echo "--- Test 5j (#2874): Dependabot-only approval on an ordinary PR → BLOCKED"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-deps')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$DEPS_APPROVAL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -q "Dependabot-only approver"; then
+  pass "#2874: a Dependabot-only approval blocks a non-Dependabot PR"
+else
+  fail "#2874: expected rc=1 BLOCKED naming the Dependabot-only approver; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo; echo "--- Test 5k (#2874): same ordinary PR, no such approval → PASS"
+FIXTURE_REVIEWS=$(make_reviews_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "#2874: the deny check is inert without a Dependabot-only approval"
+else
+  fail "#2874: expected rc=0 PASS; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Test 6: External-review, gate disabled → exit 0.
 # ---------------------------------------------------------------------------

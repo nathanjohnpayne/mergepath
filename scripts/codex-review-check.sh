@@ -2547,6 +2547,27 @@ if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && [ -n "$CODEX_BLOCKED_REASON" ] \
   fi
 fi
 
+# #2874: on a provenance-verified Dependabot PR, the Dependabot-only approver
+# identities (dependabot_reviewer_identities) count as reviewers too, so the
+# automated approval clears a `needs-external-review` label the way the general
+# reviewer PAT it replaced did. The Merge clearance gate already judges such a
+# PR by its Dependabot arm first. Any other PR, a "not Dependabot-only" verdict
+# (rc 1), an unreadable one (rc 3) or a missing helper keeps
+# available_reviewers alone: the extra standing is granted only on proof.
+if [ "$PR_AUTHOR" = "dependabot[bot]" ] && [ -n "$(read_dependabot_reviewer_identities)" ] \
+   && [ -r "$__CODEX_CHECK_DIR/lib/dependabot-commit-provenance.sh" ]; then
+  # shellcheck source=lib/dependabot-commit-provenance.sh
+  . "$__CODEX_CHECK_DIR/lib/dependabot-commit-provenance.sh"
+  __dep_rc=0
+  dependabot_commit_provenance "$REPO" "$PR_NUMBER" "$HEAD_SHA" || __dep_rc=$?
+  if [ "$__dep_rc" = 0 ]; then
+    REVIEWERS=$(read_dependabot_approvers)
+    log "Dependabot provenance verified: Dependabot-only approvers count as reviewers on this PR"
+  else
+    log "Dependabot provenance not established (rc $__dep_rc): Dependabot-only approvers do not count"
+  fi
+fi
+
 # Build a JSON array of reviewer logins for the filter.
 REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 
