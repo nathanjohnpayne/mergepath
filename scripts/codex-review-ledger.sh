@@ -404,18 +404,19 @@ VERDICT_COMMENT_IDS=$(jqx "verdict ids" -c 'map(.comment_id)' <<<"$VERDICTS")
 # verdict (#2742). Only a comment with no raw anchor field at all may be
 # anchorless; one whose raw fields parsed to nothing is excluded too.
 #
-# A raw anchor field is any occurrence of the phrase "reviewed commit" that
-# does not continue the word (#2772 item 2); `_` ends it, as Markdown
-# emphasis (`_Reviewed commit_`) does. That frees the common anchorless
-# prose "the reviewed commits look clean" without enumerating Markdown: every
-# decorated spelling of a field (numbering, nested bullets, headings, bold,
-# code) still contains the bare phrase, so a malformed field anywhere still
-# excludes its verdict. Prose that uses the bare phrase ("I reviewed commit
-# history") is excluded too; that is the fail-closed side, leaving its
-# request unanswered rather than inventing a response (Phase 4b on #2859).
+# A raw anchor field is any occurrence of the phrase "reviewed commit" except
+# the plural word "reviewed commits" (#2772 item 2). That frees the common
+# anchorless prose "the reviewed commits look clean" without enumerating
+# anything else: every decorated spelling of a field (numbering, nested
+# bullets, headings, bold, code, `_emphasis_`) still contains the phrase, and
+# so does a value glued to it with no separator, which crqe_verdicts also
+# reads as a field (`Reviewed commit` + 41 hex characters; Phase 4b on #2865).
+# Anything that is not that one plural word is a field. Other prose that uses
+# the phrase ("I reviewed commit history") is excluded too, on the fail-closed
+# side: its request stays unanswered rather than gaining a response.
 RAW_ANCHOR_IDS=$(jqx "raw anchor ids" -c --arg bot "$BOT" '
   [ .[] | select((.user.login // "") == $bot)
-    | select((.body // "") | test("(?i)reviewed commit(?![0-9a-z])"))
+    | select((.body // "") | test("(?i)reviewed commit(?!s(?![0-9a-z_]))"))
     | .id ]' <<<"$ISSUE_COMMENTS")
 # A verdict that names two different full SHAs reviewed no single commit:
 # crqe_verdicts keeps both and consistent_anchor would read the pair as no

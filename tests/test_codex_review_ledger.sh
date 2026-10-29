@@ -1095,7 +1095,9 @@ done
 # verdict read as an anchorless clean response and could clear a human stop.
 for numbered in '1. Reviewed commit: not-a-sha' '2) **Reviewed commit:** `not-a-sha`' '+ Reviewed commit: not-a-sha' \
     '1. - **Reviewed commit:** `not-a-sha`' '1. ### Reviewed commit: not-a-sha' '> 1. * _Reviewed commit_: not-a-sha' \
-    'I reviewed commit history and found nothing.'; do
+    'I reviewed commit history and found nothing.' \
+    "Reviewed commit$(printf 'a%.0s' $(seq 41))" "Reviewed commit$(printf '1%.0s' $(seq 41))" \
+    'Reviewed commitsdeadbeef'; do
   D="$WORK/anchor-numbered"; rm -rf "$D"; anchor_case "$D" "$numbered"
   RC=$(run_cli "$D")
   if [ "$RC" = 0 ] && jq -e '.responses == [] and .requests[0].outcome == "no_response_yet"' "$D/out" >/dev/null; then
