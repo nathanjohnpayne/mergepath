@@ -5911,8 +5911,12 @@ endpoint=${1:-}
 # own handling below.
 _summary_query=false
 for a in "$@"; do case "$a" in *userContentEdits*) _summary_query=true ;; esac; done
+# Both GraphQL reads carry userContentEdits; the comment-history one (#2888)
+# also names pullRequest. The force-push-heads query (#2591) names
+# pullRequest but not userContentEdits, and keeps its own handling below.
 _comment_history_query=false
-for a in "$@"; do case "$a" in *pullRequest*) _comment_history_query=true ;; esac; done
+for a in "$@"; do case "$a" in *pullRequest*userContentEdits*|*userContentEdits*pullRequest*) _comment_history_query=true ;; esac; done
+[ "$_comment_history_query" != true ] || _summary_query=false
 if [ "$endpoint" = graphql ] && [ "$_comment_history_query" = true ]; then
   # The PR comments' edit metadata (p4b_comment_mention_history): default no
   # comment was ever edited.
@@ -6296,8 +6300,9 @@ _wb_run() { # <start> <end> [trigger] [commit] [terminal-status] -> Running then
 }
 _WB_ANSWER="$(_wb_run 2026-10-29T12:00:15.5Z 2026-10-29T12:04:00.1Z | _vs)"
 _wb_case() { # <label> <want-state> <comments-json> <versions-json> [historic-json]
-  local got
-  got="$(p4b_wave_codex_binding_state "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$4" "${5:-[]}" | jq -r .state)"
+  local got h="${5:-}"
+  [ -n "$h" ] || h='{}'
+  got="$(p4b_wave_codex_binding_state "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$4" "$h" | jq -r .state)"
   [ "$got" = "$2" ] || bad="$bad [$1: want $2 got $got]"
 }
 _wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions [<TAB> historic, default []]
@@ -6305,9 +6310,12 @@ _wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions [<TAB> histori
   # its mention (its queued job is not cancelled), hold.
   printf '%s\t%s\t%s\t%s\t%s\n' \
     h-runs-overlap-running-a-running-b-completed hold "[$(_wb_req 500 nathanjohnpayne 2026-10-29T11:59:50Z),$_WB_R]" \
-      "$( { _wb_ver running 'Manual request' 2026-10-29T11:59:59Z 2026-10-29T12:00:00Z; _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" '[]' \
-    w6-older-request-edited-to-drop-its-mention hold "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z 'thanks' | jq -c '.updated_at = "2026-10-29T08:30:00Z"'),$_WB_R]" "$_WB_ANSWER" '[400]' \
-    w6-request-edit-history-unreadable hold "$_WB_C" "$_WB_ANSWER" null
+      "$( { _wb_ver running 'Manual request' 2026-10-29T11:59:59Z 2026-10-29T12:00:00Z; _wb_ver running 'Manual request' 2026-10-29T12:00:15Z 2026-10-29T12:00:16Z; _wb_ver completed 'Manual request' 2026-10-29T12:04:00Z 2026-10-29T12:04:01Z; } | _vs)" '{}' \
+    w6-older-request-edited-to-drop-its-mention hold "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z 'thanks' | jq -c '.updated_at = "2026-10-29T08:30:00Z"'),$_WB_R]" "$_WB_ANSWER" '{"400":"2026-10-29T08:00:00Z"}' \
+    w6-request-edit-history-unreadable hold "$_WB_C" "$_WB_ANSWER" null \
+    w6-mention-added-by-a-later-edit hold "[$(_wb_req 400 someone 2026-10-29T08:00:00Z 'please @codex review' | jq -c '.updated_at = "2026-10-29T12:05:00Z"'),$_WB_R]" \
+      "$( { _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z 'Manual request' "$_wb_H" failed; _wb_run 2026-10-29T12:05:15Z 2026-10-29T12:09:00Z; } | _vs)" '{"400":"2026-10-29T12:05:00Z"}' \
+    w6-edited-mention-history-says-never hold "[$(_wb_req 402 someone 2026-10-29T08:00:00Z '@codex review' | jq -c '.updated_at = "2026-10-29T09:00:00Z"'),$_WB_R]" "$_WB_ANSWER" '{"402":null}' 
   printf '%s\t%s\t%s\t%s\n' \
     answered clear "$_WB_C" "$_WB_ANSWER" \
     w1-app-review-running-at-check hold "$_WB_C" "$(_wb_ver running 'PR opened' 2026-10-29T11:58:00Z 2026-10-29T11:58:01Z | _vs)" \
@@ -6345,15 +6353,15 @@ _wb_fixtures() { # label <TAB> want <TAB> comments <TAB> versions [<TAB> histori
     request-not-exact unreadable "[$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z 'please @codex review')]" "$_WB_ANSWER" \
     comments-not-array unreadable '{"not":"an array"}' "$_WB_ANSWER"
 }
-while IFS="$(printf '\t')" read -r _l _w _c _v _h; do _wb_case "$_l" "$_w" "$_c" "$_v" "${_h:-[]}"; done < <(_wb_fixtures)
+while IFS="$(printf '\t')" read -r _l _w _c _v _h; do _wb_case "$_l" "$_w" "$_c" "$_v" "$_h"; done < <(_wb_fixtures)
 # A clear carries the generation it verified; every outcome carries its
 # evidence (reason, the requests with the run each took, the runs seen).
 _wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 \
-  "$( { _wb_run 2026-10-29T08:00:12Z 2026-10-29T08:04:00Z; _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; } | _vs)")"
+  "$( { _wb_run 2026-10-29T08:00:12Z 2026-10-29T08:04:00Z; _wb_run 2026-10-29T12:00:15Z 2026-10-29T12:04:00Z; } | _vs)" '{}')"
 printf '%s' "$_wb_out" | jq -e '.generation == [400,501] and .bound_request == 501
   and ([.requests[] | "\(.id):\(.run)"] == ["400:0","501:1"]) and (.runs | length) == 2' >/dev/null \
   || bad="$bad [clear-evidence:$_wb_out]"
-_wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER")"
+_wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-29T08:00:00Z),$_WB_R]" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER" '{}')"
 printf '%s' "$_wb_out" | jq -e '.state == "hold" and .reason == "no-run-for-bound-request"
   and ([.requests[] | "\(.id):\(.run)"] == ["400:0","501:null"]) and has("generation") == false' >/dev/null \
   || bad="$bad [hold-evidence:$_wb_out]"
@@ -6371,7 +6379,8 @@ _wb_mutant() { # <label> <replace-old> <replace-new> <window> [flipped-state]
     eval "${m/p4b_wave_codex_binding_eval()/_wb_mutant_eval()}"
     _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c v h; do
       [ "$l" = "$4" ] || continue
-      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$v" "${h:-[]}" | jq -r .state
+      [ -n "$h" ] || h='{}'
+      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$v" "$h" | jq -r .state
     done)"
   [ "$got" = "${5:-clear}" ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
 }
@@ -6383,7 +6392,8 @@ _wb_mutant fifo-pairing '(reduce $reqs[] as $q ({next: 0, out: []};' '(reduce ($
 _wb_mutant request-after 'elif ($ri + 1) < ($paired | length) then' 'elif false then' w4-superseded-after-the-run-completed
 _wb_mutant same-run-merge 'and .cur.commit == $x.commit and .cur.trigger == $x.trigger then .' 'and false then .' h-running-version-edited-twice hold
 _wb_mutant run-overlap 'elif $built.overlap then' 'elif false then' h-runs-overlap-running-a-running-b-completed
-_wb_mutant historic-mentions 'or (($historic | type) == "array" and (.id as $i | $historic | index($i))))' ')' w6-older-request-edited-to-drop-its-mention
+_wb_mutant historic-mentions 'if ($historic | type) == "object" and ($historic | has($k)) then' 'if false then' w6-older-request-edited-to-drop-its-mention
+_wb_mutant mention-time 'else {id, at: $historic[$k], t: ($historic[$k] | secs)} end' 'else {id, at: .created_at, t: (.created_at | secs)} end' w6-mention-added-by-a-later-edit
 
 # The request edit-history reader, against a shimmed gh. Whether a comment
 # was edited comes from GraphQL edit metadata (lastEditedAt / userContentEdits),
@@ -6393,9 +6403,10 @@ _wb_mutant historic-mentions 'or (($historic | type) == "array" and (.id as $i |
 _wbh_page() { # <nodes-json> -> one GraphQL page
   jq -nc --argjson n "$1" '{data:{repository:{pullRequest:{comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$n}}}}}'
 }
-_wbh_node() { # <id> <login> <lastEditedAt|null> <diffs-json>
+_wbh_node() { # <id> <login> <lastEditedAt|null> <diffs-json> -> one comment node; revision k is edited at 12:0k
   jq -nc --argjson id "$1" --arg who "$2" --argjson le "$3" --argjson d "$4" \
-    '{databaseId:$id,author:{login:$who},lastEditedAt:$le,userContentEdits:{totalCount:($d|length),nodes:[$d[] | {diff:.}]}}'
+    '{databaseId:$id,author:{login:$who},lastEditedAt:$le,
+      userContentEdits:{totalCount:($d|length),nodes:[range(0; $d|length) as $k | {editedAt:("2026-10-29T12:0\($k):00Z"),diff:$d[$k]}]}}'
 }
 _wbh() { # <graphql-output|FAIL> -> p4b_comment_mention_history output
   (
@@ -6405,25 +6416,28 @@ _wbh() { # <graphql-output|FAIL> -> p4b_comment_mention_history output
   )
 }
 _wbh_n() { _wbh "$(_wbh_page "[$*]")"; }
-[ "$(_wbh_n "$(_wbh_node 700 coderabbitai '"2026-10-29T12:05:00Z"' '["summary v1"]')")" = '[]' ] \
-  || bad="$bad [edit-history-no-mention-not-empty]"
-[ "$(_wbh_n "$(_wbh_node 700 someone '"2026-10-29T12:00:00Z"' '["ping @codex review"]')")" = '[700]' ] \
+[ "$(_wbh_n "$(_wbh_node 700 coderabbitai '"2026-10-29T12:05:00Z"' '["summary v1"]')")" = '{"700":null}' ] \
+  || bad="$bad [edit-history-no-mention-not-null-entry]"
+[ "$(_wbh_n "$(_wbh_node 700 someone '"2026-10-29T12:00:00Z"' '["ping @codex review"]')")" = '{"700":"2026-10-29T12:00:00Z"}' ] \
   || bad="$bad [edit-history-mention-missed]"
+# A mention's time is when it first appeared, not when the comment was made.
+[ "$(_wbh_n "$(_wbh_node 705 someone '"2026-10-29T12:02:00Z"' '["no mention","now @codex review","still @codex review"]')")" = '{"705":"2026-10-29T12:01:00Z"}' ] \
+  || bad="$bad [first-mention-time-wrong]"
 # Edited inside its creation second: REST created_at == updated_at, but the
 # edit metadata still records it, so its removed mention is found.
-[ "$(_wbh_n "$(_wbh_node 701 nathanjohnpayne '"2026-10-29T12:00:00Z"' '["@codex review"]')")" = '[701]' ] \
+[ "$(_wbh_n "$(_wbh_node 701 nathanjohnpayne '"2026-10-29T12:00:00Z"' '["@codex review"]')")" = '{"701":"2026-10-29T12:00:00Z"}' ] \
   || bad="$bad [same-second-edit-missed]"
-[ "$(_wbh_n "$(_wbh_node 702 nathanjohnpayne null '[]')")" = '[]' ] || bad="$bad [unedited-comment-misread]"
-[ "$(_wbh_n "$(_wbh_node 703 chatgpt-codex-connector '"2026-10-29T12:00:00Z"' '["Comment @codex review to try again"]')")" = '[]' ] \
+[ "$(_wbh_n "$(_wbh_node 702 nathanjohnpayne null '[]')")" = '{}' ] || bad="$bad [unedited-comment-misread]"
+[ "$(_wbh_n "$(_wbh_node 703 chatgpt-codex-connector '"2026-10-29T12:00:00Z"' '["Comment @codex review to try again"]')")" = '{}' ] \
   || bad="$bad [codex-bot-not-excluded-without-bot-suffix]"
 [ "$(_wbh FAIL)" = null ] || bad="$bad [edit-history-failed-read-not-null]"
 [ "$(_wbh_n "$(_wbh_node 700 someone '"x"' '["v"]' | jq -c '.userContentEdits.totalCount = 150')")" = null ] \
   || bad="$bad [edit-history-truncated-not-null]"
-[ "$(_wbh_n "$(_wbh_node 700 someone '"x"' '["v"]' | jq -c '.userContentEdits.nodes += [{diff:null}] | .userContentEdits.totalCount = 2')")" = null ] \
+[ "$(_wbh_n "$(_wbh_node 700 someone '"x"' '["v"]' | jq -c '.userContentEdits.nodes += [{editedAt:"2026-10-29T12:09:00Z",diff:null}] | .userContentEdits.totalCount = 2')")" = null ] \
   || bad="$bad [edit-history-withheld-revision-not-null]"
-# Two pages (paginated output) are read as one list.
+# Two pages (paginated output) are read as one map.
 [ "$(_wbh "$(_wbh_page "[$(_wbh_node 700 a '"x"' '["@codex review"]')]")
-$(_wbh_page "[$(_wbh_node 704 b '"x"' '["please @codex"]')]")")" = '[700,704]' ] || bad="$bad [edit-history-second-page-lost]"
+$(_wbh_page "[$(_wbh_node 704 b '"x"' '["please @codex"]')]")")" = '{"700":"2026-10-29T12:00:00Z","704":"2026-10-29T12:00:00Z"}' ] || bad="$bad [edit-history-second-page-lost]"
 # The summary-history reader treats a withheld revision the same way.
 [ "$( (
     gh() { printf '%s\n' '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":null}]}}}}'; }
@@ -6432,7 +6446,7 @@ $(_wbh_page "[$(_wbh_node 704 b '"x"' '["please @codex"]')]")")" = '[700,704]' ]
 # Stability (Phase 4b on #2888): a request that lands while the history reads
 # run was not in the evidence, so a clear becomes a hold; an unchanged
 # request set (CodeRabbit edits aside) keeps the clear.
-_wbs() { # <second-comments-json> -> evaluate state/reason
+_wbs() { # <second-comments-json> [history-json] -> evaluate state/reason
   (
     # Each read runs in a command substitution (a subshell), so the read
     # count lives in a file.
@@ -6442,18 +6456,28 @@ _wbs() { # <second-comments-json> -> evaluate state/reason
       if [ "$n" = 1 ]; then printf '%s' "$_wbs_first"; else printf '%s' "$_wbs_second"; fi
     }
     p4b_codex_summary_versions() { printf '[]\n'; }
-    p4b_comment_mention_history() { printf '[]\n'; }
+    p4b_comment_mention_history() { printf '%s\n' "$_wbs_history"; }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     _wbs_first="[$_WB_R,$(jq -nc '{id:800,user:{login:"coderabbitai[bot]"},body:"summary",created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:00:00Z"}')]"
     _wbs_second="$1"
+    _wbs_history="${2:-}"
+    [ -n "$_wbs_history" ] || _wbs_history='{"800":null}'
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r '"\(.state)/\(.reason)"'
     rm -f "$_wbs_count"
   )
 }
-[ "$(_wbs "[$_WB_R,$(jq -nc '{id:800,user:{login:"coderabbitai[bot]"},body:"summary edited",created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:09:00Z"}')]")" = clear/bound-request-answered ] \
+_wbs_cr800='{"id":800,"user":{"login":"coderabbitai[bot]"},"body":"summary","created_at":"2026-10-29T12:00:00Z","updated_at":"2026-10-29T12:00:00Z"}'
+[ "$(_wbs "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.body = "summary edited" | .updated_at = "2026-10-29T12:09:00Z"')]")" = clear/bound-request-answered ] \
   || bad="$bad [stability-coderabbit-edit-held]"
-[ "$(_wbs "[$_WB_R,$(jq -nc '{id:800,user:{login:"coderabbitai[bot]"},body:"summary",created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:00:00Z"}'),$(_wb_req 900 someone 2026-10-29T12:10:00Z)]")" = hold/requests-changed-during-evaluation ] \
+[ "$(_wbs "[$_WB_R,$_wbs_cr800,$(_wb_req 900 someone 2026-10-29T12:10:00Z)]")" = hold/requests-changed-during-evaluation ] \
   || bad="$bad [stability-new-request-missed]"
+# A new comment with no visible mention may have carried one it no longer
+# shows (posted with a mention, edited before the history read).
+[ "$(_wbs "[$_WB_R,$_wbs_cr800,$(_wb_req 901 someone 2026-10-29T12:10:00Z 'thanks')]")" = hold/requests-changed-during-evaluation ] \
+  || bad="$bad [stability-new-plain-comment-missed]"
+# A comment with a mention history that the first read did not contain.
+[ "$(_wbs "[$_WB_R,$_wbs_cr800]" '{"800":null,"902":"2026-10-29T12:10:00Z"}')" = hold/requests-changed-during-evaluation ] \
+  || bad="$bad [stability-historic-request-outside-snapshot]"
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens. The
