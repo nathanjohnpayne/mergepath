@@ -1179,8 +1179,12 @@ fi
 # general standing rather than blocking every PR it approves. Query modes are
 # exempt for the reason given above.
 if [ "$DEPENDABOT_LANE" != "true" ] && [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  # An `if`, not an `&&` chain: a chain whose last entry is filtered out ends
+  # the loop with status 1, which set -euo pipefail turns into a gate exit.
   DEPENDABOT_ONLY=$(read_dependabot_reviewer_identities "$POLICY_CONFIG" | while IFS= read -r _id; do
-    [ -n "$_id" ] && ! login_is_available_reviewer "$_id" "$POLICY_CONFIG" && printf '%s\n' "$_id"
+    if [ -n "$_id" ] && ! login_is_available_reviewer "$_id" "$POLICY_CONFIG"; then
+      printf '%s\n' "$_id"
+    fi
   done)
   if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
      && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then

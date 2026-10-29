@@ -726,6 +726,26 @@ else
   fail "#2874: expected rc=0 PASS; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# Test 5l (#2874, Codex P2 on #2877): an identity in BOTH lists keeps its
+# general standing. With it as the last (here only) entry, filtering it out
+# must not end the gate under set -e: the ordinary PR it approved passes.
+echo; echo "--- Test 5l (#2874): overlapping identity keeps general standing, gate survives"
+SCRATCH=$(make_scratch_dependabot_ids 'dependabot_reviewer_identities:
+  - nathanpayne-claude')
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-claude"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "#2874: an identity also in available_reviewers is filtered without ending the gate"
+else
+  fail "#2874: expected rc=0 PASS for an overlapping identity; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Test 6: External-review, gate disabled → exit 0.
 # ---------------------------------------------------------------------------
