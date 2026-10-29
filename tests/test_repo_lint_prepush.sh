@@ -64,7 +64,7 @@ unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 # Every runner control, so a suite run from inside the hook (check_repo_lint_prepush
 # under MERGEPATH_PREPUSH_LIVE=all, say) does not leak its opt-ins into the fixtures.
 unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
-  MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT \
+  MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS MERGEPATH_PREPUSH_LOCK_WAIT MERGEPATH_PREPUSH_LOCK_GRACE \
   MERGEPATH_PREPUSH_LOCK_TOOL GITHUB_OUTPUT 2>/dev/null || true
 unset MERGEPATH_PREPUSH_RETRY_FAILED 2>/dev/null || true
 # And every other MERGEPATH_PREPUSH_* control present, the per-repository
@@ -666,8 +666,8 @@ if grep -Eq '^repo-lint pre-push: running [0-9]+ checks \(jobs=1, nice=10, host 
 else
   bad "no host load beside jobs=: $out"
 fi
-if grep -Eq '^repo-lint pre-push: PASS \([0-9]+ checks in [0-9]+m[0-9]+s; host load ([0-9.]+|unknown) at start, ([0-9.]+|unknown) at end\)' <<<"$out"; then
-  ok "the verdict line reports the host load at start and end"
+if grep -Eq '^repo-lint pre-push: PASS \([0-9]+ checks in [0-9]+m[0-9]+s; host load ([0-9.]+|unknown) at start, ([0-9.]+|unknown) at end; queued [0-9]+s for the machine lock\)' <<<"$out"; then
+  ok "the verdict line reports the host load at start and end, and the queue time"
 else
   bad "no host load in the verdict: $out"
 fi
@@ -1090,6 +1090,7 @@ LOCK_DIR="$XDG_CACHE_HOME/mergepath"
 LOCK_FILE="$LOCK_DIR/prepush.lock"
 lock_field() { { sed -n "s/^$1=//p" "$LOCK_FILE" 2>/dev/null || true; } | head -n 1; }
 peak_concurrency() { sort -n "$PROBE_DIR/concurrency" | tail -n 1; }
+ran_set_lock() { for c in check_env check_flag check_graphed check_ok; do [ ! -f "$PROBE_DIR/ran.$c" ] || printf '%s ' "$c"; done; }
 # A helper process that is not a job of this shell, so killing it later
 # prints no termination notice. Prints its pid.
 detach() { ( "$@" >/dev/null 2>&1 & printf '%s\n' "$!" ); }
@@ -1109,7 +1110,7 @@ wait_for_lock_field() {  # $1 = field, $2 = glob it must match; up to 60 s
 check "a finished run leaves an empty lock record" "$(cat "$LOCK_FILE" 2>/dev/null)" ""
 if [ -f "$LOCK_FILE" ]; then ok "the lock file itself survives a release"; else bad "the lock file was removed on release"; fi
 help_out=$(bash "$RUNNER" --help)
-for want in MERGEPATH_PREPUSH_LOCK_WAIT MERGEPATH_PREPUSH_LOCK_TOOL 'load average' 'take turns' 'fcntl'; do
+for want in MERGEPATH_PREPUSH_LOCK_GRACE MERGEPATH_PREPUSH_LOCK_TOOL 'load average' 'take turns' 'fcntl' 'Contended means deferred'; do
   case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
 done
 
@@ -1135,6 +1136,8 @@ check "the first push passes" "$rc_a" "0"
 check "a second push waits for the running hook, then succeeds" "$rc_b" "0"
 case "$out" in *"waiting for the run of feat/lock-a (pid $holder_pid, started "[0-9][0-9]:[0-9][0-9]" UTC, "*) ok "the waiter names the holder's branch, pid and start time" ;; *) bad "waiter output: $out" ;; esac
 case "$out" in *" UTC, "[0-9]*" of 3 checks)"*|*" UTC, preparing)"*) ok "the waiter reports the holder's progress" ;; *) bad "waiter progress: $out" ;; esac
+case "$out" in *"; queued "[1-9]*"s for the machine lock"*) ok "a waiter within the grace reports its queue time and holds the lock" ;; *) bad "waiter queue time: $out" ;; esac
+case "$out" in *CONTENDED*) bad "a waiter within the grace ran contended: $out" ;; *) ok "a waiter within the grace does not run contended" ;; esac
 check "both tips reached the remote" "$(remote_tip feat/lock-a) $(remote_tip feat/lock-b)" "$(git -C "$FIX" rev-parse feat/lock-a) $(git -C "$FIX" rev-parse feat/lock-b)"
 check "the two runs' checks never overlapped" "$(peak_concurrency)" "1"
 check "the waiter's checks all ran after the holder's" "$(sed -n '1,3p' "$PROBE_DIR/start-order" | sort | tr '\n' ' ')" "check_env check_flag check_ok "
@@ -1190,29 +1193,108 @@ fix_phys=$(cd "$FIX" && pwd -P)
 sup=$(pgrep -o -f -- "--committed-snapshot --timings-root $fix_phys " || true)
 if [ -n "$sup" ]; then ok "the holder's supervisor is running a check"; else bad "no supervisor found to kill"; fi
 [ -z "$sup" ] || kill "$sup" 2>/dev/null || true
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
+# A grace past the hang keeps this waiter waiting (#2878), so it tests the lock.
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=600 MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
 wait "$A_PID" 2>/dev/null || true
 check "a push after a killed supervisor still succeeds" "$rc" "0"
 hung=$(hung_marker || true)
 if [ -n "$hung" ] && [ -f "$PROBE_DIR/unhung.$hung" ]; then ok "the killed supervisor's surviving check finished before the next push did"; else bad "the next push finished while the killed supervisor's $hung check was still running"; fi
 
-# The wait is bounded: a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up
-# nonzero, says so, pushes nothing, and leaves the holder undisturbed.
+# Contended means deferred (#2878). A fake holder keeps the machine lock for
+# five minutes, the way another session's full run would. A push that still
+# finds it held after the grace does not queue: it runs only the live
+# assertions, one at a time, names the wrapper its change selects as
+# DEFERRED TO CI, reports its queue time, pushes, and leaves the holder and
+# its record alone. A mutant that goes back to waiting is still waiting long
+# after the real runner has passed, so the timing assertions discriminate.
+HOLDER_READY="$TMP/holder.ready"
+start_fake_holder() {  # prints the pid of a process holding the machine lock
+  local pid i=0
+  rm -f "$HOLDER_READY"
+  # shellcheck disable=SC2016 # argv for python, not shell expansions
+  pid=$(detach python3 -I -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(300)' "$LOCK_FILE" "$HOLDER_READY")
+  until [ -f "$HOLDER_READY" ] || [ "$i" -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+  printf 'branch=feat/busy\npid=%s\nstarted=00:00 UTC\nprogress=3 of 41\n' "$pid" > "$LOCK_FILE"
+  printf '%s\n' "$pid"
+}
+# Runs the hook directly on feat/contended with a 2-second grace, in the
+# background, for at most $3 seconds. Prints the exit status, or `waiting`
+# when it was still running at the deadline (it is then killed).
+contended_run() {  # $1 = runner, $2 = label, $3 = deadline in seconds
+  local sha pid i=0 rc=0
+  sha=$(git -C "$FIX" rev-parse feat/contended)
+  (cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=2 MERGEPATH_PREPUSH_LOCK_TOOL=python3 bash "$1" --hook origin \
+    <<<"refs/heads/feat/contended $sha refs/heads/feat/contended $ZERO") > "$TMP/contended-$2.out" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt $(($3 * 10)) ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    printf 'waiting\n'
+    return 0
+  fi
+  wait "$pid" || rc=$?
+  printf '%s\n' "$rc"
+}
+CONT_REC="$XDG_CACHE_HOME/mergepath/prepush-results/feat_contended.tsv"
+HOLDER=$(start_fake_holder)
+holder_record=$(cat "$LOCK_FILE")
 reset_probe; slow_all
-git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m hold
-git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m late
-(cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a2.out" 2>&1 &
-A_PID=$!
-wait_for_lock_field branch feat/lock-a || bad "the second holder never recorded itself"
-before_b=$(remote_tip feat/lock-b)
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_WAIT=2 git push origin feat/lock-b 2>&1) || rc=$?
-if [ "$rc" -ne 0 ]; then ok "a waiter past MERGEPATH_PREPUSH_LOCK_WAIT gives up nonzero (exit $rc)"; else bad "the waiter did not give up"; fi
-case "$out" in *"gave up after "*" s waiting for the run of feat/lock-a (pid "*"MERGEPATH_PREPUSH_LOCK_WAIT"*) ok "the give-up message names the holder and the bound" ;; *) bad "give-up output: $out" ;; esac
-check "the push that gave up did not reach the remote" "$(remote_tip feat/lock-b)" "$before_b"
-rc_a=0; wait "$A_PID" || rc_a=$?
-check "the holder is undisturbed by a waiter that gave up" "$rc_a" "0"
-check "the undisturbed holder's tip reached the remote" "$(remote_tip feat/lock-a)" "$(git -C "$FIX" rev-parse feat/lock-a)"
-check "a waiter that gave up ran no check" "$(peak_concurrency)" "1"
+commit_change feat/contended other/contended.txt
+t_start=$(date +%s)
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=2 git push origin feat/contended 2>&1) || rc=$?
+t_took=$(( $(date +%s) - t_start ))
+check "contended: the push passes while another run holds the lock" "$rc" "0"
+check "contended: the tip reached the remote" "$(remote_tip feat/contended)" "$(git -C "$FIX" rev-parse feat/contended)"
+if [ "$t_took" -lt 60 ]; then ok "contended: the push did not queue behind the holder (${t_took}s)"; else bad "contended: the push took ${t_took}s"; fi
+case "$out" in *"CONTENDED: the run of feat/busy (pid $HOLDER, started 00:00 UTC, 3 of 41 checks) still holds the machine lock after "*" s (MERGEPATH_PREPUSH_LOCK_GRACE=2)"*) ok "contended: the holder and the grace are named" ;; *) bad "contended holder output: $out" ;; esac
+check "contended: every live assertion ran, the selected wrapper did not" "$(ran_set_lock)" "check_env check_flag check_ok "
+case "$out" in *"CONTENDED: 1 checks are DEFERRED TO CI because the run of feat/busy"*"    check_graphed"*) ok "contended: the deferred wrapper is named" ;; *) bad "contended deferral output: $out" ;; esac
+case "$out" in *"running 3 checks ("*"; queued "*"s for the machine lock, then ran contended beside the run of feat/busy"*) ok "contended: the running line shows the queue time" ;; *) bad "contended running line: $out" ;; esac
+case "$out" in *"PASS with checks DEFERRED TO CI ("*"queued "*"s for the machine lock, then ran contended"*"deferred: 1 by contention for the machine lock, named above)"*) ok "contended: the verdict line names the deferral and the queue time" ;; *) bad "contended verdict: $out" ;; esac
+case "$out" in *"concurrency pinned to 1 by contention"*) ok "contended: the concurrency is pinned to 1" ;; *) bad "contended concurrency: $out" ;; esac
+check "contended: its checks ran one at a time" "$(peak_concurrency)" "1"
+check "contended: the holder's record is untouched" "$(cat "$LOCK_FILE")" "$holder_record"
+if kill -0 "$HOLDER" 2>/dev/null; then ok "contended: the holder is undisturbed"; else bad "contended: the holder is gone"; fi
+check "contended: the retry record holds the deferred wrapper as not passed" \
+  "$(awk -F'\t' '$1 == "step" && $4 == "check_graphed" { print $3 }' "$CONT_REC" 2>/dev/null)" "none"
+# A failing live assertion still blocks a contended push.
+reset_probe; touch "$PROBE_DIR/FLAG"
+git -C "$FIX" commit -q --allow-empty -m contended-fail
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=2 git push origin feat/contended 2>&1) || rc=$?
+check "contended: a failing live assertion still blocks the push" "$rc" "1"
+case "$out" in *"this run also DEFERRED checks TO CI (1 by contention for the machine lock, named above)"*) ok "contended: a blocked push still names its deferral" ;; *) bad "contended failure output: $out" ;; esac
+rm -f "$PROBE_DIR/FLAG"
+# The same contended run through the python3 fcntl path, then a mutant that
+# keeps waiting instead of deferring.
+git -C "$FIX" commit -q --allow-empty -m contended-direct
+reset_probe
+rc=$(contended_run "$FIX/scripts/repo-lint-prepush.sh" real 45)
+check "contended (python3 lock): the run passes before the deadline" "$rc" "0"
+CMUTANT="$TMP/mutant-wait/repo-lint-prepush.sh"
+mkdir -p "$TMP/mutant-wait"
+python3 - "$RUNNER" "$CMUTANT" <<'PY2'
+import sys
+src = open(sys.argv[1]).read()
+old = '    if [ $((now - t0)) -ge "$grace" ]; then\n      LOCK_QUEUED=$((now - t0))\n'
+new = '    if false; then\n      LOCK_QUEUED=$((now - t0))\n'
+assert src.count(old) == 1
+open(sys.argv[2], 'w').write(src.replace(old, new, 1))
+PY2
+reset_probe
+rc=$(contended_run "$CMUTANT" mutant 20)
+if ! cmp -s "$CMUTANT" "$RUNNER" && [ "$rc" = waiting ] && [ -z "$(ran_set_lock)" ]; then
+  ok "mutation: a runner that keeps waiting is still queued after 20 s with no check run, so the assertions above discriminate"
+else
+  bad "mutation: expected the waiting mutant to be still queued (got '$rc', ran: $(ran_set_lock))"
+fi
+kill "$HOLDER" 2>/dev/null || true
+i=0; while kill -0 "$HOLDER" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+: > "$LOCK_FILE"
 
 # A killed run leaves its record behind; the kernel has already dropped its
 # flock. The next run says whose record it found and proceeds.
@@ -1307,6 +1389,34 @@ git -C "$FIX" commit -q --allow-empty -m inspection-works
 rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
 check "the next push with working inspection succeeds" "$rc" "0"
 case "$out" in *"retired stale snapshot "*"/prepush-$MAIN12.stale1 (left by an interrupted run)"*) ok "the same snapshot is retired once liveness can be established" ;; *) bad "post-inspection output: $out" ;; esac
+# The snapshot guard (#2878). A contended run works in its own snapshot
+# without the lock, holding prepush-snapshots.lock shared; a lock holder that
+# finds it held retires nothing that time, so a live contended snapshot is
+# never removed. A fake contended run holds the guard here; once it ends,
+# the next push retires the same stale snapshot.
+GUARD_READY="$TMP/guard.ready"
+rm -f "$GUARD_READY"
+# shellcheck disable=SC2016 # argv for python, not shell expansions
+GUARD=$(detach python3 -I -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_SH)
+open(sys.argv[2], "w").close()
+time.sleep(300)' "$LOCK_DIR/prepush-snapshots.lock" "$GUARD_READY")
+i=0; until [ -f "$GUARD_READY" ] || [ "$i" -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+git -C "$FIX" worktree add -q --detach "$SNAPS/prepush-$MAIN12.guard0" main
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m guard-held
+rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
+check "snapshot guard held: the push still succeeds" "$rc" "0"
+case "$out" in *"leaving any stale snapshots for a later run: a contended run on this machine is working in its own snapshot"*) ok "snapshot guard held: the holder retires nothing and says why" ;; *) bad "guard-held output: $out" ;; esac
+if [ -d "$SNAPS/prepush-$MAIN12.guard0" ]; then ok "snapshot guard held: the snapshot survives"; else bad "snapshot guard held: the snapshot was removed"; fi
+kill "$GUARD" 2>/dev/null || true
+i=0; while kill -0 "$GUARD" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+reset_probe
+git -C "$FIX" commit -q --allow-empty -m guard-free
+rc=0; out=$(cd "$FIX" && git push origin feat/snapshots 2>&1) || rc=$?
+check "snapshot guard free: the push succeeds" "$rc" "0"
+case "$out" in *"retired stale snapshot "*"/prepush-$MAIN12.guard0 (left by an interrupted run)"*) ok "snapshot guard free: the same snapshot is retired" ;; *) bad "guard-free output: $out" ;; esac
 git -C "$FIX" worktree remove --force "$SNAPS/prepush-$MAIN12.busy00" 2>/dev/null || true
 git -C "$FIX" worktree remove --force "$SNAPS/prepush-000000000000.wrong0" 2>/dev/null || true
 

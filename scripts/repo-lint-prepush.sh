@@ -90,8 +90,11 @@
 #   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
 #                               and markdown-it-py for the deep lane)
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
-#   MERGEPATH_PREPUSH_LOCK_WAIT=S  wait up to S seconds for another hook run
-#                               on this machine to finish (default 3600)
+#   MERGEPATH_PREPUSH_LOCK_GRACE=S  wait up to S seconds for another hook run
+#                               on this machine to finish before running
+#                               contended (default 60; below). The older name
+#                               MERGEPATH_PREPUSH_LOCK_WAIT is read when this
+#                               one is unset
 #   MERGEPATH_PREPUSH_LOCK_TOOL=T  take the lock with flock(1) or python3's
 #                               fcntl (default: flock(1) if present, else python3)
 #   MERGEPATH_PREPUSH_RETRY_FAILED=1  --retry-failed, from git push
@@ -102,9 +105,14 @@
 # flock(2) on ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush.lock (through
 # flock(1), or python3's fcntl where that is absent) from before its first
 # snapshot until its last check, a second push waits for it, naming the
-# holder's branch, pid, start time and progress every 30 s, and gives up
-# after the bound above; a snapshot left by a killed run is retired under
-# that lock. A host with neither tool fails closed (exit 2).
+# holder's branch, pid, start time and progress every 30 s; a snapshot left
+# by a killed run is retired under that lock. A host with neither tool fails
+# closed (exit 2).
+# Contended means deferred (#2878): a push still waiting after the grace
+# above does not queue behind the holder's whole run. It runs only the live
+# assertions, one at a time and without the lock, names every other step it
+# would have run as DEFERRED TO CI (contention), and pushes; CI's lint runs
+# them. The time spent waiting is printed on the running and summary lines.
 # Retry (#2843): every hook run records each selected check's result for the
 # pushed branch in ${XDG_CACHE_HOME:-$HOME/.cache}/mergepath/prepush-results/,
 # with the pushed commit and a fingerprint of the selection. After a failed
@@ -168,10 +176,10 @@
 #                      any check once N minutes have passed; running checks
 #                      finish, the unstarted ones are deferred to CI, and the
 #                      run exits 0 unless a check failed (a failed check
-#                      blocks the push, budget or not). The wait for another
-#                      run's lock is not counted (MERGEPATH_PREPUSH_LOCK_WAIT
-#                      bounds it). A later --retry-failed runs what was not
-#                      started.
+#                      blocks the push, budget or not). The time this push
+#                      waited for another run's lock counts against the N
+#                      minutes (#2878; the grace above bounds it). A later
+#                      --retry-failed runs what was not started.
 
 set -euo pipefail
 
@@ -245,17 +253,33 @@ fi
 # lock file carries the holder's branch, pid, start time and progress,
 # refreshed per completed check, so a waiter's message is specific; the file
 # is rewritten in place and never replaced or removed, because the lock lives
-# on its inode. A waiter polls every second, speaks every 30 s and gives up
-# after MERGEPATH_PREPUSH_LOCK_WAIT seconds (default 3600) rather than run
-# concurrently. Manual runs (--paths-from, HEAD vs merge-base, --plan) do not
-# lock: only the hook runs checks on a shared machine unattended.
+# on its inode. A waiter polls every second and speaks every 30 s. Manual
+# runs (--paths-from, HEAD vs merge-base, --plan) do not lock: only the hook
+# runs checks on a shared machine unattended.
+#
+# Contended means deferred (#2878). Waiting out another session's whole run
+# (22 minutes on 2026-10-29) bought almost nothing, since CI runs every check
+# anyway. A waiter that still finds the lock held after
+# MERGEPATH_PREPUSH_LOCK_GRACE seconds (default 60) stops waiting and runs
+# contended: without the lock, only the live assertions, pinned to one at a
+# time, with every other step it would have run named as deferred to CI. The
+# load a contended run adds is therefore one nice'd live assertion at a time,
+# never a second full run. It writes nothing to the holder's record. Its
+# snapshot is protected from the next holder's stale-snapshot retirement by a
+# shared flock(2) on prepush-snapshots.lock (fd 8), held from before the
+# snapshot exists until after it is removed and inherited by every check;
+# retirement takes that lock exclusively without waiting and, when a
+# contended run holds it, retires nothing that time and says so.
 LOCK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 LOCK_FILE="$LOCK_DIR/prepush.lock"
+SNAP_GUARD_FILE="$LOCK_DIR/prepush-snapshots.lock"
 LOCK_HELD=0       # 1 while this process holds the lock
 LOCK_FLOCK=''     # flock(1) path, when present
 LOCK_PY=''        # python3 with fcntl, when flock(1) is absent
 LOCK_RECORD=''    # the record this run refreshes: the holder's, or via --lock-record
 LOCK_START=''
+LOCK_QUEUED=0     # seconds this push waited for the lock (#2878)
+LOCK_CONTENDED='' # the holder's description when this run gave up waiting (#2878)
 
 lock_field() {   # $1 field; empty when the record is absent (first run on a machine)
   [ -f "$LOCK_FILE" ] || return 0
@@ -317,30 +341,52 @@ lock_tooling() {
   die "the machine-wide hook lock needs flock(1) or a python3 with fcntl; neither is available"
 }
 
-lock_try() {   # non-blocking exclusive flock(2) on fd 9; the lock stays with the fd
+lock_fd() {   # $1 fd, $2 ex|sh, $3 nb|wait: flock(2) on an open fd; the lock stays with the fd
+  local args=(-x)
   if [ -n "$LOCK_FLOCK" ]; then
-    "$LOCK_FLOCK" -n 9
+    [ "$2" != sh ] || args=(-s)
+    [ "$3" != nb ] || args+=(-n)
+    "$LOCK_FLOCK" "${args[@]}" "$1"
   else
     "$LOCK_PY" -I -c 'import fcntl, sys
+op = fcntl.LOCK_SH if sys.argv[2] == "sh" else fcntl.LOCK_EX
+if sys.argv[3] == "nb":
+    op |= fcntl.LOCK_NB
 try:
-    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(int(sys.argv[1]), op)
 except OSError:
-    sys.exit(1)'
+    sys.exit(1)' "$1" "$2" "$3"
   fi
 }
+lock_try() { lock_fd 9 ex nb; }   # non-blocking exclusive flock(2) on fd 9
 
+# Sets LOCK_HELD, or LOCK_CONTENDED once the grace runs out (#2878); either
+# way LOCK_QUEUED is the seconds spent waiting.
 prepush_lock_acquire() {   # $1 = the pushed branch this run checks
-  local bound="${MERGEPATH_PREPUSH_LOCK_WAIT:-3600}" t0 now last pid
-  case "$bound" in ''|*[!0-9]*) die "MERGEPATH_PREPUSH_LOCK_WAIT must be a whole number of seconds (got '$bound')" ;; esac
+  local grace_var=MERGEPATH_PREPUSH_LOCK_GRACE grace t0 now last pid
+  if [ -n "${MERGEPATH_PREPUSH_LOCK_GRACE:-}" ]; then
+    grace=$MERGEPATH_PREPUSH_LOCK_GRACE
+  elif [ -n "${MERGEPATH_PREPUSH_LOCK_WAIT:-}" ]; then
+    grace=$MERGEPATH_PREPUSH_LOCK_WAIT; grace_var=MERGEPATH_PREPUSH_LOCK_WAIT
+  else
+    grace=60
+  fi
+  case "$grace" in ''|*[!0-9]*) die "$grace_var must be a whole number of seconds (got '$grace')" ;; esac
+  [ "${#grace}" -le 9 ] || die "$grace_var must be a whole number of seconds (got '$grace')"
+  grace=$((10#$grace))
   mkdir -p "$LOCK_DIR" 2>/dev/null || die "cannot create $LOCK_DIR for the machine-wide hook lock"
   lock_tooling
   exec 9>>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
   t0=$(date +%s); last=$((t0 - 30))
   until lock_try; do
     now=$(date +%s)
-    if [ $((now - t0)) -ge "$bound" ]; then
-      echo "$PREFIX: gave up after $((now - t0)) s waiting for $(holder_description); MERGEPATH_PREPUSH_LOCK_WAIT=<seconds> waits longer, MERGEPATH_PREPUSH_SKIP=1 or --no-verify bypasses" >&2
-      exit 2
+    if [ $((now - t0)) -ge "$grace" ]; then
+      LOCK_QUEUED=$((now - t0))
+      LOCK_CONTENDED=$(holder_description)
+      exec 9>&-
+      echo "$PREFIX: CONTENDED: $LOCK_CONTENDED still holds the machine lock after ${LOCK_QUEUED} s ($grace_var=$grace); not queueing behind it: this push runs only the live assertions, one at a time, and defers every other selected step to CI"
+      prepush_snapshot_guard_share
+      return 0
     fi
     if [ $((now - last)) -ge 30 ]; then
       echo "$PREFIX: waiting for $(holder_description)"
@@ -348,6 +394,7 @@ prepush_lock_acquire() {   # $1 = the pushed branch this run checks
     fi
     sleep 1
   done
+  LOCK_QUEUED=$(( $(date +%s) - t0 ))
   # Held. A clean release leaves an empty record, so a record naming a dead
   # holder here means that run was killed and the kernel freed its lock.
   LOCK_HELD=1
@@ -358,6 +405,25 @@ prepush_lock_acquire() {   # $1 = the pushed branch this run checks
   LOCK_START="$(date -u +%H:%M) UTC"
   LOCK_RECORD="$LOCK_FILE"
   lock_write_record "$1" "$$" "$LOCK_START" preparing
+}
+
+# The snapshot guard (#2878): a contended run holds it shared on fd 8 for its
+# lifetime (its checks inherit the fd, so a killed supervisor's surviving
+# checks keep it too); the lock holder takes it exclusively, without waiting,
+# only to retire stale snapshots, and releases it straight after.
+prepush_snapshot_guard_share() {
+  exec 8>>"$SNAP_GUARD_FILE" || die "cannot open $SNAP_GUARD_FILE"
+  # Waits only for a holder's retirement pass, which takes seconds at most.
+  lock_fd 8 sh wait || die "cannot take the shared snapshot guard $SNAP_GUARD_FILE"
+}
+prepush_retire_guarded() {   # $1 = the snapshots directory; called under the lock
+  exec 8>>"$SNAP_GUARD_FILE" || die "cannot open $SNAP_GUARD_FILE"
+  if lock_fd 8 ex nb; then
+    retire_stale_snapshots "$1"
+  else
+    echo "$PREFIX: leaving any stale snapshots for a later run: a contended run on this machine is working in its own snapshot"
+  fi
+  exec 8>&-
 }
 
 # Invoked indirectly by the hook's EXIT trap.
@@ -724,6 +790,8 @@ while [ "$#" -gt 0 ]; do
     --committed-snapshot) SNAPSHOT=1; shift ;;
     --timings-root) [ "$#" -ge 2 ] || die "--timings-root needs a path"; TIMINGS_ROOT="$2"; shift 2 ;;
     --lock-record) [ "$#" -ge 2 ] || die "--lock-record needs a path"; LOCK_RECORD="$2"; shift 2 ;;
+    --lock-queued) [ "$#" -ge 2 ] || die "--lock-queued needs seconds"; LOCK_QUEUED="$2"; shift 2 ;;
+    --contended) [ "$#" -ge 2 ] || die "--contended needs the holder"; LOCK_CONTENDED="$2"; shift 2 ;;
     --base) [ "$#" -ge 2 ] || die "--base needs a ref"; BASE_REF="$2"; shift 2 ;;
     --paths-from) [ "$#" -ge 2 ] || die "--paths-from needs a file or -"; MODE=paths; PATHS_FROM="$2"; shift 2 ;;
     --plan) PLAN=1; shift ;;
@@ -748,6 +816,8 @@ if [ -n "$JOBS" ]; then
   JOBS=$((10#$JOBS))
 fi
 case "$RETRY" in 1|true) RETRY=1 ;; *) RETRY=0 ;; esac
+case "$LOCK_QUEUED" in ''|*[!0-9]*) die "--lock-queued must be a whole number of seconds (got '$LOCK_QUEUED')" ;; esac
+LOCK_QUEUED=$((10#$LOCK_QUEUED))
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
 cd "$ROOT"
@@ -786,11 +856,19 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
   trap 'exit 143' TERM
   # One hook run per machine (#2581): the lock covers everything from the
   # first snapshot to the last check. A push with no branch update needs none.
+  # A push that gives up waiting (#2878) runs contended: no lock, no
+  # retirement, no write to the holder's record.
   lock_branch=$(printf '%s\n' "$records" \
     | awk '$2 != "0000000000000000000000000000000000000000" && $3 ~ /^refs\/heads\// { sub("refs/heads/", "", $3); print $3; exit }')
   if [ -n "$lock_branch" ]; then
     prepush_lock_acquire "$lock_branch"
-    retire_stale_snapshots "$snapshots"
+    [ "$LOCK_HELD" -ne 1 ] || prepush_retire_guarded "$snapshots"
+  fi
+  inner_args=(--lock-queued "$LOCK_QUEUED")
+  if [ "$LOCK_HELD" -eq 1 ]; then
+    inner_args+=(--lock-record "$LOCK_FILE")
+  elif [ -n "$LOCK_CONTENDED" ]; then
+    inner_args+=(--contended "$LOCK_CONTENDED")
   fi
   saw=0
   while read -r local_ref local_sha remote_ref remote_sha; do
@@ -802,7 +880,7 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
     git -c core.hooksPath=/dev/null worktree add --quiet --detach "$snapshot" "$local_sha"
     [ "$(git -C "$snapshot" rev-parse HEAD)" = "$local_sha" ] || die "snapshot tip mismatch"
     echo "$PREFIX: checking committed tree $local_sha (${remote_ref#refs/heads/})"
-    lock_write_record "${remote_ref#refs/heads/}" "$$" "$LOCK_START" preparing
+    [ "$LOCK_HELD" -ne 1 ] || lock_write_record "${remote_ref#refs/heads/}" "$$" "$LOCK_START" preparing
     (
       # Git's hook-local repository/index variables must not redirect the
       # detached tree or any test-created fixture back into the push checkout.
@@ -812,8 +890,10 @@ if [ "$MODE" = hook ] && [ "$PLAN" -eq 0 ] && [ "$SNAPSHOT" -eq 0 ]; then
       # The inner run and every check it starts inherit fd 9, and a flock(2)
       # lives as long as any descriptor of it is open: if this supervisor is
       # killed mid-run, the checks it already started keep the machine-wide
-      # lock until they end, so a waiting push cannot overlap them.
-      bash "$SELF" --committed-snapshot --timings-root "$ROOT" --lock-record "$LOCK_FILE" "${ORIGINAL_ARGS[@]}" \
+      # lock until they end, so a waiting push cannot overlap them. A
+      # contended run's checks inherit the shared snapshot guard on fd 8 the
+      # same way.
+      bash "$SELF" --committed-snapshot --timings-root "$ROOT" "${inner_args[@]}" "${ORIGINAL_ARGS[@]}" \
         <<<"$local_ref $local_sha $remote_ref $remote_sha"
     )
     git worktree remove --force "$snapshot"
@@ -868,6 +948,11 @@ prepush_default_jobs "$(policy_value jobs_max)" "$(policy_value load_per_cpu_thr
 # actual number): the pinned value, else jobs_max.
 JOBS_CAP="$JOBS"
 [ -n "$JOBS_SRC" ] || JOBS_CAP=$(policy_value jobs_max)
+# A contended run (#2878) shares the machine with the lock holder's run, so
+# it runs one check at a time whatever the policy or a pin says.
+if [ -n "$LOCK_CONTENDED" ]; then
+  JOBS=1; JOBS_CAP=1; JOBS_SRC='contention (another hook run holds the machine lock, #2878)'
+fi
 
 ZERO=0000000000000000000000000000000000000000
 
@@ -1357,6 +1442,7 @@ while IFS= read -r step; do
   id=$((id + 1))
   sid=$(printf '%03d' "$id")
   jq -r '.name' <<<"$step" > "$RUN_DIR/steps/$sid.name"
+  jq -r '.lane' <<<"$step" > "$RUN_DIR/steps/$sid.lane"
   jq -r '.run' <<<"$step" > "$RUN_DIR/steps/$sid.sh"
   jq -r '.env[]' <<<"$step" > "$RUN_DIR/steps/$sid.env"
   name=$(cat "$RUN_DIR/steps/$sid.name")
@@ -1502,13 +1588,48 @@ retry_write() {
   return 1
 }
 
+# ── contended (#2878): only the live assertions run here ──
+# The push gave up waiting for another hook run's lock, so it runs beside
+# that run: every step outside the live lane (selected, fallback and
+# unselected wrappers, deep-lane steps) is named as deferred to CI and not
+# started. The retry record holds them as `none`, so a later --retry-failed
+# runs them. Under mode=selected that is every step.
+CONTENDED_N=0
+: > "$RUN_DIR/contended"
+if [ -n "$LOCK_CONTENDED" ]; then
+  : > "$RUN_DIR/order.contended"
+  while IFS=$'\t' read -r prev sid; do
+    [ -n "$sid" ] || continue
+    if [ "$(cat "$RUN_DIR/steps/$sid.lane")" = live ]; then
+      printf '%s\t%s\n' "$prev" "$sid" >> "$RUN_DIR/order.contended"
+    else
+      printf '%s\n' "$sid" >> "$RUN_DIR/contended"
+    fi
+  done < "$RUN_DIR/order"
+  mv "$RUN_DIR/order.contended" "$RUN_DIR/order"
+  CONTENDED_N=$(wc -l < "$RUN_DIR/contended" | tr -d ' ')
+fi
+# Queue time (#2878), on the running line and the verdict line of every hook run.
+QUEUE_NOTE=''
+if [ -n "$LOCK_CONTENDED" ]; then
+  QUEUE_NOTE="queued ${LOCK_QUEUED}s for the machine lock, then ran contended beside $LOCK_CONTENDED"
+elif [ "$MODE" = hook ] && [ "$SNAPSHOT" -eq 1 ]; then
+  QUEUE_NOTE="queued ${LOCK_QUEUED}s for the machine lock"
+fi
+
 # The load that sized the starting concurrency (#2575, #2581) is the one
 # printed here; the run re-reads it before each check (#2842, sched_resize)
 # and the verdict line reads it once more at the end.
 LOAD_START="$LOAD_1"
 BUDGET_MIN=$(policy_value max_minutes)
 BUDGET_S=$((BUDGET_MIN * 60))
-echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")"
+echo "$PREFIX: running $(wc -l < "$RUN_DIR/order" | tr -d ' ') checks (jobs=$JOBS, nice=$NICE, host load $LOAD_START on $CPU_N CPUs$([ "$BUDGET_S" -gt 0 ] && echo ", budget ${BUDGET_MIN}m")): $LIVE_RUN_N live assertions, $SEL_N selected wrappers$([ "$ALL_LIVE" -eq 1 ] && echo ", $FB_N fallback wrappers, $UNSEL_N unselected wrappers")$([ "$DEEP" -eq 1 ] && echo ", $DEEP_N deep-lane steps")$([ "$DEEP" -eq 1 ] && [ "$ALL_LIVE" -eq 1 ] && echo ", $DEEPFB_N fallback deep-lane steps")${QUEUE_NOTE:+; $QUEUE_NOTE}"
+if [ "$CONTENDED_N" -gt 0 ]; then
+  echo "$PREFIX: CONTENDED: $CONTENDED_N checks are DEFERRED TO CI because $LOCK_CONTENDED holds the machine lock (CI's lint runs them; MERGEPATH_PREPUSH_LOCK_GRACE=<seconds> waits longer):"
+  while IFS= read -r sid; do
+    [ -n "$sid" ] && echo "    $(cat "$RUN_DIR/steps/$sid.name")"
+  done < "$RUN_DIR/contended"
+fi
 if [ -n "$JOBS_SRC" ]; then
   echo "$PREFIX: concurrency pinned to $JOBS by $JOBS_SRC; it is not re-sized from the host load during the run"
 else
@@ -1535,8 +1656,9 @@ fi
 # (0 = none) a step whose previous duration would carry the run past the
 # budget, and every step once the budget is spent, is not started; it is
 # named as deferred to CI. Steps already running always finish, and a failed
-# step still blocks the push. The budget counts from the first check; the
-# wait for another run's lock is bounded on its own (MERGEPATH_PREPUSH_LOCK_WAIT).
+# step still blocks the push. The budget counts from the first check plus
+# the time the push waited for another run's lock (#2878), which the grace
+# (MERGEPATH_PREPUSH_LOCK_GRACE) bounds.
 # xargs stays the process that runs the workers, so an interrupt reaches
 # every check the way it always has.
 #
@@ -1596,7 +1718,7 @@ sched_feed() {
     # The timing cache is advisory: a value it cannot vouch for predicts nothing.
     case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
     if [ "$BUDGET_S" -gt 0 ]; then
-      el=$(( $(date +%s) - T0 ))
+      el=$(( $(date +%s) - T0 + LOCK_QUEUED ))
       if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then
         printf '%s\t%s\n' "$sid" "$prev" >> "$RUN_DIR/deferred"
         continue
@@ -1644,6 +1766,9 @@ if [ -n "$DEFER_REASON" ] && [ "$ALL_LIVE" -ne 1 ]; then
   [ "$DEEP" -ne 1 ] || d_n=$((d_n + DEEPFB_N))
   [ "$d_n" -eq 0 ] || DEFERRED_SUMMARY="$d_n by full_suite=defer"
 fi
+if [ "$CONTENDED_N" -gt 0 ]; then
+  DEFERRED_SUMMARY="${DEFERRED_SUMMARY:+$DEFERRED_SUMMARY, }$CONTENDED_N by contention for the machine lock"
+fi
 if [ "$BUDGET_N" -gt 0 ]; then
   echo "$PREFIX: max_minutes=$BUDGET_MIN (from $(policy_source max_minutes)): $BUDGET_N checks were not started within the budget and are deferred to CI (CI's lint runs them):"
   while IFS=$'\t' read -r sid _; do
@@ -1669,7 +1794,7 @@ if mkdir -p "$(dirname "$TIMINGS")" 2>/dev/null; then
 fi
 
 mins=$((ELAPSED / 60)); secs=$((ELAPSED % 60))
-LOAD_NOTE="host load $LOAD_START at start, $(host_load) at end"
+LOAD_NOTE="host load $LOAD_START at start, $(host_load) at end${QUEUE_NOTE:+; $QUEUE_NOTE}"
 if [ "$failed" -eq 0 ]; then
   if [ "${MERGEPATH_PREPUSH_KEEP_LOGS:-0}" = "1" ]; then
     echo "$PREFIX: logs kept in $RUN_DIR"
