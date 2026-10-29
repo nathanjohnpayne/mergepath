@@ -6244,6 +6244,124 @@ else
   fail "#1085: Phase 4a timeout handoff routing wrong:$bad"
 fi
 
+# #2771: a wave audit binds the barrier's Codex arm to the request it created
+# (phase-4b-review.sh --wave-codex-request). The arm clears only on the answer
+# to that request: a Completed "Manual request" Review Summary run on exactly
+# this head, timed after the request, with no foreign trigger after it. The
+# four review rounds on #2859/#2868 each named a window in which an unsolicited
+# App review cleared the unbound arm ahead of the audit's own request; each is
+# a row below, and each guard is mutation-checked against the window it
+# closes.
+bad=""
+_wb_H="$_p4a_head"
+_wb_req() { # <id> <login> <created_at> [body]
+  jq -nc --argjson id "$1" --arg who "$2" --arg t "$3" --arg b "${4:-@codex review}" \
+    '{id:$id,user:{login:$who},body:$b,created_at:$t,updated_at:$t}'
+}
+_wb_sum() { # <json-status> <cell-word> <trigger> <run-time> [commit]
+  jq -nc --arg st "$1" --arg w "$2" --arg tr "$3" --arg rt "$4" --arg c "${5:-$_wb_H}" \
+    '{id:9000,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-10-29T10:00:00Z",updated_at:$rt,
+      body:("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"" + $c + "\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"" + $st + "\"},\"security_review\":{\"commit_sha\":null}} -->\n| 📝 **Code Review** | **" + $w + "** <relative-time datetime=\"" + $rt + "\">t</relative-time> | `" + $c[0:7] + "` | " + $tr + " |")}'
+}
+_WB_R="$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z)"
+_wb_case() { # <label> <want-state> <comments-json> [binding-fn]
+  local got
+  got="$(${4:-p4b_wave_codex_binding_state} "$3" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 | jq -r .state)"
+  [ "$got" = "$2" ] || bad="$bad [$1: want $2 got $got]"
+}
+# The windows, as fixtures (label|want|comments).
+_wb_fixtures() {
+  printf '%s\t%s\t%s\n' \
+    answered clear "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00.123456Z)]" \
+    w1-app-review-running-at-check hold "[$_WB_R,$(_wb_sum running Running 'PR opened' 2026-10-29T11:58:00Z)]" \
+    w1-that-review-completes-after-request hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:03:00Z)]" \
+    w2-our-run-running hold "[$_WB_R,$(_wb_sum running Running 'Manual request' 2026-10-29T12:01:00Z)]" \
+    w2-manual-run-completed-before-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T11:59:00Z)]" \
+    w2-manual-run-same-second-as-request hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:00:00.900Z)]" \
+    w3-unsolicited-appears-after-snapshot hold "[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:00:30Z)]" \
+    w4-superseded-by-newer-author-request clear "[$_WB_R,$(_wb_req 502 nathanjohnpayne 2026-10-29T12:02:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-foreign-trigger-after-request hold "[$_WB_R,$(_wb_req 600 someone 2026-10-29T12:01:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    w4-author-prose-mention-after-request hold "[$_WB_R,$(_wb_req 601 nathanjohnpayne 2026-10-29T12:01:00Z 'please @codex review again'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    other-commit hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)]" \
+    failed-run hold "[$_WB_R,$(_wb_sum failed Failed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    no-summary hold "[$_WB_R]" \
+    request-missing unreadable "[$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    request-not-author unreadable "[$(_wb_req 501 someone 2026-10-29T12:00:00Z),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    request-not-exact unreadable "[$(_wb_req 501 nathanjohnpayne 2026-10-29T12:00:00Z 'please @codex review'),$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+    summary-garbled unreadable "[$_WB_R,{\"id\":9001,\"user\":{\"login\":\"chatgpt-codex-connector[bot]\"},\"created_at\":\"2026-10-29T12:05:00Z\",\"updated_at\":\"2026-10-29T12:05:00Z\",\"body\":\"<!-- codex-pull-request-review-summary -->\\nnot a table\"}]" \
+    summary-commit-disagrees unreadable "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z | jq -c '.body |= sub("`aaaaaaa`"; "`bbbbbbb`")')]" \
+    comments-not-array unreadable '{"not":"an array"}'
+}
+while IFS="$(printf '\t')" read -r _l _w _c; do _wb_case "$_l" "$_w" "$_c"; done < <(_wb_fixtures)
+# The latest summary decides: an older Completed manual row cannot outlive a
+# newer automatic run reported in its place.
+_wb_case latest-summary-wins hold "[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:04:00Z),$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:06:00Z | jq -c '.id = 9002')]"
+
+# Mutation checks: disable each guard in an extracted copy and require the
+# window it closes to flip to "clear". A guard whose removal flips nothing is
+# not tested by the table above.
+_wb_src="$(sed -n '/^p4b_wave_codex_binding_eval() {/,/^}/p' "$LIB")"
+[ -n "$_wb_src" ] || bad="$bad [no-binding-eval-source]"
+_wb_mutant() { # <label> <python-replace-old> <python-replace-new> <window-that-must-flip>
+  local m got
+  m="$(python3 -c 'import sys; s=sys.stdin.read(); o,n=sys.argv[1],sys.argv[2]; assert s.count(o)==1, o; print(s.replace(o,n))' "$2" "$3" <<<"$_wb_src")" \
+    || { bad="$bad [mutant-$1-did-not-apply]"; return; }
+  got="$(
+    eval "${m/p4b_wave_codex_binding_eval()/_wb_mutant_eval()}"
+    _wb_fixtures | while IFS="$(printf '\t')" read -r l _ c; do
+      [ "$l" = "$4" ] || continue
+      _wb_mutant_eval "$c" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 | jq -r .state
+    done)"
+  [ "$got" = clear ] || bad="$bad [mutant-$1-left-$4-at-${got:-nothing}]"
+}
+_wb_mutant trigger '!= "manual request"' '== "never"' w1-that-review-completes-after-request
+_wb_mutant run-time 'elif $run <= $t then' 'elif false then' w2-manual-run-completed-before-request
+_wb_mutant status 'elif ($sj.code_review.status // "") != "completed"' 'elif false' w2-our-run-running
+_wb_mutant foreign 'elif ($foreign | length) > 0 then' 'elif false then' w4-foreign-trigger-after-request
+_wb_mutant commit 'elif $jc != $h then' 'elif false then' other-commit
+
+# Barrier integration through the production arm. The diagnostic stub exits
+# 0 (Codex spoke on this head) throughout: unbound, that alone opens.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+_wb_auto="[$_WB_R,$(_wb_sum completed Completed 'PR opened' 2026-10-29T12:03:00Z)]"
+out="$(P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
+  _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad [unbound-auto-review-no-longer-opens:$rc]"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
+  _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.codex == "not-yet" and .codex_evidence == "wave-request-summary-not-manual-request"' >/dev/null \
+  || bad="$bad [bound-auto-review-not-held:$rc:$(printf '%s' "$out" | jq -c '{codex,codex_evidence}' 2>/dev/null)]"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R,$(_wb_sum completed Completed 'Manual request' 2026-10-29T12:05:00Z)]" \
+  P4B_TEST_LIVE_HEAD="$_wb_H" _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.codex == "reported" and .codex_evidence == "wave-request-answered"' >/dev/null \
+  || bad="$bad [bound-answer-not-open:$rc]"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=777 P4B_TEST_COMMENTS_JSON="$_wb_auto" P4B_TEST_LIVE_HEAD="$_wb_H" \
+  _barrier 0 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | jq -e '.decision == "error" and .codex_evidence == "wave-request-bound-request-missing"' >/dev/null \
+  || bad="$bad [bound-missing-request-not-fail-closed:$rc]"
+# The account-block waiver is unchanged: no request can be answered.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 P4B_TEST_COMMENTS_JSON="[$_WB_R]" P4B_TEST_LIVE_HEAD="$_wb_H" \
+  _barrier 2 0 "{\"head_sha\":\"$_wb_H\"}" "$WORK/barrier-both.yml" "$_wb_H")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex)" = waived ] || bad="$bad [bound-account-block-changed:$rc]"
+# The posture is the orchestrator's alone: sourcing the library resets it.
+[ "$(P4B_BARRIER_WAVE_CODEX_REQUEST=501 bash -c '. "$1"; printf %s "$P4B_BARRIER_WAVE_CODEX_REQUEST"' _ "$LIB")" = "" ] \
+  || bad="$bad [posture-inherited]"
+# The orchestrator accepts the flag only as a positive id with a wave scope.
+_wb_orch_err="$(bash "$ORCH" 7 --repo o/r --wave-codex-request 501 --dry-run 2>&1)" && bad="$bad [flag-without-scope-accepted]"
+printf '%s' "$_wb_orch_err" | grep -q -- '--wave-codex-request requires --wave-scope-file' || bad="$bad [flag-without-scope-message]"
+_wb_orch_err="$(bash "$ORCH" 7 --repo o/r --wave-scope-file /dev/null --wave-codex-request 5x1 --dry-run 2>&1)" && bad="$bad [non-numeric-flag-accepted]"
+printf '%s' "$_wb_orch_err" | grep -q -- '--wave-codex-request must be a positive comment id' || bad="$bad [non-numeric-flag-message]"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+if [ -z "$bad" ]; then
+  pass "#2771: the wave audit's Codex arm clears only on the answer to its own request; every named window holds, each guard is mutation-checked"
+else
+  fail "#2771: wave request binding wrong:$bad"
+fi
+
 # #1305: a spent governing request budget is a human-tiebreaker stop, never
 # authority for the Phase 4b adapter. The candidate policy deliberately raises
 # its own cap; the separate base fixture must still govern.

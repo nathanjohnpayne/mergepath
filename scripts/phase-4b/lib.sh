@@ -2117,6 +2117,108 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 # #814 ships with no new review-policy keys. A provider disabled in policy is
 # simply not consulted — that, and not any rc, is the only route to
 # will-not-report, and it cannot flip mid-flight on a live PR.
+# --- same-head provider barrier: wave-audit request binding (#2771) ----------
+#
+# A wave audit binds its Codex arm to the request it created
+# (phase-4b-review.sh --wave-codex-request <comment-id>). The unbound arm
+# clears on ANY current-head Codex signal, so an unsolicited App review could
+# clear it while the audit's own request was still unanswered; narrowing that
+# window did not converge over four review rounds. Binding only ever removes
+# ways to clear (an answer still needs today's rc 0), so the flag needs no
+# authority of its own. Only scripts/phase-4b-review.sh sets it, and sourcing
+# this library resets it so an inherited environment value is ignored.
+P4B_BARRIER_WAVE_CODEX_REQUEST=""
+
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id>
+# Pure. Prints {state, reason}: state is "clear", "hold" or "unreadable".
+#
+# The evidence that names a run is Codex's Review Summary: one bot comment,
+# edited in place, carrying `codex-review-state:v1` JSON (full commit sha and
+# status) and a table row whose last cell is the trigger ("Manual request"
+# for a review-request comment, "PR opened" for an automatic App review) and
+# whose status cell stamps the run time. Codex writes both; the pusher
+# cannot.
+#
+#   clear       the bound request R is the author's exact request, and the
+#               LATEST summary is a Completed "Manual request" run on exactly
+#               <head> whose run time is strictly after R, and no other
+#               comment mentioning Codex's handle appeared after R (a foreign
+#               or ambiguous trigger means the manual run cannot be tied to
+#               R). A newer author request that supersedes R clears on the
+#               same rule; the request-generation fence then sees it.
+#   hold        anything short of that: no summary, another commit, Running /
+#               Failed / Canceled / unknown, an automatic trigger, a run that
+#               predates R, or a foreign mention. The barrier's budget then
+#               ends in the existing fail-open exit 4.
+#   unreadable  R missing, not the author's or not an exact request; the
+#               latest summary's state JSON or row does not parse; the JSON
+#               and the row disagree on the commit. Fail closed.
+p4b_wave_codex_binding_state() {
+  local out
+  # A jq path that ends in `empty` prints nothing; nothing is never a state,
+  # so it is unreadable rather than silently read as a hold.
+  out="$(p4b_wave_codex_binding_eval "$@")"
+  case "$out" in
+    *'"state":"clear"'*|*'"state":"hold"'*|*'"state":"unreadable"'*) printf '%s\n' "$out" ;;
+    *) jq -nc '{state: "unreadable", reason: "binding-evaluation-failed"}' ;;
+  esac
+}
+
+p4b_wave_codex_binding_eval() {
+  printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
+    --arg head "${4:-}" --arg rid "${5:-}" '
+    def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
+    def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
+    ($head | ascii_downcase) as $h
+    | if type != "array" then {state: "unreadable", reason: "comments-not-array"} else
+      ([ .[] | select((.id | tostring) == $rid) ] | first) as $r
+      | if $r == null then {state: "unreadable", reason: "bound-request-missing"}
+        elif ($r | exact_request | not) then {state: "unreadable", reason: "bound-request-not-author-request"}
+        elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
+        else
+          ($r.created_at | secs) as $t
+          | [ .[] | select((.id | tostring) != $rid)
+              | select((.user.login // "") != $bot)
+              | select(exact_request | not)
+              | select(((.created_at // "") | secs) as $c | $c != null and $c > $t)
+              | select((.body // "") | test("@codex"; "i")) ] as $foreign
+          | [ .[] | select((.user.login // "") == $bot)
+              | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->")) ]
+            as $marked
+          | if ($marked | length) == 0 then {state: "hold", reason: "no-summary"}
+            else
+              ($marked | max_by([(.updated_at // .created_at // ""), .id])) as $latest
+              | ($latest.body
+                  | ((try (capture("<!-- codex-review-state:v1 (?<j>\\{.*\\}) -->").j | fromjson) catch null) // null)) as $sj
+              | ($latest.body
+                  | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+                  // null) as $row
+              | if $sj == null or ($sj.code_review | type) != "object" or $row == null
+                then {state: "unreadable", reason: "summary-unreadable"}
+                else
+                  (($sj.code_review.commit_sha // "") | ascii_downcase) as $jc
+                  | if ($jc | test("^[0-9a-f]{40}$") | not) then {state: "unreadable", reason: "summary-unreadable"}
+                    elif ($jc | startswith($row.commit | ascii_downcase) | not)
+                    then {state: "unreadable", reason: "summary-commit-disagrees"}
+                    elif $jc != $h then {state: "hold", reason: "summary-other-commit"}
+                    elif ($sj.code_review.status // "") != "completed"
+                    then {state: "hold", reason: ("summary-" + (($sj.code_review.status // "unknown") | tostring))}
+                    elif ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "") | ascii_downcase) != "manual request"
+                    then {state: "hold", reason: "summary-not-manual-request"}
+                    else
+                      (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) as $run
+                      | if $run == null then {state: "unreadable", reason: "summary-time-unreadable"}
+                        elif $run <= $t then {state: "hold", reason: "summary-before-request"}
+                        elif ($foreign | length) > 0 then {state: "hold", reason: "foreign-codex-mention"}
+                        else {state: "clear", reason: "bound-request-answered"} end
+                    end
+                end
+            end
+        end
+      end' 2>/dev/null \
+    || jq -nc '{state: "unreadable", reason: "binding-evaluation-failed"}'
+}
+
 p4b_same_head_barrier() {
   # cap-only is the read-only GitHub guard for an unavailable adapter: it
   # shares the Codex decision and local final-request wait bound, but never
@@ -2285,6 +2387,44 @@ p4b_same_head_barrier() {
         fi
         ;;
     esac
+    # #2771: a wave audit's Codex arm clears only on the answer to its own
+    # request (p4b_wave_codex_binding_state). Applied to the reported arm and
+    # to a Phase 4a timeout waiver; the account-block waiver (rc 2: no request
+    # can be answered) and every request-cap path are unchanged.
+    if [ -n "$P4B_BARRIER_WAVE_CODEX_REQUEST" ] && [ -z "$why" ] && [ "$cap_exhausted" != true ]; then
+      case "$cls_cx:$cx_evidence" in
+        reported:*|waived:timeout|not-yet:*)
+          local wb_comments="" wb_json wb_state wb_reason wb_author wb_bot
+          wb_author="$(p4b_top_field author_identity)"; wb_author="${wb_author:-nathanjohnpayne}"
+          wb_bot="$(p4b_policy_block_field codex bot_login)"; wb_bot="${wb_bot:-chatgpt-codex-connector[bot]}"
+          if command -v gh_api_array >/dev/null 2>&1 \
+             && wb_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
+            wb_json="$(p4b_wave_codex_binding_state "$wb_comments" "$wb_author" "$wb_bot" "$head" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
+          else
+            wb_json='{"state":"unreadable","reason":"comments-read-failed"}'
+          fi
+          wb_state="$(printf '%s' "$wb_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+          wb_reason="$(printf '%s' "$wb_json" | jq -r '.reason // "unknown"' 2>/dev/null || printf unknown)"
+          case "$cls_cx:$wb_state" in
+            *:unreadable)
+              cls_cx="escalate"
+              budget_unsafe=true
+              cx_evidence="wave-request-$wb_reason"
+              cx_budget_json="$(jq -nc --arg r "$wb_reason" --arg id "$P4B_BARRIER_WAVE_CODEX_REQUEST" \
+                '{state:"unreadable",reason:("wave-request-" + $r),wave_codex_request:$id}')"
+              why="The wave audit's Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST cannot be bound on $head ($wb_reason); refusing to infer that it was answered"
+              ;;
+            reported:clear)
+              cx_evidence="wave-request-answered"
+              ;;
+            *)
+              cls_cx="not-yet"
+              cx_evidence="wave-request-$wb_reason"
+              ;;
+          esac
+          ;;
+      esac
+    fi
     # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
     # actually clear gate (c). With codex.allow_phase_4b_substitute: false the
     # merge gate rejects that review by design, so opening the barrier would

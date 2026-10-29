@@ -25,8 +25,10 @@ export FAKE_POLICY_ARGS_LOG="$WORK/policy-args"
 
 # Wave dispatch models the trusted verifier boundary. The actual Git byte
 # comparison is exercised by test_marker_provenance.py, not duplicated here.
-mkdir -p "$WORK/trusted/scripts/workflow"
+mkdir -p "$WORK/trusted/scripts/workflow" "$WORK/trusted/scripts/lib"
 cp "$WA" "$WORK/trusted/scripts/wave-audit.sh"
+# #2771: the canary Codex binding reads request generations with this library.
+cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$WORK/trusted/scripts/lib/"
 WA="$WORK/trusted/scripts/wave-audit.sh"
 cat > "$WORK/trusted/scripts/workflow/resolve_base_policy.sh" <<'SH'
 #!/bin/sh
@@ -156,6 +158,51 @@ exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
 
+# --- fake Codex signal check, requester and comment reader (#2771) -------------
+# The check records the barrier's overrides and exits FAKE_CODEX_CHECK_EXIT
+# (default 1: Codex has not spoken). The requester records its argv and gate,
+# prints {"trigger_posted": FAKE_TRIGGER_POSTED}, and exits
+# FAKE_CODEX_REQUEST_EXIT. The reader serves FAKE_CANARY_COMMENTS before the
+# requester runs and FAKE_CANARY_COMMENTS_AFTER once it has, so a post shows
+# up as a new author request (default: request 9001).
+FAKE_CODEX_CHECK="$WORK/fake-codex-check.sh"
+cat > "$FAKE_CODEX_CHECK" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+printf '%s skip_ci=%s require=%s sub=%s\n' "$*" "${CODEX_REVIEW_CHECK_SKIP_CI:-unset}" \
+  "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-unset}" "${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-unset}" \
+  >> "$CAPTURE/codex-check"
+exit "${FAKE_CODEX_CHECK_EXIT:-1}"
+FAKE
+chmod +x "$FAKE_CODEX_CHECK"
+FAKE_CODEX_REQ="$WORK/fake-codex-request.sh"
+cat > "$FAKE_CODEX_REQ" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+printf '%s GATED=%s\n' "$*" "${MERGEPATH_PHASE_4A_GATED:-unset}" >> "$CAPTURE/codex-request"
+printf '{"trigger_posted":%s}\n' "${FAKE_TRIGGER_POSTED:-true}"
+exit "${FAKE_CODEX_REQUEST_EXIT:-0}"
+FAKE
+chmod +x "$FAKE_CODEX_REQ"
+FAKE_COMMENTS_GH="$WORK/fake-comments-gh"
+cat > "$FAKE_COMMENTS_GH" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+[ "${FAKE_COMMENTS_EXIT:-0}" = 0 ] || exit "$FAKE_COMMENTS_EXIT"
+case "$*" in
+  *"/comments"*)
+    if [ -e "$CAPTURE/codex-request" ]; then
+      # A brace inside ${var:-word} would end the expansion early.
+      default_after='[[{"id":9001,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-10-29T12:00:00Z"}]]'
+      printf '%s\n' "${FAKE_CANARY_COMMENTS_AFTER:-$default_after}"
+    else
+      printf '%s\n' "${FAKE_CANARY_COMMENTS:-[[]]}"
+    fi ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$FAKE_COMMENTS_GH"
+
 # --- policy fixtures -----------------------------------------------------------
 POLICY_GOOD="$WORK/policy-good.yml"
 cat > "$POLICY_GOOD" <<'YAML'
@@ -190,6 +237,8 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -203,6 +252,8 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
   GIT_CONFIG_VALUE_0=https://github.com/nathanjohnpayne/mergepath.git \
   WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -268,6 +319,8 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   AGE_METADATA_CASE="${AGE_METADATA_CASE:-invalid}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_CODEX_REQUEST="$FAKE_CODEX_REQ" WAVE_AUDIT_GH="$FAKE_COMMENTS_GH" \
+  WAVE_AUDIT_CODEX_CHECK="$FAKE_CODEX_CHECK" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
@@ -514,9 +567,22 @@ run_wa_lane good 69 --repo owner/consumer --base "$C6" --head-sha "$RACE_EMPTY_H
   && pass "empty-scope pair movement cannot advance the watermark" \
   || fail "empty-scope pair movement wrote authority"
 
+# #2771: a publishing run rechecks the verified pair before it asks Codex,
+# because the requester resolves the live head itself. Read 2 is that recheck;
+# drift there sends no request and runs no review.
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=2 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
+  > "$WORK/prerequest-pair-drift.json" 2> "$WORK/prerequest-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] && [ ! -e "$CAPTURE/codex-request" ] \
+  && grep -q 'before requesting the canary Codex review' "$WORK/prerequest-pair-drift.err" \
+  && pass "#2771: pair movement before the Codex request sends no request and runs no review" \
+  || fail "#2771: pair movement before the Codex request was not caught (rc=$rc)"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/post-review-pair-drift.json" 2> "$WORK/post-review-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
@@ -528,7 +594,7 @@ run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "
 
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=5 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/prepublish-pair-drift.json" 2> "$WORK/prepublish-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
@@ -540,7 +606,7 @@ run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "
 
 rc=0
 FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
   > "$WORK/local-watermark-pair-drift.json" 2> "$WORK/local-watermark-pair-drift.err" || rc=$?
 [ "$rc" -eq 3 ] && [ -n "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_REVIEW_HEAD")" ] \
@@ -1110,7 +1176,7 @@ remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark befo
   || pass "complete prefix chain alone grants no full-wave clearance"
 rc=0
 FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
-FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
 run_wa_lane good 84 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
   --finalize-historical > "$WORK/finalize-pair-drift.json" \
   2> "$WORK/finalize-pair-drift.err" || rc=$?
@@ -1345,6 +1411,64 @@ if [ "$(git -C "$CANON" tag -l)" = "$capture_tags_before" ] \
    && [ "$(git ls-remote --tags "$REMOTE")" = "$capture_remote_before" ]; then
   pass "all capture modes leave local and remote publication state unchanged"
 else fail "capture mode published a receipt or watermark"; fi
+
+# ===========================================================================
+echo "wave-audit.sh — binding the barrier to the canary's Codex request (#2771)"
+# ===========================================================================
+# A publishing run binds the orchestrator's Codex arm to ONE request and
+# passes it as --wave-codex-request; the barrier then clears only on the
+# answer to that request. FAKE_ORCH_EXIT=4 keeps the watermark still.
+_bind_case() { # <label> <want-rc> <want-requests> <want-bound|none|nodispatch> <args...>
+  local label="$1" want_rc="$2" want_req="$3" want_bound="$4" rc=0 n=0 bound=nodispatch; shift 4
+  FAKE_ORCH_EXIT="${FAKE_ORCH_EXIT:-4}" run_wa "$POLICY_GOOD" reset 91 --repo owner/consumer "$@" \
+    >/dev/null 2>"$WORK/bind-case.err" || rc=$?
+  [ ! -f "$CAPTURE/codex-request" ] || n=$(wc -l < "$CAPTURE/codex-request" | tr -d ' ')
+  if [ -e "$CAPTURE/args" ]; then
+    bound="$(awk 'prev == "--wave-codex-request" { print; exit } { prev = $0 }' "$CAPTURE/args")"
+    bound="${bound:-none}"
+  fi
+  if [ "$rc" = "$want_rc" ] && [ "$n" = "$want_req" ] && [ "$bound" = "$want_bound" ]; then
+    pass "#2771: $label"
+  else
+    fail "#2771: $label (rc=$rc want $want_rc; requests=$n want $want_req; bound=$bound want $want_bound): $(tail -n 2 "$WORK/bind-case.err")"
+  fi
+}
+_author_req() { jq -nc --argjson id "$1" '{id:$id,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-10-29T12:00:00Z"}'; }
+_bind_case "no Codex signal: one request is sent and the barrier is bound to it" 4 1 9001 --base "$C1" --head-sha "$C2"
+grep -qx -- "--trigger-only --allow-moving-head 91 owner/consumer GATED=true" "$CAPTURE/codex-request" \
+  && grep -qx -- "--diagnostic-signal-only 91 owner/consumer skip_ci=1 require=1 sub=false" "$CAPTURE/codex-check" \
+  && pass "#2771: the check uses the barrier's flag and overrides; the request is trigger-only and gated" \
+  || fail "#2771: check/request argv wrong: $(cat "$CAPTURE/codex-check" "$CAPTURE/codex-request" 2>/dev/null)"
+FAKE_CODEX_CHECK_EXIT=0 \
+  _bind_case "Codex already spoke on the head: no request, barrier unbound (today's behaviour)" 4 0 none --base "$C1" --head-sha "$C2"
+FAKE_CODEX_CHECK_EXIT=2 \
+  _bind_case "Codex cannot report: no request, barrier unbound" 4 0 none --base "$C1" --head-sha "$C2"
+FAKE_CODEX_CHECK_EXIT=3 \
+  _bind_case "an unreadable Codex signal fails closed before any request or review" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS="[[$(_author_req 501)]]" \
+  _bind_case "a rerun binds the existing author request instead of sending another" 4 0 501 --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS="[[$(_author_req 501),$(_author_req 505)]]" \
+  _bind_case "with several author requests the latest one (the superseding request) is bound" 4 0 505 --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS='[[{"id":600,"user":{"login":"someone"},"body":"@codex review","created_at":"2026-10-29T11:00:00Z"}]]' \
+FAKE_CANARY_COMMENTS_AFTER="[[{\"id\":600,\"user\":{\"login\":\"someone\"},\"body\":\"@codex review\",\"created_at\":\"2026-10-29T11:00:00Z\"},$(_author_req 9002)]]" \
+  _bind_case "a foreign mention is not the author's request: one is sent and bound" 4 1 9002 --base "$C1" --head-sha "$C2"
+FAKE_TRIGGER_POSTED=false FAKE_CANARY_COMMENTS_AFTER='[[]]' \
+  _bind_case "a signal that appears before the requester's scan: nothing posted, barrier unbound" 4 1 none --base "$C1" --head-sha "$C2"
+FAKE_TRIGGER_POSTED=true FAKE_CANARY_COMMENTS_AFTER='[[]]' \
+  _bind_case "a reported post with no new author request fails closed" 3 1 nodispatch --base "$C1" --head-sha "$C2"
+_bind_case "a dry run sends no request and binds nothing" 4 0 none --base "$C1" --head-sha "$C2" --dry-run
+FAKE_CODEX_REQUEST_EXIT=5 \
+  _bind_case "Codex not enabled (requester exit 5): barrier unbound" 4 1 none --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=7 \
+  _bind_case "a spent request cap (requester exit 7): barrier unbound, its cap path decides" 4 1 none --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=6 \
+  _bind_case "unaccounted feedback (requester exit 6) stops with exit 7 before review" 7 1 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_CODEX_REQUEST_EXIT=3 \
+  _bind_case "a failed request stops with exit 3 before review" 3 1 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_COMMENTS_EXIT=1 \
+  _bind_case "an unreadable canary timeline fails closed without requesting" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+FAKE_CANARY_COMMENTS='{"not":"an array"}' \
+  _bind_case "a malformed comments read fails closed without requesting" 3 0 nodispatch --base "$C1" --head-sha "$C2"
 
 echo "Summary: $PASS passed, $FAIL failed"
 if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \

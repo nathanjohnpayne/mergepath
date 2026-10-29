@@ -26,6 +26,20 @@
 # 20k lines); the structured canonical range enables trusted regeneration
 # of the curated bytes.
 #
+# Codex on the canary (#2771): the orchestrator's same-head barrier waits for
+# Codex to speak on the canary head, and before this a canary was never asked,
+# so audits held until the barrier budget expired (exit 4) unless the Codex
+# App happened to auto-review. A publishing run now asks the barrier's own
+# question first (codex-review-check.sh --diagnostic-signal-only). If Codex
+# already spoke on the head (rc 0) or cannot report (rc 2), nothing is sent and
+# the barrier behaves as it always has. Otherwise the run binds the barrier to
+# ONE request: the configured author's latest existing request, or the single
+# one it sends (codex-review-request.sh --trigger-only). It passes that comment
+# id as --wave-codex-request, and the barrier's Codex arm then clears only on
+# the answer to that request, never on an unsolicited App review
+# (p4b_wave_codex_binding_state). An unanswered request still ends in the
+# fail-open exit 4. Fan-out mirrors still get no Codex request.
+#
 # Verdict contract — fix at the SOURCE, never in the mirror:
 #   exit 0  APPROVED posted on the canary. The wave-audit-pass/<head>
 #           watermark tag is created and pushed; fan out. Fan-out mirrors
@@ -100,6 +114,11 @@
 #                             audit base), never the working tree
 #                             (default: .mergepath-sync.yml)
 #   WAVE_AUDIT_ORCHESTRATOR   orchestrator (default: scripts/phase-4b-review.sh)
+#   WAVE_AUDIT_CODEX_REQUEST  Codex requester (default:
+#                             scripts/codex-review-request.sh)
+#   WAVE_AUDIT_CODEX_CHECK    Codex signal check (default:
+#                             scripts/codex-review-check.sh)
+#   WAVE_AUDIT_GH             gh used for the canary comment reads (default: gh)
 #   WAVE_AUDIT_LANE_VERIFIED_OK=1  skip the canary lane precondition —
 #                             hermetic tests only, never operational runs
 #   MERGEPATH_REVIEW_POLICY_PATH  policy file override (p4b convention)
@@ -111,6 +130,9 @@ REPO_DIR="${WAVE_AUDIT_REPO_DIR:-$ROOT}"
 MANIFEST_RELPATH="${WAVE_AUDIT_MANIFEST_RELPATH:-.mergepath-sync.yml}"
 POLICY="${MERGEPATH_REVIEW_POLICY_PATH:-$REPO_DIR/.github/review-policy.yml}"
 ORCH="${WAVE_AUDIT_ORCHESTRATOR:-$ROOT/scripts/phase-4b-review.sh}"
+CODEX_REQUEST="${WAVE_AUDIT_CODEX_REQUEST:-$ROOT/scripts/codex-review-request.sh}"
+CODEX_CHECK="${WAVE_AUDIT_CODEX_CHECK:-$ROOT/scripts/codex-review-check.sh}"
+WA_GH="${WAVE_AUDIT_GH:-gh}"
 TAG_PREFIX="wave-audit-pass"
 PREFIX_TAG_PREFIX="wave-audit-prefix"
 
@@ -179,6 +201,87 @@ audit_list() {
       }
     }
   ' "$POLICY"
+}
+
+# top_field <field> — a top-level policy scalar (author_identity); only
+# column-0 keys match. Same quote/comment stripping as audit_field.
+top_field() {
+  [ -f "$POLICY" ] || return 0
+  awk -v field="$1" '
+    /^[^[:space:]#]/ && $1 == field":" {
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print; exit
+    }
+  ' "$POLICY"
+}
+
+# canary_request_generation — the configured author's request comment ids on
+# the canary, read with the grammar the request budget counts
+# (crqe_trigger_generation). Any read or parse failure fails closed: binding
+# or posting blind could tie the barrier to the wrong request.
+canary_request_generation() {
+  local comments
+  comments="$("$WA_GH" api --paginate --slurp "repos/$REPO/issues/$PR/comments" 2>/dev/null \
+    | jq -ce 'if type == "array" then (add // []) else error("shape") end' 2>/dev/null)" \
+    || die 3 "cannot read ${REPO}#${PR} comments to bind the Codex request (#2771)"
+  crqe_trigger_generation "$comments" "$CANARY_AUTHOR" 2>/dev/null \
+    || die 3 "cannot read the Codex request generation on ${REPO}#${PR} (#2771)"
+}
+
+# bind_canary_codex_review — #2771. Sets WAVE_CODEX_BOUND to the request
+# comment the barrier must see answered, or leaves it empty when the barrier
+# keeps its unbound behaviour (Codex already spoke on the head, cannot
+# report, is disabled, or the request cap is spent). See the header.
+WAVE_CODEX_BOUND=""
+bind_canary_codex_review() {
+  local check_rc=0 rc=0 before after new out posted
+  # shellcheck source=lib/codex-request-evidence.sh
+  . "$ROOT/scripts/lib/codex-request-evidence.sh" \
+    || die 3 "cannot load the Codex request-evidence library"
+  CANARY_AUTHOR="$(top_field author_identity)"
+  CANARY_AUTHOR="${CANARY_AUTHOR:-nathanjohnpayne}"
+  CODEX_REVIEW_CHECK_SKIP_CI=1 \
+  CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+  CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+    "$CODEX_CHECK" --diagnostic-signal-only "$PR" "$REPO" >/dev/null 2>&1 || check_rc=$?
+  case "$check_rc" in
+    0) log "Codex already spoke on the ${REPO}#${PR} head; no request, barrier unbound (#2771)"; return 0 ;;
+    1) ;;
+    2) log "Codex cannot report on ${REPO}#${PR} (account or connection block); no request, barrier unbound (#2771)"; return 0 ;;
+    *) die 3 "cannot read the Codex signal on ${REPO}#${PR} (codex-review-check.sh exit $check_rc) (#2771)" ;;
+  esac
+  # die inside a command substitution exits only the subshell; carry it out.
+  before="$(canary_request_generation)" || exit "$?"
+  if [ "$before" != "[]" ]; then
+    WAVE_CODEX_BOUND="$(printf '%s' "$before" | jq -r 'max')"
+    log "binding the barrier to the existing Codex request $WAVE_CODEX_BOUND on ${REPO}#${PR} (#2771)"
+    return 0
+  fi
+  out="$(MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST" --trigger-only --allow-moving-head "$PR" "$REPO")" || rc=$?
+  case "$rc" in
+    0) ;;
+    5) log "Codex review is not enabled for ${REPO}#${PR}; no request, barrier unbound (#2771)"; return 0 ;;
+    6) die 7 "Codex request refused on ${REPO}#${PR}: earlier review feedback is unaccounted — disposition it and rerun the audit (#2771)" ;;
+    7) log "Codex request cap is spent on ${REPO}#${PR}; barrier unbound, its cap path decides (#2771)"; return 0 ;;
+    *) die 3 "Codex request on canary ${REPO}#${PR} failed (codex-review-request.sh exit $rc) (#2771)" ;;
+  esac
+  # Not `// empty`: jq's alternative operator treats false like null.
+  posted="$(printf '%s' "$out" | jq -r '.trigger_posted | if type == "boolean" then tostring else empty end' 2>/dev/null || true)"
+  case "$posted" in true|false) ;; *) die 3 "codex-review-request.sh output on ${REPO}#${PR} names no trigger_posted (#2771)" ;; esac
+  after="$(canary_request_generation)" || exit "$?"
+  new="$(jq -nc --argjson a "$after" --argjson b "$before" '$a - $b')"
+  if [ "$new" != "[]" ]; then
+    WAVE_CODEX_BOUND="$(printf '%s' "$new" | jq -r 'max')"
+    log "requested Codex review on ${REPO}#${PR} (request $WAVE_CODEX_BOUND); the barrier waits on that request (#2771)"
+  elif [ "$posted" = true ]; then
+    die 3 "codex-review-request.sh reports a posted request on ${REPO}#${PR}, but no new author request appeared (#2771)"
+  else
+    log "codex-review-request.sh posted no request on ${REPO}#${PR} (a Codex signal appeared first); barrier unbound (#2771)"
+  fi
 }
 
 # --- args -------------------------------------------------------------------
@@ -913,6 +1016,18 @@ if [ "$ADMIN_OVERRIDE_SET" = true ]; then
 fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
+fi
+# #2771: only a run that can publish asks Codex. Dry runs, capture runs and
+# historical chunks force --dry-run, post nothing, and skip the barrier.
+if [ "$DRY_RUN" = false ] && [ -z "$HISTORICAL_END" ]; then
+  # The requester resolves the live head itself, so the verified pair is
+  # rechecked first; the recheck before dispatch below still stands.
+  revalidate_canary_pair "requesting the canary Codex review"
+  bind_canary_codex_review
+  if [ -n "$WAVE_CODEX_BOUND" ]; then
+    orch_args[${#orch_args[@]}]="--wave-codex-request"
+    orch_args[${#orch_args[@]}]="$WAVE_CODEX_BOUND"
+  fi
 fi
 revalidate_canary_pair "dispatching external review"
 if [ -n "$HISTORICAL_END" ]; then
