@@ -1184,6 +1184,11 @@ P_DISAGREE=$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $(
 P_RUN_OK=$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))
 p_check summary-table-only-no-request "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub("<!-- codex-review-state:v1 [^\n]*\n"; "")')]" '[]' pending summary-unreadable
 p_check summary-damaged-marker-no-request "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub(" -->\n\n\\| Review"; "\n\n| Review")')]" '[]' pending summary-unreadable
+# Phase 4b round 3 on #2886: JSON naming another commit beside a row naming
+# HEAD is a conflict that holds, never a dropped summary.
+p_check summary-json-other-row-head-running "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_OTHER" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending summary-unreadable
+p_check summary-json-head-row-other-completed "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending request-unanswered
+p_check summary-leading-marker-missing "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub("^<!-- codex-pull-request-review-summary -->\n"; "") | .body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')]" '[]' pending summary-unreadable
 p_check summary-row-running-json-completed "[$R0,$P_DISAGREE]" '[]' pending request-unanswered
 p_check summary-row-json-disagree-no-request "[$P_DISAGREE]" '[]' pending summary-unreadable
 p_check summary-failed-agreeing "[$R0,$(p_summary failed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("\\*\\*failed\\*\\*"; "⚠️ **Failed**")')]" '[]' answered

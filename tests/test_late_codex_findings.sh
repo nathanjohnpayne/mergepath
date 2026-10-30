@@ -170,7 +170,7 @@ ok "the sweep records #7 although #6 fails, skips unmerged issues, and exits 3"
 # GraphQL lastEditedAt is after merge (e.g. a fork PR's read-only event run
 # could not write) is still recorded.
 jq -nc --arg m "$MERGED" --argjson r "$OLD_REVIEW" '{pr: {merged_at: $m}, comments: [], reviews: [$r], inline: [], issues: [],
-  review_edits: [{databaseId: 802, lastEditedAt: "2026-08-28T04:00:00Z"}],
+  review_edits: [{fullDatabaseId: "802", lastEditedAt: "2026-08-28T04:00:00Z"}],
   closed: [{number: 7, pull_request: {merged_at: $m}}]}' >"$STATE"
 PATH="$DIR/bin:$PATH" TMPDIR="$DIR" "$SCRIPT" --repo o/r --sweep --since 2026-08-27T00:00:00Z >"$DIR/out" 2>&1 \
   || { cat "$DIR/out"; die "the edited-review sweep failed"; }
@@ -203,6 +203,22 @@ run || { cat "$DIR/out"; die "the race run failed"; }
   && jq -r '.issues[] | select(.number == 50) | .comments[] | if type == "string" then . else .body end' "$STATE" | grep -q 'mergepath-late-codex-item: issue-comment:5447842730:' \
   || { cat "$DIR/out"; jq . "$STATE"; die "a tracker race did not converge on the canonical tracker"; }
 ok "a tracker race converges: items land on the lowest tracker and the duplicate is closed"
+# Phase 4b round 3 on #2886: a duplicate left open by an earlier run is
+# reconciled even when nothing new arrived.
+jq -nc --arg m "$MERGED" --argjson c "$C1120" --arg fp "$FP" '{pr: {merged_at: $m}, comments: [$c], reviews: [], inline: [], issues: [
+  {number: 50, state: "open", user: {login: "github-actions[bot]"}, body: "<!-- mergepath-late-codex-finding: o/r#7 -->", comments: []},
+  {number: 60, state: "open", user: {login: "github-actions[bot]"}, body: "<!-- mergepath-late-codex-finding: o/r#7 -->\n- item <!-- mergepath-late-codex-item: issue-comment:5447842730:\($fp) -->", comments: []}]}' >"$STATE"
+run || { cat "$DIR/out"; die "the stale-duplicate run failed"; }
+[ "$(jq -r '.issues[] | select(.number == 60) | .state' "$STATE")" = closed ] \
+  && jq -r '.issues[] | select(.number == 50) | .comments[] | if type == "string" then . else .body end' "$STATE" | grep -q 'mergepath-late-codex-item: issue-comment:5447842730:' \
+  && [ "$(jq '[.issues[] | select(.number == 50) | .comments[]] | length' "$STATE")" = 1 ] \
+  || { cat "$DIR/out"; jq . "$STATE"; die "a stale duplicate tracker was not reconciled"; }
+ok "a duplicate left open by an earlier run is reconciled although nothing new arrived"
+# The edit-time join uses fullDatabaseId; a node without a usable one fails.
+jq -nc --arg m "$MERGED" --argjson r "$OLD_REVIEW" '{pr: {merged_at: $m}, comments: [], reviews: [$r], inline: [], issues: [],
+  review_edits: [{databaseId: 802, lastEditedAt: "2026-08-28T04:00:00Z"}]}' >"$STATE"
+if run; then die "a review edit node without fullDatabaseId was accepted"; fi
+ok "a review edit node without fullDatabaseId fails instead of matching nothing"
 # codex.bot_login comes from the governing policy.
 mkdir -p "$DIR/tree/scripts/lib" "$DIR/tree/.github"
 cp "$SCRIPT" "$DIR/tree/scripts/"; cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$DIR/tree/scripts/lib/"

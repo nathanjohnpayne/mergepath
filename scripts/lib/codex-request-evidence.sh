@@ -748,15 +748,18 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
         | ($req.created_at | if . == null then null else secs end) as $req_at
         | [ $comments[] | select(is_bot) ] as $botc
         # Every Review Summary that may describe <head>: its JSON names <head>,
-        # or it has no usable JSON commit and its row commit (if any) is a
-        # prefix of <head>. A relevant summary that does not validate (JSON
+        # its row commit is a prefix of <head>, or it names no commit at all. A relevant summary that does not validate (JSON
         # missing or malformed, the row missing, the row commit or status
         # disagreeing with the JSON, a status outside completed / running /
         # failed / canceled, an unreadable run time, or one later than the
         # last edit of the comment plus 300 s) is `unreadable`: it never answers,
         # and it holds, bounded from its last edit (Phase 4b on #2886).
+        # A Summary is recognized by its leading marker, its state marker or
+        # its heading, so a Summary whose leading marker is missing or damaged
+        # is held as unreadable rather than ignored (Phase 4b round 3 on #2886).
         | [ $botc[]
-            | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+            | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->")
+                     or contains("codex-review-state:v1") or test("(?m)^#+[[:space:]]*Codex Review Summary"))
             | . as $c
             # A missing or damaged marker must read as null, not as no value:
             # capture emits nothing on no match, which would drop the whole
@@ -769,7 +772,11 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
                   and ($sj.code_review.commit_sha | ascii_downcase | test("^[0-9a-f]{40}$"))
                then ($sj.code_review.commit_sha | ascii_downcase) else null end) as $jc
             | (if $row == null then null else ($row.commit | ascii_downcase) end) as $rc
-            | select($jc == $head or ($jc == null and ($rc == null or ($head | startswith($rc)))))
+            # Relevant when either representation names <head>, or neither
+            # names a commit: a JSON commit for another head beside a row for
+            # <head> is a conflict that holds, never a drop (Phase 4b round 3
+            # on #2886).
+            | select($jc == $head or ($rc != null and ($head | startswith($rc))) or ($jc == null and $rc == null))
             | (if $row == null then null
                elif ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
                elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"

@@ -190,13 +190,18 @@ process_pr() { # pr
   edits=$(gh api graphql --paginate -F pr="$pr" -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
     query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
       repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-        reviews(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { databaseId lastEditedAt } } } } }' 2>/dev/null \
+        reviews(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { fullDatabaseId lastEditedAt } } } } }' 2>/dev/null \
     | jq -cs '[ .[].data.repository.pullRequest.reviews.nodes[] ]' 2>/dev/null) \
     && printf '%s' "$edits" | jq -e 'type == "array"' >/dev/null 2>&1 \
     || { echo "late-codex-findings: cannot read review edit times on $REPO#$pr" >&2; exit 3; }
+  # Join on fullDatabaseId: the 32-bit databaseId is deprecated and can
+  # overflow (Phase 4b round 3 on #2886). Both sides compare as decimal
+  # strings; a node without one fails the PR rather than matching nothing.
   reviews=$(printf '%s\n%s\n' "$reviews" "$edits" | jq -cs '
-    (.[1] | map({key: (.databaseId | tostring), value: .lastEditedAt}) | from_entries) as $e
-    | .[0] | map(. + {edited_at: $e[(.id | tostring)]})')
+    if any(.[1][]; (.fullDatabaseId | tostring | test("^[1-9][0-9]*$")) | not) then error("review id") else . end
+    | (.[1] | map({key: (.fullDatabaseId | tostring), value: .lastEditedAt}) | from_entries) as $e
+    | .[0] | map(. + {edited_at: $e[(.id | tostring)]})') \
+    || { echo "late-codex-findings: unreadable review edit ids on $REPO#$pr" >&2; exit 3; }
   inline=$(read_array "repos/$REPO/pulls/$pr/comments?per_page=100")
   items=$(printf '%s\n%s\n%s\n' "$comments" "$reviews" "$inline" \
     | jq -cs --arg m "$merged_at" '{merged_at: $m, comments: .[0], reviews: .[1], inline: .[2]}' \
@@ -217,6 +222,13 @@ process_pr() { # pr
   # is recorded only by a marker in such a tracker's body or in a recorder
   # comment on it. A marker anyone else posts suppresses nothing.
   trackers=$(recorder_trackers "$pr") || exit 3
+  # A duplicate tracker left by an earlier race (or a failed close) is
+  # reconciled on every run, before the nothing-new return below, so it does
+  # not stay open forever (Phase 4b round 3 on #2886).
+  if [ "$DRY_RUN" = 0 ] && [ "$(printf '%s' "$trackers" | jq 'length')" -gt 1 ]; then
+    reconcile_duplicates "$trackers"
+    trackers=$(recorder_trackers "$pr") || exit 3
+  fi
   existing=$(recorded_keys "$trackers") || exit 3
   new_items=$(printf '%s\n%s\n' "$keyed" "$existing" | jq -cs '.[1] as $seen | [ .[0][] | select(.key as $k | $seen | index($k) | not) ]')
   if [ "$(printf '%s' "$new_items" | jq 'length')" = 0 ]; then
@@ -250,20 +262,54 @@ process_pr() { # pr
     # run whose tracker is not canonical records its items there first, then
     # closes its own as a duplicate, so the findings stay on an open issue.
     trackers=$(recorder_trackers "$pr") || exit 3
-    canonical=$(printf '%s' "$trackers" | jq -r 'min_by(.number) | .number // empty')
-    if [ -n "$canonical" ] && [ "$canonical" != "$created" ]; then
-      record_on "$canonical" "$(printf '%s' "$trackers" | jq -r --argjson n "$canonical" '.[] | select(.number == $n) | .state')" "$body"
-      jq -n --arg c "$canonical" '{body: ("Duplicate of #\($c), opened by a concurrent run; its findings are recorded there.")}' \
-        >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-      gh api -X POST "repos/$REPO/issues/$created/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" >/dev/null \
-        && gh api -X PATCH "repos/$REPO/issues/$created" -f state=closed -f state_reason=not_planned >/dev/null \
-        || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: recorded on #$canonical but cannot close duplicate #$created" >&2; exit 3; }
-      rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-    fi
+    [ "$(printf '%s' "$trackers" | jq 'length')" -le 1 ] || reconcile_duplicates "$trackers"
   else
     canonical=$(printf '%s' "$trackers" | jq -r 'min_by(.number) | .number')
     record_on "$canonical" "$(printf '%s' "$trackers" | jq -r --argjson n "$canonical" '.[] | select(.number == $n) | .state')" "$body"
   fi
+}
+
+# Converge duplicate recorder trackers on the lowest-numbered one: copy every
+# item line a duplicate holds that the canonical lacks onto the canonical
+# (reopening it first), then close each still-open duplicate. Recording
+# before closing keeps every finding on an open issue if a write fails.
+reconcile_duplicates() { # trackers-json (two or more, lowest first)
+  local canonical cstate have dup lines
+  canonical=$(printf '%s' "$1" | jq -r '.[0].number')
+  cstate=$(printf '%s' "$1" | jq -r '.[0].state')
+  have=$(recorded_keys "$(printf '%s' "$1" | jq -c '[.[0]]')") || exit 3
+  for dup in $(printf '%s' "$1" | jq -r '.[1:][].number'); do
+    lines=$(recorded_lines "$(printf '%s' "$1" | jq -c --argjson n "$dup" '[.[] | select(.number == $n)]')" "$have") || exit 3
+    if [ -n "$lines" ]; then
+      record_on "$canonical" "$cstate" "$lines"
+      cstate=open
+      have=$(recorded_keys "$(printf '%s' "$1" | jq -c '[.[0]]')") || exit 3
+    fi
+    if [ "$(printf '%s' "$1" | jq -r --argjson n "$dup" '.[] | select(.number == $n) | .state')" = open ]; then
+      jq -n --arg c "$canonical" '{body: ("Duplicate of #\($c), opened by a concurrent run; its findings are recorded there.")}' \
+        >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
+      gh api -X POST "repos/$REPO/issues/$dup/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" >/dev/null \
+        && gh api -X PATCH "repos/$REPO/issues/$dup" -f state=closed -f state_reason=not_planned >/dev/null \
+        || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: recorded on #$canonical but cannot close duplicate #$dup" >&2; exit 3; }
+      rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
+    fi
+  done
+}
+
+# Item lines (with their markers) recorded in the given trackers whose keys are
+# not in the given key list.
+recorded_lines() { # trackers-json keys-json
+  local bodies n comments
+  bodies=$(printf '%s' "$1" | jq -c '[ .[].body ]') || return 1
+  for n in $(printf '%s' "$1" | jq -r '.[].number'); do
+    comments=$(read_array "repos/$REPO/issues/$n/comments?per_page=100") || return 1
+    bodies=$(printf '%s\n%s\n' "$bodies" "$comments" | jq -cs --arg rec "$RECORDER" \
+      '.[0] + [ .[1][] | select((.user.login // "") == $rec) | (.body // "") ]') || return 1
+  done
+  printf '%s\n%s\n' "$bodies" "$2" | jq -rs '.[1] as $have
+    | [ .[0][] | split("\n")[] | select(test("<!-- mergepath-late-codex-item: [^ ]+ -->"))
+        | select((capture("<!-- mergepath-late-codex-item: (?<k>[^ ]+) -->").k) as $k | $have | index($k) | not) ]
+    | unique | join("\n")'
 }
 
 # The recorder's trackers for one PR, lowest number first.
