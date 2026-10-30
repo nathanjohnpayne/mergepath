@@ -318,7 +318,16 @@ bind_canary_codex_review() {
     0) ;;
     5) log "Codex review is not enabled for ${REPO}#${PR}; no request, barrier unbound (#2771)"; return 0 ;;
     6) die 7 "Codex request refused on ${REPO}#${PR}: earlier review feedback is unaccounted — disposition it and rerun the audit (#2771)" ;;
-    7) log "Codex request cap is spent on ${REPO}#${PR}; barrier unbound, its cap path decides (#2771)"; return 0 ;;
+    7)
+      # The requester's exit 7 has two kinds (Phase 4b on #2875). A spent
+      # blocking-review budget is a human stop: dispatching unbound could let
+      # the barrier run out into exit 4, which fans out. Only a spent request
+      # ceiling defers to the barrier's own cap path. Anything else is unknown.
+      case "$(printf '%s' "$out" | jq -r '.cap_exhausted.kind // empty' 2>/dev/null || true)" in
+        request-ceiling) log "Codex request ceiling is spent on ${REPO}#${PR}; barrier unbound, its cap path decides (#2771)"; return 0 ;;
+        blocking-reviews) die 8 "Codex blocking-review budget is spent on ${REPO}#${PR}: a human stop, so no review runs and nothing fans out (#2771)" ;;
+        *) die 3 "codex-review-request.sh exit 7 on ${REPO}#${PR} names no known cap kind (#2771)" ;;
+      esac ;;
     *) die 3 "Codex request on canary ${REPO}#${PR} failed (codex-review-request.sh exit $rc) (#2771)" ;;
   esac
   # Not `// empty`: jq's alternative operator treats false like null.
