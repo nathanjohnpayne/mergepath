@@ -752,9 +752,8 @@ rm -f "$KEY_PATH"
 
 ### Rotating a Firebase deploy SA key
 
-The SA key remains the legacy resolver's configured source per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical); this does not authorize production deployment. Review its age on a 90-day cadence and after any of these triggers; routine replacement remains incomplete until the non-deploying validator below is available:
+The SA key remains the legacy resolver's configured source per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical); this does not authorize production deployment. Review it after any of these triggers; routine replacement remains incomplete until the non-deploying validator below is available:
 
-- **Calendar review** — review key age every 90 days and track the last completed rotation in the 1Password item's notes field.
 - **Compromise indicator** — key leaked in logs/screenshots, exposed by a misconfigured CI runner, or invalidated by org policy. Treat this as an urgent owner-led incident decision; this routine-rotation guide neither authorizes revocation nor requires a production deployment to validate or contain the incident.
 - **Personnel change affecting key custody** — a maintainer with 1Password vault access leaves, or vault membership changes.
 
