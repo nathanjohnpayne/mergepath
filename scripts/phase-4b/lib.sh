@@ -2169,6 +2169,19 @@ p4b_codex_summary_versions() {
 # "no mention"; review-feedback-accounting.sh reads that shape the same way.
 # GraphQL logins drop the "[bot]" suffix, so the bot is compared without it.
 p4b_comment_mention_history() {
+  local snap
+  snap="$(p4b_comment_history_snapshot "$@")"
+  printf '%s' "$snap" | jq -c 'if type == "object" then .mentions else null end' 2>/dev/null || printf 'null\n'
+}
+
+# p4b_comment_history_snapshot <repo> <pr> <bot>
+# The one GraphQL read behind p4b_comment_mention_history:
+# {mentions: <that map>, counts: {"<databaseId>": <edit count>}} for every
+# non-bot comment, or `null` when anything is unreadable. An edit count
+# changes with every edit, including two inside one second that REST
+# updated_at cannot tell apart, so the counts are the binding's stability
+# evidence (p4b_wave_binding_stable; Phase 4b on #2888).
+p4b_comment_history_snapshot() {
   local repo="$1" pr="$2" bot="${3:-}" owner name pages query
   owner="${repo%%/*}"; name="${repo#*/}"
   query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{databaseId author{login} lastEditedAt userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}}}'
@@ -2179,7 +2192,10 @@ p4b_comment_mention_history() {
     [ .[] | .data.repository.pullRequest.comments | if type == "object" then . else error("page") end
       | .nodes[] ]
     | if all(.[]; (.databaseId | type) == "number") | not then error("ids") else . end
-    | [ .[] | select(((.author.login // "") | sub("\\[bot\\]$"; "")) != $bot)
+    | [ .[] | select(((.author.login // "") | sub("\\[bot\\]$"; "")) != $bot) ]
+    | if all(.[]; (.userContentEdits.totalCount | type) == "number") | not then error("counts") else . end
+    | {counts: ([ .[] | {key: (.databaseId | tostring), value: .userContentEdits.totalCount} ] | from_entries),
+       mentions: ([ .[]
         | select(.lastEditedAt != null or ((.userContentEdits.totalCount // 0) > 0))
         | .userContentEdits as $e
         | if ($e | type) != "object" or ($e.nodes | type) != "array" or $e.totalCount != ($e.nodes | length)
@@ -2187,7 +2203,7 @@ p4b_comment_mention_history() {
           then error("history")
           else {key: (.databaseId | tostring),
                 value: ([ $e.nodes[] | select(.diff | test("@codex"; "i")) | .editedAt ] | min)} end ]
-    | from_entries' 2>/dev/null \
+        | from_entries)}' 2>/dev/null \
     || printf 'null\n'
 }
 
@@ -2220,7 +2236,7 @@ p4b_wave_binding_request_view() {
 # moved, while they ran was not in the evidence (Phase 4b on #2888). An
 # unreadable comment list is `unreadable`.
 p4b_wave_binding_evaluate() {
-  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic historic_after view result
+  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic historic_after snap_after view result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   if ! command -v gh_api_array >/dev/null 2>&1 \
@@ -2241,7 +2257,8 @@ p4b_wave_binding_evaluate() {
   # both comment reads, but its revision is in this history (Phase 4b on
   # #2888). Only mentioning entries are compared, so CodeRabbit re-editing a
   # comment that never mentioned Codex changes nothing.
-  historic_after="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
+  snap_after="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  historic_after="$(printf '%s' "$snap_after" | jq -c 'if type == "object" then .mentions else null end' 2>/dev/null || printf null)"
   view="$(p4b_wave_binding_request_view "$after" "$bot" "$historic")"
   if [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" != "$view" ] \
      || ! printf '%s' "$comments" | jq -e --argjson h "$historic" '([ .[].id | tostring ]) as $ids | all($h | keys[]; . as $k | $ids | index($k))' >/dev/null 2>&1 \
@@ -2250,42 +2267,28 @@ p4b_wave_binding_evaluate() {
     printf '%s' "$result" | jq -c 'del(.generation) + {state:"hold",reason:"requests-changed-during-evaluation"}'
     return 0
   fi
-  # A clear carries what its final reads saw, so a later cheap check
-  # (p4b_wave_binding_stable) can tell whether a request has moved since:
-  # the request view, the mention history, and every comment's edit time.
-  printf '%s' "$result" | jq -c --argjson v "$view" --argjson h "$historic" --argjson s "$(p4b_wave_binding_edit_stamps "$after" "$bot")" \
-    '. + {stability: {view: $v, historic: $h, stamps: $s}}'
-}
-
-# p4b_wave_binding_edit_stamps <comments-json> <bot> -> {"<id>": "<updated_at>"}
-# for every comment not by Codex's bot.
-p4b_wave_binding_edit_stamps() {
-  printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" \
-    '[ .[] | select((.user.login // "") != $bot) | {key: (.id | tostring), value: (.updated_at // "")} ] | from_entries' 2>/dev/null
+  # A clear carries the edit count of every comment its final read saw, so
+  # a later one-read check (p4b_wave_binding_stable) can tell whether any
+  # comment appeared or was edited since.
+  printf '%s' "$result" | jq -c --argjson s "$snap_after" '. + {stability: {counts: $s.counts}}'
 }
 
 # p4b_wave_binding_stable <repo> <pr> <stability-json>
-# One comment read, compared with the view a clear's final reads saw
-# (p4b_wave_binding_evaluate's .stability). Exit 0 only when they match: the
-# orchestrator runs the full evaluation inside its feedback-accounting fences
-# and this at the POST (Phase 4b on #2888). A comment edited since, of any
-# body, may have gained and lost a mention in between, so any changed edit
-# time costs one mention-history read whose mentioning entries must still
-# match (Codex on #2888); an unchanged comment list costs nothing more.
-# Missing stability, an unreadable read, or any change returns 1.
+# One GraphQL read of every comment's edit count, compared with what a
+# clear's final read saw (p4b_wave_binding_evaluate's .stability.counts).
+# Exit 0 only when the same comments exist with the same counts: the
+# orchestrator runs the full evaluation inside its feedback-accounting
+# fences and only this at the POST (Phase 4b on #2888). Any new or edited
+# comment, of any body, may carry or have carried a mention, and a count
+# moves even for edits inside one second, so any change returns 1, as do
+# missing stability and an unreadable read. A request that moved is not
+# re-evaluated here; the run holds and a rerun decides on fresh evidence.
 p4b_wave_binding_stable() {
-  local repo="$1" pr="$2" stability="${3:-}" bot comments historic view stamps now
+  local repo="$1" pr="$2" stability="${3:-}" bot counts now
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
-  view="$(printf '%s' "$stability" | jq -ce '.view | objects' 2>/dev/null)" || return 1
-  historic="$(printf '%s' "$stability" | jq -ce '.historic | objects' 2>/dev/null)" || return 1
-  stamps="$(printf '%s' "$stability" | jq -ce '.stamps | objects' 2>/dev/null)" || return 1
-  command -v gh_api_array >/dev/null 2>&1 || return 1
-  comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request stability" 2>/dev/null)" || return 1
-  [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" = "$view" ] || return 1
-  [ "$(p4b_wave_binding_edit_stamps "$comments" "$bot")" = "$stamps" ] && return 0
-  now="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
-  jq -en --argjson a "$historic" --argjson b "${now:-null}" \
-    '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1
+  counts="$(printf '%s' "$stability" | jq -ce '.counts | objects' 2>/dev/null)" || return 1
+  now="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  jq -en --argjson a "$counts" --argjson b "${now:-null}" '($b | type) == "object" and $b.counts == $a' >/dev/null 2>&1
 }
 
 # p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>

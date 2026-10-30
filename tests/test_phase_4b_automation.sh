@@ -6463,9 +6463,12 @@ _wbs() { # <second-comments-json> [history-json] -> evaluate state/reason
     }
     p4b_codex_summary_versions() { printf '[]\n'; }
     _wbs_hcount="$(mktemp "${TMPDIR:-/tmp}/wbs-hcount.XXXXXX")"
-    p4b_comment_mention_history() {
-      local n; n=$(( $(cat "$_wbs_hcount" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$_wbs_hcount"
-      if [ "$n" = 1 ]; then printf '%s\n' "$_wbs_history"; else printf '%s\n' "$_wbs_history2"; fi
+    # Both history reads go through the snapshot (the first through
+    # p4b_comment_mention_history); counts matter only to stability.
+    p4b_comment_history_snapshot() {
+      local n h; n=$(( $(cat "$_wbs_hcount" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$_wbs_hcount"
+      if [ "$n" = 1 ]; then h="$_wbs_history"; else h="$_wbs_history2"; fi
+      jq -nc --argjson h "$h" 'if $h == null then null else {mentions: $h, counts: {}} end'
     }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     _wbs_first="[$_WB_R,$(jq -nc '{id:800,user:{login:"coderabbitai[bot]"},body:"summary",created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:00:00Z"}')]"
@@ -6499,7 +6502,7 @@ _wbs_hist701='{"id":701,"user":{"login":"someone"},"body":"thanks","created_at":
       else printf '%s' "[$_WB_R,$(printf '%s' "$_wbs_hist701" | jq -c '.updated_at = "2026-10-29T12:10:00Z"')]"; fi
     }
     p4b_codex_summary_versions() { printf '[]\n'; }
-    p4b_comment_mention_history() { printf '%s\n' '{"701":"2026-10-29T11:00:00Z"}'; }
+    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"701":"2026-10-29T11:00:00Z"},"counts":{}}'; }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r '"\(.state)/\(.reason)"'
     rm -f "$_wbs_count"
@@ -6526,42 +6529,40 @@ _wbs_ev_src="$(sed -n '/^p4b_wave_binding_evaluate() {/,/^}/p' "$LIB")"
     eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="'"'"'($b | type) == \"object\" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))'"'"'"; assert s.count(o)==1; print(s.replace(o,"true"))' <<<"$_wbs_ev_src")"
     _wbs "[$_WB_R,$_wbs_cr800]" '{"800":null}' '{"800":"2026-10-29T12:10:00Z"}'
   ) )" = clear/bound-request-answered ] || bad="$bad [mutant-final-history-not-load-bearing]"
-# A clear carries what its final reads saw; p4b_wave_binding_stable compares
-# one later comment read with it.
+# A clear carries the edit count of every comment its final read saw;
+# p4b_wave_binding_stable compares one later read with it.
 _wbs_clear="$( (
     gh_api_array() { printf '%s' "[$_WB_R,$_wbs_cr800]"; }
     p4b_codex_summary_versions() { printf '[]\n'; }
-    p4b_comment_mention_history() { printf '%s\n' '{"800":null}'; }
+    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"800":null},"counts":{"501":0,"800":1}}'; }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501
   ) )"
 _wbs_stab="$(printf '%s' "$_wbs_clear" | jq -c '.stability')"
-printf '%s' "$_wbs_stab" | jq -e '.view.requests == [{"id":501,"updated_at":"2026-10-29T12:00:00Z"}] and .historic == {"800":null}
-    and .stamps == {"501":"2026-10-29T12:00:00Z","800":"2026-10-29T12:00:00Z"}' >/dev/null \
-  || bad="$bad [clear-without-stability:$_wbs_clear]"
-_wbst() { # <comments-json> <stability-json> [history-now] -> stable|moved
-  ( gh_api_array() { printf '%s' "$_wbst_c"; }; _wbst_c="$1"
-    p4b_comment_mention_history() { printf '%s\n' "$_wbst_h"; }; _wbst_h="${3:-{\"800\":null\}}"
+[ "$_wbs_stab" = '{"counts":{"501":0,"800":1}}' ] || bad="$bad [clear-without-stability:$_wbs_clear]"
+# The real reader: every non-bot comment's edit count, edited or not.
+[ "$( ( gh() { _wbh_page "[$(_wbh_node 501 nathanjohnpayne null '[]'),$(_wbh_node 800 coderabbitai null '["a","b"]'),$(_wbh_node 900 chatgpt-codex-connector null '[]')]"; }
+        p4b_comment_history_snapshot owner/repo 7 'chatgpt-codex-connector[bot]' | jq -c .counts ) )" = '{"501":0,"800":2}' ] \
+  || bad="$bad [snapshot-counts-wrong]"
+_wbst() { # <snapshot-now-json> <stability-json> -> stable|moved
+  ( p4b_comment_history_snapshot() { printf '%s\n' "$_wbst_now"; }; _wbst_now="$1"
     if p4b_wave_binding_stable owner/repo 7 "$2"; then echo stable; else echo moved; fi )
 }
-# Codex on #2888: a plain comment that gained and lost a mention after the
-# final evaluation keeps its body but not its edit time; the history read
-# that a changed edit time costs holds its revision.
-[ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" '{"800":"2026-10-29T12:29:00Z"}')" = moved ] \
-  || bad="$bad [stable-mention-added-and-removed-missed]"
-[ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" null)" = moved ] \
-  || bad="$bad [stable-history-unreadable-passed]"
-# The mutation that skips the history read for a changed edit time passes it.
+[ "$(_wbst '{"mentions":{},"counts":{"501":0,"800":1}}' "$_wbs_stab")" = stable ] || bad="$bad [stable-unchanged-moved]"
+# Direct Phase 4b review on #2888: a comment that gains and loses a mention
+# inside one second keeps its REST updated_at and body; its edit count still
+# moves, and the read that sees it is the only one after final accounting.
+[ "$(_wbst '{"mentions":{},"counts":{"501":0,"800":3}}' "$_wbs_stab")" = moved ] || bad="$bad [stable-same-second-edit-missed]"
+# A new comment, edited or not, is new evidence.
+[ "$(_wbst '{"mentions":{},"counts":{"501":0,"800":1,"903":0}}' "$_wbs_stab")" = moved ] || bad="$bad [stable-new-comment-missed]"
+[ "$(_wbst '{"mentions":{},"counts":{"501":0,"800":1}}' '')" = moved ] || bad="$bad [stable-without-evidence-passed]"
+[ "$(_wbst null "$_wbs_stab")" = moved ] || bad="$bad [stable-unreadable-passed]"
+# The mutation that drops the count comparison passes the same-second edit.
 [ "$( (
-    eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="[ \"$(p4b_wave_binding_edit_stamps \"$comments\" \"$bot\")\" = \"$stamps\" ] && return 0"; assert s.count(o)==1; print(s.replace(o,"return 0"))' \
+    eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="$b.counts == $a"; assert s.count(o)==1; print(s.replace(o,"true"))' \
       <<<"$(sed -n '/^p4b_wave_binding_stable() {/,/^}/p' "$LIB")")"
-    _wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" '{"800":"2026-10-29T12:29:00Z"}'
-  ) )" = stable ] || bad="$bad [mutant-stable-edit-stamps-not-load-bearing]"
-[ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab")" = stable ] || bad="$bad [stable-coderabbit-edit-moved]"
-[ "$(_wbst "[$_WB_R,$_wbs_cr800,$(_wb_req 903 someone 2026-10-29T12:30:00Z)]" "$_wbs_stab")" = moved ] || bad="$bad [stable-new-request-missed]"
-[ "$(_wbst "[$_WB_R,$_wbs_cr800]" '')" = moved ] || bad="$bad [stable-without-evidence-passed]"
-[ "$( ( gh_api_array() { return 1; }; if p4b_wave_binding_stable owner/repo 7 "$_wbs_stab"; then echo stable; else echo moved; fi ) )" = moved ] \
-  || bad="$bad [stable-unreadable-passed]"
+    _wbst '{"mentions":{},"counts":{"501":0,"800":3}}' "$_wbs_stab"
+  ) )" = stable ] || bad="$bad [mutant-stable-counts-not-load-bearing]"
 
 # Barrier integration through the production arm. The diagnostic stub exits
 # 0 (Codex spoke on this head) throughout: unbound, that alone opens. The
