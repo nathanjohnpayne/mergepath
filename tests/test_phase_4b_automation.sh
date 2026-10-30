@@ -7922,6 +7922,30 @@ else
   fail "#814: barrier hold path wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
 fi
 
+# #2879: an escalated barrier falls back with exit 4 and carries its evidence
+# (reason, Codex arm and evidence, wave binding) in the summary, so the wave
+# audit can say why it holds. Evidence only: no review is posted.
+printf '#!/bin/sh\nexit 3\n' >"$WORK/stub-cx-error.sh"
+chmod +x "$WORK/stub-cx-error.sh"
+: >"$HANDOFF_LOG"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-error.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 814 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && printf '%s' "$out" | jq -e '.fell_back_to_manual == true and .review_posted == false
+     and (.barrier_escalation | type == "object")
+     and (.barrier_escalation.reason | contains("codex signal check exited 3"))
+     and .barrier_escalation.codex == "escalate"
+     and (.barrier_escalation | has("codex_evidence") and has("wave_binding"))' >/dev/null; then
+  pass "#2879: an escalated barrier's exit 4 summary carries barrier_escalation evidence"
+else
+  fail "#2879: exit 4 summary lacks barrier_escalation (rc=$rc): $out"
+fi
+
 # #1305 orchestrator contract: cap exhaustion has its own terminal exit and
 # cannot dispatch the adapter or render the authority-bearing Phase 4b handoff.
 cat >"$WORK/policy-cap-stop.yml" <<'EOF'

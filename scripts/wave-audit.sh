@@ -51,10 +51,22 @@
 #           canary. The superseded canary PR takes the blocking review with
 #           it, so no review-dismissal choreography is needed.
 #   exit 4/5  reviewer unavailable (adapter error, timeout, quota, or
-#           automation disabled). NO tag is written. The wave may proceed
-#           fail-open on CI + lane; the un-audited range chains into the
-#           NEXT wave audit automatically, because the watermark only
-#           advances on a posted APPROVED (or a scope-empty range).
+#           automation disabled). NO tag is written. Under the default
+#           propagation_audit.unavailable_policy: fail-open the wave may
+#           proceed fail-open on CI + lane; the un-audited range chains into
+#           the NEXT wave audit automatically, because the watermark only
+#           advances on a posted APPROVED (or a scope-empty range). Under
+#           `hold` these exits never reach the caller: see 11 and 12 (#2879).
+#   exit 11 held (unavailable_policy: hold). No independent audit happened:
+#           the reviewer was unavailable (exit 4, 5 or an unmapped exit).
+#           A wave-audit-hold/<head>/<base>/<n> tag records attempt n. No
+#           watermark; do NOT fan out. Rerun the same command later.
+#   exit 12 needs-owner (unavailable_policy: hold). Attempt n reached
+#           hold_max_attempts. Terminal: later runs exit 12 without asking
+#           Codex or dispatching a review. Do NOT fan out. Recovery is
+#           manual for now: the owner fans the wave out by hand under
+#           break-glass. A scripted owner release is #2900; until it lands
+#           and the owner's demonstration passes, the switch stays off.
 #   exit 3  fail-closed, never fan out on this: usage/config error, a canary
 #           whose head is not lane-verified (#663 P1 — the range-scoped
 #           APPROVED is only sound over a byte-verified mirror), or an
@@ -95,6 +107,8 @@
 #   scope_exclude_prefixes:      # manifest path prefixes skipped in the diff
 #     - tests/
 #     - docs/
+#   unavailable_policy: fail-open  # fail-open | hold (#2879)
+#   hold_max_attempts: 3         # [1, 10]; holds per range before needs-owner
 # Invalid values fail closed (exit 3). Measured basis for the defaults
 # (#662): xhigh DNFs the 900s adapter cap on a catch-up-sized wave diff,
 # while high cleared the same 745 KB diff in 231s; steady-state wave ranges
@@ -118,6 +132,8 @@
 #                             scripts/codex-review-request.sh)
 #   WAVE_AUDIT_CODEX_CHECK    Codex signal check (default:
 #                             scripts/codex-review-check.sh)
+#   WAVE_AUDIT_COMMENT_CMD    wrapper that posts hold records on the canary
+#                             (default: scripts/gh-as-reviewer.sh)
 #   WAVE_AUDIT_GH             gh used for the canary comment and commit reads
 #                             (default: gh)
 #   WAVE_AUDIT_TEST_CANARY_HEAD  canary head when WAVE_AUDIT_LANE_VERIFIED_OK=1
@@ -136,8 +152,10 @@ ORCH="${WAVE_AUDIT_ORCHESTRATOR:-$ROOT/scripts/phase-4b-review.sh}"
 CODEX_REQUEST="${WAVE_AUDIT_CODEX_REQUEST:-$ROOT/scripts/codex-review-request.sh}"
 CODEX_CHECK="${WAVE_AUDIT_CODEX_CHECK:-$ROOT/scripts/codex-review-check.sh}"
 WA_GH="${WAVE_AUDIT_GH:-gh}"
+COMMENT_CMD="${WAVE_AUDIT_COMMENT_CMD:-$ROOT/scripts/gh-as-reviewer.sh}"
 TAG_PREFIX="wave-audit-pass"
 PREFIX_TAG_PREFIX="wave-audit-prefix"
+HOLD_TAG_PREFIX="wave-audit-hold"
 
 log() { printf '[wave-audit] %s\n' "$*" >&2; }
 die() { local rc="$1"; shift; printf '[wave-audit] ERROR: %s\n' "$*" >&2; exit "$rc"; }
@@ -406,6 +424,21 @@ case "$TIMEOUT" in ''|*[!0-9]*) die 3 "invalid propagation_audit.timeout_seconds
 DIFF_MAX="$(audit_field diff_max_bytes)"; DIFF_MAX="${DIFF_MAX:-800000}"
 case "$DIFF_MAX" in ''|*[!0-9]*) die 3 "invalid propagation_audit.diff_max_bytes '$DIFF_MAX'" ;; esac
 { [ "$DIFF_MAX" -ge 4096 ] && [ "$DIFF_MAX" -le 10485760 ]; } || die 3 "propagation_audit.diff_max_bytes out of range [4096,10485760]: $DIFF_MAX"
+# #2879: only `hold` turns the switch on, and only then are its keys
+# validated, so a switch-off run never fails on them (default-off is inert).
+# Any other value reads as fail-open.
+UNAVAILABLE_POLICY="$(audit_field unavailable_policy)"
+case "${UNAVAILABLE_POLICY:-fail-open}" in
+  hold|fail-open) ;;
+  *) log "WARNING: propagation_audit.unavailable_policy '$UNAVAILABLE_POLICY' is not hold; treating it as fail-open" ;;
+esac
+[ "$UNAVAILABLE_POLICY" = hold ] || UNAVAILABLE_POLICY=fail-open
+HOLD_MAX=3
+if [ "$UNAVAILABLE_POLICY" = hold ]; then
+  HOLD_MAX="$(audit_field hold_max_attempts)"; HOLD_MAX="${HOLD_MAX:-3}"
+  case "$HOLD_MAX" in ''|*[!0-9]*) die 3 "invalid propagation_audit.hold_max_attempts '$HOLD_MAX'" ;; esac
+  { [ "$HOLD_MAX" -ge 1 ] && [ "$HOLD_MAX" -le 10 ]; } || die 3 "propagation_audit.hold_max_attempts out of range [1,10]: $HOLD_MAX"
+fi
 EXCLUDES="$(audit_list scope_exclude_prefixes)"
 [ -n "$EXCLUDES" ] || EXCLUDES="$(printf 'tests/\ndocs/')"
 
@@ -907,6 +940,122 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
       dry_run:$dry} + $ao'
 }
 
+# --- held waves (#2879) --------------------------------------------------------
+# Under unavailable_policy: hold, "no independent audit happened" holds the
+# fan-out instead of failing open. Each hold is an annotated tag
+#   wave-audit-hold/<head>/<base>/<n>
+# on origin: only hub writers can create one, every checkout counts the same
+# set, and counting records never compares clocks. The count decides only when
+# retrying stops; it grants nothing. A canary comment makes each hold visible
+# on the PR; the tag is the state.
+HOLD_REF_PREFIX="refs/tags/${HOLD_TAG_PREFIX}/${HEAD_FULL}/${BASE_FULL}"
+
+# hold_count — holds recorded on origin for this exact range. A failed read
+# exits 3: a fresh counter would restart the bound.
+hold_count() {
+  local refs
+  refs="$(git -C "$REPO_DIR" ls-remote --refs --tags origin "${HOLD_REF_PREFIX}/*" 2>/dev/null)" \
+    || die 3 "could not list ${HOLD_TAG_PREFIX}/* holds from origin (#2879)"
+  printf '%s\n' "$refs" | awk -v p="${HOLD_REF_PREFIX}/" '
+    { ref = $2; if (index(ref, p) == 1) { n = substr(ref, length(p) + 1); if (n ~ /^[1-9][0-9]*$/) c++ } }
+    END { print c + 0 }'
+}
+
+# needs-owner recovery is manual until #2900 lands: no release command exists,
+# so none is printed.
+MANUAL_RECOVERY="No scripted recovery exists yet: the owner fans this wave out by hand under break-glass, recording it in the wave tracker. A scripted owner release is tracked in %s"
+recovery_text() { printf "$MANUAL_RECOVERY" "https://github.com/nathanjohnpayne/mergepath/issues/2900"; }
+
+# post_canary_record <body-file> — posts through the reviewer wrapper and
+# prints the comment URL. Returns non-zero on failure; callers decide.
+post_canary_record() {
+  "$COMMENT_CMD" -- gh pr comment "$PR" --repo "$REPO" --body-file "$1" | tail -n 1 # NO_BARE_GH_WRITE_EXEMPT: COMMENT_CMD defaults to scripts/gh-as-reviewer.sh, which verifies the reviewer token; tests inject a fake.
+  return "${PIPESTATUS[0]}"
+}
+
+# hold_json <state> <attempt> <reason-json> <comment-url> — the hold object.
+hold_json() {
+  jq -nc --arg state "$1" --argjson attempt "$2" --argjson max "$HOLD_MAX" \
+    --argjson why "$3" --arg url "$4" --arg recovery "$(recovery_text)" \
+    '$why + {policy:"hold", attempt:$attempt, max_attempts:$max,
+      hold_comment_url:(if $url == "" then null else $url end),
+      recovery:(if $state == "needs-owner" then {mode:"manual", detail:$recovery} else null end)}'
+}
+
+# emit_held_json <orch-exit> <state> <hold-json>
+emit_held_json() {
+  emit_json "$1" false null | jq --arg state "$2" --argjson hold "$3" \
+    '. + {audit_state:$state, audited:false, fanout_authorized:false, hold:$hold}'
+}
+
+# orchestrator_hold_reason <orch-exit> — the reason the orchestrator gave, as
+# evidence only: its last summary record and the barrier escalation it carried
+# (#2771 binding: wave_binding names the bound request, the requests and runs
+# it paired). Missing evidence reads as null, never as a guess.
+orchestrator_hold_reason() {
+  jq -sc --argjson orc "$1" --arg bound "${WAVE_CODEX_BOUND:-}" '
+    (map(select(type == "object")) | last // {}) as $s
+    | {orchestrator_exit:$orc,
+       reason:($s.reason // "unknown"),
+       codex_evidence:($s.barrier_escalation.codex_evidence // $s.codex_evidence // null),
+       codex_binding:(if $bound == "" then null
+         else {request:$bound} + ($s.barrier_escalation.wave_binding // {}) end),
+       barrier_escalation:($s.barrier_escalation // null),
+       retry_after:($s.retry_after // null)}' "$ORCH_OUTPUT" 2>/dev/null \
+    || jq -nc --argjson orc "$1" '{orchestrator_exit:$orc, reason:"unknown", codex_evidence:null,
+         codex_binding:null, barrier_escalation:null, retry_after:null}'
+}
+
+# record_hold <orch-exit> — the held arm. Records attempt n, posts the canary
+# record and exits 11 (held) or 12 (needs-owner). Never writes a watermark.
+record_hold() {
+  local orc="$1" n tag why state rc note url="" body
+  why="$(orchestrator_hold_reason "$orc")"
+  n="$(hold_count)" || exit "$?"
+  n=$((n + 1))
+  state=held; rc=11
+  [ "$n" -lt "$HOLD_MAX" ] || { state=needs-owner; rc=12; }
+  tag="${HOLD_TAG_PREFIX}/${HEAD_FULL}/${BASE_FULL}/${n}"
+  note="$(mktemp "${TMPDIR:-/tmp}/wave-audit-hold.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$note"
+  printf '%s' "$why" | jq --arg repo "$REPO" --argjson pr "$PR" --arg canary "${pr_head:-}" \
+    --argjson n "$n" --argjson max "$HOLD_MAX" --arg state "$state" \
+    '{version:1, kind:"wave-audit-hold", audited:false, state:$state, attempt:$n,
+      max_attempts:$max, canary:{repo:$repo, pr:$pr, head:$canary}} + .' > "$note"
+  revalidate_canary_pair "recording a held wave"
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
+    git -C "$REPO_DIR" tag -a -f "$tag" -F "$note" "$HEAD_FULL" >/dev/null \
+    || die 3 "could not write hold record $tag — no audit happened; do NOT fan out"
+  git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
+    || die 3 "could not push hold record $tag — no audit happened; do NOT fan out, rerun to record the hold"
+  body="$(mktemp "${TMPDIR:-/tmp}/wave-audit-hold-body.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$body"
+  {
+    printf '## Wave audit held: no independent audit was performed\n\n'
+    printf 'The Phase 4b reviewer was unavailable (orchestrator exit %s), so this wave is **held**. Do not fan out.\n\n' "$orc"
+    printf -- '- Range: `%s..%s`\n' "$BASE_FULL" "$HEAD_FULL"
+    printf -- '- Attempt %s of %s (state: `%s`)\n' "$n" "$HOLD_MAX" "$state"
+    printf -- '- Reason: %s\n' "$(printf '%s' "$why" | jq -r '.reason' | tr -d '<>')"
+    printf -- '- Codex evidence: `%s`\n' "$(printf '%s' "$why" | jq -r '.codex_evidence // "none"' | tr -d '<>`')"
+    if [ "$state" = needs-owner ]; then
+      printf '\nRetries are exhausted. %s\n' "$(recovery_text)"
+    else
+      printf '\nRerun the same `scripts/wave-audit.sh` command later.\n'
+    fi
+    printf '\n<!-- mergepath-wave-audit-hold:v1 %s -->\n' "$(jq -c . "$note" | sed 's/-/\\u002d/g')"
+  } > "$body"
+  url="$(post_canary_record "$body")" \
+    || { url=""; log "WARNING: hold $tag is recorded, but the canary comment failed to post"; }
+  emit_held_json "$orc" "$state" "$(hold_json "$state" "$n" "$why" "$url")"
+  if [ "$state" = needs-owner ]; then
+    log "reviewer unavailable (orchestrator exit $orc) — wave HELD, attempt $n of $HOLD_MAX: needs owner. No independent audit was performed; no watermark; do NOT fan out."
+    log "$(recovery_text)"
+  else
+    log "reviewer unavailable (orchestrator exit $orc) — wave HELD, attempt $n of $HOLD_MAX. No independent audit was performed; no watermark; do NOT fan out. Rerun the same command later."
+  fi
+  exit "$rc"
+}
+
 if [ "$FINALIZE_HISTORICAL" = true ]; then
   [ "$PREFIX_BASE" = "$HEAD_FULL" ] \
     || die 3 "historical coverage is incomplete: retained through $PREFIX_BASE, intended head is $HEAD_FULL"
@@ -1034,6 +1183,20 @@ if [ "$BYTES" -eq 0 ] && [ "$HISTORICAL" = false ]; then
     emit_json null true '"empty-scope"'
   fi
   exit 0
+fi
+
+# --- held waves: terminal state (#2879) ---------------------------------------
+# Only a run that could publish consults the hold. A needs-owner range never
+# asks Codex or dispatches a review again: that is the bound.
+if [ "$UNAVAILABLE_POLICY" = hold ] && [ "$DRY_RUN" = false ] && [ -z "$HISTORICAL_END" ]; then
+  HOLDS="$(hold_count)" || exit "$?"
+  if [ "$HOLDS" -ge "$HOLD_MAX" ]; then
+    emit_held_json null needs-owner "$(hold_json needs-owner "$HOLDS" \
+      '{"orchestrator_exit":null,"reason":"hold attempts exhausted","codex_evidence":null,"codex_binding":null,"barrier_escalation":null,"retry_after":null}' "")"
+    log "wave HELD: ${HOLDS} of ${HOLD_MAX} attempts recorded for ${BASE_FULL}..${HEAD_FULL} — needs owner. No review was dispatched; no watermark; do NOT fan out."
+    log "$(recovery_text)"
+    exit 12
+  fi
 fi
 
 # --- dispatch the scoped review ----------------------------------------------
@@ -1166,6 +1329,14 @@ else
 fi
 
 if [ "$FINALIZE_HISTORICAL" = true ] && [ "$orc" -ne 0 ]; then
+  # #2879: finalization publishes, so under hold an unavailable reviewer
+  # holds it like an ordinary wave.
+  if [ "$UNAVAILABLE_POLICY" = hold ] && [ "$DRY_RUN" = false ]; then
+    case "$orc" in
+      1|3|6|7|8|10) ;;
+      *) record_hold "$orc" ;;
+    esac
+  fi
   emit_json "$orc" false null
   log "historical finalization did not approve (orchestrator exit $orc) — full watermark unchanged; do NOT fan out or treat retained prefixes as clearance"
   exit "$orc"
@@ -1178,7 +1349,11 @@ case "$orc" in
       emit_json 0 false null
     else
       advance_watermark
-      emit_json 0 true null
+      if [ "$UNAVAILABLE_POLICY" = hold ]; then
+        emit_json 0 true null | jq '. + {audit_state:"approved", audited:true, fanout_authorized:true}'
+      else
+        emit_json 0 true null
+      fi
       log "APPROVED posted — fan out (mirrors merge on CI + lane; open them with --coderabbit-ignore, no @codex trigger)"
     fi
     ;;
@@ -1220,7 +1395,15 @@ case "$orc" in
     log "request-budget evidence failed on ${REPO}#${PR} (orchestrator exit 10) — no watermark; do NOT fan out or render a Phase 4b handoff; repair the read/head drift and retry"
     ;;
   *)
+    # #2879: under hold, a dry run still previews only; a publishing run holds.
+    if [ "$UNAVAILABLE_POLICY" = hold ] && [ "$DRY_RUN" = false ]; then
+      record_hold "$orc"
+    fi
     emit_json "$orc" false null
+    if [ "$UNAVAILABLE_POLICY" = hold ]; then
+      log "dry run: reviewer unavailable (orchestrator exit $orc) — a publishing run would HOLD this wave (#2879); no hold recorded"
+      exit "$orc"
+    fi
     log "reviewer unavailable (orchestrator exit $orc) — no watermark; the wave may proceed on CI + lane and this range chains into the next audit"
     ;;
 esac
