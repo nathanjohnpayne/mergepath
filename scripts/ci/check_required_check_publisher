@@ -145,6 +145,8 @@ WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
 DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
 DUE_TEST="tests/test_required_check_publisher_due.sh"
+# #2907: the scheduled pass's orphaned-hold reaper and its call site.
+REAPER_TEST="tests/test_reap_orphaned_holds.sh"
 GENERATION_TEST="tests/test_required_check_generations.py"
 # #2286: the event-driven gate workflows read the installation budget through
 # the publisher's own reader (scripts/workflow/installation-budget.sh).
@@ -1393,6 +1395,15 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   fi
   if ! bash "$DUE_TEST"; then
     echo "check_required_check_publisher: FAIL (due-only targeting behavior suite)"
+    exit 1
+  fi
+  if [ ! -f "$REAPER_TEST" ]; then
+    echo "FAIL: $REAPER_TEST is missing; the orphaned-hold reaper (#2907) is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$REAPER_TEST"; then
+    echo "check_required_check_publisher: FAIL (orphaned-hold reaper suite)"
     exit 1
   fi
   if [ ! -f "$EVENT_BUDGET_TEST" ]; then

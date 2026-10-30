@@ -273,6 +273,11 @@ printf '\n' >> "$FIXTURE_LOG/gh.log"
 if [ "$*" = 'api --help' ]; then echo 'Usage: gh api <endpoint>'; exit 0; fi
 [ "${1:-}" = api ] || exit 90
 
+if [ "${2:-}" = -X ] && [ "${3:-}" = POST ] && [[ "${4:-}" == */rerun ]]; then
+  run="${4#repos/owner/repo/actions/runs/}"
+  printf 'rerun %s\n' "${run%/rerun}" >> "$FIXTURE_LOG/mutations.log"
+  exit 0
+fi
 if [ "${2:-}" = -X ] && [ "${3:-}" = POST ]; then
   endpoint="$4"
   head_sha=""
@@ -321,6 +326,14 @@ if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
     echo '{"total_count":0,"workflow_runs":[]}'
   elif [ "$RELAY_MODE" = pending ]; then
     echo '{"total_count":2,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"},{"id":502,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
+  elif [[ "$RELAY_MODE" == stalled* ]]; then
+    # #2907: 502 completed (four hours before the fixed clock, or at it for
+    # stalled-recent) and its relay never posted a terminal marker.
+    done_at=2025-12-31T20:00:00Z
+    [ "$RELAY_MODE" != stalled-recent ] || done_at=2026-01-01T00:00:00Z
+    jq -cn --arg done "$done_at" '{total_count:2,workflow_runs:[
+      {id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:"2025-12-31T19:00:00Z"},
+      {id:502,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:$done}]}'
   else
     echo '{"total_count":1,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
   fi
@@ -334,8 +347,38 @@ if [ "$endpoint" = --paginate ] && [ "${3:-}" = repos/owner/repo/issues/1/commen
   fi
   exit 0
 fi
+# #2907 stalled-relay recovery: relay history, the failed relay's job log
+# (bound to its source by the runner-rendered env block), and the re-run.
+if [[ "$*" == *"repos/owner/repo/actions/workflows/codex-feedback-archive-relay.yml/runs?"* ]]; then
+  printf '%s\n' "$*" >> "$FIXTURE_LOG/relay-list.log"
+  attempt=1
+  [ "${RELAY_MODE:-empty}" != stalled-exhausted ] || attempt=3
+  case "${RELAY_MODE:-empty}" in
+    stalled-list-fails) exit 1 ;;
+    stalled-inflight) echo '[{"total_count":2,"workflow_runs":[{"id":698,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":"2025-12-31T20:00:30Z"},{"id":699,"status":"queued","created_at":"2025-12-31T23:00:00Z"}]}]' ;;
+    *) jq -cn --argjson attempt "$attempt" '[{total_count:2,workflow_runs:[
+         {id:697,status:"completed",conclusion:"success",run_attempt:1,created_at:"2025-12-31T19:59:00Z"},
+         {id:698,status:"completed",conclusion:"failure",run_attempt:$attempt,created_at:"2025-12-31T20:00:30Z"}]}]' ;;
+  esac
+  exit 0
+fi
+case "$*" in
+  'api repos/owner/repo/actions/runs/698/attempts/'*'/jobs')
+    echo '{"jobs":[{"id":6981}]}'; exit 0 ;;
+  'api repos/owner/repo/actions/jobs/6981/logs')
+    source=502
+    [ "${RELAY_MODE:-empty}" != stalled-unmatched ] || source=999
+    printf '%s\n' '2025-12-31T20:00:31Z ##[group]Run set -euo pipefail' \
+      '2025-12-31T20:00:31Z   shell: /usr/bin/bash -e {0}' \
+      '2025-12-31T20:00:31Z   env:' \
+      "2025-12-31T20:00:31Z     SOURCE_RUN_ID: $source" \
+      '2025-12-31T20:00:31Z ##[endgroup]'
+    exit 0 ;;
+esac
 case "${@: -1}" in
   repos/owner/repo/actions/workflows/codex-feedback-archive-relay.yml)
+    # #2907 jq noise: the verifier exits 2 when its workflow identity read fails.
+    [ "${RELAY_MODE:-empty}" != markers-fail ] || exit 1
     echo '{"id":89,"path":".github/workflows/codex-feedback-archive-relay.yml"}'; exit 0 ;;
   repos/owner/repo/actions/runs/900)
     echo '{"id":900,"workflow_id":89,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"owner/repo"}}'; exit 0 ;;
@@ -554,6 +597,94 @@ SH
     pass "relay $relay_mode inventory yields its verdict and continues the sweep"
   fi
 done
+
+# #2907: a relay that ended without a terminal marker (its own failure path
+# could not post `status=failed`) is re-run by the sweep, which still holds
+# the PR pending. A relay in flight, a recent source run, an exhausted or
+# unbindable relay, or unreadable relay history re-runs nothing.
+for relay_mode in stalled stalled-inflight stalled-recent stalled-list-fails stalled-unmatched stalled-exhausted; do
+  dir="$TMP/sweep-relay-$relay_mode"
+  make_sweep_fixture "$dir"
+  mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$ROOT/scripts/workflow/relay-stall-recovery.py" "$dir/scripts/workflow/"
+  cat > "$dir/scripts/workflow/feedback-archive-relay-source.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -c '{requires_relay:true,source_run_id:.id}'
+SH
+  chmod +x "$dir/scripts/workflow/feedback-archive-relay-source.sh"
+  cat > "$dir/bin/date" <<'SH'
+#!/usr/bin/env bash
+case "${@: -1}" in
+  +%s) echo 1767225600 ;;
+  +%Y-%m-%dT%H:%M:%SZ) echo 2026-01-01T00:00:00Z ;;
+  *) exit 92 ;;
+esac
+SH
+  chmod +x "$dir/bin/date"
+  rc=$(run_sweep "$dir" relay-fork stable "$relay_mode")
+  reruns=$(grep -c '^rerun ' "$dir/mutations.log" || true)
+  if [ "$rc" -ne 0 ]; then
+    fail "relay $relay_mode is not an infrastructure error" "sweep exited $rc: $(tail -5 "$dir/out")"
+  elif ! grep -Fxq 'close lease-1 failure' "$dir/mutations.log" \
+    || grep -Fxq 'gate 1' "$dir/gate.log" \
+    || ! grep -Fq 'relay is still pending' "$dir/summary-lease-1.log"; then
+    fail "relay $relay_mode keeps its PR pending" "$(cat "$dir/mutations.log")"
+  elif ! grep -Fxq 'close lease-2 success' "$dir/mutations.log"; then
+    fail "relay $relay_mode preserves later PR evaluation"
+  elif [ "$relay_mode" = stalled ] && \
+    { [ "$reruns" -ne 1 ] || ! grep -Fxq 'rerun 698' "$dir/mutations.log" \
+      || ! grep -Fq 'Re-ran stalled relay run(s) 698 for PR #1' "$dir/out" \
+      || ! grep -Fq 'created=%3E%3D2025-12-31T19:55:00Z' "$dir/relay-list.log"; }; then
+    fail "stalled relay is re-run exactly once" "$(cat "$dir/out")"
+  elif [ "$relay_mode" != stalled ] && [ "$reruns" -ne 0 ]; then
+    fail "relay $relay_mode re-runs nothing" "$(cat "$dir/mutations.log")"
+  elif [ "$relay_mode" = stalled-recent ] && [ -e "$dir/relay-list.log" ]; then
+    fail "a recent source run spends no relay history read"
+  elif [ "$relay_mode" = stalled-list-fails ] && ! grep -Fq 'could not read relay history for PR #1' "$dir/out"; then
+    fail "unreadable relay history is reported"
+  elif { [ "$relay_mode" = stalled-unmatched ] || [ "$relay_mode" = stalled-exhausted ]; } \
+    && ! grep -Fq 'No re-runnable failed relay run found for stalled source run(s) 502 on PR #1' "$dir/out"; then
+    fail "relay $relay_mode names the unrecovered source run"
+  else
+    pass "relay $relay_mode stays pending and re-runs $reruns relay(s)"
+  fi
+done
+
+# #2907: a failed relay verifier (exit 2) fails the PR closed without feeding
+# its empty output to jq --argjson.
+dir="$TMP/sweep-relay-markers-fail"
+make_sweep_fixture "$dir"
+mkdir -p "$dir/scripts/workflow"
+cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$ROOT/scripts/workflow/relay-stall-recovery.py" "$dir/scripts/workflow/"
+cat > "$dir/scripts/workflow/feedback-archive-relay-source.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -c '{requires_relay:true,source_run_id:.id}'
+SH
+chmod +x "$dir/scripts/workflow/feedback-archive-relay-source.sh"
+cat > "$dir/bin/date" <<'SH'
+#!/usr/bin/env bash
+case "${@: -1}" in
+  +%s) echo 1767225600 ;;
+  +%Y-%m-%dT%H:%M:%SZ) echo 2026-01-01T00:00:00Z ;;
+  *) exit 92 ;;
+esac
+SH
+chmod +x "$dir/bin/date"
+rc=$(run_sweep "$dir" relay-fork stable markers-fail)
+if [ "$rc" -eq 0 ]; then
+  fail "failed relay verifier is an infrastructure error" "sweep exited 0"
+elif ! grep -Fxq 'close lease-1 failure' "$dir/mutations.log" \
+  || ! grep -Fq 'source run scan failed closed' "$dir/summary-lease-1.log"; then
+  fail "failed relay verifier fails its PR closed" "$(cat "$dir/mutations.log")"
+elif grep -Fq -- '--argjson' "$dir/out"; then
+  fail "failed relay verifier emits no jq --argjson noise" "$(grep -F -- '--argjson' "$dir/out")"
+elif ! grep -Fxq 'close lease-2 success' "$dir/mutations.log"; then
+  fail "failed relay verifier preserves later PR evaluation"
+else
+  pass "failed relay verifier fails closed without jq --argjson noise"
+fi
 
 # #1825: a bot posts once while the gate evaluates, then the full surface
 # stays clear. The same native execution and lease must recover automatically.

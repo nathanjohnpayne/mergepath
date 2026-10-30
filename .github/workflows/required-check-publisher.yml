@@ -1076,6 +1076,26 @@ jobs:
             exit 1
           fi
 
+      # #2907: close holds whose writer died. Phase-1 holds, owned
+      # generations and native leases are completed only by the run that
+      # opened them (or, for phase-1 holds, superseded by a newer
+      # generation); a run lost to an Actions incident leaves its hold
+      # `in_progress` forever, so the head's check suite never completes and
+      # an armed auto-merge never fires. The reaper cancels a hold only once
+      # it is an hour old AND a newer same-name run on the same head has
+      # completed, so it never clears a context. It runs on the */30
+      # schedule-parent pass only (full coverage), and after a failed publish
+      # step too: the evaluation's outcome does not change which holds are
+      # orphaned.
+      - name: Reap orphaned holds on open PR heads
+        if: >-
+          ${{ !cancelled() && github.event_name == 'workflow_run' &&
+          github.event.workflow_run.event == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: scripts/workflow/reap-orphaned-holds.sh "$REPO"
+
   # Phase 3 (#2239, #2205). Sends one `auto-clear-evaluate` repository_dispatch
   # per PR the publish pass nominated (see "Auto-clear nominations" in its
   # step), carrying only the PR number. auto-clear-blocking-labels.yml handles
