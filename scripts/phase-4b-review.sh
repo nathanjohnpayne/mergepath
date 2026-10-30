@@ -894,11 +894,13 @@ fall_back_to_manual() {
   ao="$(admin_override_summary)" || exit 4
   printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
-        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" '
+        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
+        --argjson barrier "${BARRIER_ESCALATION_JSON:-null}" '
     if length == 1 and (.[0] | type == "object") then .[0] as $ao |
     {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
      reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
      review_posted:false, fell_back_to_manual:true, reason:$why,
+     barrier_escalation:$barrier,
      automation_enabled:true, enabled_via:$enabled_via} + $ao
     else error("expected exactly one admin summary object") end' || exit 4
   exit 4
@@ -1269,6 +1271,10 @@ BARRIER_CODERABBIT_RATE_LIMITED=false
 # (#1335): "<source-commit> <fingerprint>" when set, empty otherwise. Read only
 # by the review-body renderer below.
 BARRIER_CODERABBIT_CARRIED=""
+# The barrier's escalation record (#2879): its reason, Codex evidence and the
+# wave request binding (#2771). fall_back_to_manual carries it in the exit 4
+# summary so the wave audit can say why it holds. Evidence only, no authority.
+BARRIER_ESCALATION_JSON=null
 
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
@@ -1321,6 +1327,8 @@ run_same_head_barrier() {
           P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
           ;;
       esac
+      BARRIER_ESCALATION_JSON="$(printf '%s' "$out" | jq -c \
+        '{reason, codex, codex_evidence, coderabbit, wave_binding:(.wave_binding // null)}' 2>/dev/null || printf null)"
       fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')"
       ;;
   esac
