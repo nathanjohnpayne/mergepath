@@ -612,8 +612,9 @@ done
 
 # #2907: a relay that ended without a terminal marker (its own failure path
 # could not post `status=failed`) is re-run by the sweep, which still holds
-# the PR pending. A relay in flight, a recent source run, an exhausted or
-# unbindable relay, or unreadable relay history re-runs nothing.
+# the PR pending. An unrelated relay in flight does not defer it (#2908
+# review). A recent source run, an exhausted or unbindable relay, or
+# unreadable relay history re-runs nothing.
 for relay_mode in stalled stalled-crowded stalled-inflight stalled-recent stalled-list-fails stalled-unmatched stalled-exhausted; do
   dir="$TMP/sweep-relay-$relay_mode"
   make_sweep_fixture "$dir"
@@ -644,12 +645,12 @@ SH
     fail "relay $relay_mode keeps its PR pending" "$(cat "$dir/mutations.log")"
   elif ! grep -Fxq 'close lease-2 success' "$dir/mutations.log"; then
     fail "relay $relay_mode preserves later PR evaluation"
-  elif { [ "$relay_mode" = stalled ] || [ "$relay_mode" = stalled-crowded ]; } && \
+  elif { [ "$relay_mode" = stalled ] || [ "$relay_mode" = stalled-crowded ] || [ "$relay_mode" = stalled-inflight ]; } && \
     { [ "$reruns" -ne 1 ] || ! grep -Fxq 'rerun 698' "$dir/mutations.log" \
       || ! grep -Fq 'Re-ran stalled relay run(s) 698 for PR #1' "$dir/out" \
       || ! grep -Fq 'created=%3E%3D2025-12-31T19:55:00Z' "$dir/relay-list.log"; }; then
     fail "stalled relay is re-run exactly once" "$(cat "$dir/out")"
-  elif [ "$relay_mode" != stalled ] && [ "$relay_mode" != stalled-crowded ] && [ "$reruns" -ne 0 ]; then
+  elif [ "$relay_mode" != stalled ] && [ "$relay_mode" != stalled-crowded ] && [ "$relay_mode" != stalled-inflight ] && [ "$reruns" -ne 0 ]; then
     fail "relay $relay_mode re-runs nothing" "$(cat "$dir/mutations.log")"
   elif [ "$relay_mode" = stalled-recent ] && [ -e "$dir/relay-list.log" ]; then
     fail "a recent source run spends no relay history read"

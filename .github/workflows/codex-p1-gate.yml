@@ -907,8 +907,8 @@ jobs:
           had_infra_error=0
           MAX_RELAY_SOURCE_RUNS=1000
           # How long a source run must have been complete, with no relay
-          # marker and no relay run in flight, before the sweep re-runs its
-          # failed relay (#2907). Well above a healthy relay's latency.
+          # marker, before the sweep re-runs its failed relay (#2907). Well
+          # above a healthy relay's latency.
           RELAY_STALL_SECONDS="${RELAY_STALL_SECONDS:-3600}"
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
@@ -1140,8 +1140,8 @@ jobs:
                       # failure path could not post `status=failed` (it
                       # shares the API that failed) left this PR pending
                       # until someone re-ran it by hand. The helper re-runs
-                      # such a relay once its source has been complete for
-                      # RELAY_STALL_SECONDS and no relay run is in flight.
+                      # a failed relay that its job log binds to a source
+                      # complete for at least RELAY_STALL_SECONDS.
                       # It never clears anything: the PR stays pending
                       # until the re-run relay posts its own marker, and a
                       # recovery failure only leaves it pending as before.

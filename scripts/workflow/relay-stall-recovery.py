@@ -7,16 +7,20 @@ path could not post `status=failed` (an Actions/API incident) left the PR
 held until someone re-ran the relay by hand (matchline#620, 2026-10-30).
 
 This helper never clears anything. For each pending source run that
-completed at least --stall-seconds ago, it looks for the relay runs created
-since then. Any relay run still queued or running means a relay may yet
-land, so nothing is done. Otherwise it reads each failed relay run's job log,
-binds it to its source through the runner-rendered `SOURCE_RUN_ID` env line,
-and re-runs that relay run (a re-run keeps the run id and replays the same
-workflow_run payload). The sweep stays pending until the relay posts its own
-marker. Each relay is re-run at most --max-attempts - 1 times.
+completed at least --stall-seconds ago, it reads the job logs of failed relay
+runs created since then. It binds each one to its source through the
+runner-rendered `SOURCE_RUN_ID` env line, then re-runs a relay bound to a
+stalled source. A re-run keeps the run id and replays the same workflow_run
+payload. The binding is what keeps an in-flight relay safe. Only a completed,
+failed relay created at or after its source's latest completion is re-run.
+Another relay for that source would need another completion, which moves the
+completion time and restarts the stall clock. Queued or running relays, for
+any PR, are neither read nor waited on (#2908 review). The sweep stays
+pending until the relay posts its own marker. Each relay is re-run at most
+--max-attempts - 1 times.
 
 stdin:  JSON list of pending source runs: [{id, status, updated_at}, ...]
-stdout: JSON {stalled, in_flight, rerun, unmatched, incomplete}
+stdout: JSON {stalled, rerun, unmatched, incomplete}
 exit 2: relay history unreadable or saturated; the caller stays pending.
 """
 import argparse
@@ -89,7 +93,7 @@ def recover(github, pending, now, stall, max_attempts):
         if (isinstance(row, dict) and type(row.get('id')) is int and row.get('status') == 'completed'
                 and when is not None and now - when >= stall):
             done[row['id']] = when
-    report = {'stalled': sorted(done), 'in_flight': False, 'rerun': [], 'unmatched': [], 'incomplete': False}
+    report = {'stalled': sorted(done), 'rerun': [], 'unmatched': [], 'incomplete': False}
     if not done:
         return report
     since = iso(min(done.values()) - SKEW)
@@ -99,9 +103,6 @@ def recover(github, pending, now, stall, max_attempts):
     if pages and (pages[0].get('total_count') or 0) >= 1000:
         raise ValueError('relay run history saturated the API ceiling')
     runs = [run for page in pages for run in page['workflow_runs'] if isinstance(run, dict)]
-    if any(run.get('status') != 'completed' for run in runs):
-        report['in_flight'] = True
-        return report
     # A relay is created when its source completes, so read the failed runs
     # nearest a stalled source's completion first. Oldest-first let unrelated
     # failures fill the bounded read budget on every sweep (#2908 review).
@@ -111,7 +112,8 @@ def recover(github, pending, now, stall, max_attempts):
         return min(abs(gap) for gap in gaps) if gaps else None
 
     candidates = sorted((run for run in runs
-                         if run.get('conclusion') in FAILED and type(run.get('id')) is int
+                         if run.get('status') == 'completed' and run.get('conclusion') in FAILED
+                         and type(run.get('id')) is int
                          and type(run.get('run_attempt')) is int and run['run_attempt'] < max_attempts
                          and distance(run) is not None),
                         key=lambda run: (distance(run), run['id']))
