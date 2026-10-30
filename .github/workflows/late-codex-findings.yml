@@ -17,7 +17,15 @@ name: Late Codex findings
 # events carry a read-only token.
 #
 # This is not a merge gate and publishes no required check, so per-PR
-# serialisation is safe here (the no-concurrency rule applies to gates).
+# serialisation is safe here (the no-concurrency rule applies to gates). The
+# sweep runs in its own group so a long sweep never cancels pending event
+# runs; when an event run and the sweep race on one PR, the script converges
+# on the lowest-numbered tracker and closes the duplicate, after recording its
+# items there (Phase 4b on #2886).
+#
+# The event filter admits any App bot, because a consumer's policy may name a
+# different codex.bot_login; the script resolves that login from the policy
+# and ignores every other author.
 
 on:
   issue_comment:
@@ -39,10 +47,10 @@ jobs:
       (github.event_name == 'issue_comment'
         && github.event.issue.pull_request
         && github.event.issue.state == 'closed'
-        && github.event.comment.user.login == 'chatgpt-codex-connector[bot]')
+        && endsWith(github.event.comment.user.login, '[bot]'))
       || ((github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment')
         && github.event.pull_request.state == 'closed'
-        && github.event.sender.login == 'chatgpt-codex-connector[bot]')
+        && endsWith(github.event.sender.login, '[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:

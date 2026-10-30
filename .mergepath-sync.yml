@@ -994,6 +994,8 @@ paths:
   - path: scripts/late-codex-findings.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"  # policy_yaml_to_json resolves codex.bot_login
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -1715,6 +1717,7 @@ paths:
     consumers: all
     requires:
       - "scripts/late-codex-findings.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
       - "tests/fixtures/codex_late_review_format_1120.json"
   # #1560 Codex review ledger: attribution fixtures, CLI contract, and the
   # verdict-expression pin across the three copies. Run by check_codex_scripts.

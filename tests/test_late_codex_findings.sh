@@ -49,6 +49,13 @@ ok "a late review and a late inline comment are selected, an old review is not"
 [ "$(input "$MERGED" '[]' "[$OLD_REVIEW]" '[]' | select_ids --touched review:802)" = "review:802" ] \
   || die "an edited pre-merge review was not selected via --touched"
 ok "--touched selects a pre-merge review edited after merge"
+# Phase 4b round 2 on #2886: a Codex finding with an unreadable time fails the
+# run rather than being skipped as not late.
+for bad in "[$(printf '%s' "$C1120" | jq -c '.updated_at = "soon"')]|[]|[]" "[]|[$(printf '%s' "$OLD_REVIEW" | jq -c '.submitted_at = null')]|[]" "[]|[]|[$(printf '%s' "$INLINE" | jq -c '.created_at = "?"')]"; do
+  IFS='|' read -r bc br bi <<<"$bad"
+  if input "$MERGED" "$bc" "$br" "$bi" | "$SCRIPT" --select >/dev/null 2>&1; then die "an unreadable finding time was skipped ($bad)"; fi
+done
+ok "an unreadable finding time (comment, review or inline) fails instead of being skipped"
 [ "$(input "$MERGED" '[]' "[$(printf '%s' "$OLD_REVIEW" | jq -c '.edited_at = "2026-08-28T04:00:00Z"')]" '[]' | select_ids)" = "review:802" ] \
   || die "a pre-merge review with a post-merge lastEditedAt was not selected"
 [ "$(input "$MERGED" '[]' "[$(printf '%s' "$OLD_REVIEW" | jq -c '.edited_at = "2026-08-27T04:00:00Z"')]" '[]' | select_ids)" = "" ] \
@@ -83,20 +90,24 @@ case "$method:$endpoint" in
   GET:repos/o/r/issues/7/comments*) out "$(printf '%s' "$s" | jq -c .comments)" ;;
   GET:repos/o/r/pulls/7/reviews*) out "$(printf '%s' "$s" | jq -c .reviews)" ;;
   GET:repos/o/r/pulls/7/comments*) out "$(printf '%s' "$s" | jq -c .inline)" ;;
-  GET:repos/o/r/issues\?labels=*) out "$(printf '%s' "$s" | jq -c '[.issues[] | del(.comments)]')" ;;
+  GET:repos/o/r/issues\?labels=*) out "$(printf '%s' "$s" | jq -c '[.issues[] | del(.comments) | .user //= {login: "github-actions[bot]"}]')" ;;
   GET:repos/o/r/issues/*/comments*) n=${endpoint#repos/o/r/issues/}; n=${n%%/*}
-    out "$(printf '%s' "$s" | jq -c --argjson n "$n" '[.issues[] | select(.number == $n) | .comments[] | {body: .}]')" ;;
+    out "$(printf '%s' "$s" | jq -c --argjson n "$n" '[.issues[] | select(.number == $n) | .comments[] | if type == "string" then {body: ., user: {login: "github-actions[bot]"}} else . end]')" ;;
   GET:graphql) out "$(printf '%s' "$s" | jq -c '{data: {repository: {pullRequest: {reviews: {pageInfo: {hasNextPage: false, endCursor: null}, nodes: (.review_edits // [])}}}}}')" ;;
   POST:repos/o/r/labels) echo '{}' ;;
   POST:repos/o/r/issues) b=$(cat "$input")
-    printf '%s' "$s" | jq -c --argjson b "$b" '.issues += [{number: (100 + (.issues | length)), state: "open", body: $b.body, title: $b.title, labels: $b.labels, comments: []}]' >"$STATE"
-    out '{"html_url":"https://example.test/issues/100"}' ;;
+    # A concurrent run (state.race) opens its own tracker, numbered lower, just before ours.
+    s=$(printf '%s' "$s" | jq -c 'if .race then .race = false | .issues += [{number: 50, state: "open", user: {login: "github-actions[bot]"}, body: "<!-- mergepath-late-codex-finding: o/r#7 -->\nconcurrent", comments: []}] else . end')
+    n=$(printf '%s' "$s" | jq '100 + ([.issues[] | select(.number >= 100)] | length)')
+    printf '%s' "$s" | jq -c --argjson b "$b" --argjson n "$n" '.issues += [{number: $n, state: "open", user: {login: "github-actions[bot]"}, body: $b.body, title: $b.title, labels: $b.labels, comments: []}]' >"$STATE"
+    out "{\"number\":$n,\"html_url\":\"https://example.test/issues/$n\"}" ;;
   POST:repos/o/r/issues/*/comments) n=${endpoint#repos/o/r/issues/}; n=${n%%/*}; b=$(cat "$input")
     printf '%s' "$s" | jq -c --argjson n "$n" --argjson b "$b" '(.issues[] | select(.number == $n) | .comments) += [$b.body]' >"$STATE"
     out '{"html_url":"https://example.test/c"}' ;;
   PATCH:repos/o/r/issues/*) [ "$(printf '%s' "$s" | jq -r '.fail_reopen // false')" != true ] || { echo "HTTP 502" >&2; exit 1; }
     n=${endpoint#repos/o/r/issues/}
-    printf '%s' "$s" | jq -c --argjson n "$n" '(.issues[] | select(.number == $n) | .state) = "open"' >"$STATE"
+    st=open; for f in ${fields[@]+"${fields[@]}"}; do case "$f" in state=*) st=${f#state=} ;; esac; done
+    printf '%s' "$s" | jq -c --argjson n "$n" --arg st "$st" '(.issues[] | select(.number == $n) | .state) = $st' >"$STATE"
     echo '{}' ;;
   *) echo "unexpected $method $endpoint" >&2; exit 99 ;;
 esac
@@ -132,6 +143,10 @@ run || { cat "$DIR/out"; die "the retry after a failed reopen failed"; }
 [ "$(jq '.issues[0].comments | length' "$STATE")" = 2 ] && [ "$(jq -r '.issues[0].state' "$STATE")" = open ] \
   || { jq . "$STATE"; die "the retry did not reopen and record the item"; }
 ok "a failed reopen records nothing, and the next run reopens and records the item"
+jq -nc --argjson c "$C1120" '{pr: {state: "closed"}, comments: [$c], reviews: [], inline: [], issues: []}' >"$STATE"
+if run; then die "a PR read without merged_at read as not merged"; fi
+grep -q 'unreadable merge state' "$DIR/out" || die "a PR read without merged_at was not named unreadable"
+ok "a PR read without a merged_at key is unreadable, never not-merged"
 jq -nc --argjson c "$C1120" '{pr: {merged_at: null}, comments: [$c], reviews: [], inline: [], issues: []}' >"$STATE"
 run || die "the unmerged run failed"
 [ "$(jq '.issues | length' "$STATE")" = 0 ] && grep -q 'is not merged' "$DIR/out" || die "an unmerged PR was recorded"
@@ -162,6 +177,44 @@ PATH="$DIR/bin:$PATH" TMPDIR="$DIR" "$SCRIPT" --repo o/r --sweep --since 2026-08
 jq -r '.issues[0].body // ""' "$STATE" | grep -q 'mergepath-late-codex-item: review:802:' \
   || { cat "$DIR/out"; jq . "$STATE"; die "the sweep missed a pre-merge review edited after merge"; }
 ok "the sweep records a pre-merge review edited after merge, without --touched"
+# Phase 4b on #2886: only the recorder's own records count. A marker someone
+# else posts on the tracker, or a tracker someone else opened, suppresses
+# nothing.
+FP=$(printf '%s' "$C1120" | jq -j .body | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -c1-16)
+jq -nc --arg m "$MERGED" --argjson c "$C1120" --arg fp "$FP" '{pr: {merged_at: $m}, comments: [$c], reviews: [], inline: [], issues: [
+  {number: 90, state: "closed", user: {login: "github-actions[bot]"}, body: "<!-- mergepath-late-codex-finding: o/r#7 -->",
+   comments: [{body: "<!-- mergepath-late-codex-item: issue-comment:5447842730:\($fp) -->", user: {login: "drive-by"}}]}]}' >"$STATE"
+run || { cat "$DIR/out"; die "the forged-marker run failed"; }
+[ "$(jq '[.issues[] | select(.number == 90) | .comments[]] | length' "$STATE")" = 2 ] && [ "$(jq -r '.issues[] | select(.number == 90) | .state' "$STATE")" = open ] \
+  || { jq . "$STATE"; die "a marker from another commenter suppressed the finding"; }
+ok "a dedup marker posted by someone else does not suppress the finding"
+jq -nc --arg m "$MERGED" --argjson c "$C1120" '{pr: {merged_at: $m}, comments: [$c], reviews: [], inline: [], issues: [
+  {number: 80, state: "open", user: {login: "drive-by"}, body: "<!-- mergepath-late-codex-finding: o/r#7 -->", comments: []}]}' >"$STATE"
+run || { cat "$DIR/out"; die "the foreign-tracker run failed"; }
+[ "$(jq '[.issues[] | select(.number >= 100)] | length' "$STATE")" = 1 ] && [ "$(jq '.issues[] | select(.number == 80) | .comments | length' "$STATE")" = 0 ] \
+  || { jq . "$STATE"; die "a tracker opened by someone else was trusted"; }
+ok "a tracker opened by someone else is ignored; the recorder opens its own"
+# Two runs race to open a tracker: the lower-numbered one is canonical, and
+# the run that lost records its items there, then closes its own duplicate.
+jq -nc --arg m "$MERGED" --argjson c "$C1120" '{pr: {merged_at: $m}, comments: [$c], reviews: [], inline: [], issues: [], race: true}' >"$STATE"
+run || { cat "$DIR/out"; die "the race run failed"; }
+[ "$(jq -r '.issues[] | select(.number == 100) | .state' "$STATE")" = closed ] \
+  && [ "$(jq -r '.issues[] | select(.number == 50) | .state' "$STATE")" = open ] \
+  && jq -r '.issues[] | select(.number == 50) | .comments[] | if type == "string" then . else .body end' "$STATE" | grep -q 'mergepath-late-codex-item: issue-comment:5447842730:' \
+  || { cat "$DIR/out"; jq . "$STATE"; die "a tracker race did not converge on the canonical tracker"; }
+ok "a tracker race converges: items land on the lowest tracker and the duplicate is closed"
+# codex.bot_login comes from the governing policy.
+mkdir -p "$DIR/tree/scripts/lib" "$DIR/tree/.github"
+cp "$SCRIPT" "$DIR/tree/scripts/"; cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$DIR/tree/scripts/lib/"
+printf 'codex:\n  bot_login: "custom-codex[bot]"\n' >"$DIR/tree/.github/review-policy.yml"
+CUSTOM=$(printf '%s' "$C1120" | jq -c '.user.login = "custom-codex[bot]"')
+[ "$(input "$MERGED" "[$CUSTOM,$C1120]" '[]' '[]' | "$DIR/tree/scripts/late-codex-findings.sh" --select | jq -r 'map(.id) | join(",")')" = 5447842730 ] \
+  && [ "$(input "$MERGED" "[$C1120]" '[]' '[]' | "$DIR/tree/scripts/late-codex-findings.sh" --select | jq 'length')" = 0 ] \
+  || die "the configured codex.bot_login was not honoured"
+printf 'codex: [unterminated\n' >"$DIR/tree/.github/review-policy.yml"
+rc=0; input "$MERGED" "[$C1120]" '[]' '[]' | "$DIR/tree/scripts/late-codex-findings.sh" --select >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || die "an unparseable policy was not refused (rc=$rc)"
+ok "the bot login comes from codex.bot_login; an unparseable policy exits 2"
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r >/dev/null 2>&1; then die "a missing --pr/--sweep was accepted"; fi
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r --pr 7 --touched comment:1 >/dev/null 2>&1; then die "a malformed --touched was accepted"; fi
 ok "usage errors exit nonzero"

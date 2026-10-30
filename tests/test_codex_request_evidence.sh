@@ -1174,6 +1174,42 @@ p_check review-format-unanchored "[$R0,$(p_comment 601 $((P_T0 + 60)) '## Review
 
 ### [P1] A finding without a permalink')]" '[]' pending
 p_check bounded-by-policy-window "[$R0]" '[]' timed-out request-unanswered 300
+# Phase 4b round 2 on #2886: a relevant Summary that does not validate is
+# never dropped. It holds, bounded from its last edit, and never answers.
+P_RUN_BAD=$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)) | jq -c '.body |= sub("datetime=\"[^\"]*\""; "datetime=\"soon\"")')
+p_check summary-running-time-unreadable-no-request "[$P_RUN_BAD]" '[]' pending summary-unreadable
+P_DISAGREE=$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("✅ \\*\\*Completed\\*\\*"; "🔄 **Running** since")')
+p_check summary-row-running-json-completed "[$R0,$P_DISAGREE]" '[]' pending request-unanswered
+p_check summary-row-json-disagree-no-request "[$P_DISAGREE]" '[]' pending summary-unreadable
+p_check summary-failed-agreeing "[$R0,$(p_summary failed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("\\*\\*failed\\*\\*"; "⚠️ **Failed**")')]" '[]' answered
+P_BAD_OLD=$(p_summary completed "$(p_at $((P_T0 - 100)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 200)) $((P_T0 - 100)) | jq -c '.body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')
+p_check unreadable-summary-older-than-answer "[$R0,$P_BAD_OLD]" "[$(p_review $((P_T0 + 60)))]" answered
+p_check summary-no-json-row-on-head "[$R0,$(printf '%s' "$P_BAD_OLD" | jq -c '.updated_at = "'"$(p_at $((P_T0 + 100)))"'"')]" "[$(p_review $((P_T0 + 60)))]" pending summary-unreadable
+if [ "$(crqe_codex_pending_state "[$(printf '%s' "$P_RUN_BAD" | jq -c '.updated_at = "yesterday" | .created_at = "yesterday"')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
+  PASS=$((PASS + 1)); echo 'PASS: #2881 pending-state an unreadable Summary with no readable edit time is unreadable'
+else
+  echo 'FAIL: #2881 an unreadable Summary without an edit time did not refuse'; exit 1
+fi
+# The shared classifier: every anchor, disposition and readable time.
+c_class() { crqe_codex_comment_signals "$1" "$P_BOT" "$P_HEAD" | jq -r 'map("\(.anchor):\(.affirmative)") | join(",")'; }
+if [ "$(c_class "[$(p_comment 701 "$P_T0" "Codex Review: Something.
+Reviewed commit: \`$P_OTHER\`
+https://github.com/o/r/blob/$P_HEAD/a.sh#L1")]")" = "mixed:false" ] \
+  && [ "$(c_class "[$(p_comment 702 "$P_T0" "Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_HEAD\`")]")" = "exact:true" ] \
+  && [ "$(c_class "[$(p_comment 703 "$P_T0" "Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_HEAD\`
+![P1 Badge](x)")]")" = "exact:false" ] \
+  && [ "$(c_class "[$(p_comment 704 "$P_T0" "Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_HEAD\`
+https://github.com/o/r/blob/$P_OTHER/a.sh#L1")]")" = "mixed:false" ] \
+  && [ "$(c_class "[$(p_comment 705 "$P_T0" "Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_OTHER\`" | jq -c '.created_at = "?" | .updated_at = "?"')]")" = "other:false" ] \
+  && ! crqe_codex_comment_signals "[$(p_comment 706 "$P_T0" '![P1 Badge](x) no anchor' | jq -c '.created_at = "?" | .updated_at = "?"')]" "$P_BOT" "$P_HEAD" >/dev/null 2>&1; then
+  PASS=$((PASS + 1)); echo 'PASS: #2881 comment classifier: full anchors, disposition, unreadable negative time refuses'
+else
+  echo 'FAIL: #2881 comment classifier'; exit 1
+fi
 # Phase 4b on #2886: only a review run answers. A body-less wrapper whose
 # inline comments are all replies does not; a root inline comment, a body, or
 # no inline comments at all does (crqe_select_head_review's predicate).
@@ -1286,6 +1322,26 @@ rm -f "$DIR/comments-reread"
 printf '%s\n' "$E_APPROVAL" | jq -c --arg at "$(e_iso 10)" '. + [.[0] + {state: "CHANGES_REQUESTED", submitted_at: $at}]' >"$DIR/reviews-reread"
 e_run approval-superseded-in-reread "[$E_REQ_OLD]" "$E_APPROVAL" 1 "no longer nathanpayne-codex's latest opinionated review"
 rm -f "$DIR/reviews-reread"
+# Phase 4b round 2 on #2886: a negative `Codex Review:` comment whose
+# Reviewed commit names another SHA but whose permalink names HEAD (mixed)
+# and that only the re-read sees still outranks the older approval.
+E_MIXED_LATE="{\"id\":142,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"Codex Review: Here are some suggestions.\\n\\nReviewed commit: \\u0060$P_OTHER\\u0060\\nhttps://github.com/o/r/blob/$P_HEAD/a.sh#L1\"}"
+printf '%s\n' "[$E_REQ_OLD,$E_MIXED_LATE]" >"$DIR/comments-reread"
+e_run mixed-negative-only-in-reread "[$E_REQ_OLD]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+rm -f "$DIR/comments-reread"
+# A clean-looking verdict naming HEAD beside another commit's permalink is
+# mixed, so it never clears gate (c) as an affirmative verdict.
+E_MIXED_CLEAN="{\"id\":143,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"Codex Review: Didn't find any major issues.\\n\\nReviewed commit: \\u0060$P_HEAD\\u0060\\nhttps://github.com/o/r/blob/$P_OTHER/a.sh#L1\"}"
+printf '%s\n' "[$E_MIXED_CLEAN]" >"$DIR/comments"; printf '%s\n' "$E_APPROVAL" >"$DIR/reviews"; : >"$DIR/calls"; rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=mixed-clean \
+  PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/default-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" = 1 ] && grep -qF 'non-affirmative or findings-bearing verdict' "$DIR/out"; then
+  PASS=$((PASS + 1)); echo "PASS: #2881 e2e mixed-clean-verdict-never-clears"
+else
+  cat "$DIR/out"; echo "FAIL #2881 e2e mixed-clean-verdict-never-clears rc=$rc"; exit 1
+fi
 e_run summary-completed-control "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 0 'Codex owes HEAD no review (answered'
 
 

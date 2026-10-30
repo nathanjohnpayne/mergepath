@@ -2381,24 +2381,29 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   ')
   # #2881: Codex also posts review-format findings (priority badges, blob
   # permalinks, no `Codex review:` header) as an issue comment, sometimes with
-  # no companion review. The selector above cannot see them. Each one is a
-  # negative signal: unless its anchors name only other heads, a newer one
-  # replaces the latest verdict as non-affirmative, wins a timestamp tie, and
-  # is timed by its latest edit so an edit that adds findings stays newest.
-  # It never clears. A missing or unreadable selector fails the run.
-  declare -F crqe_review_format_findings >/dev/null 2>&1 \
-    || die 3 "codex-request-evidence helper missing crqe_review_format_findings (#2881)"
-  CODEX_FORMAT_FINDING_JSON=$(crqe_review_format_findings "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA" \
-    | jq -c '[ .[] | select(.anchor != "other")
-               | . + {at: ([.created_at, .updated_at] | max)} ] | max_by([.at, .comment_id]) // null') \
-    || die 3 "cannot classify review-format Codex issue comments (#2881)"
+  # no companion review, and a verdict can pair a Reviewed commit field with a
+  # permalink to another commit. The selector above sees neither. Every Codex
+  # verdict or findings comment is therefore also classified with its complete
+  # anchor set (crqe_codex_comment_signals). The newest negative one (a
+  # findings comment, a non-clean header, or any comment whose anchors are not
+  # all HEAD) that is not anchored only to other commits replaces the latest
+  # verdict as non-affirmative when it is at least as new, timed by its latest
+  # edit so an edit that adds findings stays newest. It never clears. A
+  # missing helper or an unreadable comment fails the run.
+  declare -F crqe_codex_comment_signals >/dev/null 2>&1 \
+    || die 3 "codex-request-evidence helper missing crqe_codex_comment_signals (#2881)"
+  CODEX_COMMENT_SIGNALS=$(crqe_codex_comment_signals "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA") \
+    || die 3 "cannot classify Codex verdict and findings comments (#2881)"
+  CODEX_FORMAT_FINDING_JSON=$(printf '%s' "$CODEX_COMMENT_SIGNALS" \
+    | jq -c '[ .[] | select(.anchor != "other" and (.affirmative | not)) ] | max_by([.at, .comment_id]) // null') \
+    || die 3 "cannot select the newest negative Codex comment (#2881)"
   if [ "$CODEX_FORMAT_FINDING_JSON" != null ]; then
     __format_at=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.at')
     __verdict_at=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
     if [ -z "$__verdict_at" ] || ! [[ "$__verdict_at" > "$__format_at" ]]; then
       CODEX_VERDICT_JSON=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" \
         | jq -c '{created_at: .at, exact: (.anchor == "exact"), affirmative: false}')
-      log "codex verdict: review-format Codex findings comment #$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.comment_id') @ $__format_at (anchor: $(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.anchor')) is the latest verdict signal — NON-affirmative (#2881)"
+      log "codex verdict: Codex comment #$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.comment_id') @ $__format_at (anchor: $(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.anchor')) is the latest verdict signal — NON-affirmative (#2881)"
     fi
   fi
   CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')

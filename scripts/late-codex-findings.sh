@@ -59,7 +59,12 @@ SINCE=""
 TOUCHED=""
 DRY_RUN=0
 SELECT=0
-BOT="${LATE_CODEX_BOT_LOGIN:-chatgpt-codex-connector[bot]}"
+BOT=""
+# The identity whose records count (Phase 4b on #2886): the workflow writes
+# with GITHUB_TOKEN, so its trackers and comments are github-actions[bot]'s.
+# A manual run under another token should set LATE_CODEX_RECORDER_LOGIN to
+# that login; records from any other author never suppress a finding.
+RECORDER="${LATE_CODEX_RECORDER_LOGIN:-github-actions[bot]}"
 LABEL="late-codex-finding"
 
 usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -89,6 +94,28 @@ elif [ "$SELECT" = 0 ]; then
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "late-codex-findings: --pr N (positive integer) or --sweep is required" >&2; exit 2; }
 fi
 
+# The Codex bot is the governing policy's codex.bot_login (Phase 4b on #2886),
+# the field the merge checker honours, read with the shared policy parser from
+# this checkout's .github/review-policy.yml (the workflow checks out the
+# default branch). An absent file or key means the standard login; a file
+# that does not parse, or a key that is not a non-empty string, exits 2.
+resolve_bot() {
+  local root policy json
+  root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+  policy="$root/.github/review-policy.yml"
+  if [ ! -e "$policy" ]; then
+    printf '%s\n' 'chatgpt-codex-connector[bot]'; return 0
+  fi
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$root/scripts/lib/feedback-policy-helpers.sh" || return 1
+  json=$(policy_yaml_to_json "$policy") || return 1
+  printf '%s' "$json" | jq -er '
+    if (.codex | type) == "object" and (.codex | has("bot_login")) then
+      .codex.bot_login | select(type == "string" and length > 0)
+    else "chatgpt-codex-connector[bot]" end'
+}
+BOT=$(resolve_bot) || { echo "late-codex-findings: cannot resolve codex.bot_login from .github/review-policy.yml" >&2; exit 2; }
+
 read_array() { # endpoint -> flattened JSON array, or exit 3
   local out
   out=$(gh api --paginate "$1" 2>/dev/null | jq -cs 'add // []' 2>/dev/null) \
@@ -111,20 +138,25 @@ select_late_findings() { # stdin: {merged_at, comments, reviews, inline}; $1 bot
     def item($kind; $changed):
       { kind: $kind, id: .id, url: (.html_url // ""), changed_at: $changed,
         tiers: tiers, body: (.body // "") };
+    # A Codex finding whose time cannot be read fails the run rather than
+    # being skipped as "not late" (Phase 4b round 2 on #2886).
+    def changed($fields): [ $fields[] | select(. != null) ] as $t
+      | if ($t | length) == 0 or any($t[]; secs == null)
+        then error("unreadable time on Codex \(.id)") else ($t | max) end;
     (.merged_at | secs) as $merged
     | if $merged == null then error("merged_at unreadable") else . end
     | [ (.comments[] | select(is_bot and marked)
            | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->") | not)
-           | ([.created_at, .updated_at] | map(select(. != null)) | max) as $c
-           | select(($c | secs) != null and ($c | secs) > $merged)
+           | changed([.created_at, .updated_at]) as $c
+           | select(($c | secs) > $merged)
            | item("issue-comment"; $c)),
         (.reviews[] | select(is_bot and marked)
-           | ([.submitted_at, .edited_at] | map(select(. != null)) | max) as $c
-           | select((($c | secs) // 0) > $merged or ((.id | tostring) == $touched and $touched != ""))
-           | item("review"; (if (($c | secs) // 0) > $merged then $c else "edited-after-merge" end))),
+           | changed([.submitted_at, .edited_at]) as $c
+           | select(($c | secs) > $merged or ((.id | tostring) == $touched and $touched != ""))
+           | item("review"; (if ($c | secs) > $merged then $c else "edited-after-merge" end))),
         (.inline[] | select(is_bot and marked)
-           | ([.created_at, .updated_at] | map(select(. != null)) | max) as $c
-           | select(($c | secs) != null and ($c | secs) > $merged)
+           | changed([.created_at, .updated_at]) as $c
+           | select(($c | secs) > $merged)
            | item("inline-comment"; $c)) ]
     | map(. + { minutes: (if (.changed_at | secs) == null then null
                           else (((.changed_at | secs) - $merged) / 60 | floor) end) })
@@ -141,9 +173,13 @@ if [ "$SELECT" = 1 ]; then
 fi
 
 process_pr() { # pr
-  local pr="$1" meta merged_at comments reviews inline items keyed issues issue existing new_items body num state
+  local pr="$1" meta merged_at comments reviews inline edits items keyed trackers existing new_items body created canonical
   meta=$(gh api "repos/$REPO/pulls/$pr" 2>/dev/null) || { echo "late-codex-findings: cannot read $REPO#$pr" >&2; exit 3; }
-  merged_at=$(printf '%s' "$meta" | jq -r '.merged_at // ""')
+  # A PR read without a merged_at key, or with one that is neither null nor
+  # a timestamp, is unreadable, never "not merged".
+  merged_at=$(printf '%s' "$meta" | jq -er 'if type == "object" and has("merged_at")
+      and (.merged_at == null or (.merged_at | type) == "string") then (.merged_at // "") else error("merged_at") end') \
+    || { echo "late-codex-findings: unreadable merge state for $REPO#$pr" >&2; exit 3; }
   if [ -z "$merged_at" ]; then
     echo "late-codex-findings: $REPO#$pr is not merged; nothing to do"
     return 0
@@ -176,21 +212,18 @@ process_pr() { # pr
     keyed=$(printf '%s\n%s\n' "$keyed" "$it" | jq -cs --arg fp "$fp" '.[0] + [.[1] + {key: "\(.[1].kind):\(.[1].id):\($fp)"} | del(.body)]')
   done < <(printf '%s' "$items" | jq -c '.[]')
 
-  issues=$(read_array "repos/$REPO/issues?labels=$LABEL&state=all&per_page=100")
-  issue=$(printf '%s' "$issues" | jq -c --arg marker "<!-- mergepath-late-codex-finding: $REPO#$pr -->" \
-    '[ .[] | select(.pull_request == null) | select((.body // "") | contains($marker)) ] | min_by(.number) // null')
-  existing='[]'
-  if [ "$issue" != null ]; then
-    num=$(printf '%s' "$issue" | jq -r .number)
-    existing=$( { printf '%s' "$issue" | jq -c '[.body // ""]'; read_array "repos/$REPO/issues/$num/comments?per_page=100" | jq -c '[.[].body // ""]'; } \
-      | jq -cs 'add | [ .[] | scan("<!-- mergepath-late-codex-item: ([^ ]+) -->") | .[0] ] | unique')
-  fi
+  # Only records the recorder itself wrote count (Phase 4b on #2886): a
+  # tracker is an issue the recorder opened with the PR marker, and an item
+  # is recorded only by a marker in such a tracker's body or in a recorder
+  # comment on it. A marker anyone else posts suppresses nothing.
+  trackers=$(recorder_trackers "$pr") || exit 3
+  existing=$(recorded_keys "$trackers") || exit 3
   new_items=$(printf '%s\n%s\n' "$keyed" "$existing" | jq -cs '.[1] as $seen | [ .[0][] | select(.key as $k | $seen | index($k) | not) ]')
   if [ "$(printf '%s' "$new_items" | jq 'length')" = 0 ]; then
     echo "late-codex-findings: every late Codex finding on $REPO#$pr is already recorded"
     return 0
   fi
-  body=$(printf '%s' "$new_items" | jq -r --arg pr "$pr" --arg merged "$merged_at" '
+  body=$(printf '%s' "$new_items" | jq -r '
     map("- [\(.kind) \(.id)](\(.url)): \(if (.tiers | length) > 0 then (.tiers | join(", ")) else "priority marker" end), changed \(.changed_at)\(if .minutes != null then " (\(.minutes) min after merge)" else "" end) <!-- mergepath-late-codex-item: \(.key) -->")
     | join("\n")')
   if [ "$DRY_RUN" = 1 ]; then
@@ -198,7 +231,7 @@ process_pr() { # pr
     printf '%s\n' "$body"
     return 0
   fi
-  if [ "$issue" = null ]; then
+  if [ "$(printf '%s' "$trackers" | jq 'length')" = 0 ]; then
     gh api -X POST "repos/$REPO/labels" -f name="$LABEL" -f color=d93f0b \
       -f description="Codex reported findings after the PR merged (nathanjohnpayne/mergepath#2881)" >/dev/null 2>&1 || true
     jq -n --arg repo "$REPO" --arg pr "$pr" --arg merged "$merged_at" --arg items "$body" --arg label "$LABEL" '{
@@ -208,25 +241,66 @@ process_pr() { # pr
         + "Codex reported findings on #\($pr) after it merged at \($merged). No merge gate can block a finding that arrives after the merge, so each one is recorded here for triage (nathanjohnpayne/mergepath#2881).\n\n"
         + "This can follow a `timed-out/substitute-used` merge, where the gate stopped waiting for a requested Codex review and accepted the independent Phase 4b approval, or a findings comment Codex posted late. Triage each item: fix it in a follow-up PR, or record why it needs no change, then close this issue. A later finding on the same PR reopens it.\n\n"
         + $items + "\n")}' >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-    gh api -X POST "repos/$REPO/issues" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .html_url \
+    created=$(gh api -X POST "repos/$REPO/issues" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .number) \
       || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: cannot create the tracking issue for $REPO#$pr" >&2; exit 3; }
     rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-  else
-    state=$(printf '%s' "$issue" | jq -r .state)
-    # Reopen BEFORE recording the item: the item marker is what makes a rerun
-    # skip it, so a reopen that failed after the comment landed would never be
-    # retried and the finding would sit on a closed issue (Codex P2 on #2886).
-    # A failed comment after a successful reopen is retried by the next run.
-    if [ "$state" = closed ]; then
-      gh api -X PATCH "repos/$REPO/issues/$num" -f state=open >/dev/null \
-        || { echo "late-codex-findings: cannot reopen #$num; the finding is not recorded, so the next run retries" >&2; exit 3; }
+    echo "late-codex-findings: opened tracking issue #$created for $REPO#$pr"
+    # Two runs (an event run and the sweep) can both find no tracker and both
+    # open one. Converge: the lowest-numbered recorder tracker is canonical. A
+    # run whose tracker is not canonical records its items there first, then
+    # closes its own as a duplicate, so the findings stay on an open issue.
+    trackers=$(recorder_trackers "$pr") || exit 3
+    canonical=$(printf '%s' "$trackers" | jq -r 'min_by(.number) | .number // empty')
+    if [ -n "$canonical" ] && [ "$canonical" != "$created" ]; then
+      record_on "$canonical" "$(printf '%s' "$trackers" | jq -r --argjson n "$canonical" '.[] | select(.number == $n) | .state')" "$body"
+      jq -n --arg c "$canonical" '{body: ("Duplicate of #\($c), opened by a concurrent run; its findings are recorded there.")}' \
+        >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
+      gh api -X POST "repos/$REPO/issues/$created/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" >/dev/null \
+        && gh api -X PATCH "repos/$REPO/issues/$created" -f state=closed -f state_reason=not_planned >/dev/null \
+        || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: recorded on #$canonical but cannot close duplicate #$created" >&2; exit 3; }
+      rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
     fi
-    jq -n --arg items "$body" '{body: ("More Codex findings arrived after merge:\n\n" + $items + "\n")}' \
-      >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
-    gh api -X POST "repos/$REPO/issues/$num/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .html_url \
-      || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: cannot comment on #$num" >&2; exit 3; }
-    rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
+  else
+    canonical=$(printf '%s' "$trackers" | jq -r 'min_by(.number) | .number')
+    record_on "$canonical" "$(printf '%s' "$trackers" | jq -r --argjson n "$canonical" '.[] | select(.number == $n) | .state')" "$body"
   fi
+}
+
+# The recorder's trackers for one PR, lowest number first.
+recorder_trackers() { # pr
+  local all
+  all=$(read_array "repos/$REPO/issues?labels=$LABEL&state=all&per_page=100") || return 1
+  printf '%s' "$all" | jq -c --arg marker "<!-- mergepath-late-codex-finding: $REPO#$1 -->" --arg rec "$RECORDER" '
+    [ .[] | select(.pull_request == null and (.user.login // "") == $rec)
+      | select((.body // "") | contains($marker)) | {number, state, body: (.body // "")} ] | sort_by(.number)'
+}
+
+# Item keys recorded in the given trackers' bodies and recorder comments.
+recorded_keys() { # trackers-json
+  local bodies n comments
+  bodies=$(printf '%s' "$1" | jq -c '[ .[].body ]') || return 1
+  for n in $(printf '%s' "$1" | jq -r '.[].number'); do
+    comments=$(read_array "repos/$REPO/issues/$n/comments?per_page=100") || return 1
+    bodies=$(printf '%s\n%s\n' "$bodies" "$comments" | jq -cs --arg rec "$RECORDER" \
+      '.[0] + [ .[1][] | select((.user.login // "") == $rec) | (.body // "") ]') || return 1
+  done
+  printf '%s' "$bodies" | jq -c '[ .[] | scan("<!-- mergepath-late-codex-item: ([^ ]+) -->") | .[0] ] | unique'
+}
+
+# Append items to a tracker. Reopen BEFORE recording: the item marker is what
+# makes a rerun skip it, so a reopen that failed after the comment landed
+# would never be retried (Codex P2 on #2886). A failed comment after a
+# successful reopen is retried by the next run.
+record_on() { # number state items-markdown
+  if [ "$2" = closed ]; then
+    gh api -X PATCH "repos/$REPO/issues/$1" -f state=open >/dev/null \
+      || { echo "late-codex-findings: cannot reopen #$1; the finding is not recorded, so the next run retries" >&2; exit 3; }
+  fi
+  jq -n --arg items "$3" '{body: ("More Codex findings arrived after merge:\n\n" + $items + "\n")}' \
+    >"${TMPDIR:-/tmp}/late-codex-findings.$$.json"
+  gh api -X POST "repos/$REPO/issues/$1/comments" --input "${TMPDIR:-/tmp}/late-codex-findings.$$.json" --jq .html_url \
+    || { rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"; echo "late-codex-findings: cannot comment on #$1" >&2; exit 3; }
+  rm -f "${TMPDIR:-/tmp}/late-codex-findings.$$.json"
 }
 
 if [ "$SWEEP" = 1 ]; then
@@ -240,7 +314,7 @@ if [ "$SWEEP" = 1 ]; then
   dry=()
   [ "$DRY_RUN" = 0 ] || dry=(--dry-run)
   for pr in $candidates; do
-    LATE_CODEX_BOT_LOGIN="$BOT" "$0" --repo "$REPO" --pr "$pr" ${dry[@]+"${dry[@]}"} \
+    "$0" --repo "$REPO" --pr "$pr" ${dry[@]+"${dry[@]}"} \
       || { echo "late-codex-findings: sweep failed on $REPO#$pr; continuing" >&2; sweep_rc=3; }
   done
   echo "late-codex-findings: sweep since $SINCE checked $(printf '%s\n' "$candidates" | grep -c . || true) merged PR(s)"

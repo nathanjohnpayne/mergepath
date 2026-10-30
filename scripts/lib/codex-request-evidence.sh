@@ -747,18 +747,40 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
         ($requests | max_by([(.created_at | secs), .id])) as $req
         | ($req.created_at | if . == null then null else secs end) as $req_at
         | [ $comments[] | select(is_bot) ] as $botc
+        # Every Review Summary that may describe <head>: its JSON names <head>,
+        # or it has no usable JSON commit and its row commit (if any) is a
+        # prefix of <head>. A relevant summary that does not validate (JSON
+        # missing or malformed, the row missing, the row commit or status
+        # disagreeing with the JSON, a status outside completed / running /
+        # failed / canceled, an unreadable run time, or one later than the
+        # last edit of the comment plus 300 s) is `unreadable`: it never answers,
+        # and it holds, bounded from its last edit (Phase 4b on #2886).
         | [ $botc[]
             | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
             | . as $c
             | ((.body // "") | (try (capture("<!-- codex-review-state:v1 (?<j>\\{[^\\n]*\\}) -->").j | fromjson) catch null)) as $sj
             | ((.body // "") | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")? // null) as $row
-            | select($sj != null and ($sj.code_review | type) == "object" and $row != null)
-            | (($sj.code_review.commit_sha // "") | tostring | ascii_downcase) as $jc
-            | select($jc == $head and ($jc | startswith($row.commit | ascii_downcase)))
-            | (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) as $run
+            | (if ($sj | type) == "object" and ($sj.code_review | type) == "object"
+                  and (($sj.code_review.commit_sha // "") | type) == "string"
+                  and ($sj.code_review.commit_sha | ascii_downcase | test("^[0-9a-f]{40}$"))
+               then ($sj.code_review.commit_sha | ascii_downcase) else null end) as $jc
+            | (if $row == null then null else ($row.commit | ascii_downcase) end) as $rc
+            | select($jc == $head or ($jc == null and ($rc == null or ($head | startswith($rc)))))
+            | (if $row == null then null
+               elif ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
+               elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
+               elif ($row.status | test("\\*\\*Failed\\*\\*"; "i")) then "failed"
+               elif ($row.status | test("\\*\\*Cancell?ed\\*\\*"; "i")) then "canceled"
+               else "unknown" end) as $rs
+            | (if $row == null then null
+               else (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) end) as $run
             | (($c.updated_at // $c.created_at) | secs) as $edited
-            | select($run != null and $edited != null and $run <= $edited + 300)
-            | {status: ($sj.code_review.status // ""), at: $run} ] as $summaries
+            | if $jc == $head and $rc != null and ($head | startswith($rc))
+                 and $rs != null and $rs != "unknown"
+                 and (($sj.code_review.status // "") == $rs)
+                 and $run != null and $edited != null and $run <= $edited + 300
+              then {status: $rs, at: $run}
+              else {status: "unreadable", at: $edited} end ] as $summaries
         # A review counts only when it is a review run, as in
         # crqe_select_head_review: a body-less wrapper whose inline comments
         # are all replies is not one (Phase 4b on #2886).
@@ -789,17 +811,23 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
               | anchors as $a
               | select(($a | length) > 0 and all($a[]; . == $head))
               | (.created_at | secs) ]
-          + [ $summaries[] | select(.status == "completed") | .at ]
+          + [ $summaries[] | select(.status == "completed" or .status == "failed" or .status == "canceled") | .at ]
           | map(select(. != null)) | max ) as $terminal
         | ([ $summaries[] | select(.status == "running") | .at ] | max) as $running
+        | ([ $summaries[] | select(.status == "unreadable") | .at ]) as $bad
         | (if $req_at != null and ($terminal == null or $terminal <= $req_at) then
              {anchor: $req_at, reason: "request-unanswered"}
            elif $running != null and ($terminal == null or $running > $terminal) then
              {anchor: $running, reason: "review-running"}
+           elif any($bad[]; . == null) then {anchor: null, reason: "summary-unreadable"}
+           elif any($bad[]; $terminal == null or . > $terminal) then
+             {anchor: ($bad | max), reason: "summary-unreadable"}
            else null end) as $owed
         | {request: (if $req == null then null else {id: $req.id, created_at: $req.created_at} end),
            terminal_at: ($terminal | iso), running_since: ($running | iso)} as $base
-        | if $owed == null then
+        | if $owed != null and $owed.anchor == null then
+            $base + {state: "unreadable", reason: "summary-unreadable-without-time", anchor_at: null, expires_at: null}
+          elif $owed == null then
             $base + {state: (if $req == null then "none" else "answered" end),
                      reason: (if $req == null then "no-request" else "request-answered" end),
                      anchor_at: null, expires_at: null}
@@ -812,24 +840,70 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
       end'
 }
 
+# #2881 (Phase 4b on #2886): every Codex comment that carries a verdict or
+# findings, classified once with the complete anchor set so the gate's verdict
+# ordering, its fresh-snapshot ordering and the owed-review check agree. A
+# comment qualifies when the configured bot wrote it (a present user.type must
+# be `Bot`), it is not the Review Summary, and it has a `Codex review:` header,
+# a Reviewed commit field or a priority marker. Its anchors are every Reviewed
+# commit field and every `/blob/<40-hex>/` permalink: `exact` (all name
+# <head>), `other` (all are valid full SHAs and none is <head>), `none`, or
+# `mixed`. It is `affirmative` only when its header is the clean verdict, it
+# carries no priority marker, and its anchor is `exact`; anything else is a
+# negative signal. `at` is its latest server time (created or edited); a
+# qualifying comment that is not `other` and has no readable time fails the
+# call, so an unreadable negative is never dropped.
+#
+# Emits [{comment_id, at, anchor, affirmative}], oldest first.
+crqe_codex_comment_signals() { # issue-comments-json bot-login head-sha
+  printf '%s\n' "${1:-[]}" | jq -c --arg bot "${2:-}" --arg sha "${3:-}" '
+    def iso_ok: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$");
+    ($sha | ascii_downcase) as $head
+    | if type != "array" or ($head | test("^[0-9a-f]{40}$") | not) or $bot == "" then error("input") else . end
+    | [ .[]
+      | select((.user.login // "") == $bot and ((.user.type // "Bot") == "Bot"))
+      | (.body // "") as $body
+      | select($body | type == "string")
+      | select($body | startswith("<!-- codex-pull-request-review-summary -->") | not)
+      | ($body | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]")) as $marked
+      | ($body | test("(?im)^\\s*codex review:")) as $header
+      | ($body | ascii_downcase | test("reviewed commit")) as $field
+      | select($marked or $header or $field)
+      | ($body | ascii_downcase
+         | [ (scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)") | .[0]
+              | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")),
+             (scan("/blob/([0-9a-f]{40})/") | .[0]) ]) as $a
+      | (if ($a | length) == 0 then "none"
+         elif all($a[]; . == $head) then "exact"
+         elif all($a[]; test("^[0-9a-f]{40}$")) and all($a[]; . != $head) then "other"
+         else "mixed" end) as $anchor
+      | ([.created_at, .updated_at] | map(select(. != null))) as $times
+      | if $anchor != "other" and (($times | length) == 0 or any($times[]; iso_ok | not))
+        then error("unreadable time on a Codex verdict or findings comment") else . end
+      | { comment_id: .id, at: ($times | max), anchor: $anchor,
+          affirmative: ($anchor == "exact" and ($marked | not)
+                        and ($body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b"))) }
+    ]
+    | sort_by(.at, .comment_id)
+  '
+}
+
 # #2881 (Phase 4b on #2886): the newest Codex signal on <head> in one
 # snapshot, for the substitute's latest-signal-wins guard, so the guard and
-# crqe_codex_pending_state read the same comments. Prints an ISO time or empty.
-# Signals: the substantive head review (crqe_select_head_review); a verdict
-# comment that names <head> or whose anchors do not exclusively name other
-# commits (any disposition, so a newer negative still outranks an older
-# approval); and a review-format findings comment that is not anchored only
-# to other commits, timed by its latest edit. Fails on unreadable input.
+# crqe_codex_pending_state read the same evidence. Prints an ISO time or
+# empty. Signals: the substantive head review (crqe_select_head_review) and
+# every classified comment that is not anchored only to other commits, either
+# disposition. Fails on unreadable input, including an unreadable time.
 crqe_latest_codex_signal_time() { # comments-json reviews-json inline-json bot head
-  local review verdicts findings
-  review=$(crqe_select_head_review "$2" "$3" "$4" "$5" | jq -r 'if . == null then "" else .submitted_at end') || return 1
-  verdicts=$(crqe_verdicts "$1" "$4" | jq -r --arg h "$5" '
-    [ .[] | select((.reviewed_shas == [$h])
-                   or ((.affirmative | not)
-                       and ((.reviewed_shas | length) == 0 or any(.reviewed_shas[]; . == $h)
-                            or any(.reviewed_shas[]; test("^[0-9a-f]{40}$") | not))))
-      | .created_at ] | max // ""') || return 1
-  findings=$(crqe_review_format_findings "$1" "$4" "$5" \
-    | jq -r '[ .[] | select(.anchor != "other") | ([.created_at, .updated_at] | max) ] | max // ""') || return 1
-  printf '%s\n%s\n%s\n' "$review" "$verdicts" "$findings" | jq -Rsr 'split("\n") | map(select(length > 0)) | max // ""'
+  local review comments
+  review=$(crqe_select_head_review "$2" "$3" "$4" "$5") || return 1
+  [ -n "$review" ] || return 1
+  if [ "$review" != null ]; then
+    review=$(printf '%s' "$review" | jq -er '.submitted_at | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))') || return 1
+  else
+    review=""
+  fi
+  comments=$(crqe_codex_comment_signals "$1" "$4" "$5") || return 1
+  comments=$(printf '%s' "$comments" | jq -er '[ .[] | select(.anchor != "other") | .at ] | max // ""') || return 1
+  printf '%s\n%s\n' "$review" "$comments" | jq -Rsr 'split("\n") | map(select(length > 0)) | max // ""'
 }
