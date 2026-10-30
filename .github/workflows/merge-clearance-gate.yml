@@ -105,6 +105,18 @@ on:
   # Keep the event type `merge-clearance-recheck` in sync with the lane.
   repository_dispatch:
     types: [merge-clearance-recheck]
+  # #2881: a Codex request or a Codex answer is a PR-level issue comment, and
+  # none of the events above fires for one. Without this trigger a green check
+  # stays green until the */30 sweep after a new configured-author request
+  # (which now holds a Phase 4b substitute), and a hold stays red until the
+  # sweep after Codex answers with only a verdict, a refusal or a Review
+  # Summary edit. App- and author-posted comments create runs; GITHUB_TOKEN
+  # ones do not, which is why #658 above could not use this trigger. The
+  # dispatch-recheck job handles these events: like a dispatch, an
+  # issue_comment run has no PR-head association, so it resolves the PR's
+  # current head and POSTs there. The default-branch event SHA is never used.
+  issue_comment:
+    types: [created, edited, deleted]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
   # */30 since #2167 (was */15, mirroring codex-p1-gate.yml): each tick runs
@@ -189,6 +201,7 @@ jobs:
     if: >-
       github.event_name != 'schedule'
       && github.event_name != 'repository_dispatch'
+      && github.event_name != 'issue_comment'
     steps:
       - name: Open the required check_run (#841 phase 1)
         id: open
@@ -802,7 +815,28 @@ jobs:
     # a pass — so no guard on the payload is needed beyond validating it is a
     # PR number. Label events are still not a trigger (not head-pinned proof —
     # #429 round-3 P1).
-    if: github.event_name == 'repository_dispatch'
+    #
+    # #2881: the same job re-evaluates an open PR when a PR-level comment that
+    # can move gate (c) is created, edited or deleted: anything from the Codex
+    # App (a verdict, a refusal, a findings comment, or a Review Summary edit
+    # such as Running to Completed), or a comment whose current or previous
+    # body contains `@codex review` (a request created, edited or deleted).
+    # The filter only selects which events pay for an evaluation; the gate
+    # still re-derives everything, including whether the commenter is the
+    # configured author or the configured Codex bot. It admits any App bot
+    # except CodeRabbit (whose frequent summary edits would spend the
+    # installation budget) and Actions, so a consumer policy that names a
+    # different codex.bot_login still wakes the gate (Phase 4b on #2886).
+    if: >-
+      github.event_name == 'repository_dispatch'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && github.event.issue.state == 'open'
+          && ((endsWith(github.event.comment.user.login, '[bot]')
+               && github.event.comment.user.login != 'coderabbitai[bot]'
+               && github.event.comment.user.login != 'github-actions[bot]')
+              || contains(github.event.comment.body, '@codex review')
+              || contains(github.event.changes.body.from, '@codex review')))
     runs-on: ubuntu-latest
     # checks:write to POST the check_run (same as the sweep). issues:read for
     # the gate script's /issues/{pr}/comments marker read + the delegated
@@ -830,6 +864,11 @@ jobs:
           # (not interpolated into the script) and validated as a positive
           # integer below, so an arbitrary client_payload cannot inject shell.
           PR: ${{ github.event.client_payload.pr }}
+          # #2881: on issue_comment the PR is the commented issue. Both are
+          # validated as a positive integer below, and the head comes from the
+          # open-PR list, never from the event.
+          PR_COMMENTED: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
@@ -845,12 +884,17 @@ jobs:
         run: |
           set -euo pipefail
           . scripts/workflow/required-check-generation.sh
+          check_title="Merge clearance gate (propagation-lane dispatch re-evaluation)"
+          if [ "${EVENT_NAME:-}" = issue_comment ]; then
+            PR="${PR_COMMENTED:-}"
+            check_title="Merge clearance gate (Codex request/answer comment re-evaluation)"
+          fi
           # Validate the dispatched PR number before it reaches any API call —
           # the payload is attacker-influenceable (anyone with repo write can
           # dispatch), so reject anything that is not a bare positive integer.
           case "$PR" in
             ''|*[!0-9]*)
-              echo "::error::repository_dispatch client_payload.pr is not a positive integer: '$PR'"
+              echo "::error::${EVENT_NAME:-repository_dispatch} PR number is not a positive integer: '$PR'"
               exit 1
               ;;
           esac
@@ -879,7 +923,6 @@ jobs:
           rc=$?
           set -e
           echo "$output"
-          check_title="Merge clearance gate (propagation-lane dispatch re-evaluation)"
           case "$rc" in
             0) conclusion="success" ;;
             1) conclusion="failure" ;;

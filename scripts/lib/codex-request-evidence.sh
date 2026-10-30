@@ -618,3 +618,231 @@ crqe_review_approval_time() { # selected-review-json comments-json bot head
       then $review.submitted_at else "" end
   '
 }
+
+# #2881 option (c): is a Codex review still owed on <head>, and has the
+# bounded wait for it run out? Emits one object:
+#
+#   {state, reason, request, terminal_at, running_since, anchor_at, expires_at}
+#
+#   none       no configured-author request, and no run in flight
+#   answered   Codex produced a terminal outcome on <head> strictly after the
+#              latest configured-author request (whole PR), and no Code
+#              Review run on <head> started after that outcome
+#   pending    otherwise, and the bounded wait has not run out
+#   timed-out  otherwise, and now >= anchor + <timeout-seconds>. This is a
+#              fallback to the independent Phase 4b approval, never a Codex
+#              outcome: Codex may still be running and may post findings
+#              after merge.
+#   unreadable an author request lacks a positive id or a readable created_at
+#
+# The latest request counts across the whole PR. Using head transitions to
+# exclude requests made on earlier heads would need ordinary-push evidence,
+# which crqe_latest_head_transition does not have, so an earlier-head request
+# simply waits for an exact-head outcome or its own timeout.
+#
+# Terminal outcomes on <head>, each timed by the object's own server field,
+# read only from structured Codex signals (owner decision on #2886; findings
+# written as free-form issue-comment text are out of scope here):
+#   - a configured-bot review run whose commit_id is <head> (submitted_at); a
+#     body-less wrapper whose inline comments are all replies is not a run;
+#   - a verdict comment that starts with the `Codex review:` header and whose
+#     every Reviewed commit field is <head> (created_at);
+#   - a provider refusal in its exact shape at the start of the body: the
+#     usage-limit notice, `To use Codex here,`, or `Codex Review: Something
+#     went wrong` (created_at: a reply without a review still answers);
+#   - a Review Summary, recognized only by its envelope (the leading marker
+#     at the very start of the body) with its `codex-review-state:v1` JSON on
+#     the line directly after it, whose code_review names <head> in full with
+#     status `completed`, `failed` or `canceled` that the table row agrees
+#     with, timed by the run timestamp Codex writes into the status cell
+#     (`<relative-time datetime=...>`). The comment's own updated_at is never
+#     an outcome time. A relevant Summary that does not validate holds,
+#     bounded from its last edit; it never answers.
+# A Summary on <head> with status `running` contributes its run time as
+# running_since. The usage-re and not-connected-re arguments are accepted for
+# compatibility and unused: the shared not-connected regex matches anywhere in
+# a body, so the exact shapes are pinned here instead.
+#
+# Ordering uses whole seconds, and an outcome must be strictly later than the
+# request: a same-second outcome does not answer it. Different object types
+# are ordered by time only, never by id. The timeout anchor is the latest
+# request's server created_at, or, when only a run is in flight, that run's
+# provider-written start time. A rerun of the gate cannot move either.
+#
+# Pure: jq over the passed strings only (on stdin, so a large PR cannot hit
+# the argument-size limit); the caller supplies now.
+crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} author bot head timeout-seconds now-epoch [usage-re] [not-connected-re]
+  printf '%s\n' "${1:-null}" "${2:-null}" | jq -sc \
+    --arg author "${3:-}" --arg bot "${4:-}" --arg sha "${5:-}" \
+    --arg timeout "${6:-}" --arg now "${7:-}" \
+    --arg usage_re "${8:-}" --arg nc_re "${9:-}" '
+    def secs: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
+              then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) else null end;
+    def iso: if . == null then null else todate end;
+    def is_bot: (.user.login // "") == $bot and $bot != "" and ((.user.type // "Bot") == "Bot");
+    # Only structured Codex signals are read (owner decision on #2886: free-
+    # form findings text is out of scope here). A Review Summary is
+    # recognized only by its envelope: the leading marker at the very start
+    # of the body, so a marker quoted or fenced inside another comment never
+    # makes that comment a Summary.
+    def is_summary: (.body // "") | startswith("<!-- codex-pull-request-review-summary -->");
+    # The Reviewed commit fields of a verdict, and nothing else.
+    def reviewed: (.body // "") | ascii_downcase
+      | [ scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)") | .[0]
+          | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "") ];
+    (if length == 2 then .[0] else null end) as $comments
+    | (if length == 2 then .[1] else null end) as $review_input
+    # The second input is the reviews array, or {reviews, inline} with the
+    # inline review comments that tell a reply wrapper from a review run.
+    | (if ($review_input | type) == "object" then $review_input.reviews else $review_input end) as $reviews
+    | (if ($review_input | type) == "object" then $review_input.inline else [] end) as $inline
+    | ($sha | ascii_downcase) as $head
+    | if ($comments | type) != "array" or ($reviews | type) != "array" or ($inline | type) != "array"
+         or ($head | test("^[0-9a-f]{40}$") | not)
+         or ($timeout | test("^[0-9]+$") | not) or ($now | test("^[0-9]+$") | not)
+      then {state: "unreadable", reason: "invalid-input"}
+      else
+      ($timeout | tonumber) as $window | ($now | tonumber) as $t_now
+      | [ $comments[]
+          | select((.user.login // "") == $author)
+          | select((.body // "") | test("\\A@codex review\\z"; "i")) ] as $requests
+      | if any($requests[]; ((.id | type) != "number") or .id <= 0 or (.id | floor) != .id
+                            or ((.created_at | secs) == null))
+        then {state: "unreadable", reason: "request-unreadable"}
+        else
+        ($requests | max_by([(.created_at | secs), .id])) as $req
+        | ($req.created_at | if . == null then null else secs end) as $req_at
+        | [ $comments[] | select(is_bot) ] as $botc
+        # Every Review Summary that may describe <head>: its JSON names <head>,
+        # its row commit is a prefix of <head>, or it names no commit at all. A relevant summary that does not validate (JSON
+        # missing or malformed, the row missing, the row commit or status
+        # disagreeing with the JSON, a status outside completed / running /
+        # failed / canceled, an unreadable run time, or one later than the
+        # last edit of the comment plus 300 s) is `unreadable`: it never answers,
+        # and it holds, bounded from its last edit (Phase 4b on #2886).
+        # The Summary is recognized by its envelope (is_summary), and its
+        # state JSON is read only from the line directly after the leading
+        # marker; a missing or damaged state line is held as unreadable.
+        | [ $botc[]
+            | select(is_summary)
+            | . as $c
+            # A missing or damaged marker must read as null, not as no value:
+            # capture emits nothing on no match, which would drop the whole
+            # summary (Codex P1 on #2886).
+            | ([ (.body // "") | capture("\\A<!-- codex-pull-request-review-summary -->\\r?\\n<!-- codex-review-state:v1 (?<j>\\{[^\\n]*\\}) -->")? | .j ] | first) as $sj_raw
+            | (if $sj_raw == null then null else (try ($sj_raw | fromjson) catch null) end) as $sj
+            | ((.body // "") | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")? // null) as $row
+            | (if ($sj | type) == "object" and ($sj.code_review | type) == "object"
+                  and (($sj.code_review.commit_sha // "") | type) == "string"
+                  and ($sj.code_review.commit_sha | ascii_downcase | test("^[0-9a-f]{40}$"))
+               then ($sj.code_review.commit_sha | ascii_downcase) else null end) as $jc
+            | (if $row == null then null else ($row.commit | ascii_downcase) end) as $rc
+            # Relevant when either representation names <head>, or neither
+            # names a commit: a JSON commit for another head beside a row for
+            # <head> is a conflict that holds, never a drop (Phase 4b round 3
+            # on #2886).
+            | select($jc == $head or ($rc != null and ($head | startswith($rc))) or ($jc == null and $rc == null))
+            | (if $row == null then null
+               elif ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
+               elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
+               elif ($row.status | test("\\*\\*Failed\\*\\*"; "i")) then "failed"
+               elif ($row.status | test("\\*\\*Cancell?ed\\*\\*"; "i")) then "canceled"
+               else "unknown" end) as $rs
+            | (if $row == null then null
+               else (($row.status | capture("datetime=\"(?<d>[^\"]+)\"")? // null) | if . == null then null else (.d | secs) end) end) as $run
+            | (($c.updated_at // $c.created_at) | secs) as $edited
+            | if $jc == $head and $rc != null and ($head | startswith($rc))
+                 and $rs != null and $rs != "unknown"
+                 and (($sj.code_review.status // "") == $rs)
+                 and $run != null and $edited != null and $run <= $edited + 300
+              then {status: $rs, at: $run}
+              else {status: "unreadable", at: $edited} end ] as $summaries
+        # A review counts only when it is a review run, as in
+        # crqe_select_head_review: a body-less wrapper whose inline comments
+        # are all replies is not one (Phase 4b on #2886).
+        | ( [ $reviews[] | select(is_bot) | select((.commit_id // "" | ascii_downcase) == $head)
+              | . as $r
+              | [ $inline[] | select(.pull_request_review_id == $r.id) ] as $own
+              | select(any($own[]; ((.user.login // "") == $bot) and (.in_reply_to_id == null))
+                       or (($r.body // "") | test("[^[:space:]]"))
+                       or ($own | length) == 0)
+              | (.submitted_at | secs) ]
+          # A verdict answers only in its own shape: a body that starts with
+          # the `Codex review:` header and whose every Reviewed commit field
+          # names <head>.
+          + [ $botc[] | select(is_summary | not)
+              | select((.body // "") | test("\\A\\s*codex review:"; "i"))
+              | reviewed as $a
+              | select(($a | length) > 0 and all($a[]; . == $head))
+              | (.created_at | secs) ]
+          # A refusal answers only in the provider exact comment shapes, at
+          # the start of the body: the usage-limit notice, the not-connected
+          # notice (`To use Codex here,`), and `Codex Review: Something went
+          # wrong`. Quoted refusal wording inside other text is not an answer:
+          # the shared not-connected regex matches anywhere in a body, so every
+          # shape is pinned to the start of the body here.
+          + [ $botc[] | select(is_summary | not)
+              | select(((.body // "") | test("\\A\\s*you have reached your codex usage limits for code reviews"; "i"))
+                       or ((.body // "") | test("\\A\\s*to use codex here,"; "i"))
+                       or ((.body // "") | test("\\A\\s*codex review:\\s*something went wrong"; "i")))
+              | (.created_at | secs) ]
+          + [ $summaries[] | select(.status == "completed" or .status == "failed" or .status == "canceled") | .at ]
+          | map(select(. != null)) | max ) as $terminal
+        | ([ $summaries[] | select(.status == "running") | .at ] | max) as $running
+        | ([ $summaries[] | select(.status == "unreadable") | .at ]) as $bad
+        | (if $req_at != null and ($terminal == null or $terminal <= $req_at) then
+             {anchor: $req_at, reason: "request-unanswered"}
+           elif $running != null and ($terminal == null or $running > $terminal) then
+             {anchor: $running, reason: "review-running"}
+           elif any($bad[]; . == null) then {anchor: null, reason: "summary-unreadable"}
+           elif any($bad[]; $terminal == null or . > $terminal) then
+             {anchor: ($bad | max), reason: "summary-unreadable"}
+           else null end) as $owed
+        | {request: (if $req == null then null else {id: $req.id, created_at: $req.created_at} end),
+           terminal_at: ($terminal | iso), running_since: ($running | iso)} as $base
+        | if $owed != null and $owed.anchor == null then
+            $base + {state: "unreadable", reason: "summary-unreadable-without-time", anchor_at: null, expires_at: null}
+          elif $owed == null then
+            $base + {state: (if $req == null then "none" else "answered" end),
+                     reason: (if $req == null then "no-request" else "request-answered" end),
+                     anchor_at: null, expires_at: null}
+          else
+            ($owed.anchor + $window) as $exp
+            | $base + {state: (if $t_now >= $exp then "timed-out" else "pending" end),
+                       reason: $owed.reason, anchor_at: ($owed.anchor | iso), expires_at: ($exp | iso)}
+          end
+        end
+      end'
+}
+
+# #2881 (Phase 4b on #2886): the newest Codex signal on <head> in one
+# snapshot, for the substitute's latest-signal-wins guard, so the guard and
+# crqe_codex_pending_state read the same evidence. Prints an ISO time or empty.
+# Structured signals only (owner decision on #2886): the substantive head
+# review (crqe_select_head_review), and every verdict comment the gate's own
+# verdict selection would order (crqe_verdicts): one whose Reviewed commit
+# fields all name <head>, or a non-affirmative one whose fields are absent,
+# abbreviated, malformed or include <head>, so a newer negative still
+# outranks an older approval. A verdict naming only other full commits is
+# not a signal for <head>. An unreadable time fails the call.
+crqe_latest_codex_signal_time() { # comments-json reviews-json inline-json bot head
+  local review verdicts
+  review=$(crqe_select_head_review "$2" "$3" "$4" "$5") || return 1
+  [ -n "$review" ] || return 1
+  if [ "$review" != null ]; then
+    review=$(printf '%s' "$review" | jq -er '.submitted_at | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))') || return 1
+  else
+    review=""
+  fi
+  verdicts=$(crqe_verdicts "$1" "$4") || return 1
+  verdicts=$(printf '%s' "$verdicts" | jq -er --arg h "$5" '
+    [ .[] | select((.reviewed_shas | length) > 0 and all(.reviewed_shas[]; . == $h)
+                   or ((.affirmative | not)
+                       and (((.reviewed_shas | length) == 0)
+                            or any(.reviewed_shas[]; . == $h)
+                            or any(.reviewed_shas[]; test("^[0-9a-f]{40}$") | not)))) ]
+    | if any(.[]; (.created_at | type) != "string"
+                  or (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") | not))
+      then error("unreadable verdict time") else ([ .[].created_at ] | max // "") end') || return 1
+  printf '%s\n%s\n' "$review" "$verdicts" | jq -Rsr 'split("\n") | map(select(length > 0)) | max // ""'
+}

@@ -1697,6 +1697,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/lib/codex-failure-markers.sh"   # #2881 refusal markers in the pending-state cases
   # #1560 Codex review ledger: attribution fixtures, CLI contract, and the
   # verdict-expression pin across the three copies. Run by check_codex_scripts.
   - path: tests/test_codex_review_ledger.sh
