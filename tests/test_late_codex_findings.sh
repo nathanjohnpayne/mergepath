@@ -49,6 +49,11 @@ ok "a late review and a late inline comment are selected, an old review is not"
 [ "$(input "$MERGED" '[]' "[$OLD_REVIEW]" '[]' | select_ids --touched review:802)" = "review:802" ] \
   || die "an edited pre-merge review was not selected via --touched"
 ok "--touched selects a pre-merge review edited after merge"
+[ "$(input "$MERGED" '[]' "[$(printf '%s' "$OLD_REVIEW" | jq -c '.edited_at = "2026-08-28T04:00:00Z"')]" '[]' | select_ids)" = "review:802" ] \
+  || die "a pre-merge review with a post-merge lastEditedAt was not selected"
+[ "$(input "$MERGED" '[]' "[$(printf '%s' "$OLD_REVIEW" | jq -c '.edited_at = "2026-08-27T04:00:00Z"')]" '[]' | select_ids)" = "" ] \
+  || die "a review edited before the merge was selected"
+ok "a review's GraphQL edit time selects it without --touched, only when after merge"
 
 # --- writer against a fake gh -------------------------------------------------
 mkdir -p "$DIR/bin"
@@ -64,7 +69,7 @@ while [ $# -gt 0 ]; do
     -X) method=$2; shift 2 ;;
     --input) input=$2; shift 2 ;;
     --jq) jqf=$2; shift 2 ;;
-    -f) fields+=("$2"); shift 2 ;;
+    -f|-F) fields+=("$2"); shift 2 ;;
     *) endpoint=$1; shift ;;
   esac
 done
@@ -81,6 +86,7 @@ case "$method:$endpoint" in
   GET:repos/o/r/issues\?labels=*) out "$(printf '%s' "$s" | jq -c '[.issues[] | del(.comments)]')" ;;
   GET:repos/o/r/issues/*/comments*) n=${endpoint#repos/o/r/issues/}; n=${n%%/*}
     out "$(printf '%s' "$s" | jq -c --argjson n "$n" '[.issues[] | select(.number == $n) | .comments[] | {body: .}]')" ;;
+  GET:graphql) out "$(printf '%s' "$s" | jq -c '{data: {repository: {pullRequest: {reviews: {pageInfo: {hasNextPage: false, endCursor: null}, nodes: (.review_edits // [])}}}}}')" ;;
   POST:repos/o/r/labels) echo '{}' ;;
   POST:repos/o/r/issues) b=$(cat "$input")
     printf '%s' "$s" | jq -c --argjson b "$b" '.issues += [{number: (100 + (.issues | length)), state: "open", body: $b.body, title: $b.title, labels: $b.labels, comments: []}]' >"$STATE"
@@ -145,6 +151,17 @@ PATH="$DIR/bin:$PATH" TMPDIR="$DIR" "$SCRIPT" --repo o/r --sweep --since 2026-08
   && ! grep -q 'repos/o/r/pulls/5$' "$CALLS" \
   || { cat "$DIR/out"; cat "$CALLS"; die "the sweep did not isolate the failing PR (rc=$rc)"; }
 ok "the sweep records #7 although #6 fails, skips unmerged issues, and exits 3"
+# Phase 4b on #2886: the sweep has no --touched hint; a pre-merge review whose
+# GraphQL lastEditedAt is after merge (e.g. a fork PR's read-only event run
+# could not write) is still recorded.
+jq -nc --arg m "$MERGED" --argjson r "$OLD_REVIEW" '{pr: {merged_at: $m}, comments: [], reviews: [$r], inline: [], issues: [],
+  review_edits: [{databaseId: 802, lastEditedAt: "2026-08-28T04:00:00Z"}],
+  closed: [{number: 7, pull_request: {merged_at: $m}}]}' >"$STATE"
+PATH="$DIR/bin:$PATH" TMPDIR="$DIR" "$SCRIPT" --repo o/r --sweep --since 2026-08-27T00:00:00Z >"$DIR/out" 2>&1 \
+  || { cat "$DIR/out"; die "the edited-review sweep failed"; }
+jq -r '.issues[0].body // ""' "$STATE" | grep -q 'mergepath-late-codex-item: review:802:' \
+  || { cat "$DIR/out"; jq . "$STATE"; die "the sweep missed a pre-merge review edited after merge"; }
+ok "the sweep records a pre-merge review edited after merge, without --touched"
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r >/dev/null 2>&1; then die "a missing --pr/--sweep was accepted"; fi
 if PATH="$DIR/bin:$PATH" "$SCRIPT" --repo o/r --pr 7 --touched comment:1 >/dev/null 2>&1; then die "a malformed --touched was accepted"; fi
 ok "usage errors exit nonzero"

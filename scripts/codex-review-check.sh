@@ -3122,10 +3122,12 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # `timed-out/substitute-used` fallback: Codex may still be running and may
     # post findings after merge (the late-finding detector, #2881, surfaces
     # those). The approval, accounting and every other gate still apply.
-    # Both requests and outcomes come from the fresh re-read above, with its
-    # verdict anchors resolved again: an earlier snapshot must not win, or a
-    # Summary that went from Completed to Running between the two reads would
-    # read as answered (Codex P1 on #2886). Unreadable evidence refuses.
+    # Requests, outcomes, reviews, inline comments and the latest Codex signal
+    # all come from one fresh read (Phase 4b on #2886): the comments re-read
+    # above, with its verdict anchors resolved again, plus fresh reviews and
+    # inline comments. An earlier snapshot must not win, or a Summary that went
+    # from Completed to Running between the reads would read as answered (Codex
+    # P1 on #2886). Unreadable evidence refuses.
     PHASE_4B_CODEX_OWED=""
     PHASE_4B_TIMEOUT_NOTE=""
     if [ -z "$PHASE_4B_SUPERSEDED" ] && [ "$CODEX_ENABLED" = "true" ]; then
@@ -3135,14 +3137,34 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
         PHASE_4B_CODEX_OWED="the Codex pending-review helper is unavailable"
       elif ! [[ "$PENDING_WINDOW" =~ ^[0-9]+$ ]]; then
         PHASE_4B_CODEX_OWED="codex.review_timeout_seconds is not a whole number of seconds ('$PENDING_WINDOW')"
+      elif ! declare -F crqe_latest_codex_signal_time >/dev/null 2>&1; then
+        PHASE_4B_CODEX_OWED="the Codex signal-ordering helper is unavailable"
       elif ! PENDING_COMMENTS=$(crqe_resolve_verdict_anchors "$REQUEST_COMMENTS_JSON" "$REPO" "$BOT_LOGIN" 2>/dev/null) \
            || ! printf '%s' "$PENDING_COMMENTS" | jq -e 'type == "array"' >/dev/null 2>&1 \
-           || ! PENDING_JSON=$(crqe_codex_pending_state "$PENDING_COMMENTS" "$REVIEWS_JSON" "$AUTHOR_IDENTITY" \
+           || ! PENDING_REVIEWS=$(gh_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews (Phase 4b owed-review re-read)" 2>/dev/null) \
+           || ! PENDING_INLINE=$(gh_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments (Phase 4b owed-review re-read)" 2>/dev/null) \
+           || ! FRESH_SIGNAL_TIME=$(crqe_latest_codex_signal_time "$PENDING_COMMENTS" "$PENDING_REVIEWS" "$PENDING_INLINE" "$BOT_LOGIN" "$HEAD_SHA" 2>/dev/null) \
+           || ! PENDING_REVIEW_INPUT=$(printf '%s\n%s\n' "$PENDING_REVIEWS" "$PENDING_INLINE" | jq -sc '{reviews: .[0], inline: .[1]}' 2>/dev/null) \
+           || ! PENDING_JSON=$(crqe_codex_pending_state "$PENDING_COMMENTS" "$PENDING_REVIEW_INPUT" "$AUTHOR_IDENTITY" \
                "$BOT_LOGIN" "$HEAD_SHA" "$PENDING_WINDOW" "$(date -u +%s)" \
                "${CODEX_USAGE_LIMIT_MARKER_RE:-}" "${CODEX_NOT_CONNECTED_MARKER_RE:-}" 2>/dev/null); then
         PHASE_4B_CODEX_OWED="Codex pending-review evidence is unreadable"
       else
+        # The freshness guard below uses this same snapshot, so a findings
+        # comment or review that arrived since the first read outranks an
+        # older approval here too, rather than only answering the request.
+        if [ -n "$FRESH_SIGNAL_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || ! [[ "$LATEST_CODEX_SIGNAL_TIME" > "$FRESH_SIGNAL_TIME" ]]; }; then
+          LATEST_CODEX_SIGNAL_TIME="$FRESH_SIGNAL_TIME"
+        fi
+        # The candidate must still be its reviewer's latest opinionated state
+        # on HEAD in the fresh read.
+        PHASE_4B_STILL_APPROVED=$(printf '%s' "$PENDING_REVIEWS" | jq -r --arg login "$PHASE_4B_LOGIN" --arg at "$PHASE_4B_TIME" --arg sha "$HEAD_SHA" '
+          [ .[] | select(.user.login == $login and .commit_id == $sha)
+            | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED") ]
+          | max_by(.submitted_at) // null
+          | if . != null and .state == "APPROVED" and .submitted_at == $at then "yes" else "no" end' 2>/dev/null || printf no)
         PENDING_STATE=$(printf '%s' "$PENDING_JSON" | jq -r '.state // "unreadable"')
+        [ "$PHASE_4B_STILL_APPROVED" = yes ] || PENDING_STATE=superseded-approval
         PENDING_DETAIL=$(printf '%s' "$PENDING_JSON" | jq -r '"\(.reason // "unknown"); request \(.request.id // "none") @ \(.request.created_at // "none"); last exact-head Codex outcome \(.terminal_at // "none"); run in flight since \(.running_since // "none"); anchor \(.anchor_at // "none"); bound \(.expires_at // "none")"')
         case "$PENDING_STATE" in
           none|answered) log "gate (c): Codex owes HEAD no review ($PENDING_STATE: $PENDING_DETAIL) (#2881)" ;;
@@ -3151,6 +3173,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
             PHASE_4B_TIMEOUT_NOTE="; codex-review-outcome: timed-out/substitute-used — no Codex outcome within codex.review_timeout_seconds=${PENDING_WINDOW}s ($PENDING_DETAIL); this is a fallback, not a Codex result, and a running review may still report after merge (#2881)"
             log "gate (c): codex-review-outcome: timed-out/substitute-used ($PENDING_DETAIL) (#2881)"
             ;;
+          superseded-approval) PHASE_4B_CODEX_OWED="the approval is no longer $PHASE_4B_LOGIN's latest opinionated review on HEAD in the fresh read" ;;
           *) PHASE_4B_CODEX_OWED="Codex pending-review evidence is unreadable ($PENDING_DETAIL)" ;;
         esac
       fi

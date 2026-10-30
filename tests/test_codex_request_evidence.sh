@@ -49,7 +49,13 @@ case "$1" in
       cat "$FIXTURES/comments-reread"; exit 0
     fi
     cat "$FIXTURES/comments" ;;
-  repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }; cat "$FIXTURES/reviews" ;;
+  repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }
+    # #2881: a later read may see newer reviews than the first.
+    if [ -f "$FIXTURES/reviews-reread" ] \
+       && [ "$(grep -c '^repos/owner/repo/pulls/99/reviews$' "$CALLS")" -ge 2 ]; then
+      cat "$FIXTURES/reviews-reread"; exit 0
+    fi
+    cat "$FIXTURES/reviews" ;;
   repos/owner/repo/pulls/99/files) printf '%s\n' '[]' ;;
   repos/owner/repo/rulesets*) printf '%s\n' '[]' ;;
   repos/owner/repo/rules/branches/main) printf '%s\n' '[]' ;;
@@ -1168,6 +1174,23 @@ p_check review-format-unanchored "[$R0,$(p_comment 601 $((P_T0 + 60)) '## Review
 
 ### [P1] A finding without a permalink')]" '[]' pending
 p_check bounded-by-policy-window "[$R0]" '[]' timed-out request-unanswered 300
+# Phase 4b on #2886: only a review run answers. A body-less wrapper whose
+# inline comments are all replies does not; a root inline comment, a body, or
+# no inline comments at all does (crqe_select_head_review's predicate).
+P_WRAP=$(p_review $((P_T0 + 60)) | jq -c '.body = ""')
+p_inline() { jq -nc --argjson reply "$1" --arg bot "$P_BOT" '{pull_request_review_id:700,user:{login:$bot,type:"Bot"},in_reply_to_id:(if $reply then 41 else null end)}'; }
+p_check reply-wrapper-review "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[$(p_inline true)]}" pending request-unanswered
+p_check review-with-root-inline "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[$(p_inline false)]}" answered
+p_check bodyless-review-no-inline "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[]}" answered
+# Every anchor counts: a HEAD permalink plus a Reviewed commit naming another
+# SHA is mixed, so it does not answer; nor does a verdict that pairs a HEAD
+# Reviewed commit with another commit's permalink.
+p_check review-format-mixed-anchors "[$R0,$(p_comment 601 $((P_T0 + 60)) "https://github.com/o/r/blob/$P_HEAD/a.sh#L1 ![P2 Badge](x)
+Reviewed commit: \`$P_OTHER\`")]" '[]' pending
+p_check verdict-mixed-anchors "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_HEAD\`
+https://github.com/o/r/blob/$P_OTHER/a.sh#L1")]" '[]' pending
 if [ "$(crqe_codex_pending_state "[$(p_req 501 "$P_T0" | jq -c 'del(.created_at)')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ] \
    && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 18x00 "$P_NOW" | jq -r .state)" = unreadable ] \
    && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" abc 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
@@ -1252,6 +1275,17 @@ E_SUM_RUN=$(p_summary running "$(e_iso 30)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --ar
 printf '%s\n' "[$E_REQ_RECENT,$E_SUM_RUN]" >"$DIR/comments-reread"
 e_run summary-flips-to-running-between-reads "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 1 'Codex still owes abcdef0123456789000000000000000000000000 a review'
 rm -f "$DIR/comments-reread"
+# Phase 4b on #2886: a findings comment that is newer than the approval and
+# visible only in the re-read must outrank the approval, not merely answer the
+# request: the freshness guard reads the same snapshot as the owed-review check.
+printf '%s\n' "[$E_REQ_RECENT,$E_FINDING_LATE]" >"$DIR/comments-reread"
+e_run finding-only-in-reread "[$E_REQ_RECENT]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+rm -f "$DIR/comments-reread"
+# The approval must still be its reviewer's latest opinionated state on HEAD
+# in the fresh reviews read.
+printf '%s\n' "$E_APPROVAL" | jq -c --arg at "$(e_iso 10)" '. + [.[0] + {state: "CHANGES_REQUESTED", submitted_at: $at}]' >"$DIR/reviews-reread"
+e_run approval-superseded-in-reread "[$E_REQ_OLD]" "$E_APPROVAL" 1 "no longer nathanpayne-codex's latest opinionated review"
+rm -f "$DIR/reviews-reread"
 e_run summary-completed-control "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 0 'Codex owes HEAD no review (answered'
 
 

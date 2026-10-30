@@ -23,9 +23,12 @@
 #   - it carries a priority marker: a `![Pn Badge]` image, or a `[Pn]` heading
 #     or bold label, n in 0-3 (the review, inline and cloud-task formats);
 #   - it was created or last edited strictly after the PR's merged_at, so an
-#     edit that adds findings after merge counts as well as a new comment. A
-#     review has no edit time, so `--touched review:<id>` (the edited-review
-#     event) marks that review as changed now.
+#     edit that adds findings after merge counts as well as a new comment. The
+#     REST review object has no edit time, so a review's edit time comes from
+#     GraphQL `PullRequestReview.lastEditedAt`; that lets the sweep recover a
+#     pre-merge review edited after merge even when the event run could not
+#     write (a fork PR's read-only token). `--touched review:<id>` (the
+#     edited-review event) also marks that review as changed now.
 # Each finding is keyed by kind, id and a fingerprint of its current body. An
 # edit that changes the body is a new item; a repeat delivery of the same body
 # is not.
@@ -116,8 +119,9 @@ select_late_findings() { # stdin: {merged_at, comments, reviews, inline}; $1 bot
            | select(($c | secs) != null and ($c | secs) > $merged)
            | item("issue-comment"; $c)),
         (.reviews[] | select(is_bot and marked)
-           | select(((.submitted_at | secs) // 0) > $merged or ((.id | tostring) == $touched and $touched != ""))
-           | item("review"; (if (.id | tostring) == $touched and $touched != "" then "edited-after-merge" else .submitted_at end))),
+           | ([.submitted_at, .edited_at] | map(select(. != null)) | max) as $c
+           | select((($c | secs) // 0) > $merged or ((.id | tostring) == $touched and $touched != ""))
+           | item("review"; (if (($c | secs) // 0) > $merged then $c else "edited-after-merge" end))),
         (.inline[] | select(is_bot and marked)
            | ([.created_at, .updated_at] | map(select(. != null)) | max) as $c
            | select(($c | secs) != null and ($c | secs) > $merged)
@@ -146,6 +150,17 @@ process_pr() { # pr
   fi
   comments=$(read_array "repos/$REPO/issues/$pr/comments?per_page=100")
   reviews=$(read_array "repos/$REPO/pulls/$pr/reviews?per_page=100")
+  # Review edit times are GraphQL-only. Paginated; unreadable fails the PR.
+  edits=$(gh api graphql --paginate -F pr="$pr" -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
+    query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+        reviews(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { databaseId lastEditedAt } } } } }' 2>/dev/null \
+    | jq -cs '[ .[].data.repository.pullRequest.reviews.nodes[] ]' 2>/dev/null) \
+    && printf '%s' "$edits" | jq -e 'type == "array"' >/dev/null 2>&1 \
+    || { echo "late-codex-findings: cannot read review edit times on $REPO#$pr" >&2; exit 3; }
+  reviews=$(printf '%s\n%s\n' "$reviews" "$edits" | jq -cs '
+    (.[1] | map({key: (.databaseId | tostring), value: .lastEditedAt}) | from_entries) as $e
+    | .[0] | map(. + {edited_at: $e[(.id | tostring)]})')
   inline=$(read_array "repos/$REPO/pulls/$pr/comments?per_page=100")
   items=$(printf '%s\n%s\n%s\n' "$comments" "$reviews" "$inline" \
     | jq -cs --arg m "$merged_at" '{merged_at: $m, comments: .[0], reviews: .[1], inline: .[2]}' \
