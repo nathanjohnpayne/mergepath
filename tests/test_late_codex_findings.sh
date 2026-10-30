@@ -8,10 +8,15 @@
 # never recorded.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SCRIPT="$ROOT/scripts/late-codex-findings.sh"
 FIXTURE="$ROOT/tests/fixtures/codex_late_review_format_1120.json"
 DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
+# The detector reads codex.bot_login from its own checkout's policy, so the
+# fixtures run a copy in a tree with no policy file: the standard login,
+# whatever a consumer configures. The policy case below builds its own tree.
+mkdir -p "$DIR/default/scripts"
+cp "$ROOT/scripts/late-codex-findings.sh" "$DIR/default/scripts/"
+SCRIPT="$DIR/default/scripts/late-codex-findings.sh"
 PASS=0
 ok() { PASS=$((PASS + 1)); echo "PASS: $*"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -221,7 +226,7 @@ if run; then die "a review edit node without fullDatabaseId was accepted"; fi
 ok "a review edit node without fullDatabaseId fails instead of matching nothing"
 # codex.bot_login comes from the governing policy.
 mkdir -p "$DIR/tree/scripts/lib" "$DIR/tree/.github"
-cp "$SCRIPT" "$DIR/tree/scripts/"; cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$DIR/tree/scripts/lib/"
+cp "$ROOT/scripts/late-codex-findings.sh" "$DIR/tree/scripts/"; cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$DIR/tree/scripts/lib/"
 printf 'codex:\n  bot_login: "custom-codex[bot]"\n' >"$DIR/tree/.github/review-policy.yml"
 CUSTOM=$(printf '%s' "$C1120" | jq -c '.user.login = "custom-codex[bot]"')
 [ "$(input "$MERGED" "[$CUSTOM,$C1120]" '[]' '[]' | "$DIR/tree/scripts/late-codex-findings.sh" --select | jq -r 'map(.id) | join(",")')" = 5447842730 ] \
