@@ -2220,7 +2220,7 @@ p4b_wave_binding_request_view() {
 # moved, while they ran was not in the evidence (Phase 4b on #2888). An
 # unreadable comment list is `unreadable`.
 p4b_wave_binding_evaluate() {
-  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic result
+  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic historic_after view result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   if ! command -v gh_api_array >/dev/null 2>&1 \
@@ -2236,12 +2236,39 @@ p4b_wave_binding_evaluate() {
     jq -nc '{state:"unreadable",reason:"comments-reread-failed"}'
     return 0
   fi
-  if [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" != "$(p4b_wave_binding_request_view "$after" "$bot" "$historic")" ] \
-     || ! printf '%s' "$comments" | jq -e --argjson h "$historic" '([ .[].id | tostring ]) as $ids | all($h | keys[]; . as $k | $ids | index($k))' >/dev/null 2>&1; then
+  # The mention history is read once more, last: a comment that gained and
+  # then lost a mention after the first history read shows the same body in
+  # both comment reads, but its revision is in this history (Phase 4b on
+  # #2888). Only mentioning entries are compared, so CodeRabbit re-editing a
+  # comment that never mentioned Codex changes nothing.
+  historic_after="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
+  view="$(p4b_wave_binding_request_view "$after" "$bot" "$historic")"
+  if [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" != "$view" ] \
+     || ! printf '%s' "$comments" | jq -e --argjson h "$historic" '([ .[].id | tostring ]) as $ids | all($h | keys[]; . as $k | $ids | index($k))' >/dev/null 2>&1 \
+     || ! jq -en --argjson a "$historic" --argjson b "${historic_after:-null}" \
+          '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1; then
     printf '%s' "$result" | jq -c 'del(.generation) + {state:"hold",reason:"requests-changed-during-evaluation"}'
     return 0
   fi
-  printf '%s\n' "$result"
+  # A clear carries what its final reads saw, so a later cheap check
+  # (p4b_wave_binding_stable) can tell whether a request has moved since.
+  printf '%s' "$result" | jq -c --argjson v "$view" --argjson h "$historic" '. + {stability: {view: $v, historic: $h}}'
+}
+
+# p4b_wave_binding_stable <repo> <pr> <stability-json>
+# One comment read, compared with the view a clear's final reads saw
+# (p4b_wave_binding_evaluate's .stability). Exit 0 only when they match: the
+# orchestrator runs the full evaluation inside its feedback-accounting fences
+# and this at the POST (Phase 4b on #2888). Missing stability, an unreadable
+# read, or any change returns 1.
+p4b_wave_binding_stable() {
+  local repo="$1" pr="$2" stability="${3:-}" bot comments historic view
+  bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
+  view="$(printf '%s' "$stability" | jq -ce '.view | objects' 2>/dev/null)" || return 1
+  historic="$(printf '%s' "$stability" | jq -ce '.historic | objects' 2>/dev/null)" || return 1
+  command -v gh_api_array >/dev/null 2>&1 || return 1
+  comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request stability" 2>/dev/null)" || return 1
+  [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" = "$view" ]
 }
 
 # p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>
@@ -2355,9 +2382,16 @@ p4b_wave_codex_binding_eval() {
                  elif $now then {id, at: (.created_at // ""), t: ((.created_at // "") | secs)}
                  else empty end ] | sort_by(.t, .id)) as $reqs
           | {bound_request: $r.id, requests: [ $reqs[] | {id, at} ], runs: []} as $base
+          | ([ $reqs[] | select((.id | tostring) == $rid) ] | first | .t) as $rt
           | if ($historic | type) != "object" then $base + {state: "hold", reason: "request-edit-history-unreadable"}
             elif any($reqs[]; .inconsistent == true) then $base + {state: "hold", reason: "request-edit-history-inconsistent"}
             elif any($reqs[]; .t == null) then $base + {state: "hold", reason: "request-time-unreadable"}
+            # Request times have whole-second precision (REST creation, and
+            # the fraction is dropped from edit times), so another request in
+            # the bound request s second has no knowable order relative to
+            # it: comment ids follow creation, not when a mention was added
+            # by an edit (Phase 4b on #2888).
+            elif any($reqs[]; .t == $rt and (.id | tostring) != $rid) then $base + {state: "hold", reason: "request-order-ambiguous"}
             elif ($versions | type) != "array" then $base + {state: "hold", reason: "summary-history-unreadable"}
             else
               [ $versions[] | version ] as $parsed
@@ -2601,7 +2635,7 @@ p4b_same_head_barrier() {
           # Every outcome carries the binding's evidence (#2771, liveness): a
           # hold that runs out the budget is surfaced with its reason, the
           # requests and the runs it paired, not just "did not reach".
-          wave_binding_json="$(printf '%s' "$wb_json" | jq -c 'del(.generation)' 2>/dev/null || printf null)"
+          wave_binding_json="$(printf '%s' "$wb_json" | jq -c 'del(.generation, .stability)' 2>/dev/null || printf null)"
           wb_reason="$(printf '%s' "$wb_json" | jq -r '.reason // "unknown"' 2>/dev/null || printf unknown)"
           case "$cls_cx:$wb_state" in
             *:unreadable)
