@@ -1644,6 +1644,8 @@ on:
     types: [created]
   repository_dispatch:
     types: [merge-clearance-recheck]
+  issue_comment:
+    types: [created, edited, deleted]
   schedule:
     - cron: "*/15 * * * *"
 permissions:
@@ -1831,6 +1833,33 @@ if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "not wired for the marker re-trigger
 else
   fail "expected check FAIL on unwired repository_dispatch (#658); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
+
+# Case B2/B3 (#2881, negative): the canonical header without the
+# issue_comment trigger, or with one activity type dropped, FAILS: a new Codex
+# request or an issue-comment-only Codex answer would otherwise wait for the
+# scheduled sweep to move the required check.
+for mcg_ic_case in absent no-deleted; do
+  WF_IC="$WORKDIR/wf-ic-$mcg_ic_case.yml"
+  { write_wf_header; write_wf_gate_job; } > "$WF_IC"
+  if [ "$mcg_ic_case" = absent ]; then
+    perl -0pi -e 's{^  issue_comment:\n    types: \[created, edited, deleted\]\n}{}m' "$WF_IC"
+  else
+    perl -0pi -e 's{^(  issue_comment:\n    types: )\[created, edited, deleted\]}{$1\[created, edited\]}m' "$WF_IC"
+  fi
+  if grep -q 'types: \[created, edited, deleted\]' "$WF_IC"; then
+    fail "#2881 issue_comment case $mcg_ic_case: the mutation changed nothing"
+    continue
+  fi
+  set +e
+  OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$WF_IC" "$CHECK_BIN" 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "missing the issue_comment trigger"; then
+    pass "issue_comment trigger $mcg_ic_case → check FAILS (#2881)"
+  else
+    fail "expected check FAIL on issue_comment trigger $mcg_ic_case (#2881); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fi
+done
 
 # Case C (positive): the canonical header (repository_dispatch trigger +
 # merge-clearance-recheck type + client_payload.pr wiring) plus a correctly-
@@ -2342,7 +2371,7 @@ mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: m
 #     allowlist only when the key is supplied lets the strongest mutation —
 #     removing the condition — pass untested, and dispatch-recheck then runs
 #     red on every pull_request event (App P2 on #852).
-mcg22_case y 's{^    if: github.event_name == \x27repository_dispatch\x27\n}{}m' \
+mcg22_case y 's{^    if: >-\n      github.event_name == \x27repository_dispatch\x27\n(?:      .*\n)*}{}m' \
   fail "has no job-level if"
 # x2/x3 — concurrency on the NON-event producers: not the permanent native
 #     block of case x, but a cancelled member silently drops a refresh that
@@ -4736,6 +4765,16 @@ rcp_case publish-admits-push \
 # push time (duplicating the gate parent's) and on every lint rerun.
 rcp_case open-admits-lint \
   's{^      github.event.workflow_run.name == .Merge Clearance Gate. &&\n}{}m' \
+  fail '[rcp job eligibility]'
+# #2881 (direct Phase 4b on #2886): an issue_comment-originated gate run
+# carries the default branch's head_sha and completes even with every job
+# skipped. Dropping either exclusion admits it, and publish then runs a full
+# sweep of every open PR on ordinary review traffic.
+rcp_case publish-admits-issue-comment \
+  's{ &&\n       \(github.event.workflow_run.name != .Merge Clearance Gate. \|\|\n        github.event.workflow_run.event != .issue_comment.\)\)}{)}m' \
+  fail '[rcp job eligibility]'
+rcp_case open-admits-issue-comment \
+  's{^      github.event.workflow_run.event != .issue_comment. &&\n}{}m' \
   fail '[rcp job eligibility]'
 
 # ── publisher: no runner-held wait (A14) ────────────────────────────────

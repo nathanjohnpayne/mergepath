@@ -342,14 +342,19 @@ EXPECTED_JOB_IF = {
     OPEN_JOB: (
         "github.event_name == 'workflow_run' && "
         "github.event.workflow_run.name == 'Merge Clearance Gate' && "
+        "github.event.workflow_run.event != 'issue_comment' && "
         "(github.event.action == 'requested' || "
         "github.event.action == 'in_progress')"
     ),
+    # #2881: an issue_comment-originated gate run (default-branch head_sha,
+    # often all jobs skipped) must not start a full publisher sweep.
     PUBLISH_JOB: (
         "github.event_name != 'workflow_run' || "
         "(github.event.action == 'completed' && "
         "(github.event.workflow_run.name != 'repo-lint' || "
-        "github.event.workflow_run.event == 'pull_request'))"
+        "github.event.workflow_run.event == 'pull_request') && "
+        "(github.event.workflow_run.name != 'Merge Clearance Gate' || "
+        "github.event.workflow_run.event != 'issue_comment'))"
     ),
 }
 

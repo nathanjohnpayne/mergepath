@@ -128,3 +128,44 @@ Live evidence (Summary comment ids; row times from `userContentEdits`):
 - mergepath#2868, Summary 6484787518, 12 edits. `PR opened` at 00:51:57Z, 6 s after the PR was created. Four `Manual request` runs, each starting 9 to 16 s after an author request (6484875221, 6485199017, 6485521854, 6502691400). One `New commits` run at 16:39:10Z on `3f5cba8` with no author request since 01:40:57Z; the `Manual request` run for 6502691400 then replaced it on the same commit at 16:42:08Z.
 - mergepath#2875, Summary 6504004643, 4 edits. `PR opened` on `4a0d511` (answered by review 5702339974), then `Manual request` on `78bbd62` 15 s after request 6504869550.
 - swipewatch#207 (6352255749), #210 (6449391051) and #211 (6453431235) show `PR opened` only, with no author request, each followed by a PR `+1` and no verdict comment. swipewatch#213 (6473230277) shows `PR opened` ending `Failed`. swipewatch#205 and #209 carry no Codex surface at all: a missing Summary is not evidence of a skipped trigger.
+
+## Phase 4b substitute while a Codex review is owed (#2881)
+
+`crqe_codex_pending_state <comments> <reviews|{reviews, inline}> <author> <bot> <head> <timeout-seconds> <now-epoch>` decides whether Codex still owes `<head>` a review. Gate (c)'s Phase 4b substitute in `scripts/codex-review-check.sh` uses it (owner decision on #2881, option (c)). It is pure jq, and its inputs arrive on stdin, so a large PR cannot hit the argument-size limit. It emits `{state, reason, request, terminal_at, running_since, anchor_at, expires_at}`, where `state` is `none`, `answered`, `pending`, `timed-out` or `unreadable`.
+
+**Which request counts.** The configured author's latest exact request counts across the whole PR. Excluding requests made on earlier heads would need ordinary-push transition evidence, which `crqe_latest_head_transition` lacks, so an earlier-head request waits for an exact-head outcome or for its own bound.
+
+**What answers it.** The owner decision on #2886 limits this to structured Codex signals, so findings written as free-form issue-comment text are not read. A request is answered by a terminal outcome on `<head>` that is strictly later in whole seconds. The outcomes are:
+
+- a configured-bot review run whose `commit_id` is `<head>`, using the `crqe_select_head_review` predicate (a body-less review whose inline comments are all replies is a wrapper, not a run);
+- a verdict comment that starts with the `Codex review:` header and whose every Reviewed commit field is `<head>`;
+- a provider refusal in its exact shape at the start of the body: the usage-limit notice, `To use Codex here,` or `Codex Review: Something went wrong`. The shared not-connected regex matches anywhere in a body, so the shapes are pinned to the start of the body here, and quoted refusal wording inside other text is not an answer;
+- a Review Summary, read as described below.
+
+**The Review Summary.**
+
+- **Recognition.** A Summary is recognized only by its envelope: the leading marker at the very start of the body. A marker quoted or fenced inside another comment never makes that comment a Summary.
+- **Timing.** Its `codex-review-state:v1` JSON is read from the line directly after the leading marker. It answers when its `code_review` names `<head>` in full with status `completed`, `failed` or `canceled`, and the table row agrees on both commit and status. The answer is timed by the run timestamp Codex writes into the status cell (`<relative-time datetime>`), never by the comment's `updated_at`.
+- **Running.** A `running` Summary on `<head>` whose run time is later than the last outcome keeps the head owed.
+- **Relevance.** A Summary is relevant when its JSON names `<head>`, its row commit is a prefix of `<head>`, or it names no commit at all.
+- **Unreadable.** A relevant Summary that does not validate is `unreadable`. That covers a missing or damaged state line, a missing row, a commit or status that disagrees, a status outside the four, an unreadable run time, and a run time later than the comment's `updated_at` plus 300 seconds. An unreadable Summary never answers. When it was last edited after the last outcome, it keeps the head owed, bounded from that edit. A relevant Summary with no readable edit time makes the whole state `unreadable`.
+
+**Identity and ordering.** The bot must match the configured login, and a present `user.type` must be `Bot`. Objects of different types are ordered by time only, never by id.
+
+**The bound.** `pending` and `timed-out` share one anchor: the latest request's server `created_at`, or the in-flight run's start time when every request is answered. `timed-out` means now is at or past the anchor plus `<timeout-seconds>`.
+
+**Unreadable input.** An author request without a positive integer id or a readable `created_at`, a non-numeric window, or a head that is not 40 hex reads as `unreadable`.
+
+### How gate (c) uses it
+
+The gate runs the check after the #1598 checks pass.
+
+- **The window.** It is `codex.review_timeout_seconds`, read from the parsed governing policy (`AUTHOR_POLICY_JSON`). The default of 1800 applies only when the key is absent, and a present value that is not a whole number of seconds refuses (#2901 tracks the older line reader, which misses quoted keys).
+- **One fresh snapshot.** The comments come from the re-read #1598 performs, with verdict anchors resolved again, together with fresh reviews and inline comments.
+- **The freshness guard.** The substitute's latest-signal-wins guard folds in `crqe_latest_codex_signal_time` over the same snapshot. That covers the substantive head review, and every verdict the gate's own verdict selection would order: one whose Reviewed commit fields all name `<head>`, or a non-affirmative one whose fields are absent, abbreviated, malformed or include `<head>`. An unreadable time fails the check.
+- **The approval itself.** The candidate must still be its reviewer's latest opinionated review on HEAD in the fresh read.
+- **Outcomes.** `pending` refuses the candidate, as does anything unreadable. `timed-out` lets the candidate proceed. Only when the substitute then clears is `codex-review-outcome: timed-out/substitute-used`, with the request, the last outcome and the bound, appended to the clearance reason. That puts the outcome in the gate output and on the PR head's check run. An expired wait whose substitute is then rejected logs only that the wait expired.
+
+The timeout is a fallback, not a Codex outcome. A later completion may belong to an earlier request and may have seen different context, because this contract does not attribute runs to requests. The wave audit's #2771 binding (#2875) is the stronger, request-bound contract. A timed-out review may still report after merge. With Codex disabled, the check does not run.
+
+**Out of scope here.** Reading Codex findings out of free-form issue-comment text, including review-format comments with priority badges and their interplay with same-content carry-forward, has its own design issue (#2881). Until that lands, those comments are exactly as visible to the gate as on `main`. Findings that arrive after merge are recorded by the separate post-merge detector (#2898).

@@ -1273,6 +1273,17 @@ propagation_audit:
   scope_exclude_prefixes:
     - tests/
     - docs/
+  # What a wave does when no independent audit could run (orchestrator exit
+  # 4 or 5: adapter error, timeout, quota, automation off). fail-open (the
+  # default) lets it fan out on CI + lane. hold (#2879) holds it: bounded
+  # retries, then needs-owner, recovered by hand under owner break-glass.
+  # Do not enable hold before #2900 (scripted owner release) lands and the
+  # owner's demonstration passes; enabling it is a separate, owner-approved
+  # change. Any value other than hold reads as fail-open.
+  unavailable_policy: fail-open
+  # Holds recorded for one range before it becomes needs-owner [1, 10].
+  # Read only under hold.
+  hold_max_attempts: 3
 
 # ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)

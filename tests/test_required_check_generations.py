@@ -766,6 +766,25 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
                 self.assertEqual(self.state()["evaluated"], [1])
                 self.assertEqual(self.state()["writes"], [["POST", 1], ["PATCH", 1]])
 
+    def test_dispatch_recheck_issue_comment_binds_the_commented_pr(self):
+        # #2881: on issue_comment the PR is the commented issue, never the
+        # (absent) dispatch payload, and the published head comes from the
+        # open-PR list. A commented PR that is not open publishes nothing.
+        step = self.workflow_step("merge-clearance-gate.yml", "dispatch-recheck",
+                                  "output=$(scripts/merge-clearance-gate.sh")
+        for commented, expected_rc, writes in (("7", 0, [["POST", 1], ["PATCH", 1]]), ("8", 1, [])):
+            with self.subTest(commented=commented):
+                (self.path / "state.json").write_text(json.dumps(
+                    dict(runs=[], writes=[], head=HEAD, revision=REVISION, heads=[7])))
+                self.env.update(EVENT_NAME="issue_comment", PR="", PR_COMMENTED=commented,
+                                CHECK_NAME="Merge clearance gate")
+                result = self.shell(step)
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+                self.assertEqual(self.state()["writes"], writes)
+                if writes:
+                    self.assertEqual(self.state()["runs"][0]["head_sha"], HEAD)
+                    self.assertEqual(self.state()["evaluated"], [1])
+
     def test_legacy_sweep_closes_original_generation_when_head_moves_after_open(self):
         (self.path / ".github").mkdir()
         (self.path / ".github/review-policy.yml").write_text("coderabbit:\n  severity_gate:\n    enabled: true\n")

@@ -43,8 +43,19 @@ case "$1" in
        && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge "$COMMENTS_FAIL_FROM" ]; then
       exit 1
     fi
+    # #2881: a later read may see newer comment bodies than the first.
+    if [ -f "$FIXTURES/comments-reread" ] \
+       && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge 2 ]; then
+      cat "$FIXTURES/comments-reread"; exit 0
+    fi
     cat "$FIXTURES/comments" ;;
-  repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }; cat "$FIXTURES/reviews" ;;
+  repos/owner/repo/pulls/99/reviews) [ "${REVIEWS_FAIL:-0}" != 1 ] || { echo 'fixture review read failed' >&2; exit 1; }
+    # #2881: a later read may see newer reviews than the first.
+    if [ -f "$FIXTURES/reviews-reread" ] \
+       && [ "$(grep -c '^repos/owner/repo/pulls/99/reviews$' "$CALLS")" -ge 2 ]; then
+      cat "$FIXTURES/reviews-reread"; exit 0
+    fi
+    cat "$FIXTURES/reviews" ;;
   repos/owner/repo/pulls/99/files) printf '%s\n' '[]' ;;
   repos/owner/repo/rulesets*) printf '%s\n' '[]' ;;
   repos/owner/repo/rules/branches/main) printf '%s\n' '[]' ;;
@@ -1080,5 +1091,266 @@ summary_trigger_case unseen-value ' Ready for review |' "$SUMMARY_DONE" unknown
 summary_trigger_case near-miss-manual ' Manual requests |' "$SUMMARY_DONE" unknown
 summary_trigger_case manual-prose ' Manual request by @someone |' "$SUMMARY_DONE" unknown
 summary_trigger_case missing-column '' "$SUMMARY_DONE" null
+
+# #2881 option (c): a Phase 4b substitute waits while Codex still owes HEAD a
+# review, bounded by codex.review_timeout_seconds from a server-derived
+# anchor; past the bound it is an explicit timed-out/substitute-used
+# fallback. Timestamps are relative to a fixed now so the pure helper is
+# deterministic; the end-to-end cases below use the real clock.
+P_HEAD=abcdef0123456789000000000000000000000000
+P_OTHER=1111111111111111111111111111111111111111
+P_BOT='chatgpt-codex-connector[bot]'
+P_NOW=1792800000 # 2026-10-23T00:00:00Z
+p_at() { jq -nr --argjson s "$1" '$s | todate'; } # epoch -> ISO second
+p_req() { jq -nc --argjson id "$1" --arg at "$(p_at "$2")" --arg who "${3:-nathanjohnpayne}" \
+  '{id:$id,user:{login:$who,type:"User"},created_at:$at,body:"@codex review"}'; }
+p_review() { jq -nc --arg at "$(p_at "$1")" --arg sha "${2:-$P_HEAD}" --arg type "${3:-Bot}" --arg bot "$P_BOT" \
+  '{id:700,user:{login:$bot,type:$type},commit_id:$sha,submitted_at:$at,state:"COMMENTED"}'; }
+p_comment() { jq -nc --argjson id "$1" --arg at "$(p_at "$2")" --arg up "$(p_at "${4:-$2}")" --arg body "$3" --arg bot "$P_BOT" \
+  '{id:$id,user:{login:$bot,type:"Bot"},created_at:$at,updated_at:$up,body:$body}'; }
+# A Review Summary: status, run time (epoch, may carry a fraction), JSON commit,
+# row commit, comment created/updated.
+p_summary() {
+  local status=$1 run=$2 jsha=$3 rsha=$4 created=$5 updated=$6 cell
+  case "$status" in completed) cell='✅ **Completed**' ;; running) cell='⏳ **Running**' ;; *) cell="**$status**" ;; esac
+  jq -nc --arg status "$status" --arg run "$run" --arg jsha "$jsha" --arg rsha "${rsha:0:7}" --arg cell "$cell" \
+    --arg created "$(p_at "$created")" --arg updated "$(p_at "$updated")" --arg bot "$P_BOT" '
+    {id:900,user:{login:$bot,type:"Bot"},created_at:$created,updated_at:$updated,
+     body:("<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 "
+       + ({code_review:{commit_sha:$jsha,status:$status},security_review:{status:null}} | tojson)
+       + " -->\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | "
+       + $cell + " <relative-time datetime=\"" + $run + "\">" + $run + "</relative-time> | `" + $rsha + "` | Manual request |\n")}'
+}
+P_T0=$((P_NOW - 600))      # the request, ten minutes before now
+P_OLD=$((P_NOW - 4000))    # a request past the 1800 s bound
+p_check() { # name comments reviews expected-state [expected-reason] [timeout]
+  local got
+  got=$(crqe_codex_pending_state "$2" "$3" nathanjohnpayne "$P_BOT" "$P_HEAD" "${6:-1800}" "$P_NOW" \
+    "$CODEX_USAGE_LIMIT_MARKER_RE" "$CODEX_NOT_CONNECTED_MARKER_RE") \
+    || { echo "FAIL #2881 $1: helper exited nonzero"; exit 1; }
+  if [ "$(printf '%s' "$got" | jq -r .state)" != "$4" ] \
+     || { [ -n "${5:-}" ] && [ "$(printf '%s' "$got" | jq -r .reason)" != "$5" ]; }; then
+    echo "FAIL #2881 $1: want $4${5:+/$5}, got $got"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 pending-state $1 -> $4"
+}
+# shellcheck source=../scripts/lib/codex-failure-markers.sh
+. "$ROOT/scripts/lib/codex-failure-markers.sh"
+R0=$(p_req 501 "$P_T0")
+p_check no-request '[]' '[]' none no-request
+p_check foreign-request-only "[$(p_req 501 "$P_T0" someone-else)]" '[]' none
+p_check running-no-response "[$R0]" '[]' pending request-unanswered
+p_check no-response-past-bound "[$(p_req 501 "$P_OLD")]" '[]' timed-out request-unanswered
+p_check review-after-request "[$R0]" "[$(p_review $((P_T0 + 60)))]" answered
+p_check review-same-second "[$R0]" "[$(p_review "$P_T0")]" pending request-unanswered
+p_check review-before-request "[$R0]" "[$(p_review $((P_T0 - 60)))]" pending
+p_check review-other-head "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_OTHER")]" pending
+p_check review-impersonated-user-type "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_HEAD" User)]" pending
+p_check new-request-after-answer "[$R0,$(p_req 502 $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 60)))]" pending request-unanswered
+p_check new-head-old-answer "[$R0]" "[$(p_review $((P_T0 + 60)) "$P_OTHER")]" pending
+p_check affirmative-verdict "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_HEAD\`")]" '[]' answered
+p_check verdict-other-head "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_OTHER\`")]" '[]' pending
+p_check something-went-wrong "[$R0,$(p_comment 601 $((P_T0 + 60)) 'Codex Review: Something went wrong. Try again later by commenting “@codex review”.')]" '[]' answered
+p_check usage-limit-refusal "[$R0,$(p_comment 601 $((P_T0 + 60)) 'You have reached your Codex usage limits for code reviews.')]" '[]' answered
+p_check summary-completed-after "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' answered
+# An unrelated later edit moves updated_at but not the run time Codex wrote.
+p_check summary-unrelated-edit "[$R0,$(p_summary completed "$(p_at $((P_T0 - 300)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 400)) $((P_T0 + 200)))]" '[]' pending
+p_check summary-fraction-same-second "[$R0,$(p_summary completed "$(p_at "$P_T0" | sed 's/Z$/.900000Z/')" "$P_HEAD" "$P_HEAD" $((P_T0 - 10)) $((P_T0 + 5)))]" '[]' pending
+p_check summary-run-after-edit "[$R0,$(p_summary completed "$(p_at $((P_T0 + 500)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 10)) $((P_T0 + 60)))]" '[]' pending
+p_check summary-other-head "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_OTHER" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
+p_check summary-json-row-disagree "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
+p_check summary-running-after-answer "[$R0,$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 60)))]" pending review-running
+p_check running-no-request "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending review-running
+p_check running-past-bound "[$(p_summary running "$(p_at "$P_OLD")" "$P_HEAD" "$P_HEAD" "$P_OLD" "$P_OLD")]" '[]' timed-out review-running
+# Owner decision on #2886: free-form findings text is not read here, so a
+# findings comment (even one anchored to HEAD) neither answers nor holds.
+p_check findings-comment-does-not-answer "[$R0,$(p_comment 601 $((P_T0 + 60)) "### 💡 Codex Review
+
+https://github.com/o/r/blob/$P_HEAD/a.sh#L1
+**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  A finding**")]" '[]' pending request-unanswered
+p_check review-format-unanchored "[$R0,$(p_comment 601 $((P_T0 + 60)) '## Review Findings
+
+### [P1] A finding without a permalink')]" '[]' pending
+p_check bounded-by-policy-window "[$R0]" '[]' timed-out request-unanswered 300
+# Phase 4b round 2 on #2886: a relevant Summary that does not validate is
+# never dropped. It holds, bounded from its last edit, and never answers.
+P_RUN_BAD=$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)) | jq -c '.body |= sub("datetime=\"[^\"]*\""; "datetime=\"soon\"")')
+p_check summary-running-time-unreadable-no-request "[$P_RUN_BAD]" '[]' pending summary-unreadable
+P_DISAGREE=$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("✅ \\*\\*Completed\\*\\*"; "🔄 **Running** since")')
+# Codex P1 on #2886: a Summary with no state marker, or a damaged one, is
+# retained as unreadable rather than dropped.
+P_RUN_OK=$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))
+p_check summary-table-only-no-request "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub("<!-- codex-review-state:v1 [^\n]*\n"; "")')]" '[]' pending summary-unreadable
+p_check summary-damaged-marker-no-request "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub(" -->\n\n\\| Review"; "\n\n| Review")')]" '[]' pending summary-unreadable
+# Phase 4b round 3 on #2886: JSON naming another commit beside a row naming
+# HEAD is a conflict that holds, never a dropped summary.
+p_check summary-json-other-row-head-running "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_OTHER" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending summary-unreadable
+p_check summary-json-head-row-other-completed "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending request-unanswered
+# A body without the envelope (the leading marker at the very start) is not
+# a Summary, so it neither holds nor answers.
+p_check no-envelope-not-a-summary "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub("^<!-- codex-pull-request-review-summary -->\n"; "") | .body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')]" '[]' none
+# Direct Phase 4b on 8daafc68, P1 1: a findings comment with a fenced example
+# of the state marker on its own line is not a Summary (no hold), and it does
+# not answer either.
+P_FENCED=$(p_comment 630 $((P_T0 + 60)) "### [P1] Parse the envelope
+
+\`\`\`html
+<!-- codex-review-state:v1 {} -->
+\`\`\`" $((P_T0 + 120)))
+p_check fenced-marker-not-a-summary "[$P_FENCED]" '[]' none
+p_check fenced-marker-no-answer "[$R0,$P_FENCED]" '[]' pending request-unanswered
+# Direct Phase 4b on 8daafc68, P2: refusal wording quoted inside other text,
+# or on a later line, is not the provider refusal shape.
+p_check quoted-not-connected-refusal "[$R0,$(p_comment 631 $((P_T0 + 60)) "https://github.com/o/r/blob/$P_HEAD/a.sh#L1 ![P1 Badge](x)
+Reviewed commit: \`$P_OTHER\`
+The bot replies: To use Codex here, connect your account.")]" '[]' pending request-unanswered
+p_check usage-limit-on-later-line "[$R0,$(p_comment 632 $((P_T0 + 60)) "### [P2] Quote
+You have reached your Codex usage limits for code reviews.")]" '[]' pending request-unanswered
+# The verdict shape: the `Codex review:` header must start the body, and the
+# Summary state line must sit directly after the leading marker.
+p_check verdict-header-not-at-start "[$R0,$(p_comment 634 $((P_T0 + 60)) "### [P1] Quoting a verdict
+Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_HEAD\`")]" '[]' pending request-unanswered
+p_check state-line-outside-envelope "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("-->\n<!-- codex-review-state"; "-->\n\n<!-- codex-review-state")')]" '[]' pending request-unanswered
+p_check not-connected-exact-shape "[$R0,$(p_comment 633 $((P_T0 + 60)) "To use Codex here, [create a Codex account and connect to github](https://example.test).")]" '[]' answered
+# Direct Phase 4b on #2886: a Summary answers only through its validated
+# Code Review state, so refusal text elsewhere in it (here the not-connected
+# wording, which matches anywhere in a body) is not an answer.
+p_check refusal-text-inside-running-summary "[$R0,$(p_summary running "$(p_at $((P_T0 + 10)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 20)) $((P_T0 + 20)) | jq -c '.body += "\n| 🔒 **Security Review** | To use Codex here, connect your GitHub account |"')]" '[]' pending request-unanswered
+# A findings comment that mentions the state marker in prose is not a Summary.
+p_check marker-mentioned-in-prose "[$R0,$(p_comment 620 $((P_T0 + 60)) "https://github.com/o/r/blob/$P_HEAD/a.sh#L1
+**<sub><sub>![P2 Badge](x)</sub></sub> The \`<!-- codex-review-state:v1 {} -->\` marker is parsed loosely" $((P_T0 + 120)))]" '[]' pending request-unanswered
+p_check summary-row-running-json-completed "[$R0,$P_DISAGREE]" '[]' pending request-unanswered
+p_check summary-row-json-disagree-no-request "[$P_DISAGREE]" '[]' pending summary-unreadable
+p_check summary-failed-agreeing "[$R0,$(p_summary failed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("\\*\\*failed\\*\\*"; "⚠️ **Failed**")')]" '[]' answered
+P_BAD_OLD=$(p_summary completed "$(p_at $((P_T0 - 100)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 200)) $((P_T0 - 100)) | jq -c '.body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')
+p_check unreadable-summary-older-than-answer "[$R0,$P_BAD_OLD]" "[$(p_review $((P_T0 + 60)))]" answered
+p_check summary-no-json-row-on-head "[$R0,$(printf '%s' "$P_BAD_OLD" | jq -c '.updated_at = "'"$(p_at $((P_T0 + 100)))"'"')]" "[$(p_review $((P_T0 + 60)))]" pending summary-unreadable
+if [ "$(crqe_codex_pending_state "[$(printf '%s' "$P_RUN_BAD" | jq -c '.updated_at = "yesterday" | .created_at = "yesterday"')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
+  PASS=$((PASS + 1)); echo 'PASS: #2881 pending-state an unreadable Summary with no readable edit time is unreadable'
+else
+  echo 'FAIL: #2881 an unreadable Summary without an edit time did not refuse'; exit 1
+fi
+# Phase 4b on #2886: only a review run answers. A body-less wrapper whose
+# inline comments are all replies does not; a root inline comment, a body, or
+# no inline comments at all does (crqe_select_head_review's predicate).
+P_WRAP=$(p_review $((P_T0 + 60)) | jq -c '.body = ""')
+p_inline() { jq -nc --argjson reply "$1" --arg bot "$P_BOT" '{pull_request_review_id:700,user:{login:$bot,type:"Bot"},in_reply_to_id:(if $reply then 41 else null end)}'; }
+p_check reply-wrapper-review "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[$(p_inline true)]}" pending request-unanswered
+p_check review-with-root-inline "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[$(p_inline false)]}" answered
+p_check bodyless-review-no-inline "[$R0]" "{\"reviews\":[$P_WRAP],\"inline\":[]}" answered
+# Every anchor counts: a HEAD permalink plus a Reviewed commit naming another
+# SHA is mixed, so it does not answer; nor does a verdict that pairs a HEAD
+# Reviewed commit with another commit's permalink.
+p_check review-format-mixed-anchors "[$R0,$(p_comment 601 $((P_T0 + 60)) "https://github.com/o/r/blob/$P_HEAD/a.sh#L1 ![P2 Badge](x)
+Reviewed commit: \`$P_OTHER\`")]" '[]' pending
+p_check verdict-blob-link-is-not-an-anchor "[$R0,$(p_comment 601 $((P_T0 + 60)) "Codex Review: Didn't find any major issues.
+
+Reviewed commit: \`$P_HEAD\`
+https://github.com/o/r/blob/$P_OTHER/a.sh#L1")]" '[]' answered
+if [ "$(crqe_codex_pending_state "[$(p_req 501 "$P_T0" | jq -c 'del(.created_at)')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ] \
+   && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 18x00 "$P_NOW" | jq -r .state)" = unreadable ] \
+   && [ "$(crqe_codex_pending_state '[]' '[]' nathanjohnpayne "$P_BOT" abc 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
+  PASS=$((PASS + 1)); echo 'PASS: #2881 pending-state unreadable request, window or head refuse'
+else
+  echo 'FAIL: #2881 unreadable pending-state input was accepted'; exit 1
+fi
+# The anchor is the request's server time: a later evaluation of the same
+# evidence reports the same bound, so a rerun cannot extend or reset it.
+_e1=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .expires_at)
+_e2=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 $((P_NOW + 900)) | jq -r .expires_at)
+[ "$_e1" = "$_e2" ] && [ "$_e1" = "$(p_at $((P_T0 + 1800)))" ] \
+  || { echo "FAIL: #2881 the bound moved between evaluations ($_e1 vs $_e2)"; exit 1; }
+PASS=$((PASS + 1)); echo 'PASS: #2881 the timeout bound is anchored to the request, not to the evaluation'
+
+
+# End-to-end through the production checker. A Phase 4b approval that is
+# newer than every Codex signal on HEAD, under a substitute-enabled policy.
+e_iso() { date -u -r $(( $(date -u +%s) - $1 )) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ; }
+e_run() { # name comments reviews expected-rc pattern
+  printf '%s\n' "$2" >"$DIR/comments"
+  printf '%s\n' "$3" >"$DIR/reviews"
+  printf '[]\n' >"$DIR/ack"
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$1" \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$4" ] || ! grep -qF -- "$5" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #2881 e2e $1 rc=$rc (want $4, '$5')"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 e2e $1"
+}
+E_REQ_RECENT="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 300)\",\"body\":\"@codex review\"}"
+E_REQ_OLD="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 4000)\",\"body\":\"@codex review\"}"
+E_APPROVAL="[{\"user\":{\"login\":\"nathanpayne-codex\"},\"state\":\"APPROVED\",\"commit_id\":\"$P_HEAD\",\"submitted_at\":\"$(e_iso 60)\",\"body\":\"Manual Phase 4b approval\"}]"
+# Structured negative verdicts (owner decision on #2886: findings written as
+# free-form issue-comment text are not read by the gate).
+E_FINDING_ANSWER="{\"id\":140,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 200)\",\"updated_at\":\"$(e_iso 200)\",\"body\":\"Codex Review: Here are some suggestions.\\n\\nReviewed commit: \\u0060$P_HEAD\\u0060\"}"
+E_FINDING_LATE="{\"id\":141,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"Codex Review: Here are some suggestions.\\n\\nReviewed commit: \\u0060$P_HEAD\\u0060\"}"
+E_RUNNING=$(p_summary running "$(e_iso 20)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg at "$(e_iso 20)" '.created_at = $at | .updated_at = $at')
+e_run request-pending "[$E_REQ_RECENT]" "$E_APPROVAL" 1 'Codex still owes abcdef0123456789000000000000000000000000 a review'
+e_run request-timed-out "[$E_REQ_OLD]" "$E_APPROVAL" 0 'codex-review-outcome: timed-out/substitute-used'
+e_run request-answered-before-approval "[$E_REQ_RECENT,$E_FINDING_ANSWER]" "$E_APPROVAL" 0 'cleared — Phase 4b substitute'
+e_run finding-newer-than-approval "[$E_REQ_OLD,$E_FINDING_LATE]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+# Direct Phase 4b on #2886: the timeout outcome is published only with a
+# clearance. A negative verdict whose Reviewed commit is malformed does not
+# answer the expired request (so the wait has timed out) but, as in the
+# gate's own verdict selection, still outranks the older approval,
+# so the substitute is rejected and must never report substitute-used.
+E_UNANCHORED_LATE="{\"id\":144,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"Codex Review: Here are some suggestions.\\n\\nReviewed commit: \\u0060not-a-sha\\u0060\"}"
+e_run timed-out-but-rejected "[$E_REQ_OLD,$E_UNANCHORED_LATE]" "$E_APPROVAL" 1 'bounded Codex wait has expired'
+if grep -q 'substitute-used' "$DIR/out"; then
+  cat "$DIR/out"; echo 'FAIL: #2881 a rejected substitute reported timed-out/substitute-used'; exit 1
+fi
+PASS=$((PASS + 1)); echo 'PASS: #2881 e2e a rejected substitute never reports substitute-used'
+e_run run-in-flight-no-request "[$E_RUNNING]" "$E_APPROVAL" 1 'review-running'
+# Direct Phase 4b on #2886: the wait comes from the parsed governing policy,
+# so a quoted key is honoured rather than silently replaced by the default,
+# and a value that is not a whole number of seconds refuses.
+E_REQ_HOUR="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 3600)\",\"body\":\"@codex review\"}"
+for e_window in '"review_timeout_seconds": 7200|1|Codex still owes' 'review_timeout_seconds: "soon"|1|not a whole number of seconds'; do
+  IFS='|' read -r e_line e_rc e_pat <<<"$e_window"
+  sed "s/^  review_timeout_seconds: 840\$/  $e_line/" "$DIR/substitute-policy.yml" >"$DIR/window-policy.yml"
+  grep -qF "$e_line" "$DIR/window-policy.yml" || { echo "FAIL: #2881 window fixture did not apply ($e_line)"; exit 1; }
+  printf '%s\n' "[$E_REQ_HOUR]" >"$DIR/comments"; printf '%s\n' "$E_APPROVAL" >"$DIR/reviews"; : >"$DIR/calls"; rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=window \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/window-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$e_rc" ] || ! grep -qF "$e_pat" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #2881 e2e policy window ($e_line) rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 e2e policy window: $e_line"
+done
+if grep -q 'timed-out/substitute-used' "$DIR/out"; then
+  echo 'FAIL: #2881 a pending run was reported as a timeout'; exit 1
+fi
+# Codex P1 on #2886: a recent request answered by a completed run in the first
+# comments read, then a newer run Running in the #1598 re-read, must hold. The fresh copy wins;
+# with the earlier copy winning the head would read as answered and clear.
+E_SUM_DONE=$(p_summary completed "$(e_iso 200)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg c "$(e_iso 300)" --arg u "$(e_iso 200)" '.created_at = $c | .updated_at = $u')
+E_SUM_RUN=$(p_summary running "$(e_iso 30)" "$P_HEAD" "$P_HEAD" 0 0 | jq -c --arg c "$(e_iso 300)" --arg u "$(e_iso 30)" '.created_at = $c | .updated_at = $u')
+printf '%s\n' "[$E_REQ_RECENT,$E_SUM_RUN]" >"$DIR/comments-reread"
+e_run summary-flips-to-running-between-reads "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 1 'Codex still owes abcdef0123456789000000000000000000000000 a review'
+rm -f "$DIR/comments-reread"
+# Phase 4b on #2886: a findings comment that is newer than the approval and
+# visible only in the re-read must outrank the approval, not merely answer the
+# request: the freshness guard reads the same snapshot as the owed-review check.
+printf '%s\n' "[$E_REQ_RECENT,$E_FINDING_LATE]" >"$DIR/comments-reread"
+e_run finding-only-in-reread "[$E_REQ_RECENT]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+rm -f "$DIR/comments-reread"
+# The approval must still be its reviewer's latest opinionated state on HEAD
+# in the fresh reviews read.
+printf '%s\n' "$E_APPROVAL" | jq -c --arg at "$(e_iso 10)" '. + [.[0] + {state: "CHANGES_REQUESTED", submitted_at: $at}]' >"$DIR/reviews-reread"
+e_run approval-superseded-in-reread "[$E_REQ_OLD]" "$E_APPROVAL" 1 "no longer nathanpayne-codex's latest opinionated review"
+rm -f "$DIR/reviews-reread"
+e_run summary-completed-control "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 0 'Codex owes HEAD no review (answered'
+
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

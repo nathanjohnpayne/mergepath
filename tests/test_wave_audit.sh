@@ -150,6 +150,14 @@ fi
         reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",
         validated_verdict:{verdict:"CHANGES_REQUESTED",findings:[{priority:"P1",body:"fix"}],summary:"findings"}}'
     ;;
+  unavailable)
+    # #2879: the exit 4 summary with the barrier escalation it carries.
+    jq -n '{fell_back_to_manual:true,review_posted:false,
+      reason:"external review barrier (pre-adapter): external review did not reach the current head within 1245s",
+      barrier_escalation:{reason:"external review did not reach the current head within 1245s",codex:"not-yet",
+        codex_evidence:"wave-request-other-request-after-bound",coderabbit:"reported",
+        wave_binding:{state:"hold",reason:"other-request-after-bound",requests:[9001,9002],runs:[]}}}'
+    ;;
 esac; } | if [ -n "${FAKE_ORCH_OVERRIDE:-}" ]; then
   jq -c '. + {admin_overridden:[{decision:"human-tiebreaker",tripwires:["reviewer-address"]}],
     admin_override_quote:"Owner: run it"}'
@@ -1519,6 +1527,228 @@ FAKE_COMMENTS_EXIT=1 \
   _bind_case "an unreadable canary timeline fails closed without requesting" 3 0 nodispatch --base "$C1" --head-sha "$C2"
 FAKE_CANARY_COMMENTS='{"not":"an array"}' \
   _bind_case "a malformed comments read fails closed without requesting" 3 0 nodispatch --base "$C1" --head-sha "$C2"
+
+echo "wave-audit.sh — holding a wave whose reviewer was unavailable (#2879)"
+# Every case is a predicate: it returns 0 when the behaviour is right, so the
+# same case runs against the production script and against mutants of it.
+POLICY_HOLD="$WORK/policy-hold.yml"
+cat "$POLICY_GOOD" > "$POLICY_HOLD"
+printf '  unavailable_policy: hold\n  hold_max_attempts: 2\n' >> "$POLICY_HOLD"
+POLICY_OFF_EXPLICIT="$WORK/policy-off.yml"
+cat "$POLICY_GOOD" > "$POLICY_OFF_EXPLICIT"
+printf '  unavailable_policy: fail-open\n' >> "$POLICY_OFF_EXPLICIT"
+FAKE_COMMENT="$WORK/fake-comment.sh"
+cat > "$FAKE_COMMENT" <<'FAKE'
+#!/usr/bin/env bash
+: "${CAPTURE:?}"
+[ "${FAKE_COMMENT_EXIT:-0}" = 0 ] || exit "$FAKE_COMMENT_EXIT"
+printf '%s\n' "$*" >> "$CAPTURE/comment-argv"
+prev=""
+for a in "$@"; do
+  [ "$prev" = --body-file ] && cat "$a" >> "$CAPTURE/comments"
+  prev="$a"
+done
+printf 'https://github.com/owner/consumer/pull/82#issuecomment-%s\n' "$(wc -l < "$CAPTURE/comment-argv" | tr -d ' ')"
+FAKE
+chmod +x "$FAKE_COMMENT"
+# Holds reject at the remote when REJECT_HOLD_PUSH is set (local transport
+# hands the hook the pusher's environment).
+cat > "$REMOTE/hooks/pre-receive" <<'HOOK'
+#!/usr/bin/env bash
+while read -r _old _new ref; do
+  case "$ref" in refs/tags/wave-audit-hold/*) [ -z "${REJECT_HOLD_PUSH:-}" ] || exit 1 ;; esac
+done
+exit 0
+HOOK
+chmod +x "$REMOTE/hooks/pre-receive"
+
+HOLD_HEAD="$C3"; HOLD_BASE="$C2"
+reset_holds() {
+  local t
+  for t in $(git -C "$REMOTE" tag -l 'wave-audit-hold/*') "wave-audit-pass/$HOLD_HEAD"; do
+    git -C "$REMOTE" tag -d "$t" >/dev/null 2>&1 || true
+  done
+  for t in $(git -C "$CANON" tag -l 'wave-audit-hold/*') "wave-audit-pass/$HOLD_HEAD"; do
+    git -C "$CANON" tag -d "$t" >/dev/null 2>&1 || true
+  done
+}
+holds_on_origin() { git ls-remote --refs --tags "$REMOTE" "refs/tags/wave-audit-hold/$HOLD_HEAD/$HOLD_BASE/*" | grep -c . || true; }
+HOLD_OUT="$WORK/hold.out"; HOLD_ERR="$WORK/hold.err"
+hrun() { # hrun <policy> <args...>; rc in HRC. Runs the script at $WA.
+  HRC=0
+  WAVE_AUDIT_COMMENT_CMD="$FAKE_COMMENT" GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
+    run_wa "$1" reset "${@:2}" > "$HOLD_OUT" 2> "$HOLD_ERR" || HRC=$?
+}
+hold_args=(82 --repo owner/consumer --base "$HOLD_BASE" --head-sha "$HOLD_HEAD")
+dispatched() { [ -e "$CAPTURE/args" ]; }
+asked_codex() { [ -e "$CAPTURE/codex-request" ] || [ -e "$CAPTURE/codex-check" ]; }
+
+t_switch_off() { # default policy: exit 4 fails open exactly as before
+  reset_holds
+  FAKE_ORCH_EXIT=4 FAKE_ORCH_JSON=unavailable hrun "$POLICY_GOOD" "${hold_args[@]}"
+  [ "$HRC" = 4 ] && [ "$(holds_on_origin)" = 0 ] && [ ! -e "$CAPTURE/comments" ] \
+    && grep -q 'the wave may proceed on CI + lane' "$HOLD_ERR" \
+    && jq -e 'has("audit_state") or has("hold") or has("fanout_authorized") | not' "$HOLD_OUT" >/dev/null
+}
+t_switch_off_explicit() {
+  reset_holds
+  FAKE_ORCH_EXIT=4 hrun "$POLICY_OFF_EXPLICIT" "${hold_args[@]}"
+  [ "$HRC" = 4 ] && [ "$(holds_on_origin)" = 0 ] && ! jq -e 'has("hold")' "$HOLD_OUT" >/dev/null
+}
+t_off_ignores_keys() { # switch off is inert: neither key can fail a run
+  local bad
+  for bad in 'hold_max_attempts: 0' 'hold_max_attempts: two' 'unavailable_policy: maybe'; do
+    cat "$POLICY_GOOD" > "$WORK/policy-offbad.yml"; printf '  %s\n' "$bad" >> "$WORK/policy-offbad.yml"
+    reset_holds
+    FAKE_ORCH_EXIT=4 hrun "$WORK/policy-offbad.yml" "${hold_args[@]}"
+    [ "$HRC" = 4 ] && dispatched && [ "$(holds_on_origin)" = 0 ] && grep -q 'the wave may proceed on CI + lane' "$HOLD_ERR" || return 1
+  done
+  grep -q "is not hold; treating it as fail-open" "$HOLD_ERR"
+}
+t_clean() { # switch on, reviewer available: unchanged approval plus audit_state
+  reset_holds
+  FAKE_ORCH_EXIT=0 hrun "$POLICY_HOLD" "${hold_args[@]}"
+  [ "$HRC" = 0 ] && remote_has_tag "$HOLD_HEAD" && [ ! -e "$CAPTURE/comments" ] \
+    && jq -e '.audit_state == "approved" and .audited == true and .watermark_advanced == true' "$HOLD_OUT" >/dev/null
+}
+t_hold_then_clear() {
+  reset_holds
+  FAKE_ORCH_EXIT=4 FAKE_ORCH_JSON=unavailable hrun "$POLICY_HOLD" "${hold_args[@]}"
+  [ "$HRC" = 11 ] || return 1
+  [ "$(holds_on_origin)" = 1 ] && ! remote_has_tag "$HOLD_HEAD" || return 1
+  jq -e '.audit_state == "held" and .audited == false and .fanout_authorized == false
+    and .watermark_advanced == false and .hold.attempt == 1 and .hold.max_attempts == 2
+    and .hold.orchestrator_exit == 4 and .hold.recovery == null
+    and .hold.codex_evidence == "wave-request-other-request-after-bound"
+    and .hold.codex_binding.request == "9001"
+    and .hold.codex_binding.requests == [9001,9002]
+    and (.hold.hold_comment_url | test("issuecomment"))' "$HOLD_OUT" >/dev/null || return 1
+  grep -q 'mergepath-wave-audit-hold:v1' "$CAPTURE/comments" && grep -q 'no independent audit was performed' "$CAPTURE/comments" || return 1
+  ! grep -qi 'may proceed' "$HOLD_ERR" || return 1
+  ! grep -Eqi 'approv|reviewed' "$CAPTURE/comments" || return 1
+  FAKE_ORCH_EXIT=0 hrun "$POLICY_HOLD" "${hold_args[@]}"
+  [ "$HRC" = 0 ] && remote_has_tag "$HOLD_HEAD" && jq -e '.audit_state == "approved"' "$HOLD_OUT" >/dev/null
+}
+t_terminal() { # attempt M is terminal with manual recovery; later runs neither ask Codex nor dispatch
+  reset_holds
+  FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${hold_args[@]}"; [ "$HRC" = 11 ] || return 1
+  FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${hold_args[@]}"; [ "$HRC" = 12 ] || return 1
+  jq -e '.audit_state == "needs-owner" and .hold.attempt == 2 and .hold.recovery.mode == "manual"
+    and (.hold.recovery.detail | contains("break-glass") and contains("issues/2900"))' "$HOLD_OUT" >/dev/null || return 1
+  grep -q 'break-glass' "$HOLD_ERR" && grep -q 'issues/2900' "$CAPTURE/comments" || return 1
+  ! grep -q -- '--owner-release' "$HOLD_ERR" "$CAPTURE/comments" "$HOLD_OUT" || return 1
+  FAKE_ORCH_EXIT=0 hrun "$POLICY_HOLD" "${hold_args[@]}"
+  [ "$HRC" = 12 ] && ! dispatched && ! asked_codex && [ "$(holds_on_origin)" = 2 ] \
+    && ! remote_has_tag "$HOLD_HEAD" && grep -q 'break-glass' "$HOLD_ERR"
+}
+t_lossless_hold_marker() { # the hold record decodes to the reason the orchestrator gave
+  local marker
+  reset_holds
+  FAKE_ORCH_EXIT=4 FAKE_ORCH_JSON=unavailable hrun "$POLICY_HOLD" "${hold_args[@]}"; [ "$HRC" = 11 ] || return 1
+  marker="$(sed -n 's/^<!-- mergepath-wave-audit-hold:v1 \(.*\) -->$/\1/p' "$CAPTURE/comments")"
+  case "$marker" in *--*|'') return 1 ;; esac
+  printf '%s' "$marker" | jq -e '.codex_evidence == "wave-request-other-request-after-bound" and .kind == "wave-audit-hold"' >/dev/null
+}
+check_case() { # check_case <fn> <label>
+  if "$1"; then pass "#2879: $2"; else fail "#2879: $2 (rc=$HRC): $(tail -n 2 "$HOLD_ERR" 2>/dev/null)"; fi
+}
+check_case t_switch_off "switch off (default): exit 4 still fails open, unchanged, with no hold"
+check_case t_switch_off_explicit "switch off (explicit fail-open): exit 4 unchanged"
+check_case t_off_ignores_keys "switch off: invalid hold keys or an unknown policy value never fail the run"
+check_case t_clean "switch on, clean canary: approval and watermark as before, audit_state approved"
+check_case t_hold_then_clear "exit 4 holds (attempt 1, binding evidence carried, no watermark), then a clean rerun approves"
+check_case t_terminal "attempt M is needs-owner with manual recovery and no release command; later runs never ask Codex or dispatch"
+check_case t_lossless_hold_marker "the hold record is lossless JSON in the canary comment"
+
+for orc in 5 2; do
+  reset_holds
+  FAKE_ORCH_EXIT=$orc hrun "$POLICY_HOLD" "${hold_args[@]}"
+  [ "$HRC" = 11 ] && [ "$(holds_on_origin)" = 1 ] \
+    && pass "#2879: orchestrator exit $orc (no audit happened) holds too" \
+    || fail "#2879: orchestrator exit $orc did not hold (rc=$HRC)"
+done
+reset_holds
+FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${hold_args[@]}" --dry-run
+[ "$HRC" = 4 ] && [ "$(holds_on_origin)" = 0 ] && grep -q 'would HOLD' "$HOLD_ERR" \
+  && pass "#2879: a dry run previews the hold without recording one" \
+  || fail "#2879: dry run under hold (rc=$HRC)"
+reset_holds
+FAKE_COMMENT_EXIT=1 FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${hold_args[@]}"
+[ "$HRC" = 11 ] && [ "$(holds_on_origin)" = 1 ] && jq -e '.hold.hold_comment_url == null' "$HOLD_OUT" >/dev/null \
+  && pass "#2879: a failed canary comment still holds; the tag is the state" \
+  || fail "#2879: failed hold comment (rc=$HRC)"
+reset_holds
+REJECT_HOLD_PUSH=1 FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${hold_args[@]}"
+[ "$HRC" = 3 ] && [ "$(holds_on_origin)" = 0 ] && grep -q 'do NOT fan out' "$HOLD_ERR" \
+  && pass "#2879: an unpushable hold fails closed (exit 3), never proceeds" \
+  || fail "#2879: unpushable hold (rc=$HRC)"
+reset_holds
+git -C "$CANON" remote set-url origin "$WORK/missing-remote.git"
+FAKE_ORCH_EXIT=0 hrun "$POLICY_HOLD" "${hold_args[@]}"
+git -C "$CANON" remote set-url origin "$REMOTE"
+[ "$HRC" = 3 ] && ! dispatched \
+  && pass "#2879: an unreadable hold count fails closed before any review" \
+  || fail "#2879: unreadable hold count (rc=$HRC)"
+reset_holds
+hrun "$POLICY_HOLD" "${hold_args[@]}" --owner-release "Release this wave unaudited, owner here."
+[ "$HRC" = 3 ] && grep -q 'unknown flag: --owner-release' "$HOLD_ERR" && ! dispatched \
+  && pass "#2879: --owner-release is not a flag yet (#2900); it is refused before any work" \
+  || fail "#2879: --owner-release was not refused (rc=$HRC)"
+# Under hold, an invalid hold_max_attempts fails closed.
+for bad in 'hold_max_attempts: 0' 'hold_max_attempts: 11' 'hold_max_attempts: two'; do
+  cat "$POLICY_GOOD" > "$WORK/policy-badhold.yml"
+  printf '  unavailable_policy: hold\n  %s\n' "$bad" >> "$WORK/policy-badhold.yml"
+  reset_holds
+  FAKE_ORCH_EXIT=0 hrun "$WORK/policy-badhold.yml" "${hold_args[@]}"
+  [ "$HRC" = 3 ] && ! dispatched && pass "#2879: under hold, invalid '$bad' fails closed" || fail "#2879: under hold, invalid '$bad' (rc=$HRC)"
+done
+
+# Historical finalization publishes, so it holds and ends the same way.
+FIN_HEAD="$(git -C "$CANON" commit-tree "$LARGE_HEAD^{tree}" -p "$LARGE_HEAD" -m 'held finalization head (#2879)')"
+FIN_READY=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 86 --repo owner/consumer \
+  --base "$C1" --head-sha "$FIN_HEAD" --historical-end "$FIN_HEAD" >/dev/null 2>&1 || FIN_READY=$?
+[ "$FIN_READY" = 9 ] && pass "#2879: a retained chunk sets up the held finalization case" \
+  || fail "#2879: finalization setup returned $FIN_READY"
+fin_args=(86 --repo owner/consumer --base "$C1" --head-sha "$FIN_HEAD" --finalize-historical)
+t_finalize_hold() {
+  reset_holds
+  FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${fin_args[@]}"; [ "$HRC" = 11 ] || return 1
+  git ls-remote --refs --tags "$REMOTE" "refs/tags/wave-audit-hold/$FIN_HEAD/$C1/1" | grep -q . || return 1
+  FAKE_ORCH_EXIT=4 hrun "$POLICY_HOLD" "${fin_args[@]}"; [ "$HRC" = 12 ] || return 1
+  FAKE_ORCH_EXIT=0 hrun "$POLICY_HOLD" "${fin_args[@]}"
+  [ "$HRC" = 12 ] && ! dispatched && ! git ls-remote --tags "$REMOTE" "refs/tags/wave-audit-pass/$FIN_HEAD" | grep -q .
+}
+check_case t_finalize_hold "historical finalization holds and reaches needs-owner"
+reset_holds
+FAKE_ORCH_EXIT=4 hrun "$POLICY_GOOD" "${fin_args[@]}"
+[ "$HRC" = 4 ] && [ "$(git ls-remote --refs --tags "$REMOTE" "refs/tags/wave-audit-hold/$FIN_HEAD/*" | grep -c . || true)" = 0 ] \
+  && pass "#2879: switch off, finalization exit 4 is unchanged" || fail "#2879: switch-off finalization (rc=$HRC)"
+
+# Mutation checks: each mutant reverts one production line a case pins; the
+# case must FAIL against it. A sed that changes nothing is itself a failure.
+WA_PROD="$WA"
+WA_MUT="$WORK/trusted/scripts/wave-audit-mutant.sh"
+mutant() { # mutant <label> <case-fn> <sed-expr>
+  local label="$1" fn="$2" expr="$3" ok=0
+  sed -e "$expr" "$WA_PROD" > "$WA_MUT"
+  if cmp -s "$WA_PROD" "$WA_MUT"; then fail "#2879 mutation: '$label' did not apply"; return; fi
+  WA="$WA_MUT"
+  "$fn" >/dev/null 2>&1 || ok=1
+  WA="$WA_PROD"
+  [ "$ok" = 1 ] && pass "#2879 mutation caught: $label" || fail "#2879 mutation survived: $label"
+}
+mutant "default switch flipped to hold" t_switch_off 's/|| UNAVAILABLE_POLICY=fail-open$/|| UNAVAILABLE_POLICY=hold/'
+mutant "hold keys validated with the switch off" t_off_ignores_keys 's/^if \[ "\$UNAVAILABLE_POLICY" = hold \]; then$/if true; then/'
+mutant "held arm removed (fail open again)" t_hold_then_clear 's/^      record_hold "\$orc"$/      :/'
+mutant "approval loses audit_state" t_clean 's/audit_state:"approved", audited:true/audited:true/'
+mutant "attempt counter stuck at 1" t_terminal 's/^  n=\$((n + 1))$/  n=1/'
+mutant "terminal state re-dispatches" t_terminal 's/if \[ "\$HOLDS" -ge "\$HOLD_MAX" \]; then/if false; then/'
+mutant "manual recovery dropped from needs-owner" t_terminal 's/{mode:"manual", detail:\$recovery}/null/'
+mutant "binding evidence dropped" t_hold_then_clear 's/+ (\$s.barrier_escalation.wave_binding \/\/ {}) end)/end)/'
+mutant "hold marker encoding lossy" t_lossless_hold_marker '/mergepath-wave-audit-hold:v1 %s/s/u002d/u0020/'
+mutant "finalization fails open" t_finalize_hold 's/^      \*) record_hold "\$orc" ;;$/      *) : ;;/'
+reset_holds
 
 echo "Summary: $PASS passed, $FAIL failed"
 if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \
