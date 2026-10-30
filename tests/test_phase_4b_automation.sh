@@ -6536,12 +6536,27 @@ _wbs_clear="$( (
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501
   ) )"
 _wbs_stab="$(printf '%s' "$_wbs_clear" | jq -c '.stability')"
-printf '%s' "$_wbs_stab" | jq -e '.view.requests == [{"id":501,"updated_at":"2026-10-29T12:00:00Z"}] and .historic == {"800":null}' >/dev/null \
+printf '%s' "$_wbs_stab" | jq -e '.view.requests == [{"id":501,"updated_at":"2026-10-29T12:00:00Z"}] and .historic == {"800":null}
+    and .stamps == {"501":"2026-10-29T12:00:00Z","800":"2026-10-29T12:00:00Z"}' >/dev/null \
   || bad="$bad [clear-without-stability:$_wbs_clear]"
-_wbst() { # <comments-json> <stability-json> -> stable|moved
+_wbst() { # <comments-json> <stability-json> [history-now] -> stable|moved
   ( gh_api_array() { printf '%s' "$_wbst_c"; }; _wbst_c="$1"
+    p4b_comment_mention_history() { printf '%s\n' "$_wbst_h"; }; _wbst_h="${3:-{\"800\":null\}}"
     if p4b_wave_binding_stable owner/repo 7 "$2"; then echo stable; else echo moved; fi )
 }
+# Codex on #2888: a plain comment that gained and lost a mention after the
+# final evaluation keeps its body but not its edit time; the history read
+# that a changed edit time costs holds its revision.
+[ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" '{"800":"2026-10-29T12:29:00Z"}')" = moved ] \
+  || bad="$bad [stable-mention-added-and-removed-missed]"
+[ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" null)" = moved ] \
+  || bad="$bad [stable-history-unreadable-passed]"
+# The mutation that skips the history read for a changed edit time passes it.
+[ "$( (
+    eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="[ \"$(p4b_wave_binding_edit_stamps \"$comments\" \"$bot\")\" = \"$stamps\" ] && return 0"; assert s.count(o)==1; print(s.replace(o,"return 0"))' \
+      <<<"$(sed -n '/^p4b_wave_binding_stable() {/,/^}/p' "$LIB")")"
+    _wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab" '{"800":"2026-10-29T12:29:00Z"}'
+  ) )" = stable ] || bad="$bad [mutant-stable-edit-stamps-not-load-bearing]"
 [ "$(_wbst "[$_WB_R,$(printf '%s' "$_wbs_cr800" | jq -c '.updated_at = "2026-10-29T12:30:00Z"')]" "$_wbs_stab")" = stable ] || bad="$bad [stable-coderabbit-edit-moved]"
 [ "$(_wbst "[$_WB_R,$_wbs_cr800,$(_wb_req 903 someone 2026-10-29T12:30:00Z)]" "$_wbs_stab")" = moved ] || bad="$bad [stable-new-request-missed]"
 [ "$(_wbst "[$_WB_R,$_wbs_cr800]" '')" = moved ] || bad="$bad [stable-without-evidence-passed]"

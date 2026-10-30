@@ -2251,24 +2251,41 @@ p4b_wave_binding_evaluate() {
     return 0
   fi
   # A clear carries what its final reads saw, so a later cheap check
-  # (p4b_wave_binding_stable) can tell whether a request has moved since.
-  printf '%s' "$result" | jq -c --argjson v "$view" --argjson h "$historic" '. + {stability: {view: $v, historic: $h}}'
+  # (p4b_wave_binding_stable) can tell whether a request has moved since:
+  # the request view, the mention history, and every comment's edit time.
+  printf '%s' "$result" | jq -c --argjson v "$view" --argjson h "$historic" --argjson s "$(p4b_wave_binding_edit_stamps "$after" "$bot")" \
+    '. + {stability: {view: $v, historic: $h, stamps: $s}}'
+}
+
+# p4b_wave_binding_edit_stamps <comments-json> <bot> -> {"<id>": "<updated_at>"}
+# for every comment not by Codex's bot.
+p4b_wave_binding_edit_stamps() {
+  printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" \
+    '[ .[] | select((.user.login // "") != $bot) | {key: (.id | tostring), value: (.updated_at // "")} ] | from_entries' 2>/dev/null
 }
 
 # p4b_wave_binding_stable <repo> <pr> <stability-json>
 # One comment read, compared with the view a clear's final reads saw
 # (p4b_wave_binding_evaluate's .stability). Exit 0 only when they match: the
 # orchestrator runs the full evaluation inside its feedback-accounting fences
-# and this at the POST (Phase 4b on #2888). Missing stability, an unreadable
-# read, or any change returns 1.
+# and this at the POST (Phase 4b on #2888). A comment edited since, of any
+# body, may have gained and lost a mention in between, so any changed edit
+# time costs one mention-history read whose mentioning entries must still
+# match (Codex on #2888); an unchanged comment list costs nothing more.
+# Missing stability, an unreadable read, or any change returns 1.
 p4b_wave_binding_stable() {
-  local repo="$1" pr="$2" stability="${3:-}" bot comments historic view
+  local repo="$1" pr="$2" stability="${3:-}" bot comments historic view stamps now
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   view="$(printf '%s' "$stability" | jq -ce '.view | objects' 2>/dev/null)" || return 1
   historic="$(printf '%s' "$stability" | jq -ce '.historic | objects' 2>/dev/null)" || return 1
+  stamps="$(printf '%s' "$stability" | jq -ce '.stamps | objects' 2>/dev/null)" || return 1
   command -v gh_api_array >/dev/null 2>&1 || return 1
   comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request stability" 2>/dev/null)" || return 1
-  [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" = "$view" ]
+  [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" = "$view" ] || return 1
+  [ "$(p4b_wave_binding_edit_stamps "$comments" "$bot")" = "$stamps" ] && return 0
+  now="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
+  jq -en --argjson a "$historic" --argjson b "${now:-null}" \
+    '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1
 }
 
 # p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>
