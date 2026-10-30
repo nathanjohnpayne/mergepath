@@ -4766,6 +4766,16 @@ rcp_case publish-admits-push \
 rcp_case open-admits-lint \
   's{^      github.event.workflow_run.name == .Merge Clearance Gate. &&\n}{}m' \
   fail '[rcp job eligibility]'
+# #2881 (direct Phase 4b on #2886): an issue_comment-originated gate run
+# carries the default branch's head_sha and completes even with every job
+# skipped. Dropping either exclusion admits it, and publish then runs a full
+# sweep of every open PR on ordinary review traffic.
+rcp_case publish-admits-issue-comment \
+  's{ &&\n       \(github.event.workflow_run.name != .Merge Clearance Gate. \|\|\n        github.event.workflow_run.event != .issue_comment.\)\)}{)}m' \
+  fail '[rcp job eligibility]'
+rcp_case open-admits-issue-comment \
+  's{^      github.event.workflow_run.event != .issue_comment. &&\n}{}m' \
+  fail '[rcp job eligibility]'
 
 # ── publisher: no runner-held wait (A14) ────────────────────────────────
 # Injected immediately before the pass-start stamp, i.e. inside the publish

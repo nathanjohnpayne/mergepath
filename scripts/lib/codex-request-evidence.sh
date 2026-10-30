@@ -718,6 +718,13 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
               then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) else null end;
     def iso: if . == null then null else todate end;
     def is_bot: (.user.login // "") == $bot and $bot != "" and ((.user.type // "Bot") == "Bot");
+    # A Review Summary by structure (direct Phase 4b on #2886): the leading
+    # marker, the state marker as a line of its own, or the heading as a line
+    # of its own. A prose mention of the marker is not one.
+    def is_summary: (.body // "")
+      | startswith("<!-- codex-pull-request-review-summary -->")
+        or test("(?m)^<!-- codex-review-state:v1 [^\\n]*-->[[:space:]]*$")
+        or test("(?m)^#{1,6}[[:space:]]*Codex Review Summary[[:space:]]*$");
     # Every commit a comment names: Reviewed commit fields and blob
     # permalinks, the same set crqe_review_format_findings classifies.
     def anchors: (.body // "") | ascii_downcase
@@ -758,8 +765,7 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
         # its heading, so a Summary whose leading marker is missing or damaged
         # is held as unreadable rather than ignored (Phase 4b round 3 on #2886).
         | [ $botc[]
-            | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->")
-                     or contains("codex-review-state:v1") or test("(?m)^#+[[:space:]]*Codex Review Summary"))
+            | select(is_summary)
             | . as $c
             # A missing or damaged marker must read as null, not as no value:
             # capture emits nothing on no match, which would drop the whole
@@ -804,20 +810,21 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
               | (.submitted_at | secs) ]
           # A verdict answers only when every anchor it names is <head>; an
           # unanchored `Codex review:` reply (an error) answers without one.
-          + [ $botc[]
+          # Summaries answer only through their validated Code Review state
+          # above; no other arm reads one (direct Phase 4b on #2886).
+          + [ $botc[] | select(is_summary | not)
               | select(((.body // "") | test("(?im)^\\s*codex review:"))
                        or ((.body // "") | ascii_downcase | test("reviewed commit")))
               | anchors as $a
               | select((($a | length) > 0 and all($a[]; . == $head))
                        or (($a | length) == 0 and ((.body // "") | test("(?im)^\\s*codex review:"))))
               | (.created_at | secs) ]
-          + [ $botc[]
+          + [ $botc[] | select(is_summary | not)
               | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
               | select(($usage_re != "" and ((.body // "") | test($usage_re; "i")))
                        or ($nc_re != "" and ((.body // "") | test($nc_re; "i"))))
               | (.created_at | secs) ]
-          + [ $botc[]
-              | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->") | not)
+          + [ $botc[] | select(is_summary | not)
               | select((.body // "") | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]"))
               | anchors as $a
               | select(($a | length) > 0 and all($a[]; . == $head))
@@ -875,7 +882,11 @@ crqe_codex_comment_signals() { # issue-comments-json bot-login head-sha
       | select((.user.login // "") == $bot and ((.user.type // "Bot") == "Bot"))
       | (.body // "") as $body
       | select($body | type == "string")
-      | select($body | startswith("<!-- codex-pull-request-review-summary -->") | not)
+      # Not a Review Summary, recognized by structure as in
+      # crqe_codex_pending_state (direct Phase 4b on #2886).
+      | select(($body | startswith("<!-- codex-pull-request-review-summary -->")
+                or test("(?m)^<!-- codex-review-state:v1 [^\\n]*-->[[:space:]]*$")
+                or test("(?m)^#{1,6}[[:space:]]*Codex Review Summary[[:space:]]*$")) | not)
       | ($body | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]")) as $marked
       | ($body | test("(?im)^\\s*codex review:")) as $header
       | ($body | ascii_downcase | test("reviewed commit")) as $field

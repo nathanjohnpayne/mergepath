@@ -3136,8 +3136,15 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     PHASE_4B_CODEX_OWED=""
     PHASE_4B_TIMEOUT_NOTE=""
     if [ -z "$PHASE_4B_SUPERSEDED" ] && [ "$CODEX_ENABLED" = "true" ]; then
-      PENDING_WINDOW=$(codex_field review_timeout_seconds)
-      PENDING_WINDOW=${PENDING_WINDOW:-1800}
+      # From the parsed governing policy (direct Phase 4b on #2886): the
+      # line-oriented codex_field reader misses a quoted key, which would
+      # silently shorten a configured wait to the default. The default
+      # applies only when the key is absent; any other non-integer refuses.
+      PENDING_WINDOW=$(printf '%s' "$AUTHOR_POLICY_JSON" | jq -r '
+        if (.codex | type) == "object" and (.codex | has("review_timeout_seconds"))
+        then (.codex.review_timeout_seconds
+              | if type == "number" and . >= 0 and floor == . then tostring else "invalid:\(tojson)" end)
+        else "1800" end' 2>/dev/null) || PENDING_WINDOW="unreadable"
       if ! declare -F crqe_codex_pending_state >/dev/null 2>&1; then
         PHASE_4B_CODEX_OWED="the Codex pending-review helper is unavailable"
       elif ! [[ "$PENDING_WINDOW" =~ ^[0-9]+$ ]]; then
@@ -3175,8 +3182,11 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
           none|answered) log "gate (c): Codex owes HEAD no review ($PENDING_STATE: $PENDING_DETAIL) (#2881)" ;;
           pending) PHASE_4B_CODEX_OWED="Codex still owes $HEAD_SHA a review ($PENDING_DETAIL); the approval waits for Codex or for the bound" ;;
           timed-out)
+            # Diagnostic only: the outcome marker is published with the
+            # clearance below, never on a path that then rejects the
+            # substitute (direct Phase 4b on #2886).
             PHASE_4B_TIMEOUT_NOTE="; codex-review-outcome: timed-out/substitute-used — no Codex outcome within codex.review_timeout_seconds=${PENDING_WINDOW}s ($PENDING_DETAIL); this is a fallback, not a Codex result, and a running review may still report after merge (#2881)"
-            log "gate (c): codex-review-outcome: timed-out/substitute-used ($PENDING_DETAIL) (#2881)"
+            log "gate (c): the bounded Codex wait has expired ($PENDING_DETAIL); a substitute may proceed if every other check accepts it (#2881)"
             ;;
           superseded-approval) PHASE_4B_CODEX_OWED="the approval is no longer $PHASE_4B_LOGIN's latest opinionated review on HEAD in the fresh read" ;;
           *) PHASE_4B_CODEX_OWED="Codex pending-review evidence is unreadable ($PENDING_DETAIL)" ;;

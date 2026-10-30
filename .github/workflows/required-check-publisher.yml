@@ -109,9 +109,16 @@ jobs:
     # `requested` arrives at push time alongside the gate's own (duplicate),
     # and on a lint rerun it would pend three lint-independent contexts for
     # the whole lint run. The completed pass claims its head itself.
+    #
+    # #2881: an issue_comment-originated gate run is excluded here and in the
+    # publish job. Such a run carries the default branch's head_sha and
+    # matches no PR; its dispatch-recheck job (or its skipped jobs, when the
+    # comment is not a Codex request or answer) already publishes the one
+    # context the comment can move, through the Checks API on the PR head.
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.name == 'Merge Clearance Gate' &&
+      github.event.workflow_run.event != 'issue_comment' &&
       (github.event.action == 'requested' || github.event.action == 'in_progress')
     runs-on: ubuntu-latest
     # GROUPLESS, on purpose (cross-agent round 3 on #867, superseding the
@@ -285,11 +292,24 @@ jobs:
     # as head_sha, match no open PR, and must not enter the rcp-publish queue
     # at all — a member that enters must run the full pass (coalescing), so
     # the filter has to live here, at the expression level.
+    #
+    # #2881 (direct Phase 4b on #2886): a Merge Clearance Gate run whose own
+    # event was issue_comment is excluded the same way. GitHub completes that
+    # run even when every job is skipped (an ordinary or CodeRabbit comment),
+    # and its head_sha is the default branch's tip, so admitting it would
+    # leave due_only=0 and sweep every open PR on ordinary review traffic. A
+    # job-level `if:` in the gate workflow cannot prevent the completion, and
+    # issue_comment has no activity filter narrower than its types, so the
+    # filter lives here. The comment path's own dispatch-recheck job
+    # publishes the merge-clearance context on the PR head; the other two
+    # contexts do not read comments that could change on that path.
     if: >-
       github.event_name != 'workflow_run' ||
       (github.event.action == 'completed' &&
        (github.event.workflow_run.name != 'repo-lint' ||
-        github.event.workflow_run.event == 'pull_request'))
+        github.event.workflow_run.event == 'pull_request') &&
+       (github.event.workflow_run.name != 'Merge Clearance Gate' ||
+        github.event.workflow_run.event != 'issue_comment'))
     runs-on: ubuntu-latest
     # ONE global queue for every publish pass, not a per-head group
     # (cross-agent P1 on #867): a sweep or dispatch run outside the head's

@@ -1189,6 +1189,13 @@ p_check summary-damaged-marker-no-request "[$(printf '%s' "$P_RUN_OK" | jq -c '.
 p_check summary-json-other-row-head-running "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_OTHER" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending summary-unreadable
 p_check summary-json-head-row-other-completed "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending request-unanswered
 p_check summary-leading-marker-missing "[$(printf '%s' "$P_RUN_OK" | jq -c '.body |= sub("^<!-- codex-pull-request-review-summary -->\n"; "") | .body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')]" '[]' pending summary-unreadable
+# Direct Phase 4b on #2886: a Summary answers only through its validated
+# Code Review state, so refusal text elsewhere in it (here the not-connected
+# wording, which matches anywhere in a body) is not an answer.
+p_check refusal-text-inside-running-summary "[$R0,$(p_summary running "$(p_at $((P_T0 + 10)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 20)) $((P_T0 + 20)) | jq -c '.body += "\n| 🔒 **Security Review** | To use Codex here, connect your GitHub account |"')]" '[]' pending request-unanswered
+# A findings comment that mentions the state marker in prose is not a Summary.
+p_check marker-mentioned-in-prose "[$R0,$(p_comment 620 $((P_T0 + 60)) "https://github.com/o/r/blob/$P_HEAD/a.sh#L1
+**<sub><sub>![P2 Badge](x)</sub></sub> The \`<!-- codex-review-state:v1 {} -->\` marker is parsed loosely" $((P_T0 + 120)))]" '[]' answered
 p_check summary-row-running-json-completed "[$R0,$P_DISAGREE]" '[]' pending request-unanswered
 p_check summary-row-json-disagree-no-request "[$P_DISAGREE]" '[]' pending summary-unreadable
 p_check summary-failed-agreeing "[$R0,$(p_summary failed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("\\*\\*failed\\*\\*"; "⚠️ **Failed**")')]" '[]' answered
@@ -1309,7 +1316,35 @@ e_run request-pending "[$E_REQ_RECENT]" "$E_APPROVAL" 1 'Codex still owes abcdef
 e_run request-timed-out "[$E_REQ_OLD]" "$E_APPROVAL" 0 'codex-review-outcome: timed-out/substitute-used'
 e_run request-answered-before-approval "[$E_REQ_RECENT,$E_FINDING_ANSWER]" "$E_APPROVAL" 0 'cleared — Phase 4b substitute'
 e_run finding-newer-than-approval "[$E_REQ_OLD,$E_FINDING_LATE]" "$E_APPROVAL" 1 'is older than newest Codex bot signal'
+# Direct Phase 4b on #2886: the timeout outcome is published only with a
+# clearance. An unanchored findings comment does not answer the expired
+# request (so the wait has timed out) but still outranks the older approval,
+# so the substitute is rejected and must never report substitute-used.
+E_UNANCHORED_LATE="{\"id\":144,\"user\":{\"login\":\"$P_BOT\",\"type\":\"Bot\"},\"created_at\":\"$(e_iso 30)\",\"updated_at\":\"$(e_iso 30)\",\"body\":\"## Review Findings\\n\\n### [P1] An unanchored finding\"}"
+e_run timed-out-but-rejected "[$E_REQ_OLD,$E_UNANCHORED_LATE]" "$E_APPROVAL" 1 'bounded Codex wait has expired'
+if grep -q 'substitute-used' "$DIR/out"; then
+  cat "$DIR/out"; echo 'FAIL: #2881 a rejected substitute reported timed-out/substitute-used'; exit 1
+fi
+PASS=$((PASS + 1)); echo 'PASS: #2881 e2e a rejected substitute never reports substitute-used'
 e_run run-in-flight-no-request "[$E_RUNNING]" "$E_APPROVAL" 1 'review-running'
+# Direct Phase 4b on #2886: the wait comes from the parsed governing policy,
+# so a quoted key is honoured rather than silently replaced by the default,
+# and a value that is not a whole number of seconds refuses.
+E_REQ_HOUR="{\"id\":123,\"user\":{\"login\":\"nathanjohnpayne\"},\"created_at\":\"$(e_iso 3600)\",\"body\":\"@codex review\"}"
+for e_window in '"review_timeout_seconds": 7200|1|Codex still owes' 'review_timeout_seconds: "soon"|1|not a whole number of seconds'; do
+  IFS='|' read -r e_line e_rc e_pat <<<"$e_window"
+  sed "s/^  review_timeout_seconds: 840\$/  $e_line/" "$DIR/substitute-policy.yml" >"$DIR/window-policy.yml"
+  grep -qF "$e_line" "$DIR/window-policy.yml" || { echo "FAIL: #2881 window fixture did not apply ($e_line)"; exit 1; }
+  printf '%s\n' "[$E_REQ_HOUR]" >"$DIR/comments"; printf '%s\n' "$E_APPROVAL" >"$DIR/reviews"; : >"$DIR/calls"; rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=window \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/window-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$e_rc" ] || ! grep -qF "$e_pat" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #2881 e2e policy window ($e_line) rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2881 e2e policy window: $e_line"
+done
 if grep -q 'timed-out/substitute-used' "$DIR/out"; then
   echo 'FAIL: #2881 a pending run was reported as a timeout'; exit 1
 fi
