@@ -45,6 +45,26 @@ ok "a comment whose user.type is not Bot is ignored"
 CLEAN=$(printf '%s' "$C1120" | jq -c '.body = "Codex Review: Didn'"'"'t find any major issues."')
 [ "$(input "$MERGED" "[$CLEAN]" '[]' '[]' | select_ids)" = "" ] || die "a clean verdict was selected"
 ok "a clean post-merge verdict is not a finding"
+# Codex P2 on #2898: the text-only `**Pn` fallback (tests/test_codex_p1_gate.sh
+# exercises `**P1: ...`) is a finding, with its tier, in both of its forms.
+FB_BASE='{"id":901,"user":{"login":"chatgpt-codex-connector[bot]","type":"Bot"},"created_at":"2026-08-28T03:01:00Z","updated_at":"2026-08-28T03:01:00Z","html_url":"u","body":""}'
+for form in '**P1: Text-only fallback.|P1' '**P2** Text-only fallback.|P2'; do
+  body=${form%|*} want=${form##*|}
+  FALLBACK=$(printf '%s' "$FB_BASE" | jq -c --arg b "$body" '.body = $b')
+  [ "$(input "$MERGED" '[]' '[]' "[$FALLBACK]" | "$SCRIPT" --select | jq -r 'map("\(.id):\(.tiers | join(","))") | join(";")')" = "901:$want" ] \
+    || die "the text-only fallback '$body' was not selected as $want"
+done
+ok "the text-only **P1: and **P2** fallbacks are findings with their tiers"
+# Parity with codex_tiers_of: every body it reads a tier from is a finding
+# here, with the same tiers.
+# shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+. "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+for body in '![P0 Badge](x) badge' '**P1: colon fallback' '**P3** bold fallback' '**<sub>![P2 Badge](x)</sub>** wrapped badge' '![P1 Badge](x) and **P2: two markers'; do
+  want=$(codex_tiers_of "$body" | tr 'p' 'P' | sort -u | paste -sd, -)
+  got=$(input "$MERGED" '[]' '[]' "[$(printf '%s' "$FB_BASE" | jq -c --arg b "$body" '.body = $b')]" | "$SCRIPT" --select | jq -r '.[0].tiers // [] | join(",")')
+  [ -n "$want" ] && [ "$got" = "$want" ] || die "tiers for '$body': codex_tiers_of says '$want', the detector '$got'"
+done
+ok "every body codex_tiers_of reads is a finding with the same tiers"
 REVIEW='{"id":801,"user":{"login":"chatgpt-codex-connector[bot]","type":"Bot"},"submitted_at":"2026-08-28T03:00:00Z","html_url":"u","body":"### 💡 Codex Review\n![P1 Badge](x) late"}'
 OLD_REVIEW='{"id":802,"user":{"login":"chatgpt-codex-connector[bot]","type":"Bot"},"submitted_at":"2026-08-27T03:00:00Z","html_url":"u","body":"![P1 Badge](x) old"}'
 INLINE='{"id":901,"user":{"login":"chatgpt-codex-connector[bot]","type":"Bot"},"created_at":"2026-08-28T03:01:00Z","updated_at":"2026-08-28T03:01:00Z","html_url":"u","body":"**<sub><sub>![P0 Badge](x)</sub></sub> late inline"}'

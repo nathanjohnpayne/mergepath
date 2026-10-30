@@ -20,8 +20,10 @@
 # A finding qualifies when all of these hold:
 #   - the configured Codex App bot wrote it (login match; a present user.type
 #     must be `Bot`), and it is not the Review Summary;
-#   - it carries a priority marker: a `![Pn Badge]` image, or a `[Pn]` heading
-#     or bold label, n in 0-3 (the review, inline and cloud-task formats);
+#   - it carries a priority marker: a `![Pn Badge]` image, the text-only
+#     `**Pn` fallback (the two shapes `codex_tiers_of` in
+#     scripts/lib/feedback-policy-helpers.sh reads), or a `[Pn]` heading or
+#     bold label, n in 0-3 (the review, inline and cloud-task formats);
 #   - it was created or last edited strictly after the PR's merged_at, so an
 #     edit that adds findings after merge counts as well as a new comment. The
 #     REST review object has no edit time, so a review's edit time comes from
@@ -133,8 +135,12 @@ select_late_findings() { # stdin: {merged_at, comments, reviews, inline}; $1 bot
     def secs: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
               then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) else null end;
     def is_bot: (.user.login // "") == $bot and $bot != "" and ((.user.type // "Bot") == "Bot");
-    def marked: (.body // "") | test("!\\[P[0-3] Badge\\]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]");
-    def tiers: [ (.body // "") | scan("!\\[(P[0-3]) Badge\\]|\\[(P[0-3])\\]") | map(select(. != null)) | .[0] ] | unique;
+    # The first two alternatives are the codex_tiers_of pattern
+    # (`!\[P[0-3] Badge\]|\*\*P[0-3]`), so the badge and the text-only
+    # `**P1: ...` fallback both count; the test pins that parity. The
+    # bracketed forms are the cloud-task shape.
+    def marked: (.body // "") | test("!\\[P[0-3] Badge\\]|\\*\\*P[0-3]|(?m)^[[:space:]]*(#{1,6}[[:space:]]*|\\*\\*)\\[P[0-3]\\]");
+    def tiers: [ (.body // "") | scan("!\\[(P[0-3]) Badge\\]|\\*\\*(P[0-3])|\\[(P[0-3])\\]") | map(select(. != null)) | .[0] ] | unique;
     def item($kind; $changed):
       { kind: $kind, id: .id, url: (.html_url // ""), changed_at: $changed,
         tiers: tiers, body: (.body // "") };
