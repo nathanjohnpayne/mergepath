@@ -989,13 +989,6 @@ paths:
     # with the workflow for the fix to reach a consumer.
     type: canonical
     consumers: all
-  # #2881: records Codex findings that arrive after a PR merged as a durable
-  # follow-up issue. Invoked by .github/workflows/late-codex-findings.yml.
-  - path: scripts/late-codex-findings.sh
-    type: canonical
-    consumers: all
-    requires:
-      - "scripts/lib/feedback-policy-helpers.sh"  # policy_yaml_to_json resolves codex.bot_login
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -1711,14 +1704,6 @@ paths:
   - path: tests/fixtures/codex_late_review_format_1120.json
     type: canonical
     consumers: all
-  # #2881 late-finding detector suite, run by check_codex_scripts.
-  - path: tests/test_late_codex_findings.sh
-    type: canonical
-    consumers: all
-    requires:
-      - "scripts/late-codex-findings.sh"
-      - "scripts/lib/feedback-policy-helpers.sh"
-      - "tests/fixtures/codex_late_review_format_1120.json"
   # #1560 Codex review ledger: attribution fixtures, CLI contract, and the
   # verdict-expression pin across the three copies. Run by check_codex_scripts.
   - path: tests/test_codex_review_ledger.sh
@@ -2653,13 +2638,6 @@ paths:
       - "scripts/coderabbit-severity-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
-  # #2881: event and daily-sweep runner for the late-finding detector; the
-  # script must travel with it or every consumer run fails on a missing file.
-  - path: .github/workflows/late-codex-findings.yml
-    type: canonical
-    consumers: all
-    requires:
-      - "scripts/late-codex-findings.sh"
   - path: .github/workflows/daily-feedback-rollup.yml
     type: canonical
     consumers: all
@@ -2884,8 +2862,6 @@ paths:
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
-      - "tests/test_late_codex_findings.sh"      # check_codex_scripts (#2881)
-      - "scripts/late-codex-findings.sh"         # check_codex_scripts (#2881)
       - "tests/fixtures/codex_late_review_format_1120.json"  # check_codex_scripts (#2881)
       - "tests/test_codex_review_ledger.sh"      # #1560, Codex review ledger
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)

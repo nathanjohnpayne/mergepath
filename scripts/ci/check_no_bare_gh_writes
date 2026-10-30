@@ -29,7 +29,6 @@ while IFS= read -r -d '' file; do
       ;;
     *.md) continue ;;                                # documentation examples, not executable script flow
     scripts/daily-feedback-rollup.sh) continue ;;    # workflow/reporting surface, #412
-    scripts/late-codex-findings.sh) continue ;;      # workflow/reporting surface (GITHUB_TOKEN follow-up issues), #2881
     scripts/sweep-unresolved-feedback/*) continue ;; # workflow/reporting surface, #412
     scripts/post-phase-4b-handoff.sh) continue ;;    # GraphQL read helper, #412
     scripts/ci/*) continue ;;                        # tests/checks intentionally stub gh

@@ -3125,8 +3125,8 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # from the run's own start time, so a rerun can neither reset nor extend
     # it. Past the bound the approval is accepted as an explicit
     # `timed-out/substitute-used` fallback: Codex may still be running and may
-    # post findings after merge (the late-finding detector, #2881, surfaces
-    # those). The approval, accounting and every other gate still apply.
+    # post findings after merge (a post-merge detector is a separate change,
+    # #2881). The approval, accounting and every other gate still apply.
     # Requests, outcomes, reviews, inline comments and the latest Codex signal
     # all come from one fresh read (Phase 4b on #2886): the comments re-read
     # above, with its verdict anchors resolved again, plus fresh reviews and
