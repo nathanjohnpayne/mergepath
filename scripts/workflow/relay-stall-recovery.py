@@ -16,7 +16,7 @@ workflow_run payload). The sweep stays pending until the relay posts its own
 marker. Each relay is re-run at most --max-attempts - 1 times.
 
 stdin:  JSON list of pending source runs: [{id, status, updated_at}, ...]
-stdout: JSON {stalled, in_flight, rerun, unmatched}
+stdout: JSON {stalled, in_flight, rerun, unmatched, incomplete}
 exit 2: relay history unreadable or saturated; the caller stays pending.
 """
 import argparse
@@ -89,7 +89,7 @@ def recover(github, pending, now, stall, max_attempts):
         if (isinstance(row, dict) and type(row.get('id')) is int and row.get('status') == 'completed'
                 and when is not None and now - when >= stall):
             done[row['id']] = when
-    report = {'stalled': sorted(done), 'in_flight': False, 'rerun': [], 'unmatched': []}
+    report = {'stalled': sorted(done), 'in_flight': False, 'rerun': [], 'unmatched': [], 'incomplete': False}
     if not done:
         return report
     since = iso(min(done.values()) - SKEW)
@@ -102,11 +102,19 @@ def recover(github, pending, now, stall, max_attempts):
     if any(run.get('status') != 'completed' for run in runs):
         report['in_flight'] = True
         return report
+    # A relay is created when its source completes, so read the failed runs
+    # nearest a stalled source's completion first. Oldest-first let unrelated
+    # failures fill the bounded read budget on every sweep (#2908 review).
+    def distance(run):
+        created = epoch(run.get('created_at'))
+        gaps = [created - when for when in done.values() if created is not None and created >= when - SKEW]
+        return min(abs(gap) for gap in gaps) if gaps else None
+
     candidates = sorted((run for run in runs
                          if run.get('conclusion') in FAILED and type(run.get('id')) is int
                          and type(run.get('run_attempt')) is int and run['run_attempt'] < max_attempts
-                         and epoch(run.get('created_at')) is not None),
-                        key=lambda run: run['created_at'])
+                         and distance(run) is not None),
+                        key=lambda run: (distance(run), run['id']))
     matched = set()
     for run in candidates[:MAX_LOG_READS]:
         jobs = github.get(f'actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs')
@@ -124,6 +132,7 @@ def recover(github, pending, now, stall, max_attempts):
                     print(f'could not re-run relay run {run["id"]}', file=sys.stderr)
             break
     report['unmatched'] = sorted(set(done) - matched)
+    report['incomplete'] = bool(report['unmatched']) and len(candidates) > MAX_LOG_READS
     return report
 
 
