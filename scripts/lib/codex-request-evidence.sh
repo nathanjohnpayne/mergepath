@@ -758,7 +758,11 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
         | [ $botc[]
             | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
             | . as $c
-            | ((.body // "") | (try (capture("<!-- codex-review-state:v1 (?<j>\\{[^\\n]*\\}) -->").j | fromjson) catch null)) as $sj
+            # A missing or damaged marker must read as null, not as no value:
+            # capture emits nothing on no match, which would drop the whole
+            # summary (Codex P1 on #2886).
+            | ([ (.body // "") | capture("<!-- codex-review-state:v1 (?<j>\\{[^\\n]*\\}) -->")? | .j ] | first) as $sj_raw
+            | (if $sj_raw == null then null else (try ($sj_raw | fromjson) catch null) end) as $sj
             | ((.body // "") | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")? // null) as $row
             | (if ($sj | type) == "object" and ($sj.code_review | type) == "object"
                   and (($sj.code_review.commit_sha // "") | type) == "string"
