@@ -1698,12 +1698,6 @@ paths:
     requires:
       - "scripts/lib/codex-request-evidence.sh"
       - "scripts/lib/codex-failure-markers.sh"   # #2881 refusal markers in the pending-state cases
-      - "tests/fixtures/codex_late_review_format_1120.json"  # #2881 canonical review-format findings comment
-  # #2881 canonical fixture: the P2 Codex posted as an issue comment on
-  # mergepath#1120 five minutes after merge.
-  - path: tests/fixtures/codex_late_review_format_1120.json
-    type: canonical
-    consumers: all
   # #1560 Codex review ledger: attribution fixtures, CLI contract, and the
   # verdict-expression pin across the three copies. Run by check_codex_scripts.
   - path: tests/test_codex_review_ledger.sh
@@ -2862,7 +2856,6 @@ paths:
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
-      - "tests/fixtures/codex_late_review_format_1120.json"  # check_codex_scripts (#2881)
       - "tests/test_codex_review_ledger.sh"      # #1560, Codex review ledger
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)

@@ -2379,33 +2379,6 @@ if [ "$CODEX_ENABLED" = "true" ]; then
       ]
     | max_by(.created_at) // null
   ')
-  # #2881: Codex also posts review-format findings (priority badges, blob
-  # permalinks, no `Codex review:` header) as an issue comment, sometimes with
-  # no companion review, and a verdict can pair a Reviewed commit field with a
-  # permalink to another commit. The selector above sees neither. Every Codex
-  # verdict or findings comment is therefore also classified with its complete
-  # anchor set (crqe_codex_comment_signals). The newest negative one (a
-  # findings comment, a non-clean header, or any comment whose anchors are not
-  # all HEAD) that is not anchored only to other commits replaces the latest
-  # verdict as non-affirmative when it is at least as new, timed by its latest
-  # edit so an edit that adds findings stays newest. It never clears. A
-  # missing helper or an unreadable comment fails the run.
-  declare -F crqe_codex_comment_signals >/dev/null 2>&1 \
-    || die 3 "codex-request-evidence helper missing crqe_codex_comment_signals (#2881)"
-  CODEX_COMMENT_SIGNALS=$(crqe_codex_comment_signals "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA") \
-    || die 3 "cannot classify Codex verdict and findings comments (#2881)"
-  CODEX_FORMAT_FINDING_JSON=$(printf '%s' "$CODEX_COMMENT_SIGNALS" \
-    | jq -c '[ .[] | select(.anchor != "other" and (.affirmative | not)) ] | max_by([.at, .comment_id]) // null') \
-    || die 3 "cannot select the newest negative Codex comment (#2881)"
-  if [ "$CODEX_FORMAT_FINDING_JSON" != null ]; then
-    __format_at=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.at')
-    __verdict_at=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
-    if [ -z "$__verdict_at" ] || ! [[ "$__verdict_at" > "$__format_at" ]]; then
-      CODEX_VERDICT_JSON=$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" \
-        | jq -c '{created_at: .at, exact: (.anchor == "exact"), affirmative: false}')
-      log "codex verdict: Codex comment #$(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.comment_id') @ $__format_at (anchor: $(printf '%s' "$CODEX_FORMAT_FINDING_JSON" | jq -r '.anchor')) is the latest verdict signal — NON-affirmative (#2881)"
-    fi
-  fi
   CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
   if [ "$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "false" else (.affirmative | tostring) end')" = "true" ]; then
     CODEX_HEAD_VERDICT_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
@@ -3125,8 +3098,8 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # from the run's own start time, so a rerun can neither reset nor extend
     # it. Past the bound the approval is accepted as an explicit
     # `timed-out/substitute-used` fallback: Codex may still be running and may
-    # post findings after merge (a post-merge detector is a separate change,
-    # #2881). The approval, accounting and every other gate still apply.
+    # post findings after merge (the post-merge detector is a separate change,
+    # #2898). The approval, accounting and every other gate still apply.
     # Requests, outcomes, reviews, inline comments and the latest Codex signal
     # all come from one fresh read (Phase 4b on #2886): the comments re-read
     # above, with its verdict anchors resolved again, plus fresh reviews and

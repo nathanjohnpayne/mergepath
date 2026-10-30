@@ -254,7 +254,6 @@
       "scripts/lib/credential-class.sh",
       "scripts/lib/codex-request-evidence.sh",
       "tests/test_codex_request_evidence.sh",
-      "tests/fixtures/codex_late_review_format_1120.json",
       "scripts/codex-review-ledger.sh",
       "scripts/lib/codex-review-ledger.sh",
       "tests/test_codex_review_ledger.sh",
