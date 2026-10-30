@@ -1291,11 +1291,11 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-364.** Retired: the rotation-date notes record came only from the removed calendar-review requirement, and DEPLOYMENT.md no longer prescribes one. The ID stays reserved. ○ — DEPLOYMENT.md § Rotation
 
-**G-365.** Rotation is verified by a low-risk deploy whose source-credential log line still names the project key; falling through to another source forbids rolling forward. ● — DEPLOYMENT.md § Rotation
+**G-365.** During routine rotation, do not replace the canonical key, declare rotation complete or revoke the prior working key until separately reviewed, non-deploying validation proves the replacement usable; production or low-risk deploys, item metadata, key IDs and resolver logs do not establish usability. ● — DEPLOYMENT.md § Rotation
 
 **G-366.** The old key is revoked only after successful verification, so the project is never left without a valid key. ○ — DEPLOYMENT.md § Rotation
 
-**G-367.** The key rotates only on a compromise indicator or a custody or membership change; there is no calendar rotation cadence. ○ — DEPLOYMENT.md § Rotation
+**G-367.** Review the key after a compromise indicator or a custody or membership change; suspected-compromise containment is a separate owner incident decision, and there is no calendar rotation cadence. ○ — DEPLOYMENT.md § Rotation
 
 **G-368.** Multi-project rotation runs one project at a time; batching or automating it is out of bounds. ○ — DEPLOYMENT.md § Rotation
 
