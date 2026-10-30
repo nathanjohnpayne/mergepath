@@ -2155,39 +2155,30 @@ p4b_codex_summary_versions() {
   jq -nc --argjson a "$all" --argjson m "$marked" '$a + [ $m[] | {at, body} ]'
 }
 
-# p4b_comment_mention_history <repo> <pr> <bot>
-# For every EDITED non-bot PR comment, the time a mention of Codex's handle
-# first appeared in it: {"<databaseId>": "<editedAt>" | null}. Null means no
-# version ever mentioned it; an unedited comment is absent (its creation is
-# its only version). A mention added by a later edit is a request from that
-# edit on, not from the comment's creation, so request order follows mention
-# time (Phase 4b on #2888). One paginated GraphQL read of every comment's
-# edit metadata decides whether it was edited; REST timestamps have second
-# precision and miss an edit inside the creation second. Prints `null` when
-# any page or any edited comment's history cannot be read in full, including
-# a withheld or deleted revision (diff null), since an unknown body is not
-# "no mention"; review-feedback-accounting.sh reads that shape the same way.
-# GraphQL logins drop the "[bot]" suffix, so the bot is compared without it.
-p4b_comment_mention_history() {
-  local snap
-  snap="$(p4b_comment_history_snapshot "$@")"
-  printf '%s' "$snap" | jq -c 'if type == "object" then .mentions else null end' 2>/dev/null || printf 'null\n'
-}
-
 # p4b_comment_history_snapshot <repo> <pr> <bot>
-# The one GraphQL read behind p4b_comment_mention_history:
-# {mentions: <that map>, counts: {"<databaseId>": <edit count>}} for every
-# non-bot comment, or `null` when anything is unreadable. An edit count
-# changes with every edit, including two inside one second that REST
-# updated_at cannot tell apart, so the counts are the binding's stability
-# evidence (p4b_wave_binding_stable; Phase 4b on #2888).
+# One paginated GraphQL read of every non-bot PR comment's edit metadata:
+# {edited: {"<databaseId>": <mentioned>}, counts: {"<databaseId>": <edits>}}.
+# `edited` names every EDITED comment (lastEditedAt set or any recorded
+# edit), with true when any readable revision mentions Codex's handle; an
+# unedited comment is absent. The binding no longer reconstructs when a
+# mention appeared or disappeared: an edited comment that mentions Codex now
+# or in any revision makes it hold (owner decision on #2888, after five
+# edit-history findings in a row). REST timestamps have second precision and
+# miss an edit inside the creation second, so edit status comes from this
+# metadata as well. `counts` changes with every edit, even two inside one
+# second, so it is the binding's stability evidence (p4b_wave_binding_stable).
+# Prints `null` when any page or any edited comment's history cannot be read
+# in full: a truncated history, a withheld or deleted revision (diff null),
+# or a history that does not include the comment's original version
+# (includesCreatedEdit false), since an unknown body is not "no mention".
+# GraphQL logins drop the "[bot]" suffix, so the bot is compared without it.
 p4b_comment_history_snapshot() {
   local repo="$1" pr="$2" bot="${3:-}" owner name pages query
   owner="${repo%%/*}"; name="${repo#*/}"
-  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{databaseId author{login} lastEditedAt userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}}}'
+  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{databaseId author{login} lastEditedAt includesCreatedEdit userContentEdits(first:100){totalCount nodes{diff}}}}}}}'
   pages="$(gh api graphql --paginate -f query="$query" -f owner="$owner" -f name="$name" -F pr="$pr" 2>/dev/null)" \
     || { printf 'null\n'; return 0; }
-  # Not `jq -e`: an empty map or a null entry is a valid result.
+  # Not `jq -e`: an empty map is a valid result.
   printf '%s\n' "$pages" | jq -sc --arg bot "${bot%\[bot\]}" '
     [ .[] | .data.repository.pullRequest.comments | if type == "object" then . else error("page") end
       | .nodes[] ]
@@ -2195,48 +2186,37 @@ p4b_comment_history_snapshot() {
     | [ .[] | select(((.author.login // "") | sub("\\[bot\\]$"; "")) != $bot) ]
     | if all(.[]; (.userContentEdits.totalCount | type) == "number") | not then error("counts") else . end
     | {counts: ([ .[] | {key: (.databaseId | tostring), value: .userContentEdits.totalCount} ] | from_entries),
-       mentions: ([ .[]
-        | select(.lastEditedAt != null or ((.userContentEdits.totalCount // 0) > 0))
+       edited: ([ .[]
+        | select(.lastEditedAt != null or .userContentEdits.totalCount > 0)
         | .userContentEdits as $e
-        | if ($e | type) != "object" or ($e.nodes | type) != "array" or $e.totalCount != ($e.nodes | length)
-             or any($e.nodes[]; (.diff | type) != "string" or (.editedAt | type) != "string")
+        | if (.includesCreatedEdit != true) or ($e.nodes | type) != "array" or $e.totalCount != ($e.nodes | length)
+             or any($e.nodes[]; (.diff | type) != "string")
           then error("history")
-          else {key: (.databaseId | tostring),
-                value: ([ $e.nodes[] | select(.diff | test("@codex"; "i")) | .editedAt ] | min)} end ]
+          else {key: (.databaseId | tostring), value: any($e.nodes[]; .diff | test("@codex"; "i"))} end ]
         | from_entries)}' 2>/dev/null \
     || printf 'null\n'
 }
 
-# p4b_wave_binding_request_view <comments-json> <bot> <historic-json>
-# What two comment reads must agree on for the evidence between them to
-# stand: every non-bot comment id (a new comment of any body may have
-# carried a mention it no longer shows), and the edit time of each comment
-# that mentions Codex's handle now or has a mention history (a non-null
-# entry; null means edited but never mentioned). CodeRabbit re-editing a
-# comment that never mentioned Codex changes neither. The comment id is
-# captured before switching to the history map (Codex on #2888).
-p4b_wave_binding_request_view() {
-  local historic="${3:-}"
-  [ -n "$historic" ] || historic='{}'
-  printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" --argjson h "$historic" '
-    [ .[] | select((.user.login // "") != $bot) ] as $c
-    | {ids: ([ $c[].id ] | sort),
-       requests: ([ $c[] | (.id | tostring) as $k
-                    | select(((.body // "") | test("@codex"; "i")) or (($h[$k] // null) != null))
-                    | {id, updated_at} ] | sort_by(.id))}' 2>/dev/null
+# p4b_wave_binding_stamps <comments-json> <bot> -> {"<id>": "<updated_at>"}
+# for every comment not by Codex's bot: the comment set and edit times two
+# REST reads must agree on.
+p4b_wave_binding_stamps() {
+  printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" \
+    '[ .[] | select((.user.login // "") != $bot) | {key: (.id | tostring), value: (.updated_at // "")} ] | from_entries' 2>/dev/null
 }
 
 # p4b_wave_binding_evaluate <repo> <pr> <head> <request-id>
 # All the reads the binding needs, then p4b_wave_codex_binding_state. Shared
 # by the barrier and the orchestrator's publication fence, so both decide on
-# identical evidence. The comment list is read again after the GraphQL
-# history reads, and a clear stands only if both reads agree
-# (p4b_wave_binding_request_view) and every comment with a mention history
-# was already in the first read: a request that arrived, or a mention that
-# moved, while they ran was not in the evidence (Phase 4b on #2888). An
-# unreadable comment list is `unreadable`.
+# identical evidence. On a clear, the comments and the edit metadata are
+# read again, and the clear stands only if nothing moved: the same comments
+# with the same updated_at in both REST reads, the same edit metadata in
+# both GraphQL reads, and the final GraphQL read covering exactly the
+# comments of the final REST read (a request that arrived, or an edit that
+# happened, while the reads ran was not in the evidence; Phase 4b and Codex
+# on #2888). An unreadable comment list is `unreadable`.
 p4b_wave_binding_evaluate() {
-  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions historic historic_after snap_after view result
+  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions snap snap_after edited result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   if ! command -v gh_api_array >/dev/null 2>&1 \
@@ -2245,34 +2225,22 @@ p4b_wave_binding_evaluate() {
     return 0
   fi
   versions="$(p4b_codex_summary_versions "$comments" "$bot")"
-  historic="$(p4b_comment_mention_history "$repo" "$pr" "$bot")"
-  result="$(p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "$historic")"
+  snap="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  edited="$(printf '%s' "$snap" | jq -c 'if type == "object" then .edited else null end' 2>/dev/null || printf null)"
+  result="$(p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "${edited:-null}")"
   printf '%s' "$result" | jq -e '.state == "clear"' >/dev/null 2>&1 || { printf '%s\n' "$result"; return 0; }
   if ! after="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding recheck" 2>/dev/null)"; then
     jq -nc '{state:"unreadable",reason:"comments-reread-failed"}'
     return 0
   fi
-  # The mention history is read once more, last: a comment that gained and
-  # then lost a mention after the first history read shows the same body in
-  # both comment reads, but its revision is in this history (Phase 4b on
-  # #2888). Only mentioning entries are compared, so CodeRabbit re-editing a
-  # comment that never mentioned Codex changes nothing.
   snap_after="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
-  historic_after="$(printf '%s' "$snap_after" | jq -c 'if type == "object" then .mentions else null end' 2>/dev/null || printf null)"
-  view="$(p4b_wave_binding_request_view "$after" "$bot" "$historic")"
-  if [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" != "$view" ] \
-     || ! printf '%s' "$comments" | jq -e --argjson h "$historic" '([ .[].id | tostring ]) as $ids | all($h | keys[]; . as $k | $ids | index($k))' >/dev/null 2>&1 \
-     || ! jq -en --argjson a "$historic" --argjson b "${historic_after:-null}" \
-          '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1 \
+  if [ "$(p4b_wave_binding_stamps "$comments" "$bot")" != "$(p4b_wave_binding_stamps "$after" "$bot")" ] \
+     || ! jq -en --argjson a "${snap:-null}" --argjson b "${snap_after:-null}" '($b | type) == "object" and $a == $b' >/dev/null 2>&1 \
      || ! printf '%s' "$after" | jq -e --arg bot "$bot" --argjson s "${snap_after:-null}" \
           '($s | type) == "object" and ([ .[] | select((.user.login // "") != $bot) | .id | tostring ] | sort) == ($s.counts | keys | sort)' >/dev/null 2>&1; then
     printf '%s' "$result" | jq -c 'del(.generation) + {state:"hold",reason:"requests-changed-during-evaluation"}'
     return 0
   fi
-  # The final snapshot's comments are exactly those the second comment read
-  # evaluated: an unedited request that landed between the two leaves no
-  # mention-history entry, and its id must not enter the stability baseline
-  # unevaluated (direct Phase 4b review and Codex on #2888).
   # A clear carries the edit count of every comment its final read saw, so
   # a later one-read check (p4b_wave_binding_stable) can tell whether any
   # comment appeared or was edited since.
@@ -2297,8 +2265,8 @@ p4b_wave_binding_stable() {
   jq -en --argjson a "$counts" --argjson b "${now:-null}" '($b | type) == "object" and $b.counts == $a' >/dev/null 2>&1
 }
 
-# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <historic-request-ids-json>
-# Pure. Prints {state, reason, bound_request, requests, runs[, generation]}:
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <edited-json>
+# Pure. Prints {state, reason, bound_request, requests, runs[, edited, generation]}:
 # state is "clear", "hold" or "unreadable"; requests and runs are the
 # evidence the decision paired (machine-readable for whoever surfaces a hold);
 # generation, on a clear, is the author request generation the decision read
@@ -2307,10 +2275,17 @@ p4b_wave_binding_stable() {
 # <summary-versions-json> is every version of Codex's Review Summary comment,
 # [{at, body}], from its GraphQL edit history plus the live body (it is
 # edited in place), or `null` when that history could not be read in full.
-# <historic-request-ids-json> maps each edited non-bot comment to the time a
-# mention of Codex's handle first appeared in it, or null if none ever did
-# (p4b_comment_mention_history); the whole argument is `null` when an edit
-# history could not be read.
+# <edited-json> is p4b_comment_history_snapshot's `edited` map (each edited
+# non-bot comment -> whether any readable revision mentions Codex's handle),
+# or `null` when an edited comment's history could not be read.
+#
+# Edited comments are not evaluated (owner decision on #2888). A comment is
+# edited when the edit metadata names it or its REST updated_at differs from
+# its created_at. One that mentions Codex now or in any readable revision
+# may be, or may have been, a request whose time and lifetime no single read
+# establishes, so it makes the binding hold (`edited-request`), as does an
+# edited comment with no readable history. Only never-edited comments are
+# requests, each at its created_at.
 #
 # Evidence, and what it does NOT prove. Each version carries
 # `codex-review-state:v1` JSON (full commit, status) and a row whose Review
@@ -2323,8 +2298,8 @@ p4b_wave_binding_stable() {
 # never says WHICH request, and nothing documents a maximum queue age.
 #
 # So runs are tied to requests by order, never by a time window. Every
-# non-bot comment mentioning Codex's handle is a request (any age, any
-# author: Codex may treat it as one). Oldest first, each request takes the
+# never-edited non-bot comment mentioning Codex's handle is a request (any
+# age, any author: Codex may treat it as one). Oldest first, each request takes the
 # earliest Manual-request run that started at or after it and after the run
 # the previous request took (FIFO). R clears only when:
 #   - no request comes after R (a superseding, overlapping or same-second
@@ -2340,9 +2315,10 @@ p4b_wave_binding_stable() {
 # for it), and reordering is the residual. A request comment DELETED outright
 # leaves no trace in the API and is the other residual.
 #
-#   hold        any of the above unmet, runs that overlap (a new run opening
-#               before the previous one ended), an unreadable / incomplete
-#               history or request edit history,
+#   hold        any of the above unmet, an edited Codex-mentioning comment,
+#               runs that overlap (a new run opening before the previous one
+#               ended), an unreadable / incomplete history or comment edit
+#               history,
 #               an unparseable version, an inconsistent history (a terminal
 #               version with no Running start, or a commit or trigger change
 #               inside one run), or a request time that does not parse. The
@@ -2364,7 +2340,7 @@ p4b_wave_codex_binding_state() {
 p4b_wave_codex_binding_eval() {
   printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
     --arg head "${4:-}" --arg rid "${5:-}" --argjson versions "${6:-null}" \
-    --argjson historic "${7:-null}" '
+    --argjson edited "${7:-null}" '
     def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
     def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
     # One summary version -> {at, commit, status, trigger, time} or null.
@@ -2392,32 +2368,28 @@ p4b_wave_codex_binding_eval() {
         elif ($r.created_at | secs) == null then {state: "unreadable", reason: "bound-request-time-unreadable"}
         else
           ([ $comments[] | select(exact_request) | .id ] | unique) as $generation
-          # A comment is a request if its body mentions the Codex handle now
-          # OR in any earlier version: removing a mention does not cancel a
-          # job Codex already queued (Phase 4b on #2875).
-          # Request time is when the mention first appeared: an edited
-          # comment takes it from its history (historic), an unedited one
-          # from its creation. An edited comment that mentions Codex now but
-          # whose history says it never did is inconsistent.
+          # Edited comments: named by the edit metadata, or by a REST
+          # updated_at that differs from created_at. Each one that mentions
+          # Codex now or in a readable revision holds the binding; so does
+          # one the metadata does not cover (no readable history).
           | ([ $comments[] | select((.user.login // "") != $bot)
                | (.id | tostring) as $k
-               | ((.body // "") | test("@codex"; "i")) as $now
-               | if ($historic | type) == "object" and ($historic | has($k)) then
-                   if $historic[$k] == null then (if $now then {id, at: null, t: null, inconsistent: true} else empty end)
-                   else {id, at: $historic[$k], t: ($historic[$k] | secs)} end
-                 elif $now then {id, at: (.created_at // ""), t: ((.created_at // "") | secs)}
-                 else empty end ] | sort_by(.t, .id)) as $reqs
-          | {bound_request: $r.id, requests: [ $reqs[] | {id, at} ], runs: []} as $base
-          | ([ $reqs[] | select((.id | tostring) == $rid) ] | first | .t) as $rt
-          | if ($historic | type) != "object" then $base + {state: "hold", reason: "request-edit-history-unreadable"}
-            elif any($reqs[]; .inconsistent == true) then $base + {state: "hold", reason: "request-edit-history-inconsistent"}
+               | select((($edited | type) == "object" and ($edited | has($k))) or ((.updated_at // .created_at) != .created_at))
+               | {id, mentioned: (((.body // "") | test("@codex"; "i")) or (($edited | type) == "object" and $edited[$k] == true)),
+                  covered: (($edited | type) == "object" and ($edited | has($k)))} ]) as $edits
+          # Requests: never-edited comments mentioning the handle, at their
+          # creation; comment ids follow creation within a second.
+          | ([ $comments[] | select((.user.login // "") != $bot)
+               | (.id | tostring) as $k
+               | select(((.body // "") | test("@codex"; "i"))
+                        and ((($edited | type) == "object" and ($edited | has($k))) | not)
+                        and ((.updated_at // .created_at) == .created_at))
+               | {id, at: (.created_at // ""), t: ((.created_at // "") | secs)} ] | sort_by(.t, .id)) as $reqs
+          | {bound_request: $r.id, requests: [ $reqs[] | {id, at} ], runs: [], edited: [ $edits[] | select(.mentioned or (.covered | not)) | .id ]} as $base
+          | if ($edited | type) != "object" then $base + {state: "hold", reason: "comment-edit-history-unreadable"}
+            elif any($edits[]; .mentioned) then $base + {state: "hold", reason: "edited-request"}
+            elif any($edits[]; .covered | not) then $base + {state: "hold", reason: "edited-comment-without-history"}
             elif any($reqs[]; .t == null) then $base + {state: "hold", reason: "request-time-unreadable"}
-            # Request times have whole-second precision (REST creation, and
-            # the fraction is dropped from edit times), so another request in
-            # the bound request s second has no knowable order relative to
-            # it: comment ids follow creation, not when a mention was added
-            # by an edit (Phase 4b on #2888).
-            elif any($reqs[]; .t == $rt and (.id | tostring) != $rid) then $base + {state: "hold", reason: "request-order-ambiguous"}
             elif ($versions | type) != "array" then $base + {state: "hold", reason: "summary-history-unreadable"}
             else
               [ $versions[] | version ] as $parsed
