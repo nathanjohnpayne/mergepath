@@ -1289,7 +1289,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-363.** Rotation reuses the same canonical item title so lookup keeps working without a script edit. ● — DEPLOYMENT.md § Rotation
 
-**G-364.** The rotation date is recorded in the item's notes field — the primary rotation record. ● — DEPLOYMENT.md § Rotation
+**G-364.** Retired: the rotation-date notes record came only from the removed calendar-review requirement, and DEPLOYMENT.md no longer prescribes one. The ID stays reserved. ○ — DEPLOYMENT.md § Rotation
 
 **G-365.** Rotation is verified by a low-risk deploy whose source-credential log line still names the project key; falling through to another source forbids rolling forward. ● — DEPLOYMENT.md § Rotation
 
