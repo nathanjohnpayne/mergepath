@@ -2263,10 +2263,16 @@ p4b_wave_binding_evaluate() {
   if [ "$(p4b_wave_binding_request_view "$comments" "$bot" "$historic")" != "$view" ] \
      || ! printf '%s' "$comments" | jq -e --argjson h "$historic" '([ .[].id | tostring ]) as $ids | all($h | keys[]; . as $k | $ids | index($k))' >/dev/null 2>&1 \
      || ! jq -en --argjson a "$historic" --argjson b "${historic_after:-null}" \
-          '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1; then
+          '($b | type) == "object" and ($a | with_entries(select(.value != null))) == ($b | with_entries(select(.value != null)))' >/dev/null 2>&1 \
+     || ! printf '%s' "$after" | jq -e --arg bot "$bot" --argjson s "${snap_after:-null}" \
+          '($s | type) == "object" and ([ .[] | select((.user.login // "") != $bot) | .id | tostring ] | sort) == ($s.counts | keys | sort)' >/dev/null 2>&1; then
     printf '%s' "$result" | jq -c 'del(.generation) + {state:"hold",reason:"requests-changed-during-evaluation"}'
     return 0
   fi
+  # The final snapshot's comments are exactly those the second comment read
+  # evaluated: an unedited request that landed between the two leaves no
+  # mention-history entry, and its id must not enter the stability baseline
+  # unevaluated (direct Phase 4b review and Codex on #2888).
   # A clear carries the edit count of every comment its final read saw, so
   # a later one-read check (p4b_wave_binding_stable) can tell whether any
   # comment appeared or was edited since.

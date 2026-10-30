@@ -5918,9 +5918,10 @@ _comment_history_query=false
 for a in "$@"; do case "$a" in *pullRequest*userContentEdits*|*userContentEdits*pullRequest*) _comment_history_query=true ;; esac; done
 [ "$_comment_history_query" != true ] || _summary_query=false
 if [ "$endpoint" = graphql ] && [ "$_comment_history_query" = true ]; then
-  # The PR comments' edit metadata (p4b_comment_mention_history): default no
-  # comment was ever edited.
-  history_default='{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+  # The PR comments' edit metadata (p4b_comment_history_snapshot): default
+  # the served comments, none ever edited.
+  history_default="$(printf '%s' "${P4B_TEST_COMMENTS_JSON-[]}" | jq -c '{data:{repository:{pullRequest:{comments:{pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[ .[] | {databaseId:.id,author:{login:(.user.login // "")},lastEditedAt:null,userContentEdits:{totalCount:0,nodes:[]}} ]}}}}}')"
   printf '%s\n' "${P4B_TEST_COMMENT_HISTORY:-$history_default}"
   exit 0
 fi
@@ -6468,7 +6469,9 @@ _wbs() { # <second-comments-json> [history-json] -> evaluate state/reason
     p4b_comment_history_snapshot() {
       local n h; n=$(( $(cat "$_wbs_hcount" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$_wbs_hcount"
       if [ "$n" = 1 ]; then h="$_wbs_history"; else h="$_wbs_history2"; fi
-      jq -nc --argjson h "$h" 'if $h == null then null else {mentions: $h, counts: {}} end'
+      # Counts cover the comments the second read serves, unedited.
+      printf '%s' "$_wbs_second" | jq -c --argjson h "$h" \
+        'if $h == null then null else {mentions: $h, counts: ([ .[] | select(.user.login != "chatgpt-codex-connector[bot]") | {key: (.id | tostring), value: 0} ] | from_entries)} end'
     }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     _wbs_first="[$_WB_R,$(jq -nc '{id:800,user:{login:"coderabbitai[bot]"},body:"summary",created_at:"2026-10-29T12:00:00Z",updated_at:"2026-10-29T12:00:00Z"}')]"
@@ -6502,7 +6505,7 @@ _wbs_hist701='{"id":701,"user":{"login":"someone"},"body":"thanks","created_at":
       else printf '%s' "[$_WB_R,$(printf '%s' "$_wbs_hist701" | jq -c '.updated_at = "2026-10-29T12:10:00Z"')]"; fi
     }
     p4b_codex_summary_versions() { printf '[]\n'; }
-    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"701":"2026-10-29T11:00:00Z"},"counts":{}}'; }
+    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"701":"2026-10-29T11:00:00Z"},"counts":{"501":0,"701":1}}'; }
     p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r '"\(.state)/\(.reason)"'
     rm -f "$_wbs_count"
@@ -6539,6 +6542,26 @@ _wbs_clear="$( (
     p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501
   ) )"
 _wbs_stab="$(printf '%s' "$_wbs_clear" | jq -c '.stability')"
+# Direct Phase 4b review on #2888: an unedited request that lands between the
+# second comment read and the final snapshot is in the snapshot's counts but
+# not in anything evaluated; it holds instead of entering the baseline.
+_wbs_late="$( (
+    gh_api_array() { printf '%s' "[$_WB_R,$_wbs_cr800]"; }
+    p4b_codex_summary_versions() { printf '[]\n'; }
+    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"800":null},"counts":{"501":0,"800":1,"904":0}}'; }
+    p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
+    p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r '"\(.state)/\(.reason)"'
+  ) )"
+[ "$_wbs_late" = hold/requests-changed-during-evaluation ] || bad="$bad [stability-late-unedited-request-baselined:$_wbs_late]"
+[ "$( (
+    eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="([ .[] | select((.user.login // \"\") != $bot) | .id | tostring ] | sort) == ($s.counts | keys | sort)"; assert s.count(o)==1; print(s.replace(o,"true"))' \
+      <<<"$(sed -n '/^p4b_wave_binding_evaluate() {/,/^}/p' "$LIB")")"
+    gh_api_array() { printf '%s' "[$_WB_R,$_wbs_cr800]"; }
+    p4b_codex_summary_versions() { printf '[]\n'; }
+    p4b_comment_history_snapshot() { printf '%s\n' '{"mentions":{"800":null},"counts":{"501":0,"800":1,"904":0}}'; }
+    p4b_wave_codex_binding_state() { jq -nc '{state:"clear",reason:"bound-request-answered",generation:[501]}'; }
+    p4b_wave_binding_evaluate owner/repo 7 "$_wb_H" 501 | jq -r .state
+  ) )" = clear ] || bad="$bad [mutant-snapshot-ids-not-load-bearing]"
 [ "$_wbs_stab" = '{"counts":{"501":0,"800":1}}' ] || bad="$bad [clear-without-stability:$_wbs_clear]"
 # The real reader: every non-bot comment's edit count, edited or not.
 [ "$( ( gh() { _wbh_page "[$(_wbh_node 501 nathanjohnpayne null '[]'),$(_wbh_node 800 coderabbitai null '["a","b"]'),$(_wbh_node 900 chatgpt-codex-connector null '[]')]"; }
