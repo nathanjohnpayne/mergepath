@@ -268,6 +268,10 @@ SH
 set -euo pipefail
 printf '%q ' "$@" >> "$FIXTURE_LOG/gh.log"
 printf '\n' >> "$FIXTURE_LOG/gh.log"
+# #2910: the stalled modes' PR predates its source runs, so the sweep's
+# source scan (which starts at the PR's creation) can reach run 502.
+pr_created=2026-01-01T00:00:00Z
+[[ "${RELAY_MODE:-empty}" != stalled* ]] || pr_created=2025-12-31T12:00:00Z
 # The real relay reader probes CLI support before a deadline-bound API read.
 # A successful legacy help response selects the existing timeout environment.
 if [ "$*" = 'api --help' ]; then echo 'Usage: gh api <endpoint>'; exit 0; fi
@@ -319,8 +323,12 @@ endpoint="$2"
 if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
   && [ "${4:-}" = repos/owner/repo/actions/workflows/codex-p1-gate.yml/runs ]; then
   source_event=""
+  created_window=""
   for arg in "$@"; do
-    case "$arg" in event=*) source_event="${arg#event=}" ;; esac
+    case "$arg" in
+      event=*) source_event="${arg#event=}" ;;
+      created=*) created_window="${arg#created=}" ;;
+    esac
   done
   if [ "$source_event" != pull_request ] || [ "${RELAY_MODE:-empty}" = empty ]; then
     echo '{"total_count":0,"workflow_runs":[]}'
@@ -332,10 +340,20 @@ if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
     done_at=2025-12-31T20:00:00Z
     [ "$RELAY_MODE" != stalled-recent ] || done_at=2026-01-01T00:00:00Z
     # Attempt 2 of 502 started at 19:58:00; stalled-prior-attempt adds a
-    # failed relay from attempt 1, created at 19:57:00.
-    jq -cn --arg done "$done_at" '{total_count:2,workflow_runs:[
-      {id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:"2025-12-31T19:00:00Z",run_started_at:"2025-12-31T18:59:00Z"},
-      {id:502,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:$done,run_started_at:"2025-12-31T19:58:00Z"}]}'
+    # failed relay from attempt 1, created at 19:57:00. Like GitHub, return
+    # only runs created inside the requested `created=START..END` window
+    # (#2910), so a source run before the PR's creation is never reached.
+    # The window itself must run from the PR's creation to the fixed clock.
+    if [ "$created_window" != "$pr_created..2026-01-01T00:00:00Z" ]; then
+      echo "unexpected created window: $created_window" >&2
+      exit 1
+    fi
+    jq -cn --arg done "$done_at" --arg window "$created_window" '
+      ($window | split("..")) as [$start, $end] |
+      [{id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",created_at:"2025-12-31T18:58:30Z",updated_at:"2025-12-31T19:00:00Z",run_started_at:"2025-12-31T18:59:00Z"},
+       {id:502,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",created_at:"2025-12-31T19:56:00Z",updated_at:$done,run_started_at:"2025-12-31T19:58:00Z"}]
+      | map(select(.created_at >= $start and .created_at <= $end))
+      | {total_count:length,workflow_runs:.}'
   else
     echo '{"total_count":1,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
   fi
@@ -448,7 +466,7 @@ if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
   else
     fork=false
     if [ "${SWEEP_MODE:-stable}" = relay-fork ] && [ "$pr" = 1 ]; then fork=true; fi
-    jq -cn --arg sha "$sha" --argjson fork "$fork" '{head:{sha:$sha,repo:{fork:$fork}},user:{login:"owner"},created_at:"2026-01-01T00:00:00Z"}'
+    jq -cn --arg sha "$sha" --argjson fork "$fork" --arg created "$pr_created" '{head:{sha:$sha,repo:{fork:$fork}},user:{login:"owner"},created_at:$created}'
   fi
   exit 0
 fi
@@ -641,11 +659,23 @@ set -euo pipefail
 jq -c '{requires_relay:true,source_run_id:.id}'
 SH
   chmod +x "$dir/scripts/workflow/feedback-archive-relay-source.sh"
+  # #2910: convert real timestamps so the source scan's `created` window is
+  # the PR's creation through the fixed clock 2026-01-01T00:00:00Z. jq does
+  # the conversion, so the stub behaves the same under GNU and BSD date.
   cat > "$dir/bin/date" <<'SH'
 #!/usr/bin/env bash
-case "${@: -1}" in
-  +%s) echo 1767225600 ;;
-  +%Y-%m-%dT%H:%M:%SZ) echo 2026-01-01T00:00:00Z ;;
+value=""
+while [ $# -gt 1 ]; do
+  case "$1" in
+    -u) shift ;;
+    -d) value="$2"; shift 2 ;;
+    *) exit 92 ;;
+  esac
+done
+case "${1:-}:$value" in
+  +%s:) echo 1767225600 ;;
+  +%s:*) jq -rn --arg v "$value" '$v | fromdateiso8601' ;;
+  +%Y-%m-%dT%H:%M:%SZ:@*) jq -rn --arg v "${value#@}" '$v | tonumber | todate' ;;
   *) exit 92 ;;
 esac
 SH
