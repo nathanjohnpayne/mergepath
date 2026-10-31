@@ -3491,6 +3491,32 @@ if [ "$rc" = 5 ] \
   pass "#1046: --force-enabled overrides ONLY enabled; a non-local mode still defers to the manual handoff"
 else fail "#1046: force-enabled + non-local mode (rc=$rc): $out"; fi
 
+# #2913: the entry switches come from the parsed policy. A flow-mapping block
+# is read (the legacy awk reader saw no `enabled` in it and deferred as
+# automation-disabled); an unparseable policy refuses instead of reading every
+# field as unset.
+POLICY_FLOW_2913="$WORK/policy-flow-2913.yml"
+printf '%s\n' 'available_reviewers: [nathanpayne-claude, nathanpayne-codex]' \
+  'phase_4b_automation: {"enabled": true, mode: cloud}' >"$POLICY_FLOW_2913"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_FLOW_2913" bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.reason')" = "mode-not-local" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.enabled_via')" = "config" ]; then
+  pass "#2913: a flow-mapping phase_4b_automation block supplies enabled and mode"
+else fail "#2913: flow-mapping automation block (rc=$rc): $out"; fi
+POLICY_BROKEN_2913="$WORK/policy-broken-2913.yml"
+printf 'phase_4b_automation:\n  enabled: [unclosed\n' >"$POLICY_BROKEN_2913"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_BROKEN_2913" bash "$ORCH" 123 --repo o/r --force-enabled 2>"$WORK/err-2913")"; rc=$?
+set -e
+if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.reason')" = "policy-unreadable" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.automation_enabled')" = "false" ] \
+   && grep -q 'phase_4b_automation.enabled could not be read' "$WORK/err-2913"; then
+  pass "#2913: an unparseable policy defers as policy-unreadable, not automation-disabled, and --force-enabled does not override it"
+else fail "#2913: unparseable automation policy (rc=$rc): $out $(cat "$WORK/err-2913")"; fi
+
 # Undispositioned feedback is a distinct no-dispatch hold, not a manual
 # fallback and not a completed review round.
 FEEDBACK_BLOCK_STUB="$WORK/feedback-accounting-block.sh"
@@ -5468,6 +5494,118 @@ if [ "$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" p4b_automation_f
   pass "#814: p4b_automation_field still reads its own block through the generalized reader"
 else
   fail "#814: p4b_automation_field regressed after generalization"
+fi
+
+# #2913: the block reader reads the parsed policy. The line-oriented awk
+# reader it replaced matched only an unquoted, block-style `field:` key, so a
+# quoted key or a flow mapping read as unset: `allow_phase_4b_substitute:
+# false` read as not-false and the barrier treated the substitute as allowed.
+# LEGACY_P4B_BLOCK_AWK is that reader, kept as the mutation baseline.
+LEGACY_P4B_BLOCK_AWK='
+  /^[^[:space:]#]/ {
+    if ($0 ~ "^" block ":") { inblk=1; child_indent=-1; next }
+    inblk=0
+  }
+  inblk {
+    if ($0 ~ /^[[:space:]]*(#|$)/) next
+    indent = match($0, /[^[:space:]]/) - 1
+    if (child_indent < 0) child_indent = indent
+    if (indent > child_indent) next
+    if ($1 == field":") {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print; exit
+    }
+  }
+'
+# _bp2913 <yaml> <block> <field> <kind> -> "rc=<n> val=<value>"
+_bp2913() {
+  local rc=0 val
+  printf '%b\n' "$1" >"$WORK/policy-2913.yml"
+  val="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-2913.yml" p4b_policy_block_field "$2" "$3" "$4" 2>/dev/null)" || rc=$?
+  printf 'rc=%s val=%s' "$rc" "$val"
+}
+bad=""
+while IFS='|' read -r label yaml block field kind want; do
+  got="$(_bp2913 "$yaml" "$block" "$field" "$kind")"
+  [ "$got" = "rc=0 val=$want" ] || bad="$bad [$label: $block.$field -> '$got', want '$want']"
+  legacy="$(awk -v block="$block" -v field="$field" "$LEGACY_P4B_BLOCK_AWK" "$WORK/policy-2913.yml")"
+  [ "$legacy" != "$want" ] || bad="$bad [$label: the legacy reader already reads $block.$field, the case proves nothing]"
+done <<'CASES'
+quoted key|codex:\n  "allow_phase_4b_substitute": false|codex|allow_phase_4b_substitute|bool|false
+single-quoted key|codex:\n  'enabled': false|codex|enabled|bool|false
+flow mapping|codex: {allow_phase_4b_substitute: false, enabled: true}|codex|allow_phase_4b_substitute|bool|false
+flow mapping|codex: {"enabled": false}|codex|enabled|bool|false
+flow mapping|coderabbit: {enabled: false, bot_login: "cr-custom[bot]"}|coderabbit|bot_login|string|cr-custom[bot]
+quoted key|coderabbit:\n  "max_wait_seconds": 600|coderabbit|max_wait_seconds|scalar|600
+flow mapping|phase_4b_automation: {enabled: true, mode: local}|phase_4b_automation|enabled|bool|true
+CASES
+if [ -z "$bad" ]; then
+  pass "#2913: quoted keys and flow mappings read through p4b_policy_block_field, and the legacy awk reader misreads every case"
+else
+  fail "#2913: block reader spellings:$bad"
+fi
+
+# Direct-child scoping survives in flow style, and absent keys stay empty.
+bad=""
+[ "$(_bp2913 'codex: {p1_gate: {enabled: true}}' codex enabled bool)" = "rc=0 val=" ] || bad="$bad nested-flow"
+[ "$(_bp2913 'codex:' codex enabled bool)" = "rc=0 val=" ] || bad="$bad null-block"
+[ "$(_bp2913 'other: 1' codex enabled bool)" = "rc=0 val=" ] || bad="$bad absent-block"
+[ -z "$bad" ] && pass "#2913: a nested flow-style enabled never reads as the master switch; an absent key or block stays empty" \
+  || fail "#2913: absent/nested reads:$bad"
+
+# Refusals: a policy that cannot be parsed, a non-mapping block, or a value
+# of the wrong kind returns 1 instead of the caller's default.
+bad=""
+while IFS='|' read -r label yaml block field kind; do
+  got="$(_bp2913 "$yaml" "$block" "$field" "$kind")"
+  [ "$got" = "rc=1 val=" ] || bad="$bad [$label -> '$got']"
+done <<'CASES'
+unparseable|codex:\n  enabled: [unclosed|codex|enabled|bool
+non-mapping block|codex: false|codex|allow_phase_4b_substitute|bool
+list value|codex:\n  allow_phase_4b_substitute: [false]|codex|allow_phase_4b_substitute|bool
+null value|codex:\n  allow_phase_4b_substitute:|codex|allow_phase_4b_substitute|bool
+non-boolean|coderabbit: {enabled: maybe}|coderabbit|enabled|bool
+CASES
+[ -z "$bad" ] && pass "#2913: unreadable policy values refuse (rc 1) instead of defaulting" \
+  || fail "#2913: refusals:$bad"
+# No parser loaded: refuse rather than read every field as unset.
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" bash -c '
+  . "$1"; unset -f policy_json_field; p4b_policy_block_field codex enabled bool' _ "$LIB" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 1 ] && grep -q 'feedback-policy-helpers.sh is not loaded' <<<"$got"; then
+  pass "#2913: without the policy parser the block reader refuses"
+else
+  fail "#2913: block reader without a parser: rc=$rc out=$got"
+fi
+
+# The barrier itself. A flow-style policy that disables Codex and forbids the
+# substitute escalates before any probe (the legacy reader read both as
+# unset and ran the Codex arm); an unparseable policy is a barrier error
+# (rc 4), so no review authority follows.
+printf '%s\n' 'codex: {"enabled": false, allow_phase_4b_substitute: false}' 'coderabbit: {enabled: false}' \
+  >"$WORK/policy-2913-barrier.yml"
+rc=0
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-2913-barrier.yml" P4B_ACCT_STATE_DIR="$WORK/state-2913" \
+  p4b_same_head_barrier owner/repo 7 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rev-bot true 2>/dev/null)" || rc=$?
+if [ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.decision == "escalate" and (.reason | test("Codex is disabled and codex.allow_phase_4b_substitute=false"))' >/dev/null; then
+  pass "#2913: a flow-style codex block that forbids the substitute escalates the barrier"
+else
+  fail "#2913: flow-style substitute=false barrier: rc=$rc out=$out"
+fi
+legacy="$(awk -v block=codex -v field=allow_phase_4b_substitute "$LEGACY_P4B_BLOCK_AWK" "$WORK/policy-2913-barrier.yml")"
+[ -z "$legacy" ] && pass "#2913 mutation: the legacy reader reads that substitute as unset (allowed), so the case detects a regression" \
+  || fail "#2913 mutation: the legacy reader already reads the flow-style substitute ('$legacy')"
+printf 'codex:\n  enabled: [unclosed\n' >"$WORK/policy-2913-broken.yml"
+rc=0
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-2913-broken.yml" P4B_ACCT_STATE_DIR="$WORK/state-2913" \
+  p4b_same_head_barrier owner/repo 7 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rev-bot true 2>/dev/null)" || rc=$?
+if [ "$rc" = 4 ] && printf '%s' "$out" | jq -e '.decision == "error" and .codex_evidence == "policy-unreadable"' >/dev/null; then
+  pass "#2913: an unparseable policy is a barrier error (rc 4), never the enabled/substitute defaults"
+else
+  fail "#2913: unparseable-policy barrier: rc=$rc out=$out"
 fi
 
 # Terminality. Only reported / will-not-report may open a barrier.

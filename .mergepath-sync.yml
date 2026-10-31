@@ -717,6 +717,7 @@ paths:
       - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/feedback-policy-helpers.sh"  # #2913, --scan reads codex.bot_login from the parsed policy
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   - path: scripts/phase-4b-classifier.sh

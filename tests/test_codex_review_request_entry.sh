@@ -394,12 +394,13 @@ test_request_by_default_true_triggers_under_threshold() {
 # #2240: an unreadable policy never opts out. Each shape must choose a request
 # on an UNGATED PR and warn with its cause. Stop before the write-budget fence
 # independently refuses an invalid governing policy. Args: <case> <cause> <block>
-# [extra top-level YAML appended after the codex: block].
+# [extra top-level YAML appended after the codex: block] [both|base: where the
+# extra goes; default both].
 assert_unreadable_requests() {
-  local name=$1 cause=$2 block=$3 extra=${4:-} dir rc count
+  local name=$1 cause=$2 block=$3 extra=${4:-} where=${5:-both} dir rc count
   dir=$(make_case "rbd-$name" "$block")
   if [ -n "$extra" ]; then
-    printf '%s\n' "$extra" >>"$dir/.github/review-policy.yml"
+    [ "$where" = base ] || printf '%s\n' "$extra" >>"$dir/.github/review-policy.yml"
     printf '%s\n' "$extra" >>"$dir/state/base-review-policy.yml"
   fi
   # Stop after the conservative entry decision, before an invalid governing
@@ -430,11 +431,13 @@ test_request_by_default_unreadable_requests() {
   # codex_field quote stripping), now through the fail-safe.
   assert_unreadable_requests "quoted-true" "value 'true' (YAML tag !!str) is not a boolean" \
     "  enabled: 'true'"$'\n'"  request_by_default: 'true'"
-  # Unparseable YAML elsewhere in the file: the awk reader would still find a
-  # clean `request_by_default: false`, which is exactly why a skip needs the
-  # parser's answer.
+  # Unparseable YAML elsewhere in the governing base policy: a line reader
+  # would still find a clean `request_by_default: false`, which is exactly why
+  # a skip needs the parser's answer. Only the base is broken here; an
+  # unparseable checkout policy refuses before the entry decision (#2913, see
+  # test_unparseable_checkout_policy_refuses).
   assert_unreadable_requests "unparseable" "is not valid YAML" \
-    "  enabled: true"$'\n'"  request_by_default: false" "broken: [1, 2"
+    "  enabled: true"$'\n'"  request_by_default: false" "broken: [1, 2" base
   # Duplicated key: go-yaml resolves last-wins without complaint.
   assert_unreadable_requests "duplicate" "has 2 codex.request_by_default keys" \
     "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  request_by_default: false"
@@ -1222,6 +1225,108 @@ test_new_trigger_replaces_superseded_timeout_marker() {
   fi
 }
 
+
+# --- #2913: codex_field reads the parsed policy -----------------------------
+# The earlier line-oriented awk reader matched only an unquoted, block-style
+# `field:` key, so a quoted key or a flow mapping read as unset and took the
+# default. LEGACY_REQUEST_CODEX_FIELD_AWK is that reader, kept here as the
+# mutation baseline: every spelling below must be misread by it.
+LEGACY_REQUEST_CODEX_FIELD_AWK='
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block {
+    if ($1 == field":") {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  }
+'
+# write_base_policy <dir> <base-policy> -- replace the governing base policy
+# the entry decision reads. The checkout policy keeps make_case's fast knobs.
+write_base_policy() {
+  printf '%s\n' "author_identity: nathanjohnpayne" "$2" >"$1/state/base-review-policy.yml"
+}
+
+test_codex_enabled_spellings() {
+  local spec label policy dir rc count legacy n=0
+  for spec in \
+    "quoted key|codex:"$'\n'"  \"enabled\": false"$'\n'"  request_by_default: true" \
+    "single-quoted key|codex:"$'\n'"  'enabled': false" \
+    "flow mapping|codex: {enabled: false, request_by_default: true}" \
+    "flow mapping, quoted key|codex: {\"enabled\": false}"; do
+    n=$((n + 1))
+    label=${spec%%|*} policy=${spec#*|}
+    dir=$(make_case "enabled-spelling-$n" "  enabled: true")
+    write_base_policy "$dir" "$policy"
+    rc=$(run_case "$dir" true)
+    count=$(trigger_count "$dir")
+    if [ "$rc" = "5" ] && [ "$count" = "0" ] && grep -q "codex.enabled is false" "$dir/err.log"; then
+      pass "#2913 $label: codex.enabled: false is read, so a gated PR gets no trigger"
+    else
+      fail "#2913 $label: exit $rc with $count trigger(s), expected 5 and none; stderr=$(cat "$dir/err.log")"
+    fi
+    legacy=$(awk -v field=enabled "$LEGACY_REQUEST_CODEX_FIELD_AWK" "$dir/state/base-review-policy.yml")
+    if [ "$legacy" != "false" ]; then
+      pass "#2913 mutation $label: the legacy awk reader misreads codex.enabled ('$legacy'), so the case detects a regression"
+    else
+      fail "#2913 mutation $label: the legacy awk reader already reads codex.enabled; the case proves nothing"
+    fi
+  done
+
+  # A codex.enabled of the wrong kind never opts out: the trigger is requested
+  # with a warning, the #2240 failsafe. (The legacy reader handed `[false]` to
+  # the caller, which read it as "not true" and skipped.)
+  dir=$(make_case "enabled-wrong-kind" "  enabled: true")
+  write_base_policy "$dir" "codex: {enabled: [false]}"
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = "3" ] && [ "$count" = "0" ] && grep -q 'fetching HEAD commit metadata' "$dir/err.log" \
+     && grep -q 'WARN: cannot read codex.request_by_default: codex.enabled could not be read' "$dir/err.log" \
+     && grep -q 'codex.enabled must be true|false' "$dir/err.log"; then
+    pass "#2913: a codex.enabled of the wrong kind is requested through the failsafe, naming the cause"
+  else
+    fail "#2913: wrong-kind codex.enabled did not take the failsafe (rc=$rc count=$count); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+# An unparseable checkout policy refuses before the entry decision instead of
+# running the requester under default timing and bot settings.
+test_unparseable_checkout_policy_refuses() {
+  local dir rc count
+  dir=$(make_case "checkout-unparseable" "  enabled: true"$'\n'"  request_by_default: true")
+  printf '%s\n' "broken: [1, 2" >>"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" true)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = "3" ] && [ "$count" = "0" ] \
+     && grep -q 'could not be parsed; cannot read codex.review_timeout_seconds' "$dir/err.log"; then
+    pass "#2913: an unparseable checkout policy exits 3 before any trigger, naming the field"
+  else
+    fail "#2913: unparseable checkout policy (rc=$rc count=$count); stderr=$(cat "$dir/err.log")"
+  fi
+  # A flow-mapping checkout policy reads the same fast knobs as block style:
+  # under the legacy reader this case would wait out the 1800s default.
+  dir=$(make_case "checkout-flow" "  enabled: true")
+  printf '%s\n' 'codex: {"review_timeout_seconds": 0, reaction_freshness_window_seconds: 999999999, "ack_wait_seconds": 0, max_ack_retries: 0}' \
+    >"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" true)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = "4" ] && [ "$count" = "1" ]; then
+    pass "#2913: a flow-mapping, quoted-key checkout policy supplies its timing knobs"
+  else
+    fail "#2913: flow-mapping checkout policy (rc=$rc count=$count); stderr=$(cat "$dir/err.log")"
+  fi
+  if [ -z "$(awk -v field=review_timeout_seconds "$LEGACY_REQUEST_CODEX_FIELD_AWK" "$dir/.github/review-policy.yml")" ]; then
+    pass "#2913 mutation: the legacy awk reader finds no review_timeout_seconds in the flow mapping"
+  else
+    fail "#2913 mutation: the legacy awk reader already reads the flow mapping; the case proves nothing"
+  fi
+}
+
 test_defaults_request_on_gated_pr
 test_request_by_default_unset_skips_under_threshold
 test_request_by_default_true_triggers_under_threshold
@@ -1232,6 +1337,8 @@ test_gated_requests_in_every_case
 test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers
+test_codex_enabled_spellings
+test_unparseable_checkout_policy_refuses
 test_malformed_head_age_fails_only_the_write_path
 test_derive_signals
 test_derive_failsafe

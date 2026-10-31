@@ -926,6 +926,94 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+
+# ---------------------------------------------------------------------------
+# Tests 11d–11h (#2913): both codex.* reads come from the parsed policy. The
+# earlier line-oriented awk readers matched only an unquoted, block-style
+# `field:` key, so a quoted key or a flow mapping read as unset: the legacy
+# scan stayed off and a custom bot_login was missed. LEGACY_P1_GATE_AWK is the
+# old p1_gate reader, kept as the mutation baseline for these spellings.
+# ---------------------------------------------------------------------------
+LEGACY_P1_GATE_AWK='
+  /^codex:/ { in_codex=1; in_p1_gate=0; next }
+  in_codex && /^[^[:space:]#]/ { in_codex=0; in_p1_gate=0 }
+  in_codex && /^[[:space:]]+p1_gate:/ { in_p1_gate=1; next }
+  in_p1_gate && /^[[:space:]]{0,3}[^[:space:]#]/ { in_p1_gate=0 }
+  in_p1_gate && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+custom_bot_comment_fixture() {  # <sha> -- one unresolved P1 by custom-codex[bot]
+  make_comments_fixture "$(jq -n --arg sha "$1" '
+    [{ id: 1001, user: { login: "custom-codex[bot]" },
+       body: "![P1 Badge](url) Stop retrying endlessly.",
+       path: "src/foo.ts", line: 42, commit_id: $sha, original_commit_id: $sha }]')"
+}
+
+HEAD_SHA="abc123def456"
+for spec in \
+  "11d quoted keys|codex:"$'\n'"  \"bot_login\": \"custom-codex[bot]\""$'\n'"  \"p1_gate\":"$'\n'"    \"enabled\": true" \
+  "11e flow mapping|codex: {bot_login: \"custom-codex[bot]\", p1_gate: {enabled: true}}" \
+  "11f nested flow mapping|codex:"$'\n'"  bot_login: custom-codex[bot]"$'\n'"  p1_gate: {\"enabled\": true}"; do
+  label=${spec%%|*} body=${spec#*|}
+  echo
+  echo "--- Test $label (#2913): the legacy scan is enabled and the custom bot is counted"
+  SCRATCH=$(make_scratch_raw_config "$body")
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+  FIXTURE_COMMENTS=$(custom_bot_comment_fixture "$HEAD_SHA")
+  FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+  set +e
+  OUT=$(
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1
+  )
+  RC=$?
+  set -e
+  if [ "$RC" = 1 ] && grep -q "Codex blocking-tier unresolved: 1" <<<"$OUT"; then
+    pass "#2913 $label: p1_gate.enabled and bot_login are read; the custom bot's P1 blocks"
+  else
+    fail "#2913 $label: expected rc=1 with 'unresolved: 1'; got rc=$RC"
+    echo "$OUT" | sed 's/^/      /' >&2
+  fi
+  legacy=$(awk -v field=enabled "$LEGACY_P1_GATE_AWK" "$SCRATCH/.github/review-policy.yml")
+  if [ "$legacy" != "true" ]; then
+    pass "#2913 mutation $label: the legacy p1_gate reader misreads enabled ('$legacy'), so the case detects a regression"
+  else
+    fail "#2913 mutation $label: the legacy p1_gate reader already reads enabled; the case proves nothing"
+  fi
+done
+
+# A policy that cannot be parsed, or a p1_gate that is not a mapping, is a
+# config error (exit 2) before any GitHub read, not the disabled default.
+for spec in \
+  "11g unparseable policy|codex:"$'\n'"  p1_gate:"$'\n'"    enabled: [unclosed|could not be parsed" \
+  "11h non-mapping p1_gate|codex: {p1_gate: true}|codex.p1_gate must be a mapping"; do
+  label=${spec%%|*} rest=${spec#*|}
+  body=${rest%|*} want=${rest##*|}
+  echo
+  echo "--- Test $label (#2913): exit 2 before any read"
+  SCRATCH=$(make_scratch_raw_config "$body")
+  : > "$WORKDIR/gh-calls.log"
+  set +e
+  OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" = 2 ] && grep -qF "$want" <<<"$OUT" && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
+    pass "#2913 $label: exit 2 naming the cause, no GitHub reads"
+  else
+    fail "#2913 $label: expected rc=2 naming '$want' and no gh calls; got rc=$RC"
+    echo "$OUT" | sed 's/^/      /' >&2
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # Test 12: PR_NUMBER + REPO via env (no positional args). Covers the
 #          scheduled-sweep / workflow_dispatch invocation shape.

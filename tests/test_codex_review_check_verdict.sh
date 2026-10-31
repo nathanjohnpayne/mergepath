@@ -792,6 +792,60 @@ if [ "$fixture_rc" = "3" ] && grep -q 'failed to fetch commit date' <<<"$fixture
 else
   fail "#2901: flow-style policy did not reach gate evaluation (rc=$fixture_rc output=$fixture_output)"
 fi
+
+# ── #2913: phase_4b_default comes from the parsed policy too ---------------
+# The old top-level policy_field awk reader matched only an unquoted
+# `phase_4b_default:` key at column 0, so a quoted key read as unset and fell
+# back to fallback-only. LEGACY_POLICY_FIELD_AWK is that reader (mutation
+# baseline): each refusal below would have run past it under the default.
+LEGACY_POLICY_FIELD_AWK='
+  /^[^[:space:]]/ && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+if grep -Fq 'PHASE_4B_DEFAULT=$(policy_json_field "$AUTHOR_POLICY_JSON" phase_4b_default string) || exit 3' "$SCRIPT" \
+   && ! grep -q '^policy_field()' "$SCRIPT"; then
+  pass "#2913: phase_4b_default is read from the parsed policy; the awk policy_field is gone"
+else
+  fail "#2913: codex-review-check.sh still reads phase_4b_default through a line-oriented reader"
+fi
+for spec in '"phase_4b_default": bogus-mode|phase_4b_default must be one of' \
+            "'phase_4b_default': [always]|phase_4b_default must be a non-empty string"; do
+  printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+    "  - nathanpayne-codex" "codex:" "  require_ci_green: false" "${spec%%|*}" > "$BEHAVIOR_TMP/policy.yml"
+  fixture_result="$(run_body_fixture external-contributor '')"
+  fixture_rc="${fixture_result%%$'\n'*}"
+  fixture_output="${fixture_result#*$'\n'}"
+  if [ "$fixture_rc" = "3" ] && grep -qF "${spec#*|}" <<<"$fixture_output" \
+     && ! grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+    pass "#2913: the checker refuses ${spec%%|*} (exit 3) instead of defaulting to fallback-only"
+  else
+    fail "#2913: the checker did not refuse ${spec%%|*} (rc=$fixture_rc output=$fixture_output)"
+  fi
+  legacy=$(awk -v field=phase_4b_default "$LEGACY_POLICY_FIELD_AWK" "$BEHAVIOR_TMP/policy.yml")
+  if [ -z "$legacy" ]; then
+    pass "#2913 mutation: the legacy policy_field reads ${spec%%|*} as unset, so the case detects a regression"
+  else
+    fail "#2913 mutation: the legacy policy_field already reads ${spec%%|*} ('$legacy'); the case proves nothing"
+  fi
+done
+# A valid quoted key runs past the policy reads exactly as an unquoted one.
+printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+  "  - nathanpayne-codex" "codex:" "  require_ci_green: false" '"phase_4b_default": always' > "$BEHAVIOR_TMP/policy.yml"
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2913: a quoted phase_4b_default key reaches gate evaluation"
+else
+  fail "#2913: quoted phase_4b_default did not reach gate evaluation (rc=$fixture_rc output=$fixture_output)"
+fi
 cp "$BEHAVIOR_TMP/policy.good.yml" "$BEHAVIOR_TMP/policy.yml"
 
 # Positional rather than a text scan — the header documents gate (c) long
