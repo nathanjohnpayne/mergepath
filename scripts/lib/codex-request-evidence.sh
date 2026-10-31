@@ -686,6 +686,10 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
     # of the body, so a marker quoted or fenced inside another comment never
     # makes that comment a Summary.
     def is_summary: (.body // "") | startswith("<!-- codex-pull-request-review-summary -->");
+    # A start-anchored shape (a verdict or a refusal) may sit inside the
+    # provider receipt envelope: exactly one `<!-- codex-review-receipt:v1 -->`
+    # line before it, with whitespace around it, and nothing else (#2904).
+    def leads($re): (.body // "") | test("\\A\\s*(?:<!-- codex-review-receipt:v1 -->[ \\t]*\\r?\\n\\s*)?" + $re; "i");
     # The Reviewed commit fields of a verdict, and nothing else.
     def reviewed: (.body // "") | ascii_downcase
       | [ scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)") | .[0]
@@ -768,10 +772,10 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
                        or ($own | length) == 0)
               | (.submitted_at | secs) ]
           # A verdict answers only in its own shape: a body that starts with
-          # the `Codex review:` header and whose every Reviewed commit field
-          # names <head>.
+          # the `Codex review:` header (inside the receipt envelope or not)
+          # and whose every Reviewed commit field names <head>.
           + [ $botc[] | select(is_summary | not)
-              | select((.body // "") | test("\\A\\s*codex review:"; "i"))
+              | select(leads("codex review:"))
               | reviewed as $a
               | select(($a | length) > 0 and all($a[]; . == $head))
               | (.created_at | secs) ]
@@ -780,11 +784,12 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
           # notice (`To use Codex here,`), and `Codex Review: Something went
           # wrong`. Quoted refusal wording inside other text is not an answer:
           # the shared not-connected regex matches anywhere in a body, so every
-          # shape is pinned to the start of the body here.
+          # shape is pinned to the start of the body (or of the receipt
+          # envelope) here.
           + [ $botc[] | select(is_summary | not)
-              | select(((.body // "") | test("\\A\\s*you have reached your codex usage limits for code reviews"; "i"))
-                       or ((.body // "") | test("\\A\\s*to use codex here,"; "i"))
-                       or ((.body // "") | test("\\A\\s*codex review:\\s*something went wrong"; "i")))
+              | select(leads("you have reached your codex usage limits for code reviews")
+                       or leads("to use codex here,")
+                       or leads("codex review:\\s*something went wrong"))
               | (.created_at | secs) ]
           + [ $summaries[] | select(.status == "completed" or .status == "failed" or .status == "canceled") | .at ]
           | map(select(. != null)) | max ) as $terminal
@@ -824,12 +829,14 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
 # Structured signals only (owner decision on #2886): the substantive head
 # review (crqe_select_head_review), and every verdict comment the gate's own
 # verdict selection would order (crqe_verdicts): one whose Reviewed commit
-# fields all name <head>, or a non-affirmative one whose fields are absent,
-# abbreviated, malformed or include <head>, so a newer negative still
-# outranks an older approval. A verdict naming only other full commits is
-# not a signal for <head>. An unreadable time fails the call.
+# fields all name <head>, or a non-affirmative one with a `Codex review:`
+# header line whose fields are absent, abbreviated, malformed, disagree, or
+# include <head>, so a newer negative still outranks an older approval. A
+# verdict naming only one other full commit is not a signal for <head>, and
+# neither is headerless prose that only mentions "reviewed commit" (#2904).
+# An unreadable time fails the call.
 crqe_latest_codex_signal_time() { # comments-json reviews-json inline-json bot head
-  local review verdicts
+  local review verdicts headed
   review=$(crqe_select_head_review "$2" "$3" "$4" "$5") || return 1
   [ -n "$review" ] || return 1
   if [ "$review" != null ]; then
@@ -838,10 +845,19 @@ crqe_latest_codex_signal_time() { # comments-json reviews-json inline-json bot h
     review=""
   fi
   verdicts=$(crqe_verdicts "$1" "$4") || return 1
-  verdicts=$(printf '%s' "$verdicts" | jq -er --arg h "$5" '
-    [ .[] | select((.reviewed_shas | length) > 0 and all(.reviewed_shas[]; . == $h)
+  # A non-exact candidate counts only under the gate's `Codex review:` header
+  # line, as in CODEX_VERDICT_JSON: crqe_verdicts also admits prose that
+  # merely mentions "reviewed commit", which must not become a signal (#2904).
+  headed=$(printf '%s' "${1:-[]}" | jq -c --arg bot "$4" '
+    [ .[] | select((.user.login // "") == $bot)
+      | select((.body // "") | test("(?im)^\\s*codex review:")) | .id ]') || return 1
+  verdicts=$(printf '%s' "$verdicts" | jq -er --arg h "$5" --argjson headed "$headed" '
+    [ .[] | . as $v
+          | select((.reviewed_shas | length) > 0 and all(.reviewed_shas[]; . == $h)
                    or ((.affirmative | not)
+                       and any($headed[]; . == $v.comment_id)
                        and (((.reviewed_shas | length) == 0)
+                            or (.reviewed_shas | unique | length) > 1
                             or any(.reviewed_shas[]; . == $h)
                             or any(.reviewed_shas[]; test("^[0-9a-f]{40}$") | not)))) ]
     | if any(.[]; (.created_at | type) != "string"

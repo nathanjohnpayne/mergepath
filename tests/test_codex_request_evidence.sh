@@ -1220,6 +1220,42 @@ Codex Review: Didn't find any major issues.
 Reviewed commit: \`$P_HEAD\`")]" '[]' pending request-unanswered
 p_check state-line-outside-envelope "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("-->\n<!-- codex-review-state"; "-->\n\n<!-- codex-review-state")')]" '[]' pending request-unanswered
 p_check not-connected-exact-shape "[$R0,$(p_comment 633 $((P_T0 + 60)) "To use Codex here, [create a Codex account and connect to github](https://example.test).")]" '[]' answered
+# #2904: current Codex comments open with the receipt envelope, one
+# `<!-- codex-review-receipt:v1 -->` line and a blank line, before the
+# header (live on mergepath#2911 and swipewatch#221; the anchor is shown as
+# crqe_resolve_verdict_anchors leaves it, resolved to the full head).
+P_RCPT='<!-- codex-review-receipt:v1 -->'
+p_check receipt-envelope-verdict "[$R0,$(p_comment 640 $((P_T0 + 60)) "$P_RCPT
+
+Codex Review: Didn't find any major issues. :rocket:
+
+**Reviewed commit:** \`$P_HEAD\`")]" '[]' answered
+p_check receipt-envelope-something-went-wrong "[$R0,$(p_comment 641 $((P_T0 + 60)) "$P_RCPT
+
+Codex Review: Something went wrong. Try again later by commenting “@codex review”.")]" '[]' answered
+p_check receipt-envelope-usage-limit "[$R0,$(p_comment 642 $((P_T0 + 60)) "$P_RCPT
+
+You have reached your Codex usage limits for code reviews.")]" '[]' answered
+p_check receipt-envelope-not-connected "[$R0,$(p_comment 643 $((P_T0 + 60)) "$P_RCPT
+To use Codex here, [create a Codex account and connect to github](https://example.test).")]" '[]' answered
+# The envelope admits that one marker line and nothing else: header text
+# quoted in prose inside it, a second marker, or the marker sharing the
+# header's line does not count.
+p_check receipt-envelope-quoted-header "[$R0,$(p_comment 644 $((P_T0 + 60)) "$P_RCPT
+
+### [P1] Quoting a verdict
+Codex Review: Didn't find any major issues.
+Reviewed commit: \`$P_HEAD\`")]" '[]' pending request-unanswered
+p_check receipt-envelope-quoted-refusal "[$R0,$(p_comment 645 $((P_T0 + 60)) "$P_RCPT
+
+The bot said: You have reached your Codex usage limits for code reviews.")]" '[]' pending request-unanswered
+p_check receipt-envelope-twice "[$R0,$(p_comment 646 $((P_T0 + 60)) "$P_RCPT
+$P_RCPT
+
+Codex Review: Didn't find any major issues.
+
+**Reviewed commit:** \`$P_HEAD\`")]" '[]' pending request-unanswered
+p_check receipt-envelope-same-line "[$R0,$(p_comment 647 $((P_T0 + 60)) "$P_RCPT Codex Review: Something went wrong.")]" '[]' pending request-unanswered
 # Direct Phase 4b on #2886: a Summary answers only through its validated
 # Code Review state, so refusal text elsewhere in it (here the not-connected
 # wording, which matches anywhere in a body) is not an answer.
@@ -1267,6 +1303,37 @@ else
 fi
 # The anchor is the request's server time: a later evaluation of the same
 # evidence reports the same bound, so a rerun cannot extend or reset it.
+# #2904: crqe_latest_codex_signal_time orders verdicts in the gate's own
+# grammar (CODEX_VERDICT_JSON), so headerless bot prose that only mentions
+# "reviewed commit" is never the newest signal.
+s_check() { # name comments reviews expected-time
+  local got
+  got=$(crqe_latest_codex_signal_time "$2" "$3" '[]' "$P_BOT" "$P_HEAD") \
+    || { echo "FAIL #2904 $1: helper exited nonzero"; exit 1; }
+  if [ "$got" != "$4" ]; then echo "FAIL #2904 $1: want '$4', got '$got'"; exit 1; fi
+  PASS=$((PASS + 1)); echo "PASS: #2904 latest-signal $1 -> ${4:-empty}"
+}
+S_REV="[$(p_review "$P_T0")]"
+s_check prose-mentions-reviewed-commit "[$(p_comment 650 $((P_T0 + 60)) 'The parser must not treat a quoted Reviewed commit field as review evidence.')]" "$S_REV" "$(p_at "$P_T0")"
+s_check prose-quotes-receipt-anchor "[$(p_comment 651 $((P_T0 + 60)) "Done. The fixture now carries **Reviewed commit:** \`zz\` on purpose.")]" "$S_REV" "$(p_at "$P_T0")"
+# Headed negatives still outrank an older review: no anchor, a malformed
+# anchor, and (as in the gate) anchors that disagree with each other.
+s_check headed-negative-no-anchor "[$(p_comment 652 $((P_T0 + 60)) 'Codex Review: Something went wrong.')]" "$S_REV" "$(p_at $((P_T0 + 60)))"
+s_check headed-negative-in-receipt "[$(p_comment 653 $((P_T0 + 60)) "$P_RCPT
+
+Codex Review: Found 1 issue.
+
+**Reviewed commit:** \`zz\`")]" "$S_REV" "$(p_at $((P_T0 + 60)))"
+s_check headed-negative-disagreeing-anchors "[$(p_comment 654 $((P_T0 + 60)) "Codex Review: Found 1 issue.
+Reviewed commit: \`$P_OTHER\`
+Reviewed commit: \`2222222222222222222222222222222222222222\`")]" "$S_REV" "$(p_at $((P_T0 + 60)))"
+s_check headed-negative-one-other-head "[$(p_comment 655 $((P_T0 + 60)) "Codex Review: Found 1 issue.
+Reviewed commit: \`$P_OTHER\`")]" "$S_REV" "$(p_at "$P_T0")"
+s_check exact-verdict-in-receipt "[$(p_comment 656 $((P_T0 + 60)) "$P_RCPT
+
+Codex Review: Didn't find any major issues.
+
+**Reviewed commit:** \`$P_HEAD\`")]" "$S_REV" "$(p_at $((P_T0 + 60)))"
 _e1=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .expires_at)
 _e2=$(crqe_codex_pending_state "[$R0]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 $((P_NOW + 900)) | jq -r .expires_at)
 [ "$_e1" = "$_e2" ] && [ "$_e1" = "$(p_at $((P_T0 + 1800)))" ] \
