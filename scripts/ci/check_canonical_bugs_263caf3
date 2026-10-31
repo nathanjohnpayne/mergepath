@@ -826,7 +826,7 @@ else
   echo "  FAIL: enabled Codex accepted unanchored PR reaction clearance" >&2
 fi
 
-if grep -Fq 'CODEX_ENABLED=$(codex_field enabled)' "$CODEX_CHECK_SCRIPT" && \
+if grep -Fq 'CODEX_ENABLED=$(codex_field enabled bool) || exit 3' "$CODEX_CHECK_SCRIPT" && \
    grep -Fq 'codex.enabled=false — ignoring Codex bot review/reaction signals' "$CODEX_CHECK_SCRIPT" && \
    grep -Fq 'same-agent anchored Codex fallback unavailable because codex.enabled=false' "$CODEX_CHECK_SCRIPT"; then
   pass=$((pass + 1))
