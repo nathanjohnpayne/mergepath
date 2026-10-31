@@ -1164,6 +1164,9 @@ p_check summary-run-after-edit "[$R0,$(p_summary completed "$(p_at $((P_T0 + 500
 p_check summary-other-head "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_OTHER" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
 p_check summary-json-row-disagree "[$R0,$(p_summary completed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_OTHER" $((P_T0 + 30)) $((P_T0 + 90)))]" '[]' pending
 p_check summary-running-after-answer "[$R0,$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 60)))]" pending review-running
+# Wave audit on swipewatch#219: an earlier review that ends in the same second
+# a new run starts must not answer the new run.
+p_check summary-running-tied-with-answer "[$R0,$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" "[$(p_review $((P_T0 + 120)))]" pending review-running
 p_check running-no-request "[$(p_summary running "$(p_at $((P_T0 + 120)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 120)) $((P_T0 + 120)))]" '[]' pending review-running
 p_check running-past-bound "[$(p_summary running "$(p_at "$P_OLD")" "$P_HEAD" "$P_HEAD" "$P_OLD" "$P_OLD")]" '[]' timed-out review-running
 # Owner decision on #2886: free-form findings text is not read here, so a
@@ -1229,6 +1232,9 @@ p_check summary-row-json-disagree-no-request "[$P_DISAGREE]" '[]' pending summar
 p_check summary-failed-agreeing "[$R0,$(p_summary failed "$(p_at $((P_T0 + 90)))" "$P_HEAD" "$P_HEAD" $((P_T0 + 30)) $((P_T0 + 90)) | jq -c '.body |= sub("\\*\\*failed\\*\\*"; "⚠️ **Failed**")')]" '[]' answered
 P_BAD_OLD=$(p_summary completed "$(p_at $((P_T0 - 100)))" "$P_HEAD" "$P_HEAD" $((P_T0 - 200)) $((P_T0 - 100)) | jq -c '.body |= sub("codex-review-state:v1 \\{"; "codex-review-state:v1 {broken")')
 p_check unreadable-summary-older-than-answer "[$R0,$P_BAD_OLD]" "[$(p_review $((P_T0 + 60)))]" answered
+# The same tie on an unreadable summary edited in the answer's second: it may
+# be a new run's Running edit, so it holds rather than reading as older.
+p_check summary-unreadable-tied-with-answer "[$R0,$(printf '%s' "$P_BAD_OLD" | jq -c '.updated_at = "'"$(p_at $((P_T0 + 60)))"'"')]" "[$(p_review $((P_T0 + 60)))]" pending summary-unreadable
 p_check summary-no-json-row-on-head "[$R0,$(printf '%s' "$P_BAD_OLD" | jq -c '.updated_at = "'"$(p_at $((P_T0 + 100)))"'"')]" "[$(p_review $((P_T0 + 60)))]" pending summary-unreadable
 if [ "$(crqe_codex_pending_state "[$(printf '%s' "$P_RUN_BAD" | jq -c '.updated_at = "yesterday" | .created_at = "yesterday"')]" '[]' nathanjohnpayne "$P_BOT" "$P_HEAD" 1800 "$P_NOW" | jq -r .state)" = unreadable ]; then
   PASS=$((PASS + 1)); echo 'PASS: #2881 pending-state an unreadable Summary with no readable edit time is unreadable'

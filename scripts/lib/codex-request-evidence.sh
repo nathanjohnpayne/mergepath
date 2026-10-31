@@ -792,10 +792,13 @@ crqe_codex_pending_state() { # comments-json reviews-json|{reviews,inline} autho
         | ([ $summaries[] | select(.status == "unreadable") | .at ]) as $bad
         | (if $req_at != null and ($terminal == null or $terminal <= $req_at) then
              {anchor: $req_at, reason: "request-unanswered"}
-           elif $running != null and ($terminal == null or $running > $terminal) then
+           # A tie stays owed: a summary reads Running only while its run is
+           # live, so a terminal signal in the same second belongs to an
+           # earlier run (wave audit on swipewatch#219).
+           elif $running != null and ($terminal == null or $running >= $terminal) then
              {anchor: $running, reason: "review-running"}
            elif any($bad[]; . == null) then {anchor: null, reason: "summary-unreadable"}
-           elif any($bad[]; $terminal == null or . > $terminal) then
+           elif any($bad[]; $terminal == null or . >= $terminal) then
              {anchor: ($bad | max), reason: "summary-unreadable"}
            else null end) as $owed
         | {request: (if $req == null then null else {id: $req.id, created_at: $req.created_at} end),
