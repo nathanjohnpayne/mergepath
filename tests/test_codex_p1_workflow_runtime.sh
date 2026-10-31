@@ -679,6 +679,49 @@ SH
   fi
 done
 
+# #2908 review: 25 unrelated failed relays sit NEARER the stalled source's
+# completion than its own delayed relay 698, so nearest-first ordering puts
+# 698 last. The bounded window must rotate across sweep slots: the slot at
+# 21:00:00Z starts at offset 0 and misses 698, the next slot starts at 20
+# and re-runs it.
+dir="$TMP/relay-window-rotation"
+mkdir -p "$dir/bin"
+cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'api --help') echo 'Usage: gh api <endpoint>' ;;
+  *'codex-feedback-archive-relay.yml/runs?'*)
+    jq -cn '[{total_count:26,workflow_runs:([range(1;26) | {id:(600 + .),status:"completed",conclusion:"failure",
+      run_attempt:1,created_at:("2025-12-31T20:00:" + (if . < 10 then "0" else "" end) + (. | tostring) + "Z")}]
+      + [{id:698,status:"completed",conclusion:"failure",run_attempt:1,created_at:"2025-12-31T20:00:30Z"}])}]' ;;
+  'api repos/owner/repo/actions/runs/'*'/attempts/1/jobs')
+    run="${2#repos/owner/repo/actions/runs/}"
+    printf '{"jobs":[{"id":%s0}]}\n' "${run%%/*}" ;;
+  'api repos/owner/repo/actions/jobs/'*'/logs')
+    job="${2#repos/owner/repo/actions/jobs/}"
+    source=777
+    [ "${job%/logs}" != 6980 ] || source=502
+    printf '%s\n' '##[group]Run set -euo pipefail' '  env:' "    SOURCE_RUN_ID: $source" '##[endgroup]' ;;
+  'api -X POST repos/owner/repo/actions/runs/'*'/rerun')
+    run="${4#repos/owner/repo/actions/runs/}"
+    printf 'rerun %s\n' "${run%/rerun}" >> "$FIXTURE_LOG/rerun.log" ;;
+  *) echo "unexpected gh call: $*" >&2; exit 91 ;;
+esac
+SH
+chmod +x "$dir/bin/gh"
+pending='[{"id":502,"status":"completed","updated_at":"2025-12-31T20:00:00Z","run_started_at":"2025-12-31T19:58:00Z"}]'
+first=$(printf '%s' "$pending" | PATH="$dir/bin:$PATH" FIXTURE_LOG="$dir" \
+  python3 "$ROOT/scripts/workflow/relay-stall-recovery.py" --repo owner/repo --now 1767214800 --stall-seconds 3600)
+second=$(printf '%s' "$pending" | PATH="$dir/bin:$PATH" FIXTURE_LOG="$dir" \
+  python3 "$ROOT/scripts/workflow/relay-stall-recovery.py" --repo owner/repo --now 1767216600 --stall-seconds 3600)
+if [ "$(jq -c '[.rerun, .incomplete]' <<<"$first")" != '[[],true]' ]; then
+  fail "the first sweep slot reports a capped window that misses the delayed relay" "$first"
+elif [ "$(jq -c '.rerun' <<<"$second")" != '[698]' ] || [ "$(cat "$dir/rerun.log")" != 'rerun 698' ]; then
+  fail "the next sweep slot rotates the window onto the delayed relay" "$second"
+else
+  pass "the bounded relay window rotates across sweep slots onto a delayed relay"
+fi
+
 # #2907: a failed relay verifier (exit 2) fails the PR closed without feeding
 # its empty output to jq --argjson.
 dir="$TMP/sweep-relay-markers-fail"

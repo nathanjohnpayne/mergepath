@@ -35,6 +35,8 @@ WORKFLOW = 'codex-feedback-archive-relay.yml'
 FAILED = {'failure', 'cancelled', 'timed_out', 'startup_failure'}
 ESCAPE_FLAG = '--allow-escape-sequences'
 MAX_LOG_READS = 20
+# The scheduled sweep's cadence: the read window advances once per slot.
+SWEEP_SECONDS = 1800
 
 
 def epoch(stamp):
@@ -123,8 +125,17 @@ def recover(github, pending, now, stall, max_attempts):
                          and type(run.get('run_attempt')) is int and run['run_attempt'] < max_attempts
                          and distance(run) is not None),
                         key=lambda run: (distance(run), run['id']))
+    # Nearest-first alone still reads the same prefix every sweep, so a
+    # delayed relay behind MAX_LOG_READS nearer failures would never be read
+    # (#2908 review). With more candidates than the bound, the window starts
+    # at an offset that advances by MAX_LOG_READS each sweep slot, so every
+    # candidate is read within ceil(n / MAX_LOG_READS) sweeps.
+    window = candidates
+    if len(candidates) > MAX_LOG_READS:
+        offset = (now // SWEEP_SECONDS) * MAX_LOG_READS % len(candidates)
+        window = candidates[offset:] + candidates[:offset]
     matched = set()
-    for run in candidates[:MAX_LOG_READS]:
+    for run in window[:MAX_LOG_READS]:
         # One unreadable candidate is unbindable, not a reason to stop: the
         # order repeats every sweep, so aborting here could starve this PR's
         # relay forever (#2908 review). Unreadable history still exits 2.
