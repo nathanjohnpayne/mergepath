@@ -268,6 +268,10 @@ SH
 set -euo pipefail
 printf '%q ' "$@" >> "$FIXTURE_LOG/gh.log"
 printf '\n' >> "$FIXTURE_LOG/gh.log"
+# #2910: the stalled modes' PR predates its source runs, so the sweep's
+# source scan (which starts at the PR's creation) can reach run 502.
+pr_created=2026-01-01T00:00:00Z
+[[ "${RELAY_MODE:-empty}" != stalled* ]] || pr_created=2025-12-31T12:00:00Z
 # The real relay reader probes CLI support before a deadline-bound API read.
 # A successful legacy help response selects the existing timeout environment.
 if [ "$*" = 'api --help' ]; then echo 'Usage: gh api <endpoint>'; exit 0; fi
@@ -339,6 +343,11 @@ if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
     # failed relay from attempt 1, created at 19:57:00. Like GitHub, return
     # only runs created inside the requested `created=START..END` window
     # (#2910), so a source run before the PR's creation is never reached.
+    # The window itself must run from the PR's creation to the fixed clock.
+    if [ "$created_window" != "$pr_created..2026-01-01T00:00:00Z" ]; then
+      echo "unexpected created window: $created_window" >&2
+      exit 1
+    fi
     jq -cn --arg done "$done_at" --arg window "$created_window" '
       ($window | split("..")) as [$start, $end] |
       [{id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",created_at:"2025-12-31T18:58:30Z",updated_at:"2025-12-31T19:00:00Z",run_started_at:"2025-12-31T18:59:00Z"},
@@ -457,11 +466,7 @@ if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
   else
     fork=false
     if [ "${SWEEP_MODE:-stable}" = relay-fork ] && [ "$pr" = 1 ]; then fork=true; fi
-    # #2910: the stalled modes' PR predates its source runs, so the sweep's
-    # source scan (which starts at the PR's creation) can reach run 502.
-    created=2026-01-01T00:00:00Z
-    [[ "${RELAY_MODE:-empty}" != stalled* ]] || created=2025-12-31T12:00:00Z
-    jq -cn --arg sha "$sha" --argjson fork "$fork" --arg created "$created" '{head:{sha:$sha,repo:{fork:$fork}},user:{login:"owner"},created_at:$created}'
+    jq -cn --arg sha "$sha" --argjson fork "$fork" --arg created "$pr_created" '{head:{sha:$sha,repo:{fork:$fork}},user:{login:"owner"},created_at:$created}'
   fi
   exit 0
 fi
