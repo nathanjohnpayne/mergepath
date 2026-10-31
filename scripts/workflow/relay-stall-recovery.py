@@ -119,11 +119,22 @@ def recover(github, pending, now, stall, max_attempts):
                         key=lambda run: (distance(run), run['id']))
     matched = set()
     for run in candidates[:MAX_LOG_READS]:
-        jobs = github.get(f'actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs')
+        # One unreadable candidate is unbindable, not a reason to stop: the
+        # order repeats every sweep, so aborting here could starve this PR's
+        # relay forever (#2908 review). Unreadable history still exits 2.
+        try:
+            jobs = github.get(f'actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs')
+        except (ValueError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            print(f'skipping relay run {run["id"]}: {error}', file=sys.stderr)
+            continue
         for job in (jobs.get('jobs') or []) if isinstance(jobs, dict) else []:
             if not isinstance(job, dict) or type(job.get('id')) is not int:
                 continue
-            source = log_source(github.get(f'actions/jobs/{job["id"]}/logs', text=True))
+            try:
+                source = log_source(github.get(f'actions/jobs/{job["id"]}/logs', text=True))
+            except (ValueError, subprocess.TimeoutExpired) as error:
+                print(f'skipping relay run {run["id"]}: {error}', file=sys.stderr)
+                break
             if source is None:
                 continue
             if source in done and source not in matched and epoch(run['created_at']) >= done[source] - SKEW:
