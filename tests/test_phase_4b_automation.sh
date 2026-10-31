@@ -5921,7 +5921,7 @@ if [ "$endpoint" = graphql ] && [ "$_comment_history_query" = true ]; then
   # The PR comments' edit metadata (p4b_comment_history_snapshot): default
   # the served comments, none ever edited.
   history_default="$(printf '%s' "${P4B_TEST_COMMENTS_JSON-[]}" | jq -c '{data:{repository:{pullRequest:{comments:{pageInfo:{hasNextPage:false,endCursor:null},
-    nodes:[ .[] | {databaseId:.id,author:{login:(.user.login // "")},lastEditedAt:null,userContentEdits:{totalCount:0,nodes:[]}} ]}}}}}')"
+    nodes:[ .[] | {fullDatabaseId:(.id|tostring),author:{login:(.user.login // "")},lastEditedAt:null,userContentEdits:{totalCount:0,nodes:[]}} ]}}}}}')"
   printf '%s\n' "${P4B_TEST_COMMENT_HISTORY:-$history_default}"
   exit 0
 fi
@@ -6375,6 +6375,27 @@ _wb_out="$(p4b_wave_codex_binding_state "[$(_wb_req 400 nathanjohnpayne 2026-10-
 printf '%s' "$_wb_out" | jq -e '.state == "hold" and .reason == "no-run-for-bound-request"
   and ([.requests[] | "\(.id):\(.run)"] == ["400:0","501:null"]) and has("generation") == false' >/dev/null \
   || bad="$bad [hold-evidence:$_wb_out]"
+# swipewatch#218: CodeRabbit's summary is edited in place on every push and
+# quoted "@codex review" from the diff, so the edit hold held the canary to
+# exit 4. Review bots named by p4b_wave_binding_skip_logins are left out like
+# Codex's own; without the skip list the same evidence still holds, and a
+# mutant that drops the skip from `counted` must hold again.
+_wb_cr_edited="[$(_wb_req 450 'coderabbitai[bot]' 2026-10-29T11:50:00Z 'Walkthrough: rechecks comments containing `@codex review`' | jq -c '.updated_at = "2026-10-29T12:06:00Z"'),$_WB_R]"
+_wb_cr_plain="[$(_wb_req 450 'coderabbitai[bot]' 2026-10-29T11:50:00Z 'mentions @codex review in prose'),$_WB_R]"
+_wb_skip='["coderabbitai[bot]"]'
+for _wb_cr in "$_wb_cr_edited" "$_wb_cr_plain"; do
+  _wb_got="$(p4b_wave_codex_binding_state "$_wb_cr" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER" '{}' "$_wb_skip" | jq -r .state)"
+  [ "$_wb_got" = clear ] || bad="$bad [review-bot-comment-skipped: want clear got $_wb_got]"
+  _wb_got="$(p4b_wave_codex_binding_state "$_wb_cr" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER" '{}' | jq -r .state)"
+  [ "$_wb_got" = hold ] || bad="$bad [review-bot-comment-without-skip: want hold got $_wb_got]"
+  _wb_got="$(
+    eval "$(python3 -c 'import sys; s=sys.stdin.read(); o="$l != $bot and (any($skip[]; . == $l) | not);"; assert s.count(o)==1; print(s.replace(o,"$l != $bot;").replace("p4b_wave_codex_binding_eval()","_wb_skip_mutant()"))' \
+      <<<"$(sed -n '/^p4b_wave_codex_binding_eval() {/,/^}/p' "$LIB")")"
+    _wb_skip_mutant "$_wb_cr" nathanjohnpayne 'chatgpt-codex-connector[bot]' "$_wb_H" 501 "$_WB_ANSWER" '{}' "$_wb_skip" | jq -r .state
+  )"
+  [ "$_wb_got" = hold ] || bad="$bad [mutant-review-bot-skip-left-at-${_wb_got:-nothing}]"
+done
+[ "$(p4b_wave_binding_skip_logins)" = '["coderabbitai[bot]"]' ] || bad="$bad [skip-logins-default:$(p4b_wave_binding_skip_logins)]"
 
 # Mutation checks: disable each guard in an extracted copy; the window it
 # closes must flip to the named state (default "clear"). A guard whose
@@ -6423,7 +6444,7 @@ _wbh_page() { # <nodes-json> -> one GraphQL page
 }
 _wbh_node() { # <id> <login> <lastEditedAt|null> <diffs-json> -> one comment node (its history includes the original)
   jq -nc --argjson id "$1" --arg who "$2" --argjson le "$3" --argjson d "$4" \
-    '{databaseId:$id,author:{login:$who},lastEditedAt:$le,includesCreatedEdit:(($d|length) > 0),
+    '{fullDatabaseId:($id|tostring),author:{login:$who},lastEditedAt:$le,includesCreatedEdit:(($d|length) > 0),
       userContentEdits:{totalCount:($d|length),nodes:[ $d[] | {diff:.} ]}}'
 }
 _wbh() { # <graphql-output|FAIL> -> the snapshot's edited map
@@ -6461,6 +6482,20 @@ $(_wbh_page "[$(_wbh_node 704 b '"x"' '["please @codex"]')]")")" = '{"700":true,
 [ "$( ( gh() { _wbh_page "[$(_wbh_node 501 nathanjohnpayne null '[]'),$(_wbh_node 800 coderabbitai null '["a","b"]'),$(_wbh_node 900 chatgpt-codex-connector null '[]')]"; }
         p4b_comment_history_snapshot owner/repo 7 'chatgpt-codex-connector[bot]' | jq -c .counts ) )" = '{"501":0,"800":2}' ] \
   || bad="$bad [snapshot-counts-wrong]"
+# The skip list leaves review bots out of `edited` but not out of `counts`,
+# which stay stability evidence (owner decision on #2888), and ids
+# come from fullDatabaseId: a comment id past 2^31 keys as its decimal string,
+# and a node carrying only the 32-bit databaseId is an unreadable read.
+_wbh_cr="$(_wbh_node 6533283251 coderabbitai '"2026-10-30T21:14:00Z"' '["v1 @codex review","v2"]')"
+[ "$( ( gh() { _wbh_page "[$(_wbh_node 6533532355 nathanjohnpayne null '[]'),$_wbh_cr]"; }
+        p4b_comment_history_snapshot owner/repo 7 'chatgpt-codex-connector[bot]' '["coderabbitai[bot]"]' | jq -c . ) )" = '{"counts":{"6533532355":0,"6533283251":2},"edited":{}}' ] \
+  || bad="$bad [snapshot-skip-or-big-id-wrong]"
+[ "$( ( gh() { _wbh_page "[$(_wbh_node 6533532355 nathanjohnpayne null '[]'),$_wbh_cr]"; }
+        p4b_comment_history_snapshot owner/repo 7 'chatgpt-codex-connector[bot]' | jq -c .edited ) )" = '{"6533283251":true}' ] \
+  || bad="$bad [snapshot-without-skip-lost-review-bot]"
+[ "$( ( gh() { _wbh_page "[$(_wbh_node 501 nathanjohnpayne null '[]' | jq -c 'del(.fullDatabaseId) + {databaseId: 501}')]"; }
+        p4b_comment_history_snapshot owner/repo 7 'chatgpt-codex-connector[bot]' ) )" = null ] \
+  || bad="$bad [snapshot-databaseId-only-not-null]"
 # The summary-history reader treats a withheld revision the same way.
 [ "$( (
     gh() { printf '%s\n' '{"data":{"node":{"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"x","diff":null}]}}}}'; }

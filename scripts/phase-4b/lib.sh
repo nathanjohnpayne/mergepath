@@ -2155,9 +2155,13 @@ p4b_codex_summary_versions() {
   jq -nc --argjson a "$all" --argjson m "$marked" '$a + [ $m[] | {at, body} ]'
 }
 
-# p4b_comment_history_snapshot <repo> <pr> <bot>
+# p4b_comment_history_snapshot <repo> <pr> <bot> [<skip-json>]
 # One paginated GraphQL read of every non-bot PR comment's edit metadata:
-# {edited: {"<databaseId>": <mentioned>}, counts: {"<databaseId>": <edits>}}.
+# {edited: {"<id>": <mentioned>}, counts: {"<id>": <edits>}}, keyed by
+# fullDatabaseId (databaseId is a nullable 32-bit Int in the schema, and
+# comment ids are past 2^31). <skip-json> is a JSON array of review-bot
+# logins left out of `edited` (p4b_wave_binding_skip_logins); they stay in
+# `counts`, so their edits are still stability evidence.
 # `edited` names every EDITED comment (lastEditedAt set or any recorded
 # edit), with true when any readable revision mentions Codex's handle; an
 # unedited comment is absent. The binding no longer reconstructs when a
@@ -2173,26 +2177,28 @@ p4b_codex_summary_versions() {
 # (includesCreatedEdit false), since an unknown body is not "no mention".
 # GraphQL logins drop the "[bot]" suffix, so the bot is compared without it.
 p4b_comment_history_snapshot() {
-  local repo="$1" pr="$2" bot="${3:-}" owner name pages query
+  local repo="$1" pr="$2" bot="${3:-}" skip="${4:-[]}" owner name pages query
   owner="${repo%%/*}"; name="${repo#*/}"
-  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{databaseId author{login} lastEditedAt includesCreatedEdit userContentEdits(first:100){totalCount nodes{diff}}}}}}}'
+  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{fullDatabaseId author{login} lastEditedAt includesCreatedEdit userContentEdits(first:100){totalCount nodes{diff}}}}}}}'
   pages="$(gh api graphql --paginate -f query="$query" -f owner="$owner" -f name="$name" -F pr="$pr" 2>/dev/null)" \
     || { printf 'null\n'; return 0; }
   # Not `jq -e`: an empty map is a valid result.
-  printf '%s\n' "$pages" | jq -sc --arg bot "${bot%\[bot\]}" '
-    [ .[] | .data.repository.pullRequest.comments | if type == "object" then . else error("page") end
+  printf '%s\n' "$pages" | jq -sc --arg bot "${bot%\[bot\]}" --argjson skip "$skip" '
+    [ $skip[] | sub("\\[bot\\]$"; "") ] as $out
+    | [ .[] | .data.repository.pullRequest.comments | if type == "object" then . else error("page") end
       | .nodes[] ]
-    | if all(.[]; (.databaseId | type) == "number") | not then error("ids") else . end
-    | [ .[] | select(((.author.login // "") | sub("\\[bot\\]$"; "")) != $bot) ]
+    | if all(.[]; (.fullDatabaseId | type) == "string" and (.fullDatabaseId | test("^[0-9]+$"))) | not then error("ids") else . end
+    | [ .[] | ((.author.login // "") | sub("\\[bot\\]$"; "")) as $l | select($l != $bot) | . + {skipped: any($out[]; . == $l)} ]
     | if all(.[]; (.userContentEdits.totalCount | type) == "number") | not then error("counts") else . end
-    | {counts: ([ .[] | {key: (.databaseId | tostring), value: .userContentEdits.totalCount} ] | from_entries),
+    | {counts: ([ .[] | {key: .fullDatabaseId, value: .userContentEdits.totalCount} ] | from_entries),
        edited: ([ .[]
+        | select(.skipped | not)
         | select(.lastEditedAt != null or .userContentEdits.totalCount > 0)
         | .userContentEdits as $e
         | if (.includesCreatedEdit != true) or ($e.nodes | type) != "array" or $e.totalCount != ($e.nodes | length)
              or any($e.nodes[]; (.diff | type) != "string")
           then error("history")
-          else {key: (.databaseId | tostring), value: any($e.nodes[]; .diff | test("@codex"; "i"))} end ]
+          else {key: .fullDatabaseId, value: any($e.nodes[]; .diff | test("@codex"; "i"))} end ]
         | from_entries)}' 2>/dev/null \
     || printf 'null\n'
 }
@@ -2203,6 +2209,23 @@ p4b_comment_history_snapshot() {
 p4b_wave_binding_stamps() {
   printf '%s' "${1:-[]}" | jq -cS --arg bot "${2:-}" \
     '[ .[] | select((.user.login // "") != $bot) | {key: (.id | tostring), value: (.updated_at // "")} ] | from_entries' 2>/dev/null
+}
+
+# p4b_wave_binding_skip_logins -> JSON array of review-bot logins, besides
+# Codex's own, whose comments are neither requests nor edited requests: today
+# coderabbit.bot_login. A review bot's summary is edited in place on every
+# push and routinely quotes "@codex review" when the diff is about Codex
+# requests, so counting it as an edited request held every such canary to
+# the barrier's exit 4 (swipewatch#218). This is an observed-behaviour
+# assumption like the FIFO one below: a review bot's mention of the handle
+# is prose, never a review request (swipewatch#218's summary history shows
+# one Manual-request run, for the one author request). Their edits still
+# count as stability evidence (owner decision on #2888: any comment moving
+# between the reads holds, CodeRabbit's included).
+p4b_wave_binding_skip_logins() {
+  local cr
+  cr="$(p4b_policy_block_field coderabbit bot_login)"; cr="${cr:-coderabbitai[bot]}"
+  jq -nc --arg cr "$cr" '[ $cr ]'
 }
 
 # p4b_wave_binding_evaluate <repo> <pr> <head> <request-id>
@@ -2216,24 +2239,25 @@ p4b_wave_binding_stamps() {
 # happened, while the reads ran was not in the evidence; Phase 4b and Codex
 # on #2888). An unreadable comment list is `unreadable`.
 p4b_wave_binding_evaluate() {
-  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot versions snap snap_after edited result
+  local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot skip versions snap snap_after edited result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
+  skip="$(p4b_wave_binding_skip_logins)"
   if ! command -v gh_api_array >/dev/null 2>&1 \
      || ! comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
     jq -nc '{state:"unreadable",reason:"comments-read-failed"}'
     return 0
   fi
   versions="$(p4b_codex_summary_versions "$comments" "$bot")"
-  snap="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  snap="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot" "$skip")"
   edited="$(printf '%s' "$snap" | jq -c 'if type == "object" then .edited else null end' 2>/dev/null || printf null)"
-  result="$(p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "${edited:-null}")"
+  result="$(p4b_wave_codex_binding_state "$comments" "$author" "$bot" "$head" "$rid" "$versions" "${edited:-null}" "$skip")"
   printf '%s' "$result" | jq -e '.state == "clear"' >/dev/null 2>&1 || { printf '%s\n' "$result"; return 0; }
   if ! after="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding recheck" 2>/dev/null)"; then
     jq -nc '{state:"unreadable",reason:"comments-reread-failed"}'
     return 0
   fi
-  snap_after="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  snap_after="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot" "$skip")"
   if [ "$(p4b_wave_binding_stamps "$comments" "$bot")" != "$(p4b_wave_binding_stamps "$after" "$bot")" ] \
      || ! jq -en --argjson a "${snap:-null}" --argjson b "${snap_after:-null}" '($b | type) == "object" and $a == $b' >/dev/null 2>&1 \
      || ! printf '%s' "$after" | jq -e --arg bot "$bot" --argjson s "${snap_after:-null}" \
@@ -2261,11 +2285,11 @@ p4b_wave_binding_stable() {
   local repo="$1" pr="$2" stability="${3:-}" bot counts now
   bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
   counts="$(printf '%s' "$stability" | jq -ce '.counts | objects' 2>/dev/null)" || return 1
-  now="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot")"
+  now="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot" "$(p4b_wave_binding_skip_logins)")"
   jq -en --argjson a "$counts" --argjson b "${now:-null}" '($b | type) == "object" and $b.counts == $a' >/dev/null 2>&1
 }
 
-# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <edited-json>
+# p4b_wave_codex_binding_state <comments-json> <author> <bot> <head> <request-id> <summary-versions-json> <edited-json> [<skip-json>]
 # Pure. Prints {state, reason, bound_request, requests, runs[, edited, generation]}:
 # state is "clear", "hold" or "unreadable"; requests and runs are the
 # evidence the decision paired (machine-readable for whoever surfaces a hold);
@@ -2278,6 +2302,9 @@ p4b_wave_binding_stable() {
 # <edited-json> is p4b_comment_history_snapshot's `edited` map (each edited
 # non-bot comment -> whether any readable revision mentions Codex's handle),
 # or `null` when an edited comment's history could not be read.
+# <skip-json> is a JSON array of further review-bot logins whose comments,
+# like Codex's own, are neither requests nor edits
+# (p4b_wave_binding_skip_logins); default [].
 #
 # Edited comments are not evaluated (owner decision on #2888). A comment is
 # edited when the edit metadata names it or its REST updated_at differs from
@@ -2340,8 +2367,9 @@ p4b_wave_codex_binding_state() {
 p4b_wave_codex_binding_eval() {
   printf '%s\n' "${1:-[]}" | jq -c --arg author "${2:-}" --arg bot "${3:-}" \
     --arg head "${4:-}" --arg rid "${5:-}" --argjson versions "${6:-null}" \
-    --argjson edited "${7:-null}" '
+    --argjson edited "${7:-null}" --argjson skip "${8:-[]}" '
     def secs: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
+    def counted: (.user.login // "") as $l | $l != $bot and (any($skip[]; . == $l) | not);
     def exact_request: (.user.login // "") == $author and ((.body // "") | test("\\A@codex review\\z"; "i"));
     # One summary version -> {at, commit, status, trigger, time} or null.
     def version:
@@ -2372,14 +2400,14 @@ p4b_wave_codex_binding_eval() {
           # updated_at that differs from created_at. Each one that mentions
           # Codex now or in a readable revision holds the binding; so does
           # one the metadata does not cover (no readable history).
-          | ([ $comments[] | select((.user.login // "") != $bot)
+          | ([ $comments[] | select(counted)
                | (.id | tostring) as $k
                | select((($edited | type) == "object" and ($edited | has($k))) or ((.updated_at // .created_at) != .created_at))
                | {id, mentioned: (((.body // "") | test("@codex"; "i")) or (($edited | type) == "object" and $edited[$k] == true)),
                   covered: (($edited | type) == "object" and ($edited | has($k)))} ]) as $edits
           # Requests: never-edited comments mentioning the handle, at their
           # creation; comment ids follow creation within a second.
-          | ([ $comments[] | select((.user.login // "") != $bot)
+          | ([ $comments[] | select(counted)
                | (.id | tostring) as $k
                | select(((.body // "") | test("@codex"; "i"))
                         and ((($edited | type) == "object" and ($edited | has($k))) | not)
