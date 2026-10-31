@@ -1075,11 +1075,12 @@ jobs:
                         bound_run=$(jq -c '.source_run_id' <<<"$binding")
                         page_runs=$(printf '%s\n%s\n' "$page_runs" "$bound_run" \
                           | jq -cs '.[0] + [.[1]]')
-                        # Completion time of the bound run's latest attempt,
-                        # for the stalled-relay recovery below. A missing
-                        # status or time is never treated as stalled.
+                        # Start and completion of the bound run's latest
+                        # attempt, for the stalled-relay recovery below. A
+                        # missing status or time is never treated as stalled.
                         page_meta=$(jq -c --argjson meta "$page_meta" --argjson id "$bound_run" \
-                          '$meta + [{id: $id, status: (.status // ""), updated_at: (.updated_at // "")}]' \
+                          '$meta + [{id: $id, status: (.status // ""), updated_at: (.updated_at // ""),
+                            run_started_at: (.run_started_at // "")}]' \
                           <<<"$source_run")
                       fi
                     elif [ "$bind_rc" -ne 4 ]; then

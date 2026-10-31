@@ -331,9 +331,11 @@ if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
     # stalled-recent) and its relay never posted a terminal marker.
     done_at=2025-12-31T20:00:00Z
     [ "$RELAY_MODE" != stalled-recent ] || done_at=2026-01-01T00:00:00Z
+    # Attempt 2 of 502 started at 19:58:00; stalled-prior-attempt adds a
+    # failed relay from attempt 1, created at 19:57:00.
     jq -cn --arg done "$done_at" '{total_count:2,workflow_runs:[
-      {id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:"2025-12-31T19:00:00Z"},
-      {id:502,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:$done}]}'
+      {id:501,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:"2025-12-31T19:00:00Z",run_started_at:"2025-12-31T18:59:00Z"},
+      {id:502,display_title:"Codex P1 Gate relay-v1 PR #1",status:"completed",updated_at:$done,run_started_at:"2025-12-31T19:58:00Z"}]}'
   else
     echo '{"total_count":1,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
   fi
@@ -356,15 +358,19 @@ if [[ "$*" == *"repos/owner/repo/actions/workflows/codex-feedback-archive-relay.
   case "${RELAY_MODE:-empty}" in
     stalled-list-fails) exit 1 ;;
     stalled-inflight) echo '[{"total_count":2,"workflow_runs":[{"id":698,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":"2025-12-31T20:00:30Z"},{"id":699,"status":"queued","created_at":"2025-12-31T23:00:00Z"}]}]' ;;
+    stalled-prior-attempt)
+      # The only failed relay, 651, was created for attempt 1, before attempt
+      # 2 started; its log binds to 502 too. It must not be re-run.
+      echo '[{"total_count":1,"workflow_runs":[{"id":651,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":"2025-12-31T19:57:00Z"}]}]' ;;
     stalled-unreadable)
       # Failed relay 650 sits nearer the stalled source than 698, and its job
       # log cannot be read.
       echo '[{"total_count":2,"workflow_runs":[{"id":650,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":"2025-12-31T20:00:05Z"},{"id":698,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":"2025-12-31T20:00:30Z"}]}]' ;;
     stalled-crowded)
-      # 25 unrelated failed relays, created just before the stalled source
-      # completed, are listed and dated ahead of the bound relay 698.
+      # 25 unrelated failed relays, created after the stalled attempt started
+      # and before the bound relay 698, are listed ahead of it.
       jq -cn '[{total_count:26,workflow_runs:([range(0;25) | {id:(600 + .),status:"completed",conclusion:"failure",
-         run_attempt:1,created_at:("2025-12-31T19:5" + (5 + (. % 5) | tostring) + ":00Z")}]
+         run_attempt:1,created_at:("2025-12-31T19:58:" + (10 + (. % 5) * 10 | tostring) + "Z")}]
          + [{id:698,status:"completed",conclusion:"failure",run_attempt:1,created_at:"2025-12-31T20:00:30Z"}])}]' ;;
     *) jq -cn --argjson attempt "$attempt" '[{total_count:2,workflow_runs:[
          {id:697,status:"completed",conclusion:"success",run_attempt:1,created_at:"2025-12-31T19:59:00Z"},
@@ -378,6 +384,9 @@ case "$*" in
   'api repos/owner/repo/actions/runs/6'[0-9][0-9]'/attempts/1/jobs')
     run="${2#repos/owner/repo/actions/runs/}"
     printf '{"jobs":[{"id":%s5}]}\n' "${run%%/*}"; exit 0 ;;
+  'api repos/owner/repo/actions/jobs/6515/logs')
+    printf '%s\n' '##[group]Run set -euo pipefail' '  env:' '    SOURCE_RUN_ID: 502' '##[endgroup]'
+    exit 0 ;;
   'api repos/owner/repo/actions/jobs/6505/logs')
     [ "${RELAY_MODE:-empty}" != stalled-unreadable ] || exit 1 ;;&
   'api repos/owner/repo/actions/jobs/6'[0-9][0-9]'5/logs')
@@ -621,7 +630,7 @@ done
 # the PR pending. An unrelated relay in flight does not defer it (#2908
 # review). A recent source run, an exhausted or unbindable relay, or
 # unreadable relay history re-runs nothing.
-for relay_mode in stalled stalled-crowded stalled-unreadable stalled-inflight stalled-recent stalled-list-fails stalled-unmatched stalled-exhausted; do
+for relay_mode in stalled stalled-crowded stalled-unreadable stalled-prior-attempt stalled-inflight stalled-recent stalled-list-fails stalled-unmatched stalled-exhausted; do
   dir="$TMP/sweep-relay-$relay_mode"
   make_sweep_fixture "$dir"
   mkdir -p "$dir/scripts/workflow"
@@ -654,7 +663,7 @@ SH
   elif { [ "$relay_mode" = stalled ] || [ "$relay_mode" = stalled-crowded ] || [ "$relay_mode" = stalled-unreadable ] || [ "$relay_mode" = stalled-inflight ]; } && \
     { [ "$reruns" -ne 1 ] || ! grep -Fxq 'rerun 698' "$dir/mutations.log" \
       || ! grep -Fq 'Re-ran stalled relay run(s) 698 for PR #1' "$dir/out" \
-      || ! grep -Fq 'created=%3E%3D2025-12-31T19:55:00Z' "$dir/relay-list.log"; }; then
+      || ! grep -Fq 'created=%3E%3D2025-12-31T19:58:00Z' "$dir/relay-list.log"; }; then
     fail "stalled relay is re-run exactly once" "$(cat "$dir/out")"
   elif [ "$relay_mode" != stalled ] && [ "$relay_mode" != stalled-crowded ] && [ "$relay_mode" != stalled-unreadable ] && [ "$relay_mode" != stalled-inflight ] && [ "$reruns" -ne 0 ]; then
     fail "relay $relay_mode re-runs nothing" "$(cat "$dir/mutations.log")"
@@ -662,7 +671,7 @@ SH
     fail "a recent source run spends no relay history read"
   elif [ "$relay_mode" = stalled-list-fails ] && ! grep -Fq 'could not read relay history for PR #1' "$dir/out"; then
     fail "unreadable relay history is reported"
-  elif { [ "$relay_mode" = stalled-unmatched ] || [ "$relay_mode" = stalled-exhausted ]; } \
+  elif { [ "$relay_mode" = stalled-unmatched ] || [ "$relay_mode" = stalled-exhausted ] || [ "$relay_mode" = stalled-prior-attempt ]; } \
     && ! grep -Fq 'No re-runnable failed relay run found for stalled source run(s) 502 on PR #1' "$dir/out"; then
     fail "relay $relay_mode names the unrecovered source run"
   else

@@ -19,7 +19,7 @@ any PR, are neither read nor waited on (#2908 review). The sweep stays
 pending until the relay posts its own marker. Each relay is re-run at most
 --max-attempts - 1 times.
 
-stdin:  JSON list of pending source runs: [{id, status, updated_at}, ...]
+stdin:  JSON list of pending source runs: [{id, status, updated_at, run_started_at}, ...]
 stdout: JSON {stalled, rerun, unmatched, incomplete}
 exit 2: relay history unreadable or saturated; the caller stays pending.
 """
@@ -34,7 +34,6 @@ import sys
 WORKFLOW = 'codex-feedback-archive-relay.yml'
 FAILED = {'failure', 'cancelled', 'timed_out', 'startup_failure'}
 ESCAPE_FLAG = '--allow-escape-sequences'
-SKEW = 300
 MAX_LOG_READS = 20
 
 
@@ -87,16 +86,23 @@ class GitHub:
 
 
 def recover(github, pending, now, stall, max_attempts):
-    done = {}
+    # done: completion of each stalled source's latest attempt. started: when
+    # that attempt began. A re-run attempt starts only after the previous one
+    # completed, so a relay created before `started` belongs to an earlier
+    # attempt and must never be re-run for this one (#2908 review). A source
+    # without a readable start time is never bound, so it stays pending.
+    done, started = {}, {}
     for row in pending:
-        when = epoch(row.get('updated_at')) if isinstance(row, dict) else None
-        if (isinstance(row, dict) and type(row.get('id')) is int and row.get('status') == 'completed'
-                and when is not None and now - when >= stall):
-            done[row['id']] = when
+        if not isinstance(row, dict):
+            continue
+        when, began = epoch(row.get('updated_at')), epoch(row.get('run_started_at'))
+        if (type(row.get('id')) is int and row.get('status') == 'completed'
+                and when is not None and began is not None and now - when >= stall):
+            done[row['id']], started[row['id']] = when, began
     report = {'stalled': sorted(done), 'rerun': [], 'unmatched': [], 'incomplete': False}
     if not done:
         return report
-    since = iso(min(done.values()) - SKEW)
+    since = iso(min(started.values()))
     pages = github.get(f'actions/workflows/{WORKFLOW}/runs?created=%3E%3D{since}&per_page=100', pages=True)
     if not isinstance(pages, list) or not all(isinstance(p, dict) and isinstance(p.get('workflow_runs'), list) for p in pages):
         raise ValueError('relay run history unavailable')
@@ -108,7 +114,7 @@ def recover(github, pending, now, stall, max_attempts):
     # failures fill the bounded read budget on every sweep (#2908 review).
     def distance(run):
         created = epoch(run.get('created_at'))
-        gaps = [created - when for when in done.values() if created is not None and created >= when - SKEW]
+        gaps = [created - done[source] for source in done if created is not None and created >= started[source]]
         return min(abs(gap) for gap in gaps) if gaps else None
 
     candidates = sorted((run for run in runs
@@ -137,7 +143,7 @@ def recover(github, pending, now, stall, max_attempts):
                 break
             if source is None:
                 continue
-            if source in done and source not in matched and epoch(run['created_at']) >= done[source] - SKEW:
+            if source in done and source not in matched and epoch(run['created_at']) >= started[source]:
                 if github.rerun(run['id']):
                     report['rerun'].append(run['id'])
                     matched.add(source)
