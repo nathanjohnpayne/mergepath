@@ -908,10 +908,13 @@ RESOLVER
   echo 'PASS: governing author capture and revalidation ignore divergent candidate identity'
 
   # Execute the checker's actual author-assignment block against the same
-  # resolved flow-style base policy. Other legacy checker fields still reject
-  # full-flow configurations independently; author selection cannot diverge.
+  # resolved flow-style base policy. The codex.* fields read the same parse
+  # (#2901), so author selection and those settings cannot diverge.
   printf '%s\n' '{author_identity: base-author, codex: {enabled: true}}' >"$P4B_TEST_BASE"
-  checker_author_block=$(sed -n '/^AUTHOR_POLICY_JSON=/,/^  }$/p' "$ROOT/scripts/codex-review-check.sh")
+  # #2901 parses the policy once, ahead of the codex.* reads; the author
+  # assignment reads that parse. Run both blocks, in production order.
+  checker_author_block=$(sed -n -e '/^AUTHOR_POLICY_JSON=/,/^}$/p' \
+    -e '/^AUTHOR_IDENTITY=/,/^  }$/p' "$ROOT/scripts/codex-review-check.sh")
   [ -n "$checker_author_block" ] || { echo 'FAIL checker parsed-author assignment missing'; exit 1; }
   checker_author=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY")
   [ "$checker_author" = base-author ] \

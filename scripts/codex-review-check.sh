@@ -372,28 +372,48 @@ if [ -z "${MERGEPATH_REVIEW_POLICY_PATH:-}" ]; then
   fi
 fi
 
-# Read a scalar field from the codex: block. See agent-review.yml
-# post-#54 for the rationale on the state-machine awk parser.
-codex_field() {
-  local field=$1
-  [ -f "$CONFIG" ] || return 0
-  awk -v field="$field" '
-    /^codex:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block && $1 == field":" {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^["\047]/, "", $0)
-      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
+# BEGIN codex_policy_field
+# Read one codex.* field from the parsed governing policy (#2901). The earlier
+# line-oriented awk reader matched only an unquoted, block-style `field:` key,
+# so a quoted key or a flow mapping (`codex: {enabled: false}`) read as unset
+# and took the default -- permissive for enabled and allow_phase_4b_substitute.
+# The default applies only when the key, or the whole codex block, is absent.
+# A present value of the wrong kind, a non-mapping codex block, or a policy
+# that could not be parsed returns 1 with a reason on stderr; callers refuse.
+# A quoted scalar keeps working ("false", "1800") as the awk reader allowed.
+codex_field() { # field kind(bool|int|string); reads $AUTHOR_POLICY_JSON
+  local field=$1 kind=$2 result
+  if [ -z "${AUTHOR_POLICY_JSON:-}" ]; then
+    echo "ERROR: governing policy was not parsed; cannot read codex.$field" >&2
+    return 1
+  fi
+  # One line out: "ok <value>" or "err <reason>". A jq failure leaves it empty.
+  result=$(printf '%s' "$AUTHOR_POLICY_JSON" | jq -r --arg f "$field" --arg k "$kind" '
+    def want: {bool: "true|false", int: "a non-negative integer"}[$k] // "a non-empty string";
+    def bad: "err codex.\($f) must be \(want); got \(tojson)";
+    if type != "object" then "err the governing policy is not a mapping"
+    elif .codex == null then "ok "
+    elif (.codex | type) != "object" then "err codex must be a mapping; got \(.codex | tojson)"
+    elif (.codex | has($f)) | not then "ok "
+    else .codex[$f]
+      | if $k == "bool" then
+          if type == "boolean" then "ok \(.)" elif . == "true" or . == "false" then "ok \(.)" else bad end
+        elif $k == "int" then
+          if type == "number" and . >= 0 and floor == . then "ok \(.)"
+          elif type == "string" and test("^[0-9]+$") then "ok \(.)" else bad end
+        elif type == "string" and length > 0 and (test("[\n\r]") | not) then "ok \(.)"
+        else bad end
+    end' 2>/dev/null) || result=""
+  case "$result" in
+    "ok "*) printf '%s\n' "${result#ok }" ;;
+    "err "*) echo "ERROR: ${result#err }" >&2; return 1 ;;
+    *) echo "ERROR: codex.$field could not be read from the governing policy" >&2; return 1 ;;
+  esac
 }
+# END codex_policy_field
 
-# Read a top-level (block-less) scalar field. Same shape as codex_field
-# but without the in-block check — used for fields like `phase_4b_default`
+# Read a top-level (block-less) scalar field. A line-oriented awk reader
+# (codex_field's shape before #2901), without the in-block check — used for fields like `phase_4b_default`
 # (#185) that live at the document root rather than inside `codex:` /
 # `coderabbit:`. Outputs the value or empty on miss.
 #
@@ -432,10 +452,18 @@ case "$PHASE_4B_DEFAULT" in
 esac
 export PHASE_4B_DEFAULT
 
-BOT_LOGIN=$(codex_field bot_login)
+# Parse the governing policy once, before any codex.* read (#2901). A policy
+# that cannot be parsed refuses here instead of every field silently taking
+# its default. The resolver above already selected the governing CONFIG.
+AUTHOR_POLICY_JSON=$(policy_yaml_to_json "$CONFIG") && [ -n "$AUTHOR_POLICY_JSON" ] || {
+  echo "ERROR: governing policy $CONFIG could not be parsed; author_identity and codex.* settings are unknown" >&2
+  exit 3
+}
+
+BOT_LOGIN=$(codex_field bot_login string) || exit 3
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
-CODEX_ENABLED=$(codex_field enabled)
+CODEX_ENABLED=$(codex_field enabled bool) || exit 3
 CODEX_ENABLED=${CODEX_ENABLED:-true}
 case "$CODEX_ENABLED" in
   true|false) ;;
@@ -445,7 +473,7 @@ case "$CODEX_ENABLED" in
     ;;
 esac
 
-REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds)
+REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds int) || exit 3
 REACTION_FRESHNESS_SECONDS=${REACTION_FRESHNESS_SECONDS:-1800}
 if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.reaction_freshness_window_seconds must be an integer; got '$REACTION_FRESHNESS_SECONDS'" >&2
@@ -459,7 +487,7 @@ fi
 # the nathanpaynedotcom propagation PR #180 (the field was read by
 # the policy parser and documented in the codex: block but never
 # actually consulted by this script).
-REQUIRE_CI_GREEN=$(codex_field require_ci_green)
+REQUIRE_CI_GREEN=$(codex_field require_ci_green bool) || exit 3
 REQUIRE_CI_GREEN=${REQUIRE_CI_GREEN:-true}
 # Validate strictly (consistent with codex.enabled /
 # allow_phase_4b_substitute above) so a config typo can't silently skip
@@ -558,7 +586,9 @@ REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
 # reviewer APPROVED that already clears gate (b) — otherwise an ordinary
 # under-threshold approval with no Codex review would arm the shortened
 # CodeRabbit wait and reopen the pre-review merge race. Unset ⇒ policy value.
-ALLOW_PHASE_4B_SUBSTITUTE=${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-$(codex_field allow_phase_4b_substitute)}
+# The env override skips the policy read entirely; otherwise a refused read
+# is the assignment's status, so it exits rather than defaulting to true.
+ALLOW_PHASE_4B_SUBSTITUTE=${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-$(codex_field allow_phase_4b_substitute bool)} || exit 3
 ALLOW_PHASE_4B_SUBSTITUTE=${ALLOW_PHASE_4B_SUBSTITUTE:-true}
 # #2139 under-threshold substitution needs Codex itself on this head, with
 # ordinary finding disposition and approval checks still active.
@@ -580,10 +610,9 @@ if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2
   exit 3
 fi
-# The resolver above selected governing CONFIG; parse it rather than guessing
-# authority from line shape. Malformed present identities never use the default.
-AUTHOR_POLICY_JSON=$(policy_yaml_to_json "$CONFIG") &&
-  AUTHOR_IDENTITY=$(crqe_policy_author "$AUTHOR_POLICY_JSON") || {
+# Read from the policy parsed above rather than guessing authority from line
+# shape. Malformed present identities never use the default.
+AUTHOR_IDENTITY=$(crqe_policy_author "$AUTHOR_POLICY_JSON") || {
     echo "ERROR: governing policy author_identity could not be read" >&2
     exit 3
   }
@@ -2513,9 +2542,10 @@ crc_render_request_evidence() {
   if [[ "$id" =~ ^[0-9]+$ ]] && reactions=$(gh_api_array "repos/$REPO/issues/comments/$id/reactions" "trigger acknowledgements"); then
     ack=$(crqe_ack_present "$reactions" "$BOT_LOGIN" "$posted") || ack=unknown
   fi
-  budget=$(codex_field review_timeout_seconds); ack_budget=$(codex_field ack_wait_seconds)
   # Optional policy fields have the same defaults as codex-review-request.sh.
-  budget=${budget:-1800}; ack_budget=${ack_budget:-30}
+  # Diagnostics only: a refused read reports unknown rather than a default.
+  budget=$(codex_field review_timeout_seconds int 2>/dev/null) && budget=${budget:-1800} || budget=unknown
+  ack_budget=$(codex_field ack_wait_seconds int 2>/dev/null) && ack_budget=${ack_budget:-30} || ack_budget=unknown
   [[ "$budget" =~ ^[0-9]+$ ]] || budget=unknown
   [[ "$ack_budget" =~ ^[0-9]+$ ]] || ack_budget=unknown
   log "request evidence: freshness-qualified author trigger #${id:-unknown} at $posted (anchor $REACTION_THRESHOLD; not immutable SHA attribution)"
@@ -3110,7 +3140,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     PHASE_4B_TIMEOUT_NOTE=""
     if [ -z "$PHASE_4B_SUPERSEDED" ] && [ "$CODEX_ENABLED" = "true" ]; then
       # From the parsed governing policy (direct Phase 4b on #2886): the
-      # line-oriented codex_field reader misses a quoted key, which would
+      # old line-oriented codex_field reader missed a quoted key, which would
       # silently shorten a configured wait to the default. The default
       # applies only when the key is absent; any other non-integer refuses.
       PENDING_WINDOW=$(printf '%s' "$AUTHOR_POLICY_JSON" | jq -r '

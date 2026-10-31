@@ -223,12 +223,12 @@ fi
 
 # ── 3c. Structural (#727, Codex P2 on #729): the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE
 #      env var overrides the policy value, taking precedence over
-#      `codex_field allow_phase_4b_substitute`. The post-clearance fast-path
+#      `codex_field allow_phase_4b_substitute bool`. The post-clearance fast-path
 #      probe sets it to false so gate (c) requires an ACTUAL Codex bot signal and
 #      is NOT satisfied by the same reviewer APPROVED that clears gate (b) — the
 #      env override must win, else a bare under-threshold approval would arm the
 #      shortened CodeRabbit wait and reopen the pre-review merge race.
-if grep -Eq 'ALLOW_PHASE_4B_SUBSTITUTE=\$\{CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-\$\(codex_field allow_phase_4b_substitute\)\}' "$SCRIPT"; then
+if grep -Eq 'ALLOW_PHASE_4B_SUBSTITUTE=\$\{CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-\$\(codex_field allow_phase_4b_substitute bool\)\} \|\| exit 3$' "$SCRIPT"; then
   pass "gate (c) honors the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE env override, precedence over policy (#727 fast-path probe requires an actual Codex signal)"
 else
   fail "codex-review-check.sh does not let CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE override the policy value (#727)"
@@ -633,7 +633,7 @@ fixture_result="$(PATH="$BEHAVIOR_TMP/no-parsers:$PATH" run_body_fixture externa
 fixture_rc="${fixture_result%%$'\n'*}"
 fixture_output="${fixture_result#*$'\n'}"
 if [ "$fixture_rc" = "3" ] \
-   && grep -q 'governing policy author_identity could not be read' <<<"$fixture_output" \
+   && grep -q 'could not be parsed; author_identity and codex.\* settings are unknown' <<<"$fixture_output" \
    && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
   pass "#2314: direct checker without a working YAML parser refuses before commit lookup"
 else
@@ -648,6 +648,151 @@ if [ "$fixture_rc" = "3" ] && grep -q 'does not map to exactly one configured re
 else
   fail "#1121: unregistered Authoring-Agent fixture did not fail closed (rc=$fixture_rc output=$fixture_output)"
 fi
+
+# ── #2901: every codex.* field comes from the parsed governing policy ------
+#
+# The old line-oriented awk reader matched only an unquoted, block-style
+# `field:` key. A quoted key or a flow mapping read as unset and took the
+# default, which is permissive for enabled and allow_phase_4b_substitute. Run
+# the extracted reader against fixtures, then run the same fixtures through
+# the legacy awk reader (mutation self-check): each spelling the fix exists for
+# must be misread there, or these cases would not detect a regression to it.
+POLICY_FIELD_READER=$(sed -n \
+  '/^# BEGIN codex_policy_field$/,/^# END codex_policy_field$/p' "$SCRIPT")
+if [ -n "$POLICY_FIELD_READER" ] && grep -q '^codex_field()' <<<"$POLICY_FIELD_READER"; then
+  pass "#2901: codex-review-check.sh exposes the parsed-policy codex_field reader"
+else
+  fail "#2901: codex-review-check.sh is missing the BEGIN/END codex_policy_field block"
+fi
+if grep -nE '^[^#]*\$\(codex_field [a-z_]+\)' "$SCRIPT" >/dev/null; then
+  fail "#2901: a codex_field call site omits its expected kind: $(grep -nE '^[^#]*\$\(codex_field [a-z_]+\)' "$SCRIPT" | head -3)"
+else
+  pass "#2901: every codex_field call site names the kind it expects"
+fi
+
+# shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+. "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+LEGACY_CODEX_FIELD_AWK='
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+
+# read_new <yaml> <field> <kind> -> "rc=<n> val=<value>"
+read_new() {
+  local rc=0 val=""
+  printf '%s\n' "$1" > "$BEHAVIOR_TMP/field-policy.yml"
+  val=$(env -u BASH_ENV bash -c '
+    . "$1/scripts/lib/feedback-policy-helpers.sh"
+    eval "$2"
+    CONFIG=$3
+    AUTHOR_POLICY_JSON=$(policy_yaml_to_json "$3") || AUTHOR_POLICY_JSON=""
+    codex_field "$4" "$5"
+  ' _ "$ROOT" "$POLICY_FIELD_READER" "$BEHAVIOR_TMP/field-policy.yml" "$2" "$3" 2>/dev/null) || rc=$?
+  printf 'rc=%s val=%s' "$rc" "$val"
+}
+# read_legacy <yaml> <field> -> what the pre-#2901 reader produced. It had
+# no failure mode: an unreadable value fell through to the caller's default.
+read_legacy() {
+  printf '%s\n' "$1" | awk -v field="$2" "$LEGACY_CODEX_FIELD_AWK" | {
+    read -r v || true; printf 'rc=0 val=%s' "$v"; }
+}
+
+# case_field <label> <yaml> <field> <kind> <expected> <legacy-must-differ 0|1>
+case_field() {
+  local label=$1 yaml=$2 field=$3 kind=$4 want=$5 must_differ=$6 got legacy
+  got=$(read_new "$yaml" "$field" "$kind")
+  if [ "$got" = "$want" ]; then
+    pass "#2901 $label: $field reads '$got'"
+  else
+    fail "#2901 $label: $field read '$got', expected '$want'"
+  fi
+  [ "$must_differ" = 1 ] || return 0
+  legacy=$(read_legacy "$yaml" "$field")
+  if [ "$legacy" != "$want" ]; then
+    pass "#2901 mutation $label: the legacy awk reader misreads $field ('$legacy'), so this case detects a regression"
+  else
+    fail "#2901 mutation $label: the legacy awk reader already reads $field correctly; the case proves nothing"
+  fi
+}
+
+BASE=$'author_identity: nathanjohnpayne\navailable_reviewers:\n  - nathanpayne-claude'
+REFUSE='rc=1 val='
+
+# Block style, unquoted: both readers agree (regression guard for the norm).
+case_field "block style" "$BASE"$'\ncodex:\n  enabled: false\n  allow_phase_4b_substitute: false\n  bot_login: "custom-codex[bot]"' enabled bool 'rc=0 val=false' 0
+case_field "block style" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute: false' allow_phase_4b_substitute bool 'rc=0 val=false' 0
+case_field "block style quoted value" "$BASE"$'\ncodex:\n  bot_login: "custom-codex[bot]"' bot_login string 'rc=0 val=custom-codex[bot]' 0
+case_field "quoted scalar value" "$BASE"$'\ncodex:\n  enabled: "false"' enabled bool 'rc=0 val=false' 0
+case_field "absent key" "$BASE"$'\ncodex:\n  require_ci_green: true' enabled bool 'rc=0 val=' 0
+case_field "absent block" "$BASE" allow_phase_4b_substitute bool 'rc=0 val=' 0
+
+# Quoted keys.
+case_field "quoted key" "$BASE"$'\ncodex:\n  "enabled": false' enabled bool 'rc=0 val=false' 1
+case_field "quoted key" "$BASE"$'\ncodex:\n  "allow_phase_4b_substitute": false' allow_phase_4b_substitute bool 'rc=0 val=false' 1
+case_field "single-quoted key" "$BASE"$'\ncodex:\n  \'bot_login\': custom-codex[bot]' bot_login string 'rc=0 val=custom-codex[bot]' 1
+case_field "quoted key" "$BASE"$'\ncodex:\n  "reaction_freshness_window_seconds": 600' reaction_freshness_window_seconds int 'rc=0 val=600' 1
+
+# Flow mappings.
+case_field "flow mapping" "$BASE"$'\ncodex: {enabled: false}' enabled bool 'rc=0 val=false' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {allow_phase_4b_substitute: false}' allow_phase_4b_substitute bool 'rc=0 val=false' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {bot_login: "custom-codex[bot]"}' bot_login string 'rc=0 val=custom-codex[bot]' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {require_ci_green: false}' require_ci_green bool 'rc=0 val=false' 1
+
+# Values of the wrong kind refuse instead of defaulting. The legacy reader
+# handed these to the caller, which either refused (enabled: maybe) or, for a
+# list or mapping, saw a value it could not tell from unset.
+case_field "wrong kind" "$BASE"$'\ncodex:\n  enabled: [false]' enabled bool "$REFUSE" 1
+case_field "wrong kind" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute: {value: false}' allow_phase_4b_substitute bool "$REFUSE" 1
+case_field "wrong kind" "$BASE"$'\ncodex:\n  bot_login: [custom-codex]' bot_login string "$REFUSE" 1
+case_field "null value" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute:' allow_phase_4b_substitute bool "$REFUSE" 1
+case_field "empty string" "$BASE"$'\ncodex:\n  bot_login: ""' bot_login string "$REFUSE" 1
+case_field "non-mapping block" "$BASE"$'\ncodex: false' enabled bool "$REFUSE" 1
+case_field "negative integer" "$BASE"$'\ncodex:\n  reaction_freshness_window_seconds: -5' reaction_freshness_window_seconds int "$REFUSE" 0
+
+# A policy that cannot be parsed refuses every field.
+for f in enabled:bool allow_phase_4b_substitute:bool bot_login:string; do
+  case_field "unparseable policy" "$BASE"$'\ncodex:\n  enabled: false\n  bot_login: [unclosed' "${f%%:*}" "${f#*:}" "$REFUSE" 1
+done
+
+# The real checker refuses before its first API read beyond the PR: a present
+# value of the wrong kind exits 3 with the reason instead of defaulting.
+cp "$BEHAVIOR_TMP/policy.yml" "$BEHAVIOR_TMP/policy.good.yml"
+for spec in 'enabled: [false]|codex.enabled must be true|false' \
+            'allow_phase_4b_substitute: ~|codex.allow_phase_4b_substitute must be true|false' \
+            'bot_login: [x]|codex.bot_login must be a non-empty string'; do
+  printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+    "  - nathanpayne-codex" "codex:" "  require_ci_green: false" "  ${spec%%|*}" > "$BEHAVIOR_TMP/policy.yml"
+  fixture_result="$(run_body_fixture external-contributor '')"
+  fixture_rc="${fixture_result%%$'\n'*}"
+  fixture_output="${fixture_result#*$'\n'}"
+  if [ "$fixture_rc" = "3" ] && grep -qF "${spec#*|}" <<<"$fixture_output" \
+     && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
+    pass "#2901: the checker refuses '${spec%%|*}' (exit 3) instead of defaulting"
+  else
+    fail "#2901: the checker did not refuse '${spec%%|*}' (rc=$fixture_rc output=$fixture_output)"
+  fi
+done
+# A flow-style policy runs past the policy reads exactly as block style does.
+printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" "  - nathanpayne-codex" \
+  'codex: {"enabled": true, require_ci_green: false, "allow_phase_4b_substitute": false}' > "$BEHAVIOR_TMP/policy.yml"
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2901: a flow-style, quoted-key codex block reaches gate evaluation"
+else
+  fail "#2901: flow-style policy did not reach gate evaluation (rc=$fixture_rc output=$fixture_output)"
+fi
+cp "$BEHAVIOR_TMP/policy.good.yml" "$BEHAVIOR_TMP/policy.yml"
 
 # Positional rather than a text scan — the header documents gate (c) long
 # before it is evaluated, so a "starts matching at the first mention" filter
