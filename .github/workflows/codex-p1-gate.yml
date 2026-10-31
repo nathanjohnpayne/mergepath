@@ -835,6 +835,17 @@ jobs:
     # No Actions concurrency here either. Each PR gets its own in-progress
     # check generation and this sweep PATCHes only that generation, so an
     # overlapping newer sweep or event remains newer regardless of finish order.
+    # The workflow-level grants, plus `actions: write` so the sweep can
+    # re-run a failed feedback-archive relay that left no terminal marker
+    # (#2907, scripts/workflow/relay-stall-recovery.py). The sweep runs only
+    # on schedule, from the default branch, so no PR code holds this grant.
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+      checks: write
+      security-events: read
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -895,6 +906,10 @@ jobs:
           set -euo pipefail
           had_infra_error=0
           MAX_RELAY_SOURCE_RUNS=1000
+          # How long a source run must have been complete, with no relay
+          # marker, before the sweep re-runs its failed relay (#2907). Well
+          # above a healthy relay's latency.
+          RELAY_STALL_SECONDS="${RELAY_STALL_SECONDS:-3600}"
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
             # Scheduled runs load this default-branch workflow and helper from
@@ -981,6 +996,7 @@ jobs:
             relay_scan_error=false
             if [ "$requires_relay" = true ]; then
               source_runs='[]'
+              source_meta='[]'
               relay_source_cache="$RUNNER_TEMP/relay-source-cache-$PR"
               rm -rf "$relay_source_cache"
               mkdir -p "$relay_source_cache"
@@ -994,7 +1010,7 @@ jobs:
               scan_source_window() {
                 local source_event="$1" window_start="$2" window_end="$3"
                 local start_iso end_iso source_page source_page_json source_total
-                local midpoint matching_source_runs page_runs source_count
+                local midpoint matching_source_runs page_runs page_meta source_count
                 [ "$relay_scan_error" != true ] || return 0
                 start_iso=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)
                 end_iso=$(date -u -d "@$window_end" +%Y-%m-%dT%H:%M:%SZ)
@@ -1030,6 +1046,7 @@ jobs:
                     fi
                   fi
                   page_runs='[]'
+                  page_meta='[]'
                   if ! matching_source_runs=$(jq -cs \
                     --arg title "Codex P1 Gate relay-v1 PR #$PR" '
                       if length != 1 then
@@ -1058,6 +1075,13 @@ jobs:
                         bound_run=$(jq -c '.source_run_id' <<<"$binding")
                         page_runs=$(printf '%s\n%s\n' "$page_runs" "$bound_run" \
                           | jq -cs '.[0] + [.[1]]')
+                        # Start and completion of the bound run's latest
+                        # attempt, for the stalled-relay recovery below. A
+                        # missing status or time is never treated as stalled.
+                        page_meta=$(jq -c --argjson meta "$page_meta" --argjson id "$bound_run" \
+                          '$meta + [{id: $id, status: (.status // ""), updated_at: (.updated_at // ""),
+                            run_started_at: (.run_started_at // "")}]' \
+                          <<<"$source_run")
                       fi
                     elif [ "$bind_rc" -ne 4 ]; then
                       echo "::error::Could not resolve the trusted source binding for a matching run on PR #$PR"
@@ -1068,6 +1092,8 @@ jobs:
                     # to hold this PR's sweep, so leave it out of the inventory.
                   done <<<"$matching_source_runs"
                   source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
+                    | jq -cs '.[0] + .[1]')
+                  source_meta=$(printf '%s\n%s\n' "$source_meta" "$page_meta" \
                     | jq -cs '.[0] + .[1]')
                   source_count=$(jq 'length' <<<"$source_runs")
                   if [ "$source_count" -ge "$MAX_RELAY_SOURCE_RUNS" ]; then
@@ -1094,20 +1120,50 @@ jobs:
                   "repos/$REPO/issues/$PR/comments" | jq -s 'add // []'); then
                   relay_scan_error=true
                 else
+                  # A failed verifier (exit 2) leaves no JSON to reduce, so
+                  # stop here rather than feed jq an empty --argjson (#2907).
                   if ! relay_comments=$(printf '%s' "$relay_comments" \
                     | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR"); then
                     relay_scan_error=true
-                  fi
-                  terminal_runs=$(printf '%s' "$relay_comments" | jq -c '[
-                    .[] | select(.user.login == "github-actions[bot]") | .body // ""
-                    | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$").run
-                      catch empty
-                    | tonumber
-                  ]')
-                  if jq -e --argjson terminal "$terminal_runs" \
-                    'any(.[]; . as $run | ($terminal | index($run)) == null)' \
-                    <<<"$source_runs" >/dev/null; then
-                    relay_pending=true
+                  else
+                    terminal_runs=$(printf '%s' "$relay_comments" | jq -c '[
+                      .[] | select(.user.login == "github-actions[bot]") | .body // ""
+                      | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$").run
+                        catch empty
+                      | tonumber
+                    ]')
+                    pending_runs=$(jq -c --argjson terminal "$terminal_runs" \
+                      '[.[] | select(. as $run | ($terminal | index($run)) == null)] | unique' \
+                      <<<"$source_runs")
+                    if [ "$pending_runs" != '[]' ]; then
+                      relay_pending=true
+                      # Stalled-relay recovery (#2907). A relay whose own
+                      # failure path could not post `status=failed` (it
+                      # shares the API that failed) left this PR pending
+                      # until someone re-ran it by hand. The helper re-runs
+                      # a failed relay that its job log binds to a source
+                      # complete for at least RELAY_STALL_SECONDS.
+                      # It never clears anything: the PR stays pending
+                      # until the re-run relay posts its own marker, and a
+                      # recovery failure only leaves it pending as before.
+                      if recovery=$(jq -c --argjson pending "$pending_runs" \
+                          '[.[] | select(.id as $id | $pending | index($id) != null)]' <<<"$source_meta" \
+                        | python3 scripts/workflow/relay-stall-recovery.py --repo "$REPO" \
+                          --now "$scan_end_epoch" --stall-seconds "$RELAY_STALL_SECONDS"); then
+                        relay_rerun=$(jq -r '.rerun | map(tostring) | join(", ")' <<<"$recovery")
+                        relay_unmatched=$(jq -r '.unmatched | map(tostring) | join(", ")' <<<"$recovery")
+                        if [ -n "$relay_rerun" ]; then
+                          echo "::notice::Re-ran stalled relay run(s) $relay_rerun for PR #$PR (#2907); the PR stays pending until the relay posts its marker."
+                        fi
+                        if [ "$(jq -r '.incomplete' <<<"$recovery")" = true ]; then
+                          echo "::notice::Stalled-relay recovery reached its log-read bound before matching source run(s) $relay_unmatched on PR #$PR; a later sweep continues."
+                        elif [ -n "$relay_unmatched" ]; then
+                          echo "::notice::No re-runnable failed relay run found for stalled source run(s) $relay_unmatched on PR #$PR; re-run the source run if its relay never ran."
+                        fi
+                      else
+                        echo "::notice::Stalled-relay recovery could not read relay history for PR #$PR; the relay stays pending."
+                      fi
+                    fi
                   fi
                 fi
               fi

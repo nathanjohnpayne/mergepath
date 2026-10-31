@@ -1605,6 +1605,15 @@ paths:
       - ".github/workflows/merge-clearance-gate.yml"
       - ".github/workflows/auto-clear-blocking-labels.yml"
       - ".github/workflows/required-check-publisher.yml"
+  # Runs the orphaned-hold reaper (#2907) against fixture check runs and
+  # pins its call site in the publisher's scheduled pass. Hard-run by
+  # check_required_check_publisher.
+  - path: tests/test_reap_orphaned_holds.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/required-check-publisher.yml"
+      - "scripts/workflow/reap-orphaned-holds.sh"
   - path: tests/test_required_check_publisher_summary_hold.sh
     type: canonical
     consumers: all
@@ -2575,6 +2584,7 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
       - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
       - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding for the scheduled inventory
+      - "scripts/workflow/relay-stall-recovery.py"   # #2907, scheduled re-run of a failed relay that left no marker
       - "scripts/workflow/installation-budget.sh"   # #2286, event-job budget guard (absent: evaluates without it)
       - "scripts/gate-api-lineage-blocking.sh"   # #2286, native conclusion of a run that did not evaluate
   - path: .github/workflows/codex-feedback-archive-relay.yml
@@ -2634,6 +2644,7 @@ paths:
       - "scripts/workflow/required-check-generation.sh"
       - "scripts/workflow/installation-budget.sh"   # #2286, the budget reader, sourced hard (#2220 guard)
       - "scripts/workflow/coderabbit-evidence-recovery.py"
+      - "scripts/workflow/reap-orphaned-holds.sh"   # #2907, scheduled-pass orphaned-hold reaper
       # The parent workflow is the trigger source: workflow_run fires only
       # on its exact top-level name, so a consumer missing (or renaming)
       # it gets no event-driven publishes at all (cross-agent round 3 on

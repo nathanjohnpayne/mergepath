@@ -325,6 +325,7 @@ SCAN_HARNESS="$TMP/scan-source-window-harness.sh"
   cat <<'SH'
 relay_scan_error=false
 source_runs='[]'
+source_meta='[]'
 relay_source_cache="$RUNNER_TEMP/relay-source-cache-$PR"
 rm -rf "$relay_source_cache"
 mkdir -p "$relay_source_cache"
