@@ -144,6 +144,8 @@ Live evidence (Summary comment ids; row times from `userContentEdits`):
 - a provider refusal in its exact shape at the start of the body: the usage-limit notice, `To use Codex here,` or `Codex Review: Something went wrong`. The shared not-connected regex matches anywhere in a body, so the shapes are pinned to the start of the body here, and quoted refusal wording inside other text is not an answer;
 - a Review Summary, read as described below.
 
+Current Codex comments open with the receipt envelope: a `<!-- codex-review-receipt:v1 -->` line, then a blank line, then the header. The start of the body, for the verdict and refusal shapes above, may therefore be that one marker line with whitespace around it, and nothing else. Header text quoted in other prose, a second marker, or a marker on the header's own line does not count (#2904).
+
 **The Review Summary.**
 
 - **Recognition.** A Summary is recognized only by its envelope: the leading marker at the very start of the body. A marker quoted or fenced inside another comment never makes that comment a Summary.
@@ -164,7 +166,7 @@ The gate runs the check after the #1598 checks pass.
 
 - **The window.** It is `codex.review_timeout_seconds`, read from the parsed governing policy (`AUTHOR_POLICY_JSON`). The default of 1800 applies only when the key is absent, and a present value that is not a whole number of seconds refuses (#2901 tracks the older line reader, which misses quoted keys).
 - **One fresh snapshot.** The comments come from the re-read #1598 performs, with verdict anchors resolved again, together with fresh reviews and inline comments.
-- **The freshness guard.** The substitute's latest-signal-wins guard folds in `crqe_latest_codex_signal_time` over the same snapshot. That covers the substantive head review, and every verdict the gate's own verdict selection would order: one whose Reviewed commit fields all name `<head>`, or a non-affirmative one whose fields are absent, abbreviated, malformed or include `<head>`. An unreadable time fails the check.
+- **The freshness guard.** The substitute's latest-signal-wins guard folds in `crqe_latest_codex_signal_time` over the same snapshot. That covers the substantive head review, and every verdict the gate's own verdict selection would order: one whose Reviewed commit fields all name `<head>`, or a non-affirmative one with a `Codex review:` header line, as the gate's `CODEX_VERDICT_JSON` requires, whose fields are absent, abbreviated, malformed, disagree with each other, or include `<head>`. `crqe_verdicts` also admits bot prose that merely mentions "reviewed commit", so a candidate without that header line is not a signal and cannot outrank an approval (#2904). An unreadable time fails the check.
 - **The approval itself.** The candidate must still be its reviewer's latest opinionated review on HEAD in the fresh read.
 - **Outcomes.** `pending` refuses the candidate, as does anything unreadable. `timed-out` lets the candidate proceed. Only when the substitute then clears is `codex-review-outcome: timed-out/substitute-used`, with the request, the last outcome and the bound, appended to the clearance reason. That puts the outcome in the gate output and on the PR head's check run. An expired wait whose substitute is then rejected logs only that the wait expired.
 
