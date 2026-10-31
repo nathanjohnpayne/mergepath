@@ -68,13 +68,18 @@ if [ -r "$P4B_LIB_DIR/../lib/gh-api-array.sh" ]; then
   P4B_GH_API_ARRAY_OK=true
 fi
 
+# The policy parser behind p4b_policy_block_field (#2913). Without it every
+# policy read refuses, so nothing reads as a default.
+if [ -r "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh" ]; then
+  # shellcheck source=../lib/feedback-policy-helpers.sh
+  . "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh"
+fi
+
 # #1305 request-budget readers. The barrier must use the same exact-command
 # counter and governing-base-policy parser as the requester itself.
 P4B_CODEX_REQUEST_BUDGET_OK=false
 if [ -r "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh" ] \
    && [ -r "$P4B_LIB_DIR/../lib/codex-request-evidence.sh" ]; then
-  # shellcheck source=../lib/feedback-policy-helpers.sh
-  . "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh"
   # shellcheck source=../lib/codex-request-evidence.sh
   . "$P4B_LIB_DIR/../lib/codex-request-evidence.sh"
   P4B_CODEX_REQUEST_BUDGET_OK=true
@@ -115,30 +120,26 @@ p4b_config() {
   printf '%s/.github/review-policy.yml' "$(p4b_repo_root)"
 }
 
-# --- YAML readers (awk; mirrors the codex_field/policy_top_field style) ----
+# --- YAML readers --------------------------------------------------------
 
-# p4b_automation_field <field> — scalar under the top-level
+# p4b_automation_field <field> [kind] — scalar under the top-level
 # `phase_4b_automation:` block. Empty string if absent; caller defaults.
-# Nesting-aware (#615 Codex round 3): only DIRECT children of the block
-# match. The block carries nested sub-blocks (e.g. `accounting.enabled`),
-# and the previous flat scan matched a nested key as the parent-level
-# field — a downstream policy that omitted or reordered the parent
-# `enabled` would read the accounting sub-toggle as the master switch and
-# wrongly run the orchestrator. The direct-child indent is captured from
-# the first key line inside the block (so 2- and 4-space styles both
-# work); deeper-indented lines belong to sub-blocks and never match —
-# sub-block readers (p4b_acct_config_field, mirroring codex_p1_gate_field)
-# own those.
+# Only DIRECT children of the block match (#615 Codex round 3): the block
+# carries nested sub-blocks (e.g. `accounting.enabled`), and a flat scan once
+# read a nested key as the parent-level field — a downstream policy that
+# omitted or reordered the parent `enabled` would read the accounting
+# sub-toggle as the master switch and wrongly run the orchestrator.
+# Sub-block readers (p4b_acct_config_field) own the nested keys.
 p4b_automation_field() {
-  p4b_policy_block_field phase_4b_automation "$1"
+  p4b_policy_block_field phase_4b_automation "$1" "${2:-scalar}"
 }
 
-# p4b_policy_block_field <block> <field> — the same reader, generalized over
-# the top-level block name (#814). Needed because the same-head barrier reads
-# `codex.enabled` and `coderabbit.enabled`, and neither has a sourceable
-# reader: the existing per-script `codex_field` / `coderabbit_field` copies
-# live inside scripts whose top level runs work on source, and both are
-# hardcoded to one block.
+# p4b_policy_block_field <block> <field> [kind] — the same reader,
+# generalized over the top-level block name (#814). Needed because the
+# same-head barrier reads `codex.enabled` and `coderabbit.enabled`, and
+# neither has a sourceable reader: the per-script `codex_field` /
+# `coderabbit_field` copies live inside scripts whose top level runs work on
+# source, and both are hardcoded to one block.
 #
 # The direct-child scoping is load-bearing for exactly the keys the barrier
 # needs. `coderabbit.severity_gate.enabled`, `codex.p1_gate.enabled` and
@@ -146,30 +147,29 @@ p4b_automation_field() {
 # a flat block scan returns whichever comes first in document order — a
 # consumer that omits the optional top-level `enabled` would read a sub-gate
 # toggle as the master switch and the barrier would guard on the wrong thing.
+#
+# It reads the parsed policy (#2913). The line-oriented awk reader it
+# replaces matched only an unquoted, block-style `field:` key, so a quoted key
+# or a flow mapping (`codex: {allow_phase_4b_substitute: false}`) read as
+# unset: the barrier then treated a forbidden substitute as allowed. Prints
+# nothing when the file, the block or the key is absent, and the caller
+# applies its default only then. Returns 1 with a reason on stderr when no
+# parser is available, the policy cannot be parsed, or the value is not of
+# <kind> (bool|int|string|scalar, see policy_json_field; default scalar);
+# every caller refuses on that.
 p4b_policy_block_field() {
-  local block="$1" field="$2" cfg
+  local block="$1" field="$2" kind="${3:-scalar}" cfg json
   cfg="$(p4b_config)"
   [ -f "$cfg" ] || return 0
-  awk -v block="$block" -v field="$field" '
-    /^[^[:space:]#]/ {
-      if ($0 ~ "^" block ":") { inblk=1; child_indent=-1; next }
-      inblk=0
-    }
-    inblk {
-      if ($0 ~ /^[[:space:]]*(#|$)/) next
-      indent = match($0, /[^[:space:]]/) - 1
-      if (child_indent < 0) child_indent = indent
-      if (indent > child_indent) next
-      if ($1 == field":") {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^["\047]/, "", $0)
-        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-        gsub(/[[:space:]]*#.*$/, "", $0)
-        sub(/[[:space:]]+$/, "", $0)
-        print; exit
-      }
-    }
-  ' "$cfg"
+  if ! command -v policy_json_field >/dev/null 2>&1; then
+    echo "ERROR: scripts/lib/feedback-policy-helpers.sh is not loaded; cannot read $block.$field from $cfg" >&2
+    return 1
+  fi
+  json="$(policy_yaml_to_json "$cfg")" && [ -n "$json" ] || {
+    echo "ERROR: policy $cfg could not be parsed; cannot read $block.$field" >&2
+    return 1
+  }
+  policy_json_field "$json" "$block.$field" "$kind"
 }
 
 # p4b_top_field <field> — a column-0 top-level scalar (author_identity,
@@ -1207,10 +1207,12 @@ p4b_barrier_coderabbit_carryforward() {
 
 # Wall-clock bound for the pending wait, from coderabbit.max_wait_seconds.
 # A malformed value falls back to the default rather than failing closed: this
-# governs only when a human is called, so a bad parse must not deadlock.
+# governs only when a human is called, so a bad parse must not deadlock. A
+# policy that cannot be read at all takes the default too, for the same
+# reason; the barrier's provider switches refuse on it separately (#2913).
 p4b_barrier_budget_seconds() {
   local raw
-  raw="$(p4b_policy_block_field coderabbit max_wait_seconds)"
+  raw="$(p4b_policy_block_field coderabbit max_wait_seconds scalar 2>/dev/null)" || raw=""
   case "$raw" in
     ''|*[!0-9]*) printf '1245' ;;
     *) printf '%s' "$raw" ;;
@@ -1676,8 +1678,9 @@ p4b_barrier_write_count() {
   # The bare form is the CONFIGURED bot's exact command, compared as a string
   # — a wildcard mention pattern counted any trusted reviewer's `@renovate
   # resume` as the CodeRabbit recovery and suppressed the real one (Codex P2,
-  # round 4). Same login source and [bot]-strip as the poster.
-  bot="$(p4b_policy_block_field coderabbit bot_login)"
+  # round 4). Same login source and [bot]-strip as the poster. A login that
+  # cannot be read prints no count and returns 1 (#2913).
+  bot="$(p4b_policy_block_field coderabbit bot_login string)" || return 1
   bot="${bot:-coderabbitai}"
   bot="${bot%\[bot\]}"
   printf '%s' "${4:-[]}" | jq --arg m "$m" --arg fam "$fam" --arg legacy "$legacy" \
@@ -1697,8 +1700,10 @@ p4b_barrier_write_count() {
     | length' 2>/dev/null || printf '0'
 }
 
-p4b_barrier_write_posted() {
-  [ "$(p4b_barrier_write_count "$1" "$2" "$3" "$4")" -gt 0 ]
+p4b_barrier_write_posted() {  # returns 2 when the count is unreadable
+  local n
+  n="$(p4b_barrier_write_count "$1" "$2" "$3" "$4")" || return 2
+  [ "$n" -gt 0 ]
 }
 
 # p4b_barrier_should_trigger <observed>
@@ -1755,7 +1760,7 @@ p4b_barrier_post_trigger() {
   # that never answers while the probe keeps observing `none` — the barrier
   # then burns its whole budget and escalates on every PR in that repo. Strip
   # the REST-only `[bot]` suffix, as the existing retry and resume paths do.
-  bot="$(p4b_policy_block_field coderabbit bot_login)"
+  bot="$(p4b_policy_block_field coderabbit bot_login string)" || return 1
   bot="${bot:-coderabbitai}"
   bot="${bot%\[bot\]}"
   body="$(printf '@%s %s\n\n%s\n' "$bot" "$verb" "$(p4b_barrier_marker "$kind" "$head")")"
@@ -1826,7 +1831,8 @@ p4b_barrier_maybe_write() {
     '['*) ;;
     *) p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0 ;;
   esac
-  n="$(p4b_barrier_write_count "$kind" "$key" "$reviewer" "$comments" "$since" "$family")"
+  n="$(p4b_barrier_write_count "$kind" "$key" "$reviewer" "$comments" "$since" "$family")" \
+    || { p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0; }
   if [ "$n" -gt 1 ]; then
     # Two markers can only mean two checkouts raced before this change, or a
     # write reported failed actually landed and was retried. Surfaced, not
@@ -2224,7 +2230,8 @@ p4b_wave_binding_stamps() {
 # between the reads holds, CodeRabbit's included).
 p4b_wave_binding_skip_logins() {
   local cr
-  cr="$(p4b_policy_block_field coderabbit bot_login)"; cr="${cr:-coderabbitai[bot]}"
+  cr="$(p4b_policy_block_field coderabbit bot_login string)" || return 1
+  cr="${cr:-coderabbitai[bot]}"
   jq -nc --arg cr "$cr" '[ $cr ]'
 }
 
@@ -2241,8 +2248,12 @@ p4b_wave_binding_skip_logins() {
 p4b_wave_binding_evaluate() {
   local repo="$1" pr="$2" head="$3" rid="$4" comments after author bot skip versions snap snap_after edited result
   author="$(p4b_top_field author_identity)"; author="${author:-nathanjohnpayne}"
-  bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
-  skip="$(p4b_wave_binding_skip_logins)"
+  if ! bot="$(p4b_policy_block_field codex bot_login string)" \
+     || ! skip="$(p4b_wave_binding_skip_logins)"; then
+    jq -nc '{state:"unreadable",reason:"policy-unreadable"}'
+    return 0
+  fi
+  bot="${bot:-chatgpt-codex-connector[bot]}"
   if ! command -v gh_api_array >/dev/null 2>&1 \
      || ! comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "wave Codex request binding" 2>/dev/null)"; then
     jq -nc '{state:"unreadable",reason:"comments-read-failed"}'
@@ -2282,10 +2293,12 @@ p4b_wave_binding_evaluate() {
 # missing stability and an unreadable read. A request that moved is not
 # re-evaluated here; the run holds and a rerun decides on fresh evidence.
 p4b_wave_binding_stable() {
-  local repo="$1" pr="$2" stability="${3:-}" bot counts now
-  bot="$(p4b_policy_block_field codex bot_login)"; bot="${bot:-chatgpt-codex-connector[bot]}"
+  local repo="$1" pr="$2" stability="${3:-}" bot skip counts now
+  bot="$(p4b_policy_block_field codex bot_login string)" || return 1
+  bot="${bot:-chatgpt-codex-connector[bot]}"
+  skip="$(p4b_wave_binding_skip_logins)" || return 1
   counts="$(printf '%s' "$stability" | jq -ce '.counts | objects' 2>/dev/null)" || return 1
-  now="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot" "$(p4b_wave_binding_skip_logins)")"
+  now="$(p4b_comment_history_snapshot "$repo" "$pr" "$bot" "$skip")"
   jq -en --argjson a "$counts" --argjson b "${now:-null}" '($b | type) == "object" and $b.counts == $a' >/dev/null 2>&1
 }
 
@@ -2497,6 +2510,18 @@ p4b_same_head_barrier() {
   local cx_human_stops_json="null"
   local budget_unsafe=false
   local elapsed budget remaining=0
+  local pol_cx_enabled pol_cx_substitute pol_cr_enabled
+  # The provider switches, read once from the parsed policy (#2913). A policy
+  # that cannot be read decides nothing: no review authority follows, and the
+  # stderr reason says why. Absent keys keep their defaults (enabled,
+  # substitute allowed).
+  if ! pol_cx_enabled="$(p4b_policy_block_field codex enabled bool)" \
+     || ! pol_cx_substitute="$(p4b_policy_block_field codex allow_phase_4b_substitute bool)" \
+     || ! pol_cr_enabled="$(p4b_policy_block_field coderabbit enabled bool)"; then
+    jq -nc '{decision:"error",reason:"the review policy could not be read, so the codex/coderabbit switches are unknown",
+      coderabbit:"unknown",codex:"unknown",codex_evidence:"policy-unreadable",coderabbit_cause:"",request_budget:null,wave_binding:null}'
+    return 4
+  fi
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
   cx_bin="${P4B_CODEX_REVIEW_CHECK:-$root/scripts/codex-review-check.sh}"
@@ -2504,7 +2529,7 @@ p4b_same_head_barrier() {
   # Codex arm. The five overrides turn a merge-gate verdict into "has Codex
   # itself spoken on THIS head" — see p4b_barrier_class_codex for why each is
   # required, and why the diagnostic switch is a flag rather than an env var.
-  if [ "$(p4b_policy_block_field codex enabled)" != "false" ]; then
+  if [ "$pol_cx_enabled" != "false" ]; then
     rc=0
     CODEX_REVIEW_CHECK_SKIP_CI=1 \
     CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
@@ -2698,7 +2723,7 @@ p4b_same_head_barrier() {
     # accomplished nothing (Codex P2 on #842). In that configuration a block is
     # exactly what it looks like: something a human has to fix.
     if [ "$cls_cx" = waived ] \
-       && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
+       && [ "$pol_cx_substitute" = "false" ]; then
       cls_cx="escalate"
       if [ "$cx_evidence" = timeout ]; then
         why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
@@ -2720,7 +2745,7 @@ p4b_same_head_barrier() {
   # Reject an explicitly forbidden substitute before probing/triggering
   # CodeRabbit or dispatching an adapter that could never clear that gate.
   if [ "$cls_cx" = disabled ] \
-     && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = false ]; then
+     && [ "$pol_cx_substitute" = false ]; then
     cls_cx=escalate
     why="Codex is disabled and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
   fi
@@ -2728,7 +2753,7 @@ p4b_same_head_barrier() {
   # CodeRabbit arm: probe (read-only, zero allowance) -> conditional trigger
   # -> bounded retry. The probe resolves the live head itself, so classifying
   # against "$head" is also what catches a push landing mid-run.
-  if [ "$scope" = all ] && [ -z "$why" ] && [ "$(p4b_policy_block_field coderabbit enabled)" != "false" ]; then
+  if [ "$scope" = all ] && [ -z "$why" ] && [ "$pol_cr_enabled" != "false" ]; then
     rc=0
     json="$("$cr_bin" --probe "$pr" "$repo" 2>/dev/null)" || rc=$?
     # Head drift, detected BEFORE any trigger (Codex P2 on #842). The probe
@@ -2959,7 +2984,7 @@ p4b_same_head_barrier() {
   # invariant to the final classification so a late timeout never opens a
   # Phase 4b path whose approval cannot satisfy gate (c).
   if [ -z "$why" ] && [ "$cls_cx" = waived ] \
-     && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
+     && [ "$pol_cx_substitute" = "false" ]; then
     cls_cx="escalate"
     case "$cx_evidence" in
       request-ceiling*) why="The Codex request ceiling is spent on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c); a human must decide" ;;
@@ -3066,8 +3091,8 @@ P4B_MAX_ADAPTER_TIMEOUT_SECONDS=3600
 # by the orchestrator, not here.
 p4b_resolve_adapter_timeout() {
   local adapter="$1" val
-  val="$(p4b_automation_field "${adapter}_timeout_seconds")"
-  [ -n "$val" ] || val="$(p4b_automation_field adapter_timeout_seconds)"
+  val="$(p4b_automation_field "${adapter}_timeout_seconds")" || return 1
+  [ -n "$val" ] || val="$(p4b_automation_field adapter_timeout_seconds)" || return 1
   [ -n "$val" ] || { printf '%s' "$P4B_DEFAULT_ADAPTER_TIMEOUT_SECONDS"; return 0; }
   case "$val" in
     ''|*[!0-9]*) return 1 ;;
@@ -3090,7 +3115,7 @@ p4b_resolve_adapter_timeout() {
 # invalid configured value so the caller fails closed.
 p4b_resolve_adapter_effort() {
   local adapter="$1" val
-  val="$(p4b_automation_field "${adapter}_effort")"
+  val="$(p4b_automation_field "${adapter}_effort")" || return 1
   case "$adapter" in
     claude)
       [ -n "$val" ] || { printf 'medium'; return 0; }
@@ -3558,7 +3583,7 @@ p4b_resolve_diff_max_bytes() {
     printf '%s' "$P4B_DIFF_MAX_BYTES"
     return 0
   fi
-  val="$(p4b_automation_field diff_max_bytes)"
+  val="$(p4b_automation_field diff_max_bytes)" || return 1
   [ -n "$val" ] || { printf '%s' "$P4B_DEFAULT_DIFF_MAX_BYTES"; return 0; }
   case "$val" in
     *[!0-9]*) return 1 ;;

@@ -80,8 +80,9 @@ auth_status() { # auth_status <adapter>  -> prints "ok" or "BLOCKED: <reason>"
 }
 
 # --- resolved config -------------------------------------------------------
-ENABLED="$(p4b_automation_field enabled)"; ENABLED="${ENABLED:-false}"
-MODE="$(p4b_automation_field mode)"; MODE="${MODE:-local}"
+# An unreadable policy is reported as such, never as the defaults (#2913).
+ENABLED="$(p4b_automation_field enabled)" && ENABLED="${ENABLED:-false}" || ENABLED="UNREADABLE"
+MODE="$(p4b_automation_field mode)" && MODE="${MODE:-local}" || MODE="UNREADABLE"
 
 resolved_timeout() { p4b_resolve_adapter_timeout "$1" 2>/dev/null || printf 'INVALID'; }
 resolved_effort()  { local e; e="$(p4b_resolve_adapter_effort "$1" 2>/dev/null)" || { printf 'INVALID'; return; }; printf '%s' "${e:-cli-default}"; }
