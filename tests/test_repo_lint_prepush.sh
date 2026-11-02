@@ -442,6 +442,25 @@ check "a full trigger beside an undeclared path keeps the complete surface" "$(g
 case "$(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" in *"complete-surface rule (a full trigger"*) ok "the full-trigger reason is printed" ;; *) bad "full-trigger reason: $(sed -n 's/^selection\t//p' "$TMP/plan.unknowntrigger")" ;; esac
 check "a propagation head beside an undeclared path keeps the complete surface" "$(grep -c '^fallback' "$TMP/plan.sync" || true)" "0"
 
+# #2926: a tooling file moved out of a tooling path keeps the complete
+# surface in the hook and in CI. With rename detection on, both diffs list
+# only the docs destination and take the fast lane.
+git -C "$HUB" checkout -q -B feat/move main
+mkdir -p "$HUB/docs"
+git -C "$HUB" mv scripts/ci/repo-lint-tooling-scope.sh docs/tooling-scope.txt
+git -C "$HUB" commit -q -m "case move"
+check "[move] the fixture is a rename git collapses to its destination" \
+  "$(git -C "$HUB" -c diff.renames=true diff --name-only main HEAD)" "docs/tooling-scope.txt"
+printf 'refs/heads/feat/move %s refs/heads/feat/move %s\n' "$(git -C "$HUB" rev-parse HEAD)" "$ZERO" \
+  | (cd "$HUB" && bash scripts/repo-lint-prepush.sh --hook origin "$REMOTE" --plan 2>/dev/null) > "$TMP/plan.move"
+: > "$TMP/ci_scope.move"
+(cd "$HUB" && EVENT_NAME=pull_request BASE_SHA="$(git -C "$HUB" rev-parse main)" HEAD_SHA="$(git -C "$HUB" rev-parse HEAD)" \
+   HEAD_REF=feat/move GITHUB_OUTPUT="$TMP/ci_scope.move" bash -e "$TMP/ci_classify.sh") > /dev/null
+check "[move] CI's classify step counts the renamed file's source path" "$(sed -n 's/^full=//p' "$TMP/ci_scope.move")" "true"
+check "[move] the hook's scope bits equal CI's" \
+  "$(sed -n 's/^scope\t//p' "$TMP/plan.move" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')" \
+  "$(sort "$TMP/ci_scope.move" | tr '\n' ' ')"
+
 # A push to the default branch is a `push` event in CI: the complete surface.
 git -C "$HUB" checkout -q main
 printf 'refs/heads/main %s refs/heads/main %s\n' "$(git -C "$HUB" rev-parse HEAD)" "$(git -C "$HUB" rev-parse HEAD)" \

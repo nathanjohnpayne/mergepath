@@ -975,10 +975,11 @@ remote_default_ref() {
 CHANGED=''
 FAIL_CLOSED=0
 add_range() {
-  # $1 = base ref/sha, $2 = tip sha. Appends the merge-base diff.
+  # $1 = base ref/sha, $2 = tip sha. Appends the merge-base diff, with a
+  # renamed file's source path listed too, as the CI classify step does.
   local mb names
   if mb=$(git merge-base "$1" "$2" 2>/dev/null) \
-     && names=$(git diff --name-only "$mb" "$2"); then
+     && names=$(git diff --no-renames --name-only "$mb" "$2"); then
     [ -n "$names" ] && CHANGED="${CHANGED}${names}
 "
     return 0

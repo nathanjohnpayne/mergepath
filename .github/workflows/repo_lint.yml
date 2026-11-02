@@ -84,6 +84,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # #2926: `--no-renames` lists a moved file's source as well as its
+      # destination, so a tooling file moved out of a tooling path still
+      # selects the deep lane that covers it.
       - name: classify repo-lint scope
         id: classify
         env:
@@ -113,7 +116,7 @@ jobs:
             printf '' | bash "$classifier" --event "$EVENT_NAME"
           elif git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
               && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
-              && changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
+              && changed=$(git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA"); then
             printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME" --head-ref "$HEAD_REF"
           else
             {
