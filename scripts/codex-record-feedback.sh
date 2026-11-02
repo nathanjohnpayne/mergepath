@@ -422,24 +422,23 @@ fi
 if [ "$DO_SCAN" -eq 1 ]; then
   log "scanning current-HEAD latest-round Codex findings (read-only)"
   CONFIG=".github/review-policy.yml"
-  codex_field() {
-    local field=$1
-    [ -f "$CONFIG" ] || return 0
-    awk -v field="$field" '
-      /^codex:/ {in_block=1; next}
-      in_block && /^[^[:space:]#]/ {in_block=0}
-      in_block && $1 == field":" {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^["\047]/, "", $0)
-        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-        gsub(/[[:space:]]*#.*$/, "", $0)
-        sub(/[[:space:]]+$/, "", $0)
-        print
-        exit
-      }
-    ' "$CONFIG"
-  }
-  BOT_LOGIN=$(codex_field bot_login)
+  # codex.bot_login from the parsed policy (#2913). The earlier line-oriented
+  # awk reader matched only an unquoted, block-style `bot_login:` key, so a
+  # quoted key or a flow mapping read as unset and the scan looked for the
+  # default login, missing a custom bot's findings. A missing file keeps the
+  # default; a file that cannot be parsed, or a bot_login that is not a
+  # non-empty string, refuses.
+  BOT_LOGIN=""
+  if [ -f "$CONFIG" ]; then
+    [ -r "$__CRF_DIR/lib/feedback-policy-helpers.sh" ] \
+      || die 3 "scripts/lib/feedback-policy-helpers.sh is missing (policy parser); cannot read codex.bot_login"
+    # shellcheck source=lib/feedback-policy-helpers.sh
+    . "$__CRF_DIR/lib/feedback-policy-helpers.sh"
+    POLICY_JSON=$(policy_yaml_to_json "$CONFIG") && [ -n "$POLICY_JSON" ] \
+      || die 3 "$CONFIG could not be parsed; codex.bot_login is unknown"
+    BOT_LOGIN=$(policy_json_field "$POLICY_JSON" codex.bot_login string) \
+      || die 3 "codex.bot_login could not be read from $CONFIG"
+  fi
   BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
   PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"

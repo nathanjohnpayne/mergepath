@@ -46,6 +46,7 @@ make_case() {
   chmod +x "$dir/scripts/codex-record-feedback.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"  # #2913, --scan policy reader
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 codex:
@@ -106,6 +107,7 @@ make_real_wrapper_case() {
   chmod +x "$dir/scripts/codex-record-feedback.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"  # #2913, --scan policy reader
   mkdir -p "$dir/scripts/workflow"
   cp "$ROOT/scripts/lib/gh-comment-trigger-guard.sh" "$dir/scripts/lib/gh-comment-trigger-guard.sh"
   cp "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" "$dir/scripts/workflow/gh-comment-trigger-guard.py"
@@ -744,6 +746,109 @@ EOF
   fi
 }
 
+# #2913: --scan reads codex.bot_login from the parsed policy. The earlier
+# line-oriented awk reader matched only an unquoted, block-style `bot_login:`
+# key, so a quoted key or a flow mapping read as unset and the scan looked for
+# the default login, missing every finding of a custom bot.
+LEGACY_RECORD_BOT_LOGIN_AWK='
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+write_gh_custom_bot() {
+  local dir=$1
+  cat >"$dir/bin/gh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+[ "\${1:-}" = "api" ] || { echo "unexpected gh: \$*" >&2; exit 9; }
+shift
+[ "\${1:-}" = "--paginate" ] && shift
+ep=\${1:-}
+bot='custom-codex[bot]'
+case "\$ep" in
+  repos/owner/repo/pulls/999) printf '{"head":{"sha":"head-sha"}}\n' ;;
+  repos/owner/repo/pulls/999/reviews)
+    printf '[{"id":300,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-02T00:00:00Z","commit_id":"head-sha"}]\n' "\$bot" ;;
+  repos/owner/repo/pulls/999/comments)
+    printf '[{"id":1501,"user":{"login":"%s"},"pull_request_review_id":300,"path":"a","line":1,"body":"![P1 Badge] custom bot. $SOLICIT"}]\n' "\$bot" ;;
+  repos/owner/repo/pulls/comments/1501)
+    printf '{"id":1501,"user":{"login":"%s"},"pull_request_url":"https://api.github.com/repos/owner/repo/pulls/999","pull_request_review_id":300,"commit_id":"head-sha","path":"a","line":1,"body":"![P1 Badge] custom bot. $SOLICIT"}\n' "\$bot" ;;
+  repos/owner/repo/pulls/comments/*/reactions) printf '[]\n' ;;
+  *) echo "unexpected gh api endpoint: \$ep" >&2; exit 9 ;;
+esac
+EOF
+  chmod +x "$dir/bin/gh"
+}
+
+test_scan_reads_bot_login_from_parsed_policy() {
+  local label yaml dir rc legacy n=0
+  while IFS='|' read -r label yaml; do
+    n=$((n + 1))
+    dir=$(make_case "scan-bot-login-$n")
+    printf '%b\n' "$yaml" >"$dir/.github/review-policy.yml"
+    write_gh_custom_bot "$dir"
+    rc=$(run_case "$dir" -- 999 owner/repo --scan --verdict 1501=fixed)
+    if [ "$rc" = "0" ] && grep -q 'comments/1501/reactions' "$(posts_file "$dir")" 2>/dev/null; then
+      pass "#2913 $label: the scan finds the custom bot's finding"
+    else
+      fail "#2913 $label: the scan missed the custom bot (rc=$rc); stderr=$(cat "$dir/err.log") posts=$(cat "$(posts_file "$dir")" 2>/dev/null)"
+    fi
+    # Mutation self-check: the legacy reader misreads this spelling, so the
+    # case above would fail against it.
+    legacy=$(awk -v field=bot_login "$LEGACY_RECORD_BOT_LOGIN_AWK" "$dir/.github/review-policy.yml")
+    if [ "$legacy" != "custom-codex[bot]" ]; then
+      pass "#2913 mutation $label: the legacy awk reader misreads bot_login ('$legacy')"
+    else
+      fail "#2913 mutation $label: the legacy awk reader already reads bot_login; the case proves nothing"
+    fi
+  done <<'CASES'
+quoted key|codex:\n  "bot_login": "custom-codex[bot]"
+single-quoted key|codex:\n  'bot_login': custom-codex[bot]
+flow mapping|codex: {bot_login: "custom-codex[bot]"}
+flow mapping, quoted key|codex: {"enabled": true, "bot_login": "custom-codex[bot]"}
+CASES
+
+  # A policy that cannot be parsed, or a bot_login of the wrong kind, refuses
+  # before any read or reaction instead of scanning for the default login.
+  while IFS='|' read -r label yaml; do
+    n=$((n + 1))
+    dir=$(make_case "scan-bot-login-$n")
+    printf '%b\n' "$yaml" >"$dir/.github/review-policy.yml"
+    write_gh_custom_bot "$dir"
+    rc=$(run_case "$dir" -- 999 owner/repo --scan --verdict 1501=fixed)
+    if [ "$rc" = "3" ] && [ ! -s "$(posts_file "$dir")" ] && grep -q 'codex.bot_login' "$dir/err.log"; then
+      pass "#2913 $label: --scan refuses (exit 3) and posts nothing"
+    else
+      fail "#2913 $label: expected exit 3 and no post (rc=$rc); stderr=$(cat "$dir/err.log")"
+    fi
+  done <<'CASES'
+unparseable policy|codex:\n  bot_login: [unclosed
+list bot_login|codex:\n  bot_login: [custom-codex]
+empty bot_login|codex: {bot_login: ""}
+CASES
+
+  # No policy file keeps the default login, as before.
+  dir=$(make_case "scan-bot-login-absent")
+  rm -f "$dir/.github/review-policy.yml"
+  write_gh_custom_bot "$dir"
+  rc=$(run_case "$dir" -- 999 owner/repo --scan --verdict 1501=fixed)
+  if [ "$rc" = "0" ] && [ ! -s "$(posts_file "$dir")" ] \
+     && [ "$(jq -c '[.skipped[] | select(.why=="not-found") | .comment_id]' "$dir/out.json")" = "[1501]" ]; then
+    pass "#2913: with no policy file the scan keeps the default login (the custom bot's finding is not-found)"
+  else
+    fail "#2913: absent policy changed behaviour (rc=$rc); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+
 test_string_id_coerced_no_double_report
 test_fixed_reacts_plus1_via_reviewer
 test_rebuttal_reacts_minus1
@@ -760,6 +865,7 @@ test_findings_from_stdin
 test_post_failure_exits_1_and_skips_ledger
 test_ambient_gh_token_bridges_to_reviewer_write
 test_explicit_reviewer_pat_not_clobbered_by_ambient
+test_scan_reads_bot_login_from_parsed_policy
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
