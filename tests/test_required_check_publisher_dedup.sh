@@ -255,6 +255,11 @@ gif_decide() {
   esac
 }
 SH
+# A stub budget reader: FP_BUDGET_OK=0 is a budget short of the comparison.
+cat >"$FPDIR/.gate-input-fingerprint/scripts/workflow/installation-budget.sh" <<'SH'
+ib_read() { :; }
+ib_affordable() { [ "${FP_BUDGET_OK:-1}" = 1 ]; }
+SH
 printf '#!/bin/sh\necho bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TMP/fpbin/git"
 chmod +x "$TMP/fpbin/git"
 
@@ -265,7 +270,7 @@ fp_case() {  # name action attempt mode parent decision want_calls want_posts wa
     cd "$FPDIR"
     [ "${FP_NO_LIB:-}" != 1 ] || mv .gate-input-fingerprint .gate-input-fingerprint.off
     PATH="$TMP/fpbin:$TMP:$PATH" \
-      GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$4" FP_LOG="$dir/fp" FP_DECISION="$6" \
+      GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$4" FP_LOG="$dir/fp" FP_DECISION="$6" FP_BUDGET_OK="${FP_BUDGET_OK:-1}" \
       REPO="example/repo" HEAD_SHA="abc123" PARENT_RUN_ID="4242" \
       PARENT_RUN_ATTEMPT="$3" EVENT_ACTION="$2" PARENT_EVENT="$5" \
       MCG_CONTEXT="Merge clearance gate" \
@@ -309,6 +314,8 @@ fp_case fp-label-never-skips requested 1 empty pull_request_target match 6 3 0 1
 fp_case fp-review-mismatch requested 1 empty pull_request_review nomatch 6 3 0 1 1
 fp_case fp-review-unreadable requested 1 empty pull_request_review fail 6 3 0 1 1
 FP_NO_LIB=1 fp_case fp-review-no-library requested 1 empty pull_request_review match 6 3 0 1 0
+# A budget short of the comparison opens every hold and asks nothing.
+FP_BUDGET_OK=0 fp_case fp-review-budget-short requested 1 empty pull_request_review match 6 3 0 1 0
 # The in_progress delivery: a context the requested delivery left standing
 # is covered by the same decision, and costs one PR-list read, no writes.
 fp_case fp-in-progress-covered in_progress 1 exact-but-mcg pull_request_review match 3 0 1 0 1

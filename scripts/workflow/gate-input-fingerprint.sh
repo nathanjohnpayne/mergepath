@@ -95,10 +95,15 @@ gif_threads() {
 #
 # Reviews are the one surface not hashed raw, because a repeated identical
 # approval is a NEW review object: each review is reduced to who left it,
-# its state, commit and body, and a review identical to the same author's
-# previous one is dropped. A dismissal (state DISMISSED), an edit (body), a
-# CHANGES_REQUESTED or an approval of another commit is never identical, so
-# each one changes the fingerprint. Inline comments, PR-level comments and
+# its state, commit and body, and a review identical to the one immediately
+# before it in the PR's whole review sequence is dropped. Only that adjacent
+# repeat is dropped, never a repeat with another review in between: the
+# gate selects governing reviews by their order across reviewers (the
+# newest Phase 4b approver, for one), so a reviewer re-posting an approval
+# after someone else's moves that selection and must change the
+# fingerprint (Codex P1 on #2924). A dismissal (state DISMISSED), an edit
+# (body), a CHANGES_REQUESTED or an approval of another commit is never
+# identical, so each one changes the fingerprint. Inline comments, PR-level comments and
 # review threads are hashed with their ids, bodies, edit times and reaction
 # counts, so any finding, reply, edit, deletion or resolution changes it.
 GIF_MCG_PROJECTION=$(cat <<'JQ'
@@ -122,9 +127,7 @@ def rx: if type == "object" then del(.url) else null end;
   reviews: ($reviews | sort_by(.id)
     | map({user: .user.login, state, commit: .commit_id, body,
            association: .author_association})
-    | reduce .[] as $r ({last: {}, out: []};
-        if .last[$r.user] == $r then . else .last[$r.user] = $r | .out += [$r] end)
-    | .out),
+    | reduce .[] as $r ([]; if (length > 0 and .[-1] == $r) then . else . + [$r] end)),
   inline: ($inline | sort_by(.id) | map({
     id, user: .user.login, body, created_at, updated_at,
     review: .pull_request_review_id, reply_to: .in_reply_to_id,

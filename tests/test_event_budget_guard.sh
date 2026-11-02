@@ -593,6 +593,7 @@ gif_decide() {
 mkdir -p "$W/.gate-input-fingerprint/scripts/workflow"
 printf '%s\n' "$FP_STUB" >"$W/.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh"
 printf '%s\n' "$FP_STUB" >"$W/scripts/workflow/gate-input-fingerprint.sh"
+cp "$BUDGET_LIB" "$W/.gate-input-fingerprint/scripts/workflow/installation-budget.sh"
 FPA=$(printf 'a%.0s' $(seq 64)); FPB=$(printf 'e%.0s' $(seq 64))
 # mcg_fp <event> [VAR=value ...]: the fingerprint step, then either the skip
 # (report only) or the full job with the step's `before` handed to phase 2.
@@ -633,6 +634,9 @@ check "no live fingerprint: evaluated in full, nothing recorded" \
 fresh; mcg_fp pull_request FP_SEQ="$FPA" MCG_MODE=block && rc=0 || rc=$?
 check "a red verdict records no fingerprint and the native run still fails" \
   '[ "$rc" = 1 ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|failure" ] && [ "$(newest_text)" = none ]'
+fresh; mcg_fp pull_request_review "$SHORT" FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "short installation budget: no comparison read, no skip; the guarded path decides as before" \
+  '[ "$FP_STEP_SKIP" != true ] && [ -z "$FP_STEP_BEFORE" ] && [ ! -s "$T/state/fp-calls" ] && [ -z "$(gates)" ]'
 mv "$W/.gate-input-fingerprint" "$W/.gate-input-fingerprint.off"
 fresh; mcg_fp pull_request_review FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
 check "no library on the default branch: no skip and no recorded fingerprint" \

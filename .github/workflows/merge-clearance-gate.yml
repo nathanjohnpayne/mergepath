@@ -214,7 +214,9 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           path: .gate-input-fingerprint
           fetch-depth: 1
-          sparse-checkout: scripts/workflow/gate-input-fingerprint.sh
+          sparse-checkout: |
+            scripts/workflow/gate-input-fingerprint.sh
+            scripts/workflow/installation-budget.sh
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -238,12 +240,34 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CHECK_NAME: "Merge clearance gate"
+          # The comparison's own reads (five paginated REST lists, the PR
+          # read, one check-run listing; one GraphQL point), against the same
+          # reserve as the budget guard below, so an optional comparison
+          # never spends what that guard keeps back (Codex P2 on #2924).
+          FP_BUDGET_REQUESTS: "8"
+          FP_BUDGET_RESERVE_REQUESTS: "200"
+          FP_BUDGET_GRAPHQL_POINTS: "1"
+          FP_BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           set -uo pipefail
           lib=.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh
+          budget=.gate-input-fingerprint/scripts/workflow/installation-budget.sh
           if [ ! -r "$lib" ]; then
             echo "::notice::$lib is not on the default branch yet; evaluating in full (#2920)."
             exit 0
+          fi
+          # A short budget skips the comparison, never the evaluation: the
+          # guarded path below runs exactly as without it. An unreadable
+          # budget compares, the guard's own direction.
+          if [ -r "$budget" ]; then
+            # shellcheck source=scripts/workflow/installation-budget.sh
+            . "$budget" || exit 0
+            ib_read "$FP_BUDGET_REQUESTS" "$FP_BUDGET_RESERVE_REQUESTS" \
+              "$FP_BUDGET_GRAPHQL_POINTS" "$FP_BUDGET_GRAPHQL_RESERVE_POINTS"
+            if ! ib_affordable 1; then
+              echo "::notice::The installation budget does not cover the input comparison beyond the reserve; evaluating in full (#2920)."
+              exit 0
+            fi
           fi
           # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
           . "$lib" || exit 0
@@ -402,7 +426,8 @@ jobs:
           # reserve) plus room for the skip-path writes of the other gate
           # workflows the same review event starts, so an event workflow
           # stops spending before the publisher has to.
-          BUDGET_PER_EVAL_REQUESTS: "30"
+          # #2920: plus six for the input fingerprint re-read after a green.
+          BUDGET_PER_EVAL_REQUESTS: "36"
           BUDGET_RESERVE_REQUESTS: "200"
           BUDGET_PER_EVAL_GRAPHQL_POINTS: "5"
           BUDGET_GRAPHQL_RESERVE_POINTS: "75"

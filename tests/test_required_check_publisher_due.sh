@@ -826,6 +826,11 @@ MCG_RED_PRS=1 fp_pass fp-red pull_request "$FPA" ""
 check "a red verdict never records a fingerprint" \
   eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_text "$EH")" = none ]'
 
+RL_REMAINING=140 fp_pass fp-budget-short pull_request_review "$FPA" "$FPA"
+check "a budget that covers the event head but not the comparison: evaluated, no comparison read" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ ! -s "$TMP/fp-calls" ]'
+unset RL_REMAINING
+
 CASE_PARENT_NAME=repo-lint fp_pass fp-lint-parent pull_request_review "$FPA" "$FPA"
 check "a repo-lint parent never skips" \
   eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log"'

@@ -8,7 +8,8 @@
 # the library's own --jq expression with the real jq.
 #
 # Skips (the fingerprint is unchanged):
-#   1. a second identical approval on the same head;
+#   1. a second identical approval on the same head, right after the first
+#      (1b: one with another reviewer's review in between re-evaluates);
 #   2. a second identical comment-only review on the same head.
 # Re-evaluates (the fingerprint changes):
 #   3. approve, then request changes;
@@ -165,6 +166,20 @@ jq --arg head "$HEAD" '. + [{id: 12, user: {login: "nathanpayne-claude"}, state:
   commit_id: $head, body: "", author_association: "COLLABORATOR",
   submitted_at: "2026-11-01T10:05:00Z"}]' "$TMP/base/reviews.json" >"$TMP/re-approve/reviews.json"
 expect_same "1. repeated identical approval keeps the fingerprint" "$TMP/base" "$TMP/re-approve"
+
+# 1b. The same re-approval with ANOTHER reviewer's approval in between is not
+# collapsed: the gate selects governing reviews by their order across
+# reviewers (the newest Phase 4b approver), so it moves that selection.
+cp -R "$TMP/base" "$TMP/interleaved-a"
+jq --arg head "$HEAD" '. + [{id: 12, user: {login: "nathanpayne-codex"}, state: "APPROVED",
+  commit_id: $head, body: "4b approve [1,2]", author_association: "COLLABORATOR"}]' \
+  "$TMP/base/reviews.json" >"$TMP/interleaved-a/reviews.json"
+cp -R "$TMP/interleaved-a" "$TMP/interleaved-b"
+jq --arg head "$HEAD" '. + [{id: 13, user: {login: "nathanpayne-claude"}, state: "APPROVED",
+  commit_id: $head, body: "", author_association: "COLLABORATOR"}]' \
+  "$TMP/interleaved-a/reviews.json" >"$TMP/interleaved-b/reviews.json"
+expect_differ "1b. re-approval after another reviewer's approval changes the fingerprint" \
+  "$TMP/interleaved-a" "$TMP/interleaved-b"
 
 # 2. A second identical comment-only review.
 cp -R "$TMP/base" "$TMP/comment1"
