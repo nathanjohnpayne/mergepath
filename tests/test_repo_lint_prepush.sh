@@ -226,6 +226,7 @@ HUB="$TMP/hub"
 REMOTE="$TMP/hub-remote.git"
 mkdir -p "$HUB/scripts/ci" "$HUB/.github/workflows"
 cp "$REPO_ROOT/scripts/ci/repo-lint-scope.sh" "$REPO_ROOT/scripts/ci/repo-lint-dependencies.json" "$HUB/scripts/ci/"
+cp "$REPO_ROOT/scripts/ci/repo-lint-tooling-scope.sh" "$HUB/scripts/ci/"
 cp "$REPO_ROOT/.github/workflows/repo_lint.yml" "$HUB/.github/workflows/"
 cp "$RUNNER" "$HUB/scripts/"
 printf '#!/usr/bin/env bash\n# hub marker\n' > "$HUB/scripts/sync-to-downstream.sh"
@@ -243,6 +244,16 @@ yq '.jobs.scope.steps[] | select(.name == "classify repo-lint scope") | .run' \
   "$HUB/.github/workflows/repo_lint.yml" > "$TMP/ci_classify.sh"
 if ! grep -q 'repo-lint-scope.sh' "$TMP/ci_classify.sh"; then
   echo "test_repo_lint_prepush: FAIL (could not extract the CI classify step)" >&2
+  exit 1
+fi
+# The #2921 tooling step publishes the scope output the gated fast-lane
+# steps read. The hook never skips them, so parity holds only where CI runs
+# them too: this fixture declares no content paths, so CI answers
+# tooling=true, and the evaluator below reads that answer from the step.
+yq '.jobs.scope.steps[] | select(.id == "tooling") | .run' \
+  "$HUB/.github/workflows/repo_lint.yml" > "$TMP/ci_tooling.sh"
+if ! grep -q 'repo-lint-tooling-scope.sh' "$TMP/ci_tooling.sh"; then
+  echo "test_repo_lint_prepush: FAIL (could not extract the CI tooling step)" >&2
   exit 1
 fi
 
@@ -348,6 +359,13 @@ while IFS='|' read -r id branch paths undeclared; do
   else
     check "[$id] no local scope without an undeclared path" "$(grep -c '^local_scope' "$TMP/plan.$id" || true)" "0"
   fi
+
+  : > "$TMP/ci_tooling.$id"
+  (cd "$HUB" && EVENT_NAME=pull_request BASE_SHA="$base" HEAD_SHA="$head" \
+     GITHUB_OUTPUT="$TMP/ci_tooling.$id" bash -e "$TMP/ci_tooling.sh") > /dev/null
+  check "[$id] CI's tooling step runs the full set on this fixture" "$(cat "$TMP/ci_tooling.$id")" "tooling=true"
+  cat "$TMP/ci_tooling.$id" >> "$TMP/ci_scope.$id"
+  cat "$TMP/ci_tooling.$id" >> "$TMP/ci_local_scope.$id"
 
   # (a) Coverage: every check step CI executes is in exactly the hook's plan
   # (any lane, the undeclared-path fallback lanes included), nothing more.
