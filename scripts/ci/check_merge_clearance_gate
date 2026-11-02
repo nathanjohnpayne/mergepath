@@ -1004,6 +1004,62 @@ if "workflow_run" in trigger_keys:
         "      completion. Add CI-side parents to the publisher instead.")
 
 # Property 1 — phase 1 is the FIRST step, unconditional, with its own bindings.
+#
+# #2920 admits exactly one preamble before it: a shallow, sparse checkout of
+# the input-fingerprint library from the default branch, then the step that
+# compares the live review inputs with the newest published verdict. Phase 1
+# then carries exactly one condition, that comparison's skip output. Both
+# preamble steps are pinned whole, so neither can grow into an evaluator or a
+# writer, and the skip output is set only when the newest Checks-API run is
+# already a green verdict for the same inputs: no stale verdict needs
+# retiring in exactly the runs that skip the hold.
+FP_CHECKOUT_NAME = "Checkout the input-fingerprint library (#2920)"
+FP_CHECKOUT = {
+    "name": FP_CHECKOUT_NAME,
+    "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "with": {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "path": ".gate-input-fingerprint",
+        "fetch-depth": 1,
+        "sparse-checkout": "scripts/workflow/gate-input-fingerprint.sh",
+        "sparse-checkout-cone-mode": False,
+        "persist-credentials": False,
+    },
+}
+FP_STEP_NAME = "Compare review inputs with the published verdict (#2920)"
+FP_STEP_KEYS = {"name", "id", "env", "run"}
+FP_SKIP_IF = "${{ steps.fp.outputs.skip != 'true' }}"
+_mcg_job = jobs.get("merge-clearance-gate")
+_steps_all = _mcg_job.get("steps") if isinstance(_mcg_job, dict) else None
+FP_PREAMBLE = False
+if isinstance(_steps_all, list) and len(_steps_all) >= 3 \
+        and isinstance(_steps_all[0], dict) and _steps_all[0].get("name") == FP_CHECKOUT_NAME:
+    FP_PREAMBLE = True
+    if _steps_all[0] != FP_CHECKOUT:
+        bad("FAIL: [#2920 fingerprint preamble] the step %r is not exactly the pinned" % FP_CHECKOUT_NAME,
+            "      shallow, sparse, default-branch checkout of the fingerprint library",
+            "      (got %r). A PR-head ref would let a PR make every run skip; a" % (_steps_all[0],),
+            "      wider checkout turns the preamble into a second evaluator.")
+    fp_step = _steps_all[1]
+    if not isinstance(fp_step, dict) or fp_step.get("name") != FP_STEP_NAME \
+            or set(fp_step) != FP_STEP_KEYS or fp_step.get("id") != "fp":
+        bad("FAIL: [#2920 fingerprint preamble] the second step must be %r with" % FP_STEP_NAME,
+            "      id: fp and exactly the keys %s (no if:, no" % sorted(FP_STEP_KEYS),
+            "      continue-on-error:, no uses:).")
+    else:
+        fenv = fp_step.get("env") or {}
+        frun = strip_comments(fp_step.get("run") or "")
+        if fenv.get("HEAD_SHA") not in HEAD_SHA_OK or fenv.get("CHECK_NAME") != "Merge clearance gate":
+            bad("FAIL: [#2920 fingerprint preamble] the comparison must bind HEAD_SHA to",
+                "      the PR head and CHECK_NAME to exactly 'Merge clearance gate'.")
+        if "gif_decide" not in frun or "pull_request_review|pull_request_review_comment)" not in frun:
+            bad("FAIL: [#2920 fingerprint preamble] the comparison must decide through",
+                "      gif_decide, and only for review and review-comment events: a push",
+                "      always recomputes.")
+    steps_for_phase1 = _steps_all[2:]
+else:
+    steps_for_phase1 = None
+
 event_job = jobs.get("merge-clearance-gate")
 if event_job is not None and not isinstance(event_job, dict):
     # A non-mapping value (a YAML list or scalar) is truthy, so `or {}` does
@@ -1014,6 +1070,8 @@ if event_job is not None and not isinstance(event_job, dict):
     # with accurate text instead of crashing before any of them print.
     event_job = None
 steps = (event_job or {}).get("steps") or []
+if steps_for_phase1 is not None:
+    steps = steps_for_phase1
 if not steps:
     bad("FAIL: [#850 phase-1 position] the merge-clearance-gate job declares no",
         "      steps, so nothing opens the in-progress check_run.")
@@ -1047,7 +1105,7 @@ else:
             "      point fails CLOSED only if the pending entry already retired the",
             "      previous verdict, so phase 1 must come first and must actually",
             "      publish.")
-    if "if" in first:
+    if "if" in first and not (FP_PREAMBLE and first["if"] == FP_SKIP_IF):
         bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
             "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
             "      the run it guards is the one that needed to retire a stale verdict.")
@@ -1158,8 +1216,18 @@ STEP_IF_ALLOWED = {
     ("merge-clearance-gate", "Confirm the Checks-API lineage blocks while pending (#2247)"):
         "${{ (steps.gate.outputs.pending == 'true' || steps.budget.outputs.skip == 'true' || steps.gate.outputs.rate_limited == 'true') && steps.open.outputs.id != '' }}",
     # #2286: the gate step is skipped only when the budget guard said so.
+    # #2920: or when the review inputs match the published green verdict.
     ("merge-clearance-gate", "Run scripts/merge-clearance-gate.sh"):
-        "${{ steps.budget.outputs.skip != 'true' }}",
+        "${{ steps.budget.outputs.skip != 'true' && steps.fp.outputs.skip != 'true' }}",
+    # #2920: a run whose review inputs match the published green verdict
+    # opens no hold, checks out nothing further and reads no budget. Its
+    # native conclusion is decided by the report step's FP_SKIP arm.
+    ("merge-clearance-gate", "Open the required check_run (#841 phase 1)"):
+        "${{ steps.fp.outputs.skip != 'true' }}",
+    ("merge-clearance-gate", "Checkout repo (default branch — trusted gate scripts)"):
+        "${{ steps.fp.outputs.skip != 'true' }}",
+    ("merge-clearance-gate", "Installation budget guard (#2286)"):
+        "${{ steps.fp.outputs.skip != 'true' }}",
 }
 for key in PRODUCERS:
     job = jobs.get(key)
@@ -1344,7 +1412,7 @@ if budget_step in (None, "ambiguous"):
 else:
     benv = budget_step.get("env") or {}
     brun = strip_comments(budget_step.get("run") or "")
-    if budget_step.get("id") != "budget" or "if" in budget_step:
+    if budget_step.get("id") != "budget" or ("if" in budget_step and budget_step["if"] != FP_SKIP_IF):
         bad("FAIL: [#2286 budget guard] the budget step must carry id: budget and no",
             "      step-level if:, so every evaluating run reads the budget first.")
     for knob in ("BUDGET_PER_EVAL_REQUESTS", "BUDGET_RESERVE_REQUESTS",

@@ -203,8 +203,72 @@ jobs:
       && github.event_name != 'repository_dispatch'
       && github.event_name != 'issue_comment'
     steps:
+      # #2920: a review event whose inputs have not changed since the newest
+      # published verdict leaves that verdict standing. This checkout carries
+      # only the fingerprint library, from the default branch (never the PR
+      # head: a PR could otherwise make every run skip), and is shallow so
+      # the hold below opens a few seconds later at most.
+      - name: Checkout the input-fingerprint library (#2920)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .gate-input-fingerprint
+          fetch-depth: 1
+          sparse-checkout: scripts/workflow/gate-input-fingerprint.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Compare review inputs with the published verdict (#2920)
+        # Never fails the job and never decides a verdict: it sets skip=true
+        # only for a review or review-comment event whose live input
+        # fingerprint equals the one recorded on the newest Checks-API run of
+        # this context on the head, and that run is a completed success under
+        # 30 minutes old (scripts/workflow/gate-input-fingerprint.sh states
+        # each condition). Every other outcome, including a missing library,
+        # a failed read or any mismatch, evaluates in full as before. A push
+        # (pull_request events), the sweep and the dispatch path always
+        # recompute. `before` is the fingerprint read before the evaluation;
+        # phase 2 records it only if a second read after the evaluation
+        # matches.
+        id: fp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHECK_NAME: "Merge clearance gate"
+        run: |
+          set -uo pipefail
+          lib=.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh
+          if [ ! -r "$lib" ]; then
+            echo "::notice::$lib is not on the default branch yet; evaluating in full (#2920)."
+            exit 0
+          fi
+          # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
+          . "$lib" || exit 0
+          revision=$(git -C .gate-input-fingerprint rev-parse HEAD 2>/dev/null) || exit 0
+          case "$EVENT_NAME" in
+            pull_request_review|pull_request_review_comment)
+              if gif_decide "$REPO" "$PR_NUMBER" "$HEAD_SHA" "$CHECK_NAME" "$revision"; then
+                echo "::notice::Review inputs on $HEAD_SHA are unchanged since the published verdict ($GIF_REASON); leaving it standing without re-evaluating (#2920)."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Evaluating in full: ${GIF_REASON:-no decision} (#2920)."
+              ;;
+            *)
+              GIF_HEX=$(gif_compute "$REPO" "$PR_NUMBER" "$HEAD_SHA" "$CHECK_NAME" "$revision") || GIF_HEX=""
+              ;;
+          esac
+          if [ -n "${GIF_HEX:-}" ]; then
+            echo "before=$GIF_HEX" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
       - name: Open the required check_run (#841 phase 1)
         id: open
+        if: ${{ steps.fp.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -270,6 +334,7 @@ jobs:
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repo (default branch — trusted gate scripts)
+        if: ${{ steps.fp.outputs.skip != 'true' }}
         # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
         # status check: if it ran scripts/merge-clearance-gate.sh (and the
         # codex-review-check.sh it delegates to) from the PR's own
@@ -309,6 +374,7 @@ jobs:
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
       - name: Installation budget guard (#2286)
+        if: ${{ steps.fp.outputs.skip != 'true' }}
         # Reads GET /rate_limit (free) through the publisher's own reader,
         # scripts/workflow/installation-budget.sh. When the installation
         # budget cannot cover one evaluation plus the reserve, this run does
@@ -364,7 +430,7 @@ jobs:
 
       - name: Run scripts/merge-clearance-gate.sh
         id: gate
-        if: ${{ steps.budget.outputs.skip != 'true' }}
+        if: ${{ steps.budget.outputs.skip != 'true' && steps.fp.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -459,6 +525,8 @@ jobs:
           BUDGET_SKIP_TITLE: ${{ steps.budget.outputs.title }}
           RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
           RATE_LIMITED_TITLE: ${{ steps.gate.outputs.budget_title }}
+          # #2920: the input fingerprint read before the evaluation.
+          FP_BEFORE: ${{ steps.fp.outputs.before }}
         run: |
           set -uo pipefail
           if [ "${BUDGET_SKIP:-}" = true ] || [ "${RATE_LIMITED:-}" = true ]; then
@@ -515,6 +583,25 @@ jobs:
               summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
             fi
           fi
+          # #2920: a green verdict records the input fingerprint it was
+          # computed from, so a later review event with unchanged inputs can
+          # leave it standing. Only when a second read, after the evaluation,
+          # matches the one before it (a state change during the evaluation
+          # records nothing), and only in output.text, which no gate output
+          # reaches. Any failure records nothing: the next event evaluates.
+          fp_args=()
+          if [ "$conclusion" = success ] && [ -n "${FP_BEFORE:-}" ] \
+             && [ -r scripts/workflow/gate-input-fingerprint.sh ]; then
+            # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
+            if . scripts/workflow/gate-input-fingerprint.sh \
+               && fp_after=$(gif_compute "$REPO" "$PR_NUMBER" "$HEAD_SHA" "Merge clearance gate" "$trusted_revision") \
+               && [ "$fp_after" = "$FP_BEFORE" ] \
+               && fp_marker=$(gif_marker "Merge clearance gate" "$fp_after"); then
+              fp_args=(-f "output[text]=$fp_marker")
+            else
+              echo "Review inputs changed during the evaluation or could not be re-read; recording no input fingerprint (#2920)."
+            fi
+          fi
           # A PATCH that never lands leaves the run in_progress = the required
           # context PENDING = merge blocked. Fail-closed in BOTH verdict
           # directions, which is why this step needs no asymmetric error
@@ -524,7 +611,7 @@ jobs:
               -f status="completed" \
               -f conclusion="$conclusion" \
               -f "output[title]=$title" \
-              -f "output[summary]=$summary" >/dev/null && exit 0
+              -f "output[summary]=$summary" ${fp_args[@]+"${fp_args[@]}"} >/dev/null && exit 0
             sleep $((attempt * 5))
           done
           echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the scheduled sweep supersedes it (#841)."
@@ -596,8 +683,17 @@ jobs:
           API_BLOCKING: ${{ steps.lineage.outputs.api_blocking }}
           BUDGET_SKIP: ${{ steps.budget.outputs.skip }}
           RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
+          FP_SKIP: ${{ steps.fp.outputs.skip }}
         run: |
           set -euo pipefail
+          # #2920: the review inputs on this head match the newest published
+          # verdict, a completed success carrying their fingerprint, so this
+          # run evaluated nothing and left that verdict standing. A success is
+          # the only verdict ever reused, so this native run is a success too.
+          if [ "${FP_SKIP:-}" = true ]; then
+            echo "::notice::Merge clearance inputs are unchanged since the published green verdict on this head; not re-evaluated (#2920)."
+            exit 0
+          fi
           # #2286: a run that did not evaluate (budget guard skip, or the
           # script failed on the exhausted installation budget). Its phase 2
           # closed this run's hold with the publisher's back-off red; the

@@ -1587,6 +1587,14 @@ paths:
     requires:
       - ".github/workflows/required-check-publisher.yml"
       - "scripts/workflow/installation-budget.sh"   # #2286, staged into the extracted publish step
+  # Unit suite for the review-input fingerprint (#2920): the reads, the
+  # per-context projection and the published-run decision. Hard-run by
+  # check_required_check_publisher.
+  - path: tests/test_gate_input_fingerprint.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/gate-input-fingerprint.sh"
   # Runs the budget guard of every event-driven gate workflow (#2286) from the
   # shipped workflow files, against the real budget reader, snapshot driver,
   # lineage helper and the publisher's own due(). Hard-run by
@@ -2633,6 +2641,7 @@ paths:
       - "scripts/codex-review-check.sh"
       - "scripts/gate-api-lineage-blocking.sh"   # #2247 pending arm of the native conclusion
       - "scripts/workflow/installation-budget.sh"   # #2286, budget guard (absent: evaluates without it)
+      - "scripts/workflow/gate-input-fingerprint.sh"   # #2920, review-input skip (absent: evaluates in full)
   - path: .github/workflows/required-check-publisher.yml
     type: canonical
     consumers: all
@@ -2646,6 +2655,7 @@ paths:
       - "scripts/workflow/installation-budget.sh"   # #2286, the budget reader, sourced hard (#2220 guard)
       - "scripts/workflow/coderabbit-evidence-recovery.py"
       - "scripts/workflow/reap-orphaned-holds.sh"   # #2907, scheduled-pass orphaned-hold reaper
+      - "scripts/workflow/gate-input-fingerprint.sh"   # #2920, review-input skip (absent: evaluates in full)
       # The parent workflow is the trigger source: workflow_run fires only
       # on its exact top-level name, so a consumer missing (or renaming)
       # it gets no event-driven publishes at all (cross-agent round 3 on
@@ -2972,6 +2982,7 @@ paths:
       - "tests/test_required_check_publisher_dedup.sh"  # check_required_check_publisher behavior suite (#1130)
       - "tests/test_required_check_publisher_summary_hold.sh"  # CodeRabbit rc-3 publication hold (#886)
       - "tests/test_required_check_publisher_due.sh"  # due-only event-pass targeting (#1130)
+      - "tests/test_gate_input_fingerprint.sh"  # review-input fingerprint skip (#2920)
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
       - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)
