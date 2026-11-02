@@ -2205,7 +2205,10 @@ mcg22_case I '' pass
 
 # #2918: dispatch-recheck nominates a PR whose green verdict a Codex comment
 # published to auto-clear, through a separate contents: write job. Each case
-# breaks one part of that hand-off and must be named as the cause.
+# breaks one part of that hand-off and must be named as the cause. Every pin
+# is structural, so the cases are gated on PyYAML like Test 24: the check
+# soft-skips that layer without it.
+if python3 -c "import yaml" >/dev/null 2>&1; then
 MCG_TAG='#2918'
 mcg22_case nominate-job-removed \
   's{\n  nominate-auto-clear:\n.*?(?=\n  [A-Za-z0-9_-]+:\n)}{}s' \
@@ -2235,6 +2238,9 @@ mcg22_case nominate-step-id-dropped \
   's{^        id: recheck\n}{}m' \
   fail "step's id is"
 unset MCG_TAG
+else
+  echo; echo "SKIP: #2918 nomination cases — PyYAML unavailable (the check soft-skips them too)"
+fi
 
 # ---------------------------------------------------------------------------
 # Test 24 (#850): the STRUCTURAL layer — assertions over the PARSED document.
