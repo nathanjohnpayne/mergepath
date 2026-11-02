@@ -876,6 +876,47 @@ else
     fail "the scope step's kit-less and diff-unavailable fallbacks must emit consumer_replay and self_tests"
   fi
 
+  # #2926: a tooling file moved out of a tooling path must still select the
+  # deep lane. With rename detection on, the diff lists only the
+  # destination, so the move reads as a docs change and skips the deep net
+  # that covers the moved file. Execute the shipped step body on a real
+  # rename, and prove the fixture is a rename git would collapse.
+  if [ -f "$SCOPE" ] && [ -f "$DEPENDENCIES" ] && command -v git >/dev/null 2>&1; then
+    RN_GIT="$SCOPE_FIXTURES/rename-git"
+    cp -R "$HUB_SCOPE_ROOT" "$RN_GIT"
+    printf '#!/usr/bin/env bash\n# residue safety wrapper fixture\nexit 0\n' > "$RN_GIT/scripts/ci/check_consumer_residue_safety"
+    git -C "$RN_GIT" init -q -b main
+    git -C "$RN_GIT" -c user.name=t -c user.email=t@example.invalid add -A
+    git -C "$RN_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm base
+    rn_base=$(git -C "$RN_GIT" rev-parse HEAD)
+    mkdir -p "$RN_GIT/docs"
+    git -C "$RN_GIT" mv scripts/ci/check_consumer_residue_safety docs/residue-safety.txt
+    git -C "$RN_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm rename
+    rn_head=$(git -C "$RN_GIT" rev-parse HEAD)
+
+    # $1 step body. Prints the published `full` value.
+    run_classify_step() {
+      local out="$SCOPE_FIXTURES/rename-github-output"
+      : > "$out"
+      ( cd "$RN_GIT" && EVENT_NAME=pull_request BASE_SHA="$rn_base" HEAD_SHA="$rn_head" HEAD_REF=feat/move \
+          GITHUB_OUTPUT="$out" bash --noprofile --norc -e -o pipefail -c "$1" >/dev/null 2>&1 ) || echo "step-failed"
+      sed -n 's/^full=//p' "$out"
+    }
+    rn_collapsed=$(git -C "$RN_GIT" -c diff.renames=true diff --name-only "$rn_base" "$rn_head")
+    rn_destination_full=$(classify pull_request docs/residue-safety.txt | sed -n 's/^full=//p')
+    rn_step_full=$(run_classify_step "$classify_run")
+    # Mutation: the same step with rename detection back on must miss it.
+    rn_mutant=${classify_run//'git diff --no-renames --name-only'/'git diff --name-only'}
+    rn_mutant_full=$(run_classify_step "$rn_mutant")
+    if [ "$rn_collapsed" = "docs/residue-safety.txt" ] && [ "$rn_destination_full" = "false" ] \
+       && [ "$rn_step_full" = "true" ] \
+       && [ "$rn_mutant" != "$classify_run" ] && [ "$rn_mutant_full" = "false" ]; then
+      pass "the classify step selects the full deep lane for a tooling file renamed out of a tooling path (rename-detecting mutant caught)"
+    else
+      fail "the classify step must count a renamed file's source path (collapsed=$rn_collapsed destination_full=$rn_destination_full step_full=$rn_step_full mutant_full=$rn_mutant_full)"
+    fi
+  fi
+
   if yq -e '.jobs.deep_safety.needs == "scope" and .jobs.deep_safety.if == "needs.scope.outputs.deep == '\''true'\''" and (.jobs.deep_safety.strategy.matrix.safety | contains(["consumer", "residue"]))' "$REPO_LINT" >/dev/null; then
     pass "one matrix declaration runs the two exhaustive safety nets in parallel only for deep CI"
   else
