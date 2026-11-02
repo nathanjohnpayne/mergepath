@@ -268,8 +268,8 @@ expect_same "7h. the PR's updated_at alone keeps the fingerprint" "$TMP/base" "$
 # 128 KiB): a 200 KiB comment body still fingerprints, and its edit still
 # changes the fingerprint.
 cp -R "$TMP/base" "$TMP/big"
-big=$(head -c 204800 /dev/zero | tr '\0' 'x')
-jq --arg b "$big" '.[0].body = $b' "$TMP/base/comments.json" >"$TMP/big/comments.json"
+# Built inside jq: as a --arg the fixture would itself exceed the limit.
+jq '.[0].body = ("x" * 204800)' "$TMP/base/comments.json" >"$TMP/big/comments.json"
 cp -R "$TMP/big" "$TMP/big2"
 jq '.[0].body += "y"' "$TMP/big/comments.json" >"$TMP/big2/comments.json"
 expect_differ "7i. a comment body over 128 KiB fingerprints, and its edit changes it" "$TMP/big" "$TMP/big2"
