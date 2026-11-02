@@ -131,7 +131,10 @@ jobs:
       # failed diff or merge base, a classifier error or any other output
       # writes tooling=true, so every doubt runs the full set. The diff is
       # three-dot (against the merge base), so a content branch that is
-      # behind main is not charged with main's own tooling commits.
+      # behind main is not charged with main's own tooling commits, and
+      # `--no-renames` lists a moved file's source as well as its
+      # destination, so a tooling file renamed into a content directory
+      # still reads as a tooling change.
       - name: classify tooling scope
         id: tooling
         env:
@@ -148,7 +151,7 @@ jobs:
             verdict=$(printf '' | bash "$classifier" --event "$EVENT_NAME") || verdict=''
           elif git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
               && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
-              && changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
+              && changed=$(git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA"); then
             verdict=$(printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME") || verdict=''
           else
             echo "repo-lint tooling scope: PR diff unavailable; running the full set"

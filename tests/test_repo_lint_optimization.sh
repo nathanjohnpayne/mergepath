@@ -1590,6 +1590,14 @@ ROWS
     echo '# edit' >> "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
     git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qam classifier
     ts_tooling=$(git -C "$TS_GIT" rev-parse HEAD)
+    # A tooling file moved into a content directory: the source path must
+    # count, or the move would skip the checks that read it.
+    git -C "$TS_GIT" checkout -q -b rename "$ts_base"
+    mkdir -p "$TS_GIT/plans"
+    git -C "$TS_GIT" mv scripts/ci/repo-lint-tooling-scope.sh plans/moved.sh
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm rename
+    ts_rename=$(git -C "$TS_GIT" rev-parse HEAD)
+    git -C "$TS_GIT" checkout -q main
 
     # $1 step body, $2 event, $3 base, $4 head. Prints the published value.
     run_tooling_step() {
@@ -1602,13 +1610,14 @@ ROWS
     step_rows_ok=1
     [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_content")" = "tooling=false" ] || step_rows_ok=0
     [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_tooling")" = "tooling=true" ] || step_rows_ok=0
+    [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_rename")" = "tooling=true" ] || step_rows_ok=0
     [ "$(run_tooling_step "$tooling_step" push "$ts_base" "$ts_content")" = "tooling=true" ] || step_rows_ok=0
     [ "$(run_tooling_step "$tooling_step" pull_request 0000000000000000000000000000000000000000 "$ts_content")" = "tooling=true" ] || step_rows_ok=0
     [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" '')" = "tooling=true" ] || step_rows_ok=0
     if [ "$step_rows_ok" -eq 1 ]; then
-      pass "the scope job's tooling step publishes false for a content-only diff and true for tooling, push, and an unreadable diff"
+      pass "the scope job's tooling step publishes false for a content-only diff and true for tooling, a tooling file renamed into content, push, and an unreadable diff"
     else
-      fail "the scope job's tooling step published the wrong verdict for a content, tooling, push or unreadable-diff row"
+      fail "the scope job's tooling step published the wrong verdict for a content, tooling, rename, push or unreadable-diff row"
     fi
 
     # A classifier that is absent, errors after printing false, or prints
