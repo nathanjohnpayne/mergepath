@@ -207,8 +207,13 @@ jobs:
       # published verdict leaves that verdict standing. This checkout carries
       # only the fingerprint library, from the default branch (never the PR
       # head: a PR could otherwise make every run skip), and is shallow so
-      # the hold below opens a few seconds later at most.
+      # the hold below opens a few seconds later at most. It is an
+      # optimization, so its failure is tolerated: without the library the
+      # comparison step finds nothing to read and every later step runs
+      # exactly as before, phase 1 included (Phase 4b on #2924). Without
+      # continue-on-error a failed checkout would skip phase 1 and the gate.
       - name: Checkout the input-fingerprint library (#2920)
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}

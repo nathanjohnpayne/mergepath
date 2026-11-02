@@ -181,6 +181,51 @@ jq --arg head "$HEAD" '. + [{id: 13, user: {login: "nathanpayne-claude"}, state:
 expect_differ "1b. re-approval after another reviewer's approval changes the fingerprint" \
   "$TMP/interleaved-a" "$TMP/interleaved-b"
 
+# 1c. Submission order, not review id: a pending review gets its id when it
+# is created, not when it is submitted. B (id 10, submitted 10:03), A (id
+# 11, submitted 09:01), then A again identically (id 12, 10:04): in
+# submission order B sits between A's two reviews, so the repeat is kept.
+cp -R "$TMP/base" "$TMP/draft-a"
+jq -n --arg head "$HEAD" '[
+  {id: 10, user: {login: "nathanpayne-codex"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve [55]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:03:00Z"},
+  {id: 11, user: {login: "nathanpayne-claude"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve []", author_association: "COLLABORATOR", submitted_at: "2026-11-01T09:01:00Z"}]' \
+  >"$TMP/draft-a/reviews.json"
+cp -R "$TMP/draft-a" "$TMP/draft-b"
+jq --arg head "$HEAD" '. + [{id: 12, user: {login: "nathanpayne-claude"}, state: "APPROVED", commit_id: $head,
+  body: "4b approve []", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:04:00Z"}]' \
+  "$TMP/draft-a/reviews.json" >"$TMP/draft-b/reviews.json"
+expect_differ "1c. a late-submitted draft between two identical reviews keeps the repeat (submission order)" \
+  "$TMP/draft-a" "$TMP/draft-b"
+# 1d. A comment between two identical reviews keeps the repeat: the gate
+# checks an approval against the requests posted before it.
+cp -R "$TMP/re-approve" "$TMP/req-between"
+jq '. + [{id: 32, user: {login: "nathanjohnpayne"}, body: "@codex review",
+  created_at: "2026-11-01T10:02:00Z", updated_at: "2026-11-01T10:02:00Z", reactions: {url: "x", total_count: 0}}]' \
+  "$TMP/base/comments.json" >"$TMP/req-between/comments.json"
+cp -R "$TMP/base" "$TMP/req-before"
+cp "$TMP/req-between/comments.json" "$TMP/req-before/comments.json"
+expect_differ "1d. a request comment between two identical approvals keeps the repeat" \
+  "$TMP/req-before" "$TMP/req-between"
+# 1e. A comment in the same second as the repeat counts as between them.
+cp -R "$TMP/re-approve" "$TMP/req-tie"
+jq '. + [{id: 32, user: {login: "nathanjohnpayne"}, body: "@codex review",
+  created_at: "2026-11-01T10:05:00Z", updated_at: "2026-11-01T10:05:00Z", reactions: {url: "x", total_count: 0}}]' \
+  "$TMP/base/comments.json" >"$TMP/req-tie/comments.json"
+cp -R "$TMP/base" "$TMP/req-tie-before"
+cp "$TMP/req-tie/comments.json" "$TMP/req-tie-before/comments.json"
+expect_differ "1e. a same-second comment counts as between the two reviews" \
+  "$TMP/req-tie-before" "$TMP/req-tie"
+# 1f. An EDIT of an older comment between the two reviews keeps the repeat.
+cp -R "$TMP/re-approve" "$TMP/edit-between"
+jq '.[0].body = "@codex review (edited)" | .[0].updated_at = "2026-11-01T10:03:00Z"' \
+  "$TMP/base/comments.json" >"$TMP/edit-between/comments.json"
+cp -R "$TMP/base" "$TMP/edit-before"
+cp "$TMP/edit-between/comments.json" "$TMP/edit-before/comments.json"
+expect_differ "1f. a comment edit between two identical approvals keeps the repeat" \
+  "$TMP/edit-before" "$TMP/edit-between"
+
 # 2. A second identical comment-only review.
 cp -R "$TMP/base" "$TMP/comment1"
 jq --arg head "$HEAD" '. + [{id: 13, user: {login: "nathanpayne-cursor"}, state: "COMMENTED",

@@ -95,17 +95,25 @@ gif_threads() {
 #
 # Reviews are the one surface not hashed raw, because a repeated identical
 # approval is a NEW review object: each review is reduced to who left it,
-# its state, commit and body, and a review identical to the one immediately
-# before it in the PR's whole review sequence is dropped. Only that adjacent
-# repeat is dropped, never a repeat with another review in between: the
-# gate selects governing reviews by their order across reviewers (the
-# newest Phase 4b approver, for one), so a reviewer re-posting an approval
-# after someone else's moves that selection and must change the
-# fingerprint (Codex P1 on #2924). A dismissal (state DISMISSED), an edit
+# its state, commit and body. A review identical to its predecessor is
+# dropped only when that predecessor is the event immediately before it on
+# one timeline of reviews (by submitted_at, the order the gate selects them
+# in) and PR-level and inline comments (by creation and by every edit). On a
+# timestamp tie a comment sorts before a review, so a same-second comment
+# always counts as between them. Anything in between keeps the repeat: the
+# gate selects governing reviews by submission order across reviewers (the
+# newest Phase 4b approver, for one) and checks an approval against the
+# requests and Codex outcomes posted before it, so a repeat with another
+# review or a comment in between can move the verdict (Codex P1 and Phase 4b
+# on #2924). The kept entries carry no timestamps, so an adjacent repeat
+# leaves the fingerprint unchanged. A dismissal (state DISMISSED), an edit
 # (body), a CHANGES_REQUESTED or an approval of another commit is never
-# identical, so each one changes the fingerprint. Inline comments, PR-level comments and
-# review threads are hashed with their ids, bodies, edit times and reaction
-# counts, so any finding, reply, edit, deletion or resolution changes it.
+# identical, so each one changes the fingerprint. Reactions are hashed as
+# per-object counts without times; no gate check makes a later identical
+# approval weaker against a reaction (an approval only has to follow the
+# Codex signal). Inline comments, PR-level comments and review threads are
+# hashed with their ids, bodies, edit times and reaction counts, so any
+# finding, reply, edit, deletion or resolution changes it.
 GIF_MCG_PROJECTION=$(cat <<'JQ'
 def rx: if type == "object" then del(.url) else null end;
 {
@@ -124,10 +132,20 @@ def rx: if type == "object" then del(.url) else null end;
     auto_merge: (if has("auto_merge") then (.auto_merge != null) else "unknown" end)
   }),
   pr_reactions: ($issue.reactions | rx),
-  reviews: ($reviews | sort_by(.id)
-    | map({user: .user.login, state, commit: .commit_id, body,
-           association: .author_association})
-    | reduce .[] as $r ([]; if (length > 0 and .[-1] == $r) then . else . + [$r] end)),
+  reviews: (
+    ( [ $reviews[] | {t: (.submitted_at // ""), o: 1, id, r: true,
+                      v: {user: .user.login, state, commit: .commit_id, body,
+                          association: .author_association}} ]
+      + [ ($comments + $inline)[]
+          | {t: (.created_at // ""), o: 0, id, r: false},
+            (select((.updated_at // "") != (.created_at // ""))
+             | {t: (.updated_at // ""), o: 0, id, r: false}) ] )
+    | sort_by([.t, .o, .id])
+    | reduce .[] as $e ({prev: null, out: []};
+        if $e.r and .prev != null and .prev.r and .prev.v == $e.v then .prev = $e
+        elif $e.r then .out += [$e.v] | .prev = $e
+        else .prev = $e end)
+    | .out),
   inline: ($inline | sort_by(.id) | map({
     id, user: .user.login, body, created_at, updated_at,
     review: .pull_request_review_id, reply_to: .in_reply_to_id,

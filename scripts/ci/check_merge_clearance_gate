@@ -1017,6 +1017,8 @@ if "workflow_run" in trigger_keys:
 FP_CHECKOUT_NAME = "Checkout the input-fingerprint library (#2920)"
 FP_CHECKOUT = {
     "name": FP_CHECKOUT_NAME,
+    # An optimization: its failure must leave phase 1 and the gate running.
+    "continue-on-error": True,
     "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     "with": {
         "ref": "${{ github.event.repository.default_branch }}",
@@ -1245,7 +1247,10 @@ for key in PRODUCERS:
         # would run on PyYAML 1.1 resolution, where no/off construct to
         # False while Actions retains them as strings. A gate that never
         # reads the value cannot diverge from Actions semantics on it.
-        if "continue-on-error" in step:
+        # #2920: the one exemption is the pinned fingerprint-library checkout
+        # (Property 1 pins it whole), an optimization whose failure must NOT
+        # stop the producer chain behind it.
+        if "continue-on-error" in step and not (key == "merge-clearance-gate" and step == FP_CHECKOUT):
             bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
                 "      continue-on-error key. A tolerated failure silently breaks",
                 "      this producer's publish chain, so the key must be absent on",

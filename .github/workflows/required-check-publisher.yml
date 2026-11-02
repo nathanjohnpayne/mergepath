@@ -142,8 +142,12 @@ jobs:
       # #2920: only a review or review-comment parent can skip a hold, so
       # only that parent pays for this shallow, sparse, default-branch
       # checkout of the fingerprint library. Pushes open their holds with
-      # no checkout in front of them.
+      # no checkout in front of them. A failed checkout is tolerated: the
+      # open step then finds no library and opens every hold, where an
+      # untolerated failure would skip the open step and leave the previous
+      # greens standing (Phase 4b on #2924).
       - name: Checkout the input-fingerprint library (#2920)
+        continue-on-error: true
         if: >-
           github.event.workflow_run.event == 'pull_request_review' ||
           github.event.workflow_run.event == 'pull_request_review_comment'
@@ -688,14 +692,16 @@ jobs:
               # after a green, on top of the evaluation the caller already
               # found affordable. An optional comparison never eats the
               # reserve (Codex P2 on #2924): when the budget does not cover
-              # it as well, this context is evaluated without one.
+              # it as well, this context is evaluated without one. The six
+              # stay charged for the rest of the pass, whether or not the
+              # re-read happens, so the target selection below cannot hand
+              # them to another PR (Phase 4b on #2924).
               spent=$((spent + 13))
               if ! ib_affordable 1; then
                 spent=$((spent - 13))
                 echo "PR #$pr: budget short of the $ctx input comparison; evaluating without one (#2920)."
                 continue
               fi
-              spent=$((spent - 6))
               case "${PARENT_NAME:-}|${PARENT_EVENT:-}" in
                 'Merge Clearance Gate|pull_request_review'|'Merge Clearance Gate|pull_request_review_comment')
                   if gif_decide "$REPO" "$pr" "$hd" "$ctx" "$revision"; then
@@ -1057,7 +1063,7 @@ jobs:
             # turns the verdict red.
             fp_before=$(awk -F'|' -v h="$head" -v c="$context" '$1==h && $2==c {print $3; exit}' <<<"${FP_BEFORE:-}")
             if [ "$conclusion" = success ] && [ -n "$fp_before" ]; then
-              spent=$((spent + 6))
+              # The re-read was reserved (charged) by fp_read_before.
               if fp_after=$(gif_compute "$REPO" "$pr" "$head" "$context") \
                   && [ "$fp_after" = "$fp_before" ]; then
                 fp_text=$(gif_marker "$context" "$fp_after") || fp_text=""

@@ -2341,6 +2341,8 @@ mcg22_case j 's{(\n)(      - name: Open the required check_run)}{$1      - just-
 #     push; phase 1 may carry the skip condition and nothing else.
 mcg22_case fp1 's{(path: \.gate-input-fingerprint\n)}{$1}; s{(          ref: )\$\{\{ github\.event\.repository\.default_branch \}\}(\n          path: \.gate-input-fingerprint)}{$1\$\{\{ github.event.pull_request.head.sha \}\}$2}' \
   fail '[#2920 fingerprint preamble]'
+mcg22_case fp6 's{(      - name: Checkout the input-fingerprint library \(#2920\)\n)        continue-on-error: true\n}{$1}' \
+  fail '[#2920 fingerprint preamble]'
 mcg22_case fp2 's{(        id: fp\n)}{$1        if: always()\n}' \
   fail '[#2920 fingerprint preamble]'
 mcg22_case fp3 's{            pull_request_review\|pull_request_review_comment\)\n              if gif_decide}{            *)\n              if gif_decide}' \
@@ -4276,6 +4278,12 @@ rcp_case publish-noconc \
 rcp_case open-group \
   's{^    runs-on: ubuntu-latest\n(    # GROUPLESS)}{    runs-on: ubuntu-latest\n    concurrency:\n      group: rcp-open\n$1}m' \
   fail '[rcp open groupless]'
+
+# #2920 (Phase 4b on #2924): an untolerated fingerprint checkout failure
+# would skip the hold-opening step.
+rcp_case fp-checkout-strict \
+  's{(      - name: Checkout the input-fingerprint library \(#2920\)\n)        continue-on-error: true\n}{$1}' \
+  fail '[rcp fingerprint checkout]'
 
 # ── A11 — write scope is job-scoped, never workflow-scoped ────────────
 rcp_case perms-actions \
