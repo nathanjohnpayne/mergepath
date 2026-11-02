@@ -846,6 +846,10 @@ jobs:
       pull-requests: read
       issues: read
       checks: write
+    # #2918: the PR to nominate to auto-clear, or empty. See the
+    # nominate-auto-clear job below.
+    outputs:
+      autoclear_pr: ${{ steps.recheck.outputs.autoclear_pr }}
     steps:
       - name: Checkout repo (default branch — trusted gate scripts)
         # Same trusted-checkout posture as the other jobs: run the gate script
@@ -858,6 +862,7 @@ jobs:
           persist-credentials: false
 
       - name: Re-evaluate gate for the dispatched PR and post check_run
+        id: recheck
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The PR number the lane put in the dispatch payload. Passed via env
@@ -868,6 +873,12 @@ jobs:
           # validated as a positive integer below, and the head comes from the
           # open-PR list, never from the event.
           PR_COMMENTED: ${{ github.event.issue.number }}
+          # #2918: whether the commented PR carried needs-external-review when
+          # the comment landed, read from the event payload (no request). It
+          # only decides whether to nominate the PR to auto-clear, which
+          # re-derives everything from live state; a label added after the
+          # comment is left to the auto-clear sweep.
+          PR_LABELED: ${{ github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'needs-external-review') }}
           EVENT_NAME: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
@@ -945,4 +956,62 @@ jobs:
           if ! rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion" "$check_title" "$summary"; then
             echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
             exit 1
+          fi
+          # #2918: a Codex answer that turns the gate green is often the last
+          # input a labeled PR needs, and this run is invisible to auto-clear:
+          # its workflow_run carries the default branch's head_sha (no PR
+          # resolves) and the publisher skips issue_comment-originated runs.
+          # Nominate the PR so the label comes off within one run instead of
+          # waiting for the auto-clear sweep. Only a published green verdict
+          # on a labeled PR nominates.
+          if [ "${EVENT_NAME:-}" = issue_comment ] && [ "$conclusion" = success ] \
+             && [ "${PR_LABELED:-}" = true ]; then
+            echo "PR #$PR: green clearance verdict on a PR carrying needs-external-review; nominating it to auto-clear (#2918)."
+            echo "autoclear_pr=$PR" >> "$GITHUB_OUTPUT"
+          fi
+
+  # #2918. Sends one `auto-clear-evaluate` repository_dispatch for the PR
+  # dispatch-recheck nominated (a green verdict, published by a Codex comment,
+  # on a PR carrying needs-external-review), carrying only the PR number. The
+  # mirror of required-check-publisher.yml's nominate-auto-clear job (#2239),
+  # which never sees these runs. auto-clear-blocking-labels.yml handles the
+  # event on its default-branch definition, re-derives clearance from live
+  # state and fences the live head/base before any label DELETE.
+  #
+  # A SEPARATE job because POST /dispatches needs `contents: write`, and a job
+  # is the narrowest scope a GITHUB_TOKEN permission can have: dispatch-recheck
+  # runs the gate scripts and must not hold it. This job checks out nothing and
+  # runs one inline step over an integer it validates, so no repository code
+  # ever executes with that grant. It writes no check-run, is not a producer of
+  # the required context, and is skipped (no runner) whenever dispatch-recheck
+  # nominated nothing, which is almost every run. No PAT: a GITHUB_TOKEN
+  # repository_dispatch starts the run.
+  nominate-auto-clear:
+    name: nominate-auto-clear
+    needs: dispatch-recheck
+    if: ${{ !cancelled() && needs.dispatch-recheck.outputs.autoclear_pr != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Dispatch auto-clear evaluation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          AUTOCLEAR_PR: ${{ needs.dispatch-recheck.outputs.autoclear_pr }}
+        run: |
+          set -euo pipefail
+          # Best effort, single attempt: the auto-clear */5 sweep still bounds
+          # a dropped nomination. A failed dispatch warns instead of reddening
+          # this run, whose verdict was already published.
+          if ! [[ "$AUTOCLEAR_PR" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            echo "::warning::Ignoring malformed auto-clear nomination '$AUTOCLEAR_PR'."
+            exit 0
+          fi
+          if gh api -X POST "repos/$REPO/dispatches" \
+              -f event_type=auto-clear-evaluate \
+              -F "client_payload[pr]=$AUTOCLEAR_PR" >/dev/null; then
+            echo "Dispatched auto-clear-evaluate for PR #$AUTOCLEAR_PR."
+          else
+            echo "::warning::Could not dispatch auto-clear-evaluate for PR #$AUTOCLEAR_PR; the auto-clear sweep covers it."
           fi

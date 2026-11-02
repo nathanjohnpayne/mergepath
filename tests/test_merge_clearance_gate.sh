@@ -58,6 +58,10 @@ fi
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/merge-clearance-gate-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
+# #2918: the check reads the auto-clear listener beside the workflow under
+# test, to match the nomination's event type against it. Fixtures written to
+# $WORKDIR get the real one beside them.
+cp "$ROOT/.github/workflows/auto-clear-blocking-labels.yml" "$WORKDIR/"
 
 # Model the trusted live-byte-verifier boundary separately from the gate's
 # policy/dispatch decisions. Its actual Git/provenance implementation is
@@ -1660,6 +1664,8 @@ WF
   # that hides regressions. Extracting them means the control cannot lag.
   mcg_real_job scheduled-sweep
   mcg_real_job dispatch-recheck
+  # #2918: dispatch-recheck's auto-clear hand-off, pinned with it.
+  mcg_real_job nominate-auto-clear
 }
 
 # Print one job block verbatim from the canonical workflow.
@@ -2196,6 +2202,39 @@ mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}
 mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
 # I — positive control.
 mcg22_case I '' pass
+
+# #2918: dispatch-recheck nominates a PR whose green verdict a Codex comment
+# published to auto-clear, through a separate contents: write job. Each case
+# breaks one part of that hand-off and must be named as the cause.
+MCG_TAG='#2918'
+mcg22_case nominate-job-removed \
+  's{\n  nominate-auto-clear:\n.*?(?=\n  [A-Za-z0-9_-]+:\n)}{}s' \
+  fail "has no 'nominate-auto-clear' job mapping"
+mcg22_case nominate-uses-step \
+  's{^(      - name: Dispatch auto-clear evaluation\n)}{      - uses: actions/checkout\@v4\n$1}m' \
+  fail 'must carry exactly one step'
+mcg22_case nominate-wider-permissions \
+  's{(  nominate-auto-clear:.*?\n      contents: write\n)}{$1      issues: write\n}s' \
+  fail 'permissions are'
+mcg22_case nominate-event-type-renamed \
+  's{event_type=auto-clear-evaluate}{event_type=auto-clear-eval}' \
+  fail 'auto-clear-blocking-labels.yml listens to'
+mcg22_case nominate-pat \
+  's{(  nominate-auto-clear:.*?GH_TOKEN: )\$\{\{ secrets.GITHUB_TOKEN \}\}}{$1\$\{\{ secrets.CI_ACTOR_TOKEN \}\}}s' \
+  fail 'step env is'
+mcg22_case nominate-unvalidated \
+  's{\[\[ "\$AUTOCLEAR_PR" =~ \^\[1-9\]\[0-9\]\{0,9\}\$ \]\]}{[[ -n "\$AUTOCLEAR_PR" ]]}' \
+  fail 'must validate AUTOCLEAR_PR'
+mcg22_case nominate-red-verdict \
+  's{ && \[ "\$conclusion" = success \]}{}' \
+  fail 'dispatch-recheck must write'
+mcg22_case nominate-label-unread \
+  's{PR_LABELED: \$\{\{ github.event_name == .issue_comment. && contains\(github.event.issue.labels.\*.name, .needs-external-review.\) \}\}}{PR_LABELED: true}' \
+  fail 'must bind PR_LABELED'
+mcg22_case nominate-step-id-dropped \
+  's{^        id: recheck\n}{}m' \
+  fail "step's id is"
+unset MCG_TAG
 
 # ---------------------------------------------------------------------------
 # Test 24 (#850): the STRUCTURAL layer — assertions over the PARSED document.
