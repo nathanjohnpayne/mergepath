@@ -5490,6 +5490,12 @@ mcg22_case budget-knob-malformed \
 mcg22_case budget-open-id-unbound \
   's{OPEN_ID: \$\{\{ steps\.open\.outputs\.id \}\}}{OPEN_ID: "1"}' \
   fail '[#2286 budget guard]'
+mcg22_case fp-skip-const \
+  's{(Report gate verdict.*?)FP_SKIP: \$\{\{ steps\.fp\.outputs\.skip \}\}}{$1FP_SKIP: "true"}s' \
+  fail '[#2920 fingerprint binding]'
+mcg22_case fp-before-const \
+  's{FP_BEFORE: \$\{\{ steps\.fp\.outputs\.before \}\}}{FP_BEFORE: "aaaa"}' \
+  fail '[#2920 fingerprint binding]'
 mcg22_case budget-gate-if-dropped \
   's{(      - name: Run scripts/merge-clearance-gate\.sh\n        id: gate\n)        if: [^\n]*\n}{$1        if: \$\{\{ always() \}\}\n}' \
   fail '[#850 producer eligibility]'

@@ -1452,6 +1452,23 @@ if isinstance(report_step, dict):
         bad("FAIL: [#2286 budget guard] the report step's budget arm must exit 0 only when",
             "      API_BLOCKING is true and exit 1 otherwise.")
 
+# Property 7 (#2920)—the review-input skip arm. The report step concludes the
+# native run success when FP_SKIP is true, and phase 2 records FP_BEFORE as
+# the input fingerprint of a green. Each must be bound to the comparison
+# step's own output: a constant FP_SKIP greens the native run with no
+# evaluation, and a constant FP_BEFORE records a fingerprint no read produced
+# (CodeRabbit on #2924).
+if isinstance(report_step, dict):
+    if (report_step.get("env") or {}).get("FP_SKIP") != "${{ steps.fp.outputs.skip }}":
+        bad("FAIL: [#2920 fingerprint binding] 'Report gate verdict' must bind FP_SKIP to",
+            "      exactly ${{ steps.fp.outputs.skip }} (got %r). Any other binding" % (report_step.get("env") or {}).get("FP_SKIP"),
+            "      concludes the required job-native run success without an evaluation.")
+if isinstance(close_step, dict):
+    if (close_step.get("env") or {}).get("FP_BEFORE") != "${{ steps.fp.outputs.before }}":
+        bad("FAIL: [#2920 fingerprint binding] the phase-2 close step must bind FP_BEFORE",
+            "      to exactly ${{ steps.fp.outputs.before }} (got %r): it is recorded" % (close_step.get("env") or {}).get("FP_BEFORE"),
+            "      as the input fingerprint a later review event may skip on.")
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)

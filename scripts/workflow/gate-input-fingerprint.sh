@@ -171,11 +171,18 @@ gif_compute() {
     'Merge clearance gate') projection="$GIF_MCG_PROJECTION" ;;
     *) return 1 ;;
   esac
-  doc=$(jq -ncS --arg context "$context" --arg repo "$repo" --arg revision "$revision" \
-    --argjson pr "$pr_json" --argjson issue "$issue_json" \
-    --argjson reviews "$reviews" --argjson inline "$inline" \
-    --argjson comments "$comments" --argjson threads "$threads" \
-    "$projection" 2>/dev/null) || return 1
+  # The six documents travel on stdin, not as --argjson arguments: Linux caps
+  # one argument at 128 KiB (MAX_ARG_STRLEN), which a busy PR's comment list
+  # passes, and the skip would then never work on exactly the PRs with the
+  # most review events (CodeRabbit on #2924). printf is a builtin, so it has
+  # no such limit. Exactly six documents must arrive, each the right type.
+  doc=$(printf '%s\n' "$pr_json" "$issue_json" "$reviews" "$inline" "$comments" "$threads" \
+    | jq -ncS --arg context "$context" --arg repo "$repo" --arg revision "$revision" \
+      '[inputs] as $docs
+       | if ($docs | length) != 6 or ($docs[0] | type) != "object" or ($docs[1] | type) != "object"
+            or any($docs[2:][]; type != "array") then error("malformed inputs") else . end
+       | $docs as [$pr, $issue, $reviews, $inline, $comments, $threads]
+       | '"$projection" 2>/dev/null) || return 1
   [ -n "$doc" ] || return 1
   printf '%s' "$doc" | gif_sha256
 }
