@@ -747,6 +747,7 @@ if [ -f "$WORKFLOW" ]; then
     echo "  SKIP: PyYAML unavailable — the #850 structural assertions did NOT run."
     echo "        Install PyYAML to enforce phase-1 position + producer eligibility."
   elif ! python3 - "$WORKFLOW" <<'PY'
+import os
 import re
 import sys
 
@@ -1383,6 +1384,128 @@ if isinstance(report_step, dict):
             or not arm.group(1).rstrip().endswith("exit 1"):
         bad("FAIL: [#2286 budget guard] the report step's budget arm must exit 0 only when",
             "      API_BLOCKING is true and exit 1 otherwise.")
+
+# Property 6 (#2918)—a green verdict that a Codex comment publishes on a
+# labeled PR nominates that PR to auto-clear. The comment path's run carries
+# the default branch's head_sha, so auto-clear's workflow_run listener resolves
+# no PR for it, and the publisher skips issue_comment-originated runs; without
+# this hand-off the label waits for the auto-clear */5 sweep, which GitHub
+# delays or drops under load. Pinned the way check_required_check_publisher
+# pins the publisher's nominate-auto-clear job (#2239), and for the same
+# reasons: POST /dispatches needs `contents: write`, so every addition that
+# keeps the job looking right widens what runs with a write token (a `uses:`
+# step executes code under the grant, a second scope or an `environment:`
+# widens the token, a `concurrency:` block can cancel a pending nomination),
+# and a broken hand-off or a renamed event type silently nominates nothing.
+NOMINATE_JOB = "nominate-auto-clear"
+NOMINATE_KEYS = {"name", "needs", "if", "runs-on", "permissions", "steps"}
+NOMINATE_IF = "${{ !cancelled() && needs.dispatch-recheck.outputs.autoclear_pr != '' }}"
+NOMINATE_STEP_KEYS = {"name", "env", "run"}
+NOMINATE_ENV = {
+    "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    "REPO": "${{ github.repository }}",
+    "AUTOCLEAR_PR": "${{ needs.dispatch-recheck.outputs.autoclear_pr }}",
+}
+RECHECK_OUTPUTS = {"autoclear_pr": "${{ steps.recheck.outputs.autoclear_pr }}"}
+RECHECK_STEP = "Re-evaluate gate for the dispatched PR and post check_run"
+RECHECK_PR_LABELED = ("${{ github.event_name == 'issue_comment' && "
+                      "contains(github.event.issue.labels.*.name, 'needs-external-review') }}")
+nominate = jobs.get(NOMINATE_JOB)
+if not isinstance(nominate, dict):
+    bad("FAIL: [#2918 auto-clear nomination] %s has no %r job mapping;" % (WORKFLOW, NOMINATE_JOB),
+        "      a green verdict a Codex comment publishes on a labeled PR then reaches",
+        "      auto-clear only through its */5 sweep, which GitHub delays or drops.")
+else:
+    if set(nominate) != NOMINATE_KEYS:
+        bad("FAIL: [#2918 auto-clear nomination] job %r keys are %s, not exactly %s."
+            % (NOMINATE_JOB, sorted(nominate), sorted(NOMINATE_KEYS)),
+            "      An `environment:`, `concurrency:`, `outputs:` or `container:` beside",
+            "      a contents: write token changes what the grant reaches.")
+    if nominate.get("needs") not in ("dispatch-recheck", ["dispatch-recheck"]):
+        bad("FAIL: [#2918 auto-clear nomination] job %r needs %r, not dispatch-recheck."
+            % (NOMINATE_JOB, nominate.get("needs")))
+    if " ".join(str(nominate.get("if", "")).split()) != NOMINATE_IF:
+        bad("FAIL: [#2918 auto-clear nomination] job %r condition is %r, not %r."
+            % (NOMINATE_JOB, nominate.get("if"), NOMINATE_IF),
+            "      It must run only when dispatch-recheck nominated a PR (no runner",
+            "      otherwise).")
+    if nominate.get("permissions") != {"contents": "write"}:
+        bad("FAIL: [#2918 auto-clear nomination] job %r permissions are %r, not exactly"
+            % (NOMINATE_JOB, nominate.get("permissions")),
+            "      {'contents': 'write'}: POST /dispatches needs that and nothing else.")
+    nsteps = nominate.get("steps")
+    if not (isinstance(nsteps, list) and len(nsteps) == 1 and isinstance(nsteps[0], dict)):
+        bad("FAIL: [#2918 auto-clear nomination] job %r must carry exactly one step." % NOMINATE_JOB)
+    else:
+        nstep = nsteps[0]
+        if set(nstep) != NOMINATE_STEP_KEYS:
+            bad("FAIL: [#2918 auto-clear nomination] job %r step keys are %s, not exactly %s."
+                % (NOMINATE_JOB, sorted(nstep), sorted(NOMINATE_STEP_KEYS)),
+                "      A `uses:` step (a checkout or an action) would execute code under",
+                "      the contents: write grant.")
+        if nstep.get("env") != NOMINATE_ENV:
+            bad("FAIL: [#2918 auto-clear nomination] job %r step env is %r, not %r."
+                % (NOMINATE_JOB, nstep.get("env"), NOMINATE_ENV),
+                "      The dispatch rides the job's own GITHUB_TOKEN, never a PAT.")
+        nrun = strip_comments(str(nstep.get("run", "")))
+        if '[[ "$AUTOCLEAR_PR" =~ ^[1-9][0-9]{0,9}$ ]]' not in nrun:
+            bad("FAIL: [#2918 auto-clear nomination] job %r must validate AUTOCLEAR_PR as a"
+                % NOMINATE_JOB,
+                "      positive integer before the dispatch.")
+        sent = re.findall(r"event_type=([A-Za-z0-9_.-]+)", nrun)
+        listener_path = os.path.join(os.path.dirname(os.path.abspath(WORKFLOW)),
+                                     "auto-clear-blocking-labels.yml")
+        listener_types = None
+        try:
+            with open(listener_path, encoding="utf-8") as handle:
+                listener_doc = yaml.safe_load(handle) or {}
+            listener_on = listener_doc.get("on", listener_doc.get(True))
+            listener_rd = listener_on.get("repository_dispatch") if isinstance(listener_on, dict) else None
+            listener_types = listener_rd.get("types") if isinstance(listener_rd, dict) else None
+        except Exception as exc:
+            bad("FAIL: [#2918 auto-clear nomination] could not read %s: %s"
+                % (listener_path, " ".join(str(exc).split())))
+        if not (isinstance(listener_types, list) and len(listener_types) == 1):
+            bad("FAIL: [#2918 auto-clear nomination] %s does not listen to exactly one"
+                % listener_path,
+                "      repository_dispatch type (read %r), so the nomination event has" % listener_types,
+                "      no single listener to match.")
+        elif sent != listener_types:
+            bad("FAIL: [#2918 auto-clear nomination] the job dispatches event_type %r, but" % sent,
+                "      auto-clear-blocking-labels.yml listens to %r. A mismatch orphans" % listener_types,
+                "      every nomination silently.")
+recheck_job = jobs.get("dispatch-recheck")
+if isinstance(recheck_job, dict):
+    if recheck_job.get("outputs") != RECHECK_OUTPUTS:
+        bad("FAIL: [#2918 auto-clear nomination] dispatch-recheck's outputs are %r, not %r."
+            % (recheck_job.get("outputs"), RECHECK_OUTPUTS))
+    recheck_step = step_named(recheck_job, RECHECK_STEP)
+    if not isinstance(recheck_step, dict):
+        bad("FAIL: [#2918 auto-clear nomination] dispatch-recheck needs exactly one %r step." % RECHECK_STEP)
+    else:
+        rrun = strip_comments(str(recheck_step.get("run") or ""))
+        if recheck_step.get("id") != "recheck":
+            bad("FAIL: [#2918 auto-clear nomination] the dispatch-recheck step's id is %r, not"
+                % recheck_step.get("id"),
+                "      'recheck'; the job output reads steps.recheck.outputs.autoclear_pr.")
+        if " ".join(str((recheck_step.get("env") or {}).get("PR_LABELED", "")).split()) != RECHECK_PR_LABELED:
+            bad("FAIL: [#2918 auto-clear nomination] dispatch-recheck must bind PR_LABELED to",
+                "      exactly %s." % RECHECK_PR_LABELED)
+        # The nomination is written only for a published green verdict on an
+        # issue_comment run whose PR carried the label, and only after the
+        # verdict was published (a failed rcg_close exits before it).
+        nominate_at = rrun.find('echo "autoclear_pr=$PR" >> "$GITHUB_OUTPUT"')
+        guard = re.search(r'if \[ "\$\{EVENT_NAME:-\}" = issue_comment \] && \[ "\$conclusion" = success \] \\\n'
+                          r'\s*&& \[ "\$\{PR_LABELED:-\}" = true \]; then\n', rrun)
+        close_at = rrun.find('if ! rcg_close "$REPO" "$PR" "$head_sha"')
+        if nominate_at < 0 or guard is None or not (0 <= close_at < guard.start() < nominate_at):
+            bad("FAIL: [#2918 auto-clear nomination] dispatch-recheck must write",
+                "      autoclear_pr=$PR only after rcg_close, and only under the guard that",
+                "      EVENT_NAME is issue_comment, the conclusion is success and PR_LABELED",
+                "      is true. A red verdict or an unlabeled PR nominates nothing.")
+        elif rrun.count("autoclear_pr=") != 1:
+            bad("FAIL: [#2918 auto-clear nomination] dispatch-recheck writes autoclear_pr",
+                "      more than once; only the guarded write may nominate.")
 
 if failures:
     print("\n".join(failures))
