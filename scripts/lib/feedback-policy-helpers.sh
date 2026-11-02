@@ -103,6 +103,62 @@ puts JSON.generate(value)
   fi
 }
 
+# policy_json_field <policy-json> <dotted.path> <kind> -- read one field of a
+# policy already parsed by policy_yaml_to_json (#2901, #2913). It replaces the
+# line-oriented awk readers, which matched only an unquoted, block-style
+# `field:` key: a quoted key or a flow mapping (`codex: {enabled: false}`) read
+# as unset there and took the default. Prints the value, or nothing when the
+# key or an enclosing block is absent (`block:` with no value counts as
+# absent); the caller applies its default only then. Returns 1 with a reason
+# on stderr when the policy is not a mapping, an enclosing block is not a
+# mapping, or the value is not of <kind>:
+#   bool    true/false, or the quoted strings "true"/"false"
+#   int     a non-negative integer, or a quoted string of digits
+#   string  a non-empty one-line string
+#   scalar  any one-line string, number or boolean (the caller validates)
+# Only the named path matches, so a nested p1_gate.enabled can never stand in
+# for codex.enabled. A null value is present but of no kind, so it refuses.
+policy_json_field() {
+  local json="${1:-}" path="$2" kind="$3" result
+  if [ -z "$json" ]; then
+    echo "ERROR: governing policy was not parsed; cannot read $path" >&2
+    return 1
+  fi
+  # One line out: "ok <value>" or "err <reason>". A jq failure leaves it empty.
+  result=$(printf '%s' "$json" | jq -r --arg p "$path" --arg k "$kind" '
+    def want: {bool: "true|false", int: "a non-negative integer",
+               scalar: "a one-line scalar"}[$k] // "a non-empty string";
+    def bad: "err \($p) must be \(want); got \(tojson)";
+    def one_line: test("[\n\r]") | not;
+    def check:
+      if $k == "bool" then
+        if type == "boolean" then "ok \(.)" elif . == "true" or . == "false" then "ok \(.)" else bad end
+      elif $k == "int" then
+        if type == "number" and . >= 0 and floor == . then "ok \(.)"
+        elif type == "string" and test("^[0-9]+$") then "ok \(.)" else bad end
+      elif $k == "scalar" then
+        if type == "boolean" or type == "number" then "ok \(.)"
+        elif type == "string" and one_line then "ok \(.)" else bad end
+      elif type == "string" and length > 0 and one_line then "ok \(.)"
+      else bad end;
+    # Walk the path; $seen is the dotted prefix already entered.
+    def walk_to($keys; $seen):
+      if ($keys | length) == 0 then check
+      elif type != "object" then
+        if $seen == "" then "err the governing policy is not a mapping"
+        else "err \($seen) must be a mapping; got \(tojson)" end
+      elif has($keys[0]) | not then "ok "
+      elif ($keys | length) > 1 and .[$keys[0]] == null then "ok "
+      else .[$keys[0]] | walk_to($keys[1:];
+             (if $seen == "" then $keys[0] else "\($seen).\($keys[0])" end)) end;
+    walk_to($p | split("."); "")' 2>/dev/null) || result=""
+  case "$result" in
+    "ok "*) printf '%s\n' "${result#ok }" ;;
+    "err "*) echo "ERROR: ${result#err }" >&2; return 1 ;;
+    *) echo "ERROR: $path could not be read from the governing policy" >&2; return 1 ;;
+  esac
+}
+
 # policy_block_field_parsed <block> <field> [config] -- read one block field
 # through policy_yaml_to_json, so block AND flow style both resolve. Empty
 # (rc 1) when the file is unreadable or no YAML parser exists, which callers

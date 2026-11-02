@@ -162,65 +162,32 @@ fi
 # shellcheck source=lib/gh-api-scalar.sh
 . "$__P1_GATE_DIR/lib/gh-api-scalar.sh"
 
-# Read a scalar field nested inside `codex:` `<sub_block>:` `<field>:`.
-# Same state-machine awk pattern as codex-review-check.sh, but tracks
-# nesting one level deeper for the `p1_gate` sub-block.
-codex_p1_gate_field() {
-  local field=$1
-  [ -f "$CONFIG" ] || return 0
-  awk -v field="$field" '
-    /^codex:/ { in_codex=1; in_p1_gate=0; next }
-    in_codex && /^[^[:space:]#]/ { in_codex=0; in_p1_gate=0 }
-    in_codex && /^[[:space:]]+p1_gate:/ { in_p1_gate=1; next }
-    in_p1_gate && /^[[:space:]]{0,3}[^[:space:]#]/ { in_p1_gate=0 }
-    in_p1_gate && $1 == field":" {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      # Strip BOTH single and double quotes (#536, unified here by #817).
-      # This reader was double-quote-only, so `enabled: '"'"'true'"'"'` came back
-      # with its quotes intact, reached P1_GATE_ENABLED below, and tripped
-      # the true|false validator — a required gate deadlocked by a benign
-      # YAML quoting choice. \047 is the octal escape for a single quote
-      # inside the awk character class, matching codex-review-check.sh:253.
-      gsub(/^["\047]/, "", $0)
-      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
-}
+# The policy, parsed once (#2913). The earlier line-oriented awk readers
+# matched only an unquoted, block-style `field:` key, so a quoted key or a flow
+# mapping (`codex: {p1_gate: {enabled: true}}`) read as unset and took the
+# default, and a custom bot_login was missed. A missing file keeps the
+# defaults; a file that cannot be parsed is a config error (exit 2).
+P1_POLICY_JSON=""
+if [ -f "$CONFIG" ]; then
+  P1_POLICY_JSON=$(policy_yaml_to_json "$CONFIG") && [ -n "$P1_POLICY_JSON" ] || {
+    echo "ERROR: $CONFIG could not be parsed; codex.* settings are unknown" >&2
+    exit 2
+  }
+fi
 
-# Read a scalar field from the codex: block. Mirrors codex-review-check.sh.
+# codex_field <dotted.field> <kind> -- one field under codex: (`bot_login`,
+# `p1_gate.enabled`). Prints nothing when the key, an enclosing block or the
+# file is absent; returns 1 with a reason on stderr for a value not of <kind>.
 codex_field() {
-  local field=$1
-  [ -f "$CONFIG" ] || return 0
-  awk -v field="$field" '
-    /^codex:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block && $1 == field":" {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      # Strip BOTH single and double quotes (#536, unified here by #817).
-      # This reader was double-quote-only, so a single-quoted bot_login came
-      # back with its quotes intact and matched zero comments — the gate then
-      # passed on an empty finding set instead of blocking. That direction is
-      # a soundness defect, not just a nuisance. Same form as
-      # codex-review-check.sh:253.
-      gsub(/^["\047]/, "", $0)
-      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
+  [ -n "$P1_POLICY_JSON" ] || return 0
+  policy_json_field "$P1_POLICY_JSON" "codex.$1" "$2"
 }
 
 # Legacy thread-gate knob: codex.p1_gate.enabled. Default false everywhere
 # except mergepath itself. It controls only the current-HEAD required-tier
 # thread scan; complete-history feedback accounting is independent and
 # default-on in every consumer (#1000).
-P1_GATE_ENABLED=$(codex_p1_gate_field enabled)
+P1_GATE_ENABLED=$(codex_field p1_gate.enabled bool) || exit 2
 P1_GATE_ENABLED=${P1_GATE_ENABLED:-false}
 case "$P1_GATE_ENABLED" in
   true|false) ;;
@@ -262,7 +229,7 @@ if [ -z "$REPO" ]; then
   fi
 fi
 
-BOT_LOGIN=$(codex_field bot_login)
+BOT_LOGIN=$(codex_field bot_login string) || exit 2
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
 # Resolve the BLOCKING tier set from the feedback_policy block (#577). Absent

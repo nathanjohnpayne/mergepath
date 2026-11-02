@@ -467,39 +467,39 @@ fi
 CONFIG="$__CODEX_REQUEST_DIR/../.github/review-policy.yml"
 [ -f "$CONFIG" ] || CONFIG=".github/review-policy.yml"
 
-# Extract a scalar field from the codex: block in review-policy.yml.
-# Uses the state-machine awk pattern established in #54 (stops at the next
-# top-level key, tolerates column-0 comments). Returns empty string if the
-# field is not present, which the caller should turn into a default.
+# The policy parser and the typed field reader (#2913). Sourced here, before
+# the first codex_field read; the guarded source further down also needs it
+# for resolve_required_tiers and stays as it is.
+if [ -r "$__CODEX_REQUEST_DIR/lib/feedback-policy-helpers.sh" ]; then
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$__CODEX_REQUEST_DIR/lib/feedback-policy-helpers.sh"
+fi
+
+# codex_field <field> <kind> -- one codex.* field from the parsed policy at
+# $CONFIG (#2913). The earlier line-oriented awk reader matched only an
+# unquoted, block-style `field:` key, so a quoted key or a flow mapping
+# (`codex: {enabled: false}`) read as unset and took the default. Prints
+# nothing when the key, the codex block or the whole file is absent; the
+# caller applies its default only then. A policy that cannot be parsed, a
+# missing parser, or a value not of <kind> (see policy_json_field) returns 1
+# with a reason on stderr.
 codex_field() {
-  local field=$1
+  local field=$1 kind=$2 json
   [ -f "$CONFIG" ] || return 0
-  awk -v field="$field" '
-    /^codex:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block {
-      # Match "  field: value" or a value wrapped in double OR single
-      # quotes. Strip BOTH quote styles (\047 = single quote) so a
-      # single-quoted boolean (valid YAML) survives the == "true"
-      # entry-gate checks below. Matches the quote-tolerance of the
-      # codex_field parser in scripts/codex-review-check.sh and the
-      # workflow parser tests.
-      if ($1 == field":") {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^["\047]/, "", $0)
-        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-        gsub(/[[:space:]]*#.*$/, "", $0)
-        sub(/[[:space:]]+$/, "", $0)
-        print
-        exit
-      }
-    }
-  ' "$CONFIG"
+  if ! command -v policy_json_field >/dev/null 2>&1; then
+    echo "ERROR: scripts/lib/feedback-policy-helpers.sh is missing; cannot read codex.$field from $CONFIG" >&2
+    return 1
+  fi
+  json=$(policy_yaml_to_json "$CONFIG") && [ -n "$json" ] || {
+    echo "ERROR: policy $CONFIG could not be parsed; cannot read codex.$field" >&2
+    return 1
+  }
+  policy_json_field "$json" "codex.$field" "$kind"
 }
 
 # Extract a top-level scalar (column-0 key, no enclosing block) from
-# review-policy.yml — e.g. author_identity. Same quoting/comment
-# tolerance as codex_field.
+# review-policy.yml — e.g. author_identity. A line-oriented awk reader
+# (codex_field's shape before #2913).
 policy_top_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
@@ -583,14 +583,14 @@ fi
 # It is deliberately NOT sized to the dropped/rate-limited non-response tail
 # (#570): that is not a slow verdict and no foreground wait can catch it —
 # --trigger-only + event-driven pickup remains its escape path (#489).
-TIMEOUT_SECONDS=$(codex_field review_timeout_seconds)
+TIMEOUT_SECONDS=$(codex_field review_timeout_seconds int) || exit 3
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1800}
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.review_timeout_seconds must be an integer; got '$TIMEOUT_SECONDS'" >&2
   exit 3
 fi
 
-BOT_LOGIN=$(codex_field bot_login)
+BOT_LOGIN=$(codex_field bot_login string) || exit 3
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
 # --- blocking-tier surfacing (#577) -----------------------------------------
@@ -712,8 +712,8 @@ CODEX_ENABLED=true
 # The two outcomes are not symmetric: requesting wrongly costs one Codex
 # round, while skipping wrongly silently drops a review. So a skip needs a
 # real parser's answer, the same rule coderabbit-should-invoke.sh applies
-# to its suppressing decisions; codex_field's awk reader cannot tell an
-# absent key from a file it failed to read.
+# to its suppressing decisions; the line-oriented awk reader codex_field used
+# before #2913 could not tell an absent key from a file it failed to read.
 #
 # Presence is tested with has(), never with `//`: yq's alternative operator
 # treats an explicit `false` like null, so `.request_by_default // "x"`
@@ -1208,7 +1208,17 @@ should_request_codex() {
   fi
   [ "$entry_cfg" = "$CONFIG" ] || __CRA_ENTRY_CFG_TMP="$entry_cfg"
   CONFIG="$entry_cfg"
-  CODEX_ENABLED=$(codex_field enabled)
+  # A codex.enabled that cannot be read never opts out of review: request,
+  # with a warning, the same failsafe as request_by_default (#2240, #2913).
+  # codex_field has already printed the reason; resolve_request_by_default
+  # names a parse failure in its own warning, as it does on every path.
+  if ! CODEX_ENABLED=$(codex_field enabled bool); then
+    CODEX_ENABLED=true
+    resolve_request_by_default
+    [ "$REQUEST_BY_DEFAULT_SOURCE" = failsafe ] \
+      || request_by_default_failsafe "codex.enabled could not be read"
+    return 0
+  fi
   CODEX_ENABLED=${CODEX_ENABLED:-true}
   # Codex off ⇒ never trigger (orthogonality rule).
   [ "$CODEX_ENABLED" = "true" ] || return 1
@@ -1232,14 +1242,14 @@ should_request_codex() {
 # sizes the WINDOW; the retry COUNT (max_ack_retries) is unchanged, so the full
 # failover budget is 30s × (1 + max_ack_retries) = 60s, halved from the prior
 # 60s × 2 = 120s. Was 60s folklore.
-ACK_WAIT_SECONDS=$(codex_field ack_wait_seconds)
+ACK_WAIT_SECONDS=$(codex_field ack_wait_seconds int) || exit 3
 ACK_WAIT_SECONDS=${ACK_WAIT_SECONDS:-30}
 if ! [[ "$ACK_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.ack_wait_seconds must be an integer; got '$ACK_WAIT_SECONDS'" >&2
   exit 3
 fi
 
-MAX_ACK_RETRIES=$(codex_field max_ack_retries)
+MAX_ACK_RETRIES=$(codex_field max_ack_retries int) || exit 3
 MAX_ACK_RETRIES=${MAX_ACK_RETRIES:-1}
 if ! [[ "$MAX_ACK_RETRIES" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.max_ack_retries must be an integer; got '$MAX_ACK_RETRIES'" >&2
@@ -1292,7 +1302,10 @@ fi
 # The value is validated inside the guard, not here (#2253): a malformed knob
 # must not turn the disabled (codex.enabled: false) or skip
 # (request_by_default) paths, which post nothing, from exit 5 into exit 3.
-REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds)
+# An unreadable value is held as a non-integer marker, so the guard refuses
+# it on the write path and the no-write paths stay as they are.
+REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds scalar) \
+  || REQUEST_MIN_HEAD_AGE_SECONDS="<unreadable from the policy>"
 REQUEST_MIN_HEAD_AGE_SECONDS=${REQUEST_MIN_HEAD_AGE_SECONDS:-300}
 # REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
 # off (key present and empty). Resolve value and presence together as YAML

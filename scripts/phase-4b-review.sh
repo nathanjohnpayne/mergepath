@@ -393,14 +393,21 @@ fi
 # (false) exists to prevent. ENABLED_VIA is carried into the emitted JSON so
 # a review posted under the override is distinguishable after the fact from
 # one posted under a configured opt-in.
-ENABLED="$(p4b_automation_field enabled)"; ENABLED="${ENABLED:-false}"
+# Read from the parsed policy (#2913). A policy that cannot be read (no
+# parser, no jq, a parse error, a value of the wrong kind) is not read as the
+# defaults: the run defers to the manual handoff below with its own reason,
+# policy-unreadable, which --force-enabled does not override.
+POLICY_UNREADABLE=""
+ENABLED="$(p4b_automation_field enabled bool)" || POLICY_UNREADABLE=enabled
+ENABLED="${ENABLED:-false}"
 ENABLED_VIA="config"
-if [ "$ENABLED" != "true" ] && [ "$FORCE_ENABLED" = true ]; then
+if [ -z "$POLICY_UNREADABLE" ] && [ "$ENABLED" != "true" ] && [ "$FORCE_ENABLED" = true ]; then
   ENABLED="true"
   ENABLED_VIA="override"
   p4b_log "phase_4b_automation.enabled != true, but --force-enabled/P4B_FORCE_ENABLED requested this run anyway"
 fi
-MODE="$(p4b_automation_field mode)"; MODE="${MODE:-local}"
+MODE="$(p4b_automation_field mode string)" || POLICY_UNREADABLE="${POLICY_UNREADABLE:-mode}"
+MODE="${MODE:-local}"
 
 json_string() {
   local value="$1"
@@ -423,6 +430,11 @@ emit_skip_json() {
     "$(json_string "$ENABLED_VIA")" "$(json_string "$1")"
 }
 
+if [ -n "$POLICY_UNREADABLE" ]; then
+  p4b_log "ERROR: phase_4b_automation.$POLICY_UNREADABLE could not be read from the review policy — deferring to the manual handoff"
+  emit_skip_json "policy-unreadable"
+  exit 5
+fi
 if [ "$ENABLED" != "true" ]; then
   p4b_log "phase_4b_automation.enabled != true — deferring to the manual handoff"
   emit_skip_json "automation-disabled"
@@ -2028,7 +2040,7 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
   # true/false (or absent ⇒ true) are accepted — a typo like `False`, `no`,
   # or `0` must not silently fail OPEN into auto-filing issues under the
   # author PAT.
-  _pri_knob="$(p4b_automation_field post_review_issues)"
+  _pri_knob="$(p4b_automation_field post_review_issues)" || _pri_knob="<unreadable>"
   case "${_pri_knob:-true}" in
     true) : ;;
     false)
