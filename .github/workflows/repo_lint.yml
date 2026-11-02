@@ -77,6 +77,7 @@ jobs:
       checks: ${{ steps.classify.outputs.checks }}
       consumer_replay: ${{ steps.classify.outputs.consumer_replay }}
       self_tests: ${{ steps.classify.outputs.self_tests }}
+      tooling: ${{ steps.tooling.outputs.tooling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,6 +126,43 @@ jobs:
             echo "repo-lint scope: PR diff unavailable; failing closed to deep CI"
           fi
 
+      # #2921: may lint-fast skip its tooling-only checks? Only an exact
+      # `tooling=false` from the classifier says yes; a missing classifier, a
+      # failed diff or merge base, a classifier error or any other output
+      # writes tooling=true, so every doubt runs the full set. The diff is
+      # three-dot (against the merge base), so a content branch that is
+      # behind main is not charged with main's own tooling commits, and
+      # `--no-renames` lists a moved file's source as well as its
+      # destination, so a tooling file renamed into a content directory
+      # still reads as a tooling change.
+      - name: classify tooling scope
+        id: tooling
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          classifier=scripts/ci/repo-lint-tooling-scope.sh
+          verdict=''
+          if [ ! -f "$classifier" ]; then
+            echo "repo-lint tooling scope: $classifier absent; running the full set"
+          elif [ "$EVENT_NAME" != "pull_request" ]; then
+            verdict=$(printf '' | bash "$classifier" --event "$EVENT_NAME") || verdict=''
+          elif git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+              && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
+              && changed=$(git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA"); then
+            verdict=$(printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME") || verdict=''
+          else
+            echo "repo-lint tooling scope: PR diff unavailable; running the full set"
+          fi
+          [ -z "$verdict" ] || printf '%s\n' "$verdict"
+          if [ "$(printf '%s\n' "$verdict" | head -n 1)" = "tooling=false" ]; then
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
+          fi
+
   lint_fast:
     # Sharded fast lane (#2163, #1062 Phase 2). Every check step below is
     # pinned to exactly one shard with `if: matrix.shard == N`; the setup
@@ -149,7 +187,15 @@ jobs:
     # No `concurrency:` here: the workflow-level group already cancels a
     # superseded PR head, and a job-level group on a required-gate input
     # cancels a PENDING leg of the same head (memory: never add one).
+    #
+    # Content-only routing (#2921): the steps listed in the `report tooling
+    # scope` step below also carry `&& needs.scope.outputs.tooling != 'false'`,
+    # so they skip when the scope job proved every changed path is declared
+    # content. The skip is at step level: the job still runs and reports, and
+    # `lint` still reads its rolled-up result. Anything but an exact 'false'
+    # (including an empty output) runs them.
     name: lint-fast
+    needs: scope
     runs-on: ubuntu-latest
     # Bound each leg the way deep_safety is bounded: a wedged check would
     # otherwise hold the required `lint` context open for the 6 h runner
@@ -196,6 +242,42 @@ jobs:
       # shard records its own baseline and verifies it at its own end.
       - name: check_git_identity_hygiene --snapshot
         run: ./scripts/ci/check_git_identity_hygiene --snapshot || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+      # #2921: print this leg's routing so a skip is visible in its own log.
+      # TOOLING_ONLY_CHECKS names every step gated on the tooling scope, as
+      # shard:name; tests/test_repo_lint_optimization.sh asserts it equals
+      # the gated steps exactly. Any event but pull_request must never see
+      # tooling=false, so that reading fails the leg instead of skipping.
+      - name: report tooling scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TOOLING: ${{ needs.scope.outputs.tooling }}
+          SHARD: ${{ matrix.shard }}
+          TOOLING_ONLY_CHECKS: >-
+            1:check_codex_scripts
+            1:check_op_preflight_contract
+            2:check_gh_as_author
+            2:check_coderabbit_severity_gate
+            2:check_stalled_pr_resume
+            3:check_review_feedback_accounting
+            3:check_resolve_pr_threads
+            4:check_codex_p1_gate
+        run: |
+          set -euo pipefail
+          if [ "$TOOLING" != "false" ]; then
+            echo "repo-lint tooling scope: tooling=${TOOLING:-<empty>}; running every check on shard $SHARD"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "FAIL: tooling=false on a $EVENT_NAME run; only a pull request may skip" >&2
+            exit 1
+          fi
+          echo "repo-lint tooling scope: content-only pull request (tooling=false)"
+          for entry in $TOOLING_ONLY_CHECKS; do
+            if [ "${entry%%:*}" = "$SHARD" ]; then
+              echo "SKIPPED (content-only PR, #2921): ${entry#*:}"
+            fi
+          done
 
       # #853 — provision the Python packages the check_* loop depends on
       # explicitly, instead of relying on whatever the runner image happens
@@ -426,11 +508,11 @@ jobs:
       # See #289 r4 / #290 / #269 — nathanpayne-codex Phase 4b finding.
 
       - name: check_codex_scripts
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_codex_scripts || { rc=$?; if [ ! -f scripts/ci/check_codex_scripts ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_codex_scripts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_review_feedback_accounting
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_review_feedback_accounting || { rc=$?; if [ ! -f scripts/ci/check_review_feedback_accounting ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_review_feedback_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_daily_feedback_rollup
@@ -566,7 +648,7 @@ jobs:
         run: ./scripts/ci/check_lint_tooling || { rc=$?; if [ ! -f scripts/ci/check_lint_tooling ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_lint_tooling not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_codex_p1_gate
-        if: matrix.shard == 4
+        if: matrix.shard == 4 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_codex_p1_gate || { rc=$?; if [ ! -f scripts/ci/check_codex_p1_gate ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_codex_p1_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_wave_audit
@@ -589,7 +671,7 @@ jobs:
         run: ./scripts/ci/check_external_review_helpers || { rc=$?; if [ ! -f scripts/ci/check_external_review_helpers ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_external_review_helpers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_severity_gate
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
         # scripts/coderabbit-severity-gate.sh +
         # .github/workflows/coderabbit-severity-gate.yml +
@@ -696,7 +778,7 @@ jobs:
       # Both travel with the scripts/workflow/ kit, so the suite runs on
       # every consumer too; it is fixture-driven with a PATH-shimmed gh.
       - name: check_stalled_pr_resume
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # GitHub blocks pull_request_target in public repositories from
@@ -723,14 +805,14 @@ jobs:
         run: ./scripts/ci/check_policy_mutations || { rc=$?; if [ ! -f scripts/ci/check_policy_mutations ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_policy_mutations not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_resolve_pr_threads
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && needs.scope.outputs.tooling != 'false'
         # Requires yq via the delegated verified-propagation suite —
         # runs after install_yq_for_sync_manifest above (Codex P2 on
         # #616, finding 3509567286).
         run: ./scripts/ci/check_resolve_pr_threads || { rc=$?; if [ ! -f scripts/ci/check_resolve_pr_threads ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_resolve_pr_threads not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_gh_as_author
-        if: matrix.shard == 2
+        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_gh_as_author || { rc=$?; if [ ! -f scripts/ci/check_gh_as_author ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_as_author not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_bare_gh_writes
@@ -782,7 +864,7 @@ jobs:
         run: ./scripts/ci/check_no_token_in_output --scan || { rc=$?; if [ -f scripts/ci/check_no_token_in_output ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/token_output_gate.py ]; then echo "check_no_token_in_output is absent while its gate payload scripts/ci/token_output_gate.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_op_preflight_contract
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_op_preflight_contract || { rc=$?; if [ ! -f scripts/ci/check_op_preflight_contract ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_op_preflight_contract not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_onepassword_headless_proof_workflow
