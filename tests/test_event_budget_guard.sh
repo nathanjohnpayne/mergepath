@@ -575,6 +575,8 @@ echo "── Merge Clearance Gate (event job): review-input fingerprint (#2920) 
 # runs them: a skip leaves phase 1, the checkout, the budget guard and the
 # gate skipped by their pinned conditions, and the report concludes.
 FP_STUB='gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf "%s\n" "${1:-none}" >>"$FP_CALLS.budget"; }
+gif_requests_used() { echo 7; }
 gif_compute() {
   local n v
   printf "%s\n" "$*" >>"$FP_CALLS"
@@ -599,7 +601,7 @@ FPA=$(printf 'a%.0s' $(seq 64)); FPB=$(printf 'e%.0s' $(seq 64))
 # (report only) or the full job with the step's `before` handed to phase 2.
 mcg_fp() {
   local event="$1" skip before rc=0; shift
-  : >"$T/state/fp-calls"; : >"$T/state/output"
+  : >"$T/state/fp-calls"; : >"$T/state/fp-calls.budget"; : >"$T/state/output"
   step "$T/steps/mcg-fp.sh" EVENT_NAME="$event" PR_NUMBER=41 HEAD_SHA="$HEAD" FP_CALLS="$T/state/fp-calls" "$@" || return 9
   skip=$(output skip); before=$(output before)
   FP_STEP_SKIP="$skip"; FP_STEP_BEFORE="$before"
@@ -615,11 +617,19 @@ newest_text() { runs_json | jq -r '[.[] | select(.name == "Merge clearance gate"
 fresh; mcg_fp pull_request_review FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
 check "review event, unchanged inputs: skip, no evaluation, no hold, a non-failing native run" \
   '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" = true ] && [ -z "$(gates)" ] && [ "$(runs_json | jq length)" = 0 ]'
+check "the comparison is bounded per request by the live budget above the reserve (1000 - 200)" \
+  '[ "$(head -1 "$T/state/fp-calls.budget")" = 800 ]'
 fresh; mcg_fp pull_request_review_comment FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
 check "review-comment event, unchanged inputs: skip" '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" = true ] && [ -z "$(gates)" ]'
 fresh; mcg_fp pull_request FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
 check "push event: never skips, even on a matching fingerprint; the green records it" \
   '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" != true ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = "<!-- mergepath-input-fingerprint:v1 $FPA -->" ]'
+check "the re-read after a green is bounded the same way, from a fresh budget read (900 - 200)" \
+  '[ "$(sed -n 2p "$T/state/fp-calls.budget")" = 700 ]'
+fresh; mcg_fp pull_request_review RL_REMAINING=fail FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "an unreadable budget compares with no limit (the guard's own direction)" \
+  '[ "$(head -1 "$T/state/fp-calls.budget")" = none ]'
+
 fresh; mcg_fp pull_request_review FP_SEQ="$FPB" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
 check "review event, changed inputs: evaluated; the green records the new fingerprint" \
   '[ "$rc" = 0 ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = "<!-- mergepath-input-fingerprint:v1 $FPB -->" ]'

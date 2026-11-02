@@ -264,6 +264,7 @@ jobs:
           # A short budget skips the comparison, never the evaluation: the
           # guarded path below runs exactly as without it. An unreadable
           # budget compares, the guard's own direction.
+          fp_limit=""
           if [ -r "$budget" ]; then
             # shellcheck source=scripts/workflow/installation-budget.sh
             . "$budget" || exit 0
@@ -273,9 +274,15 @@ jobs:
               echo "::notice::The installation budget does not cover the input comparison beyond the reserve; evaluating in full (#2920)."
               exit 0
             fi
+            # The reads are paginated, so FP_BUDGET_REQUESTS is a floor, not
+            # a bound: the library counts each request as it happens and
+            # stops at the reserve, which then evaluates in full (Phase 4b
+            # on #2924). An unknown budget sets no limit.
+            [ "${budget_known:-0}" -ne 1 ] || fp_limit=$(( rl_remaining - FP_BUDGET_RESERVE_REQUESTS ))
           fi
           # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
           . "$lib" || exit 0
+          gif_budget "$fp_limit" || exit 0
           revision=$(git -C .gate-input-fingerprint rev-parse HEAD 2>/dev/null) || exit 0
           case "$EVENT_NAME" in
             pull_request_review|pull_request_review_comment)
@@ -555,8 +562,11 @@ jobs:
           BUDGET_SKIP_TITLE: ${{ steps.budget.outputs.title }}
           RATE_LIMITED: ${{ steps.gate.outputs.rate_limited }}
           RATE_LIMITED_TITLE: ${{ steps.gate.outputs.budget_title }}
-          # #2920: the input fingerprint read before the evaluation.
+          # #2920: the input fingerprint read before the evaluation, and the
+          # reserve its re-read must leave untouched (the budget guard's).
           FP_BEFORE: ${{ steps.fp.outputs.before }}
+          FP_BUDGET_RESERVE_REQUESTS: "200"
+          FP_BUDGET_GRAPHQL_RESERVE_POINTS: "75"
         run: |
           set -uo pipefail
           if [ "${BUDGET_SKIP:-}" = true ] || [ "${RATE_LIMITED:-}" = true ]; then
@@ -622,8 +632,19 @@ jobs:
           fp_args=()
           if [ "$conclusion" = success ] && [ -n "${FP_BEFORE:-}" ] \
              && [ -r scripts/workflow/gate-input-fingerprint.sh ]; then
+            # The re-read is bounded the same way as the first read: by the
+            # live budget above the guard's reserve, counted per request
+            # (Phase 4b on #2924); an unknown budget sets no limit.
+            fp_limit=""
+            if [ -r scripts/workflow/installation-budget.sh ] \
+               && . scripts/workflow/installation-budget.sh \
+               && ib_read 1 "$FP_BUDGET_RESERVE_REQUESTS" 1 "$FP_BUDGET_GRAPHQL_RESERVE_POINTS" \
+               && [ "${budget_known:-0}" -eq 1 ]; then
+              fp_limit=$(( rl_remaining - FP_BUDGET_RESERVE_REQUESTS ))
+            fi
             # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
             if . scripts/workflow/gate-input-fingerprint.sh \
+               && gif_budget "$fp_limit" \
                && fp_after=$(gif_compute "$REPO" "$PR_NUMBER" "$HEAD_SHA" "Merge clearance gate" "$trusted_revision") \
                && [ "$fp_after" = "$FP_BEFORE" ] \
                && fp_marker=$(gif_marker "Merge clearance gate" "$fp_after"); then

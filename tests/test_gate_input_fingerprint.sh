@@ -51,13 +51,15 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$GH_LOG"
 [ "$1" = api ] || exit 2
 shift
-endpoint="" jqexpr="" graphql=0
+endpoint="" jqexpr="" graphql=0 page="" per_page=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --paginate) ;;
     -X) shift ;;
     --jq) jqexpr="$2"; shift ;;
-    -f|-F) shift ;;
+    -f|-F)
+      case "$2" in page=*) page="${2#page=}" ;; per_page=*) per_page="${2#per_page=}" ;; esac
+      shift ;;
     graphql) graphql=1 ;;
     *) [ -n "$endpoint" ] || endpoint="$1" ;;
   esac
@@ -81,6 +83,11 @@ esac
 [ -f "$FIX/$file" ] || { echo "gh: HTTP 404 ($file)" >&2; exit 1; }
 if [ -n "$jqexpr" ]; then
   jq -rc "$jqexpr" "$FIX/$file"
+elif [ -n "$page" ]; then
+  # One page of a list (or of a check-run listing), as the API serves it.
+  jq -c --argjson p "$page" --argjson n "${per_page:-30}" '
+    if type == "array" then .[(($p - 1) * $n):($p * $n)]
+    else .check_runs |= .[(($p - 1) * $n):($p * $n)] end' "$FIX/$file"
 else
   cat "$FIX/$file"
 fi
@@ -226,14 +233,43 @@ cp "$TMP/edit-between/comments.json" "$TMP/edit-before/comments.json"
 expect_differ "1f. a comment edit between two identical approvals keeps the repeat" \
   "$TMP/edit-before" "$TMP/edit-between"
 
+# 1g. A same-second tie with ANOTHER reviewer keeps the repeat: the gate
+# breaks submitted_at ties by input order, so cursor's draft (id 12, 10:05)
+# tying claude's approval (id 13, 10:05) can move which review governs.
+cp -R "$TMP/base" "$TMP/tie-a"
+jq -n --arg head "$HEAD" '[
+  {id: 11, user: {login: "nathanpayne-cursor"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve [9]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:01:00Z"},
+  {id: 13, user: {login: "nathanpayne-claude"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve [55]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:05:00Z"}]' \
+  >"$TMP/tie-a/reviews.json"
+cp -R "$TMP/tie-a" "$TMP/tie-b"
+jq --arg head "$HEAD" '. + [{id: 12, user: {login: "nathanpayne-cursor"}, state: "APPROVED", commit_id: $head,
+  body: "4b approve [9]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:05:00Z"}]' \
+  "$TMP/tie-a/reviews.json" >"$TMP/tie-b/reviews.json"
+expect_differ "1g. a repeat tying another reviewer's review keeps the repeat" "$TMP/tie-a" "$TMP/tie-b"
+# 1h. ...and so does a repeat whose PREDECESSOR ties another review.
+cp -R "$TMP/base" "$TMP/ptie-a"
+jq -n --arg head "$HEAD" '[
+  {id: 11, user: {login: "nathanpayne-cursor"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve [9]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:01:00Z"},
+  {id: 10, user: {login: "nathanpayne-claude"}, state: "APPROVED", commit_id: $head,
+   body: "4b approve [55]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:01:00Z"}]' \
+  >"$TMP/ptie-a/reviews.json"
+cp -R "$TMP/ptie-a" "$TMP/ptie-b"
+jq --arg head "$HEAD" '. + [{id: 12, user: {login: "nathanpayne-cursor"}, state: "APPROVED", commit_id: $head,
+  body: "4b approve [9]", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:07:00Z"}]' \
+  "$TMP/ptie-a/reviews.json" >"$TMP/ptie-b/reviews.json"
+expect_differ "1h. a repeat whose predecessor ties another review keeps the repeat" "$TMP/ptie-a" "$TMP/ptie-b"
+
 # 2. A second identical comment-only review.
 cp -R "$TMP/base" "$TMP/comment1"
 jq --arg head "$HEAD" '. + [{id: 13, user: {login: "nathanpayne-cursor"}, state: "COMMENTED",
-  commit_id: $head, body: "Looks fine", author_association: "COLLABORATOR"}]' \
+  commit_id: $head, body: "Looks fine", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:10:00Z"}]' \
   "$TMP/base/reviews.json" >"$TMP/comment1/reviews.json"
 cp -R "$TMP/comment1" "$TMP/comment2"
 jq --arg head "$HEAD" '. + [{id: 14, user: {login: "nathanpayne-cursor"}, state: "COMMENTED",
-  commit_id: $head, body: "Looks fine", author_association: "COLLABORATOR"}]' \
+  commit_id: $head, body: "Looks fine", author_association: "COLLABORATOR", submitted_at: "2026-11-01T10:12:00Z"}]' \
   "$TMP/comment1/reviews.json" >"$TMP/comment2/reviews.json"
 expect_same "2. repeated identical comment-only review keeps the fingerprint" "$TMP/comment1" "$TMP/comment2"
 expect_differ "2b. the FIRST comment-only review with a body changes it" "$TMP/base" "$TMP/comment1"
@@ -374,6 +410,42 @@ FAIL_READ=check-runs decide "8. unreadable run listing" eval "$TMP/base"
 GIF_MAX_AGE_SECONDS=abc decide "8. malformed GIF_MAX_AGE_SECONDS" eval "$TMP/base"
 # The newest run decides even when an older one matches: ids, not order.
 neg "newest by id, listed first" "[$(api_run 502 completed failure "" "$FRESH"), $(api_run 500 completed success "$MARK" "$FRESH")]"
+
+echo "gate-input-fingerprint: request accounting"
+# 10. Pagination is counted page by page against GIF_REQUEST_LIMIT, and a
+# limit the reads would pass leaves no fingerprint (the caller evaluates in
+# full) before the request that would cross it is made.
+cp -R "$TMP/base" "$TMP/many"
+jq --arg head "$HEAD" '[range(0; 230) as $i | {id: (1000 + $i), user: {login: "u\($i)"}, state: "COMMENTED",
+  commit_id: $head, body: "c\($i)", author_association: "NONE", submitted_at: ("2026-11-01T08:" + (($i / 60 | floor) | tostring | if length < 2 then "0" + . else . end) + ":" + (($i % 60) | tostring | if length < 2 then "0" + . else . end) + "Z")}]' \
+  -n >"$TMP/many/reviews.json"
+gif_budget ""
+FIX="$TMP/many" gif_compute "$REPO" "$PR" "$HEAD" "$CTX" "$REV" >/dev/null \
+  && [ "$(gif_requests_used)" = 8 ] \
+  && pass "10a. 230 reviews read as three pages: eight requests in all, counted" \
+  || fail "10a. 230 reviews read as three pages: eight requests in all, counted (used $(gif_requests_used))"
+gif_budget 7
+: >"$GH_LOG"
+if FIX="$TMP/many" gif_compute "$REPO" "$PR" "$HEAD" "$CTX" "$REV" >/dev/null 2>&1; then
+  fail "10b. a limit one request short computes no fingerprint"
+else
+  [ "$(grep -c . "$GH_LOG")" = 7 ] && pass "10b. a limit one request short computes no fingerprint, after exactly seven requests" \
+    || fail "10b. a limit one request short made $(grep -c . "$GH_LOG") requests"
+fi
+gif_budget 8
+FIX="$TMP/many" gif_compute "$REPO" "$PR" "$HEAD" "$CTX" "$REV" >/dev/null \
+  && pass "10c. an exact limit still computes" || fail "10c. an exact limit still computes"
+gif_budget 1
+rc=0; FIX="$TMP/base" gif_decide "$REPO" "$PR" "$HEAD" "$CTX" "$REV" || rc=$?
+[ "$rc" -ne 0 ] && [ -z "$GIF_HEX" ] && pass "10d. a limit too small for the comparison decides nothing" \
+  || fail "10d. a limit too small for the comparison decides nothing"
+# Six reads for the fingerprint, then the listing would be the seventh.
+gif_budget 6
+rc=0; FIX="$TMP/base" gif_decide "$REPO" "$PR" "$HEAD" "$CTX" "$REV" || rc=$?
+[ "$rc" -ne 0 ] && [ "$GIF_REASON" = "could not read the published runs" ] \
+  && pass "10e. the published-run listing counts against the same limit" \
+  || fail "10e. the published-run listing counts against the same limit ($GIF_REASON)"
+gif_budget ""
 
 echo "gate-input-fingerprint: fail toward re-evaluating"
 nofp() { # label env-assignment...

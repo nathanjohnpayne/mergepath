@@ -62,13 +62,56 @@ gif_sha256() {
   fi
 }
 
+# Request accounting (Phase 4b on #2924). Every API request this library
+# makes goes through gif_request, which counts it in GIF_REQUESTS_FILE (a
+# file, so the count survives the command substitutions callers use) and
+# refuses once GIF_REQUEST_LIMIT requests have been made. A caller sets the
+# limit from the live installation budget with gif_budget, so the optional
+# comparison stops, page by page, before it reaches the reserve the budget
+# guards keep back, and the caller then evaluates in full. An unset limit
+# (an unknown budget) counts without refusing, the guards' own direction.
+gif_budget() { # <limit or empty>: start counting afresh under this limit
+  if [ -z "${GIF_REQUESTS_FILE:-}" ] || [ ! -w "$GIF_REQUESTS_FILE" ]; then
+    GIF_REQUESTS_FILE=$(mktemp "${TMPDIR:-/tmp}/gif-requests.XXXXXX") || return 1
+    export GIF_REQUESTS_FILE
+  fi
+  : >"$GIF_REQUESTS_FILE"
+  GIF_REQUEST_LIMIT="${1:-}"
+  export GIF_REQUEST_LIMIT
+}
+gif_requests_used() {
+  if [ -n "${GIF_REQUESTS_FILE:-}" ] && [ -r "$GIF_REQUESTS_FILE" ]; then
+    wc -l <"$GIF_REQUESTS_FILE" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+gif_request() { # gh api arguments: one counted request, refused over the limit
+  local used
+  [ -n "${GIF_REQUESTS_FILE:-}" ] || gif_budget "${GIF_REQUEST_LIMIT:-}" || return 1
+  used=$(gif_requests_used)
+  if [ -n "${GIF_REQUEST_LIMIT:-}" ]; then
+    [[ "$GIF_REQUEST_LIMIT" =~ ^[0-9]+$ ]] || return 1
+    [ "$used" -lt "$GIF_REQUEST_LIMIT" ] || return 1
+  fi
+  echo . >>"$GIF_REQUESTS_FILE"
+  gh api "$@"
+}
+
 # gif_list <endpoint>: every element of a paginated REST list, as one JSON
-# array. Fails when any page is not an array.
+# array, fetched one counted page at a time (so the request limit can stop
+# it between pages). Fails when any page is not an array of objects, and
+# past 50 pages.
 gif_list() {
-  local lines
-  lines=$(gh api --paginate -X GET "$1" -f per_page=100 \
-    --jq 'if type == "array" then .[] else error("not a list page") end') || return 1
-  printf '%s\n' "$lines" | jq -cs 'if all(.[]; type == "object") then . else error("not objects") end'
+  local page=1 reply all='[]' n
+  while [ "$page" -le 50 ]; do
+    reply=$(gif_request -X GET "$1" -f per_page=100 -f page="$page") || return 1
+    n=$(printf '%s\n' "$reply" | jq -e 'if type == "array" and all(.[]; type == "object") then length else error("not a list page") end' 2>/dev/null) || return 1
+    all=$(printf '%s\n%s\n' "$all" "$reply" | jq -cs '.[0] + .[1]') || return 1
+    [ "$n" -ge 100 ] || { printf '%s\n' "$all"; return 0; }
+    page=$((page + 1))
+  done
+  return 1
 }
 
 # gif_threads <repo> <pr>: every review thread's resolution state. A PR
@@ -76,7 +119,7 @@ gif_list() {
 gif_threads() {
   local repo="$1" pr="$2" reply
   # shellcheck disable=SC2016  # GraphQL variables, bound by the -F/-f flags
-  reply=$(gh api graphql -F owner="${repo%%/*}" -F name="${repo#*/}" -F number="$pr" \
+  reply=$(gif_request graphql -F owner="${repo%%/*}" -F name="${repo#*/}" -F number="$pr" \
     -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated}}}}}') || return 1
   printf '%s\n' "$reply" | jq -ce '
     if (.errors // null) != null then error("graphql errors") else . end
@@ -100,7 +143,10 @@ gif_threads() {
 # one timeline of reviews (by submitted_at, the order the gate selects them
 # in) and PR-level and inline comments (by creation and by every edit). On a
 # timestamp tie a comment sorts before a review, so a same-second comment
-# always counts as between them. Anything in between keeps the repeat: the
+# always counts as between them, and a repeat whose timestamp, or whose
+# predecessor's, is shared with any other event is kept: the gate breaks
+# submitted_at ties by input order, so a tie can move which review governs
+# (Phase 4b on #2924). Anything in between keeps the repeat: the
 # gate selects governing reviews by submission order across reviewers (the
 # newest Phase 4b approver, for one) and checks an approval against the
 # requests and Codex outcomes posted before it, so a repeat with another
@@ -141,8 +187,10 @@ def rx: if type == "object" then del(.url) else null end;
             (select((.updated_at // "") != (.created_at // ""))
              | {t: (.updated_at // ""), o: 0, id, r: false}) ] )
     | sort_by([.t, .o, .id])
+    | (group_by(.t) | map({key: .[0].t, value: length}) | from_entries) as $at
     | reduce .[] as $e ({prev: null, out: []};
-        if $e.r and .prev != null and .prev.r and .prev.v == $e.v then .prev = $e
+        if $e.r and .prev != null and .prev.r and .prev.v == $e.v
+           and $at[$e.t] == 1 and $at[.prev.t] == 1 then .prev = $e
         elif $e.r then .out += [$e.v] | .prev = $e
         else .prev = $e end)
     | .out),
@@ -178,9 +226,9 @@ gif_compute() {
     revision=$(git rev-parse HEAD 2>/dev/null) || return 1
   fi
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
-  pr_json=$(gh api "repos/$repo/pulls/$pr") || return 1
+  pr_json=$(gif_request "repos/$repo/pulls/$pr") || return 1
   jq -e --arg head "$head" '.head.sha == $head' >/dev/null <<<"$pr_json" 2>/dev/null || return 1
-  issue_json=$(gh api "repos/$repo/issues/$pr") || return 1
+  issue_json=$(gif_request "repos/$repo/issues/$pr") || return 1
   reviews=$(gif_list "repos/$repo/pulls/$pr/reviews") || return 1
   inline=$(gif_list "repos/$repo/pulls/$pr/comments") || return 1
   comments=$(gif_list "repos/$repo/issues/$pr/comments") || return 1
@@ -218,14 +266,21 @@ gif_published_matches() {
   # Job-native runs carry an /actions/runs/ details URL and an Actions
   # external_id; Checks-API runs carry neither (the discriminators due()
   # and scripts/gate-api-lineage-blocking.sh use).
-  if ! runs=$(gh api --paginate -X GET "repos/$repo/commits/$head/check-runs" \
-      -f check_name="$context" -f filter=all -f per_page=100 \
-      --jq '.check_runs[] | {id, name, status, conclusion, completed_at,
+  local page=1 reply n
+  runs=""
+  while :; do
+    if [ "$page" -gt 50 ] || ! reply=$(gif_request -X GET "repos/$repo/commits/$head/check-runs" \
+        -f check_name="$context" -f filter=all -f per_page=100 -f page="$page") \
+        || ! n=$(printf '%s\n' "$reply" | jq -e '.check_runs | if type == "array" then length else error("no list") end' 2>/dev/null); then
+      GIF_REASON="could not read the published runs"
+      return 1
+    fi
+    runs="$runs$(printf '%s\n' "$reply" | jq -c '.check_runs[] | {id, name, status, conclusion, completed_at,
               ext: (.external_id // ""), app: (.app.slug // ""),
-              url: (.details_url // ""), text: (.output.text // "")}'); then
-    GIF_REASON="could not read the published runs"
-    return 1
-  fi
+              url: (.details_url // ""), text: (.output.text // "")}')"$'\n'
+    [ "$n" -ge 100 ] || break
+    page=$((page + 1))
+  done
   verdict=$(printf '%s\n' "$runs" | jq -rs --arg context "$context" --arg marker "$marker" \
     --argjson age "$GIF_MAX_AGE_SECONDS" '
     [ .[] | select(.name == $context and .app == "github-actions" and .ext == ""

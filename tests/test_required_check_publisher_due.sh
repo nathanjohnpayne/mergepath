@@ -739,6 +739,8 @@ check "nominate job: malformed entries are ignored and a failed dispatch only wa
 # after the evaluation agree; a red one never does.
 cat >"$TMP/work/scripts/workflow/gate-input-fingerprint.sh" <<'SH'
 gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf '%s\n' "${1:-none}" >>"$FP_CALLS.budget"; }
+gif_requests_used() { echo 7; }
 gif_compute() {
   local n v
   printf '%s\n' "$*" >>"$FP_CALLS"
@@ -781,7 +783,7 @@ mcg_opened() {  # mcg_opened <head>: Merge clearance generations opened on <head
   grep '^POST ' "$TMP/gh.log" | grep -F '"head_sha": "'"$1"'"' | grep -c '"name": "Merge clearance gate"' || true
 }
 fp_pass() {  # fp_pass <label> <parent_event> <FP_SEQ> <FP_PUBLISHED>
-  : >"$TMP/fp-calls"
+  : >"$TMP/fp-calls"; : >"$TMP/fp-calls.budget"
   FP_CALLS="$TMP/fp-calls" FP_SEQ="$3" FP_PUBLISHED="$4" run_pass "$1" workflow_run "$EH" "$2" ""
 }
 export FP_CALLS FP_SEQ FP_PUBLISHED
@@ -807,6 +809,8 @@ check "push parent: never skips, even on a matching fingerprint" \
   eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_opened "$EH")" -ge 1 ]'
 check "push parent: the green records the fingerprint read before and after" \
   eval '[ "$(mcg_text "$EH")" = "<!-- mergepath-input-fingerprint:v1 $FPA -->" ]'
+check "push parent: the comparison is bounded by what the reserve and the evaluation leave (1000 - 100 - 60), the re-read by the measured first read" \
+  eval '[ "$(cat "$TMP/fp-calls.budget" | tr "\n" " ")" = "840 7 " ]'
 check "push parent: no published-run comparison is made" \
   eval '[ "$(wc -l <"$TMP/fp-calls" | tr -d " ")" = 2 ]'
 

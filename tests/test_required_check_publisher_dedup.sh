@@ -245,6 +245,7 @@ FPDIR="$TMP/fp-work"
 mkdir -p "$FPDIR/.gate-input-fingerprint/scripts/workflow" "$TMP/fpbin"
 cat >"$FPDIR/.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh" <<'SH'
 gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf 'budget %s\n' "${1:-none}" >>"$FP_LOG.budget"; }
 gif_decide() {
   printf '%s\n' "$*" >>"$FP_LOG"
   GIF_HEX=""; GIF_REASON="stub $FP_DECISION"
