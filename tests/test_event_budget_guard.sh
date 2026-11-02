@@ -85,6 +85,7 @@ extract "$MCG_WORKFLOW" merge-clearance-gate "Run scripts/merge-clearance-gate.s
 extract "$MCG_WORKFLOW" merge-clearance-gate "Close the required check_run (#841 phase 2)" "$T/steps/mcg-close.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Confirm the Checks-API lineage blocks while pending (#2247)" "$T/steps/mcg-lineage.sh"
 extract "$MCG_WORKFLOW" merge-clearance-gate "Report gate verdict" "$T/steps/mcg-report.sh"
+extract "$MCG_WORKFLOW" merge-clearance-gate "Compare review inputs with the published verdict (#2920)" "$T/steps/mcg-fp.sh"
 extract "$AC_WORKFLOW" evaluate-and-clear "Installation budget guard (#2286)" "$T/steps/ac-budget.sh"
 extract "$AC_WORKFLOW" evaluate-and-clear "Re-evaluate gate per PR + remove label on pass" "$T/steps/ac-clear.sh"
 extract "$RCP_WORKFLOW" publish "Resolve targets, evaluate gates, publish" "$T/steps/rcp-publish.sh"
@@ -249,7 +250,8 @@ if m and method == "PATCH":
         if run["id"] == int(m.group(1)):
             run["status"] = fields.get("status", run["status"])
             run["conclusion"] = fields.get("conclusion", run["conclusion"])
-            run["output"] = {"title": fields.get("output[title]", ""), "summary": fields.get("output[summary]", "")}
+            run["output"] = {"title": fields.get("output[title]", ""), "summary": fields.get("output[summary]", ""),
+                             "text": fields.get("output[text]")}
             run["completed_at"] = NOW
     save(); out({"id": int(m.group(1))}, jq)
 if m and method == "GET":
@@ -564,6 +566,93 @@ id=$(open_lease "Merge clearance gate")
 step "$T/steps/mcg-gate.sh" PR_NUMBER=41 MCG_MODE=ratelimit RL_AFTER_FAIL=healthy || true
 check "rate limit mid-run: the back-off title carries the refused probe's reset, not /rate_limit's" \
   '[ "$(output budget_title)" = "Merge clearance gate — installation API budget exhausted (rc=2); re-evaluated after $PROBE_ISO" ]'
+
+echo "── Merge Clearance Gate (event job): review-input fingerprint (#2920) ──"
+# A stub library answers the decision (tests/test_gate_input_fingerprint.sh
+# covers the real one): FP_SEQ lists what each successive gif_compute call
+# returns ("fail" fails it); FP_PUBLISHED is what the newest published
+# verdict records. The steps are the shipped ones, threaded the way Actions
+# runs them: a skip leaves phase 1, the checkout, the budget guard and the
+# gate skipped by their pinned conditions, and the report concludes.
+FP_STUB='gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf "%s\n" "${1:-none}" >>"$FP_CALLS.budget"; }
+gif_requests_used() { echo 7; }
+gif_compute() {
+  local n v
+  printf "%s\n" "$*" >>"$FP_CALLS"
+  n=$(wc -l <"$FP_CALLS" | tr -d " ")
+  set -- $FP_SEQ
+  if [ "$n" -le "$#" ]; then eval "v=\${$n}"; else eval "v=\${$#}"; fi
+  [ "$v" != fail ] || return 1
+  printf "%s" "$v"
+}
+gif_marker() { printf "<!-- mergepath-input-fingerprint:v1 %s -->" "$2"; }
+gif_decide() {
+  GIF_REASON=stub
+  GIF_HEX=$(gif_compute "$@") || { GIF_HEX=""; return 1; }
+  [ "$GIF_HEX" = "${FP_PUBLISHED:-}" ]
+}'
+mkdir -p "$W/.gate-input-fingerprint/scripts/workflow"
+printf '%s\n' "$FP_STUB" >"$W/.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh"
+printf '%s\n' "$FP_STUB" >"$W/scripts/workflow/gate-input-fingerprint.sh"
+cp "$BUDGET_LIB" "$W/.gate-input-fingerprint/scripts/workflow/installation-budget.sh"
+FPA=$(printf 'a%.0s' $(seq 64)); FPB=$(printf 'e%.0s' $(seq 64))
+# mcg_fp <event> [VAR=value ...]: the fingerprint step, then either the skip
+# (report only) or the full job with the step's `before` handed to phase 2.
+mcg_fp() {
+  local event="$1" skip before rc=0; shift
+  : >"$T/state/fp-calls"; : >"$T/state/fp-calls.budget"; : >"$T/state/output"
+  step "$T/steps/mcg-fp.sh" EVENT_NAME="$event" PR_NUMBER=41 HEAD_SHA="$HEAD" FP_CALLS="$T/state/fp-calls" "$@" || return 9
+  skip=$(output skip); before=$(output before)
+  FP_STEP_SKIP="$skip"; FP_STEP_BEFORE="$before"
+  if [ "$skip" = true ]; then
+    : >"$T/state/output"
+    step "$T/steps/mcg-report.sh" FP_SKIP=true "$@" || rc=$?
+    return "$rc"
+  fi
+  mcg "$PLENTY" NATIVE_RUN_ID=9003 FP_BEFORE="$before" FP_CALLS="$T/state/fp-calls" "$@" || rc=$?
+  return "$rc"
+}
+newest_text() { runs_json | jq -r '[.[] | select(.name == "Merge clearance gate")] | sort_by(.id) | last | .output.text // "none"'; }
+fresh; mcg_fp pull_request_review FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "review event, unchanged inputs: skip, no evaluation, no hold, a non-failing native run" \
+  '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" = true ] && [ -z "$(gates)" ] && [ "$(runs_json | jq length)" = 0 ]'
+check "the comparison is bounded per request by the live budget above the reserve (1000 - 200)" \
+  '[ "$(head -1 "$T/state/fp-calls.budget")" = 800 ]'
+fresh; mcg_fp pull_request_review_comment FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "review-comment event, unchanged inputs: skip" '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" = true ] && [ -z "$(gates)" ]'
+fresh; mcg_fp pull_request FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "push event: never skips, even on a matching fingerprint; the green records it" \
+  '[ "$rc" = 0 ] && [ "$FP_STEP_SKIP" != true ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = "<!-- mergepath-input-fingerprint:v1 $FPA -->" ]'
+check "the re-read after a green is bounded the same way, from a fresh budget read (900 - 200)" \
+  '[ "$(sed -n 2p "$T/state/fp-calls.budget")" = 700 ]'
+fresh; mcg_fp pull_request_review RL_REMAINING=fail FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "an unreadable budget compares with no limit (the guard's own direction)" \
+  '[ "$(head -1 "$T/state/fp-calls.budget")" = none ]'
+
+fresh; mcg_fp pull_request_review FP_SEQ="$FPB" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "review event, changed inputs: evaluated; the green records the new fingerprint" \
+  '[ "$rc" = 0 ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = "<!-- mergepath-input-fingerprint:v1 $FPB -->" ]'
+fresh; mcg_fp pull_request "FP_SEQ=$FPA $FPB" && rc=0 || rc=$?
+check "inputs changed during the evaluation: the green records no fingerprint" \
+  '[ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|success" ] && [ "$(newest_text)" = none ]'
+fresh; mcg_fp pull_request "FP_SEQ=$FPA fail" && rc=0 || rc=$?
+check "the after-read fails: the green records no fingerprint" '[ "$(newest_text)" = none ]'
+fresh; mcg_fp pull_request_review FP_SEQ=fail FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "no live fingerprint: evaluated in full, nothing recorded" \
+  '[ "$FP_STEP_SKIP" != true ] && [ -z "$FP_STEP_BEFORE" ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = none ]'
+fresh; mcg_fp pull_request FP_SEQ="$FPA" MCG_MODE=block && rc=0 || rc=$?
+check "a red verdict records no fingerprint and the native run still fails" \
+  '[ "$rc" = 1 ] && [ "$(newest "Merge clearance gate" | cut -d"|" -f1-2)" = "completed|failure" ] && [ "$(newest_text)" = none ]'
+fresh; mcg_fp pull_request_review "$SHORT" FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "short installation budget: no comparison read, no skip; the guarded path decides as before" \
+  '[ "$FP_STEP_SKIP" != true ] && [ -z "$FP_STEP_BEFORE" ] && [ ! -s "$T/state/fp-calls" ] && [ -z "$(gates)" ]'
+mv "$W/.gate-input-fingerprint" "$W/.gate-input-fingerprint.off"
+fresh; mcg_fp pull_request_review FP_SEQ="$FPA" FP_PUBLISHED="$FPA" && rc=0 || rc=$?
+check "no library on the default branch: no skip and no recorded fingerprint" \
+  '[ "$FP_STEP_SKIP" != true ] && [ -z "$FP_STEP_BEFORE" ] && [ "$(gates)" = "merge-clearance-gate.sh 41" ] && [ "$(newest_text)" = none ]'
+mv "$W/.gate-input-fingerprint.off" "$W/.gate-input-fingerprint"
+rm -f "$W/scripts/workflow/gate-input-fingerprint.sh"
 
 echo "── Auto-clear blocking labels ──"
 fresh; step "$T/steps/ac-budget.sh" "$SHORT" && rc=0 || rc=$?

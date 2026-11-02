@@ -151,6 +151,9 @@ GENERATION_TEST="tests/test_required_check_generations.py"
 # #2286: the event-driven gate workflows read the installation budget through
 # the publisher's own reader (scripts/workflow/installation-budget.sh).
 EVENT_BUDGET_TEST="tests/test_event_budget_guard.sh"
+# #2920: the review-input fingerprint the publisher and the event gate jobs
+# use to leave an unchanged context's green verdict standing.
+FINGERPRINT_TEST="tests/test_gate_input_fingerprint.sh"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -221,8 +224,11 @@ LINT_PARENT_WORKFLOW = sys.argv[4]
 OPEN_JOB = "open"
 PUBLISH_JOB = "publish"
 EXPECTED_JOB_PERMISSIONS = {
+    # issues: read for the #2920 input-fingerprint comparison, which reads
+    # the PR's issue comments and the reactions on its body.
     OPEN_JOB: {
         "contents": "read", "pull-requests": "read", "actions": "read", "checks": "write",
+        "issues": "read",
     },
     PUBLISH_JOB: {
         "contents": "read", "pull-requests": "read", "issues": "read",
@@ -906,6 +912,20 @@ for key, job in jobs.items():
             % key,
             "      Only the two reviewed publisher jobs may write this lineage (#1662).")
 
+# ── A18 — the #2920 fingerprint checkout cannot stop the holds ───────
+#
+# The `open` job's optional fingerprint-library checkout runs before the
+# hold-opening step. Untolerated, a failed checkout would skip that step and
+# leave the previous greens standing on a review event (Phase 4b on #2924),
+# so when the step exists it must carry `continue-on-error: true`.
+if open_job is not None:
+    for step in open_job.get("steps") or []:
+        if isinstance(step, dict) and step.get("name") == "Checkout the input-fingerprint library (#2920)" \
+                and step.get("continue-on-error") is not True:
+            bad("FAIL: [rcp fingerprint checkout] the open job's fingerprint-library checkout",
+                "      must carry continue-on-error: true; a failed checkout must not skip",
+                "      the step that opens the holds.")
+
 # ── A2 — every head_sha binding SITE is on an allowlist ────────────────
 #
 # Scope is exactly the binding sites, by spelling, plus their count; the
@@ -1413,6 +1433,15 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   fi
   if ! bash "$EVENT_BUDGET_TEST"; then
     echo "check_required_check_publisher: FAIL (event-driven budget guard suite)"
+    exit 1
+  fi
+  if [ ! -f "$FINGERPRINT_TEST" ]; then
+    echo "FAIL: $FINGERPRINT_TEST is missing; the review-input fingerprint skip (#2920) is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$FINGERPRINT_TEST"; then
+    echo "check_required_check_publisher: FAIL (review-input fingerprint suite)"
     exit 1
   fi
 fi

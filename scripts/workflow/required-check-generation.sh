@@ -28,9 +28,10 @@ rcg_open() { # repo pr full-head context; prints owned check id
     | .id | select(type == "number" and . > 0 and floor == .)'
 }
 
-rcg_close() { # repo pr head context id conclusion title summary
+rcg_close() { # repo pr head context id conclusion title summary [text]
   local repo="$1" pr="$2" head="$3" context="$4" id="$5" conclusion="$6" title="$7" summary="$8"
-  local revision binding owned live tip heads failed=0
+  local text="${9:-}" revision binding owned live tip heads failed=0
+  local -a text_args=()
   [[ "$id" =~ ^[1-9][0-9]*$ && "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
   revision=$(git rev-parse HEAD) || return 1
   binding=$(rcg_binding "$repo" "$pr" "$head" "$context" "$revision") || return 1
@@ -76,6 +77,12 @@ $summary"
   # a newer pending/failing generation wins even if it opens after these reads.
   summary="<!-- mergepath-generation:v1 $binding -->
 ${summary:0:59000}"
-  gh api -X PATCH "repos/$repo/check-runs/$id" -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" -f "output[summary]=$summary" >/dev/null || return 1 # NO_BARE_GH_WRITE_EXEMPT: Actions-only owned Checks API generation under workflow GITHUB_TOKEN (checks:write), never interactive author/reviewer PATs.
+  # #2920: output.text carries only the caller's review-input fingerprint
+  # marker (scripts/workflow/gate-input-fingerprint.sh), and only on a green
+  # that survived the fence above. A red never records one.
+  if [ -n "$text" ] && [ "$failed" -eq 0 ] && [ "$conclusion" = success ]; then
+    text_args=(-f "output[text]=$text")
+  fi
+  gh api -X PATCH "repos/$repo/check-runs/$id" -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" -f "output[summary]=$summary" ${text_args[@]+"${text_args[@]}"} >/dev/null || return 1 # NO_BARE_GH_WRITE_EXEMPT: Actions-only owned Checks API generation under workflow GITHUB_TOKEN (checks:write), never interactive author/reviewer PATs.
   [ "$failed" -eq 0 ]
 }

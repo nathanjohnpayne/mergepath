@@ -2271,7 +2271,7 @@ mcg22_case a 's{(      - name: Open the required check_run.*?)(      - name: Che
   fail '[#850 phase-1 position]'
 # b — phase 1 made conditional. success() is TRUTHY on purpose: the property is
 #     that phase 1 carries no step-level if: AT ALL, not that its if is falsy.
-mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        if: success()\n}' \
+mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n        id: open\n)        if: [^\n]*\n}{$1        if: success()\n}' \
   fail '[#850 phase-1 unconditional]'
 # c — the sweep can never run. Trigger, CHECK_NAME, POST, permissions all
 #     intact; only the parse sees that the job is unreachable.
@@ -2305,7 +2305,7 @@ mcg22_case h2 's{^  merge-clearance-gate:\n}{  merge-clearance-gate: ["not-a-map
 #      strings. Substrings alone accept it (the real publisher still satisfies
 #      the text layer later in the job); only the step-identity conjunct sees
 #      that the first step is not the publisher.
-mcg22_case a2 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - name: Preliminary\n        run: echo check-runs in_progress\n$2}' \
+mcg22_case a2 's{(\n)(      - name: Open the required check_run)}{$1      - name: Preliminary\n        run: echo check-runs in_progress\n$2}' \
   fail '[#850 phase-1 position]'
 # c2 — the same unreachable sweep spelled as an expression-wrapped literal,
 #      which GitHub evaluates exactly like the bare one.
@@ -2333,8 +2333,24 @@ mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
 # j — a steps entry that parses to a bare string. .get on it would raise; the
 #     first-step property must fail with its own named cause instead.
-mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
+mcg22_case j 's{(\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
   fail '[#850 phase-1 position]'
+# fp1–fp5 (#2920) — the review-input fingerprint preamble ahead of phase 1 is
+#     pinned whole: a PR-head checkout of the library would let a PR make
+#     every run skip; a conditional or non-review comparison would skip on a
+#     push; phase 1 may carry the skip condition and nothing else.
+mcg22_case fp1 's{(path: \.gate-input-fingerprint\n)}{$1}; s{(          ref: )\$\{\{ github\.event\.repository\.default_branch \}\}(\n          path: \.gate-input-fingerprint)}{$1\$\{\{ github.event.pull_request.head.sha \}\}$2}' \
+  fail '[#2920 fingerprint preamble]'
+mcg22_case fp6 's{(      - name: Checkout the input-fingerprint library \(#2920\)\n)        continue-on-error: true\n}{$1}' \
+  fail '[#2920 fingerprint preamble]'
+mcg22_case fp2 's{(        id: fp\n)}{$1        if: always()\n}' \
+  fail '[#2920 fingerprint preamble]'
+mcg22_case fp3 's{            pull_request_review\|pull_request_review_comment\)\n              if gif_decide}{            *)\n              if gif_decide}' \
+  fail '[#2920 fingerprint preamble]'
+mcg22_case fp4 's{(      - name: Open the required check_run[^\n]*\n        id: open\n        if: )[^\n]*}{$1\$\{\{ steps.fp.outputs.skip == \x27true\x27 \}\}}' \
+  fail '[#850 phase-1 unconditional]'
+mcg22_case fp5 's{(      - name: Run scripts/merge-clearance-gate\.sh\n        id: gate\n        if: )[^\n]*}{$1\$\{\{ steps.fp.outputs.skip != \x27true\x27 \}\}}' \
+  fail '[#850 producer eligibility] step'
 # c7 — the EMPTY quoted literal is the one falsy quoted form.
 mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
@@ -4263,6 +4279,12 @@ rcp_case open-group \
   's{^    runs-on: ubuntu-latest\n(    # GROUPLESS)}{    runs-on: ubuntu-latest\n    concurrency:\n      group: rcp-open\n$1}m' \
   fail '[rcp open groupless]'
 
+# #2920 (Phase 4b on #2924): an untolerated fingerprint checkout failure
+# would skip the hold-opening step.
+rcp_case fp-checkout-strict \
+  's{(      - name: Checkout the input-fingerprint library \(#2920\)\n)        continue-on-error: true\n}{$1}' \
+  fail '[rcp fingerprint checkout]'
+
 # ── A11 — write scope is job-scoped, never workflow-scoped ────────────
 rcp_case perms-actions \
   's{^      actions: read\n      checks: write\n    steps:}{      checks: write\n    steps:}m' \
@@ -5521,6 +5543,12 @@ mcg22_case budget-knob-malformed \
 mcg22_case budget-open-id-unbound \
   's{OPEN_ID: \$\{\{ steps\.open\.outputs\.id \}\}}{OPEN_ID: "1"}' \
   fail '[#2286 budget guard]'
+mcg22_case fp-skip-const \
+  's{(Report gate verdict.*?)FP_SKIP: \$\{\{ steps\.fp\.outputs\.skip \}\}}{$1FP_SKIP: "true"}s' \
+  fail '[#2920 fingerprint binding]'
+mcg22_case fp-before-const \
+  's{FP_BEFORE: \$\{\{ steps\.fp\.outputs\.before \}\}}{FP_BEFORE: "aaaa"}' \
+  fail '[#2920 fingerprint binding]'
 mcg22_case budget-gate-if-dropped \
   's{(      - name: Run scripts/merge-clearance-gate\.sh\n        id: gate\n)        if: [^\n]*\n}{$1        if: \$\{\{ always() \}\}\n}' \
   fail '[#850 producer eligibility]'

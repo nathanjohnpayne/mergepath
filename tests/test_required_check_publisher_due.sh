@@ -728,5 +728,121 @@ check "nominate job: exactly one auto-clear-evaluate dispatch per valid PR, carr
 check "nominate job: malformed entries are ignored and a failed dispatch only warns" \
   eval 'grep -q "Ignoring malformed auto-clear nomination .07." "$TMP/out.log" && grep -q "Ignoring malformed auto-clear nomination .2x." "$TMP/out.log" && grep -q "Could not dispatch auto-clear-evaluate for PR #3" "$TMP/out.log"'
 
+# ── #2920: review-input fingerprints on the event head ─────────────────
+# A stub library answers the decision (tests/test_gate_input_fingerprint.sh
+# covers the real one): FP_SEQ lists what each successive gif_compute call
+# returns ("fail" fails it), FP_PUBLISHED is the fingerprint the newest
+# published Merge clearance verdict records. These cases pin the publish
+# step's wiring: only a review or review-comment parent of the gate may skip;
+# a skipped context gets no generation and no evaluation, the others still
+# do; a green verdict records the fingerprint only when the reads before and
+# after the evaluation agree; a red one never does.
+cat >"$TMP/work/scripts/workflow/gate-input-fingerprint.sh" <<'SH'
+gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf '%s\n' "${1:-none}" >>"$FP_CALLS.budget"; }
+gif_requests_used() { echo 7; }
+gif_compute() {
+  local n v
+  printf '%s\n' "$*" >>"$FP_CALLS"
+  n=$(wc -l <"$FP_CALLS" | tr -d ' ')
+  set -- $FP_SEQ
+  if [ "$n" -le "$#" ]; then eval "v=\${$n}"; else eval "v=\${$#}"; fi
+  [ "$v" != fail ] || return 1
+  printf '%s' "$v"
+}
+gif_marker() { printf '<!-- mergepath-input-fingerprint:v1 %s -->' "$2"; }
+gif_decide() {
+  GIF_REASON="stub"
+  GIF_HEX=$(gif_compute "$@") || { GIF_HEX=""; return 1; }
+  [ "$GIF_HEX" = "${FP_PUBLISHED:-}" ]
+}
+SH
+FPA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+FPA=${FPA:0:64}
+FPB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+EH=0000000000000000000000000000000000000001
+# mcg_text <head>: output[text] of the closing PATCH of Merge clearance on
+# <head>, "none" when it carried none, "absent" when nothing was closed.
+mcg_text() {
+  python3 - "$TMP/gh.log" "$1" <<'PY2'
+import json, sys
+opened, out = {}, "absent"
+for index, line in enumerate(open(sys.argv[1]), 1):
+    method, endpoint, fields = line.rstrip("\n").split(" ", 2)
+    f = json.loads(fields)
+    if method == "POST" and endpoint.endswith("/check-runs"):
+        opened[900000000 + index] = f
+    elif method == "PATCH":
+        o = opened.get(int(endpoint.rsplit("/", 1)[1]), {})
+        if o.get("name") == "Merge clearance gate" and o.get("head_sha") == sys.argv[2]:
+            out = f.get("output[text]", "none")
+print(out)
+PY2
+}
+mcg_opened() {  # mcg_opened <head>: Merge clearance generations opened on <head>
+  grep '^POST ' "$TMP/gh.log" | grep -F '"head_sha": "'"$1"'"' | grep -c '"name": "Merge clearance gate"' || true
+}
+fp_pass() {  # fp_pass <label> <parent_event> <FP_SEQ> <FP_PUBLISHED>
+  : >"$TMP/fp-calls"; : >"$TMP/fp-calls.budget"
+  FP_CALLS="$TMP/fp-calls" FP_SEQ="$3" FP_PUBLISHED="$4" run_pass "$1" workflow_run "$EH" "$2" ""
+}
+export FP_CALLS FP_SEQ FP_PUBLISHED
+
+fp_pass fp-review-match pull_request_review "$FPA" "$FPA"
+check "review parent, unchanged inputs: no Merge clearance generation or evaluation on the event head" \
+  eval '[ "$(mcg_opened "$EH")" = 0 ] && ! grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$RC" -eq 0 ]'
+check "review parent, unchanged inputs: the other two contexts are still evaluated on the event head" \
+  eval 'grep -q "^codex-p1-gate.sh	1$" "$TMP/gates.log" && grep -q "^coderabbit-severity-gate.sh	1$" "$TMP/gates.log"'
+check "review parent, unchanged inputs: other PRs keep due-only coverage" \
+  eval 'grep -q "^merge-clearance-gate.sh	3$" "$TMP/gates.log"'
+
+fp_pass fp-review-comment-match pull_request_review_comment "$FPA" "$FPA"
+check "review-comment parent, unchanged inputs: Merge clearance left standing" \
+  eval '[ "$(mcg_opened "$EH")" = 0 ] && ! grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log"'
+
+fp_pass fp-review-mismatch pull_request_review "$FPB" "$FPA"
+check "review parent, changed inputs: Merge clearance evaluated and its green records the fingerprint" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_text "$EH")" = "<!-- mergepath-input-fingerprint:v1 $FPB -->" ]'
+
+fp_pass fp-push pull_request "$FPA" "$FPA"
+check "push parent: never skips, even on a matching fingerprint" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_opened "$EH")" -ge 1 ]'
+check "push parent: the green records the fingerprint read before and after" \
+  eval '[ "$(mcg_text "$EH")" = "<!-- mergepath-input-fingerprint:v1 $FPA -->" ]'
+check "push parent: the comparison is bounded by what the reserve and the evaluation leave (1000 - 100 - 60), the re-read by the measured first read" \
+  eval '[ "$(cat "$TMP/fp-calls.budget" | tr "\n" " ")" = "840 7 " ]'
+check "push parent: no published-run comparison is made" \
+  eval '[ "$(wc -l <"$TMP/fp-calls" | tr -d " ")" = 2 ]'
+
+fp_pass fp-changed-during pull_request "$FPA $FPB" ""
+check "inputs changed during the evaluation: the green records no fingerprint" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_text "$EH")" = none ]'
+
+fp_pass fp-reread-fails pull_request "$FPA fail" ""
+check "the after-read fails: the green records no fingerprint" \
+  eval '[ "$(mcg_text "$EH")" = none ]'
+
+fp_pass fp-no-fingerprint pull_request_review "fail" "$FPA"
+check "no live fingerprint on a review parent: evaluated in full, nothing recorded" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_text "$EH")" = none ]'
+
+MCG_RED_PRS=1 fp_pass fp-red pull_request "$FPA" ""
+check "a red verdict never records a fingerprint" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ "$(mcg_text "$EH")" = none ]'
+
+RL_REMAINING=140 fp_pass fp-budget-short pull_request_review "$FPA" "$FPA"
+check "a budget that covers the event head but not the comparison: evaluated, no comparison read" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log" && [ ! -s "$TMP/fp-calls" ]'
+unset RL_REMAINING
+
+CASE_PARENT_NAME=repo-lint fp_pass fp-lint-parent pull_request_review "$FPA" "$FPA"
+check "a repo-lint parent never skips" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log"'
+
+fp_pass fp-schedule schedule "$FPA" "$FPA"
+check "the schedule-parent sweep never skips" \
+  eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log"'
+rm -f "$TMP/work/scripts/workflow/gate-input-fingerprint.sh"
+
 echo "required-check publisher due-only targeting tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

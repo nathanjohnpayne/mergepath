@@ -129,6 +129,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # #2920: the input-fingerprint comparison reads the PR's issue
+      # comments and the reactions on the PR body.
+      issues: read
       # actions: read for the parent-status lookup below — without it the
       # guard 403s into its fail-open branch on restricted-default repos
       # (cross-agent round 2; same requirement documented in
@@ -136,6 +139,29 @@ jobs:
       actions: read
       checks: write
     steps:
+      # #2920: only a review or review-comment parent can skip a hold, so
+      # only that parent pays for this shallow, sparse, default-branch
+      # checkout of the fingerprint library. Pushes open their holds with
+      # no checkout in front of them. A failed checkout is tolerated: the
+      # open step then finds no library and opens every hold, where an
+      # untolerated failure would skip the open step and leave the previous
+      # greens standing (Phase 4b on #2924).
+      - name: Checkout the input-fingerprint library (#2920)
+        continue-on-error: true
+        if: >-
+          github.event.workflow_run.event == 'pull_request_review' ||
+          github.event.workflow_run.event == 'pull_request_review_comment'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .gate-input-fingerprint
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/workflow/gate-input-fingerprint.sh
+            scripts/workflow/installation-budget.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Open pending entries on the event head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -147,6 +173,9 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           PARENT_RUN_ID: ${{ github.event.workflow_run.id }}
           PARENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          # #2920: the parent's own trigger. Only a review or review-comment
+          # parent may leave a context's published verdict standing.
+          PARENT_EVENT: ${{ github.event.workflow_run.event }}
         run: |
           set -euo pipefail
           if [ -z "$HEAD_SHA" ]; then
@@ -176,11 +205,73 @@ jobs:
           # discriminator for these required contexts must remain unset on
           # Checks-API runs, or the native and synthetic lineages collapse.
           pending_summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
+          # #2920: contexts whose review inputs are unchanged since their
+          # newest published verdict, a completed success recording the same
+          # input fingerprint (scripts/workflow/gate-input-fingerprint.sh
+          # states every condition). Such a context needs no hold: its
+          # verdict is current. Computed only for a review or review-comment
+          # parent with the library checked out, from the open-PR list (read
+          # once and reused below). Any failure leaves the set empty, which
+          # opens every hold exactly as before.
+          heads=""
+          heads_read=0
+          fp_skip=""
+          fp_done=0
+          fp_lib=.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh
+          fp_budget=.gate-input-fingerprint/scripts/workflow/installation-budget.sh
+          fingerprint_skips() {
+            local pr revision ctx fp_limit
+            [ "$fp_done" -eq 0 ] || return 0
+            fp_done=1
+            case "${PARENT_EVENT:-}" in
+              pull_request_review|pull_request_review_comment) ;;
+              *) return 0 ;;
+            esac
+            [ -r "$fp_lib" ] || return 0
+            # The comparison is optional: when the installation budget does
+            # not cover its reads (about eight requests and one GraphQL
+            # point) beyond the publisher's own 100-request, 50-point
+            # reserve, every hold opens as before (Codex P2 on #2924). An
+            # unreadable budget compares, the guard's own direction.
+            fp_limit=""
+            if [ -r "$fp_budget" ]; then
+              # shellcheck source=scripts/workflow/installation-budget.sh
+              . "$fp_budget" || return 0
+              ib_read 8 100 1 50
+              ib_affordable 1 || { echo "::notice::Budget short of the input comparison; opening every hold (#2920)."; return 0; }
+              # Paginated reads are counted as they happen and stop at the
+              # reserve (Phase 4b on #2924); an unknown budget sets no limit.
+              [ "${budget_known:-0}" -ne 1 ] || fp_limit=$(( rl_remaining - 100 ))
+            fi
+            if [ "$heads_read" -eq 0 ]; then
+              heads=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
+                -f per_page=100 --jq '.[] | "\(.head.sha)\t\(.number)"') || { heads_read=2; return 0; }
+              heads_read=1
+            fi
+            [ "$heads_read" -eq 1 ] || return 0
+            pr=$(awk -F '\t' -v h="$HEAD_SHA" '$1 == h { n++; pr = $2 } END { if (n == 1) print pr }' <<<"$heads")
+            [ -n "$pr" ] || return 0
+            # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
+            . "$fp_lib" || return 0
+            gif_budget "$fp_limit" || return 0
+            revision=$(git -C .gate-input-fingerprint rev-parse HEAD 2>/dev/null) || return 0
+            for ctx in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              gif_supported "$ctx" || continue
+              if gif_decide "$REPO" "$pr" "$HEAD_SHA" "$ctx" "$revision"; then
+                echo "$ctx: review inputs unchanged since the published verdict ($GIF_REASON); no hold (#2920)."
+                fp_skip="$fp_skip$ctx"$'\n'
+              else
+                echo "$ctx: opening a hold (${GIF_REASON:-no decision}) (#2920)."
+              fi
+            done
+          }
+          fp_skipped() { grep -qxF "$1" <<<"$fp_skip"; }
           if [ "$EVENT_ACTION" = "in_progress" ] && [ "$PARENT_RUN_ATTEMPT" = "1" ]; then
             if pending_runs=$(gh api --paginate -X GET \
                 "repos/$REPO/commits/$HEAD_SHA/check-runs" -f per_page=100 -f filter=all \
                 --jq '.check_runs[] | [.name, .status, (.output.summary // ""), (.app.slug // ""), (.started_at // ""), .id] | @tsv'); then
               all_pending=1
+              uncovered=""
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
                 if ! awk -F '\t' -v name="$name" -v summary="$pending_summary" \
                     '$1 == name {
@@ -195,8 +286,21 @@ jobs:
                        exit(found && exact && !conflict ? 0 : 1)
                      }' <<<"$pending_runs"; then
                   all_pending=0
+                  uncovered="$uncovered$name"$'\n'
                 fi
               done
+              # #2920: a requested delivery that left a context's verdict
+              # standing opened no hold for it, so that context reads as
+              # uncovered here. It is covered when this delivery reaches the
+              # same fingerprint decision.
+              if [ "$all_pending" -eq 0 ]; then
+                fingerprint_skips
+                all_pending=1
+                while IFS= read -r name; do
+                  [ -n "$name" ] || continue
+                  fp_skipped "$name" || all_pending=0
+                done <<<"$uncovered"
+              fi
               if [ "$all_pending" -eq 1 ]; then
                 echo "Requested delivery already opened all three pending entries for parent $PARENT_RUN_ID attempt $PARENT_RUN_ATTEMPT."
                 exit 0
@@ -211,15 +315,26 @@ jobs:
           # the list READ fails, open anyway: pending is the fail-closed
           # direction, and a spurious pending on a non-PR head is invisible
           # to branch protection and retired by the next publish pass.
-          if heads=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
-              -f per_page=100 --jq '.[].head.sha'); then
-            if ! grep -qxF "$HEAD_SHA" <<<"$heads"; then
+          if [ "$heads_read" -eq 0 ]; then
+            if heads=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
+                -f per_page=100 --jq '.[] | "\(.head.sha)\t\(.number)"'); then
+              heads_read=1
+            else
+              heads_read=2
+            fi
+          fi
+          if [ "$heads_read" -eq 1 ]; then
+            if ! cut -f1 <<<"$heads" | grep -qxF "$HEAD_SHA"; then
               echo "Head $HEAD_SHA is not an open PR head; nothing to open."
               exit 0
             fi
           else
             echo "::warning::open-PR list read failed; opening pending entries anyway (fail closed)."
           fi
+          # #2920: decided once per delivery (the in_progress probe above may
+          # already have), before the second status check so that fence
+          # stays immediately in front of the burst.
+          fingerprint_skips
           # NO delayed-open fence here, on purpose (#2171, removed in Codex
           # round 5). A fence that skips these holds because a "newer" publisher
           # verdict exists cannot be made sound from check-run data: a verdict's
@@ -266,12 +381,15 @@ jobs:
           }
           open_failed=0
           for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+            if fp_skipped "$name"; then
+              continue
+            fi
             if ! post_pending "$name"; then
               echo "::error::Failed to open pending $name on $HEAD_SHA after 3 attempts."
               open_failed=1
             fi
           done
-          echo "Opened pending entries for all three contexts on $HEAD_SHA."
+          echo "Opened pending entries on $HEAD_SHA for every context whose inputs could have changed."
           # A completion during this burst is handled by the completed
           # delivery and its freshness guard, or the next sweep. Reading the
           # parent again here cannot retract or repair these writes; it only
@@ -556,10 +674,74 @@ jobs:
           # and a later opening can retire it without patching an unowned ID.
           # Exhausted opening retries make the pass an infrastructure failure.
           OWN_PENDING_IDS=""
+          # #2920: review-input fingerprints on the event head. FP_BEFORE
+          # holds "head|context|hex" for each supported context, read before
+          # its evaluation; a green verdict records it only when a second read
+          # after the evaluation matches. FP_SKIP holds "head|context" for the
+          # contexts a review or review-comment parent leaves standing: their
+          # newest published verdict is a completed success for the same
+          # inputs (scripts/workflow/gate-input-fingerprint.sh), so they get
+          # no hold and no evaluation. Anything unreadable leaves both empty
+          # for that context, which evaluates it exactly as before.
+          FP_BEFORE=""
+          FP_SKIP=""
+          fp_read_before() {
+            local hd="$1" pr="$2" ctx revision avail used reread
+            [ -r scripts/workflow/gate-input-fingerprint.sh ] || return 0
+            # shellcheck source=scripts/workflow/gate-input-fingerprint.sh
+            . scripts/workflow/gate-input-fingerprint.sh || return 0
+            revision=$(git rev-parse HEAD 2>/dev/null) || return 0
+            for ctx in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              gif_supported "$ctx" || continue
+              # The optional comparison may spend only what is left after
+              # the reserve and this PR's own evaluation, counted request by
+              # request as its paginated reads happen (Phase 4b on #2924):
+              # at that limit it stops, and the context is evaluated without
+              # one. Every request it made is charged to the pass, and a
+              # recorded fingerprint reserves as many again for the re-read
+              # after a green, charged now so the target selection below
+              # cannot hand it to another PR. An unknown budget sets no
+              # limit, the guard's own direction.
+              avail=""
+              if [ "${budget_known:-0}" -eq 1 ]; then
+                avail=$(( rl_remaining - spent - reserve - per_pr ))
+                [ "$avail" -gt 0 ] || { echo "PR #$pr: budget short of the $ctx input comparison; evaluating without one (#2920)."; continue; }
+              fi
+              gif_budget "$avail" || continue
+              GIF_HEX=""
+              case "${PARENT_NAME:-}|${PARENT_EVENT:-}" in
+                'Merge Clearance Gate|pull_request_review'|'Merge Clearance Gate|pull_request_review_comment')
+                  if gif_decide "$REPO" "$pr" "$hd" "$ctx" "$revision"; then
+                    spent=$((spent + $(gif_requests_used)))
+                    echo "PR #$pr: $ctx review inputs unchanged since the published verdict ($GIF_REASON); leaving it standing (#2920)."
+                    FP_SKIP="$FP_SKIP$hd|$ctx"$'\n'
+                    continue
+                  fi
+                  ;;
+                *)
+                  GIF_HEX=$(gif_compute "$REPO" "$pr" "$hd" "$ctx" "$revision") || GIF_HEX=""
+                  ;;
+              esac
+              used=$(gif_requests_used)
+              spent=$((spent + used))
+              if [ -n "${GIF_HEX:-}" ] && [ -n "$avail" ] && [ $(( avail - used )) -lt "$used" ]; then
+                echo "PR #$pr: budget short of the $ctx re-read; recording no input fingerprint (#2920)."
+                GIF_HEX=""
+              fi
+              if [ -n "${GIF_HEX:-}" ]; then
+                spent=$((spent + used))
+                reread=""
+                if [ -n "$avail" ]; then reread="$used"; fi
+                FP_BEFORE="$FP_BEFORE$hd|$ctx|$GIF_HEX|$reread"$'\n'
+              fi
+            done
+          }
+          fp_skipped() { grep -qxF "$1|$2" <<<"$FP_SKIP"; }
           open_holds() {
             local hd="$1" claim_pr="$2" name attempt oid ok
             CLAIMED_HEADS="$CLAIMED_HEADS $hd"
             for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              fp_skipped "$hd" "$name" && continue
               ok=0
               for attempt in 1 2 3; do
                 if oid=$(rcg_open "$REPO" "$claim_pr" "$hd" "$name"); then
@@ -608,7 +790,9 @@ jobs:
           if [ -n "$RUN_HEAD" ] && [ -n "$targets" ] \
               && [ "$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")" = "$RUN_HEAD" ]; then
             if ib_affordable 1; then
-              open_holds "$RUN_HEAD" "$(awk -F'\t' -v h="$RUN_HEAD" '$2==h{print $1; exit}' <<<"$targets")"
+              run_head_pr=$(awk -F'\t' -v h="$RUN_HEAD" '$2==h{print $1; exit}' <<<"$targets")
+              fp_read_before "$RUN_HEAD" "$run_head_pr"
+              open_holds "$RUN_HEAD" "$run_head_pr"
             elif [ "${PARENT_NAME:-}" = "repo-lint" ]; then
               # A lint-parent pass opened no holds and the gates do not
               # read `lint`, so there is nothing to close and nothing new to
@@ -755,7 +939,13 @@ jobs:
             local CR_EVIDENCE_REPORT
             CR_EVIDENCE_REPORT=$(mktemp) || { had_infra_error=1; return 0; }
             export CR_EVIDENCE_REPORT
-            local generation_id
+            local generation_id fp_before fp_after fp_text=""
+            # Self-contained (the generation suite runs gate() on its own):
+            # both #2920 sets default to empty, which evaluates as before.
+            if grep -qxF "$head|$context" <<<"${FP_SKIP:-}"; then
+              echo "PR #$pr: $context not re-evaluated; its published verdict covers the unchanged review inputs (#2920)."
+              return 0
+            fi
             if [ "${RATE_LIMITED:-0}" -eq 1 ]; then
               case " ${CLAIMED_HEADS:-} " in
                 *" $head "*) ;;
@@ -885,7 +1075,26 @@ jobs:
               title="$context — head moved during evaluation"
               summary="PR #$pr moved from $head to $live_head while this pass evaluated; this verdict is pinned red to the superseded head. The new head gets its own evaluation from its own events."
             fi
-            if ! rcg_close "$REPO" "$pr" "$head" "$context" "$generation_id" "$conclusion" "$title" "$summary"; then
+            # #2920: a green verdict records the review-input fingerprint it
+            # was computed from, only when a second read after the evaluation
+            # equals the one before it. rcg_close writes it to output.text,
+            # which no gate output reaches, and drops it if its own fence
+            # turns the verdict red.
+            fp_before=$(awk -F'|' -v h="$head" -v c="$context" '$1==h && $2==c {print $3; exit}' <<<"${FP_BEFORE:-}")
+            if [ "$conclusion" = success ] && [ -n "$fp_before" ]; then
+              # The re-read spends at most what fp_read_before reserved and
+              # charged for it (no limit when the budget was unknown).
+              gif_budget "$(awk -F'|' -v h="$head" -v c="$context" '$1==h && $2==c {print $4; exit}' <<<"${FP_BEFORE:-}")" || fp_before=""
+            fi
+            if [ "$conclusion" = success ] && [ -n "$fp_before" ]; then
+              if fp_after=$(gif_compute "$REPO" "$pr" "$head" "$context") \
+                  && [ "$fp_after" = "$fp_before" ]; then
+                fp_text=$(gif_marker "$context" "$fp_after") || fp_text=""
+              else
+                echo "PR #$pr: $context review inputs changed during the evaluation or could not be re-read; recording no input fingerprint (#2920)."
+              fi
+            fi
+            if ! rcg_close "$REPO" "$pr" "$head" "$context" "$generation_id" "$conclusion" "$title" "$summary" "$fp_text"; then
               echo "::error::Failed to post $context for PR #$pr — its slot was not refreshed."
               had_infra_error=1
             elif [ "$context" = "$CODERABBIT_CONTEXT" ] && [ -s "$CR_EVIDENCE_REPORT" ] \

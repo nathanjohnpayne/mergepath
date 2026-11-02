@@ -78,6 +78,12 @@ case "$*" in
         printf 'Codex P1 unresolved threads\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t102\n' "$summary"
         printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t103\n' "$summary"
         ;;
+      exact-but-mcg)
+        # #2920: the requested delivery left Merge clearance standing on an
+        # unchanged-input fingerprint and held only the other two.
+        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$summary"
+        ;;
       completed-markers)
         printf 'Merge clearance gate\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
         printf 'Codex P1 unresolved threads\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
@@ -111,7 +117,8 @@ case "$*" in
     esac
     ;;
   *"repos/"*"/pulls"*)
-    printf '%s\n' "$HEAD_SHA"
+    # head<TAB>number, the open step's own --jq row shape (#2920).
+    printf '%s\t42\n' "$HEAD_SHA"
     ;;
   *"check-runs"*)
     if [ "$GH_FIXTURE_MODE" = write-fails ] && [[ "$*" == *'name=Merge clearance gate'* ]]; then
@@ -227,6 +234,96 @@ GH_FIXTURE_NEWER_PASS=301; export GH_FIXTURE_NEWER_PASS
 run_case newer-verdict-does-not-skip-requested requested 1 empty 6 3 0
 run_case newer-verdict-does-not-skip-in-progress in_progress 1 empty 7 3 1
 unset GH_FIXTURE_NEWER_PASS
+
+# #2920: a review or review-comment parent leaves a context standing when its
+# review inputs match the newest published green verdict. The decision itself
+# (scripts/workflow/gate-input-fingerprint.sh) has its own suite,
+# tests/test_gate_input_fingerprint.sh; here a stub library answers it, so
+# these cases pin the open step's wiring: who asks, what a skip removes, and
+# that every other outcome opens all three holds.
+FPDIR="$TMP/fp-work"
+mkdir -p "$FPDIR/.gate-input-fingerprint/scripts/workflow" "$TMP/fpbin"
+cat >"$FPDIR/.gate-input-fingerprint/scripts/workflow/gate-input-fingerprint.sh" <<'SH'
+gif_supported() { [ "$1" = "Merge clearance gate" ]; }
+gif_budget() { printf 'budget %s\n' "${1:-none}" >>"$FP_LOG.budget"; }
+gif_decide() {
+  printf '%s\n' "$*" >>"$FP_LOG"
+  GIF_HEX=""; GIF_REASON="stub $FP_DECISION"
+  case "$FP_DECISION" in
+    match) GIF_HEX=1111111111111111111111111111111111111111111111111111111111111111; return 0 ;;
+    nomatch) GIF_HEX=2222222222222222222222222222222222222222222222222222222222222222; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+SH
+# A stub budget reader: FP_BUDGET_OK=0 is a budget short of the comparison.
+cat >"$FPDIR/.gate-input-fingerprint/scripts/workflow/installation-budget.sh" <<'SH'
+ib_read() { :; }
+ib_affordable() { [ "${FP_BUDGET_OK:-1}" = 1 ]; }
+SH
+printf '#!/bin/sh\necho bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TMP/fpbin/git"
+chmod +x "$TMP/fpbin/git"
+
+fp_case() {  # name action attempt mode parent decision want_calls want_posts want_probes want_mcg_posts want_decisions
+  local name="$1" dir="$TMP/$1" rc=0 calls posts probes mcg decisions
+  mkdir -p "$dir"; : >"$dir/calls"; : >"$dir/fp"
+  (
+    cd "$FPDIR"
+    [ "${FP_NO_LIB:-}" != 1 ] || mv .gate-input-fingerprint .gate-input-fingerprint.off
+    PATH="$TMP/fpbin:$TMP:$PATH" \
+      GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$4" FP_LOG="$dir/fp" FP_DECISION="$6" FP_BUDGET_OK="${FP_BUDGET_OK:-1}" \
+      REPO="example/repo" HEAD_SHA="abc123" PARENT_RUN_ID="4242" \
+      PARENT_RUN_ATTEMPT="$3" EVENT_ACTION="$2" PARENT_EVENT="$5" \
+      MCG_CONTEXT="Merge clearance gate" \
+      CODEX_P1_CONTEXT="Codex P1 unresolved threads" \
+      CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings" \
+      GITHUB_RUN_ID="9999" \
+      bash "$TMP/open.sh" >"$dir/out" 2>&1
+    rc=$?
+    [ "${FP_NO_LIB:-}" != 1 ] || mv .gate-input-fingerprint.off .gate-input-fingerprint
+    exit "$rc"
+  ) || rc=$?
+  calls=$(wc -l <"$dir/calls" | tr -d ' ')
+  posts=$(grep -c -- '-X POST .*check-runs' "$dir/calls" || true)
+  probes=$(grep -c -- '/commits/abc123/check-runs' "$dir/calls" || true)
+  mcg=$(grep -- '-X POST .*check-runs' "$dir/calls" | grep -c -- 'name=Merge clearance gate' || true)
+  decisions=$(wc -l <"$dir/fp" | tr -d ' ')
+  if [ "$rc" -ne 0 ] || [ "$calls" -ne "$7" ] || [ "$posts" -ne "$8" ] || [ "$probes" -ne "$9" ] \
+      || [ "$mcg" -ne "${10}" ] || [ "$decisions" -ne "${11}" ]; then
+    echo "FAIL: $name: rc=$rc calls=$calls posts=$posts probes=$probes mcg_posts=$mcg decisions=$decisions; expected 0/$7/$8/$9/${10}/${11}"
+    sed -n '1,60p' "$dir/out" "$dir/calls"
+    fail=$((fail + 1))
+    return
+  fi
+  if grep -q 'number' "$dir/fp" || ! { [ "$decisions" -eq 0 ] || grep -q '^example/repo 42 abc123 Merge clearance gate bbbbbbbb' "$dir/fp"; }; then
+    echo "FAIL: $name: the decision must name the repo, the head's PR, the head, the context and the trusted revision"
+    cat "$dir/fp"
+    fail=$((fail + 1))
+    return
+  fi
+  echo "PASS: $name ($calls HTTP fixture calls, $posts writes, $decisions fingerprint decision(s))"
+  pass=$((pass + 1))
+}
+
+# A review parent whose Merge clearance inputs match: two holds, none for it.
+fp_case fp-review-match requested 1 empty pull_request_review match 5 2 0 0 1
+fp_case fp-review-comment-match requested 1 empty pull_request_review_comment match 5 2 0 0 1
+# A push (or any non-review parent) never asks, even when a match is armed.
+fp_case fp-push-never-skips requested 1 empty pull_request match 6 3 0 1 0
+fp_case fp-label-never-skips requested 1 empty pull_request_target match 6 3 0 1 0
+# A mismatch, or no decision at all, opens all three.
+fp_case fp-review-mismatch requested 1 empty pull_request_review nomatch 6 3 0 1 1
+fp_case fp-review-unreadable requested 1 empty pull_request_review fail 6 3 0 1 1
+FP_NO_LIB=1 fp_case fp-review-no-library requested 1 empty pull_request_review match 6 3 0 1 0
+# A budget short of the comparison opens every hold and asks nothing.
+FP_BUDGET_OK=0 fp_case fp-review-budget-short requested 1 empty pull_request_review match 6 3 0 1 0
+# The in_progress delivery: a context the requested delivery left standing
+# is covered by the same decision, and costs one PR-list read, no writes.
+fp_case fp-in-progress-covered in_progress 1 exact-but-mcg pull_request_review match 3 0 1 0 1
+# ...and when the decision no longer holds, the full open path runs.
+fp_case fp-in-progress-uncovered in_progress 1 exact-but-mcg pull_request_review nomatch 7 3 1 1 1
+# A completion-before-burst still owns the head after a skip decision.
+fp_case fp-complete-before-burst in_progress 1 complete-before-burst pull_request_review match 4 0 1 0 1
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"

@@ -610,6 +610,8 @@
       "tests/test_required_check_publisher_dedup.sh",
       "tests/test_required_check_publisher_summary_hold.sh",
       "tests/test_required_check_publisher_due.sh",
+      "tests/test_gate_input_fingerprint.sh",
+      "scripts/workflow/gate-input-fingerprint.sh",
       "tests/test_required_check_generations.py",
       "tests/test_reap_orphaned_holds.sh",
       "scripts/workflow/reap-orphaned-holds.sh",
