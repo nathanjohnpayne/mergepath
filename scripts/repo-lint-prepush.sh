@@ -1268,8 +1268,11 @@ PLAN_JSON=$(jq -c \
   | need("deep_safety") as $safety
   | need("deep_consumer_replay") as $rep
   | need("deep_self_tests") as $st
+  # A tooling-only step (#2921) adds `&& needs.scope.outputs.tooling !=
+  # 'false'` to its pin. CI skips it on a content-only pull request; the hook
+  # never does, so locally it is an ordinary pinned step (a superset of CI).
   | [ ($fast.steps[] | select(.if != null and (.name | startswith("check_")))
-        | if (.if | test("^matrix\\.shard == [0-9]+$")) then
+        | if (.if | test("^matrix\\.shard == [0-9]+( && needs\\.scope\\.outputs\\.tooling != \u0027false\u0027)?$")) then
             wrapper as $w
             | {lane: (if $w == null or ($graph | index($w)) == null then "live"
                       elif $lfull or ($lchecks | index($w)) != null then "selected"

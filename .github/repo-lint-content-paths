@@ -1,0 +1,14 @@
+# Content paths for repo-lint tooling routing (#2921).
+#
+# One case glob per line: a plain relative path, or a directory followed by
+# `/*` (which matches everything beneath it). A pull request whose every
+# changed path matches a line here, and none matches the tooling globs that
+# scripts/ci/repo-lint-tooling-scope.sh hard-codes, skips the lint-fast
+# tooling-only checks. Anything else runs the full set.
+#
+# This file is per repo and is never propagated. List only paths that no
+# scripts/ci check reads; editing this file is itself a tooling change.
+plans/*
+bugs/*
+docs/audits/*
+docs/retrospectives/*

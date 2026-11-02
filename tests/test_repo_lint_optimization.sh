@@ -1020,6 +1020,7 @@ else
   bad_pins=""
   hygiene_full_shard=""
   hygiene_verify_shard=""
+  tooling_gated=""
   while IFS=$'\t' read -r step_name step_if; do
     [ -n "$step_name" ] || continue
     case "$step_name" in
@@ -1037,6 +1038,15 @@ else
       unpinned_steps="$unpinned_steps $step_name"
       continue
     fi
+    # #2921: a tooling-only check adds exactly this clause after its `==`
+    # pin. Strip it and record shard:name; the set is compared below with
+    # the report step's TOOLING_ONLY_CHECKS.
+    case "$step_if" in
+      "matrix.shard == "[0-9]*" && needs.scope.outputs.tooling != 'false'")
+        step_if="${step_if% && needs.scope.outputs.tooling != \'false\'}"
+        tooling_gated="$tooling_gated${step_if##* }:$step_name"$'\n'
+        ;;
+    esac
     if ! printf '%s' "$step_if" | grep -E '^matrix\.shard (==|!=) [0-9]+$' >/dev/null; then
       pins_ok=0
       bad_pins="$bad_pins ${step_name}(${step_if})"
@@ -1066,6 +1076,19 @@ else
     pass "every lint-fast check step ($pinned_steps) is pinned to one shard that exists in the matrix"
   else
     fail "lint-fast shard pins are broken (unpinned:$unpinned_steps) (bad:$bad_pins) (pinned=$pinned_steps)"
+  fi
+
+  # #2921: the steps gated on the tooling scope are exactly the ones the
+  # report step names, so the log's SKIPPED lines are the truth. The scope
+  # job must publish the output the gate reads, and lint-fast must need it.
+  tooling_gated_sorted=$(printf '%s' "$tooling_gated" | sed '/^$/d' | LC_ALL=C sort)
+  tooling_reported=$(yq -r '.jobs.lint_fast.steps[] | select(.name == "report tooling scope") | .env.TOOLING_ONLY_CHECKS' "$REPO_LINT" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort)
+  if [ -n "$tooling_gated_sorted" ] && [ "$tooling_gated_sorted" = "$tooling_reported" ] \
+     && printf '%s\n' "$tooling_gated_sorted" | grep -Fx '1:check_codex_scripts' >/dev/null \
+     && yq -e '.jobs.lint_fast.needs == "scope" and .jobs.scope.outputs.tooling == "${{ steps.tooling.outputs.tooling }}" and ([.jobs.scope.steps[] | select(.id == "tooling")] | length == 1) and ((.jobs.lint_fast.steps[] | select(.name == "report tooling scope") | .if) == null) and ((.jobs.lint_fast.steps[] | select(.name == "report tooling scope") | .env.TOOLING) == "${{ needs.scope.outputs.tooling }}")' "$REPO_LINT" >/dev/null; then
+    pass "the tooling-scope gate covers exactly the steps the report step names ($(printf '%s\n' "$tooling_gated_sorted" | wc -l | tr -d ' ')), including check_codex_scripts"
+  else
+    fail "tooling-gated steps ($(printf '%s' "$tooling_gated_sorted" | tr '\n' ' ')) must equal the report step's TOOLING_ONLY_CHECKS ($(printf '%s' "$tooling_reported" | tr '\n' ' ')) and read the scope job's tooling output"
   fi
 
   shard_coverage_ok=1
@@ -1428,6 +1451,207 @@ else
     pass "consumer-safety distinguishes a canonical wrapper skip from nested skip chatter"
   else
     fail "consumer-safety verdicts should be exit 0/SKIP, got '$nested'/'$canonical'"
+  fi
+fi
+
+# -------------------------------------------------------------------------
+# #2921: content-only PRs skip the lint-fast tooling-only checks. The
+# classifier answers tooling=false only for a pull request whose every
+# changed path is declared content and none is a tooling path; every other
+# shape, including each negative control below, must run the full set. The
+# rows run against fixture roots, since a consumer has no hub glob file.
+# -------------------------------------------------------------------------
+TOOLING_SCOPE="$ROOT/scripts/ci/repo-lint-tooling-scope.sh"
+if [ ! -f "$TOOLING_SCOPE" ]; then
+  if [ -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+    fail "the tooling-scope classifier exists on the hub"
+  fi
+else
+  TS_FIXTURES="$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-tooling-scope.XXXXXX")"
+  trap 'rm -rf "$TS_FIXTURES" "$SCOPE_FIXTURES" "${TOKEN_FIXTURE:-}"' EXIT
+  TS_ROOT="$TS_FIXTURES/repo"
+  mkdir -p "$TS_ROOT/.github" "$TS_ROOT/scripts/ci"
+  cp "$TOOLING_SCOPE" "$TS_ROOT/scripts/ci/repo-lint-tooling-scope.sh"
+  printf '%s\n' '# content' 'plans/*' 'src/content/*' 'public/*' 'NOTES.md' > "$TS_ROOT/.github/repo-lint-content-paths"
+
+  # $1 classifier, $2 event, $3 glob-file root, then the changed paths (or
+  # nothing for an empty list). Prints the first output line.
+  tooling_verdict() {
+    local classifier="$1" event="$2" root="$3"
+    shift 3
+    if [ "$#" -eq 0 ]; then
+      printf '' | bash "$classifier" --event "$event" --root "$root" | head -n 1
+    else
+      printf '%s\n' "$@" | bash "$classifier" --event "$event" --root "$root" | head -n 1
+    fi
+  }
+
+  # The negative controls, as event|root|paths rows (paths `,`-separated).
+  # Each must answer tooling=true. Prints the rows that wrongly skip.
+  tooling_negative_skips() {
+    local classifier="$1" row event root paths verdict
+    local -a list
+    local missing_root="$TS_FIXTURES/no-glob-file"
+    local malformed_root
+    mkdir -p "$missing_root/.github"
+    for glob in '*' 'p*' '/plans/*' '../plans/*' 'plans/**' 'plans/*/x' '*/content'; do
+      malformed_root="$TS_FIXTURES/malformed-$(printf '%s' "$glob" | cksum | cut -d' ' -f1)"
+      mkdir -p "$malformed_root/.github"
+      printf '%s\n' 'plans/*' "$glob" > "$malformed_root/.github/repo-lint-content-paths"
+      verdict=$(tooling_verdict "$classifier" pull_request "$malformed_root" plans/a.md)
+      [ "$verdict" = "tooling=true" ] || echo "malformed glob $glob: $verdict"
+    done
+    local empty_root="$TS_FIXTURES/comments-only"
+    mkdir -p "$empty_root/.github"
+    printf '%s\n' '# nothing declared' '' > "$empty_root/.github/repo-lint-content-paths"
+    local broad_root="$TS_FIXTURES/declares-tooling"
+    mkdir -p "$broad_root/.github"
+    printf '%s\n' 'plans/*' 'scripts/*' '.github/*' 'tests/*' 'docs/agents/*' > "$broad_root/.github/repo-lint-content-paths"
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      event="${row%%|*}"; row="${row#*|}"
+      root="${row%%|*}"; paths="${row#*|}"
+      IFS=',' read -r -a list <<<"$paths"
+      if [ -z "$paths" ]; then
+        verdict=$(tooling_verdict "$classifier" "$event" "$root")
+      else
+        verdict=$(tooling_verdict "$classifier" "$event" "$root" "${list[@]}")
+      fi
+      [ "$verdict" = "tooling=true" ] || echo "$event|$root|$paths: $verdict"
+    done <<ROWS
+push|$TS_ROOT|plans/a.md
+schedule|$TS_ROOT|plans/a.md
+merge_group|$TS_ROOT|plans/a.md
+workflow_dispatch|$TS_ROOT|plans/a.md
+pull_request|$missing_root|plans/a.md
+pull_request|$empty_root|plans/a.md
+pull_request|$TS_ROOT|
+pull_request|$TS_ROOT|plans/a.md,,plans/b.md
+pull_request|$TS_ROOT|plans/a.md,README.md
+pull_request|$TS_ROOT|plans/a.md,scripts/ci/check_codex_scripts
+pull_request|$TS_ROOT|plans/a.md,.github/workflows/repo_lint.yml
+pull_request|$TS_ROOT|plans/a.md,tests/test_codex_review_request_ack.sh
+pull_request|$TS_ROOT|plans/a.md,"plans/caf\303\251.md"
+pull_request|$TS_ROOT|plans/a.md,plans/my post.md
+pull_request|$TS_ROOT|plans/../scripts/x.sh
+pull_request|$TS_ROOT|/plans/a.md
+pull_request|$broad_root|plans/a.md,scripts/ci/repo-lint-tooling-scope.sh
+pull_request|$broad_root|plans/a.md,.github/repo-lint-content-paths
+pull_request|$broad_root|plans/a.md,.github/workflows/repo_lint.yml
+pull_request|$broad_root|plans/a.md,docs/agents/cloud-environments.md
+ROWS
+  }
+
+  content_verdict=$(printf '%s\n' plans/a.md src/content/blog/post.mdx public/img.png NOTES.md | bash "$TS_ROOT/scripts/ci/repo-lint-tooling-scope.sh" --event pull_request --root "$TS_ROOT")
+  if [ "$(printf '%s\n' "$content_verdict" | head -n 1)" = "tooling=false" ] \
+     && printf '%s\n' "$content_verdict" | grep -Fx 'path: content src/content/blog/post.mdx' >/dev/null \
+     && printf '%s\n' "$content_verdict" | grep -Fx 'reason=all 4 changed paths are declared content' >/dev/null; then
+    pass "a content-only pull request answers tooling=false and logs each path's classification"
+  else
+    fail "a content-only pull request should answer tooling=false, got: $content_verdict"
+  fi
+
+  negative_skips=$(tooling_negative_skips "$TS_ROOT/scripts/ci/repo-lint-tooling-scope.sh")
+  if [ -z "$negative_skips" ]; then
+    pass "every negative control runs the full set: non-PR events, missing/empty/malformed glob file, empty or unreadable path list, tooling paths, the classifier and glob file themselves"
+  else
+    fail "negative controls skipped the tooling checks: $negative_skips"
+  fi
+
+  # Mutation: a classifier whose fail-closed exit answers false must be
+  # caught by the negative controls, or they prove nothing.
+  mutant_dir="$TS_FIXTURES/mutant/scripts/ci"
+  mkdir -p "$mutant_dir"
+  sed "s/printf 'tooling=true\\\\n/printf 'tooling=false\\\\n/" "$TOOLING_SCOPE" > "$mutant_dir/repo-lint-tooling-scope.sh"
+  mutant_skips=$(tooling_negative_skips "$mutant_dir/repo-lint-tooling-scope.sh" | wc -l | tr -d ' ')
+  if ! cmp -s "$TOOLING_SCOPE" "$mutant_dir/repo-lint-tooling-scope.sh" && [ "$mutant_skips" -ge 20 ]; then
+    pass "a fail-open mutant of the classifier is caught by $mutant_skips negative controls"
+  else
+    fail "the fail-open classifier mutant should trip the negative controls (caught $mutant_skips)"
+  fi
+
+  if command -v yq >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+    # Execute the shipped scope step and report step bodies, not copies.
+    tooling_step=$(yq -r '.jobs.scope.steps[] | select(.id == "tooling") | .run' "$REPO_LINT")
+    report_step=$(yq -r '.jobs.lint_fast.steps[] | select(.name == "report tooling scope") | .run' "$REPO_LINT")
+    report_checks=$(yq -r '.jobs.lint_fast.steps[] | select(.name == "report tooling scope") | .env.TOOLING_ONLY_CHECKS' "$REPO_LINT")
+
+    TS_GIT="$TS_FIXTURES/git"
+    cp -R "$TS_ROOT" "$TS_GIT"
+    git -C "$TS_GIT" init -q -b main
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid add -A
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm base
+    ts_base=$(git -C "$TS_GIT" rev-parse HEAD)
+    mkdir -p "$TS_GIT/plans"
+    echo post > "$TS_GIT/plans/post.md"
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid add -A
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm content
+    ts_content=$(git -C "$TS_GIT" rev-parse HEAD)
+    echo '# edit' >> "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
+    git -C "$TS_GIT" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qam classifier
+    ts_tooling=$(git -C "$TS_GIT" rev-parse HEAD)
+
+    # $1 step body, $2 event, $3 base, $4 head. Prints the published value.
+    run_tooling_step() {
+      local body="$1" out="$TS_FIXTURES/github-output"
+      : > "$out"
+      ( cd "$TS_GIT" && EVENT_NAME="$2" BASE_SHA="$3" HEAD_SHA="$4" GITHUB_OUTPUT="$out" \
+          bash --noprofile --norc -e -o pipefail -c "$body" >/dev/null 2>&1 ) || echo "step-failed"
+      cat "$out"
+    }
+    step_rows_ok=1
+    [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_content")" = "tooling=false" ] || step_rows_ok=0
+    [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_tooling")" = "tooling=true" ] || step_rows_ok=0
+    [ "$(run_tooling_step "$tooling_step" push "$ts_base" "$ts_content")" = "tooling=true" ] || step_rows_ok=0
+    [ "$(run_tooling_step "$tooling_step" pull_request 0000000000000000000000000000000000000000 "$ts_content")" = "tooling=true" ] || step_rows_ok=0
+    [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" '')" = "tooling=true" ] || step_rows_ok=0
+    if [ "$step_rows_ok" -eq 1 ]; then
+      pass "the scope job's tooling step publishes false for a content-only diff and true for tooling, push, and an unreadable diff"
+    else
+      fail "the scope job's tooling step published the wrong verdict for a content, tooling, push or unreadable-diff row"
+    fi
+
+    # A classifier that is absent, errors after printing false, or prints
+    # anything but an exact first line of tooling=false must publish true.
+    cp "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh" "$TS_FIXTURES/real-classifier"
+    stub_rows_ok=1
+    for stub in 'printf "tooling=false\n"; exit 1' 'printf "tooling=falsey\n"' 'printf "TOOLING=false\n"' 'printf "\n"' 'printf "reason=x\ntooling=false\n"' 'printf " tooling=false\n"'; do
+      printf '%s\n' "$stub" > "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
+      [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_content")" = "tooling=true" ] || { stub_rows_ok=0; echo "INFO: stub accepted: $stub" >&2; }
+    done
+    rm "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
+    [ "$(run_tooling_step "$tooling_step" pull_request "$ts_base" "$ts_content")" = "tooling=true" ] || stub_rows_ok=0
+    # Mutation: a step body whose fallback publishes false must fail a row.
+    mutant_step=${tooling_step//'echo "tooling=true" >>'/'echo "tooling=false" >>'}
+    printf '%s\n' 'printf "tooling=falsey\n"' > "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
+    mutant_caught=0
+    [ "$mutant_step" != "$tooling_step" ] \
+      && [ "$(run_tooling_step "$mutant_step" pull_request "$ts_base" "$ts_content")" != "tooling=true" ] \
+      && mutant_caught=1
+    cp "$TS_FIXTURES/real-classifier" "$TS_GIT/scripts/ci/repo-lint-tooling-scope.sh"
+    if [ "$stub_rows_ok" -eq 1 ] && [ "$mutant_caught" -eq 1 ]; then
+      pass "only an exact tooling=false first line skips: absent, erroring or malformed classifier output publishes true (fail-open step mutant caught)"
+    else
+      fail "the tooling step must publish true unless the classifier printed exactly tooling=false (stubs=$stub_rows_ok mutant=$mutant_caught)"
+    fi
+
+    run_report() {  # EVENT TOOLING SHARD
+      EVENT_NAME="$1" TOOLING="$2" SHARD="$3" TOOLING_ONLY_CHECKS="$report_checks" \
+        bash --noprofile --norc -e -o pipefail -c "$report_step" 2>&1
+    }
+    report_ok=1
+    run_report pull_request false 1 | grep -Fx 'SKIPPED (content-only PR, #2921): check_codex_scripts' >/dev/null || report_ok=0
+    run_report pull_request false 2 | grep -F 'check_codex_scripts' >/dev/null && report_ok=0
+    run_report pull_request true 1 | grep -F 'SKIPPED' >/dev/null && report_ok=0
+    run_report pull_request '' 1 | grep -F 'running every check' >/dev/null || report_ok=0
+    for event in push schedule merge_group workflow_dispatch; do
+      run_report "$event" false 1 >/dev/null && report_ok=0
+    done
+    if [ "$report_ok" -eq 1 ]; then
+      pass "each leg logs its skipped checks on a content-only PR, and tooling=false on a non-PR event fails the leg"
+    else
+      fail "the report step must log SKIPPED lines per shard and fail on tooling=false outside pull_request"
+    fi
   fi
 fi
 
