@@ -656,6 +656,13 @@ Owner said: P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: go")]"
 want_cls "a quoted, unanchored authorization record is not a citation" ledger "" \
   "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2" "" "**Automated Phase 4b review** (x)
 Finding text quoting <!-- mergepath-p4b-owner-authorization: 501 --> mid-review.")]"
+want_cls "a complete authorization/run/footer example quoted before the real trailer is not the citation (Codex P2 on #2980)" ledger "" \
+  "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2" "" "**Automated Phase 4b review** (x)
+Example trailer:
+<!-- mergepath-p4b-owner-authorization: 501 -->
+<!-- mergepath-p4b-run: example -->
+$FOOT
+End of example.")]"
 want_cls "an authorization consumed by two entries is unverified" unverified "more than one ledger entry" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" \
   "$(jq -c '. + [{"run":"r4","head":"'"$HEAD_A"'","state":"reserved","authorization":501}]' <<<"$LEDGER_R")"
 want_cls "an edited authorization comment is unverified" unverified "was edited" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" "" "[$(acomment 501 "$HEAD_A" "$T1" "$T2")]"
@@ -785,6 +792,17 @@ cls13=$(p4b_prov_classify "$(cat "$S/reviews.json")" "$(ledger)" "$(cat "$S/comm
             and contains("reason: \"fixed \\<\\!\\-\\- x \\-\\-\\> \\*\\*P1\\*\\* go\"") and (contains("P4B_EXTRA_ROUND_AUTHORIZED") | not)' <<<"$posted" >/dev/null \
   && pass "#2968 A13: the authorized round publishes once through the production writer, cites its authorization (reason escaped) and classifies as owner-authorized" \
   || fail "#2968 A13 rc=$RC cls=$cls13 $posted $(cat "$S/err.extra")"
+# A15 (Codex P2 on #2980): an owner reason that quotes the reserved Codex
+# command still publishes: the citation breaks the command the way adapter
+# text is broken, so the guard never refuses after consumption.
+spent3 a15; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: rerun after @CoDeX  ReViEw timed out")" >"$S/comments.json"
+H_AUTH=501 run extra reserve publish
+posted15=$(jq -r '[.[] | select(.id == 99)][0].body // ""' "$S/reviews.json")
+if [ "$RC" = 0 ] && [ "$(cat "$S/review_posts" 2>/dev/null)" = 1 ] \
+   && ! printf '%s' "$posted15" | python3 -c 'import re,sys; sys.exit(0 if re.search(r"@codex\s+review", sys.stdin.read(), re.I) else 1)' \
+   && printf '%s' "$posted15" | grep -q 'rerun after'; then
+  pass "#2968 A15: an authorization reason quoting the reserved Codex command publishes with the command broken"
+else fail "#2968 A15 rc=$RC $(cat "$S/err.extra")"; fi
 spent_less() { fresh "$1" 3; run r1 reserve; areview 11 CHANGES_REQUESTED "$HEAD_A" r1 "$T0" | arr >"$S/reviews.json"; }
 spent_less a14; run plain reserve publish
 cls14=$(p4b_prov_classify "$(cat "$S/reviews.json")" "$(ledger)" null nathanjohnpayne "$PRURL" | jq -r '.[] | select(.id == 99) | .class')

@@ -1252,12 +1252,16 @@ round_provenance_trailer() {
 # round (#2968). The reason is owner-typed free text in a reviewer-authored
 # body, so every ASCII punctuation character is escaped, as the #2633
 # admin-override quote is: it renders unchanged but cannot form a tier marker,
-# ack token or HTML-comment record.
+# ack token or HTML-comment record. A quoted reserved Codex command first gets
+# the zero-width break adapter strings get, or the comment guard would refuse
+# the POST after the single-use authorization was consumed.
 round_owner_authorization_line() {
   [ -n "$P4B_OWNER_AUTH_ID" ] || return 0
   printf -- '- Owner authorization (#2968): one round beyond the spent Phase 4b round cap, authorized for this head by https://github.com/%s/pull/%s#issuecomment-%s; reason: "%s"\n' \
     "$REPO" "$PR" "$P4B_OWNER_AUTH_ID" \
-    "$(jq -rn --argjson v "$P4B_OWNER_AUTH_JSON" '($v.reason // "") | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')"
+    "$(jq -rn --argjson v "$P4B_OWNER_AUTH_JSON" '($v.reason // "")
+        | gsub("@(?<command>codex[\\s\u001c-\u001f]+rev[i\u0130\u0131]ew)"; "@\u200b\(.command)"; "i")
+        | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')"
 }
 # round_owner_authorization_check <where> -> validates --owner-authorization
 # against fresh PR comments and the current ledger (#2968). Pre-dispatch an

@@ -42,8 +42,9 @@ P4B_PROV_RUN_MARKER_JQ='def p4b_run_marker:
 #     verdict, and their reviews quote this repository's own diffs, which
 #     carry these markers whenever the Phase 4b code changes.
 #   p4b_owner_authorization: the authorization record the orchestrator
-#     writes directly before its run marker and footer; a quoted copy
-#     elsewhere in the body is not it.
+#     writes directly before its run marker and footer, read from the same
+#     final trailer p4b_run_marker selects. A quoted copy elsewhere in the
+#     body, even a complete authorization/run/footer example, is not it.
 #   p4b_seconds: an ISO-8601 instant as whole seconds, or null when it is not
 #     one (malformed evidence never orders).
 P4B_PROV_JQ_DEFS="$P4B_PROV_RUN_MARKER_JQ"'
@@ -55,8 +56,8 @@ def p4b_claims:
 def p4b_claiming:
   type == "object" and ((.user.login // "") | endswith("[bot]") | not) and (.body | p4b_claims);
 def p4b_owner_authorization:
-  [(. // "") | capture("<!-- mergepath-p4b-owner-authorization: (?<c>[1-9][0-9]*) -->\\s+<!-- mergepath-p4b-run: [A-Za-z0-9._-]+ -->\\s+_Posted by scripts/phase-4b-review\\.sh"; "g") | .c]
-  | last;
+  [(. // "") | capture("(<!-- mergepath-p4b-owner-authorization: (?<c>[1-9][0-9]*) -->\\s+)?<!-- mergepath-p4b-run: (?<r>[A-Za-z0-9._-]+) -->\\s+_Posted by scripts/phase-4b-review\\.sh"; "g")]
+  | last | if . == null then null else .c end;
 def p4b_seconds:
   if type == "string" and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z")
   then try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch null
