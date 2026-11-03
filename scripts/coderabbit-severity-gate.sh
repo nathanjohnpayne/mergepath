@@ -516,15 +516,18 @@ while [ "$i" -lt "$CAND_COUNT" ]; do
   c=$(echo "$CANDIDATES" | jq -c ".[$i]")
   body=$(echo "$c" | jq -r '.body')
   tier=$(coderabbit_tier_of "$body") || die 2 "could not classify an inline CodeRabbit finding"
-  if [ -z "$tier" ]; then
-    # A severity row this classifier cannot grade is an unclassified finding,
-    # not an absent one (#2927): it gates as the top CodeRabbit tier until its
-    # thread is resolved, exactly like a known blocking finding.
-    cr_inline_scan=$(coderabbit_finding_scan "$body") \
-      || die 2 "could not read an inline CodeRabbit finding while looking for an unclassified severity row"
-    tier=$(coderabbit_unclassified_tier "$cr_inline_scan") \
-      || die 2 "could not classify an inline CodeRabbit finding's severity row"
-    [ -z "$tier" ] || log "inline CodeRabbit comment $(echo "$c" | jq -r '.id') carries a severity row no reader recognises — gating it as unclassified ($tier)"
+  # A severity row this classifier cannot grade is an unclassified finding,
+  # not an absent one (#2927): it gates as the top CodeRabbit tier until its
+  # thread is resolved, exactly like a known blocking finding. Checked on
+  # every body, not only an untiered one, so a recognised row elsewhere in the
+  # same body cannot lend the unclassified finding its lower tier.
+  cr_inline_scan=$(coderabbit_finding_scan "$body") \
+    || die 2 "could not read an inline CodeRabbit finding while looking for an unclassified severity row"
+  cr_unclassified_tier=$(coderabbit_unclassified_tier "$cr_inline_scan") \
+    || die 2 "could not classify an inline CodeRabbit finding's severity row"
+  if [ -n "$cr_unclassified_tier" ]; then
+    tier=$cr_unclassified_tier
+    log "inline CodeRabbit comment $(echo "$c" | jq -r '.id') carries a severity row no reader recognises — gating it as unclassified ($tier)"
   fi
   if tier_is_required "$tier"; then
     BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \

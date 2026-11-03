@@ -460,6 +460,7 @@ eq 1 "$(coderabbit_unclassified_severity_rows "**$CR_ICON Severe** · **Security
 eq 1 "$(coderabbit_unclassified_severity_rows "> \`12-14\`: **🔒 Security & Privacy** | **🟣 Severe** | **⚡ Quick win**")" "cr_unclassified: blockquoted unknown emoji row counts (#2927)"
 eq 0 "$(coderabbit_unclassified_severity_rows "> **$CR_ICON Major** · **Security & Privacy** · **Quick win**")" "cr_unclassified: blockquoted icon-label Major row is graded (#2927)"
 eq 0 "$(coderabbit_unclassified_severity_rows "\`17-17\`: **📐 Maintainability & Code Quality** | **🟡 Minor** | **⚡ Quick win**")" "cr_unclassified: legacy emoji row is graded (#2927)"
+# shellcheck disable=SC2016 # Literal Markdown backticks in a CodeRabbit body.
 eq 0 "$(coderabbit_unclassified_severity_rows '`3-3`: LGTM!
 
 <!-- cr-comment:v1:1d0917d279ece1649e83f86d -->')" "cr_unclassified: LGTM additional comment has no row (#2927)"

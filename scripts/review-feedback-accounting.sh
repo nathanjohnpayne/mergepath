@@ -324,6 +324,13 @@ finding_tier() {
   fi
   if [ "$login" = "$CODERABBIT_BOT" ]; then
     sanitized=$(coderabbit_finding_scan "$body") || return 2
+    # An unclassified severity row outranks any recognised row in the same
+    # body (#2927), so a lower recognised tier cannot downgrade or drop it.
+    tier=$(coderabbit_unclassified_tier "$sanitized") || return 2
+    if [ -n "$tier" ]; then
+      printf '%s' "$tier"
+      return
+    fi
     while IFS= read -r line; do
       tier=$(coderabbit_tier_of "$line") || return 2
       if [ -n "$tier" ]; then
@@ -333,7 +340,6 @@ finding_tier() {
     done <<EOF
 $sanitized
 EOF
-    coderabbit_unclassified_tier "$sanitized"
     return
   fi
   if [ "$login" = "$GHAS_BOT" ]; then

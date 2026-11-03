@@ -667,6 +667,7 @@ test_review_serialization_2927() {
   ser_case 'root with its real icon-label Major resolved clears' 0 'rev(5747872230)' 'com(4451423418)' '[{isResolved:true, comment_ids:[4451423418]}]'
   ser_case 'root with an unresolved icon-label Minor stays non-blocking' 0 'rev(5747737952)' 'com(4451315353)' '[{isResolved:false, comment_ids:[4451315353]}]'
   ser_case 'unknown icon label on an inline finding fails closed' 1 'rev(5747872230)' 'com(4451423418) | .body |= sub("> Major\\*\\*"; "> Severe**")' '[{isResolved:false, comment_ids:[4451423418]}]' 'gating it as unclassified (p1)'
+  ser_case 'unknown row beside a recognised Minor row still fails closed' 1 'rev(5747737952)' 'com(4451315353) | .body += ("\n\n" + icon("Severe") + " · **Security & Privacy** · **Quick win**")' '[{isResolved:false, comment_ids:[4451315353]}]' 'gating it as unclassified (p1)'
   ser_case 'unknown icon label on a resolved inline finding clears' 0 'rev(5747872230)' 'com(4451423418) | .body |= sub("> Major\\*\\*"; "> Severe**")' '[{isResolved:true, comment_ids:[4451423418]}]'
   ser_case 'follow-up root with a Major emoji row blocks' 1 'rev(5739617104) | .body |= sub("🔵 Trivial"; "🟠 Major")' '' '' 'CodeRabbit blocking-tier unresolved: 1'
   ser_case 'follow-up root with an icon-label Major row blocks' 1 'rev(5739617104) | .body |= sub("\\*\\*🔵 Trivial\\*\\*"; icon("Major"))' '' '' 'CodeRabbit blocking-tier unresolved: 1'
