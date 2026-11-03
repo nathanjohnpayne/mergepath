@@ -2277,6 +2277,17 @@ paths:
     consumers: all
     requires:
       - "docs/agents/cloud-environments.md"   # linked from § Cloud agent sessions (#1057 F)
+      - "docs/agents/model-routing.md"        # linked from § Filing an issue (#2847)
+  # The routing tier table (#2847): which model and effort an issue is
+  # routed to. Split out of the shared rules by owner decision so the
+  # table, which changes as models do, has one home that the filing rule,
+  # the board-triage prompt and re-routing all cite. It owns tier
+  # selection only; the mergepath-route marker format and vocabulary stay
+  # in the shared rules. Consumer-truth checked: it links only the shared
+  # rules, which every consumer has.
+  - path: docs/agents/model-routing.md
+    type: canonical
+    consumers: all
   # The soft-wrap prose convention (#780 step 6), extracted from the
   # per-repo-owned docs/agents/documentation-rules.md. The RULE is
   # fleet-wide — a machine's ~/GitHub/CLAUDE.md already named it the
@@ -3234,6 +3245,12 @@ doc_ownership:
       the mergepath-local half (in-scope path allowlist, the
       md-prose-wrap gate) stays in the per-repo-owned file, which now
       points here for the rule itself.
+  - path: docs/agents/model-routing.md
+    class: canonical
+    note: >-
+      The routing tier table (#2847), split out of the shared rules by
+      owner decision. Tier selection only; the mergepath-route marker
+      contract is defined in docs/agents/shared-operating-rules.md.
 
   # ── per-repo-owned ─────────────────────────────────────────────────
   - path: docs/agents/operating-rules.md
