@@ -163,6 +163,7 @@ run() {
   RC=$?
   set -e
   ERR="$(cat "$WORK/$name.err")"
+  printf '%s' "$OUT" >"$WORK/$name.out"
 }
 expect_rc() { ok "$1: expected exit $2, got $RC; stdout: $OUT; stderr: $ERR" [ "$RC" -eq "$2" ]; }
 expect_out() { ok "$1: stdout '$OUT' != '$2'" [ "$OUT" = "$2" ]; }
@@ -173,8 +174,9 @@ expect_silent_stdout() { ok "$1: stdout must be empty on failure, got '$OUT'" [ 
 expect_rest_only() {
   ok "$1: gh calls must be exactly one REST issue read; log: $(cat "$LOG")" \
     [ "$(wc -l <"$LOG" | tr -d ' ')" -eq 1 ]
-  ok "$1: gh call was not 'api repos/nathanjohnpayne/example/issues/211'; log: $(cat "$LOG")" \
-    grep -q '^api repos/nathanjohnpayne/example/issues/211 ' "$LOG"
+  # The stub logs "$*" plus a trailing space: the exact call, arguments included.
+  ok "$1: gh call was not exactly 'api repos/nathanjohnpayne/example/issues/211 --jq .body // \"\"'; log: $(cat "$LOG")" \
+    grep -Fxq 'api repos/nathanjohnpayne/example/issues/211 --jq .body // "" ' "$LOG"
 }
 # fails <case> <exit> <err-token> — a failure case: code, named case, no stdout.
 fails() { expect_rc "$1" "$2"; expect_err "$1" "$3"; expect_silent_stdout "$1"; }
@@ -194,12 +196,14 @@ body bare '%s' "$M"
 run bare bare 211 "${R[@]}"
 expect_rc bare 0
 expect_out bare 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+expect_rest_only bare
 
 # CRLF body (web-edited issue): the trailing CR does not break the match.
 body crlf 'Part of #1.\r\n\r\n%s\r\n' "$M"
 run crlf crlf 211 "${R[@]}"
 expect_rc crlf 0
 expect_out crlf 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+expect_rest_only crlf
 
 # Every vocabulary value is accepted, in the stable output form.
 for m in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1; do
@@ -209,6 +213,7 @@ for m in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1; do
     run "va$SEQ" "va$SEQ" 211 "${R[@]}"
     expect_rc "anthropic $m/$e" 0
     expect_out "anthropic $m/$e" "anthropic=$m/$e openai=gpt-6-luna/low"
+    expect_rest_only "anthropic $m/$e"
   done
 done
 for m in gpt-6-luna gpt-6.1-sol gpt-6-astra; do
@@ -218,6 +223,7 @@ for m in gpt-6-luna gpt-6.1-sol gpt-6-astra; do
     run "vo$SEQ" "vo$SEQ" 211 "${R[@]}"
     expect_rc "openai $m/$e" 0
     expect_out "openai $m/$e" "anthropic=haiku-4.5/low openai=$m/$e"
+    expect_rest_only "openai $m/$e"
   done
 done
 
@@ -307,6 +313,7 @@ run u_badrepo ok 211 --repo notaslug
 expect_rc u_badrepo 2
 for c in u_noargs u_notnum u_zero u_extra u_badopt u_norepoval u_badrepo; do
   ok "$c: gh was called on a usage error; log: $(cat "$WORK/$c.log")" [ ! -s "$WORK/$c.log" ]
+  ok "$c: stdout must be empty on a usage error" [ ! -s "$WORK/$c.out" ]
 done
 
 # --- repository resolution: --repo, $REPO, then the origin remote ---
@@ -330,6 +337,7 @@ if command -v git >/dev/null 2>&1; then
   git -C "$WORK/cwd" remote remove origin >/dev/null 2>&1 || true
   run noorigin ok 211
   expect_rc noorigin 2
+  expect_silent_stdout noorigin
 fi
 
 echo "$NAME: $PASS passed, $FAIL failed"

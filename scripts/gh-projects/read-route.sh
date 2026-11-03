@@ -16,7 +16,8 @@
 #   0  found        a valid marker; the route is on stdout
 #   1  read-failed  the issue could not be read (gh missing or gh failed)
 #   2  usage        bad arguments, or no resolvable OWNER/REPO
-#   3  no-marker    the body carries no marker; keep the session's model/effort
+#   3  no-marker    the body carries no marker; keep the session's model/effort,
+#                   unless the issue carries decision-needed (not ready to start)
 #   4  malformed    a marker line breaks the format, or
 #   4  out-of-vocabulary  a model or effort value is not in the vocabulary
 #   5  duplicated   more than one marker line
@@ -132,7 +133,7 @@ while IFS= read -r LINE || [ -n "$LINE" ]; do
 done <<<"$BODY"
 
 if [ "$CANDIDATES" -eq 0 ]; then
-  echo "$NAME: no-marker: issue #$ISSUE_NUM in $REPO_SLUG has no mergepath-route marker; keep the session's model and effort" >&2
+  echo "$NAME: no-marker: issue #$ISSUE_NUM in $REPO_SLUG has no mergepath-route marker; keep the session's model and effort unless the issue carries decision-needed" >&2
   exit 3
 fi
 if [ "$CANDIDATES" -gt 1 ]; then

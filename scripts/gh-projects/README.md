@@ -119,7 +119,7 @@ Success prints one line, `anthropic=<model>/<effort> openai=<model>/<effort>`, o
 | 0 | found | A valid marker; the route is on stdout. |
 | 1 | `read-failed` | The issue could not be read. |
 | 2 | usage | Bad arguments or no resolvable repository. |
-| 3 | `no-marker` | No marker; the caller keeps the session's model and effort. |
+| 3 | `no-marker` | No marker; the caller keeps the session's model and effort, unless the issue carries `decision-needed`, in which case it is not ready to start. |
 | 4 | `malformed` / `out-of-vocabulary` | A marker line breaks the format, or a model or effort is not in the vocabulary. |
 | 5 | `duplicated` | More than one marker line. |
 
