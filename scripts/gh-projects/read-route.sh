@@ -14,8 +14,8 @@
 # with that case's own code:
 #
 #   0  found        a valid marker; the route is on stdout
-#   1  read-failed  the issue could not be read (gh failed or no repository)
-#   2  usage        bad arguments
+#   1  read-failed  the issue could not be read (gh missing or gh failed)
+#   2  usage        bad arguments, or no resolvable OWNER/REPO
 #   3  no-marker    the body carries no marker; keep the session's model/effort
 #   4  malformed    a marker line breaks the format, or
 #   4  out-of-vocabulary  a model or effort value is not in the vocabulary

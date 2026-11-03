@@ -367,6 +367,13 @@ MARKER_ONLY_CONSUMER_GATES=(
   # rules/repo_rules.md prose assertion is intentionally inside the hub-only
   # branch because consumers own that file and carry repository-local prose.
   "check_self_approval_detector"
+  # Gate: scripts/sync-to-downstream.sh (marker) only, and only to decide
+  # whether a missing '### The route marker' section is a hub defect (fail)
+  # or a consumer whose rules copy lags the wave (skip the drift
+  # comparison). The subject scripts/gh-projects/read-route.sh and the
+  # compared docs/agents/shared-operating-rules.md are manifest-delivered
+  # (scripts/ci/ kit requires:), so neither is bootstrap residue.
+  "check_gh_projects_read_route"
 )
 
 is_marker_only_gate() {

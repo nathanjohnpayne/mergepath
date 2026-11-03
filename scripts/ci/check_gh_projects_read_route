@@ -78,7 +78,7 @@ ok "read-route.sh must make exactly one gh api call" \
 
 # The vocabulary is declared once: every value appears exactly once in code.
 for v in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1 gpt-6-luna gpt-6.1-sol gpt-6-astra xhigh; do
-  n="$(grep -oF -- "$v" <<<"$CODE" | wc -l | tr -d ' ')"
+  n="$({ grep -oF -- "$v" <<<"$CODE" || true; } | wc -l | tr -d ' ')"
   ok "read-route.sh holds '$v' $n times in code; the vocabulary must be declared in exactly one place" [ "$n" -eq 1 ]
 done
 
@@ -93,8 +93,8 @@ rules_row() {
 vocab_line() { sed -n "s/^$1=//p" <<<"$VOCAB"; }
 if [ -f "$RULES" ] && grep -qF '### The route marker' "$RULES"; then
   for half in anthropic openai; do
-    exp_models="$(rules_row "$half" 3 '→ `[^`]+`')"
-    exp_efforts="$(rules_row "$half" 4 '`[^`]+`')"
+    exp_models="$(rules_row "$half" 3 '→ `[^`]+`' || true)"
+    exp_efforts="$(rules_row "$half" 4 '`[^`]+`' || true)"
     ok "$half models: script has '$(vocab_line "$half.models")', shared-operating-rules.md table has '$exp_models'" \
       [ "$(vocab_line "$half.models")" = "$exp_models" ]
     ok "$half efforts: script has '$(vocab_line "$half.efforts")', shared-operating-rules.md table has '$exp_efforts'" \
