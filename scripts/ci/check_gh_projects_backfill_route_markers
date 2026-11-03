@@ -68,7 +68,7 @@ ok() { local msg="$1"; shift; if "$@"; then pass; else fail "$msg"; fi; }
 # 1. Structural assertions (comment lines stripped first).
 # ---------------------------------------------------------------------------
 CODE="$(grep -v '^[[:space:]]*#' "$SUBJECT")"
-for pat in 'api[[:space:]]+graphql' 'gh[[:space:]]+project''(^|[[:space:]])-X[[:space:]]*[A-Z]' '--method'; do
+for pat in 'api[[:space:]]+graphql' 'gh[[:space:]]+project' '(^|[[:space:]])-X[[:space:]]*[A-Z]' '--method'; do
   if grep -Eq -- "$pat" <<<"$CODE"; then
     fail "backfill-route-markers.sh matches '$pat' in code (reads are REST GETs; the one write is gh issue edit through the author wrapper)"
   else
@@ -146,7 +146,7 @@ emit() { if [ -n "$jqexpr" ]; then jq -r "$jqexpr"; else cat; fi; }
 case "$1 $2" in
   "api users/o/projectsV2?per_page=100")
     [ "$paginate" = 1 ] || forbid "$@"
-    emit <"$STUB_FX/projects.json" ;;
+    emit <"${STUB_PROJECTS:-$STUB_FX/projects.json}" ;;
   "api users/o/projectsV2/"*"/fields?per_page=100")
     [ "$paginate" = 1 ] || forbid "$@"
     n="${2#users/o/projectsV2/}"; n="${n%%/*}"
@@ -290,6 +290,17 @@ echo '{"full_name":"o/gamma","archived":true}' >"$FX/repo-o_gamma.json"
 jq -s -c '.' "$P1" >"$FX/items-4-p1.json"
 jq -s -c '.' "$P2" >"$FX/items-4-p2.json"
 jq -s -c '.' "$B6" >"$FX/items-6-p1.json"
+# Board 9 (only listed under STUB_PROJECTS=$FX/projects-9.json): a body with
+# thousands of marker-like lines, and two items whose listing omits the body.
+fields 9 900
+B9="$WORK/b9p1.jsonl"; : >"$B9"
+awk 'BEGIN { for (i = 0; i < 3000; i++) print "<!--mergepath-route broken line " i " -->" }' >"$WORK/many.txt"
+item "$B9" 900 Issue o/delta 1 open "" "Opus 5.5" high "GPT-6.1 Sol" high '%s' "$(cat "$WORK/many.txt")"
+item "$B9" 900 Issue o/delta 2 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Two.\n\n%s' "$M_OK"
+item "$B9" 900 Issue o/delta 3 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Three.'
+jq -s -c 'map(if .content.number == 2 or .content.number == 3 then del(.content.body) else . end)' "$B9" >"$FX/items-9-p1.json"
+echo '{"full_name":"o/delta","archived":false}' >"$FX/repo-o_delta.json"
+jq -n '[{number: 9, title: "Delta"}]' >"$FX/projects-9.json"
 echo '{"resources":{"core":{"remaining":4000},"graphql":{"remaining":4000}}}' >"$WORK/rate-ok.json"
 echo '{"resources":{"core":{"remaining":4000},"graphql":{"remaining":10}}}' >"$WORK/rate-low.json"
 
@@ -304,7 +315,7 @@ run() {
   : >"$LOG"; : >"$WLOG"
   set +e
   OUT="$(env -u GITHUB_TOKEN GH_TOKEN=stub-token PATH="$WORK/bin:$PATH" STUB_LOG="$LOG" WRAP_LOG="$WLOG" \
-    STUB_FX="$FX" STATE="$WORK/state" STUB_RATE="$rate" STUB_DRY="$dry" STUB_MANGLE="${STUB_MANGLE:-0}" STUB_FROZEN="${STUB_FROZEN:-0}" STUB_REPO_FAIL="${STUB_REPO_FAIL:-0}" \
+    STUB_FX="$FX" STATE="$WORK/state" STUB_RATE="$rate" STUB_DRY="$dry" STUB_MANGLE="${STUB_MANGLE:-0}" STUB_FROZEN="${STUB_FROZEN:-0}" STUB_REPO_FAIL="${STUB_REPO_FAIL:-0}" STUB_PROJECTS="${STUB_PROJECTS:-}" \
     BACKFILL_AS_AUTHOR="$WORK/bin/as-author" bash "$SUBJECT" --owner o "$@" 2>"$WORK/$name.err")"
   RC=$?
   set -e
@@ -415,7 +426,23 @@ lacks onlyb6 "board 4"
 run badboard 1 "$WORK/rate-ok.json" --dry-run --board 5
 ok "badboard: an unknown board must fail, got $RC" [ "$RC" -eq 1 ]
 
-# --- usage: no mode, both modes ---
+# --- many marker-like lines (no SIGPIPE abort) and a body the listing omits ---
+reset_state
+STUB_PROJECTS="$FX/projects-9.json" STUB_FROZEN=1 run delta 1 "$WORK/rate-ok.json" --dry-run
+ok "delta: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+has delta "conflict (duplicated-marker)  o/delta#1"
+has delta "already-present  o/delta#2"
+has delta "would-write  o/delta#3"
+ok "delta: the omitted bodies were not read from the issue" \
+  [ "$(grep -cE '^api repos/o/delta/issues/(2|3)$' "$LOG")" -eq 2 ]
+ok "delta: a listed body was re-read" bash -c '! grep -q "^api repos/o/delta/issues/1$" "$1"' _ "$LOG"
+no_forbidden delta
+
+# --- usage: no mode, both modes, out-of-range numbers ---
+run bigfloor 1 "$WORK/rate-ok.json" --live --budget-floor 99999999999999999999
+ok "bigfloor: an overflowing --budget-floor must be a usage error, got $RC" [ "$RC" -eq 2 ]
+run bigcap 1 "$WORK/rate-ok.json" --live --max-writes 1234567890
+ok "bigcap: a 10-digit --max-writes must be a usage error, got $RC" [ "$RC" -eq 2 ]
 run nomode 1 "$WORK/rate-ok.json"
 ok "nomode: expected usage exit 2, got $RC" [ "$RC" -eq 2 ]
 ok "nomode: gh was called on a usage error" [ ! -s "$LOG" ]

@@ -93,7 +93,9 @@ usage() {
   echo "       [--pace SECONDS] [--max-writes N] [--budget-floor N]" >&2
 }
 die_usage() { echo "$NAME: usage: $1" >&2; usage; exit 2; }
-is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# At most 9 digits: a longer value could overflow `[ -lt ]`, which would then
+# fail as "integer expression expected" and silently disable the guard.
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "${#1}" -le 9 ]; }
 
 MODE=""
 OWNER="nathanjohnpayne"
@@ -226,7 +228,9 @@ for n in $BOARDS; do
       is_pr: ((.content_type == "PullRequest") or ((.content.pull_request? // null) != null)),
       size_l: ([(.content.labels? // [])[] | .name] | index("size:L") != null),
       am: fv($am), ae: fv($ae), om: fv($om), oe: fv($oe),
-      body: (.content.body? // "")
+      body: (.content.body? // ""),
+      # A listing that omits the body must not read as an empty body.
+      body_present: (((.content | type) == "object") and (.content | has("body")))
     }' "$WORK/items-$n.raw" >"$WORK/items-$n.jsonl"
   cat "$WORK/items-$n.jsonl" >>"$WORK/records.jsonl"
   count="$(wc -l <"$WORK/items-$n.jsonl" | tr -d ' ')"
@@ -303,7 +307,7 @@ jq -s -c --slurpfile arch "$WORK/archived.json" --arg am "$A_MODELS" --arg ae "$
             else
               . + {category: "candidate", reason: null,
                    route: "anthropic=\($m.am)/\($m.ae) openai=\($m.om)/\($m.oe)",
-                   body_b64: ($r.body | @base64)}
+                   body_b64: (if $r.body_present then ($r.body | @base64) else null end)}
             end
         end )
 ' "$WORK/records.jsonl" >"$WORK/classified.jsonl"
@@ -338,7 +342,9 @@ compose() {
 }
 # The marker-shaped lines of a body, for the report only (verdicts come from
 # read-route.sh): every line mentioning the token, CR stripped.
-marker_lines() { { grep -F 'mergepath-route' "$1" || true; } | tr -d '\r' | head -n 5 | jq -Rsc 'split("\n") | map(select(length > 0))'; }
+# awk, not head: head would close the pipe early and, under pipefail, a body
+# with many such lines would abort the run on SIGPIPE.
+marker_lines() { { grep -F 'mergepath-route' "$1" || true; } | tr -d '\r' | awk 'NR <= 5' | jq -Rsc 'split("\n") | map(select(length > 0))'; }
 
 # judge <repo> <number> <route> <body-file>: sets J_CAT, J_REASON, J_EXISTING.
 judge() {
@@ -371,11 +377,20 @@ jq -c 'select(.category == "candidate")' "$WORK/classified.jsonl" >"$WORK/candid
 # base64 (so neither a tab, a newline nor a backslash in them can shift a field;
 # the `b:` prefix keeps an empty body's field from collapsing, since a tab is
 # IFS whitespace).
-jq -r '[.repo, (.number | tostring), .route, ("b:" + .body_b64), (del(.body_b64) | tojson | @base64)] | join("\t")' \
+# A body the listing omitted is `missing` and is read from the issue instead.
+jq -r '[.repo, (.number | tostring), .route, (if .body_b64 == null then "missing" else "b:" + .body_b64 end), (del(.body_b64) | tojson | @base64)] | join("\t")' \
   "$WORK/candidates.jsonl" >"$WORK/candidates.tsv"
 while IFS=$'\t' read -r repo num route b64 row64 <&3; do
-  printf '%s' "${b64#b:}" | base64 "$B64D" >"$WORK/body"
   row="$(printf '%s' "$row64" | base64 "$B64D")"
+  if [ "$b64" = "missing" ]; then
+    if ! ghr api "repos/$repo/issues/$num" >"$WORK/body.json" || ! jq -j '.body // ""' "$WORK/body.json" >"$WORK/body"; then
+      jq -c '. + {category: "error", reason: "the listing omitted the body and the issue read failed", existing: null}' \
+        <<<"$row" >>"$WORK/results.jsonl"
+      continue
+    fi
+  else
+    printf '%s' "${b64#b:}" | base64 "$B64D" >"$WORK/body"
+  fi
   judge "$repo" "$num" "$route" "$WORK/body"
   jq -c --arg c "$J_CAT" --arg r "$J_REASON" --argjson e "$J_EXISTING" \
     '. + {category: $c, reason: (if $r == "" then null else $r end), existing: $e}' <<<"$row" >>"$WORK/results.jsonl"
