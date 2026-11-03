@@ -293,6 +293,37 @@ else
   fail "hunk joining (rc=$RC headers=$hunk_headers patch=$(jq -c '.[0].patch' "$WORK/hunks-files.json" 2>/dev/null))"
 fi
 
+# Local git state GitHub never sees must not move the answer (Codex P2 x2 on
+# #2970): a repository diff.context=0 would drop the unchanged Promise.all
+# line from the patch the classifier scans, and a local `-diff` attribute (in
+# .git/info/attributes or an uncommitted .gitattributes) would turn the file
+# binary and zero its count.
+R=$(new_repo local-state "external_review_threshold: 1
+phase_4b_default: complex-changes
+")
+mkdir -p "$R/src"
+printf 'const a = 1;\nawait Promise.all(jobs);\nconst b = 2;\nconst c = 3;\n' > "$R/src/job.js"
+commit_all "$R" add-job
+gitc "$R" checkout -q main
+gitc "$R" merge -q --ff-only feature
+gitc "$R" checkout -q feature
+printf 'const a = 1;\nawait Promise.all(jobs);\nconst b = 2;\nconst c = 4;\n' > "$R/src/job.js"
+commit_all "$R" edit-job
+run_preview "$R"
+clean=$(jget '[.phase_4.lines_changed, .phase_4b.triggers]')
+git -C "$R" config diff.context 0
+git -C "$R" config diff.algorithm histogram
+mkdir -p "$(git -C "$R" rev-parse --absolute-git-dir)/info"
+printf '*.js -diff\n' >> "$(git -C "$R" rev-parse --absolute-git-dir)/info/attributes"
+printf '*.js binary\n' > "$R/.gitattributes"
+run_preview "$R"
+if [ "$clean" = '[2,["concurrency"]]' ] && [ "$RC" -eq 0 ] \
+  && [ "$(jget '[.phase_4.lines_changed, .phase_4b.triggers, .phase_4.required, .phase_4b.invoked]')" = '[2,["concurrency"],true,true]' ]; then
+  pass "repository diff config and local attributes do not change the counts or the 4b route"
+else
+  fail "local git state leaked into the preview (clean=$clean rc=$RC out=$OUT err=$ERR)"
+fi
+
 # Live-mode parity for the decision fields: the fingerprint WITHOUT
 # --no-fingerprint, on the same files JSON, reports the same requires_review,
 # lines_changed, threshold and reasons. Under the threshold the live mode

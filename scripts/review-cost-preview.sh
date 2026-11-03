@@ -121,11 +121,7 @@ CLASSIFIER="$SCRIPT_DIR/phase-4b-classifier.sh"
 
 TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
 
-# Every diff option is pinned so user config (diff.relative, an external diff
-# driver, textconv, another algorithm, quoted paths) cannot reshape the files
-# list away from what GitHub reports.
 g() { git -C "$TOP" -c core.quotepath=false "$@"; }
-DIFF_OPTS=(--no-color --no-ext-diff --no-textconv --no-relative --diff-algorithm=myers -M)
 
 if [ -z "$BASE" ]; then
   BASE=$(g symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
@@ -161,15 +157,55 @@ if ! POLICY_BLOB=$(g rev-parse --verify --quiet "${BASE_SHA}:${POLICY_REL}"); th
 fi
 g cat-file blob "$POLICY_BLOB" > "$POLICY" || die "cannot read ${BASE}:${POLICY_REL}"
 
+# ── An isolated view of the two commits ─────────────────────────────────────
+# Both endpoints are commits, but `git diff` between them still reads local
+# state GitHub never sees: user, system and repository config (diff.context,
+# diff.algorithm, diff.relative, an external driver, textconv, quoted paths)
+# and local attributes (.git/info/attributes, core.attributesFile, an
+# uncommitted .gitattributes), any of which can turn a file binary or change
+# the patch the classifier scans. So the diffs run in a throwaway bare
+# repository that borrows this repository's objects through `alternates` and
+# has no config, no work tree and no info/attributes of its own. Attributes
+# come only from the committed HEAD tree (attr.tree; a git older than 2.42
+# ignores the key and reads none). The options below are pinned on top.
+COMMON_DIR=$(cd "$TOP" && cd "$(git rev-parse --git-common-dir)" && pwd -P) \
+  || die "cannot locate the git directory"
+[ -d "$COMMON_DIR/objects" ] || die "no object directory under $COMMON_DIR"
+ISO="$WORK/iso.git"
+iso_git() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    -u GIT_OBJECT_DIRECTORY -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+    HOME="$WORK" XDG_CONFIG_HOME="$WORK" GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 GIT_TEMPLATE_DIR="$WORK/no-templates" \
+    git "$@"
+}
+gi() {
+  iso_git --git-dir="$ISO" -c core.quotepath=false -c core.attributesFile=/dev/null \
+    -c attr.tree="$HEAD_SHA" "$@"
+}
+mkdir -p "$WORK/no-templates"
+iso_git init -q --bare "$ISO" >/dev/null 2>&1 || die "cannot create the isolated diff repository"
+mkdir -p "$ISO/objects/info"
+printf '%s\n' "$COMMON_DIR/objects" > "$ISO/objects/info/alternates" \
+  || die "cannot link the isolated diff repository to $COMMON_DIR/objects"
+for sha in "$HEAD_SHA" "$MERGE_BASE"; do
+  gi cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || die "the isolated diff repository cannot read commit $sha"
+done
+# --unified is pinned only on the patch call below: it implies -p, which would
+# mix patch text into the --raw and --numstat listings.
+DIFF_OPTS=(--no-color --no-ext-diff --no-textconv --no-relative --diff-algorithm=myers
+  --indent-heuristic -M)
+
 # ── Synthesize the PR-files JSON (gh api repos/O/R/pulls/N/files shape) ──────
 # --raw gives the status (and the rename source), --numstat the counts. Both
 # walk the same diff queue in the same order; the paths are cross-checked.
 # Each listing goes to a file first so a failed diff stops the preview: read
 # through a process substitution, its failure would arrive as an empty diff,
 # which is the "nothing to review" answer.
-g diff "${DIFF_OPTS[@]}" -z --raw "$MERGE_BASE" "$HEAD_SHA" > "$WORK/raw.z" \
+gi diff "${DIFF_OPTS[@]}" -z --raw "$MERGE_BASE" "$HEAD_SHA" > "$WORK/raw.z" \
   || die "git diff --raw failed"
-g diff "${DIFF_OPTS[@]}" -z --numstat "$MERGE_BASE" "$HEAD_SHA" > "$WORK/numstat.z" \
+gi diff "${DIFF_OPTS[@]}" -z --numstat "$MERGE_BASE" "$HEAD_SHA" > "$WORK/numstat.z" \
   || die "git diff --numstat failed"
 RAW_TOKENS=()
 while IFS= read -r -d '' tok; do RAW_TOKENS+=("$tok"); done < "$WORK/raw.z"
@@ -238,7 +274,7 @@ while [ "$ri" -lt "$n_raw" ]; do
   # hunk-header function names (GitHub picks its own) and squash-base drift.
   pathspec=(":(literal)$path")
   [ -z "$prev" ] || pathspec+=(":(literal)$prev")
-  g diff "${DIFF_OPTS[@]}" --inter-hunk-context=1 "$MERGE_BASE" "$HEAD_SHA" -- "${pathspec[@]}" \
+  gi diff "${DIFF_OPTS[@]}" --unified=3 --inter-hunk-context=1 "$MERGE_BASE" "$HEAD_SHA" -- "${pathspec[@]}" \
     | awk 'f || /^@@/ { f = 1; print }' > "$WORK/patch.raw" \
     || die "cannot diff $path"
   printf '%s' "$(cat "$WORK/patch.raw")" > "$WORK/patch.txt"
