@@ -1533,9 +1533,11 @@ for a in "$@"; do [ "${#a}" -lt 131072 ] || { echo 'jq: Argument list too long' 
 exec "$REAL_JQ" "$@"
 JQ
 chmod +x "$DIR/argv-bin/jq"
-PV_BIG=$(jq -nc --arg x "$(head -c 150000 /dev/zero | tr '\0' x)" '$x')
-PV_BIG_REVIEW=$(jq -nc --argjson b "$PV_BIG" --arg h "$PV_HEAD" '{id:19,user:{login:"coderabbitai[bot]"},state:"COMMENTED",commit_id:$h,submitted_at:"2026-09-14T00:04:50Z",body:$b}')
-PV_BIG_COMMENT=$(jq -nc --argjson b "$PV_BIG" '{id:777,user:{login:"coderabbitai[bot]"},created_at:"2026-09-14T00:02:00Z",updated_at:"2026-09-14T00:02:00Z",body:$b}')
+# The fixture is built on stdin: a 150000-byte --arg would itself exceed
+# the Linux limit and stop this suite before either case runs.
+PV_BIG_REVIEW=$(head -c 150000 /dev/zero | tr '\0' x | REAL_JQ=$(command -v jq) PATH="$DIR/argv-bin:$PATH" jq -Rsc --arg h "$PV_HEAD" '{id:19,user:{login:"coderabbitai[bot]"},state:"COMMENTED",commit_id:$h,submitted_at:"2026-09-14T00:04:50Z",body:.}')
+PV_BIG_COMMENT=$(head -c 150000 /dev/zero | tr '\0' x | REAL_JQ=$(command -v jq) PATH="$DIR/argv-bin:$PATH" jq -Rsc '{id:777,user:{login:"coderabbitai[bot]"},created_at:"2026-09-14T00:02:00Z",updated_at:"2026-09-14T00:02:00Z",body:.}')
+[ "${#PV_BIG_REVIEW}" -gt 150000 ] && [ "${#PV_BIG_COMMENT}" -gt 150000 ] || { echo 'FAIL #2968 gate: oversized fixtures were not built'; exit 1; }
 REAL_JQ=$(command -v jq) PATH="$DIR/argv-bin:$PATH" pv_run oversized-history-classifies cap-policy.yml \
   "[$PV_REQ,$PV_BIG_COMMENT,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
   "[$PV_BIG_REVIEW,$PV_SPENT,$(pv_review 13 CHANGES_REQUESTED r3 2026-09-14T00:04:00Z),$(pv_review 15 APPROVED r4 "$PV_T" 555)]" 0 \
