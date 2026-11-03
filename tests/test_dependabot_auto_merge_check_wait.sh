@@ -1176,5 +1176,144 @@ else
   echo "SKIP: workflow wiring assertions (yq or a workflow is unavailable)"
 fi
 
+# ---------------------------------------------------------------------------
+# #2932: transient failures in the merge job must be retried, not final.
+#
+# (a) require_current_head_checks_success tolerates a short run of
+#     consecutive rc=3 ("could not read") results from the verifier, resets
+#     the run on any successful read, and still fails closed on a persistent
+#     read failure.
+# (b) The --auto arm retries GitHub's "Base branch was modified" race a
+#     bounded number of times, re-reading the exact-head approval before
+#     every attempt, and never retries any other error.
+#
+# Both run the live workflow text: (a) extracts the function, (b) the
+# retry loop between its AUTO_MAX_ATTEMPTS assignment and its `done`.
+# ---------------------------------------------------------------------------
+RETRY_DIR="$WORK/retry-2932"
+mkdir -p "$RETRY_DIR/bin" "$RETRY_DIR/repo/scripts"
+cat >"$RETRY_DIR/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+# pr view → the pinned head. pr merge → pop the next scripted outcome.
+case "$1 $2" in
+  "pr view") printf '%s\n' "retry-head" ;;
+  "pr merge")
+    printf '%s\n' "$*" >>"$RETRY_DIR/merge.log"
+    line=$(head -n 1 "$RETRY_DIR/merge-script"); sed -i.bak 1d "$RETRY_DIR/merge-script"
+    case "$line" in
+      ok) exit 0 ;;
+      *) printf '%s\n' "$line" >&2; exit 1 ;;
+    esac
+    ;;
+  *) echo "retry gh shim: unexpected $*" >&2; exit 97 ;;
+esac
+SHIM
+chmod +x "$RETRY_DIR/bin/gh"
+# The verifier stub pops one exit status per poll from verify-script.
+cat >"$RETRY_DIR/repo/scripts/required-head-checks.sh" <<'STUB'
+#!/usr/bin/env bash
+rc=$(head -n 1 "$RETRY_DIR/verify-script"); sed -i.bak 1d "$RETRY_DIR/verify-script"
+echo "verify poll rc=$rc" >>"$RETRY_DIR/verify.log"
+exit "${rc:-9}"
+STUB
+
+extract_function require_current_head_checks_success >"$RETRY_DIR/wait.sh"
+if grep -Fq 'HEAD_CHECKS_MAX_INFRA_ERRORS' "$RETRY_DIR/wait.sh"; then
+  pass "#2932: extracted the live plural check waiter"
+else
+  fail "#2932: could not extract require_current_head_checks_success with its infra-error budget"
+fi
+
+run_wait() {
+  printf '%s\n' "$@" >"$RETRY_DIR/verify-script"
+  : >"$RETRY_DIR/verify.log"
+  ( cd "$RETRY_DIR/repo" && PATH="$RETRY_DIR/bin:$PATH" RETRY_DIR="$RETRY_DIR" \
+      PR_URL=https://example.invalid/pr/1 GITHUB_REPOSITORY=o/r \
+      TEST_CHECK_POLL_SECONDS=0 TEST_CHECK_WAIT_SECONDS=60 \
+      bash -c '. "$1"; require_current_head_checks_success; echo "MERGEABLE $CURRENT_HEAD_SHA"' _ "$RETRY_DIR/wait.sh" ) 2>&1
+}
+
+out=$(run_wait 3 1 3 0) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -Fq 'MERGEABLE retry-head' <<<"$out" && [ "$(wc -l <"$RETRY_DIR/verify.log")" -eq 4 ]; then
+  pass "#2932: isolated rc=3 reads are retried and the wait still ends green"
+else
+  fail "#2932: an isolated rc=3 read must be polled through (rc=$rc): $out"
+fi
+
+out=$(run_wait 1 3 3 1 3 3 0) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -Fq 'MERGEABLE' <<<"$out"; then
+  pass "#2932: a successful read resets the consecutive rc=3 budget"
+else
+  fail "#2932: the infra-error run must reset on a successful read (rc=$rc): $out"
+fi
+
+out=$(run_wait 3 3 3 0) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && ! grep -Fq 'MERGEABLE' <<<"$out" \
+   && grep -Fq 'failed closed (rc=3, 3 consecutive read failures)' <<<"$out"; then
+  pass "#2932: a persistent rc=3 still fails closed"
+else
+  fail "#2932: three consecutive rc=3 reads must fail closed (rc=$rc): $out"
+fi
+
+out=$(run_wait 2 0) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && grep -Fq 'failed closed (rc=2)' <<<"$out"; then
+  pass "#2932: a non-infra error status is still fatal on first sight"
+else
+  fail "#2932: rc=2 must still fail closed immediately (rc=$rc): $out"
+fi
+
+# (b) The --auto retry loop, run with stubbed hold and approval reads.
+awk '/^[[:space:]]*AUTO_MAX_ATTEMPTS=/{f=1} f{print} f && /^[[:space:]]*done[[:space:]]*$/{exit}' \
+  "$WORKFLOW" >"$RETRY_DIR/auto-loop.sh"
+if grep -Fq 'gh pr merge --squash --auto' "$RETRY_DIR/auto-loop.sh" \
+   && grep -Fq 'require_exact_head_approval "$CURRENT_HEAD_SHA"' "$RETRY_DIR/auto-loop.sh"; then
+  pass "#2932: extracted the live --auto retry loop"
+else
+  fail "#2932: could not extract the --auto retry loop"
+fi
+
+run_auto() {
+  printf '%s\n' "$@" >"$RETRY_DIR/merge-script"
+  : >"$RETRY_DIR/merge.log"; : >"$RETRY_DIR/approval.log"
+  ( PATH="$RETRY_DIR/bin:$PATH" RETRY_DIR="$RETRY_DIR" AUTHOR_MERGE_TOKEN=t \
+      PR_URL=https://example.invalid/pr/1 CURRENT_HEAD_SHA=retry-head AUTO_MERGE_RETRY_SECONDS=0 \
+      bash -c 'set -e
+        has_human_hold() { [ -n "${HOLD_AFTER:-}" ] && [ "$(wc -l <"$RETRY_DIR/merge.log")" -ge "$HOLD_AFTER" ]; }
+        require_exact_head_approval() { echo "$1" >>"$RETRY_DIR/approval.log"; }
+        . "$1"; echo "AUTO_RC=$AUTO_RC"' _ "$RETRY_DIR/auto-loop.sh" ) 2>&1
+}
+RACE='GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)'
+
+out=$(run_auto "$RACE" ok)
+if grep -Fq 'AUTO_RC=0' <<<"$out" && [ "$(wc -l <"$RETRY_DIR/merge.log")" -eq 2 ] \
+   && [ "$(wc -l <"$RETRY_DIR/approval.log")" -eq 2 ] \
+   && grep -Fq -- '--match-head-commit retry-head' "$RETRY_DIR/merge.log"; then
+  pass "#2932: 'Base branch was modified' is retried, re-reading the approval before each attempt"
+else
+  fail "#2932: the base-modified race must be retried with an approval re-read: $out"
+fi
+
+out=$(run_auto "$RACE" "$RACE" "$RACE" ok)
+if grep -Fq 'AUTO_RC=1' <<<"$out" && [ "$(wc -l <"$RETRY_DIR/merge.log")" -eq 3 ]; then
+  pass "#2932: the retry is bounded at AUTO_MERGE_MAX_ATTEMPTS (default 3)"
+else
+  fail "#2932: the --auto retry must stop after 3 attempts: $out"
+fi
+
+out=$(run_auto 'GraphQL: Resource not accessible by personal access token' ok)
+if grep -Fq 'AUTO_RC=1' <<<"$out" && [ "$(wc -l <"$RETRY_DIR/merge.log")" -eq 1 ]; then
+  pass "#2932: any other --auto error is not retried"
+else
+  fail "#2932: a non-race error must surface on the first attempt: $out"
+fi
+
+out=$(HOLD_AFTER=1 run_auto "$RACE" ok) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -Fq 'human-hold before the --auto retry' <<<"$out" \
+   && ! grep -Fq 'AUTO_RC=' <<<"$out" && [ "$(wc -l <"$RETRY_DIR/merge.log")" -eq 1 ]; then
+  pass "#2932: a human-hold added between attempts stops the retry"
+else
+  fail "#2932: the retry must re-read human-hold (rc=$rc): $out"
+fi
+
 echo "test_dependabot_auto_merge_check_wait: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
