@@ -947,7 +947,7 @@ else
   fi
 
   governance_modes_ok=1
-  for name in check_auto_clear_workflow check_coderabbit_wait check_merge_clearance_gate check_required_check_publisher check_phase_4b_automation check_phase_4b_accounting check_gh_projects_move_item; do
+  for name in check_auto_clear_workflow check_coderabbit_wait check_merge_clearance_gate check_required_check_publisher check_phase_4b_automation check_phase_4b_accounting check_gh_projects_move_item check_gh_projects_read_route; do
     name="$name" yq -e '([.jobs.lint_fast.steps[] | select(.name == strenv(name)) | .run | contains("--check")] | any) and ([.jobs.deep_self_tests.steps[] | select(.name == (strenv(name) + " --self-test")) | select((.if | contains("needs.scope.outputs.full")) and (.if | contains("needs.scope.outputs.checks")) and (.if | contains("matrix.suite == "))) | .run | contains("--self-test")] | any)' "$REPO_LINT" >/dev/null || governance_modes_ok=0
   done
   if [ "$governance_modes_ok" -eq 1 ]; then

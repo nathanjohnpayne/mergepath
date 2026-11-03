@@ -2974,6 +2974,8 @@ paths:
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/gh-projects/move-item.sh"     # check_gh_projects_move_item subject
+      - "scripts/gh-projects/read-route.sh"    # check_gh_projects_read_route subject (#2848)
+      - "docs/agents/shared-operating-rules.md"  # check_gh_projects_read_route compares its route-marker vocabulary table (#2848)
       - "scripts/workflow/"                    # check_workflow_parsers
       - ".github/workflows/agent-review.yml"   # disagreement + self-approval detector structural assertions
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
