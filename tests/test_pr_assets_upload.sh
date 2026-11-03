@@ -103,6 +103,7 @@ set -u
 printf '%s\n' "$*" >> "$MOCK_DIR/git.argv.log"
 is_push=0
 for a in "$@"; do [ "$a" = "push" ] && is_push=1 && break; done
+[ "$is_push" = 1 ] && printf '%s\n' "$HOME" >> "$MOCK_DIR/push.home"
 if [ "$is_push" = 1 ] && [ -n "${MOCK_RACE:-}" ]; then
   n=$(( $(cat "$MOCK_DIR/race.count" 2>/dev/null || echo 0) + 1 ))
   echo "$n" > "$MOCK_DIR/race.count"
@@ -424,6 +425,33 @@ test_no_source_ref_created() {
   pass "no ref is created in the source repository (ls-remote and local refs unchanged)"
 }
 
+test_relative_paths() {
+  reset_store
+  local after
+  mkdir -p "$T/img/sub"
+  png sub/rel.png "relative-bytes"
+  RUN_CWD="$T/img" run --repo nathanjohnpayne/mergepath --pr 42 desktop.png sub/rel.png
+  expect_rc 0 "relative input paths" || return 0
+  after="$(main_sha)"
+  "$REAL_GIT" --git-dir="$BARE" cat-file -e "$after:mergepath/42/desktop.png" || { fail "relative: desktop.png missing"; return 0; }
+  cmp -s <("$REAL_GIT" --git-dir="$BARE" cat-file blob "$after:mergepath/42/rel.png") "$T/img/sub/rel.png" \
+    || { fail "relative: sub/rel.png bytes differ"; return 0; }
+  pass "relative input paths are resolved against the caller's directory, not the work repository"
+}
+
+test_push_does_not_see_caller_netrc() {
+  reset_store
+  printf 'machine github.com login someone password not-the-scoped-token\n' > "$HOME/.netrc"
+  run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
+  rm -f "$HOME/.netrc"
+  expect_rc 0 "upload with a caller netrc present" || return 0
+  local h
+  h="$(tail -1 "$MOCK_DIR/push.home")"
+  [ -n "$h" ] && [ "$h" != "$HOME" ] || { fail "push ran with the caller's HOME ($h)"; return 0; }
+  [ ! -e "$h/.netrc" ] || { fail "push HOME carries a .netrc"; return 0; }
+  pass "network git runs with an isolated HOME, so the caller's ~/.netrc cannot supply a credential"
+}
+
 test_collision_refused_identical_reused() {
   reset_store
   local first second
@@ -559,6 +587,8 @@ test_private_source_refused
 test_happy_path_sha_pinned
 test_no_secret_leak_and_get_only
 test_no_source_ref_created
+test_relative_paths
+test_push_does_not_see_caller_netrc
 test_collision_refused_identical_reused
 test_concurrent_push_retried
 test_concurrent_collision_refused

@@ -223,6 +223,7 @@ content_matches_ext() { # <file> <ext>
 }
 
 NAMES=()
+ABS_FILES=()
 for f in "${FILES[@]}"; do
   [ -e "$f" ] || die "$EXIT_INPUT" "file not found: $f"
   [ -f "$f" ] || die "$EXIT_INPUT" "not a regular file: $f"
@@ -260,6 +261,10 @@ for f in "${FILES[@]}"; do
     done
   fi
   NAMES+=("$name")
+  # Absolute from here on: git later runs with -C <work repo>, where a
+  # relative path would resolve against the wrong directory.
+  dir="$(cd -P -- "$(dirname -- "$f")" && pwd)" || die "$EXIT_INPUT" "cannot resolve the directory of $f"
+  ABS_FILES+=("$dir/$name")
 done
 
 # ── Credential: present, fine-grained, identity-checked ───────────────
@@ -369,12 +374,16 @@ fi
 # Git with the caller's configuration switched off. Used for every operation
 # except commit-tree. Also dropped: environment that would disable TLS
 # verification, or trace the HTTP exchange (and so the Authorization header)
-# to stderr.
+# to stderr. HOME points at an empty directory: git's HTTP transport reads
+# $HOME/.netrc (CURL_NETRC_OPTIONAL) whatever the config says, so the
+# caller's netrc could otherwise supply an unchecked credential to the push.
+ISOLATED_HOME="$WORK_PARENT/home"
+mkdir -p "$ISOLATED_HOME"
 git_h() {
   env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_ASKPASS -u SSH_ASKPASS \
     -u GIT_SSL_NO_VERIFY -u GIT_TRACE -u GIT_TRACE_CURL -u GIT_TRACE_CURL_NO_DATA \
-    -u GIT_TRACE_PACKET -u GIT_CURL_VERBOSE -u GIT_TRACE_REDACT \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    -u GIT_TRACE_PACKET -u GIT_CURL_VERBOSE -u GIT_TRACE_REDACT -u XDG_CONFIG_HOME \
+    HOME="$ISOLATED_HOME" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
     git "$@"
 }
 
@@ -395,9 +404,9 @@ git_h -C "$WORK" config credential.helper ""
 # depend on the base, so retries reuse them.
 OIDS=()
 i=0
-while [ "$i" -lt "${#FILES[@]}" ]; do
-  oid="$(git_h -C "$WORK" hash-object -w --no-filters -- "${FILES[$i]}")" \
-    || die "$EXIT_FAILED" "could not hash ${FILES[$i]}."
+while [ "$i" -lt "${#ABS_FILES[@]}" ]; do
+  oid="$(git_h -C "$WORK" hash-object -w --no-filters -- "${ABS_FILES[$i]}")" \
+    || die "$EXIT_FAILED" "could not hash ${ABS_FILES[$i]}."
   OIDS+=("$oid")
   i=$((i + 1))
 done
