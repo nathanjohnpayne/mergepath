@@ -17,7 +17,8 @@
 #      that answers ONLY `api repos/<repo>/issues/<n>` and exits 99 on any
 #      other call (GraphQL, projects, anything). Covers a valid route, every
 #      vocabulary value, CRLF bodies, a null body, no marker, duplicated
-#      markers, malformed lines of each shape, out-of-vocabulary values, a
+#      markers, malformed lines of each shape, prose mentions and fenced
+#      examples (not candidates), out-of-vocabulary values, a
 #      read failure, the usage contract, repository resolution, and that no
 #      failure ever prints a partial route on stdout.
 #
@@ -262,18 +263,74 @@ check_malformed m_swapped '<!-- mergepath-route: openai=gpt-6.1-sol/high anthrop
 check_malformed m_one_half '<!-- mergepath-route: anthropic=opus-5.5/high -->\n'
 check_malformed m_no_effort '<!-- mergepath-route: anthropic=opus-5.5 openai=gpt-6.1-sol/high -->\n'
 check_malformed m_no_open '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high\n'
-check_malformed m_no_close 'mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
 check_malformed m_double_space '<!-- mergepath-route: anthropic=opus-5.5/high  openai=gpt-6.1-sol/high -->\n'
 check_malformed m_tight '<!--mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high-->\n'
 check_malformed m_comma '<!-- mergepath-route: anthropic=opus-5.5/high, openai=gpt-6.1-sol/high -->\n'
 check_malformed m_upper '<!-- mergepath-route: anthropic=Opus-5.5/high openai=gpt-6.1-sol/high -->\n'
 check_malformed m_lead_space ' <!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
 check_malformed m_trail_space '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high --> \n'
-check_malformed m_prefix 'Route: <!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
 check_malformed m_suffix '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high --> done\n'
-check_malformed m_inline_code 'The marker is `<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->` in prose.\n'
-check_malformed m_unquoted_token 'See the mergepath-route marker.\n'
+# Near-misses outside a fence: still candidates (begin with `<!--`), so malformed.
+check_malformed m_nearmiss '<!--mergepath-route anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+check_malformed m_nearmiss_text 'Intro.\n\n<!--mergepath-route anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n\nMore.\n'
+check_malformed m_indented '    <!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
 check_malformed m_placeholder '<!-- mergepath-route: anthropic=<model>/<effort> openai=<model>/<effort> -->\n'
+check_malformed m_fence_unclosed_after '```\nexample\n```\n<!--mergepath-route anthropic=opus-5.5/high -->\n'
+
+# --- not a candidate: prose, inline code, and fenced examples (#2848 fix) ---
+# A mention of the token that does not begin a `<!--` comment is not a marker.
+ok_route() { # <case> <printf-format> [args]: exactly one real marker => exit 0
+  local c="$1"; shift
+  body "$c" "$@"
+  run "$c" "$c" 211 "${R[@]}"
+  expect_rc "$c" 0
+  expect_out "$c" 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+  expect_rest_only "$c"
+}
+no_marker() { # <case> <printf-format> [args]: nothing counts => exit 3
+  local c="$1"; shift
+  body "$c" "$@"
+  run "$c" "$c" 211 "${R[@]}"
+  fails "$c" 3 'no-marker'
+  expect_rest_only "$c"
+}
+ok_route p_prose 'Reads the `mergepath-route` marker from the issue body.\n\n%s\n' "$M"
+ok_route p_prose_after '%s\n\nSee the mergepath-route marker above.\n' "$M"
+ok_route p_prose_comment 'Route: <!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low --> is the form.\n%s\n' "$M"
+ok_route p_inline_code 'The marker is `<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->` in prose.\n%s\n' "$M"
+ok_route p_no_opener 'mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n%s\n' "$M"
+ok_route f_backtick 'Example:\n\n```markdown\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n```\n\n%s\n' "$M"
+ok_route f_tilde 'Example:\n\n~~~\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n~~~\n\n%s\n' "$M"
+ok_route f_crlf 'Example:\r\n```\r\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\r\n```\r\n%s\r\n' "$M"
+ok_route f_indent3 'Example:\n   ```\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n   ```\n%s\n' "$M"
+ok_route f_malformed_inside '```\n<!--mergepath-route broken\n```\n%s\n' "$M"
+# Fence length and character matter: a shorter or different closer does not end it.
+ok_route f_long_open '````\n```\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n```\n````\n%s\n' "$M"
+ok_route f_mixed_char '~~~\n```\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n~~~\n%s\n' "$M"
+# A real marker before the fence still counts, and the fence does not hide it.
+ok_route f_marker_before '%s\n\n```\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n```\n' "$M"
+# A closed fence ends: a marker after it counts again.
+ok_route f_after_close '```\nx\n```\n%s\n' "$M"
+no_marker f_only '```\n<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n```\n'
+no_marker f_only_tilde '~~~yaml\n<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n~~~\n'
+no_marker f_unclosed 'Intro\n```\n<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+no_marker p_prose_only 'Reads the `mergepath-route` marker from the issue body.\n'
+# Two real markers are still duplicated, fenced examples or not.
+body d_two '```\nexample\n```\n%s\n%s\n' "$M" "$M"
+run d_two d_two 211 "${R[@]}"
+fails d_two 5 'duplicated'
+# After a closed fence, the next marker is real again: two real markers.
+body d_fence_between '%s\n```\nx\n```\n%s\n' "$M" "$M"
+run d_fence_between d_fence_between 211 "${R[@]}"
+fails d_fence_between 5 'duplicated'
+# A real marker plus a near-miss outside a fence is two candidates.
+body d_nearmiss '%s\n<!--mergepath-route anthropic=opus-5.5/high -->\n' "$M"
+run d_nearmiss d_nearmiss 211 "${R[@]}"
+fails d_nearmiss 5 'duplicated'
+# Out-of-vocabulary values are still rejected next to a fenced example.
+body o_fenced_ok '```\n%s\n```\n<!-- mergepath-route: anthropic=opus-4/high openai=gpt-6.1-sol/high -->\n' "$M"
+run o_fenced_ok o_fenced_ok 211 "${R[@]}"
+fails o_fenced_ok 4 'out-of-vocabulary'
 
 # --- out-of-vocabulary (same code 4, named separately) ---
 check_oov() { # <case> <expected-fragment> <printf-format>
