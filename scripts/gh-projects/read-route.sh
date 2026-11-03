@@ -28,12 +28,26 @@
 #
 # One marker per issue, on its own line, both halves, anthropic first.
 # Where the contract is silent this reads strictly:
-#   - any line containing the token `mergepath-route` is a marker candidate,
-#     so a quoted or half-typed marker fails closed instead of being ignored;
-#     fenced code blocks are not skipped;
-#   - a candidate must be the whole line, with no text before or after it and
-#     single spaces exactly where the format shows them (one trailing CR is
-#     tolerated, because web-edited bodies are CRLF);
+#   - a marker candidate is a line that, after one optional trailing CR and
+#     any leading or trailing whitespace, begins with `<!--` and contains the
+#     token `mergepath-route`. A prose mention ("reads the `mergepath-route`
+#     marker"), an inline-code span, or a `mergepath-route: ...` line without
+#     the `<!--` opener is not a candidate, so it cannot make a one-marker
+#     issue `duplicated`. A half-typed comment (`<!--mergepath-route ...`,
+#     a missing `-->`) is still a candidate and fails closed as `malformed`;
+#   - lines inside a fenced code block are not candidates, so a documentation
+#     example does not count. Fences follow CommonMark: an opening run of 3+
+#     backticks or tildes (up to 3 spaces of indent; a backtick info string
+#     may not contain a backtick), closed by a run of the same character at
+#     least as long, with only whitespace after it; an unclosed fence runs to
+#     the end of the body. Fences nested in blockquotes or list items are not
+#     recognized, so a marker line there is still a candidate;
+#   - a candidate must be exactly the canonical marker, with no text before or
+#     after it and single spaces exactly where the format shows them. The
+#     contract says "its own line", so leading or trailing whitespace on an
+#     otherwise exact marker is NOT accepted: it is a candidate that fails as
+#     `malformed` (one trailing CR is tolerated, because web-edited bodies are
+#     CRLF);
 #   - two or more candidates are `duplicated` whatever they say.
 #
 # REST only: one `GET repos/OWNER/REPO/issues/N`. A Claude cloud session's
@@ -126,10 +140,34 @@ MARKER_RE='^<!-- mergepath-route: anthropic=([a-z0-9.-]+)/([a-z]+) openai=([a-z0
 
 CANDIDATES=0
 MARKER_LINE=""
+FENCE_CHAR=""
+FENCE_LEN=0
+# shellcheck disable=SC2016  # a literal backtick run in a regex, not an expansion
+FENCE_OPEN_BT='^ {0,3}(`{3,})[^`]*$'
+FENCE_OPEN_TL='^ {0,3}(~{3,}).*$'
+FENCE_CLOSE='^ {0,3}(`{3,}|~{3,})[[:space:]]*$'
 while IFS= read -r LINE || [ -n "$LINE" ]; do
-  case "$LINE" in *mergepath-route*) ;; *) continue ;; esac
+  LINE="${LINE%$'\r'}"
+  if [ -n "$FENCE_CHAR" ]; then
+    # Inside a fence only a closing fence matters: same character, at least
+    # as long as the opener, up to 3 spaces of indent, nothing after it.
+    if [[ "$LINE" =~ $FENCE_CLOSE ]]; then
+      CLOSE="${BASH_REMATCH[1]}"
+      if [ "${CLOSE:0:1}" = "$FENCE_CHAR" ] && [ "${#CLOSE}" -ge "$FENCE_LEN" ]; then
+        FENCE_CHAR=""; FENCE_LEN=0
+      fi
+    fi
+    continue
+  fi
+  if [[ "$LINE" =~ $FENCE_OPEN_BT ]] || [[ "$LINE" =~ $FENCE_OPEN_TL ]]; then
+    FENCE_CHAR="${BASH_REMATCH[1]:0:1}"
+    FENCE_LEN="${#BASH_REMATCH[1]}"
+    continue
+  fi
+  TRIMMED="${LINE#"${LINE%%[![:space:]]*}"}"
+  case "$TRIMMED" in '<!--'*mergepath-route*) ;; *) continue ;; esac
   CANDIDATES=$((CANDIDATES + 1))
-  MARKER_LINE="${LINE%$'\r'}"
+  MARKER_LINE="$LINE"
 done <<<"$BODY"
 
 if [ "$CANDIDATES" -eq 0 ]; then
