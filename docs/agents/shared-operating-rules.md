@@ -242,6 +242,23 @@ Use `Refs #N` instead when the pull request is only part of the work, so the mer
 
 One issue, one open pull request. `scripts/gh-as-author.sh -- gh pr create` refuses to open a pull request whose body links an issue that another open pull request in the same repository already links with any of those keywords, and names that pull request (exit `7`). Two sessions implementing one issue, discovered only by a merge conflict, is the failure it catches (nathanjohnpayne/mergepath#2562). When the second pull request is a deliberate split or a stacked tranche, name the first in `GH_AS_AUTHOR_ALLOW_DUPLICATE_LINK=<number>` and say so in the body; an open-PR list the wrapper cannot read refuses rather than passes. The check sees only open pull requests, so before starting on an issue read its newest comments and any open linked pull request, and leave a one-line claim through the reviewer wrapper, `<!-- mergepath-claim: <agent> <YYYY-MM-DD> -->` on its own line, so a session arriving in the window before your pull request exists sees who holds it; do not start on an issue whose newest claim is another identity's while that identity's pull request is still open or its claim is less than a day old.
 
+## Visual evidence for reader-visible UI changes
+
+A pull request that makes a meaningful reader-visible UI change carries screenshots of the changed state in its body. By default that means a desktop capture and a phone capture; a ticket may require more widths or states, and a reviewer may ask for more. When screenshots would add no useful evidence, or cannot be produced, the body says so with a concrete explanation (what was tried, or why the change has no visible state to capture). Silence does not satisfy the requirement, and neither does a bare "N/A".
+
+Upload with `scripts/pr-assets-upload.sh`, then paste the Markdown lines it prints into the PR body or a comment. They are pinned to the full commit SHA of the upload, so they keep rendering after later uploads:
+
+```
+eval "$(scripts/op-preflight.sh --agent <agent> --mode pr-assets)"
+scripts/pr-assets-upload.sh --repo nathanjohnpayne/<name> --pr <N> desktop.png phone.png
+```
+
+`--mode pr-assets` caches the identity-checked author credential scoped to the assets repository; the script uses no other credential. `scripts/pr-assets-upload.sh --help` lists the accepted file types, the naming rules and the exit codes.
+
+- **Never in the code repository.** Do not commit screenshots to the repository the pull request targets, and do not push them as a branch of it. The script writes only to `nathanjohnpayne/pr-assets` and never touches the source repository's refs.
+- **Public-only.** Everything in `nathanjohnpayne/pr-assets` is public, so a screenshot must meet the bar of a public PR body: nothing from signed-in analytics or vendor dashboards, no personal data, nothing from a private repository. The script refuses a private or internal source repository. For a private repository, use an approved private method for visual evidence, or report the blocker on the pull request; do not substitute the public store and do not silently omit the evidence.
+- **Keep everything.** Never delete or rewrite history in `nathanjohnpayne/pr-assets`: older pull requests embed SHA-pinned URLs into it, and removing a commit breaks them. Upload under a new name rather than replacing a file.
+
 ## PR and issue titles/descriptions: describe the work, not the session
 
 Titles and descriptions — for both pull requests and issues — must describe the final state of the change (what it does and why) for a reader who arrives with no knowledge of the session that produced it.
