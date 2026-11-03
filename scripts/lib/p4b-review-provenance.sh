@@ -173,13 +173,20 @@ p4b_prov_cites_authorization() {
 # not listed.
 # Prints [{id, login, state, commit_id, class, reason, run, authorization}];
 # returns 1 on malformed input.
+# The reviews arrive on stdin and the comments through a file: either can
+# pass the 131072-byte single-argument limit on Linux (MAX_ARG_STRLEN), and an
+# oversized --argjson would keep jq from starting at all. Only the small
+# ledger rides on argv.
 p4b_prov_classify() {
-  local ledger="${2:-null}" comments="${3:-null}"
+  local ledger="${2:-null}" comments="${3:-null}" cf rc=0
   [ -n "$ledger" ] || ledger=null
   [ -n "$comments" ] || comments=null
-  printf '%s' "${1:-}" | jq -ce --argjson ledger "$ledger" --argjson comments "$comments" \
+  cf=$(mktemp "${TMPDIR:-/tmp}/p4b-prov-comments.XXXXXX") || return 1
+  printf '%s' "$comments" >"$cf" || { rm -f "$cf"; return 1; }
+  printf '%s' "${1:-}" | jq -ce --argjson ledger "$ledger" --slurpfile cs "$cf" \
     --arg author "${4:-}" --arg url "${5:-}" "$P4B_PROV_JQ_DEFS"'
-    if type != "array" then error("reviews are not an array") else . end
+    (if ($cs | length) == 1 then $cs[0] else error("comments") end) as $comments
+    | if type != "array" then error("reviews are not an array") else . end
     | if $ledger != null and ($ledger | type) != "array" then error("ledger") else . end
     | if $comments != null and ($comments | type) != "array" then error("comments") else . end
     | . as $all
@@ -211,7 +218,9 @@ p4b_prov_classify() {
             end ) as $why
         | {id:$r.id, login:($r.user.login // null), state:$r.state, commit_id:($r.commit_id // null),
            class:(if $why != null then "unverified" elif $auth != null then "owner-authorized" else "ledger" end),
-           reason:$why, run:$run, authorization:$auth} ]' 2>/dev/null
+           reason:$why, run:$run, authorization:$auth} ]' 2>/dev/null || rc=$?
+  rm -f "$cf"
+  return "$rc"
 }
 
 # p4b_prov_neutralize <reviews-json> <classified-json>
@@ -220,9 +229,12 @@ p4b_prov_classify() {
 # nor lets an earlier approval by the same reviewer stand in its place, the
 # fail-closed reading of "this reviewer's latest position cannot be trusted".
 p4b_prov_neutralize() {
-  jq -nce --argjson reviews "${1:-}" --argjson c "${2:-[]}" '
-    ([ $c[] | select(.class == "unverified") | {key:(.id | tostring), value:.reason} ] | from_entries) as $bad
-    | $reviews | map(if type == "object" and (((.id // null) | tostring) as $i | $bad | has($i)) and .state == "APPROVED"
+  # The reviews arrive on stdin (see p4b_prov_classify); the classification
+  # lists only claim-bearing reviews and stays small.
+  printf '%s' "${1:-}" | jq -ce --argjson c "${2:-[]}" '
+    if type != "array" then error("reviews are not an array") else . end
+    | ([ $c[] | select(.class == "unverified") | {key:(.id | tostring), value:.reason} ] | from_entries) as $bad
+    | map(if type == "object" and (((.id // null) | tostring) as $i | $bad | has($i)) and .state == "APPROVED"
                      then .state = "DISMISSED" | .mergepath_p4b_unverified = $bad[(.id | tostring)] else . end)' 2>/dev/null
 }
 

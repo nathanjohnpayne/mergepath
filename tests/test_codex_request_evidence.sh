@@ -1522,6 +1522,28 @@ pv_run manual-handoff-exempt cap-policy.yml "[$PV_REQ]" "[$(pv_review 18 APPROVE
 # Without a governing round cap there is no ledger; the reading is unchanged.
 pv_run no-governing-cap-unchanged substitute-policy.yml "[$PV_REQ]" "[$(pv_review 14 APPROVED forged "$PV_T")]" 0 'cleared — Phase 4b substitute' absent
 ! grep -q 'git/ref' "$DIR/calls" || { echo 'FAIL #2968 gate: an uncapped policy read the ledger'; exit 1; }
+# CodeRabbit on #2980: reviews and comments past the 131072-byte Linux
+# single-argument limit (CodeRabbit bodies, accounting records) must still
+# classify. The shim jq refuses any such argument, as Linux execve would.
+# The second case also shows the flag is visible when the gate still clears.
+mkdir -p "$DIR/argv-bin"
+cat >"$DIR/argv-bin/jq" <<'JQ'
+#!/usr/bin/env bash
+for a in "$@"; do [ "${#a}" -lt 131072 ] || { echo 'jq: Argument list too long' >&2; exit 126; }; done
+exec "$REAL_JQ" "$@"
+JQ
+chmod +x "$DIR/argv-bin/jq"
+PV_BIG=$(jq -nc --arg x "$(head -c 150000 /dev/zero | tr '\0' x)" '$x')
+PV_BIG_REVIEW=$(jq -nc --argjson b "$PV_BIG" --arg h "$PV_HEAD" '{id:19,user:{login:"coderabbitai[bot]"},state:"COMMENTED",commit_id:$h,submitted_at:"2026-09-14T00:04:50Z",body:$b}')
+PV_BIG_COMMENT=$(jq -nc --argjson b "$PV_BIG" '{id:777,user:{login:"coderabbitai[bot]"},created_at:"2026-09-14T00:02:00Z",updated_at:"2026-09-14T00:02:00Z",body:$b}')
+REAL_JQ=$(command -v jq) PATH="$DIR/argv-bin:$PATH" pv_run oversized-history-classifies cap-policy.yml \
+  "[$PV_REQ,$PV_BIG_COMMENT,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
+  "[$PV_BIG_REVIEW,$PV_SPENT,$(pv_review 13 CHANGES_REQUESTED r3 2026-09-14T00:04:00Z),$(pv_review 15 APPROVED r4 "$PV_T" 555)]" 0 \
+  'is owner-authorized under owner authorization 555' "$PV_LEDGER"
+REAL_JQ=$(command -v jq) PATH="$DIR/argv-bin:$PATH" pv_run oversized-history-still-flags cap-policy.yml \
+  "[$PV_REQ,$PV_BIG_COMMENT,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
+  "[$PV_BIG_REVIEW,$(pv_review 15 APPROVED r4 "$PV_T" 555),$(pv_review 16 APPROVED forged 2026-09-14T00:06:00Z "" "" nathanpayne-cursor)]" 0 \
+  'review 16 by nathanpayne-cursor (APPROVED on abcdef0123456789000000000000000000000000): run forged has 0 ledger entries' "$PV_LEDGER"
 # Unreadable evidence is not a decision.
 pv_run unreadable-ledger-exits-3 cap-policy.yml "[$PV_REQ]" "[$(pv_review 13 APPROVED r3 "$PV_T")]" 3 'Phase 4b round ledger refs/mergepath/p4b-rounds/pr-99 is unreadable' fail
 
