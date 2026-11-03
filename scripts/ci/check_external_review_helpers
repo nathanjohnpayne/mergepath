@@ -18,6 +18,11 @@
 # agent-review.yml's `load-config` step to the base policy and pins the
 # default-base no-API-call short circuit that shaped the resolver.
 #
+# tests/test_review_cost_preview.sh (#1679) covers the fingerprint's offline
+# `--no-fingerprint` seam and scripts/review-cost-preview.sh, which drives that
+# seam and the Phase 4b classifier's `--fixture` seam before a PR exists, under
+# a gh stub that fails on any call.
+#
 # jq is REQUIRED, not optional (CodeRabbit, #764): the wrapped suite skips
 # itself with exit 0 when jq is absent, which this wrapper would otherwise
 # report as a pass — a green check over zero executed assertions. Fail loudly
@@ -40,6 +45,7 @@ tests/test_external_review_gh_stderr.sh
 tests/test_external_review_rename_protection.sh
 tests/test_resolve_base_policy.sh
 tests/test_load_review_config.sh
+tests/test_review_cost_preview.sh
 "
 
 missing=""

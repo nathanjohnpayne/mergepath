@@ -3,7 +3,13 @@
 #
 # Usage:
 #   scripts/gh-projects/read-route.sh <issue_number> [--repo OWNER/REPO]
+#   scripts/gh-projects/read-route.sh <issue_number> [--repo OWNER/REPO] --body-file PATH
 #   scripts/gh-projects/read-route.sh --vocabulary
+#
+# --body-file parses the body held in PATH instead of reading the issue, with
+# the same verdicts and exit codes and no gh call. It exists so a caller that
+# already holds the body (the route-marker backfill, #2850) reuses this parser
+# instead of keeping a second one.
 #
 # Prints the route on one line in a stable, parseable form:
 #
@@ -14,7 +20,8 @@
 # with that case's own code:
 #
 #   0  found        a valid marker; the route is on stdout
-#   1  read-failed  the issue could not be read (gh missing or gh failed)
+#   1  read-failed  the issue could not be read (gh missing or gh failed, or
+#                   the --body-file PATH is unreadable)
 #   2  usage        bad arguments, or no resolvable OWNER/REPO
 #   3  no-marker    the body carries no marker; keep the session's model/effort,
 #                   unless the issue carries decision-needed (not ready to start)
@@ -50,7 +57,7 @@
 #     CRLF);
 #   - two or more candidates are `duplicated` whatever they say.
 #
-# REST only: one `GET repos/OWNER/REPO/issues/N`. A Claude cloud session's
+# REST only: one `GET repos/OWNER/REPO/issues/N` (none with --body-file). A Claude cloud session's
 # GitHub proxy serves only `repos/<owner>/<repo>/...` and no GraphQL, and the
 # boards (projectsV2) are outside it, so this script never calls either. It is
 # read-only and so does not source lib.sh, which demands a write-identity PAT;
@@ -72,7 +79,7 @@ OPENAI_EFFORTS="low medium high xhigh"
 NAME="read-route.sh"
 
 usage() {
-  echo "usage: $NAME <issue_number> [--repo OWNER/REPO]" >&2
+  echo "usage: $NAME <issue_number> [--repo OWNER/REPO] [--body-file PATH]" >&2
   echo "       $NAME --vocabulary" >&2
 }
 
@@ -82,6 +89,8 @@ in_list() { # in_list <value> <space-separated list>
 
 REPO_ARG=""
 ISSUE_NUM=""
+BODY_FILE=""
+BODY_FILE_SET=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -97,6 +106,14 @@ while [ "$#" -gt 0 ]; do
       REPO_ARG="$2"; shift 2
       ;;
     --repo=*) REPO_ARG="${1#--repo=}"; shift ;;
+    --body-file)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then echo "$NAME: usage: --body-file needs PATH" >&2; usage; exit 2; fi
+      BODY_FILE="$2"; BODY_FILE_SET=1; shift 2
+      ;;
+    --body-file=*)
+      BODY_FILE="${1#--body-file=}"; BODY_FILE_SET=1; shift
+      if [ -z "$BODY_FILE" ]; then echo "$NAME: usage: --body-file needs PATH" >&2; usage; exit 2; fi
+      ;;
     -?*) echo "$NAME: usage: unknown option: $1" >&2; usage; exit 2 ;;
     *)
       if [ -n "$ISSUE_NUM" ]; then echo "$NAME: usage: unexpected extra argument: $1" >&2; usage; exit 2; fi
@@ -125,13 +142,21 @@ case "$REPO_SLUG" in
   *) echo "$NAME: usage: repository must be OWNER/REPO (pass --repo or set REPO), got '$REPO_SLUG'" >&2; usage; exit 2 ;;
 esac
 
-command -v gh >/dev/null 2>&1 || { echo "$NAME: read-failed: gh CLI not on PATH" >&2; exit 1; }
+if [ "$BODY_FILE_SET" = "1" ]; then
+  # The caller holds the body: parse it and make no gh call.
+  if [ ! -f "$BODY_FILE" ] || [ ! -r "$BODY_FILE" ] || ! BODY="$(cat -- "$BODY_FILE")"; then
+    echo "$NAME: read-failed: could not read the body of issue #$ISSUE_NUM in $REPO_SLUG from --body-file '$BODY_FILE'" >&2
+    exit 1
+  fi
+else
+  command -v gh >/dev/null 2>&1 || { echo "$NAME: read-failed: gh CLI not on PATH" >&2; exit 1; }
 
-# The only network call: the issue over REST. `// ""` turns a null body into
-# an empty one, which is the no-marker case rather than a read failure.
-if ! BODY="$(gh api "repos/$REPO_SLUG/issues/$ISSUE_NUM" --jq '.body // ""')"; then
-  echo "$NAME: read-failed: could not read issue #$ISSUE_NUM in $REPO_SLUG over REST (see the gh error above)" >&2
-  exit 1
+  # The only network call: the issue over REST. `// ""` turns a null body into
+  # an empty one, which is the no-marker case rather than a read failure.
+  if ! BODY="$(gh api "repos/$REPO_SLUG/issues/$ISSUE_NUM" --jq '.body // ""')"; then
+    echo "$NAME: read-failed: could not read issue #$ISSUE_NUM in $REPO_SLUG over REST (see the gh error above)" >&2
+    exit 1
+  fi
 fi
 
 # The strict format, as one pattern: both halves, anthropic first, single

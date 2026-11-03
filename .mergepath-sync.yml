@@ -732,6 +732,16 @@ paths:
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
+  # Pre-PR review cost preview (#1679, #816). Runs before a PR exists and
+  # decides nothing itself: it feeds a synthesized PR-files JSON to the two
+  # emitters' offline seams, so both must travel with it. Its hermetic suite
+  # is hub-only (check_external_review_helpers), like the fingerprint's own.
+  - path: scripts/review-cost-preview.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b-classifier.sh"   # --fixture seam, Phase 4b triggers
+      - "scripts/workflow/"                # external_review_fingerprint.sh --no-fingerprint and its parsers
   # Automated Phase 4b handoff orchestrator (#579). It sources the
   # scripts/phase-4b/ kit for adapter selection, schema validation, and
   # timeout helpers, then delegates review posting to the identity-checked
@@ -3014,6 +3024,7 @@ paths:
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/gh-projects/move-item.sh"     # check_gh_projects_move_item subject
       - "scripts/gh-projects/read-route.sh"    # check_gh_projects_read_route subject (#2848)
+      - "scripts/gh-projects/backfill-route-markers.sh"  # check_gh_projects_backfill_route_markers subject (#2850)
       - "docs/agents/shared-operating-rules.md"  # check_gh_projects_read_route compares its route-marker vocabulary table (#2848)
       - "scripts/workflow/"                    # check_workflow_parsers
       - ".github/workflows/agent-review.yml"   # disagreement + self-approval detector structural assertions
@@ -3048,6 +3059,7 @@ paths:
     requires:
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      - "scripts/gh-as-author.sh"           # backfill-route-markers.sh --live writes through it (#2850)
   # scripts/workflow/ — the awk/bash parser helpers the canonical
   # .github/workflows/ files shell out to (parse_policy_list,
   # match_protected_paths, parse_manifest_paths). These were already

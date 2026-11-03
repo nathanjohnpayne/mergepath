@@ -12,6 +12,14 @@ set -euo pipefail
 #   --ref <sha-or-ref>
 #   --config <path>          default: .github/review-policy.yml
 #   --files-json <path>      optional current PR files JSON fixture/cache
+#   --no-fingerprint         offline decision only (#1679): requires
+#                            --files-json, makes --repo/--pr/--ref optional,
+#                            and never calls the GitHub API. When review is
+#                            required it stops before the tree/base-SHA reads
+#                            that the hash needs, emitting `fingerprint: ""`
+#                            plus `"fingerprint_skipped": true`. Used by
+#                            scripts/review-cost-preview.sh before a PR
+#                            exists. Without the flag, output is unchanged.
 #
 # Output: JSON:
 #   {
@@ -30,10 +38,12 @@ REPO=""
 PR_NUMBER=""
 REF=""
 FILES_JSON_PATH=""
+NO_FINGERPRINT=false
 
 usage() {
   cat >&2 <<'EOF'
 usage: external_review_fingerprint.sh --repo owner/repo --pr N --ref SHA [--config path] [--files-json path]
+       external_review_fingerprint.sh --no-fingerprint --files-json path [--config path] [--repo owner/repo] [--pr N] [--ref SHA]
 EOF
   exit 2
 }
@@ -55,6 +65,8 @@ while [ $# -gt 0 ]; do
     --files-json)
       [ $# -ge 2 ] || usage
       FILES_JSON_PATH="$2"; shift 2 ;;
+    --no-fingerprint)
+      NO_FINGERPRINT=true; shift ;;
     -h|--help)
       usage ;;
     *)
@@ -63,10 +75,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$REPO" ] || usage
-[ -n "$PR_NUMBER" ] || usage
-[ -n "$REF" ] || usage
-[[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "external_review_fingerprint.sh: --pr must be an integer" >&2; exit 2; }
+if [ "$NO_FINGERPRINT" = "true" ]; then
+  # Offline mode reads nothing from GitHub, so the PR files must come from the
+  # caller, and the PR identity the hash would need is optional.
+  [ -n "$FILES_JSON_PATH" ] || { echo "external_review_fingerprint.sh: --no-fingerprint requires --files-json" >&2; exit 2; }
+else
+  [ -n "$REPO" ] || usage
+  [ -n "$PR_NUMBER" ] || usage
+  [ -n "$REF" ] || usage
+fi
+[ -z "$PR_NUMBER" ] || [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "external_review_fingerprint.sh: --pr must be an integer" >&2; exit 2; }
 [ -f "$CONFIG" ] || { echo "external_review_fingerprint.sh: config not found: $CONFIG" >&2; exit 2; }
 
 PARSE="$SCRIPT_DIR/parse_policy_list.sh"
@@ -288,6 +306,23 @@ fi
 
 FINGERPRINT_INPUT="$ALL_CHANGED_FILES"$'\n'
 FINGERPRINT_PATHS_JSON=$(printf '%s\n' "$FINGERPRINT_INPUT" | LC_ALL=C sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+# Offline decision (#1679): every field above came from --files-json and the
+# config. The hash below needs the head tree and the PR base SHA from the API,
+# so stop here and say so, rather than emit an empty fingerprint that reads
+# like the "no review required" shape.
+if [ "$NO_FINGERPRINT" = "true" ]; then
+  jq -n \
+    --argjson requires true \
+    --arg fingerprint "" \
+    --argjson paths "$FINGERPRINT_PATHS_JSON" \
+    --argjson protected "$PROTECTED_JSON" \
+    --argjson reasons "$REASONS_JSON" \
+    --argjson lines "$LINES_CHANGED" \
+    --argjson threshold "$THRESHOLD" \
+    '{requires_review:$requires, fingerprint:$fingerprint, fingerprint_paths:$paths, lines_changed:$lines, threshold:$threshold, protected_paths:$protected, reasons:$reasons, fingerprint_skipped:true}'
+  exit 0
+fi
 
 HEAD_TREE_JSON=$(tree_for_ref "$REF") || exit 2
 HEAD_ENTRIES_JSON=$(entries_for_tree "$HEAD_TREE_JSON")

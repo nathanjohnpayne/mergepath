@@ -35,6 +35,7 @@
     "check_coderabbit_wait",
     "check_dependabot_coupled_groups",
     "check_doc_ownership",
+    "check_gh_projects_backfill_route_markers",
     "check_gh_projects_move_item",
     "check_gh_projects_read_route",
     "check_merge_clearance_gate",
@@ -335,9 +336,12 @@
       "tests/test_external_review_rename_protection.sh",
       "tests/test_load_review_config.sh",
       "tests/test_resolve_base_policy.sh",
+      "tests/test_review_cost_preview.sh",
       "scripts/codex-review-check.sh",
       "scripts/merge-clearance-gate.sh",
-      "scripts/lib/review-policy-scalar.sh"
+      "scripts/lib/review-policy-scalar.sh",
+      "scripts/review-cost-preview.sh",
+      "scripts/phase-4b-classifier.sh"
     ],
     "check_feedback_policy_helpers": [
       "tests/test_feedback_policy_helpers.sh"
@@ -390,6 +394,12 @@
       "scripts/lib/gh-command-classifier.sh",
       "scripts/lib/reviewers-helpers.sh",
       "scripts/workflow/external_review_classify.sh"
+    ],
+    "check_gh_projects_backfill_route_markers": [
+      "scripts/gh-projects/backfill-route-markers.sh",
+      "scripts/gh-projects/read-route.sh",
+      "scripts/gh-as-author.sh",
+      "scripts/lib/ci-check-modes.sh"
     ],
     "check_gh_projects_move_item": [
       "scripts/gh-projects/move-item.sh",
