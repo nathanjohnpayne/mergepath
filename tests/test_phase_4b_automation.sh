@@ -1373,9 +1373,13 @@ publication_run() {
   set -e
 }
 publication_run quoted fake-codex-publication-quoted false env
+# #2968: the guard admits the posted body only in the orchestrator's own write
+# context; the same body posted by hand is refused as unreserved provenance.
 if [ "$rc" = 1 ] && [ -s "$WORK/publication-body" ] \
-  && python3 "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+  && MERGEPATH_P4B_REVIEW_WRITE=1 python3 "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
       gh api repos/o/r/pulls/2790/reviews --method POST --input "$P4B_TEST_POSTED_REVIEW" >/dev/null \
+  && ! env -u MERGEPATH_P4B_REVIEW_WRITE python3 "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+      gh api repos/o/r/pulls/2790/reviews --method POST --input "$P4B_TEST_POSTED_REVIEW" >/dev/null 2>&1 \
   && python3 - "$WORK/publication-body" <<'PYTEST'
 import pathlib, re, sys
 body = pathlib.Path(sys.argv[1]).read_text()

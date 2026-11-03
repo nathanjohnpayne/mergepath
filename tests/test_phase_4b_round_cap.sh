@@ -23,6 +23,8 @@ HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # shellcheck source=../scripts/phase-4b/lib.sh
 . "$ROOT/scripts/phase-4b/lib.sh"
+# shellcheck source=../scripts/lib/p4b-review-provenance.sh
+. "$ROOT/scripts/lib/p4b-review-provenance.sh"
 
 # --- review fixtures -----------------------------------------------------------
 review() { # <id> <login> <state> <head> [run] [heading:yes|no] [footer:yes|no]
@@ -233,11 +235,15 @@ case "$method:$endpoint" in
   POST:repos/owner/repo/pulls/7/reviews)
     bump review_posts >/dev/null
     [ "$(knob review_unknown)" = 0 ] || { echo 'fixture unknown review outcome' >&2; exit 42; }
-    response=$(jq --arg login nathanpayne-codex '. + {id:99,user:{login:$login},state:"CHANGES_REQUESTED"}' "$input")
+    response=$(jq --arg login nathanpayne-codex --arg at "${FAKE_SUBMITTED_AT:-2026-11-03T23:00:00Z}" \
+      '. + {id:99,user:{login:$login},state:"CHANGES_REQUESTED",submitted_at:$at}' "$input")
     jq --argjson r "$response" '. + [$r]' "$S/reviews.json" >"$S/reviews.next"
     mv "$S/reviews.next" "$S/reviews.json"
     [ "$(knob review_lost_response)" = 0 ] || { echo 'fixture lost review response' >&2; exit 42; }
     printf '%s\n' "$response" ;;
+  GET:repos/owner/repo/issues/7/comments)
+    [ "$(knob comments_fail)" = 0 ] || { echo "HTTP 500" >&2; exit 1; }
+    cat "$S/comments.json" 2>/dev/null || echo '[]' ;;
   GET:repos/owner/repo/pulls/7/reviews)
     n=$(bump review_reads)
     if [ -f "$S/reviews_late.json" ] && [ "$n" -gt "$(knob reviews_late_after)" ]; then
@@ -264,7 +270,9 @@ cat >"$WORK/harness.sh" <<'H'
 # Runs the production block. Args: <run-id> <steps...>; steps: reserve, prepost, attempt, release.
 set -euo pipefail
 . "$ROOT/scripts/phase-4b/lib.sh"
+. "$ROOT/scripts/lib/p4b-review-provenance.sh"
 export P4B_ROUND_TEST_GUARD="$ROOT/scripts/workflow/gh-comment-trigger-guard.py"
+P4B_OWNER_AUTH_ID=${H_AUTH:-}
 PR=7 REPO=owner/repo HEAD=${H_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} DIRECTION=claude-\>codex
 REVIEWER=nathanpayne-codex ADAPTER=codex ENABLED_VIA=config GH_AS_REVIEWER="$FAKE_BIN/as-reviewer"
 P4B_ACCT_RUN_ID=$1; shift
@@ -289,6 +297,16 @@ for step in "$@"; do
   case "$step" in
     reserve) enforce_phase4b_round_cap pre-dispatch ;;
     prepost) enforce_phase4b_round_cap pre-post ;;
+    publish)
+      # #2968: the production header line, owner-authorization metadata line
+      # and provenance trailer, through the production post_review.
+      BODY_FILE="$FAKE_GH_STATE/body.$P4B_ACCT_RUN_ID"
+      { printf '**Automated Phase 4b review** (%s, reviewer %s)\n\nok\n\n### Review Metadata\n\n' "$DIRECTION" "$REVIEWER"
+        round_owner_authorization_line; round_provenance_trailer; } >"$BODY_FILE"
+      ROOT="$ROOT/scripts"
+      publish_rc=0
+      post_review --request-changes || publish_rc=$?
+      exit "$publish_rc" ;;
     publish-refused|publish-unknown|publish-lost-response)
       BODY_FILE="$FAKE_GH_STATE/body.$P4B_ACCT_RUN_ID"
       if [ "$step" = publish-refused ]; then
@@ -324,7 +342,7 @@ run() { # <run-id> <steps...> -> the last JSON document in OUT; RC set
   RC=0
   OUT=$(PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
         H_POST="$POST_REVIEW" H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" H_ADMIN_SET="${H_ADMIN_SET:-false}" H_ADMIN_QUOTE="${H_ADMIN_QUOTE:-}" \
-        H_ADMIN_OVERRIDDEN="${H_ADMIN_OVERRIDDEN:-[]}" \
+        H_ADMIN_OVERRIDDEN="${H_ADMIN_OVERRIDDEN:-[]}" H_AUTH="${H_AUTH:-}" \
         H_HOOK="${H_HOOK:-/dev/null}" TAMPER="${TAMPER:-}" \
         bash "$WORK/harness.sh" "$@" 2>"$S/err.$1") || RC=$?
   OUT=$(printf '%s\n' "$OUT" | jq -sc 'last // {}' 2>/dev/null || printf '{}')
@@ -532,6 +550,246 @@ run b reserve
 [ "$RC" = 8 ] && [ "$(jq -c '[.round_cap.occupied, .round_cap.in_flight]' <<<"$OUT")" = '[3,0]' ] && [ "$(reserved_runs)" = '["a"]' ] \
   && pass "P19: a surplus review under one reserved run id counts; the cap is spent and b is refused (exit 8)" \
   || fail "P19 rc=$RC $OUT $(reserved_runs)"
+
+# ===========================================================================
+# #2968: automated Phase 4b review provenance and the owner-authorized round
+# ===========================================================================
+# Pure helpers in scripts/lib/p4b-review-provenance.sh, then the production
+# round-cap block's --owner-authorization path against the same fake GitHub.
+PRURL=https://github.com/owner/repo/pull/7
+FOOT="_Posted by scripts/phase-4b-review.sh under the reviewer identity._"
+areview() { # <id> <state> <head> <run|""> <submitted_at> [auth-id] [body-prefix]
+  local body="${7:-**Automated Phase 4b review** (claude->codex, reviewer nathanpayne-codex)}"$'\n\nok\n'
+  [ -z "${6:-}" ] || body+=$'\n'"<!-- mergepath-p4b-owner-authorization: $6 -->"$'\n'
+  [ -z "$4" ] || body+=$'\n'"<!-- mergepath-p4b-run: $4 -->"$'\n'
+  body+=$'\n\n'"$FOOT"$'\n'
+  jq -nc --argjson id "$1" --arg state "$2" --arg head "$3" --arg body "$body" --arg at "$5" \
+    '{id:$id,user:{login:"nathanpayne-codex"},state:$state,commit_id:$head,submitted_at:$at,body:$body}'
+}
+acomment() { # <id> <head> <created_at> [updated_at] [login] [body]
+  local body="${6:-P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$2 reason: the last round findings were fixed; one more review}"
+  jq -nc --argjson id "$1" --arg c "$3" --arg u "${4:-$3}" --arg login "${5:-nathanjohnpayne}" --arg body "$body" \
+    '{id:$id,user:{login:$login},created_at:$c,updated_at:$u,body:$body,html_url:("https://github.com/owner/repo/pull/7#issuecomment-" + ($id|tostring))}'
+}
+
+# Parity with the ledger counter: one run-marker definition, one ledger and
+# cap acceptance.
+[ "$P4B_PROV_RUN_MARKER_JQ" = "$P4B_RUN_MARKER_JQ" ] \
+  && pass "#2968: the gate's run-marker parse is byte-identical to the round counter's" || fail "#2968: run-marker parse diverged"
+parity_bad=""
+for m in "$(p4b_round_ledger_message 7 '[{"run":"r1","head":"'"$HEAD_A"'","state":"reserved"}]')" "no ledger here" \
+         $'x\n{"schema":"p4b-round-ledger/v1","pr":7,"entries":[{"run":"r","state":"maybe"}]}' \
+         $'{"schema":"p4b-round-ledger/v1","pr":7,"entries":[]}\n{"schema":"p4b-round-ledger/v1","pr":7,"entries":[]}' \
+         $'{"schema":"p4b-round-ledger/v1","pr":7,"entries":[{"run":"bad id","state":"reserved"}]}' \
+         "$(p4b_round_ledger_message 7 '[{"run":"r1","head":"'"$HEAD_A"'","state":"reserved","authorization":12}]')"; do
+  a=$(p4b_round_ledger_parse "$m" || echo REFUSED); b=$(p4b_prov_ledger_parse "$m" || echo REFUSED)
+  [ "$a" = "$b" ] || parity_bad="$parity_bad [${m:0:30}]"
+done
+for c in '{}' '{"phase_4b_automation":{"max_review_rounds":3}}' '{"phase_4b_automation":{"max_review_rounds":0}}' \
+         '{"phase_4b_automation":3}' '{"phase_4b_automation":null}' '{"phase_4b_automation":{"max_review_rounds":2.5}}'; do
+  a=$(p4b_governing_round_cap "$c" || echo REFUSED); b=$(p4b_prov_round_cap_enforced "$c" || echo REFUSED)
+  case "$a:$b" in none:false|REFUSED:REFUSED|[1-9]*:true) ;; *) parity_bad="$parity_bad [cap $c: $a/$b]" ;; esac
+done
+[ -z "$parity_bad" ] && pass "#2968: the gate's ledger and cap readers accept exactly what the round counter accepts" || fail "#2968: parity$parity_bad"
+for bad in '"12"' 0 -1 1.5 null; do
+  p4b_prov_ledger_parse "$(printf '{"schema":"p4b-round-ledger/v1","pr":7,"entries":[{"run":"r","head":"h","state":"reserved","authorization":%s}]}' "$bad")" >/dev/null \
+    && fail "#2968: ledger authorization $bad accepted" || pass "#2968: a ledger authorization that is not a positive comment id ($bad) is malformed"
+done
+
+# The authorization line: exact PR, full head, reason, the owner's unedited
+# comment, newer than the latest automated review, exactly one line.
+T0=2026-11-03T10:00:00Z; T1=2026-11-03T11:00:00Z; T2=2026-11-03T12:00:00Z
+authv() { p4b_prov_authorization "$1" "${2:-501}" nathanjohnpayne "$PRURL" "${3:-$HEAD_A}" "${4:-$T0}"; }
+ok=$(authv "[$(acomment 501 "$HEAD_A" "$T1")]")
+jq -e --arg h "$HEAD_A" '.ok == true and .comment_id == 501 and .head == $h and (.reason | startswith("the last round"))' <<<"$ok" >/dev/null \
+  && pass "#2968: a well-formed owner authorization for this PR and head validates" || fail "#2968: valid authorization $ok"
+[ "$(authv "[$(acomment 501 "$HEAD_A" "$T1" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=https://GitHub.com/Owner/Repo/pull/7@$HEAD_A reason: go")]" | jq -r .ok)" = true ] \
+  && pass "#2968: the PR URL compares case-insensitively, as the tiebreak markers do" || fail "#2968: case-insensitive URL"
+while IFS='|' read -r label comments cid head floor want; do
+  got=$(authv "$comments" "$cid" "$head" "$floor")
+  if [ "$(jq -r .ok <<<"$got")" = false ] && jq -e --arg w "$want" '.why | contains($w)' <<<"$got" >/dev/null; then
+    pass "#2968: authorization refused: $label"
+  else fail "#2968: authorization $label gave $got"; fi
+done <<CASES
+missing comment|[$(acomment 502 "$HEAD_A" "$T1")]|501|$HEAD_A|$T0|is not a comment on this pull request
+another account|[$(acomment 501 "$HEAD_A" "$T1" "" nathanpayne-claude)]|501|$HEAD_A|$T0|configured author_identity
+edited comment|[$(acomment 501 "$HEAD_A" "$T1" "$T2")]|501|$HEAD_A|$T0|was edited
+no reason|[$(acomment 501 "$HEAD_A" "$T1" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A")]|501|$HEAD_A|$T0|malformed
+abbreviated head|[$(acomment 501 "$HEAD_A" "$T1" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@aaaaaaa reason: go")]|501|$HEAD_A|$T0|malformed
+quoted in prose|[$(acomment 501 "$HEAD_A" "$T1" "" "" "As agreed: P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: go")]|501|$HEAD_A|$T0|malformed
+another PR|[$(acomment 501 "$HEAD_A" "$T1" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=https://github.com/owner/repo/pull/8@$HEAD_A reason: go")]|501|$HEAD_A|$T0|another pull request
+another head|[$(acomment 501 "$HEAD_A" "$T1")]|501|$HEAD_B|$T0|a new head needs a fresh authorization
+older than the latest automated review|[$(acomment 501 "$HEAD_A" "$T0")]|501|$HEAD_A|$T1|not newer than the latest automated
+same second as the latest automated review|[$(acomment 501 "$HEAD_A" "$T1")]|501|$HEAD_A|$T1|not newer than the latest automated
+CASES
+two=$(authv "[$(acomment 501 "$HEAD_A" "$T1" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: a
+P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: b")]")
+jq -e '.ok == false and (.why | contains("exactly one"))' <<<"$two" >/dev/null \
+  && pass "#2968: authorization refused: two authorization lines in one comment are ambiguous" || fail "#2968: two lines gave $two"
+p4b_prov_authorization '{"not":"array"}' 501 nathanjohnpayne "$PRURL" "$HEAD_A" "" >/dev/null \
+  && fail "#2968: non-array comments accepted" || pass "#2968: unreadable comments fail closed rather than reading as no authorization"
+
+# Classification: the gate's four cases.
+LEDGER_R='[{"run":"r1","head":"'"$HEAD_A"'","state":"reserved"},{"run":"r2","head":"'"$HEAD_A"'","state":"reserved","authorization":501},{"run":"r3","head":"'"$HEAD_A"'","state":"released"}]'
+COMMENTS_R="[$(acomment 501 "$HEAD_A" "$T1")]"
+cls() { p4b_prov_classify "$1" "${2:-$LEDGER_R}" "${3:-$COMMENTS_R}" nathanjohnpayne "$PRURL" | jq -r --argjson id "${4:-1}" '.[] | select(.id == $id) | "\(.class)|\(.reason // "")"'; }
+want_cls() { # <label> <expected-class> <reason-substring> <reviews> [ledger] [comments] [id]
+  local got; got=$(cls "$4" "${5:-}" "${6:-}" "${7:-1}")
+  if [ "${got%%|*}" = "$2" ] && [[ "${got#*|}" == *"$3"* ]]; then pass "#2968: classify: $1"; else fail "#2968: classify $1 gave '$got'"; fi
+}
+want_cls "a ledger-reserved automated review is ledger" ledger "" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2")]"
+want_cls "a review reserved under a valid owner authorization it cites is owner-authorized" owner-authorized "" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]"
+want_cls "the #2887 direct header with a quoted owner instruction is unverified" unverified "without opening with the orchestrator header" \
+  "[$(jq -c '.body = "**Direct Phase 4b review** (claude -> codex)\n\nOne direct run at the owner'"'"'s direction.\n\n- Owner authorization: \"use an automated 4b\""' <<<"$(areview 1 APPROVED "$HEAD_A" "" "$T2")")]"
+want_cls "the #2887 automated header with no run marker or footer is unverified" unverified "no run marker" \
+  "[$(jq -c '.body = "**Automated Phase 4b review** (claude->codex, reviewer nathanpayne-codex), direct adapter run\n\n- Owner authorization: \"use an automated 4b\"; scope reduced per owner \"go\""' <<<"$(areview 1 APPROVED "$HEAD_A" "" "$T2")")]"
+want_cls "a forged header, run marker and footer with no ledger entry is unverified" unverified "has 0 ledger entries" "[$(areview 1 APPROVED "$HEAD_A" forged "$T2")]"
+want_cls "any claim on a PR with no ledger is unverified" unverified "no Phase 4b round ledger" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2")]" null
+want_cls "a released entry does not reserve its review" unverified "is released" "[$(areview 1 APPROVED "$HEAD_A" r3 "$T2")]"
+want_cls "a review on another head than its reservation is unverified" unverified "for head $HEAD_A" "[$(areview 1 APPROVED "$HEAD_B" r1 "$T2")]"
+want_cls "two reviews carrying one run id are unverified" unverified "2 reviews carry run id r1" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$(areview 2 APPROVED "$HEAD_A" r1 "$T2")]"
+want_cls "an authorized reservation cited without its record is unverified" unverified "does not match the ledger" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2")]"
+want_cls "a record on an unauthorized reservation is unverified" unverified "does not match the ledger" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2" 501)]"
+want_cls "a review that only quotes an authorization line is unverified" unverified "0 ledger entries" \
+  "[$(areview 1 APPROVED "$HEAD_A" quoted "$T2" "" "**Automated Phase 4b review** (x)
+Owner said: P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: go")]"
+want_cls "a quoted, unanchored authorization record is not a citation" ledger "" \
+  "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2" "" "**Automated Phase 4b review** (x)
+Finding text quoting <!-- mergepath-p4b-owner-authorization: 501 --> mid-review.")]"
+want_cls "an authorization consumed by two entries is unverified" unverified "more than one ledger entry" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" \
+  "$(jq -c '. + [{"run":"r4","head":"'"$HEAD_A"'","state":"reserved","authorization":501}]' <<<"$LEDGER_R")"
+want_cls "an edited authorization comment is unverified" unverified "was edited" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" "" "[$(acomment 501 "$HEAD_A" "$T1" "$T2")]"
+want_cls "an authorization for another head is unverified" unverified "a new head needs a fresh authorization" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" "" "[$(acomment 501 "$HEAD_B" "$T1")]"
+want_cls "an authorization posted after the review is unverified" unverified "not posted before the review" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T1" 501)]" "" "[$(acomment 501 "$HEAD_A" "$T2")]"
+want_cls "a cited authorization with unread comments is unverified" unverified "were not read" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2" 501)]" "" null
+manual=$(jq -nc --arg h "$HEAD_A" '{id:9,user:{login:"nathanpayne-cursor"},state:"APPROVED",commit_id:$h,submitted_at:"2026-11-03T12:00:00Z",body:"Phase 4b manual handoff review: APPROVED."}')
+[ "$(p4b_prov_classify "[$manual]" null null nathanjohnpayne "$PRURL")" = '[]' ] && [ "$(p4b_prov_claim_count "[$manual]")" = 0 ] \
+  && pass "#2968: a manual handoff review claims nothing and is never classified (the documented exemption)" || fail "#2968: manual handoff classified"
+botq=$(jq -nc --arg h "$HEAD_A" --arg f "$FOOT" '{id:8,user:{login:"coderabbitai[bot]"},state:"COMMENTED",commit_id:$h,submitted_at:"2026-11-03T12:00:00Z",body:("Diff quotes **Automated Phase 4b review** and <!-- mergepath-p4b-run: r1 -->\n\n" + $f)}')
+[ "$(p4b_prov_classify "[$botq,$(areview 1 APPROVED "$HEAD_A" r1 "$T2")]" "$LEDGER_R" null nathanjohnpayne "$PRURL" | jq -c '[.[] | [.id, .class]]')" = '[[1,"ledger"]]' ] \
+  && pass "#2968: a bot review quoting the markers from a diff is neither classified nor counted as a surplus carrier of the run id" || fail "#2968: bot quote classified"
+p4b_prov_classify '{"x":1}' null null a b >/dev/null && fail "#2968: classify accepted non-array reviews" || pass "#2968: classify fails closed on malformed reviews"
+# Neutralization: an unverified APPROVED reads as DISMISSED; nothing else moves.
+nr="[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$(areview 2 APPROVED "$HEAD_A" forged "$T2"),$(areview 3 CHANGES_REQUESTED "$HEAD_A" forged2 "$T2"),$manual]"
+nc=$(p4b_prov_classify "$nr" "$LEDGER_R" "$COMMENTS_R" nathanjohnpayne "$PRURL")
+[ "$(p4b_prov_neutralize "$nr" "$nc" | jq -c '[.[] | [.id, .state, (.mergepath_p4b_unverified != null)]]')" = '[[1,"APPROVED",false],[2,"DISMISSED",true],[3,"CHANGES_REQUESTED",false],[9,"APPROVED",false]]' ] \
+  && pass "#2968: only unverified approvals are neutralized; ledger, manual and non-approving reviews keep their state" || fail "#2968: neutralize $(p4b_prov_neutralize "$nr" "$nc")"
+
+# --- the production round-cap block with --owner-authorization ---------------
+spent3() { # three completed ledger-reserved rounds on HEAD_A, the last at T1
+  fresh "$1" 3
+  run r1 reserve; run r2 reserve; run r3 reserve
+  { areview 11 CHANGES_REQUESTED "$HEAD_A" r1 "$T0"; areview 12 CHANGES_REQUESTED "$HEAD_A" r2 "$T0"; areview 13 CHANGES_REQUESTED "$HEAD_A" r3 "$T1"; } | arr >"$S/reviews.json"
+}
+auth_of() { ledger | jq -c --arg r "$1" '[.[] | select(.run == $r) | .authorization // null]'; }
+
+# A1: a spent cap without an authorization stops and names the owner's line.
+spent3 a1; run extra reserve
+[ "$RC" = 8 ] && [ "$(jq -r .round_cap.state <<<"$OUT")" = spent ] && grep -q 'P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why>' "$S/err.extra" \
+  && pass "#2968 A1: a direct round after a spent cap with no authorization is refused (exit 8) and the stop names the owner's placeholder line" || fail "#2968 A1 rc=$RC $OUT"
+# A2: a valid authorization reserves exactly one slot beyond the cap, bound to
+# it, and the pre-POST binding check accepts it while the authorization holds.
+printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+H_AUTH=501 run extra reserve prepost
+[ "$RC" = 0 ] && [ "$(auth_of extra)" = '[501]' ] && [ "$(jq -c '[.round_cap.occupied, .round_cap.owner_authorization.state, .round_cap.owner_authorization.comment_id]' <<<"$OUT")" = '[3,"consumed",501]' ] \
+  && pass "#2968 A2: a valid owner authorization reserves one round beyond the spent cap, the ledger entry records its comment id, and the binding check accepts it" || fail "#2968 A2 rc=$RC $OUT $(cat "$S/err.extra")"
+# A4: a second run on the same authorization is refused; the cap stays spent.
+{ cat "$S/reviews.json" | jq -c '.[]'; areview 14 APPROVED "$HEAD_A" extra 2026-11-03T13:00:00Z 501; } | arr >"$S/reviews.next" && mv "$S/reviews.next" "$S/reviews.json"
+H_AUTH=501 run again reserve
+[ "$RC" = 8 ] && [ "$(auth_of again)" = '[]' ] && grep -q 'already consumed by run extra' "$S/err.again" \
+  && [ "$(jq -r .round_cap.owner_authorization.state <<<"$OUT")" = refused ] \
+  && pass "#2968 A4: a second run on the same authorization is refused (exit 8): it authorizes exactly one run" || fail "#2968 A4 rc=$RC $OUT"
+run plain reserve
+[ "$RC" = 8 ] && pass "#2968 A4: after the authorized round, an unauthorized run still meets the spent cap" || fail "#2968 A4b rc=$RC"
+# A5: a head change invalidates the authorization.
+spent3 a5; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+H_HEAD=$HEAD_B H_AUTH=501 run extra reserve
+[ "$RC" = 8 ] && grep -q 'a new head needs a fresh authorization' "$S/err.extra" && [ "$(auth_of extra)" = '[]' ] \
+  && pass "#2968 A5: an authorization for an earlier head is stale on a new head (exit 8, nothing reserved)" || fail "#2968 A5 rc=$RC $OUT"
+# A6: an authorization older than the latest automated review, or edited, or
+# by another account, keeps the stop.
+for variant in older edited other; do
+  spent3 "a6-$variant"
+  case "$variant" in
+    older) printf '[%s]' "$(acomment 501 "$HEAD_A" "$T0")" >"$S/comments.json" ;;
+    edited) printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2" 2026-11-03T13:00:00Z)" >"$S/comments.json" ;;
+    other) printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2" "" nathanpayne-claude)" >"$S/comments.json" ;;
+  esac
+  H_AUTH=501 run extra reserve
+  [ "$RC" = 8 ] && [ "$(auth_of extra)" = '[]' ] && pass "#2968 A6: an $variant authorization keeps the spent stop" || fail "#2968 A6 $variant rc=$RC $OUT"
+done
+# A7: a cap that is not spent, or no cap, refuses the flag and consumes nothing.
+fresh a7 3; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+H_AUTH=501 run extra reserve
+[ "$RC" = 3 ] && [ ! -f "$S/tip" ] && grep -q 'applies only to a spent round cap' "$S/err.extra" \
+  && pass "#2968 A7: below the cap the flag is refused (exit 3) and the authorization stays unconsumed" || fail "#2968 A7 rc=$RC"
+fresh a7n none; H_AUTH=501 run extra reserve
+[ "$RC" = 3 ] && [ ! -f "$S/tip" ] && pass "#2968 A7: with no governing cap the flag is refused (exit 3)" || fail "#2968 A7n rc=$RC"
+# A8: unreadable comments are unreadable evidence (exit 10), never "no authorization".
+spent3 a8; echo 1 >"$S/knob.comments_fail"
+H_AUTH=501 run extra reserve
+[ "$RC" = 10 ] && [ "$(auth_of extra)" = '[]' ] && pass "#2968 A8: unreadable authorization evidence exits 10 and reserves nothing" || fail "#2968 A8 rc=$RC"
+# A9: an authorization edited after dispatch refuses the POST at the binding check.
+spent3 a9; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+cat >"$WORK/edit-auth.sh" <<'E'
+#!/usr/bin/env bash
+jq -c '.[0].updated_at = "2026-11-03T14:00:00Z"' "$FAKE_GH_STATE/comments.json" >"$FAKE_GH_STATE/comments.next" && mv "$FAKE_GH_STATE/comments.next" "$FAKE_GH_STATE/comments.json"
+E
+H_AUTH=501 H_HOOK="$WORK/edit-auth.sh" run extra reserve hook prepost
+[ "$RC" = 10 ] && grep -q 'no longer holds' "$S/err.extra" && grep -q '\[cleanup\]' "$S/err.extra" \
+  && pass "#2968 A9: an authorization edited after dispatch refuses publication at the binding check (exit 10, pre-POST cleanup)" || fail "#2968 A9 rc=$RC $(cat "$S/err.extra")"
+# A10: a reservation stripped of its authorization fails the binding check.
+spent3 a10; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+cat >"$WORK/strip-auth.sh" <<'T'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$ROOT/scripts/phase-4b/lib.sh"
+t=$(cat "$FAKE_GH_STATE/tip"); e=$(p4b_round_ledger_parse "$(cat "$FAKE_GH_STATE/commits/$t")")
+e=$(jq -c 'map(del(.authorization))' <<<"$e")
+msg=$(p4b_round_ledger_message 7 "$e"); sha=$(printf 'strip|%s' "$msg" | shasum | cut -c1-40)
+printf '%s' "$msg" >"$FAKE_GH_STATE/commits/$sha"; printf '%s' "$t" >"$FAKE_GH_STATE/parents.$sha"; printf '%s' "$sha" >"$FAKE_GH_STATE/tip"
+T
+H_AUTH=501 H_HOOK="$WORK/strip-auth.sh" run extra reserve hook prepost
+[ "$RC" = 10 ] && grep -q 'no longer bound to its owner authorization' "$S/err.extra" \
+  && pass "#2968 A10: a reservation stripped of its authorization is refused before the POST" || fail "#2968 A10 rc=$RC $(cat "$S/err.extra")"
+# A11: a released authorized run still spent its authorization.
+spent3 a11; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+H_AUTH=501 run extra reserve release
+H_AUTH=501 run retry reserve
+[ "$RC" = 8 ] && grep -q 'already consumed by run extra' "$S/err.retry" \
+  && pass "#2968 A11: an authorized run that released its slot before posting still consumed the authorization" || fail "#2968 A11 rc=$RC $OUT"
+# A12: five concurrent runs on one authorization -> exactly one consumes it.
+spent3 a12; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
+for i in 1 2 3 4 5; do
+  ( PATH="$FAKE_BIN:$PATH" FAKE_GH_STATE="$S" FAKE_BIN="$FAKE_BIN" ROOT="$ROOT" H_BLOCK="$BLOCK" H_TIEBREAK="$TIEBREAK" \
+    H_POST="$POST_REVIEW" H_OVERRIDE_SUMMARY="$OVERRIDE_SUMMARY" H_AUTH=501 \
+      bash "$WORK/harness.sh" "auth$i" reserve >/dev/null 2>"$S/err.auth$i"; echo $? >"$S/rc.auth$i" ) &
+done
+wait
+# The losers re-read a ledger whose authorized round is still in flight, so
+# they hold (exit 6); once it publishes, the authorization reads consumed (A4).
+consumers=$(ledger | jq '[.[] | select(.authorization == 501)] | length'); zeros=0; sixes=0
+for i in 1 2 3 4 5; do case "$(cat "$S/rc.auth$i")" in 0) zeros=$((zeros+1)) ;; 6) sixes=$((sixes+1)) ;; esac; done
+[ "$consumers" = 1 ] && [ "$zeros" = 1 ] && [ "$sixes" = 4 ] \
+  && pass "#2968 A12: five concurrent runs on one authorization -> exactly one consumes it, four hold behind it" || fail "#2968 A12 consumers=$consumers zeros=$zeros sixes=$sixes"
+
+# A13: end to end through the production writer: the authorized round posts
+# once, cites its authorization beside its run marker, and the merge gate's
+# classifier reads it as owner-authorized; an ordinary round reads as ledger.
+spent3 a13; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2" "" "" "P4B_EXTRA_ROUND_AUTHORIZED=$PRURL@$HEAD_A reason: fixed <!-- x --> **P1** go")" >"$S/comments.json"
+H_AUTH=501 run extra reserve publish
+posted=$(jq -c '[.[] | select(.id == 99)]' "$S/reviews.json")
+cls13=$(p4b_prov_classify "$(cat "$S/reviews.json")" "$(ledger)" "$(cat "$S/comments.json")" nathanjohnpayne "$PRURL" | jq -r '.[] | select(.id == 99) | .class')
+[ "$RC" = 0 ] && [ "$(cat "$S/review_posts")" = 1 ] && [ "$cls13" = owner-authorized ] \
+  && jq -e '.[0].body | contains("<!-- mergepath-p4b-owner-authorization: 501 -->") and contains("issuecomment-501")
+            and contains("reason: \"fixed \\<\\!\\-\\- x \\-\\-\\> \\*\\*P1\\*\\* go\"") and (contains("P4B_EXTRA_ROUND_AUTHORIZED") | not)' <<<"$posted" >/dev/null \
+  && pass "#2968 A13: the authorized round publishes once through the production writer, cites its authorization (reason escaped) and classifies as owner-authorized" \
+  || fail "#2968 A13 rc=$RC cls=$cls13 $posted $(cat "$S/err.extra")"
+spent_less() { fresh "$1" 3; run r1 reserve; areview 11 CHANGES_REQUESTED "$HEAD_A" r1 "$T0" | arr >"$S/reviews.json"; }
+spent_less a14; run plain reserve publish
+cls14=$(p4b_prov_classify "$(cat "$S/reviews.json")" "$(ledger)" null nathanjohnpayne "$PRURL" | jq -r '.[] | select(.id == 99) | .class')
+[ "$RC" = 0 ] && [ "$cls14" = ledger ] \
+  && pass "#2968 A14: an ordinary ledger-reserved round published by the production writer classifies as ledger" || fail "#2968 A14 rc=$RC cls=$cls14 $(cat "$S/err.plain")"
 
 # ===========================================================================
 # #2746 item 2: the REST transport passes the ledger's git-data writes through

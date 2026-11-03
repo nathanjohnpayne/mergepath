@@ -245,6 +245,17 @@ fi
 # shellcheck source=lib/pr-body-contract.sh
 . "$__CODEX_CHECK_DIR/lib/pr-body-contract.sh"
 
+# Automated Phase 4b review provenance (#2968). Gates (b) and (c) count a
+# review that claims automated Phase 4b provenance only when the round ledger
+# reserved it, or reserved it under a valid owner authorization. Hard-required:
+# without the classifier a hand-posted header-bearing approval would clear.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/p4b-review-provenance.sh" ]; then
+  echo "ERROR: Phase 4b provenance helper missing: $__CODEX_CHECK_DIR/lib/p4b-review-provenance.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/p4b-review-provenance.sh
+. "$__CODEX_CHECK_DIR/lib/p4b-review-provenance.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --diagnostic-signal-only (#814) and --approval-readiness-only (#1062) are
@@ -577,7 +588,13 @@ log() {
 }
 
 fail_gate() {
-  echo "[codex-review-check] FAIL: $*" >&2
+  # #2968: a failing gate names any header-bearing Phase 4b review it refused
+  # to count, so the reason the approval did not clear is visible.
+  if [ -n "${P4B_PROVENANCE_FLAGS:-}" ]; then
+    echo "[codex-review-check] FAIL: $* (not counted, unverified Phase 4b review provenance: $P4B_PROVENANCE_FLAGS; #2968)" >&2
+  else
+    echo "[codex-review-check] FAIL: $*" >&2
+  fi
   exit 1
 }
 
@@ -2512,6 +2529,53 @@ crc_render_request_evidence() {
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
 
 REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+
+# --- #2968: automated Phase 4b review provenance -----------------------------
+# Where the governing policy caps automated Phase 4b rounds, the round ledger
+# (refs/mergepath/p4b-rounds/pr-<N>) is the record of every automated round. A
+# review that claims automated provenance (the automated or direct Phase 4b
+# heading, the run marker, the owner-authorization record or the orchestrator
+# footer) counts as a reviewer opinion only when it is (1) ledger-reserved, or
+# (2) reserved under a valid owner authorization it cites. A manual handoff
+# review (3) claims none of this and is untouched. Anything else (4) is
+# flagged below and, when APPROVED, read as DISMISSED: it clears neither gate
+# (b) nor gate (c), and an earlier approval by the same reviewer does not
+# stand in for it. Unreadable evidence exits 3. Without a governing cap there
+# is no ledger, and header-bearing reviews keep their earlier reading.
+P4B_PROVENANCE_FLAGS=""
+if ! __p4b_claims=$(p4b_prov_claim_count "$REVIEWS_JSON"); then
+  die 3 "cannot read the PR's reviews for Phase 4b provenance (#2968)"
+fi
+if [ "$__p4b_claims" -gt 0 ]; then
+  if ! __p4b_cap=$(p4b_prov_round_cap_enforced "$AUTHOR_POLICY_JSON"); then
+    die 3 "governing phase_4b_automation.max_review_rounds is malformed; Phase 4b review provenance is unknown (#2968)"
+  fi
+  if [ "$__p4b_cap" = true ]; then
+    if ! __p4b_ledger=$(p4b_prov_read_ledger "$REPO" "$PR_NUMBER"); then
+      die 3 "the Phase 4b round ledger refs/mergepath/p4b-rounds/pr-$PR_NUMBER is unreadable or malformed; Phase 4b review provenance is unknown (#2968)"
+    fi
+    __p4b_comments=null
+    if p4b_prov_cites_authorization "$REVIEWS_JSON"; then
+      __p4b_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (Phase 4b owner authorization)")
+    fi
+    if ! __p4b_class=$(p4b_prov_classify "$REVIEWS_JSON" "$__p4b_ledger" "$__p4b_comments" "$AUTHOR_IDENTITY" "$(p4b_prov_pr_url "$REPO" "$PR_NUMBER")") \
+       || ! REVIEWS_JSON=$(p4b_prov_neutralize "$REVIEWS_JSON" "$__p4b_class"); then
+      die 3 "cannot classify Phase 4b review provenance (#2968)"
+    fi
+    while IFS= read -r __p4b_line; do
+      [ -n "$__p4b_line" ] || continue
+      log "Phase 4b provenance: $__p4b_line"
+    done < <(printf '%s' "$__p4b_class" | jq -r '.[] | select(.class != "unverified")
+      | "review \(.id) by \(.login // "unknown") (\(.state)) is \(.class)\(if .authorization then " under owner authorization \(.authorization)" else "" end) (run \(.run))"')
+    P4B_PROVENANCE_FLAGS=$(printf '%s' "$__p4b_class" | jq -r '[.[] | select(.class == "unverified")
+      | "review \(.id) by \(.login // "unknown") (\(.state) on \(.commit_id // "unknown")): \(.reason)"] | join("; ")')
+    if [ -n "$P4B_PROVENANCE_FLAGS" ]; then
+      log "FLAG: UNVERIFIED Phase 4b review provenance, not clearance (#2968): $P4B_PROVENANCE_FLAGS"
+      echo "::warning title=Unverified Phase 4b review (#2968)::$P4B_PROVENANCE_FLAGS" >&2
+    fi
+  fi
+fi
+
 COMMENTS_JSON='[]'
 if [ "$CODEX_ENABLED" = "true" ] && [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
   COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")

@@ -57,6 +57,12 @@ case "$1" in
     fi
     cat "$FIXTURES/reviews" ;;
   repos/owner/repo/pulls/99/files) printf '%s\n' '[]' ;;
+  # #2968: the Phase 4b round ledger ref and its tip commit.
+  repos/owner/repo/git/ref/mergepath/p4b-rounds/pr-99)
+    [ "${LEDGER_FAIL:-0}" != 1 ] || { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
+    [ -f "$FIXTURES/ledger" ] || { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
+    printf '%s\n' '{"ref":"refs/mergepath/p4b-rounds/pr-99","object":{"sha":"1111111111111111111111111111111111111111"}}' ;;
+  repos/owner/repo/git/commits/1111111111111111111111111111111111111111) jq -nc --rawfile m "$FIXTURES/ledger" '{message:$m}' ;;
   repos/owner/repo/rulesets*) printf '%s\n' '[]' ;;
   repos/owner/repo/rules/branches/main) printf '%s\n' '[]' ;;
   repos/owner/repo/contents/.github/workflows/repo_lint_local.yml*) echo 'HTTP 404: fixture annex absent' >&2; exit 1 ;;
@@ -1427,6 +1433,97 @@ printf '%s\n' "$E_APPROVAL" | jq -c --arg at "$(e_iso 10)" '. + [.[0] + {state: 
 e_run approval-superseded-in-reread "[$E_REQ_OLD]" "$E_APPROVAL" 1 "no longer nathanpayne-codex's latest opinionated review"
 rm -f "$DIR/reviews-reread"
 e_run summary-completed-control "[$E_REQ_RECENT,$E_SUM_DONE]" "$E_APPROVAL" 0 'Codex owes HEAD no review (answered'
+
+# #2968: the merge gate counts a review that claims automated Phase 4b
+# provenance only when the round ledger reserved it, or reserved it under a
+# valid owner authorization it cites. Real checker, fake GitHub ledger ref.
+PV_HEAD=abcdef0123456789000000000000000000000000
+PV_URL=https://github.com/owner/repo/pull/99
+PV_FOOT='_Posted by scripts/phase-4b-review.sh under the reviewer identity._'
+{ cat "$DIR/substitute-policy.yml"; printf 'phase_4b_automation:\n  enabled: true\n  max_review_rounds: 3\n'; } >"$DIR/cap-policy.yml"
+pv_review() { # <id> <state> <run|""> <submitted_at> [auth] [header] [login]
+  local body="${6:-**Automated Phase 4b review** (claude->codex, reviewer nathanpayne-codex)}"$'\n\nok\n'
+  [ -z "${5:-}" ] || body+=$'\n'"<!-- mergepath-p4b-owner-authorization: $5 -->"$'\n'
+  [ -z "$3" ] || body+=$'\n'"<!-- mergepath-p4b-run: $3 -->"$'\n'
+  [ -z "$3" ] || body+=$'\n\n'"$PV_FOOT"$'\n'
+  jq -nc --argjson id "$1" --arg s "$2" --arg h "$PV_HEAD" --arg at "$4" --arg b "$body" --arg l "${7:-nathanpayne-codex}" \
+    '{id:$id,user:{login:$l},state:$s,commit_id:$h,submitted_at:$at,body:$b}'
+}
+pv_ledger() { # <entries-json>
+  printf 'mergepath Phase 4b round ledger (#2663)\n\n%s\n' "$(jq -nc --argjson e "$1" '{schema:"p4b-round-ledger/v1",pr:99,entries:$e}')" >"$DIR/ledger"
+}
+PV_REQ='{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}'
+pv_auth() { # <id> <created_at> [updated_at] [head]
+  jq -nc --argjson id "$1" --arg c "$2" --arg u "${3:-$2}" --arg body "P4B_EXTRA_ROUND_AUTHORIZED=$PV_URL@${4:-$PV_HEAD} reason: fixed the last findings" \
+    '{id:$id,user:{login:"nathanjohnpayne"},created_at:$c,updated_at:$u,body:$body}'
+}
+pv_run() { # <name> <policy> <comments> <reviews> <expected-rc> <pattern> [ledger-entries|absent|fail]
+  printf '%s\n' "$3" >"$DIR/comments"; printf '%s\n' "$4" >"$DIR/reviews"; printf '[]\n' >"$DIR/ack"; : >"$DIR/calls"
+  rm -f "$DIR/ledger"
+  local ledger_fail=0
+  case "${7:-absent}" in absent) ;; fail) ledger_fail=1 ;; *) pv_ledger "$7" ;; esac
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$1" LEDGER_FAIL=$ledger_fail \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/$2" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$5" ] || ! grep -qF -- "$6" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #2968 gate $1 rc=$rc (want $5, '$6')"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: #2968 gate $1"
+}
+PV_T=2026-09-14T00:05:00Z
+PV_LEDGER="[{\"run\":\"r1\",\"head\":\"$PV_HEAD\",\"state\":\"reserved\"},{\"run\":\"r2\",\"head\":\"$PV_HEAD\",\"state\":\"reserved\"},{\"run\":\"r3\",\"head\":\"$PV_HEAD\",\"state\":\"reserved\"},{\"run\":\"r4\",\"head\":\"$PV_HEAD\",\"state\":\"reserved\",\"authorization\":555}]"
+PV_SPENT="$(pv_review 11 CHANGES_REQUESTED r1 2026-09-14T00:02:00Z),$(pv_review 12 CHANGES_REQUESTED r2 2026-09-14T00:03:00Z)"
+# (1) A ledger-reserved automated approval still clears.
+pv_run ledger-reserved-clears cap-policy.yml "[$PV_REQ]" "[$PV_SPENT,$(pv_review 13 APPROVED r3 "$PV_T")]" 0 'cleared — Phase 4b substitute' "$PV_LEDGER"
+grep -qF 'review 13 by nathanpayne-codex (APPROVED) is ledger' "$DIR/out" || { cat "$DIR/out"; echo 'FAIL #2968 gate: ledger class not logged'; exit 1; }
+# (2) After a spent cap, a direct review with no authorization does not clear
+# and is flagged: the #2887 shapes, and a forged header, marker and footer.
+PV_2887="**Automated Phase 4b review** (claude->codex, reviewer nathanpayne-codex), direct adapter run"$'\n\n'"- Owner authorization: \"use an automated 4b\"; scope reduced per owner \"go\""
+pv_run 2887-direct-adapter-run-flagged cap-policy.yml "[$PV_REQ]" \
+  "[$PV_SPENT,$(pv_review 13 CHANGES_REQUESTED r3 2026-09-14T00:04:00Z),$(pv_review 14 APPROVED "" "$PV_T" "" "$PV_2887")]" 1 \
+  'FLAG: UNVERIFIED Phase 4b review provenance, not clearance (#2968): review 14 by nathanpayne-codex (APPROVED on abcdef0123456789000000000000000000000000): it carries no run marker' "$PV_LEDGER"
+grep -qF 'not counted, unverified Phase 4b review provenance' "$DIR/out" || { cat "$DIR/out"; echo 'FAIL #2968 gate: the failing gate does not name the unverified review'; exit 1; }
+grep -qF '::warning title=Unverified Phase 4b review (#2968)::' "$DIR/out" || { echo 'FAIL #2968 gate: no workflow warning'; exit 1; }
+pv_run 2887-direct-heading-flagged cap-policy.yml "[$PV_REQ]" \
+  "[$PV_SPENT,$(pv_review 14 APPROVED "" "$PV_T" "" "**Direct Phase 4b review** (claude -> codex) at the owner's direction")]" 1 \
+  'without opening with the orchestrator header' "$PV_LEDGER"
+pv_run forged-reviewer-session-flagged cap-policy.yml "[$PV_REQ]" "[$(pv_review 14 APPROVED forged "$PV_T")]" 1 \
+  'run forged has 0 ledger entries' "$PV_LEDGER"
+pv_run forged-without-any-ledger-flagged cap-policy.yml "[$PV_REQ]" "[$(pv_review 14 APPROVED forged "$PV_T")]" 1 \
+  'the PR has no Phase 4b round ledger' absent
+# A forged approval masks an earlier approval by the same reviewer: the
+# reviewer's latest position is untrusted, so nothing older stands in for it.
+pv_run forged-masks-earlier-manual-approval cap-policy.yml "[$PV_REQ]" \
+  "[$(pv_review 10 APPROVED "" 2026-09-14T00:03:00Z "" "Manual Phase 4b approval"),$(pv_review 14 APPROVED forged "$PV_T")]" 1 'UNVERIFIED Phase 4b review' "$PV_LEDGER"
+# (3) With a valid authorization the run's review clears; it cites the
+# comment its ledger entry consumed.
+pv_run owner-authorized-clears cap-policy.yml "[$PV_REQ,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
+  "[$PV_SPENT,$(pv_review 13 CHANGES_REQUESTED r3 2026-09-14T00:04:00Z),$(pv_review 15 APPROVED r4 "$PV_T" 555)]" 0 'cleared — Phase 4b substitute' "$PV_LEDGER"
+grep -qF 'review 15 by nathanpayne-codex (APPROVED) is owner-authorized under owner authorization 555 (run r4)' "$DIR/out" \
+  || { cat "$DIR/out"; echo 'FAIL #2968 gate: owner-authorized class not logged'; exit 1; }
+# A review that only quotes the authorization does not clear.
+pv_run quoted-authorization-flagged cap-policy.yml "[$PV_REQ,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
+  "[$(pv_review 16 APPROVED quoted "$PV_T" "" "**Automated Phase 4b review** (x)
+Owner said P4B_EXTRA_ROUND_AUTHORIZED=$PV_URL@$PV_HEAD reason: fixed the last findings")]" 1 'run quoted has 0 ledger entries' "$PV_LEDGER"
+# A second review on the same authorization (a second run) does not clear.
+pv_run second-run-on-one-authorization-flagged cap-policy.yml "[$PV_REQ,$(pv_auth 555 2026-09-14T00:04:30Z)]" \
+  "[$(pv_review 15 CHANGES_REQUESTED r4 2026-09-14T00:04:40Z 555),$(pv_review 17 APPROVED r4 "$PV_T" 555)]" 1 '2 reviews carry run id r4' "$PV_LEDGER"
+# A head change invalidates it: the authorization names another head.
+pv_run authorization-for-another-head-flagged cap-policy.yml "[$PV_REQ,$(pv_auth 555 2026-09-14T00:04:30Z "" 1111111111111111111111111111111111111111)]" \
+  "[$(pv_review 15 APPROVED r4 "$PV_T" 555)]" 1 'a new head needs a fresh authorization' "$PV_LEDGER"
+pv_run edited-authorization-flagged cap-policy.yml "[$PV_REQ,$(pv_auth 555 2026-09-14T00:04:30Z 2026-09-14T00:06:00Z)]" \
+  "[$(pv_review 15 APPROVED r4 "$PV_T" 555)]" 1 'was edited after it was posted' "$PV_LEDGER"
+# (4) The manual handoff exemption: no automated header, marker or footer, no
+# ledger read, today's clearance unchanged.
+pv_run manual-handoff-exempt cap-policy.yml "[$PV_REQ]" "[$(pv_review 18 APPROVED "" "$PV_T" "" "Manual Phase 4b approval")]" 0 'cleared — Phase 4b substitute' absent
+! grep -q 'git/ref' "$DIR/calls" || { echo 'FAIL #2968 gate: a manual review made the gate read the ledger'; exit 1; }
+# Without a governing round cap there is no ledger; the reading is unchanged.
+pv_run no-governing-cap-unchanged substitute-policy.yml "[$PV_REQ]" "[$(pv_review 14 APPROVED forged "$PV_T")]" 0 'cleared — Phase 4b substitute' absent
+! grep -q 'git/ref' "$DIR/calls" || { echo 'FAIL #2968 gate: an uncapped policy read the ledger'; exit 1; }
+# Unreadable evidence is not a decision.
+pv_run unreadable-ledger-exits-3 cap-policy.yml "[$PV_REQ]" "[$(pv_review 13 APPROVED r3 "$PV_T")]" 3 'Phase 4b round ledger refs/mergepath/p4b-rounds/pr-99 is unreadable' fail
 
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

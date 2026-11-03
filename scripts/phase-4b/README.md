@@ -267,7 +267,7 @@ runs complete-history feedback accounting before emitting the reviewer prompt;
 it exits `4` with no handoff when an earlier finding is unaccounted (#1000).
 Automated-mode fallbacks run that accounting before announcing or rendering a manual handoff; a miss becomes orchestrator exit `7`, not fallback exit `4`.
 
-`max_review_rounds` is enforced (#2663): each invocation reserves a slot in the per-PR Git-ref round ledger before any adapter run, and a PR whose completed and in-flight rounds have reached the governing cap stops for an owner decision. The contract, including what frees a slot and what never does, is [the round-cap spec](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_round_cap.md).
+`max_review_rounds` is enforced (#2663): each invocation reserves a slot in the per-PR Git-ref round ledger before any adapter run, and a PR whose completed and in-flight rounds have reached the governing cap stops for an owner decision. The contract, including what frees a slot and what never does, is [the round-cap spec](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_round_cap.md). Past a spent cap the only further round is `--owner-authorization <comment-id>`, which names the owner's scoped authorization comment and consumes it through the ledger (#2968). A review carrying the automated header that no ledger reservation accounts for is refused by the comment guard and does not clear the merge gate; see the spec's provenance section.
 
 ## Try it (dry-run, offline, with fake CLIs)
 
