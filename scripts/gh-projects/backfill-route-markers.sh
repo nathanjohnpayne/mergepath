@@ -70,6 +70,10 @@
 #      check: the run stops before a write when the REST core or GraphQL
 #      remaining budget (GET rate_limit, which costs nothing) is under
 #      --budget-floor (default 1000). `gh issue edit` spends GraphQL points.
+# GitHub's issue update has no compare-and-swap (no If-Match, no expected-body
+# input), so an edit landing between step 1 and step 2 would be overwritten:
+# the window is one round trip, and whoever runs --live does not edit fleet
+# issue bodies meanwhile. The issue's edit history keeps every prior body.
 # A second run after the writes finds every marker present and writes nothing.
 #
 # Exit: 0 the run completed (conflicts, partial routes and skips are report
