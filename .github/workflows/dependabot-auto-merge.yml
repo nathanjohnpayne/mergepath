@@ -619,9 +619,17 @@ jobs:
           # implementation rather than three drifting copies.
           require_current_head_checks_success() {
             local wait_seconds poll_seconds deadline pinned attempts max_attempts
+            local infra_errors max_infra_errors
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             max_attempts=${HEAD_DRIFT_MAX_RESTARTS:-3}
+            # rc=3 is the verifier's "could not read" exit: one failed API
+            # call, not a verdict. A single transient 5xx or secondary rate
+            # limit inside a 20-minute wait used to discard the whole wait
+            # (#2932). Tolerate a short run of CONSECUTIVE read failures;
+            # any successful read resets the run, the deadline still bounds
+            # the wait, and a persistent failure still fails closed.
+            max_infra_errors=${HEAD_CHECKS_MAX_INFRA_ERRORS:-3}
             attempts=0
             while :; do
               attempts=$((attempts + 1))
@@ -631,6 +639,7 @@ jobs:
                 exit 1
               fi
               deadline=$((SECONDS + wait_seconds))
+              infra_errors=0
               while :; do
                 # Capture the verifier's OWN status. `rc=$?` after a failed
                 # `if` reads the compound statement's status (0), not the
@@ -649,9 +658,18 @@ jobs:
                 if [ "$rc" -eq 0 ]; then
                   break
                 fi
-                if [ "$rc" -ne 1 ]; then
+                if [ "$rc" -eq 3 ]; then
+                  infra_errors=$((infra_errors + 1))
+                  if [ "$infra_errors" -ge "$max_infra_errors" ]; then
+                    echo "::error::required-head-checks failed closed (rc=3, $infra_errors consecutive read failures); refusing auto-merge."
+                    exit 1
+                  fi
+                  echo "::warning::required-head-checks could not read check state (rc=3, $infra_errors of $max_infra_errors consecutive); polling again."
+                elif [ "$rc" -ne 1 ]; then
                   echo "::error::required-head-checks failed closed (rc=$rc); refusing auto-merge."
                   exit 1
+                else
+                  infra_errors=0
                 fi
                 if [ "$SECONDS" -ge "$deadline" ]; then
                   echo "::error::Timed out waiting for the configured required head checks on $pinned."
@@ -910,13 +928,41 @@ jobs:
             echo "::notice::PR carries human-hold immediately before --auto; skipping Dependabot auto-merge until the human removes the label."
             exit 0
           fi
-          # Last base and approval read before the write: --match-head-commit
-          # pins only the head.
-          require_exact_head_approval "$CURRENT_HEAD_SHA"
-          set +e
-          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL" 2>&1 1>/dev/null)
-          AUTO_RC=$?
-          set -e
+          # GitHub answers a merge that races another merge onto the base
+          # with "Base branch was modified. Review and try the merge again."
+          # It is a request to retry, not a verdict, and grouped Dependabot
+          # updates open PRs in bursts that merge into each other's window
+          # (#2932). Retry only that message, a bounded number of times,
+          # re-reading the hold and the exact-head approval before each
+          # attempt. --match-head-commit keeps every attempt pinned to the
+          # verified head.
+          AUTO_MAX_ATTEMPTS=${AUTO_MERGE_MAX_ATTEMPTS:-3}
+          AUTO_RETRY_SECONDS=${AUTO_MERGE_RETRY_SECONDS:-10}
+          auto_attempt=0
+          while :; do
+            auto_attempt=$((auto_attempt + 1))
+            if [ "$auto_attempt" -gt 1 ]; then
+              sleep "$AUTO_RETRY_SECONDS"
+              if has_human_hold; then
+                echo "::notice::PR carries human-hold before the --auto retry; skipping Dependabot auto-merge until the human removes the label."
+                exit 0
+              fi
+            fi
+            # Last base and approval read before the write: --match-head-commit
+            # pins only the head.
+            require_exact_head_approval "$CURRENT_HEAD_SHA"
+            set +e
+            AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL" 2>&1 1>/dev/null)
+            AUTO_RC=$?
+            set -e
+            if [ "$AUTO_RC" -eq 0 ] || \
+               [ "$auto_attempt" -ge "$AUTO_MAX_ATTEMPTS" ] || \
+               ! [[ "${AUTO_STDERR,,}" =~ (base|head)\ branch\ was\ modified ]]; then
+              break
+            fi
+            echo "$AUTO_STDERR" >&2
+            echo "::warning::gh pr merge --auto raced a concurrent change to the branch (attempt $auto_attempt of $AUTO_MAX_ATTEMPTS); retrying."
+          done
           if [ "$AUTO_RC" -eq 0 ]; then
             echo "$AUTO_STDERR"
             exit 0
