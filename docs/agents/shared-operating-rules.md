@@ -244,7 +244,7 @@ One issue, one open pull request. `scripts/gh-as-author.sh -- gh pr create` refu
 
 ## Visual evidence for reader-visible UI changes
 
-A pull request that makes a meaningful reader-visible UI change carries screenshots of the changed state in its body. By default that means a desktop capture and a phone capture; a ticket may require more widths or states, and a reviewer may ask for more. When screenshots would add no useful evidence, or cannot be produced, the body says so with a concrete explanation (what was tried, or why the change has no visible state to capture). Silence does not satisfy the requirement, and neither does a bare "N/A".
+A pull request that makes a meaningful reader-visible UI change carries screenshots of the changed state, in its body or in a comment on it. By default that means a desktop capture and a phone capture; a ticket may require more widths or states, and a reviewer may ask for more. When screenshots would add no useful evidence, or cannot be produced, the pull request says so, in the same places, with a concrete explanation (what was tried, or why the change has no visible state to capture). Silence does not satisfy the requirement, and neither does a bare "N/A".
 
 Upload with `scripts/pr-assets-upload.sh`, then paste the Markdown lines it prints into the PR body or a comment. They are pinned to the full commit SHA of the upload, so they keep rendering after later uploads:
 

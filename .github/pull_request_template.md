@@ -28,7 +28,7 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 - [ ] Tests pass
 - [ ] Build succeeds
 - [ ] Manual verification completed when needed
-- [ ] Reader-visible UI change: desktop and phone screenshots below, or a concrete reason there are none (docs/agents/shared-operating-rules.md § Visual evidence for reader-visible UI changes); delete this line otherwise
+- [ ] Reader-visible UI change: desktop and phone screenshots in the body or a comment, or a concrete reason there are none (docs/agents/shared-operating-rules.md § Visual evidence for reader-visible UI changes); delete this line otherwise
 
 ## Self-Review
 - [ ] Correctness: changes match stated requirements
