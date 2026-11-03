@@ -9,6 +9,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 - **`lib.sh`** — a sourceable library of functions: `create_parent`, `create_child`, `link_sub_issue`, `add_to_project`, `set_project_readme`, `ensure_label`, `prep_body` (placeholder substitution). Source it from a short per-initiative driver script.
 - **`move-item.sh`** — a standalone CLI that moves one issue to a named Status swimlane by discovering the project's field/option IDs at runtime. Works against any Project v2 with a `Status` single-select field. One GraphQL query per move, whatever the board's size.
 - **`read-route.sh`** — a read-only CLI that prints an issue's model/effort route from its `mergepath-route` marker, over one REST call, so it works where GraphQL and the boards are unreachable (a Claude cloud session). See [Read an issue's route](#read-an-issues-route).
+- **`backfill-route-markers.sh`** — a one-time, local-session CLI that copies each per-repo board's four routing fields into the issues' `mergepath-route` markers, with a dry run, a per-repository report, and conflicts and partial routes reported instead of written. See [Backfill route markers from the boards](#backfill-route-markers-from-the-boards).
 - **`examples/mux-video-integration/`** — a complete worked example: the driver script, body-file templates, and the output that produced issues #210–#230.
 
 ## Prerequisites
@@ -123,7 +124,37 @@ Success prints one line, `anthropic=<model>/<effort> openai=<model>/<effort>`, o
 | 4 | `malformed` / `out-of-vocabulary` | A marker line breaks the format, or a model or effort is not in the vocabulary. |
 | 5 | `duplicated` | More than one marker line. |
 
-The parse is strict: any line containing `mergepath-route` must be the whole marker, with single spaces and `anthropic` first, or it fails closed (so an issue that quotes the marker in prose reads as `malformed`). One trailing CR is tolerated. `read-route.sh --vocabulary` prints the accepted values; `check_gh_projects_read_route` compares them with the rules table so the two cannot drift.
+The parse is strict: any line containing `mergepath-route` must be the whole marker, with single spaces and `anthropic` first, or it fails closed (so an issue that quotes the marker in prose reads as `malformed`). One trailing CR is tolerated. `read-route.sh --vocabulary` prints the accepted values; `check_gh_projects_read_route` compares them with the rules table so the two cannot drift. `--body-file PATH` parses a body the caller already holds instead of reading the issue, with the same verdicts and exit codes and no `gh` call; the backfill below uses it so there is one marker parser.
+
+### Backfill route markers from the boards
+
+`backfill-route-markers.sh` moves routing data off the boards and onto the issues: for every per-repo board of the owner (default `nathanjohnpayne`, all of its Projects v2 boards unless `--board N` names some), it reads every item over REST with an explicit `fields[]=<id>` for each of the four routing fields (`Anthropic model`, `Anthropic effort`, `OpenAI model`, `OpenAI effort`), maps each item to its repository by the item's own `content.repository`, and appends the [route marker](../../docs/agents/shared-operating-rules.md#the-route-marker) to each issue, open or closed, whose four fields are set. It needs a local session: a Claude cloud session cannot read the boards.
+
+```bash
+eval "$(scripts/op-preflight.sh --agent claude --mode review)"
+# Plan first: GET calls only, the full plan and the per-repository report.
+GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
+  scripts/gh-projects/backfill-route-markers.sh --dry-run --json backfill-plan.json
+# Then write, one issue at a time, through scripts/gh-as-author.sh.
+GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
+  scripts/gh-projects/backfill-route-markers.sh --live --json backfill-run.json
+```
+
+One of `--dry-run` or `--live` is required, so a bare invocation never writes. Option names map to marker values as the contract says (lowercased, spaces to `-`), checked against `read-route.sh --vocabulary`. Each issue item with any routing field set lands in one category:
+
+| Category | Meaning |
+|---|---|
+| `would-write` / `written` | All four fields are set and in the vocabulary and the body has no marker; the marker is appended on its own line after a blank line. |
+| `already-present` | The body's marker equals the board's route. A second run finds every written issue here and writes nothing. |
+| `conflict` | The body's marker differs (`different-marker`), is malformed or out of the vocabulary (`malformed-marker`), or is duplicated (`duplicated-marker`); or two boards hold different values for the same issue (`board-disagreement`). Never overwritten. |
+| `partial` | A model without its effort, the reverse, or only one provider set. The contract requires both halves, so nothing is guessed or written. |
+| `out-of-vocabulary` | A board option that maps outside the vocabulary. Never written. |
+| `unwritable` | The appended marker would not parse as the route (for example, the body ends inside an unclosed code fence). |
+| `skipped` | Pull requests, draft items, `size:L` parents (by label), and items whose issue content is unavailable. |
+
+Issues with no routing field set are counted as `no-route` and not listed. The report gives, per repository, the items read and the count in each category, with skips broken down by reason; `--json FILE` writes the same report and every item's result as JSON. Board-level notes name a board that lacks a routing field (it is skipped) and any board option outside the vocabulary.
+
+In `--live`, each write reads the issue again immediately before it and re-judges that fresh body (a marker added since the listing is reported, not overwritten), writes through `scripts/gh-as-author.sh -- gh issue edit N --repo OWNER/REPO --body-file F`, and reads the issue back, requiring the stored body to equal the written file byte for byte. A failed write or a mismatched readback stops the run. Writes are paced by `--pace` seconds (default 10, about 360 an hour, inside GitHub's limit of 500 content-creating requests an hour), and the run stops before a write when the REST core or GraphQL remaining budget is under `--budget-floor` (default 1000; `gh issue edit` spends GraphQL points). `--max-writes N` caps a run, for a first small batch.
 
 ### Set the Project README
 

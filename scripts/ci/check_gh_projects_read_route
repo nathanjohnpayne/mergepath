@@ -19,8 +19,9 @@
 #      vocabulary value, CRLF bodies, a null body, no marker, duplicated
 #      markers, malformed lines of each shape, prose mentions and fenced
 #      examples (not candidates), out-of-vocabulary values, a
-#      read failure, the usage contract, repository resolution, and that no
-#      failure ever prints a partial route on stdout.
+#      read failure, the usage contract, repository resolution, that no
+#      failure ever prints a partial route on stdout, and the --body-file
+#      mode (same verdicts, no gh call; the #2850 backfill reuses it).
 #
 # Modes (docs/agents/testing-requirements.md § Repo-lint execution, shared
 # selector scripts/lib/ci-check-modes.sh): --check runs 1 and 2 (repo-lint's
@@ -352,6 +353,32 @@ check_oov o_cross2 "openai model 'haiku-4.5'" '<!-- mergepath-route: anthropic=h
 # --- read failure (code 1), and no repository (usage) ---
 STUB_API_RC=1 run readfail ok 211 "${R[@]}"
 fails readfail 1 'read-failed'
+
+# --- --body-file: the same verdicts from a body the caller holds, no gh call
+# (the route-marker backfill, #2850, reuses this parser through it) ---
+body_file_case() { # <case> <fixture> <exit> [stdout]
+  local c="$1" fx="$2" want="$3" out="${4:-}"
+  run "$c" none 211 "${R[@]}" --body-file "$WORK/$fx.body"
+  expect_rc "$c" "$want"
+  expect_out "$c" "$out"
+  ok "$c: --body-file must make no gh call; log: $(cat "$LOG")" [ ! -s "$LOG" ]
+}
+body_file_case bf_ok ok 0 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+body_file_case bf_crlf crlf 0 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+body_file_case bf_none none 3
+body_file_case bf_empty empty 3
+body_file_case bf_dup dup 5
+body_file_case bf_malformed m_one_half 4
+body_file_case bf_fenced f_only 3
+body_file_case bf_oov o_a_model 4
+run bf_eq ok 211 "${R[@]}" "--body-file=$WORK/dupdiff.body"
+expect_rc bf_eq 5
+ok "bf_eq: --body-file= must make no gh call" [ ! -s "$LOG" ]
+run bf_missing ok 211 "${R[@]}" --body-file "$WORK/does-not-exist.body"
+fails bf_missing 1 'read-failed'
+ok "bf_missing: --body-file must make no gh call" [ ! -s "$LOG" ]
+run bf_noval ok 211 "${R[@]}" --body-file
+expect_rc bf_noval 2
 
 # --- usage contract: exit 2 before any gh call ---
 run u_noargs ok
