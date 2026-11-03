@@ -29,6 +29,8 @@
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
 #     Both CodeRabbit tier readers return 2, with no output, on extraction error.
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
+#   coderabbit_unclassified_severity_rows "<body>"  # ungraded severity rows (#2927)
+#   coderabbit_unclassified_tier "<body>"  # p1 when any row is ungraded (#2927)
 #   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
 #   ghas_alert_number_from_body "<comment-body>"     # alert number or empty (#1113)
 #   read_policy_block_field <block> <field> [cfg]    # scalar under an arbitrary top-level block
@@ -356,9 +358,10 @@ codex_tier_of() {
 #
 # CodeRabbit markers → tier (p0 is Codex-only; CodeRabbit never maps to p0):
 #   🟠 Major / Potential issue / ⚠️  → p1
+#   icon label `</picture> Critical**` / `</picture> Major**` → p1 (#2927)
 #   🧹 Nitpick                                     → nitpick
-#   🔵 Trivial / Outside diff range                → p3
-#   🟡 Minor                                       → p2
+#   🔵 Trivial / Outside diff range / icon label `</picture> Trivial**` → p3
+#   🟡 Minor / icon label `</picture> Minor**`     → p2
 # Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
 #
 # CodeRabbit's other machine-readable signal — the `cr-indicator-types` tag it
@@ -500,7 +503,19 @@ coderabbit_tiers_of() {
     echo "ERROR: could not read CodeRabbit section headings" >&2
     return 2
   }
-  markers=$(grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' <<<"$body") || rc=$?
+  # Since late October 2026 CodeRabbit writes an inline finding's severity as
+  # an icon image followed by a bold label, with no emoji:
+  # `**<picture><img src=".../review-comment-icons-v1/major-16.svg" ...></picture> Major** · **<category>** · **<effort>**`
+  # (#2927: mergepath#2963 comment 4451423418, #2924, #2922, #2908 and others;
+  # the same row opens findings inside review bodies, blockquoted in an
+  # outside-diff CAUTION block on overridebroadway#277). Measured labels:
+  # Major (major-16.svg), Minor (amber-16.svg) and Trivial (neutral-16.svg).
+  # The emoji alternatives match none of it, so every new-format Major graded
+  # as untiered and never blocked. Match the label only where it closes the
+  # icon and the bold span, so a bare `Major` or `Minor` in prose still stays
+  # unclassified. Critical is graded p1, as its legacy `⚠️ Potential issue`
+  # form already was; the ladder above never maps CodeRabbit to p0.
+  markers=$(grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor|</picture> (Critical|Major|Minor|Trivial)\*\*' <<<"$body") || rc=$?
   case "$rc" in
     0) ;;
     1) return 0 ;;
@@ -508,9 +523,9 @@ coderabbit_tiers_of() {
   esac
   while IFS= read -r marker; do
     case "$marker" in
-      "🟠 Major"|"Potential issue"|"⚠️") echo p1 ;;
-      "🟡 Minor") echo p2 ;;
-      "🔵 Trivial"|"Outside diff range") echo p3 ;;
+      "🟠 Major"|"Potential issue"|"⚠️"|"</picture> Critical**"|"</picture> Major**") echo p1 ;;
+      "🟡 Minor"|"</picture> Minor**") echo p2 ;;
+      "🔵 Trivial"|"Outside diff range"|"</picture> Trivial**") echo p3 ;;
       "🧹 Nitpick") echo nitpick ;;
     esac
   done <<EOF
@@ -531,6 +546,54 @@ coderabbit_tier_of() {
       *$'\n'"$wanted"$'\n'*) echo "$wanted"; return 0 ;;
     esac
   done
+  return 0
+}
+
+# coderabbit_unclassified_severity_rows "<body>" -- print how many CodeRabbit
+# severity rows in the body grade no tier. Returns 2, with no output, on
+# extraction error.
+#
+# A severity row is the line CodeRabbit writes at the head of every finding:
+# two or more bold (or, in older bodies, italic) spans separated by ` · ` or
+# ` | `, optionally after a blockquote prefix and a backticked location, such
+# as `**🔒 Security & Privacy** | **🟡 Minor** | **⚡ Quick win**` or
+# `**<picture>...</picture> Major** · **Security & Privacy** · **Quick win**`.
+# A row that grades no tier is a finding whose severity serialization the
+# readers have not been taught, and callers must count it as unclassified
+# rather than as zero findings (#2927): before #2927 the icon-label form
+# graded empty, so the required gate and feedback accounting both read
+# new-format Major findings as no finding at all
+# (nathanjohnpayne/overridebroadway#277 reviews 5747953237 and 5748027323).
+# The row, not CodeRabbit's `<!-- cr-comment:v1:... -->` closer, is the
+# discriminator: CodeRabbit also closes untiered `LGTM!` additional comments
+# with that marker, so a marker-based count would block on approval prose.
+# Callers pass text already stripped of fenced and pre-merge regions
+# (coderabbit_finding_scan), so a quoted row is data.
+coderabbit_unclassified_severity_rows() {
+  local body=${1:-} line tiers count=0
+  local span='(\*\*[^*]+\*\*|_[^_]+_)'
+  local row_re="^[[:space:]]*(>[[:space:]]*)*(\`[^\`]*\`:[[:space:]]*)?${span}( (·|[|]) ${span})+[[:space:]]*$"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    [[ $line =~ $row_re ]] || continue
+    tiers=$(coderabbit_tiers_of "$line") || return 2
+    [ -n "$tiers" ] || count=$((count + 1))
+  done <<EOF
+$body
+EOF
+  echo "$count"
+}
+
+# coderabbit_unclassified_tier "<body>" -- print `p1` when the body carries at
+# least one unclassified severity row, nothing otherwise; return 2 with no
+# output on extraction error. An unclassified finding is graded at the highest
+# tier CodeRabbit maps to, so it blocks until it is dispositioned through the
+# same channel as any other blocking finding: unknown severity fails closed
+# rather than reading as no finding.
+coderabbit_unclassified_tier() {
+  local count
+  count=$(coderabbit_unclassified_severity_rows "${1:-}") || return 2
+  [ "$count" -gt 0 ] && echo p1
   return 0
 }
 

@@ -333,6 +333,7 @@ finding_tier() {
     done <<EOF
 $sanitized
 EOF
+    coderabbit_unclassified_tier "$sanitized"
     return
   fi
   if [ "$login" = "$GHAS_BOT" ]; then
@@ -349,6 +350,10 @@ strongest_nonignored_finding_tier() {
   elif [ "$login" = "$CODERABBIT_BOT" ]; then
     sanitized=$(coderabbit_finding_scan "$body") || return 2
     tiers=$(coderabbit_tiers_of "$sanitized") || return 2
+    tier=$(coderabbit_unclassified_tier "$sanitized") || return 2
+    if [ -n "$tier" ]; then
+      tiers="$tiers"$'\n'"$tier"
+    fi
   fi
   while IFS= read -r tier; do
     [ -n "$tier" ] || continue
