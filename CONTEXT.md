@@ -70,11 +70,11 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Chat-side handoff block**: The copy-paste-friendly companion block emitted into chat at the same moment the human is alerted; additive to the PR-side handoff, never a replacement.
 
-**Disagreement**: The state where internal and external reviewers disagree on merge-readiness; the human is the tiebreaker and the agent stops and waits. Detected in Phase 4a by exactly two signals: repeat-after-rebuttal and runaway rounds.
+**Disagreement**: The state where internal and external reviewers disagree on merge-readiness; the human is the tiebreaker and the agent stops and waits. Detected in Phase 4a by three signals: repeat-after-rebuttal, the Phase 4b barrier's runaway stop, and the blocking-review budget (REVIEW_POLICY.md § Disagreements and Tiebreaking). A spent request ceiling alone is cost exhaustion routed to Phase 4b, not a disagreement signal; an exact-head owner tiebreak clears only the stop it names and grants no approval or budget refund.
 
 **Repeat-after-rebuttal**: The escalation signal fired when Codex re-flags a finding after the agent posted a rebuttal — evidence the reviewer is not convinced.
 
-**Runaway rounds**: The escalation signal fired when the round counter exceeds the cap — read as a sign the PR scope is too broad even when each finding is valid.
+**Runaway rounds**: The Phase 4b barrier's `runaway` stop, fired at a spent Codex request ceiling (`codex.max_review_rounds`) when every request the ceiling allowed drew a blocking review whose findings were not all fixed, while the blocking count is still below `codex.max_blocking_reviews`. The ceiling alone is cost exhaustion, not runaway, and routes to Phase 4b. A round whose blocking findings were all proven fixed leaves the runaway count only; it still spends the blocking-review budget. The stop takes the human-tiebreaker route (exit `8`), and an owner's exact-head `TIEBREAK_RUNAWAY_ACCEPTED` line clears only the runaway: it grants no approval, no budget refund and no extra Phase 4b round. Distinct from the separate blocking-review budget stop and from the automated Phase 4b round cap (`phase_4b_automation.max_review_rounds`).
 
 **Default disposition**: The standing posture of favoring automation — drive every PR author → review → merge without pausing to ask, deferring only for an explicit human signal or a genuine handoff or escalation. _Avoid_: the "how far should I take this PR?" prompt — a deviation, not a courtesy.
 
