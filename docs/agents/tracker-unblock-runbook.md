@@ -20,7 +20,7 @@ For each candidate issue, read:
 
 - the full body and **all** comments (paginate; `gh pr view --json` silently caps connections at 100);
 - linked owner decisions, including decisions recorded in comments and surfaced per [decision-records.md](decision-records.md);
-- project fields: priority, size, implementation model, reasoning effort;
+- priority and size (project labels), and the model and effort route from the issue's `mergepath-route` marker (`scripts/gh-projects/read-route.sh <n> --repo <o>/<r>`; see § 3 "Model and effort");
 - dependencies (`gh api repos/<o>/<r>/issues/<n>/dependencies/blocked_by`), sub-issues, and `human-hold` or other blocking labels;
 - existing PRs (open, merged and closed) and their merge state.
 
@@ -47,7 +47,7 @@ Present one compact table before you start executing, and update it at each batc
 
 - **Order:** priority tier first; within a tier, smallest remaining size first; dependencies override both.
 - **Concurrency:** at most **two** PRs in review at once, and exactly one merge at a time. Start the next ticket while a PR waits on review or CI, but do not open a third. Each additional open PR multiplies rebases, expired approvals and spend against the shared token budgets (`GITHUB_TOKEN` 1k/hr/repo, PAT 5k/hr/account).
-- **Model and effort:** use the ticket's project fields. A session cannot change its own model, so when a ticket specifies a different model or effort, delegate that ticket's implementation to a subagent configured with it. When a field is unset, keep the session's setting. When a specified setting is unavailable, record the mismatch in the ledger, ask once, and continue other work.
+- **Model and effort:** read the ticket's route with `scripts/gh-projects/read-route.sh <n> --repo <o>/<r>` and honor the half for your provider, as defined by the [route marker](shared-operating-rules.md#the-route-marker) and [Starting an issue: read and honor its route](shared-operating-rules.md#starting-an-issue-read-and-honor-its-route). A session cannot change its own model, so when the route names a different model or effort, delegate that ticket's implementation to a subagent configured with it. No marker (exit `3`) means keep the session's setting. When the route's setting is unavailable, or the marker is malformed or duplicated (exits `4` and `5`), do not substitute or guess and do not ignore it: record the mismatch in the ledger, ask once, leave that ticket unstarted, and continue other work.
 
 ## 4. Owner decisions: propose, don't implement
 
