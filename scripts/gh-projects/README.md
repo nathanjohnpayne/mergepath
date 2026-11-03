@@ -8,6 +8,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 
 - **`lib.sh`** — a sourceable library of functions: `create_parent`, `create_child`, `link_sub_issue`, `add_to_project`, `set_project_readme`, `ensure_label`, `prep_body` (placeholder substitution). Source it from a short per-initiative driver script.
 - **`move-item.sh`** — a standalone CLI that moves one issue to a named Status swimlane by discovering the project's field/option IDs at runtime. Works against any Project v2 with a `Status` single-select field. One GraphQL query per move, whatever the board's size.
+- **`read-route.sh`** — a read-only CLI that prints an issue's model/effort route from its `mergepath-route` marker, over one REST call, so it works where GraphQL and the boards are unreachable (a Claude cloud session). See [Read an issue's route](#read-an-issues-route).
 - **`examples/mux-video-integration/`** — a complete worked example: the driver script, body-file templates, and the output that produced issues #210–#230.
 
 ## Prerequisites
@@ -101,6 +102,28 @@ PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
 ```
 
 Valid status names are the options on the Project's `Status` field. The canonical set is `Backlog`, `Ready`, `In progress`, `In review`, `Done` (see [Prerequisites](#prerequisites)). `move-item.sh` matches the name exactly, including case, so `"In Progress"` does not select `In progress`.
+
+### Read an issue's route
+
+```bash
+scripts/gh-projects/read-route.sh 2848 --repo nathanjohnpayne/mergepath
+# anthropic=opus-5.5/high openai=gpt-6.1-sol/high
+```
+
+Reads `GET repos/OWNER/REPO/issues/N` only (no GraphQL, no Projects v2), so it works from a Claude cloud session whose GitHub proxy serves only `repos/<owner>/<repo>/...`. It needs no project PAT and does not source `lib.sh`; it uses the read auth `gh` already has. The repository is `--repo`, else `$REPO`, else the `origin` remote. The marker contract is [Shared Agent Operating Rules § The route marker](../../docs/agents/shared-operating-rules.md#the-route-marker); a session honors the route as that file's *Starting an issue* section says.
+
+Success prints one line, `anthropic=<model>/<effort> openai=<model>/<effort>`, on stdout. Every failure prints one line on stderr naming its case, nothing on stdout, and exits with the case's own code:
+
+| Exit | Case | Meaning |
+|---|---|---|
+| 0 | found | A valid marker; the route is on stdout. |
+| 1 | `read-failed` | The issue could not be read. |
+| 2 | usage | Bad arguments or no resolvable repository. |
+| 3 | `no-marker` | No marker; the caller keeps the session's model and effort. |
+| 4 | `malformed` / `out-of-vocabulary` | A marker line breaks the format, or a model or effort is not in the vocabulary. |
+| 5 | `duplicated` | More than one marker line. |
+
+The parse is strict: any line containing `mergepath-route` must be the whole marker, with single spaces and `anthropic` first, or it fails closed (so an issue that quotes the marker in prose reads as `malformed`). One trailing CR is tolerated. `read-route.sh --vocabulary` prints the accepted values; `check_gh_projects_read_route` compares them with the rules table so the two cannot drift.
 
 ### Set the Project README
 

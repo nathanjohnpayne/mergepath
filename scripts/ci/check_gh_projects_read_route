@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# check_gh_projects_read_route — structural and stubbed-behavior guard for
+# scripts/gh-projects/read-route.sh (nathanjohnpayne/mergepath#2848).
+#
+# read-route.sh reads an issue's `mergepath-route` marker over REST so a
+# Claude cloud session, whose GitHub proxy serves only repos/<owner>/<repo>/...
+# and no GraphQL, can learn its route. This check pins that contract:
+#
+#   1. Structural: the script makes no GraphQL / projectsV2 / `gh project`
+#      call, reads the issue through `repos/.../issues/N`, and holds the
+#      route vocabulary in exactly one place (each value appears once).
+#   2. Drift: the script's vocabulary equals the table in
+#      docs/agents/shared-operating-rules.md § The route marker, so a change
+#      to the rules or to the script alone fails here. (A consumer whose copy
+#      of the rules lags this wrapper skips the comparison; the hub never does.)
+#   3. Behavioral (self-test): the script runs against a PATH-shimmed `gh`
+#      that answers ONLY `api repos/<repo>/issues/<n>` and exits 99 on any
+#      other call (GraphQL, projects, anything). Covers a valid route, every
+#      vocabulary value, CRLF bodies, a null body, no marker, duplicated
+#      markers, malformed lines of each shape, out-of-vocabulary values, a
+#      read failure, the usage contract, repository resolution, and that no
+#      failure ever prints a partial route on stdout.
+#
+# Modes (docs/agents/testing-requirements.md § Repo-lint execution, shared
+# selector scripts/lib/ci-check-modes.sh): --check runs 1 and 2 (repo-lint's
+# fast lane), --self-test runs everything (deep CI), and the no-argument form
+# runs everything.
+#
+# Hermetic: no token, no network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUBJECT="$REPO_ROOT/scripts/gh-projects/read-route.sh"
+RULES="$REPO_ROOT/docs/agents/shared-operating-rules.md"
+NAME="check_gh_projects_read_route"
+
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "$NAME: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: $NAME [--check | --self-test]" >&2
+  exit 2
+fi
+
+if [ ! -f "$SUBJECT" ]; then
+  echo "$NAME: ERROR (missing scripts/gh-projects/read-route.sh)" >&2
+  exit 1
+fi
+
+PASS=0
+FAIL=0
+pass() { PASS=$((PASS + 1)); }
+fail() { FAIL=$((FAIL + 1)); echo "$NAME: FAIL: $1" >&2; }
+# ok <failure message> <command...> — pass when the command succeeds.
+ok() { local msg="$1"; shift; if "$@"; then pass; else fail "$msg"; fi; }
+
+# ---------------------------------------------------------------------------
+# 1. Structural assertions (comment lines stripped first).
+# ---------------------------------------------------------------------------
+CODE="$(grep -v '^[[:space:]]*#' "$SUBJECT")"
+
+for pat in 'graphql' 'projectsV2' 'projectV2' 'projectItems' 'gh[[:space:]]+project' 'repo[[:space:]]+view'; do
+  if grep -Eq "$pat" <<<"$CODE"; then
+    fail "read-route.sh mentions '$pat' in code (REST only: GET repos/OWNER/REPO/issues/N)"
+  else
+    pass
+  fi
+done
+ok "read-route.sh no longer reads the issue through repos/\$REPO_SLUG/issues/N" \
+  grep -qF 'repos/$REPO_SLUG/issues/$ISSUE_NUM' <<<"$CODE"
+ok "read-route.sh must make exactly one gh api call" \
+  [ "$(grep -Ec '(^|[^A-Za-z_-])gh[[:space:]]+api' <<<"$CODE")" -eq 1 ]
+
+# The vocabulary is declared once: every value appears exactly once in code.
+for v in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1 gpt-6-luna gpt-6.1-sol gpt-6-astra xhigh; do
+  n="$(grep -oF -- "$v" <<<"$CODE" | wc -l | tr -d ' ')"
+  ok "read-route.sh holds '$v' $n times in code; the vocabulary must be declared in exactly one place" [ "$n" -eq 1 ]
+done
+
+# ---------------------------------------------------------------------------
+# 2. Drift against the contract's value table.
+# ---------------------------------------------------------------------------
+VOCAB="$(bash "$SUBJECT" --vocabulary)"
+# rules_row <half> <field> <grep-pattern> — backticked values of one table cell.
+rules_row() {
+  grep -E "^\| \`$1\` \|" "$RULES" | awk -F'|' -v f="$2" '{print $f}' | grep -oE "$3" | tr -d '`→ ' | tr '\n' ' ' | sed 's/ $//'
+}
+vocab_line() { sed -n "s/^$1=//p" <<<"$VOCAB"; }
+if [ -f "$RULES" ] && grep -qF '### The route marker' "$RULES"; then
+  for half in anthropic openai; do
+    exp_models="$(rules_row "$half" 3 '→ `[^`]+`')"
+    exp_efforts="$(rules_row "$half" 4 '`[^`]+`')"
+    ok "$half models: script has '$(vocab_line "$half.models")', shared-operating-rules.md table has '$exp_models'" \
+      [ "$(vocab_line "$half.models")" = "$exp_models" ]
+    ok "$half efforts: script has '$(vocab_line "$half.efforts")', shared-operating-rules.md table has '$exp_efforts'" \
+      [ "$(vocab_line "$half.efforts")" = "$exp_efforts" ]
+    ok "$half: the rules table yielded no models (table shape changed?)" [ -n "$exp_models" ]
+    ok "$half: the rules table yielded no efforts (table shape changed?)" [ -n "$exp_efforts" ]
+  done
+elif [ -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  fail "docs/agents/shared-operating-rules.md has no '### The route marker' section on the hub"
+fi
+
+if [ "$CI_CHECK_RUN_SELF_TEST" != "1" ]; then
+  echo "$NAME: $PASS passed, $FAIL failed (--check: structural and drift only)"
+  if [ "$FAIL" -ne 0 ]; then
+    echo "$NAME: FAIL"
+    exit 1
+  fi
+  echo "$NAME: PASS"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Behavioral assertions against a stubbed gh.
+# ---------------------------------------------------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-read-route.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin" "$WORK/cwd"
+
+# Stub gh: ONLY `api repos/<repo>/issues/<n> ...` is answered, with the body
+# fixture exactly as `--jq '.body // ""'` would print it. Anything else (a
+# GraphQL call, `gh project`, `gh repo view`) is logged and exits 99.
+cat >"$WORK/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" | tr '\n' ' ' >>"$STUB_LOG"
+echo >>"$STUB_LOG"
+case "$1 $2" in
+  "api repos/"*"/issues/"*)
+    if [ "${STUB_API_RC:-0}" != "0" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit "$STUB_API_RC"
+    fi
+    cat "$STUB_BODY"
+    ;;
+  *) echo "stub gh: forbidden call: $*" >&2; exit 99 ;;
+esac
+EOF
+chmod +x "$WORK/bin/gh"
+
+RC=0
+OUT=""
+ERR=""
+LOG=""
+SEQ=0
+# body_case <name> <printf-format-and-args...> — write a body fixture.
+body() { local f="$WORK/$1.body"; shift; printf "$@" >"$f"; }
+# run <case> <body> [args...] — runs the subject with stdout and stderr apart.
+run() {
+  local name="$1" fx="$2"
+  shift 2
+  LOG="$WORK/$name.log"
+  : >"$LOG"
+  set +e
+  OUT="$(cd "$WORK/cwd" && env -u GITHUB_TOKEN -u REPO PATH="$WORK/bin:$PATH" \
+    STUB_LOG="$LOG" STUB_BODY="$WORK/$fx.body" \
+    bash "$SUBJECT" "$@" 2>"$WORK/$name.err")"
+  RC=$?
+  set -e
+  ERR="$(cat "$WORK/$name.err")"
+}
+expect_rc() { ok "$1: expected exit $2, got $RC; stdout: $OUT; stderr: $ERR" [ "$RC" -eq "$2" ]; }
+expect_out() { ok "$1: stdout '$OUT' != '$2'" [ "$OUT" = "$2" ]; }
+expect_err() { case "$ERR" in *"$2"*) pass ;; *) fail "$1: stderr lacks '$2'; stderr: $ERR" ;; esac; }
+# A failure never prints a route (or anything) on stdout.
+expect_silent_stdout() { ok "$1: stdout must be empty on failure, got '$OUT'" [ -z "$OUT" ]; }
+# Every gh call was the one REST read.
+expect_rest_only() {
+  ok "$1: gh calls must be exactly one REST issue read; log: $(cat "$LOG")" \
+    [ "$(wc -l <"$LOG" | tr -d ' ')" -eq 1 ]
+  ok "$1: gh call was not 'api repos/nathanjohnpayne/example/issues/211'; log: $(cat "$LOG")" \
+    grep -q '^api repos/nathanjohnpayne/example/issues/211 ' "$LOG"
+}
+# fails <case> <exit> <err-token> — a failure case: code, named case, no stdout.
+fails() { expect_rc "$1" "$2"; expect_err "$1" "$3"; expect_silent_stdout "$1"; }
+
+M='<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->'
+R=(--repo nathanjohnpayne/example)
+
+# --- found ---
+body ok 'Part of #1.\n\n%s\n' "$M"
+run ok ok 211 "${R[@]}"
+expect_rc ok 0
+expect_out ok 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+expect_rest_only ok
+
+# No trailing newline; marker as the only content.
+body bare '%s' "$M"
+run bare bare 211 "${R[@]}"
+expect_rc bare 0
+expect_out bare 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+
+# CRLF body (web-edited issue): the trailing CR does not break the match.
+body crlf 'Part of #1.\r\n\r\n%s\r\n' "$M"
+run crlf crlf 211 "${R[@]}"
+expect_rc crlf 0
+expect_out crlf 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+
+# Every vocabulary value is accepted, in the stable output form.
+for m in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1; do
+  for e in low medium high; do
+    SEQ=$((SEQ + 1))
+    body "va$SEQ" '<!-- mergepath-route: anthropic=%s/%s openai=gpt-6-luna/low -->\n' "$m" "$e"
+    run "va$SEQ" "va$SEQ" 211 "${R[@]}"
+    expect_rc "anthropic $m/$e" 0
+    expect_out "anthropic $m/$e" "anthropic=$m/$e openai=gpt-6-luna/low"
+  done
+done
+for m in gpt-6-luna gpt-6.1-sol gpt-6-astra; do
+  for e in low medium high xhigh; do
+    SEQ=$((SEQ + 1))
+    body "vo$SEQ" '<!-- mergepath-route: anthropic=haiku-4.5/low openai=%s/%s -->\n' "$m" "$e"
+    run "vo$SEQ" "vo$SEQ" 211 "${R[@]}"
+    expect_rc "openai $m/$e" 0
+    expect_out "openai $m/$e" "anthropic=haiku-4.5/low openai=$m/$e"
+  done
+done
+
+# --- no marker (own code 3, message says none is set) ---
+body none 'Just prose. Mentions routing but carries no marker.\n'
+run none none 211 "${R[@]}"
+fails none 3 'no-marker'
+expect_err none 'no mergepath-route marker'
+expect_rest_only none
+: >"$WORK/empty.body"
+run empty empty 211 "${R[@]}"
+fails empty 3 'no-marker'
+# A null body is served as an empty string by the jq filter; here, an empty file.
+
+# --- duplicated (own code 5) ---
+body dup '%s\n\n%s\n' "$M" "$M"
+run dup dup 211 "${R[@]}"
+fails dup 5 'duplicated'
+body dupdiff '%s\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n' "$M"
+run dupdiff dupdiff 211 "${R[@]}"
+fails dupdiff 5 'duplicated'
+# A valid marker plus a broken one is still a duplicate, not a silent pick.
+body dupbad '%s\n<!-- mergepath-route: anthropic=opus-5.5/high -->\n' "$M"
+run dupbad dupbad 211 "${R[@]}"
+fails dupbad 5 'duplicated'
+
+# --- malformed (own code 4, named malformed) ---
+check_malformed() { # <case> <printf-format> [args]
+  local c="$1"; shift
+  body "$c" "$@"
+  run "$c" "$c" 211 "${R[@]}"
+  fails "$c" 4 'malformed'
+  expect_rest_only "$c"
+}
+check_malformed m_swapped '<!-- mergepath-route: openai=gpt-6.1-sol/high anthropic=opus-5.5/high -->\n'
+check_malformed m_one_half '<!-- mergepath-route: anthropic=opus-5.5/high -->\n'
+check_malformed m_no_effort '<!-- mergepath-route: anthropic=opus-5.5 openai=gpt-6.1-sol/high -->\n'
+check_malformed m_no_open '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high\n'
+check_malformed m_no_close 'mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+check_malformed m_double_space '<!-- mergepath-route: anthropic=opus-5.5/high  openai=gpt-6.1-sol/high -->\n'
+check_malformed m_tight '<!--mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high-->\n'
+check_malformed m_comma '<!-- mergepath-route: anthropic=opus-5.5/high, openai=gpt-6.1-sol/high -->\n'
+check_malformed m_upper '<!-- mergepath-route: anthropic=Opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+check_malformed m_lead_space ' <!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+check_malformed m_trail_space '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high --> \n'
+check_malformed m_prefix 'Route: <!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->\n'
+check_malformed m_suffix '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high --> done\n'
+check_malformed m_inline_code 'The marker is `<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->` in prose.\n'
+check_malformed m_unquoted_token 'See the mergepath-route marker.\n'
+check_malformed m_placeholder '<!-- mergepath-route: anthropic=<model>/<effort> openai=<model>/<effort> -->\n'
+
+# --- out-of-vocabulary (same code 4, named separately) ---
+check_oov() { # <case> <expected-fragment> <printf-format>
+  local c="$1" frag="$2"; shift 2
+  body "$c" "$@"
+  run "$c" "$c" 211 "${R[@]}"
+  fails "$c" 4 'out-of-vocabulary'
+  expect_err "$c" "$frag"
+  expect_rest_only "$c"
+}
+check_oov o_a_model "anthropic model 'opus-4'" '<!-- mergepath-route: anthropic=opus-4/high openai=gpt-6.1-sol/high -->\n'
+check_oov o_a_effort "anthropic effort 'xhigh'" '<!-- mergepath-route: anthropic=opus-5.5/xhigh openai=gpt-6.1-sol/high -->\n'
+check_oov o_o_model "openai model 'gpt-5'" '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-5/high -->\n'
+check_oov o_o_effort "openai effort 'max'" '<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/max -->\n'
+# A model from the other provider's list is not valid in this half.
+check_oov o_cross "anthropic model 'gpt-6-luna'" '<!-- mergepath-route: anthropic=gpt-6-luna/low openai=gpt-6-luna/low -->\n'
+check_oov o_cross2 "openai model 'haiku-4.5'" '<!-- mergepath-route: anthropic=haiku-4.5/low openai=haiku-4.5/low -->\n'
+
+# --- read failure (code 1), and no repository (usage) ---
+STUB_API_RC=1 run readfail ok 211 "${R[@]}"
+fails readfail 1 'read-failed'
+
+# --- usage contract: exit 2 before any gh call ---
+run u_noargs ok
+expect_rc u_noargs 2
+run u_notnum ok abc "${R[@]}"
+expect_rc u_notnum 2
+run u_zero ok 0 "${R[@]}"
+expect_rc u_zero 2
+run u_extra ok 211 212 "${R[@]}"
+expect_rc u_extra 2
+run u_badopt ok 211 --bogus "${R[@]}"
+expect_rc u_badopt 2
+run u_norepoval ok 211 --repo
+expect_rc u_norepoval 2
+run u_badrepo ok 211 --repo notaslug
+expect_rc u_badrepo 2
+for c in u_noargs u_notnum u_zero u_extra u_badopt u_norepoval u_badrepo; do
+  ok "$c: gh was called on a usage error; log: $(cat "$WORK/$c.log")" [ ! -s "$WORK/$c.log" ]
+done
+
+# --- repository resolution: --repo, $REPO, then the origin remote ---
+run repoflag ok 211 --repo nathanjohnpayne/example
+expect_rest_only repoflag
+run repoeq ok 211 --repo=nathanjohnpayne/example
+expect_rest_only repoeq
+LOG="$WORK/repoenv.log"; : >"$LOG"
+OUT="$(cd "$WORK/cwd" && env -u GITHUB_TOKEN REPO=nathanjohnpayne/example PATH="$WORK/bin:$PATH" STUB_LOG="$LOG" STUB_BODY="$WORK/ok.body" bash "$SUBJECT" 211 2>/dev/null)"
+expect_out repoenv 'anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+expect_rest_only repoenv
+if command -v git >/dev/null 2>&1; then
+  for url in https://github.com/nathanjohnpayne/example.git git@github.com:nathanjohnpayne/example.git http://local_proxy@127.0.0.1:41234/git/nathanjohnpayne/example; do
+    git init -q "$WORK/cwd" >/dev/null 2>&1 || true
+    git -C "$WORK/cwd" remote remove origin >/dev/null 2>&1 || true
+    git -C "$WORK/cwd" remote add origin "$url"
+    run "origin" ok 211
+    expect_rc "origin $url" 0
+    expect_rest_only "origin $url"
+  done
+  git -C "$WORK/cwd" remote remove origin >/dev/null 2>&1 || true
+  run noorigin ok 211
+  expect_rc noorigin 2
+fi
+
+echo "$NAME: $PASS passed, $FAIL failed"
+if [ "$FAIL" -ne 0 ]; then
+  echo "$NAME: FAIL"
+  exit 1
+fi
+echo "$NAME: PASS"

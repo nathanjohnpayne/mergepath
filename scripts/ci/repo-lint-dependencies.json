@@ -36,6 +36,7 @@
     "check_dependabot_coupled_groups",
     "check_doc_ownership",
     "check_gh_projects_move_item",
+    "check_gh_projects_read_route",
     "check_merge_clearance_gate",
     "check_no_token_in_output",
     "check_phase_4b_accounting",
@@ -392,6 +393,11 @@
       "scripts/gh-projects/move-item.sh",
       "scripts/lib/ci-check-modes.sh",
       "scripts/identity-check.sh"
+    ],
+    "check_gh_projects_read_route": [
+      "scripts/gh-projects/read-route.sh",
+      "docs/agents/shared-operating-rules.md",
+      "scripts/lib/ci-check-modes.sh"
     ],
     "check_git_identity_hygiene": [
       "tests/test_git_identity_hygiene.sh"
