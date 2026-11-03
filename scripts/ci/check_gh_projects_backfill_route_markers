@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# check_gh_projects_backfill_route_markers — structural and stubbed-behavior
+# guard for scripts/gh-projects/backfill-route-markers.sh
+# (nathanjohnpayne/mergepath#2850).
+#
+# The backfill copies each per-repo board's four routing fields into the
+# issue's `mergepath-route` marker. It writes persisted data (issue bodies)
+# across the fleet, so this check pins the safety contract:
+#
+#   1. Structural: no GraphQL and no `gh project` call; no `-X`/`--method`;
+#      every `gh issue edit` goes through the author wrapper with
+#      --body-file; the board items are read with --paginate and an explicit
+#      fields[]=<id>; the marker verdicts come from read-route.sh --body-file
+#      and the vocabulary from read-route.sh --vocabulary (no vocabulary
+#      value is restated in the backfill's code).
+#   2. Behavioral (self-test): the script runs against a PATH-shimmed `gh`
+#      that serves the boards, fields, items (two pages, only under
+#      --paginate, and routing values only when every fields[]=<id> is
+#      requested), issues and rate_limit, and exits 99 on anything else.
+#      --dry-run must never reach a write: the gh stub and the author-wrapper
+#      stub both fail on one. Covers write, already present, conflicts
+#      (different, malformed, duplicated marker; two boards disagreeing),
+#      partial routes (each half missing, one provider only), pull-request,
+#      draft and size:L items skipped, archived repositories skipped (one
+#      cached read; unreadable fails closed), an out-of-vocabulary option, an
+#      unwritable body, cross-board deduplication, repository mapping by
+#      content.repository, pagination, byte-exact composition (LF, CRLF,
+#      empty), the fresh read before a write, a readback mismatch stopping
+#      the run, the budget floor, and the idempotent rerun.
+#
+# Modes (scripts/lib/ci-check-modes.sh): --check runs 1, --self-test runs
+# everything, and the no-argument form runs everything. Hermetic: no token,
+# no network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUBJECT="$REPO_ROOT/scripts/gh-projects/backfill-route-markers.sh"
+READ_ROUTE="$REPO_ROOT/scripts/gh-projects/read-route.sh"
+NAME="check_gh_projects_backfill_route_markers"
+
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "$NAME: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: $NAME [--check | --self-test]" >&2
+  exit 2
+fi
+
+for f in "$SUBJECT" "$READ_ROUTE"; do
+  if [ ! -f "$f" ]; then
+    echo "$NAME: ERROR (missing ${f#"$REPO_ROOT"/})" >&2
+    exit 1
+  fi
+done
+
+PASS=0
+FAIL=0
+pass() { PASS=$((PASS + 1)); }
+fail() { FAIL=$((FAIL + 1)); echo "$NAME: FAIL: $1" >&2; }
+ok() { local msg="$1"; shift; if "$@"; then pass; else fail "$msg"; fi; }
+
+# ---------------------------------------------------------------------------
+# 1. Structural assertions (comment lines stripped first).
+# ---------------------------------------------------------------------------
+CODE="$(grep -v '^[[:space:]]*#' "$SUBJECT")"
+for pat in 'api[[:space:]]+graphql' 'gh[[:space:]]+project' '(^|[[:space:]])-X[[:space:]]*[A-Z]' '--method'; do
+  if grep -Eq -- "$pat" <<<"$CODE"; then
+    fail "backfill-route-markers.sh matches '$pat' in code (reads are REST GETs; the one write is gh issue edit through the author wrapper)"
+  else
+    pass
+  fi
+done
+EDITS="$(grep -E 'gh[[:space:]]+issue[[:space:]]+edit' <<<"$CODE" || true)"
+ok "backfill-route-markers.sh has no gh issue edit at all" [ -n "$EDITS" ]
+while IFS= read -r l; do
+  [ -n "$l" ] || continue
+  case "$l" in
+    *'"$BACKFILL_AS_AUTHOR" -- gh issue edit '*'--body-file '*) pass ;;
+    *) fail "a gh issue edit does not go through \"\$BACKFILL_AS_AUTHOR\" -- ... --body-file: $l" ;;
+  esac
+done <<<"$EDITS"
+ok "the author wrapper default is not scripts/gh-as-author.sh" \
+  grep -qF 'BACKFILL_AS_AUTHOR="${BACKFILL_AS_AUTHOR:-$ROOT/scripts/gh-as-author.sh}"' <<<"$CODE"
+ok "the board items are not read with an explicit fields[]=<id>" grep -qF 'fields[]=' <<<"$CODE"
+ok "the board items are not read with --paginate" \
+  grep -Eq 'api --paginate "users/\$OWNER/projectsV2/\$n/items' <<<"$CODE"
+ok "the marker verdicts do not come from read-route.sh --body-file" grep -qF -- '--body-file "$3"' <<<"$CODE"
+ok "the backfill does not call read-route.sh" grep -qF 'read-route.sh' <<<"$CODE"
+ok "the vocabulary does not come from read-route.sh --vocabulary" grep -qF -- '"$READ_ROUTE" --vocabulary' <<<"$CODE"
+for v in haiku-4.5 sonnet-5.5 opus-5.5 fable-5.1 gpt-6-luna gpt-6.1-sol gpt-6-astra xhigh; do
+  if grep -qF -- "$v" <<<"$CODE"; then
+    fail "backfill-route-markers.sh restates the vocabulary value '$v'; read it from read-route.sh --vocabulary"
+  else
+    pass
+  fi
+done
+ok "read-route.sh lost its --body-file mode" grep -qF -- '--body-file)' "$READ_ROUTE"
+
+if [ "$CI_CHECK_RUN_SELF_TEST" != "1" ]; then
+  echo "$NAME: $PASS passed, $FAIL failed (--check: structural only)"
+  if [ "$FAIL" -ne 0 ]; then
+    echo "$NAME: FAIL"
+    exit 1
+  fi
+  echo "$NAME: PASS"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Behavioral assertions against a stubbed gh.
+# ---------------------------------------------------------------------------
+command -v jq >/dev/null 2>&1 || { echo "$NAME: ERROR jq is required for the self-test" >&2; exit 1; }
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-backfill-check.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin" "$WORK/fx" "$WORK/state"
+
+# The gh stub. Every call is logged. Served:
+#   api --paginate users/o/projectsV2?per_page=100
+#   api --paginate users/o/projectsV2/N/fields?per_page=100
+#   api [--paginate] users/o/projectsV2/N/items?...   page 1, plus page 2 only
+#       under --paginate; routing values only when every one of the board's
+#       fields[]=<id> is in the query (as the real endpoint: Title only).
+#   api repos/O/R/issues/N            from $STATE (the mutable issue store)
+#   api rate_limit --jq EXPR          from $STUB_RATE
+#   issue edit N --repo O/R --body-file F   writes $STATE, unless STUB_DRY=1
+# Anything else exits 99 and is logged as FORBIDDEN.
+cat >"$WORK/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_LOG"
+forbid() { echo "FORBIDDEN $*" >>"$STUB_LOG"; echo "stub gh: forbidden call: $*" >&2; exit 99; }
+paginate=0; jqexpr=""; args=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --paginate) paginate=1; shift ;;
+    --jq) jqexpr="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+emit() { if [ -n "$jqexpr" ]; then jq -r "$jqexpr"; else cat; fi; }
+case "$1 $2" in
+  "api users/o/projectsV2?per_page=100")
+    [ "$paginate" = 1 ] || forbid "$@"
+    emit <"${STUB_PROJECTS:-$STUB_FX/projects.json}" ;;
+  "api users/o/projectsV2/"*"/fields?per_page=100")
+    [ "$paginate" = 1 ] || forbid "$@"
+    n="${2#users/o/projectsV2/}"; n="${n%%/*}"
+    emit <"$STUB_FX/fields-$n.json" ;;
+  "api users/o/projectsV2/"*"/items?"*)
+    n="${2#users/o/projectsV2/}"; n="${n%%/*}"; q="${2#*\?}"
+    all=1
+    for id in $(jq -r '.[] | select(.name | test("model|effort")) | .id' "$STUB_FX/fields-$n.json"); do
+      case "&$q&" in *"&fields[]=$id&"*) ;; *) all=0 ;; esac
+    done
+    for p in 1 2; do
+      [ "$p" = 1 ] || [ "$paginate" = 1 ] || continue
+      f="$STUB_FX/items-$n-p$p.json"
+      [ -f "$f" ] || continue
+      # The listing shows each issue's current body (from the store), unless
+      # STUB_FROZEN=1 keeps the fixture's, to model an edit after the listing.
+      if [ "${STUB_FROZEN:-0}" = 1 ]; then cat "$f"
+      else
+        jq --argjson b "$(jq -s 'map({key: ._key, value: .body}) | from_entries' "$STATE"/*.json)" \
+          'map(if .content.repository? then .content.body = ($b[.content.repository.full_name + "#" + (.content.number | tostring)] // .content.body) else . end)' "$f"
+      fi >"$f.served"
+      if [ "$all" = 1 ]; then emit <"$f.served"; else jq 'map(.fields = [])' "$f.served" | emit; fi
+    done ;;
+  "api repos/"*"/issues/"*)
+    [ "$#" -eq 2 ] || forbid "$@"
+    r="${2#repos/}"; r="${r%/issues/*}"; num="${2##*/}"
+    f="$STATE/${r//\//_}_$num.json"
+    [ -f "$f" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    emit <"$f" ;;
+  "api repos/"*)
+    [ "$#" -eq 2 ] && [ "${STUB_REPO_FAIL:-0}" != 1 ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    f="$STUB_FX/repo-$(printf '%s' "${2#repos/}" | tr '/' '_').json"
+    [ -f "$f" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    emit <"$f" ;;
+  "api rate_limit")
+    emit <"$STUB_RATE" ;;
+  "issue edit")
+    [ "${STUB_DRY:-0}" = 1 ] && forbid issue edit "$@"
+    num="$3"; [ "$4" = "--repo" ] && [ "$6" = "--body-file" ] && [ "$#" -eq 7 ] || forbid "$@"
+    f="$STATE/${5//\//_}_$num.json"
+    [ -f "$f" ] || { echo "gh: Not Found" >&2; exit 1; }
+    jq --rawfile b "$7" '.body = $b' "$f" >"$f.new"
+    if [ "${STUB_MANGLE:-0}" = 1 ]; then jq '.body += " "' "$f.new" >"$f.new2"; mv "$f.new2" "$f.new"; fi
+    mv "$f.new" "$f"
+    echo "https://github.com/$5/issues/$num" ;;
+  *) forbid "$@" ;;
+esac
+EOF
+chmod +x "$WORK/bin/gh"
+
+# The author-wrapper stub: logs, then runs the payload (the gh stub). Under
+# STUB_DRY=1 any call is a failure.
+cat >"$WORK/bin/as-author" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$WRAP_LOG"
+if [ "${STUB_DRY:-0}" = 1 ]; then echo "FORBIDDEN wrapper $*" >>"$WRAP_LOG"; exit 99; fi
+[ "$1" = "--" ] && [ "$2" = "gh" ] || { echo "FORBIDDEN payload $*" >>"$WRAP_LOG"; exit 98; }
+shift
+exec "$@"
+EOF
+chmod +x "$WORK/bin/as-author"
+
+FX="$WORK/fx"
+M_OK='<!-- mergepath-route: anthropic=opus-5.5/high openai=gpt-6.1-sol/high -->'
+R_OK='anthropic=opus-5.5/high openai=gpt-6.1-sol/high'
+
+jq -n '[{number: 4, title: "Mergepath"}, {number: 6, title: "Beta Board"}, {number: 8, title: "No Routing"}]' >"$FX/projects.json"
+fields() { # <board> <id-base>
+  jq -n --argjson b "$2" '[
+    {id: ($b + 0), name: "Status", data_type: "single_select", options: [{name: {raw: "Backlog"}}]},
+    {id: ($b + 1), name: "Anthropic model", data_type: "single_select", options: [{name: {raw: "Haiku 4.5"}}, {name: {raw: "Opus 5.5"}}, {name: {raw: "Opus 4"}}]},
+    {id: ($b + 2), name: "Anthropic effort", data_type: "single_select", options: [{name: {raw: "low"}}, {name: {raw: "high"}}]},
+    {id: ($b + 3), name: "OpenAI model", data_type: "single_select", options: [{name: {raw: "GPT-6.1 Sol"}}]},
+    {id: ($b + 4), name: "OpenAI effort", data_type: "single_select", options: [{name: {raw: "high"}}]}
+  ]' >"$FX/fields-$1.json"
+}
+fields 4 400
+fields 6 600
+jq -n '[{id: 801, name: "Anthropic model", data_type: "single_select", options: [{name: {raw: "Opus 5.5"}}]}]' >"$FX/fields-8.json"
+
+# item <file> <id-base> <type> <repo> <number> <state> <labels-csv> <am> <ae> <om> <oe> <body-printf-format> [args]
+# "-" leaves a field unset. The issue is also seeded in the issue store.
+item() {
+  local file="$1" base="$2" type="$3" repo="$4" num="$5" state="$6" labels="$7" am="$8" ae="$9" om="${10}" oe="${11}" fmt="${12}"
+  shift 12
+  local bf="$WORK/body.tmp"
+  # shellcheck disable=SC2059  # the fixture format is the point
+  printf "$fmt" "$@" >"$bf"
+  jq -n -c --rawfile body "$bf" --arg type "$type" --arg repo "$repo" --argjson num "$num" --arg state "$state" \
+    --arg labels "$labels" --argjson base "$base" --arg am "$am" --arg ae "$ae" --arg om "$om" --arg oe "$oe" '
+    def fld($i; $n; $v): {id: ($base + $i), name: $n, data_type: "single_select",
+                           value: (if $v == "-" then null else {name: {raw: $v, html: $v}} end)};
+    {id: ($num * 1000 + $base), content_type: $type, archived_at: null,
+     content: (if $type == "DraftIssue" then {title: "draft", body: $body}
+               else {number: $num, state: $state, repository: {full_name: $repo},
+                     labels: ($labels | split(",") | map(select(. != "")) | map({name: .})),
+                     body: $body}
+                    + (if $type == "PullRequest" then {pull_request: {url: "x"}} else {} end) end),
+     fields: [fld(1; "Anthropic model"; $am), fld(2; "Anthropic effort"; $ae),
+              fld(3; "OpenAI model"; $om), fld(4; "OpenAI effort"; $oe)]}' >>"$file"
+  if [ "$type" = "Issue" ]; then
+    jq -n --rawfile body "$bf" --argjson num "$num" --arg labels "$labels" --arg key "$repo#$num" \
+      '{_key: $key, number: $num, body: $body, labels:($labels | split(",") | map(select(. != "")) | map({name: .}))}' \
+      >"$WORK/seed/${repo//\//_}_$num.json"
+  fi
+}
+mkdir -p "$WORK/seed"
+P1="$WORK/b4p1.jsonl"; P2="$WORK/b4p2.jsonl"; B6="$WORK/b6p1.jsonl"
+: >"$P1"; : >"$P2"; : >"$B6"
+A=o/alpha
+item "$P1" 400 Issue $A 1 open "size:S" "Opus 5.5" high "GPT-6.1 Sol" high 'Body one.'
+item "$P1" 400 Issue $A 2 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Two.\n\n%s\n' "$M_OK"
+item "$P1" 400 Issue $A 3 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Three.\n<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->\n'
+item "$P1" 400 Issue $A 4 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Four.\n<!-- mergepath-route: anthropic=opus-5.5/high -->\n'
+item "$P1" 400 Issue $A 5 open "" "Opus 5.5" high "GPT-6.1 Sol" high '%s\n%s\n' "$M_OK" "$M_OK"
+item "$P1" 400 Issue $A 6 open "" "Opus 5.5" - "GPT-6.1 Sol" high 'Six.'
+item "$P1" 400 Issue $A 7 open "" - high "GPT-6.1 Sol" high 'Seven.'
+item "$P1" 400 Issue $A 8 open "" "Opus 5.5" high - - 'Eight.'
+item "$P1" 400 Issue $A 22 open "" "Opus 5.5" high "GPT-6.1 Sol" - 'Twenty-two.'
+item "$P1" 400 PullRequest $A 9 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'A PR.'
+item "$P1" 400 DraftIssue $A 10 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'A draft.'
+item "$P1" 400 Issue $A 11 open "size:L" "Opus 5.5" high "GPT-6.1 Sol" high 'Parent.'
+item "$P1" 400 Issue $A 12 open "" "Opus 4" high "GPT-6.1 Sol" high 'Twelve.'
+item "$P1" 400 Issue $A 13 open "" - - - - 'No route.'
+item "$P1" 400 Issue $A 14 closed "" "Opus 5.5" high "GPT-6.1 Sol" high 'Line one\r\nLine two\r\n'
+item "$P2" 400 Issue $A 15 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Fifteen (page two).'
+item "$P2" 400 Issue $A 16 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Sixteen.\n```\nunclosed fence\n'
+item "$P2" 400 Issue $A 17 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Example:\n```\n%s\n```\n' "$M_OK"
+item "$P2" 400 Issue $A 20 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Twenty.'
+item "$P2" 400 Issue $A 21 open "" "Opus 5.5" high "GPT-6.1 Sol" high ''
+item "$B6" 600 Issue o/beta 1 open "" "Haiku 4.5" low "GPT-6.1 Sol" high 'Beta one.'
+item "$B6" 600 Issue $A 1 open "size:S" "Opus 5.5" high "GPT-6.1 Sol" high 'Body one.'
+item "$B6" 600 Issue $A 20 open "" "Haiku 4.5" low "GPT-6.1 Sol" high 'Twenty.'
+# o/gamma is archived: its routed issues are skipped (read-only repository).
+item "$B6" 600 Issue o/gamma 1 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Gamma one.'
+item "$B6" 600 Issue o/gamma 2 closed "" "Opus 5.5" high "GPT-6.1 Sol" high 'Gamma two.'
+item "$B6" 600 Issue o/gamma 3 open "" - - - - 'Gamma unrouted.'
+echo '{"full_name":"o/alpha","archived":false}' >"$FX/repo-o_alpha.json"
+echo '{"full_name":"o/beta","archived":false}' >"$FX/repo-o_beta.json"
+echo '{"full_name":"o/gamma","archived":true}' >"$FX/repo-o_gamma.json"
+jq -s -c '.' "$P1" >"$FX/items-4-p1.json"
+jq -s -c '.' "$P2" >"$FX/items-4-p2.json"
+jq -s -c '.' "$B6" >"$FX/items-6-p1.json"
+# Board 9 (only listed under STUB_PROJECTS=$FX/projects-9.json): a body with
+# thousands of marker-like lines, and two items whose listing omits the body.
+fields 9 900
+B9="$WORK/b9p1.jsonl"; : >"$B9"
+awk 'BEGIN { for (i = 0; i < 3000; i++) print "<!--mergepath-route broken line " i " -->" }' >"$WORK/many.txt"
+item "$B9" 900 Issue o/delta 1 open "" "Opus 5.5" high "GPT-6.1 Sol" high '%s' "$(cat "$WORK/many.txt")"
+item "$B9" 900 Issue o/delta 2 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Two.\n\n%s' "$M_OK"
+item "$B9" 900 Issue o/delta 3 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Three.'
+jq -s -c 'map(if .content.number == 2 or .content.number == 3 then del(.content.body) else . end)' "$B9" >"$FX/items-9-p1.json"
+echo '{"full_name":"o/delta","archived":false}' >"$FX/repo-o_delta.json"
+jq -n '[{number: 9, title: "Delta"}]' >"$FX/projects-9.json"
+echo '{"resources":{"core":{"remaining":4000},"graphql":{"remaining":4000}}}' >"$WORK/rate-ok.json"
+echo '{"resources":{"core":{"remaining":4000},"graphql":{"remaining":10}}}' >"$WORK/rate-low.json"
+
+reset_state() { rm -rf "$WORK/state"; cp -R "$WORK/seed" "$WORK/state"; }
+
+RC=0; OUT=""; ERR=""; LOG=""; WLOG=""
+# run <case> <dry:0|1> <rate-file> [args...]
+run() {
+  local name="$1" dry="$2" rate="$3"
+  shift 3
+  LOG="$WORK/$name.gh.log"; WLOG="$WORK/$name.wrap.log"
+  : >"$LOG"; : >"$WLOG"
+  set +e
+  OUT="$(env -u GITHUB_TOKEN GH_TOKEN=stub-token PATH="$WORK/bin:$PATH" STUB_LOG="$LOG" WRAP_LOG="$WLOG" \
+    STUB_FX="$FX" STATE="$WORK/state" STUB_RATE="$rate" STUB_DRY="$dry" STUB_MANGLE="${STUB_MANGLE:-0}" STUB_FROZEN="${STUB_FROZEN:-0}" STUB_REPO_FAIL="${STUB_REPO_FAIL:-0}" STUB_PROJECTS="${STUB_PROJECTS:-}" \
+    BACKFILL_AS_AUTHOR="$WORK/bin/as-author" bash "$SUBJECT" --owner o "$@" 2>"$WORK/$name.err")"
+  RC=$?
+  set -e
+  ERR="$(cat "$WORK/$name.err")"
+  printf '%s\n' "$OUT" >"$WORK/$name.out"
+}
+has() { case "$OUT" in *"$2"*) pass ;; *) fail "$1: output lacks '$2'"$'\n'"$OUT" ;; esac; }
+lacks() { case "$OUT" in *"$2"*) fail "$1: output must not contain '$2'" ;; *) pass ;; esac; }
+no_forbidden() { ok "$1: a forbidden gh or wrapper call was made: $(grep -h FORBIDDEN "$LOG" "$WLOG" || true)" \
+  bash -c '! grep -q FORBIDDEN "$1" "$2"' _ "$LOG" "$WLOG"; }
+body_of() { jq -j '.body' "$WORK/state/${1//\//_}_$2.json"; }
+same_body() { # <case> <repo> <num>: the store still holds the seeded body
+  ok "$1: $2#$3 was modified" cmp -s "$WORK/seed/${2//\//_}_$3.json" "$WORK/state/${2//\//_}_$3.json"
+}
+expect_body() { # <case> <repo> <num> <printf-format> [args]
+  local c="$1" r="$2" n="$3" fmt="$4"
+  shift 4
+  # shellcheck disable=SC2059
+  printf "$fmt" "$@" >"$WORK/expected.body"
+  body_of "$r" "$n" >"$WORK/actual.body"
+  ok "$c: $r#$n body is not byte-equal to the expected composition: $(od -c "$WORK/actual.body" | head -n 5)" \
+    cmp -s "$WORK/expected.body" "$WORK/actual.body"
+}
+line_for() { grep -F "  $1 " "$WORK/$2.out" | head -n 1; }
+
+# --- dry run: the full plan, nothing written, no write attempted ---
+reset_state
+run dry 1 "$WORK/rate-ok.json" --dry-run --json "$WORK/dry.json"
+ok "dry: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+no_forbidden dry
+ok "dry: the author wrapper was invoked" [ ! -s "$WLOG" ]
+ok "dry: a non-GET gh call was made" bash -c '! grep -Eq "^(issue|pr|project) " "$1"' _ "$LOG"
+for n in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 20 21 22; do same_body dry $A "$n"; done
+same_body dry o/beta 1
+has dry "would-write  o/alpha#1 [open] board 4,6  route: $R_OK"
+has dry "already-present  o/alpha#2 [open] board 4"
+has dry "conflict (different-marker)  o/alpha#3"
+has dry "existing: anthropic=haiku-4.5/low openai=gpt-6-luna/low"
+has dry "conflict (malformed-marker)  o/alpha#4"
+has dry "conflict (duplicated-marker)  o/alpha#5"
+has dry "partial (unset: Anthropic effort)  o/alpha#6"
+has dry "partial (unset: Anthropic model)  o/alpha#7"
+has dry "partial (unset: OpenAI model, OpenAI effort)  o/alpha#8"
+has dry "partial (unset: OpenAI effort)  o/alpha#22"
+has dry "skipped (pull-request)  o/alpha#9"
+has dry "skipped (draft)  (draft)#-"
+has dry "skipped (size-l-parent)  o/alpha#11"
+has dry "out-of-vocabulary (Anthropic model=Opus 4)  o/alpha#12"
+has dry "would-write  o/alpha#14 [closed] board 4"
+has dry "would-write  o/alpha#15 [open] board 4"
+has dry "unwritable (the appended marker would not parse as the route"
+has dry "would-write  o/alpha#17 [open] board 4"
+has dry "conflict (board-disagreement)  o/alpha#20 [open] board 4,6"
+has dry "would-write  o/alpha#21 [open] board 4"
+has dry "would-write  o/beta#1 [open] board 6  route: anthropic=haiku-4.5/low openai=gpt-6.1-sol/high"
+has dry 'board 8 "No Routing": skipped (missing routing field(s): Anthropic effort, OpenAI model, OpenAI effort)'
+has dry "note: field 'Anthropic model' has option 'Opus 4' ('opus-4'), outside the vocabulary"
+lacks dry "o/alpha#13"
+lacks dry "o/beta#1 [open] board 4"
+ok "dry: o/alpha#1 is listed twice (cross-board deduplication failed)" [ "$(grep -c 'o/alpha#1 \[' "$WORK/dry.out")" -eq 1 ]
+# Per-repository report, from the JSON form.
+rep() { jq -r --arg r "$1" --arg k "$2" '.repositories[] | select(.repository == $r) | .[$k]' "$WORK/dry.json"; }
+ok "dry: o/alpha items read $(rep o/alpha items_read) != 21" [ "$(rep o/alpha items_read)" = 21 ]
+ok "dry: o/alpha would-write $(rep o/alpha would-write) != 5" [ "$(rep o/alpha would-write)" = 5 ]
+ok "dry: o/alpha already-present != 1" [ "$(rep o/alpha already-present)" = 1 ]
+ok "dry: o/alpha conflicts $(rep o/alpha conflict) != 4" [ "$(rep o/alpha conflict)" = 4 ]
+ok "dry: o/alpha partial $(rep o/alpha partial) != 4" [ "$(rep o/alpha partial)" = 4 ]
+ok "dry: o/alpha out-of-vocabulary != 1" [ "$(rep o/alpha out-of-vocabulary)" = 1 ]
+ok "dry: o/alpha unwritable != 1" [ "$(rep o/alpha unwritable)" = 1 ]
+ok "dry: o/alpha skipped $(rep o/alpha skipped) != 2" [ "$(rep o/alpha skipped)" = 2 ]
+ok "dry: o/alpha no-route != 1" [ "$(rep o/alpha no-route)" = 1 ]
+ok "dry: o/beta items read != 1" [ "$(rep o/beta items_read)" = 1 ]
+ok "dry: o/beta would-write != 1" [ "$(rep o/beta would-write)" = 1 ]
+ok "dry: drafts are not reported under their own bucket" [ "$(rep '(no repository: drafts)' skipped)" = 1 ]
+ok "dry: written must be 0 in a dry run" [ "$(jq '.totals.written' "$WORK/dry.json")" = 0 ]
+ok "dry: board 4 items read != 20" [ "$(jq '.boards[] | select(.number == 4) | .items_read' "$WORK/dry.json")" = 20 ]
+has dry "skipped (archived-repository)  o/gamma#1 [open] board 6"
+has dry "skipped (archived-repository)  o/gamma#2 [closed] board 6"
+ok "dry: o/gamma skipped $(rep o/gamma skipped) != 2" [ "$(rep o/gamma skipped)" = 2 ]
+ok "dry: o/gamma no-route != 1 (an unrouted issue stays no-route)" [ "$(rep o/gamma no-route)" = 1 ]
+ok "dry: o/gamma archived skips not broken out by reason" \
+  [ "$(jq '.repositories[] | select(.repository == "o/gamma") | .skipped_by_reason["archived-repository"]' "$WORK/dry.json")" = 2 ]
+ok "dry: repos/o/gamma was not read exactly once (cache): $(grep -c '^api repos/o/gamma ' "$LOG")" \
+  [ "$(grep -c '^api repos/o/gamma ' "$LOG")" -eq 1 ]
+has dry "REPORT (per repository)"
+has dry "  TOTAL | 26 | 6 | 0 | 1 | 4 | 4 | 1 | 1 | 5 |"
+
+# --- an unreadable repository (archived flag unknown) fails closed ---
+reset_state
+STUB_REPO_FAIL=1 run repofail 1 "$WORK/rate-ok.json" --dry-run
+ok "repofail: expected exit 1, got $RC" [ "$RC" -eq 1 ]
+case "$ERR" in *"needed to tell whether it is archived"*) pass ;; *) fail "repofail: stderr lacks the archived-read failure; $ERR" ;; esac
+
+# --- pagination and fields[] are load-bearing ---
+grep -F 'items?' "$LOG" >"$WORK/items-calls.log" || true
+ok "dry: the items were not read with --paginate" grep -q -- '--paginate' "$WORK/items-calls.log"
+ok "dry: the items request lacks fields[]=401..404" \
+  grep -q 'fields\[\]=401&fields\[\]=402&fields\[\]=403&fields\[\]=404' "$WORK/items-calls.log"
+ok "dry: board 8 (no routing fields) had its items read" bash -c '! grep -q "projectsV2/8/items" "$1"' _ "$LOG"
+
+# --- a single board ---
+reset_state
+run onlyb6 1 "$WORK/rate-ok.json" --dry-run --board 6
+ok "onlyb6: exit $RC" [ "$RC" -eq 0 ]
+has onlyb6 "would-write  o/beta#1 [open] board 6"
+has onlyb6 "would-write  o/alpha#1 [open] board 6"
+lacks onlyb6 "board 4"
+run badboard 1 "$WORK/rate-ok.json" --dry-run --board 5
+ok "badboard: an unknown board must fail, got $RC" [ "$RC" -eq 1 ]
+
+# --- many marker-like lines (no SIGPIPE abort) and a body the listing omits ---
+reset_state
+STUB_PROJECTS="$FX/projects-9.json" STUB_FROZEN=1 run delta 1 "$WORK/rate-ok.json" --dry-run
+ok "delta: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+has delta "conflict (duplicated-marker)  o/delta#1"
+has delta "already-present  o/delta#2"
+has delta "would-write  o/delta#3"
+ok "delta: the omitted bodies were not read from the issue" \
+  [ "$(grep -cE '^api repos/o/delta/issues/(2|3)$' "$LOG")" -eq 2 ]
+ok "delta: a listed body was re-read" bash -c '! grep -q "^api repos/o/delta/issues/1$" "$1"' _ "$LOG"
+no_forbidden delta
+
+# --- usage: no mode, both modes, out-of-range numbers ---
+run bigfloor 1 "$WORK/rate-ok.json" --live --budget-floor 99999999999999999999
+ok "bigfloor: an overflowing --budget-floor must be a usage error, got $RC" [ "$RC" -eq 2 ]
+run bigcap 1 "$WORK/rate-ok.json" --live --max-writes 1234567890
+ok "bigcap: a 10-digit --max-writes must be a usage error, got $RC" [ "$RC" -eq 2 ]
+run nomode 1 "$WORK/rate-ok.json"
+ok "nomode: expected usage exit 2, got $RC" [ "$RC" -eq 2 ]
+ok "nomode: gh was called on a usage error" [ ! -s "$LOG" ]
+run bothmodes 1 "$WORK/rate-ok.json" --dry-run --live
+ok "bothmodes: expected usage exit 2, got $RC" [ "$RC" -eq 2 ]
+
+# --- live: writes exactly the plan, byte-exact, via the wrapper ---
+reset_state
+run live 0 "$WORK/rate-ok.json" --live --pace 0 --json "$WORK/live.json"
+ok "live: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+no_forbidden live
+ok "live: wrapper calls $(wc -l <"$WLOG" | tr -d ' ') != 6" [ "$(wc -l <"$WLOG" | tr -d ' ')" -eq 6 ]
+ok "live: a wrapper call is not '-- gh issue edit N --repo R --body-file F'" \
+  bash -c '! grep -Ev "^-- gh issue edit [0-9]+ --repo o/(alpha|beta) --body-file [^ ]+$" "$1"' _ "$WLOG"
+expect_body live $A 1 'Body one.\n\n%s' "$M_OK"
+expect_body live $A 14 'Line one\r\nLine two\r\n\r\n%s' "$M_OK"
+expect_body live $A 15 'Fifteen (page two).\n\n%s' "$M_OK"
+expect_body live $A 17 'Example:\n```\n%s\n```\n\n%s' "$M_OK" "$M_OK"
+expect_body live $A 21 '%s' "$M_OK"
+expect_body live o/beta 1 'Beta one.\n\n%s' '<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6.1-sol/high -->'
+for n in 2 3 4 5 6 7 8 11 12 16 20 22; do same_body live $A "$n"; done
+for n in 1 2 3; do same_body live o/gamma "$n"; done
+ok "live: a write reached the archived o/gamma" bash -c '! grep -q "o/gamma" "$1"' _ "$WLOG"
+for n in 1 14 15 17 21; do
+  body_of $A "$n" >"$WORK/rr.body"
+  ok "live: read-route.sh does not read $A#$n back as the route" \
+    [ "$(bash "$READ_ROUTE" "$n" --repo $A --body-file "$WORK/rr.body" 2>/dev/null)" = "$R_OK" ]
+done
+ok "live: written != 6" [ "$(jq '.totals.written' "$WORK/live.json")" = 6 ]
+ok "live: would-write must be 0 after the writes" [ "$(jq '.totals["would-write"]' "$WORK/live.json")" = 0 ]
+has live "written  o/alpha#1 [open] board 4,6"
+# Each write was preceded by a fresh read and followed by a readback.
+ok "live: o/alpha#15 was not read twice around its write" \
+  [ "$(grep -c '^api repos/o/alpha/issues/15$' "$LOG")" -eq 2 ]
+
+# --- idempotent rerun: nothing to write ---
+run rerun 0 "$WORK/rate-ok.json" --live --pace 0 --json "$WORK/rerun.json"
+ok "rerun: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+ok "rerun: the wrapper was invoked $(wc -l <"$WLOG" | tr -d ' ') times on a second run" [ ! -s "$WLOG" ]
+ok "rerun: already-present $(jq '.totals["already-present"]' "$WORK/rerun.json") != 7" \
+  [ "$(jq '.totals["already-present"]' "$WORK/rerun.json")" = 7 ]
+ok "rerun: written != 0" [ "$(jq '.totals.written' "$WORK/rerun.json")" = 0 ]
+run rerundry 1 "$WORK/rate-ok.json" --dry-run --json "$WORK/rerundry.json"
+ok "rerundry: would-write != 0 after the live run" [ "$(jq '.totals["would-write"]' "$WORK/rerundry.json")" = 0 ]
+no_forbidden rerundry
+
+# --- the fresh read decides: a marker added since the listing is not overwritten ---
+reset_state
+jq --arg m "Body one.
+
+<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6-luna/low -->" '.body = $m' \
+  "$WORK/seed/o_alpha_1.json" >"$WORK/state/o_alpha_1.json"
+cp "$WORK/state/o_alpha_1.json" "$WORK/race-before.json"
+STUB_FROZEN=1 run race 0 "$WORK/rate-ok.json" --live --pace 0 --json "$WORK/race.json"
+ok "race: expected exit 0, got $RC; stderr: $ERR" [ "$RC" -eq 0 ]
+ok "race: o/alpha#1 was overwritten" cmp -s "$WORK/race-before.json" "$WORK/state/o_alpha_1.json"
+has race "conflict (changed since the plan: different-marker)  o/alpha#1"
+ok "race: the other writes did not proceed" [ "$(jq '.totals.written' "$WORK/race.json")" = 5 ]
+
+# --- a readback mismatch stops the run after one write ---
+reset_state
+STUB_MANGLE=1 run mangle 0 "$WORK/rate-ok.json" --live --pace 0 --json "$WORK/mangle.json"
+ok "mangle: expected exit 1, got $RC" [ "$RC" -eq 1 ]
+ok "mangle: wrapper calls $(wc -l <"$WLOG" | tr -d ' ') != 1 (the run must stop at the first mismatch)" \
+  [ "$(wc -l <"$WLOG" | tr -d ' ')" -eq 1 ]
+has mangle "STOPPED: readback of o/alpha#1 differs from the written body"
+ok "mangle: not-written != 5" [ "$(jq '.totals["not-written"]' "$WORK/mangle.json")" = 5 ]
+
+# --- the budget floor stops before any write ---
+reset_state
+run lowbudget 0 "$WORK/rate-low.json" --live --pace 0 --json "$WORK/low.json"
+ok "lowbudget: expected exit 1, got $RC" [ "$RC" -eq 1 ]
+ok "lowbudget: the wrapper was invoked under the budget floor" [ ! -s "$WLOG" ]
+has lowbudget "STOPPED: budget under --budget-floor 1000 (core 4000, graphql 10)"
+for n in 1 14 15 17 21; do same_body lowbudget $A "$n"; done
+
+# --- --max-writes caps the run ---
+reset_state
+run cap 0 "$WORK/rate-ok.json" --live --pace 0 --max-writes 2 --json "$WORK/cap.json"
+ok "cap: a --max-writes cap is not a failure, got exit $RC" [ "$RC" -eq 0 ]
+ok "cap: wrapper calls != 2" [ "$(wc -l <"$WLOG" | tr -d ' ')" -eq 2 ]
+ok "cap: written != 2" [ "$(jq '.totals.written' "$WORK/cap.json")" = 2 ]
+
+echo "$NAME: $PASS passed, $FAIL failed"
+if [ "$FAIL" -ne 0 ]; then
+  echo "$NAME: FAIL"
+  exit 1
+fi
+echo "$NAME: PASS"
