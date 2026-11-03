@@ -360,6 +360,10 @@ ALLOW_LIST=(
   #     test_load_review_config.sh (#788) is the same shape again: the
   #     loader travels under the scripts/workflow/ kit, its suite stubs
   #     `gh` and asserts mergepath's own load-config semantics.
+  #     test_review_cost_preview.sh (#1679) is the same shape: the preview
+  #     travels (scripts/review-cost-preview.sh, canonical) with both
+  #     emitters, and its suite stubs `gh` inside this hub-only wrapper's
+  #     SUITES like the fingerprint's own.
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
@@ -376,6 +380,7 @@ ALLOW_LIST=(
   "tests/test_external_review_rename_protection.sh"
   "tests/test_resolve_base_policy.sh"
   "tests/test_load_review_config.sh"
+  "tests/test_review_cost_preview.sh"
 
   # The #623 Codex-latency audit script — hub-only operator tooling for
   # this pass (a consumer-repo sweep is a possible follow-up, at which
