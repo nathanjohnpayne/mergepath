@@ -25,4 +25,4 @@ Ambiguity is not resolved by routing higher. If the tier depends on something th
 
 ## Changing this table
 
-A model or effort that is not already an option on the boards' routing fields cannot be recorded in a marker. Adding one means adding the option to every board's routing field and the marker value to the shared rules, in the same change as the row that uses it, so the table never names a route that cannot be written down.
+A model or effort that is not already an option on the boards' routing fields cannot be recorded in a marker. Adding one means adding the option to every board's routing field and its marker value to the shared rules no later than the change that adds the row using it, so the table never names a route that cannot be written down.
