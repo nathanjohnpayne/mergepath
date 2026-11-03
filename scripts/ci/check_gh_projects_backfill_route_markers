@@ -21,7 +21,8 @@
 #      stub both fail on one. Covers write, already present, conflicts
 #      (different, malformed, duplicated marker; two boards disagreeing),
 #      partial routes (each half missing, one provider only), pull-request,
-#      draft and size:L items skipped, an out-of-vocabulary option, an
+#      draft and size:L items skipped, archived repositories skipped (one
+#      cached read; unreadable fails closed), an out-of-vocabulary option, an
 #      unwritable body, cross-board deduplication, repository mapping by
 #      content.repository, pagination, byte-exact composition (LF, CRLF,
 #      empty), the fresh read before a write, a readback mismatch stopping
@@ -175,6 +176,11 @@ case "$1 $2" in
     f="$STATE/${r//\//_}_$num.json"
     [ -f "$f" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     emit <"$f" ;;
+  "api repos/"*)
+    [ "$#" -eq 2 ] && [ "${STUB_REPO_FAIL:-0}" != 1 ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    f="$STUB_FX/repo-$(printf '%s' "${2#repos/}" | tr '/' '_').json"
+    [ -f "$f" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    emit <"$f" ;;
   "api rate_limit")
     emit <"$STUB_RATE" ;;
   "issue edit")
@@ -274,6 +280,13 @@ item "$P2" 400 Issue $A 21 open "" "Opus 5.5" high "GPT-6.1 Sol" high ''
 item "$B6" 600 Issue o/beta 1 open "" "Haiku 4.5" low "GPT-6.1 Sol" high 'Beta one.'
 item "$B6" 600 Issue $A 1 open "size:S" "Opus 5.5" high "GPT-6.1 Sol" high 'Body one.'
 item "$B6" 600 Issue $A 20 open "" "Haiku 4.5" low "GPT-6.1 Sol" high 'Twenty.'
+# o/gamma is archived: its routed issues are skipped (read-only repository).
+item "$B6" 600 Issue o/gamma 1 open "" "Opus 5.5" high "GPT-6.1 Sol" high 'Gamma one.'
+item "$B6" 600 Issue o/gamma 2 closed "" "Opus 5.5" high "GPT-6.1 Sol" high 'Gamma two.'
+item "$B6" 600 Issue o/gamma 3 open "" - - - - 'Gamma unrouted.'
+echo '{"full_name":"o/alpha","archived":false}' >"$FX/repo-o_alpha.json"
+echo '{"full_name":"o/beta","archived":false}' >"$FX/repo-o_beta.json"
+echo '{"full_name":"o/gamma","archived":true}' >"$FX/repo-o_gamma.json"
 jq -s -c '.' "$P1" >"$FX/items-4-p1.json"
 jq -s -c '.' "$P2" >"$FX/items-4-p2.json"
 jq -s -c '.' "$B6" >"$FX/items-6-p1.json"
@@ -291,7 +304,7 @@ run() {
   : >"$LOG"; : >"$WLOG"
   set +e
   OUT="$(env -u GITHUB_TOKEN GH_TOKEN=stub-token PATH="$WORK/bin:$PATH" STUB_LOG="$LOG" WRAP_LOG="$WLOG" \
-    STUB_FX="$FX" STATE="$WORK/state" STUB_RATE="$rate" STUB_DRY="$dry" STUB_MANGLE="${STUB_MANGLE:-0}" STUB_FROZEN="${STUB_FROZEN:-0}" \
+    STUB_FX="$FX" STATE="$WORK/state" STUB_RATE="$rate" STUB_DRY="$dry" STUB_MANGLE="${STUB_MANGLE:-0}" STUB_FROZEN="${STUB_FROZEN:-0}" STUB_REPO_FAIL="${STUB_REPO_FAIL:-0}" \
     BACKFILL_AS_AUTHOR="$WORK/bin/as-author" bash "$SUBJECT" --owner o "$@" 2>"$WORK/$name.err")"
   RC=$?
   set -e
@@ -368,8 +381,22 @@ ok "dry: o/beta would-write != 1" [ "$(rep o/beta would-write)" = 1 ]
 ok "dry: drafts are not reported under their own bucket" [ "$(rep '(no repository: drafts)' skipped)" = 1 ]
 ok "dry: written must be 0 in a dry run" [ "$(jq '.totals.written' "$WORK/dry.json")" = 0 ]
 ok "dry: board 4 items read != 20" [ "$(jq '.boards[] | select(.number == 4) | .items_read' "$WORK/dry.json")" = 20 ]
+has dry "skipped (archived-repository)  o/gamma#1 [open] board 6"
+has dry "skipped (archived-repository)  o/gamma#2 [closed] board 6"
+ok "dry: o/gamma skipped $(rep o/gamma skipped) != 2" [ "$(rep o/gamma skipped)" = 2 ]
+ok "dry: o/gamma no-route != 1 (an unrouted issue stays no-route)" [ "$(rep o/gamma no-route)" = 1 ]
+ok "dry: o/gamma archived skips not broken out by reason" \
+  [ "$(jq '.repositories[] | select(.repository == "o/gamma") | .skipped_by_reason["archived-repository"]' "$WORK/dry.json")" = 2 ]
+ok "dry: repos/o/gamma was not read exactly once (cache): $(grep -c '^api repos/o/gamma ' "$LOG")" \
+  [ "$(grep -c '^api repos/o/gamma ' "$LOG")" -eq 1 ]
 has dry "REPORT (per repository)"
-has dry "  TOTAL | 23 | 6 | 0 | 1 | 4 | 4 | 1 | 1 | 3 |"
+has dry "  TOTAL | 26 | 6 | 0 | 1 | 4 | 4 | 1 | 1 | 5 |"
+
+# --- an unreadable repository (archived flag unknown) fails closed ---
+reset_state
+STUB_REPO_FAIL=1 run repofail 1 "$WORK/rate-ok.json" --dry-run
+ok "repofail: expected exit 1, got $RC" [ "$RC" -eq 1 ]
+case "$ERR" in *"needed to tell whether it is archived"*) pass ;; *) fail "repofail: stderr lacks the archived-read failure; $ERR" ;; esac
 
 # --- pagination and fields[] are load-bearing ---
 grep -F 'items?' "$LOG" >"$WORK/items-calls.log" || true
@@ -410,6 +437,8 @@ expect_body live $A 17 'Example:\n```\n%s\n```\n\n%s' "$M_OK" "$M_OK"
 expect_body live $A 21 '%s' "$M_OK"
 expect_body live o/beta 1 'Beta one.\n\n%s' '<!-- mergepath-route: anthropic=haiku-4.5/low openai=gpt-6.1-sol/high -->'
 for n in 2 3 4 5 6 7 8 11 12 16 20 22; do same_body live $A "$n"; done
+for n in 1 2 3; do same_body live o/gamma "$n"; done
+ok "live: a write reached the archived o/gamma" bash -c '! grep -q "o/gamma" "$1"' _ "$WLOG"
 for n in 1 14 15 17 21; do
   body_of $A "$n" >"$WORK/rr.body"
   ok "live: read-route.sh does not read $A#$n back as the route" \

@@ -150,7 +150,7 @@ One of `--dry-run` or `--live` is required, so a bare invocation never writes. O
 | `partial` | A model without its effort, the reverse, or only one provider set. The contract requires both halves, so nothing is guessed or written. |
 | `out-of-vocabulary` | A board option that maps outside the vocabulary. Never written. |
 | `unwritable` | The appended marker would not parse as the route (for example, the body ends inside an unclosed code fence). |
-| `skipped` | Pull requests, draft items, `size:L` parents (by label), and items whose issue content is unavailable. |
+| `skipped` | Pull requests, draft items, `size:L` parents (by label), routed issues in an archived repository (`archived-repository`: read-only, and out of scope for fleet work; each repository's `archived` flag is read once with `GET repos/OWNER/REPO` and cached), and items whose issue content is unavailable. |
 
 Issues with no routing field set are counted as `no-route` and not listed. The report gives, per repository, the items read and the count in each category, with skips broken down by reason; `--json FILE` writes the same report and every item's result as JSON. Board-level notes name a board that lacks a routing field (it is skipped) and any board option outside the vocabulary.
 

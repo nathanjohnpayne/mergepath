@@ -23,6 +23,8 @@
 #       an explicit fields[]=<id> per routing field (without it the endpoint
 #       returns only the Title). Each item's repository is its own
 #       content.repository, never the board's title.
+#   GET repos/OWNER/REPO                            once per repository holding
+#       a routed issue (cached), for its `archived` flag.
 #
 # What it decides, per issue item (open or closed) with any routing field set.
 # The marker contract is docs/agents/shared-operating-rules.md § The route
@@ -46,7 +48,9 @@
 #   unwritable       the appended marker would not parse as the board's route
 #                    (for example the body ends inside an unclosed code fence).
 #   skipped          pull requests, draft items, size:L parents (by label),
-#                    and items whose issue content is unavailable.
+#                    routed issues in an archived repository (read-only, and
+#                    out of scope for fleet work: archived-repository), and
+#                    items whose issue content is unavailable.
 #   no-route         an issue with no routing field set (counted, not listed).
 # The already-present and conflict verdicts come from read-route.sh
 # --body-file, the one marker parser; the composed body is parsed by it too
@@ -232,9 +236,28 @@ for n in $BOARDS; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Classify everything that does not depend on the body's marker.
+# 2. Archived repositories: one `GET repos/OWNER/REPO` per repository that
+#    holds a routed issue, cached. An archived repository is read-only (and out
+#    of scope for fleet work), so its items are skipped, never written.
 # ---------------------------------------------------------------------------
-jq -s -c --arg am "$A_MODELS" --arg ae "$A_EFFORTS" --arg om "$O_MODELS" --arg oe "$O_EFFORTS" '
+: >"$WORK/archived.jsonl"
+jq -r 'select(.type == "Issue" and (.is_pr | not) and .repo != null and .number != null
+              and (.am != null or .ae != null or .om != null or .oe != null)) | .repo' \
+  "$WORK/records.jsonl" | sort -u >"$WORK/repos.txt"
+while IFS= read -r r <&3; do
+  if ! a="$(ghr api "repos/$r" --jq '.archived')"; then
+    echo "$NAME: could not read repos/$r (needed to tell whether it is archived)" >&2
+    exit 1
+  fi
+  case "$a" in true|false) ;; *) echo "$NAME: repos/$r returned archived='$a', not true or false" >&2; exit 1 ;; esac
+  jq -cn --arg r "$r" --argjson a "$a" '{($r): $a}' >>"$WORK/archived.jsonl"
+done 3<"$WORK/repos.txt"
+jq -s 'add // {}' "$WORK/archived.jsonl" >"$WORK/archived.json"
+
+# ---------------------------------------------------------------------------
+# 3. Classify everything that does not depend on the body's marker.
+# ---------------------------------------------------------------------------
+jq -s -c --slurpfile arch "$WORK/archived.json" --arg am "$A_MODELS" --arg ae "$A_EFFORTS" --arg om "$O_MODELS" --arg oe "$O_EFFORTS" '
   def norm: ascii_downcase | gsub(" "; "-");
   def inv($v; $l): ($l | split(" ") | index($v)) != null;
   def vals: {"Anthropic model": .am, "Anthropic effort": .ae, "OpenAI model": .om, "OpenAI effort": .oe};
@@ -257,7 +280,8 @@ jq -s -c --arg am "$A_MODELS" --arg ae "$A_EFFORTS" --arg om "$O_MODELS" --arg o
       | ($g | map(vals) | unique) as $distinct
       | $g[0] as $r
       | ($r | base) + {boards: ($g | map(.board) | unique)}
-      | if ($distinct | length) > 1 then
+      | if ($arch[0][$r.repo] // false) then . + {category: "skipped", reason: "archived-repository"}
+        elif ($distinct | length) > 1 then
           . + {category: "conflict", reason: "board-disagreement",
                detail: ($g | map({board, board_values: vals}))}
         elif $r.size_l then . + {category: "skipped", reason: "size-l-parent"}
@@ -285,7 +309,7 @@ jq -s -c --arg am "$A_MODELS" --arg ae "$A_EFFORTS" --arg om "$O_MODELS" --arg o
 ' "$WORK/records.jsonl" >"$WORK/classified.jsonl"
 
 # ---------------------------------------------------------------------------
-# 3. The marker verdicts, from read-route.sh (the one parser).
+# 4. The marker verdicts, from read-route.sh (the one parser).
 # ---------------------------------------------------------------------------
 # parse_body <repo> <number> <body-file>: sets P_RC, P_OUT, P_ERR.
 parse_body() {
@@ -358,7 +382,7 @@ while IFS=$'\t' read -r repo num route b64 row64 <&3; do
 done 3<"$WORK/candidates.tsv"
 
 # ---------------------------------------------------------------------------
-# 4. Live writes.
+# 5. Live writes.
 # ---------------------------------------------------------------------------
 STOP_REASON=""
 CAPPED=0
@@ -428,7 +452,7 @@ if [ "$MODE" = "live" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Plan and report.
+# 6. Plan and report.
 # ---------------------------------------------------------------------------
 GENERATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 jq -n --arg mode "$MODE" --arg owner "$OWNER" --arg gen "$GENERATED" --arg stop "$STOP_REASON" \
