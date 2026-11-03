@@ -431,6 +431,43 @@ for banner in \
   eq p1 "$(coderabbit_tier_of "$banner
 **⚠️ Potential issue** Real required finding under the banner.")" "cr_banner: Potential issue under the banner stays p1: $banner"
 done
+# #2927: CodeRabbit's icon-label inline severity (late October 2026) carries
+# no emoji. These are the verbatim leading lines of mergepath#2963 comments
+# 4451423418 (Major) and 4451315353 (Minor); before #2927 both graded empty, so
+# a new-format Major never blocked the required gate.
+CR_ICON='<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture>'
+CR_AMBER='<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/amber-16.svg" width="16" height="16" align="absmiddle" alt=""></picture>'
+eq p1 "$(coderabbit_tier_of "<!-- coderabbit-ai-generated:v1 -->
+
+**$CR_ICON Major** · **Data Integrity & Integration** · **Heavy lift**
+
+**Route child creation through the documented author wrapper.**")" "cr_icon: icon-label Major grades p1 (#2927)"
+eq p2 "$(coderabbit_tier_of "<!-- coderabbit-ai-generated:v1 -->
+
+**$CR_AMBER Minor** · **Functional Correctness** · **Quick win**
+
+**Allow an unresolved route to remain unset.**")" "cr_icon: icon-label Minor grades p2 (#2927)"
+eq p1 "$(coderabbit_tier_of "**$CR_ICON Critical** · **Security & Privacy** · **Heavy lift**")" "cr_icon: icon-label Critical grades p1 (#2927)"
+eq p1 "$(coderabbit_tier_of "**$CR_ICON Major** · **Functional Correctness** · **Quick win**
+
+The fix is a Minor edit.")" "cr_icon: icon-label Major beats Minor-in-prose -> p1 (#2927)"
+eq "" "$(coderabbit_tier_of 'This is a **Major** concern in prose, not a badge.')" "cr_icon: bold Major prose without the icon stays empty (#2927)"
+eq "" "$(coderabbit_tier_of "$CR_ICON Major without the bold close")" "cr_icon: icon without the bold close stays empty (#2927)"
+eq "" "$(coderabbit_tier_of "**$CR_ICON Refactor** · **Maintainability**")" "cr_icon: unknown icon label stays empty (#2927)"
+eq p3 "$(coderabbit_tier_of "\`329-336\`: **$CR_ICON Trivial** · **Functional Correctness** · **Quick win**")" "cr_icon: icon-label Trivial grades p3 (#2927)"
+# Ungraded severity rows are unclassified findings, never zero findings.
+eq 1 "$(coderabbit_unclassified_severity_rows "**$CR_ICON Severe** · **Security & Privacy** · **Quick win**")" "cr_unclassified: unknown icon label row counts (#2927)"
+eq 1 "$(coderabbit_unclassified_severity_rows "> \`12-14\`: **🔒 Security & Privacy** | **🟣 Severe** | **⚡ Quick win**")" "cr_unclassified: blockquoted unknown emoji row counts (#2927)"
+eq 0 "$(coderabbit_unclassified_severity_rows "> **$CR_ICON Major** · **Security & Privacy** · **Quick win**")" "cr_unclassified: blockquoted icon-label Major row is graded (#2927)"
+eq 0 "$(coderabbit_unclassified_severity_rows "\`17-17\`: **📐 Maintainability & Code Quality** | **🟡 Minor** | **⚡ Quick win**")" "cr_unclassified: legacy emoji row is graded (#2927)"
+# shellcheck disable=SC2016 # Literal Markdown backticks in a CodeRabbit body.
+eq 0 "$(coderabbit_unclassified_severity_rows '`3-3`: LGTM!
+
+<!-- cr-comment:v1:1d0917d279ece1649e83f86d -->')" "cr_unclassified: LGTM additional comment has no row (#2927)"
+eq 0 "$(coderabbit_unclassified_severity_rows '| **File** | **Change** |')" "cr_unclassified: Markdown table row is not a severity row (#2927)"
+eq 0 "$(coderabbit_unclassified_severity_rows '**Actionable comments posted: 0**')" "cr_unclassified: a single bold span is not a severity row (#2927)"
+eq p1 "$(coderabbit_unclassified_tier "**$CR_ICON Severe** · **Security & Privacy** · **Quick win**")" "cr_unclassified: unclassified row grades p1 (#2927)"
+eq "" "$(coderabbit_unclassified_tier "**$CR_ICON Minor** · **Security & Privacy** · **Quick win**")" "cr_unclassified: graded row adds no tier (#2927)"
 for near_miss in \
   '⚠️ **Unverified finding** _🟠 Major_ real finding on the same line' \
   '⚠️ **Unverified finding**: investigate this'; do

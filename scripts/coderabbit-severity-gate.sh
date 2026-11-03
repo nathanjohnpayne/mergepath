@@ -516,6 +516,19 @@ while [ "$i" -lt "$CAND_COUNT" ]; do
   c=$(echo "$CANDIDATES" | jq -c ".[$i]")
   body=$(echo "$c" | jq -r '.body')
   tier=$(coderabbit_tier_of "$body") || die 2 "could not classify an inline CodeRabbit finding"
+  # A severity row this classifier cannot grade is an unclassified finding,
+  # not an absent one (#2927): it gates as the top CodeRabbit tier until its
+  # thread is resolved, exactly like a known blocking finding. Checked on
+  # every body, not only an untiered one, so a recognised row elsewhere in the
+  # same body cannot lend the unclassified finding its lower tier.
+  cr_inline_scan=$(coderabbit_finding_scan "$body") \
+    || die 2 "could not read an inline CodeRabbit finding while looking for an unclassified severity row"
+  cr_unclassified_tier=$(coderabbit_unclassified_tier "$cr_inline_scan") \
+    || die 2 "could not classify an inline CodeRabbit finding's severity row"
+  if [ -n "$cr_unclassified_tier" ]; then
+    tier=$cr_unclassified_tier
+    log "inline CodeRabbit comment $(echo "$c" | jq -r '.id') carries a severity row no reader recognises — gating it as unclassified ($tier)"
+  fi
   if tier_is_required "$tier"; then
     BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \
       --argjson c "$c" --arg tier "$tier" '
@@ -586,6 +599,57 @@ CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 # prose such as a chat reply must not become a summary merely because a review
 # object exists on the same head.
 CR_MARKERLESS_FULL_REVIEW_RE='^\*\*Actionable comments posted: [0-9]+\*\*(\r?\n|$)'
+# The single-batch publication root CodeRabbit has written since late October
+# 2026 (#2927). It carries neither the result line nor a commits range, so
+# neither acceptor above can see it. Measured shapes, all head-pinned run
+# bodies:
+#   - STATUS-ONLY: mergepath#2963 reviews 5747737952 and 5747872230 and
+#     mergepath#2924 review 5739983887. The body is the vendor header pair,
+#     the publication marker and the autofix checkbox, and nothing else. The
+#     run's findings are its inline comments, which GitHub publishes atomically
+#     with the review object and the inline path above already grades.
+#   - FOLLOW-UP: mergepath#2924 review 5739617104. The same envelope with a
+#     `## Follow-up Comments` section carrying body-level findings, which the
+#     summary grader below classifies line by line like any other summary.
+# The grammar is WHOLE-BODY and exact, so any other serialization stays
+# unrecognised and holds: the body opens with the vendor header at byte zero;
+# only vendor and review-status header lines and blank lines precede exactly
+# one publication marker naming batch 1/1; an optional autofix checkbox block
+# closes the body; and whatever lies between is either nothing or opens with
+# the `## Follow-up Comments` heading. A multi-batch root (1/N, N > 1) is not
+# accepted here: the root could otherwise certify the head before its later
+# batches, and their inline comments, exist. Output is the shape name, or
+# empty when the body is not this envelope.
+# shellcheck disable=SC2016 # jq variables, not shell expansions.
+CR_PUBLICATION_ROOT_JQ='
+  def uuid: "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+  def header: . == "<!-- coderabbit-ai-generated:v1 -->"
+    or . == "<!-- This is an auto-generated comment by CodeRabbit for review status -->";
+  def trim_blank: until((length == 0) or (.[-1] != ""); .[:-1])
+    | until((length == 0) or (.[0] != ""); .[1:]);
+  (.body // "" | split("\n") | map(sub("\r$"; ""))) as $lines
+  | if ($lines[0] // "") != "<!-- coderabbit-ai-generated:v1 -->" then ""
+    else
+      ([range(0; $lines | length) as $i
+        | select(($lines[$i] != "") and ($lines[$i] | header | not)) | $i] | first // null) as $at
+      | if $at == null
+           or ($lines[$at] | test("^<!-- coderabbit-review-publication v1 publication=" + uuid
+                                  + " attempt=" + uuid + " batch=1/1 -->$") | not)
+        then ""
+        else
+          ($lines[$at + 1:] | trim_blank) as $rest
+          | (if ($rest | length) >= 3
+                and $rest[-3] == "<!-- autofix_checkbox_start -->"
+                and ($rest[-2] | test("^- \\[[ xX]\\] <!-- \\{\"checkboxId\":\"" + uuid
+                                      + "\"\\} --> Fix comments: Fix CodeRabbit comments on this PR$"))
+                and $rest[-1] == "<!-- autofix_checkbox_end -->"
+             then $rest[:-3] | trim_blank else $rest end) as $middle
+          | if ($middle | length) == 0 then "status-only"
+            elif $middle[0] == "## Follow-up Comments" then "follow-up"
+            else "" end
+        end
+    end
+'
 
 # --- shared fence-aware line filter ----------------------------------------
 #
@@ -1145,6 +1209,12 @@ fi
 #      which is strictly stronger than the marker path's one. The #880 body
 #      carries `between 21cf07b5… and 9601e872…` — the anchor the gate needed was
 #      inside the object it was already holding on.
+#   3. PUBLICATION ROOT (#2927) — the body is exactly the single-batch
+#      publication envelope CR_PUBLICATION_ROOT_JQ describes. Its scope anchor
+#      is the object's `commit_id` alone, as for acceptor 1. That serialization
+#      held every head it appeared on (mergepath#2924, #2963) behind the
+#      evidence hold with zero blocking findings, because neither acceptor
+#      above can see it.
 #
 # Acceptor 2 declines a body whose own markup says the publication produced no
 # review (a `rate limited` / `failure` / `review in progress` stanza). It does
@@ -1212,6 +1282,22 @@ while IFS= read -r cr_run_json; do
         die 2 "could not READ the body of CodeRabbit review run $(printf '%s' "$cr_run_json" | jq -r '.id') while checking it for a refusal stanza — refusing to accept an unread body as a completed report"
       elif [ "$cr_nonbenign_rc" != "0" ]; then
         cr_run_recognised_by='own-commits-range'
+      fi
+    fi
+  fi
+  if [ -z "$cr_run_recognised_by" ]; then
+    # Acceptor 3, the single-batch publication root (#2927). Same three-way
+    # read as acceptor 2: a jq failure is an unread body, never a non-match,
+    # and a body whose own markup declares a non-review is still declined.
+    cr_root_shape=$(printf '%s' "$cr_run_json" | jq -r "$CR_PUBLICATION_ROOT_JQ") \
+      || die 2 "could not READ the body of CodeRabbit review run $(printf '%s' "$cr_run_json" | jq -r '.id') while matching the publication-root envelope — refusing to decide whether it is a completed report from a body nobody read"
+    if [ -n "$cr_root_shape" ]; then
+      cr_nonbenign_rc=0
+      summary_has_non_benign_stanza "$cr_run_body" || cr_nonbenign_rc=$?
+      if [ "$cr_nonbenign_rc" = "3" ]; then
+        die 2 "could not READ the body of CodeRabbit review run $(printf '%s' "$cr_run_json" | jq -r '.id') while checking it for a refusal stanza — refusing to accept an unread body as a completed report"
+      elif [ "$cr_nonbenign_rc" != "0" ]; then
+        cr_run_recognised_by="publication-root-$cr_root_shape"
       fi
     fi
   fi
@@ -1581,6 +1667,16 @@ while IFS= read -r SUMMARY_JSON; do
     cr_line=${cr_numbered#*	}
     [ -n "$cr_line" ] || continue
     cr_tier=$(coderabbit_tier_of "$cr_line") || die 2 "could not classify the CodeRabbit summary"
+    if [ -z "$cr_tier" ]; then
+      case "$cr_line" in
+        *' · '*|*' | '*)
+          # An ungraded severity row is an unclassified finding (#2927), and
+          # it gates through the same summary ack channel as a known one.
+          cr_tier=$(coderabbit_unclassified_tier "$cr_line") \
+            || die 2 "could not classify a CodeRabbit summary severity row"
+          ;;
+      esac
+    fi
     if tier_is_required "$cr_tier"; then
       SUMMARY_BLOCKING=$(echo "$SUMMARY_BLOCKING" | jq -c \
         --argjson id "$SUMMARY_ID" --argjson line "$cr_line_no" \

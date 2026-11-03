@@ -614,6 +614,86 @@ if [ "${1:-}" = --batch-continuations-only ]; then
   exit $?
 fi
 
+# #2927: CodeRabbit's late-October 2026 serializations, driven through the real
+# gate from verbatim bodies in tests/fixtures/coderabbit_review_serialization_2927.json.
+# The single-batch publication root held mergepath#2924 and #2963 behind the
+# evidence hold with zero blocking findings; the icon-label severity row made
+# every new-format Major grade as no finding at all (overridebroadway#277).
+# Each case names a review-set jq expression over the fixture (`rev(id)`
+# selects one verbatim review), and optionally inline comments (`com(id)`) and
+# their thread state. The PR head is the first review's real commit, so a body
+# that anchors itself by its own commits range keeps that anchor.
+# shellcheck disable=SC2016 # jq programs and literal Markdown backticks.
+test_review_serialization_2927() {
+  local scratch fixture pr reviews comments threads head out rc
+  local defs='def rev($id): .reviews[] | select(.id == $id);
+    def com($id): .inline_comments[] | select(.id == $id);
+    def icon($label): "**<picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> " + $label + "**";'
+  fixture="$ROOT/tests/fixtures/coderabbit_review_serialization_2927.json"
+  scratch=$(make_scratch_with_config true)
+  ser_case() {
+    local label=$1 expected=$2 review_expr=$3 inline_expr=${4:-empty} threads_expr=${5:-[]} diagnostic=${6:-}
+    reviews="$WORKDIR/ser-reviews.json"
+    jq -c "$defs [$review_expr]" "$fixture" > "$WORKDIR/ser-picked.json"
+    head=$(jq -r '.[0].commit_id' "$WORKDIR/ser-picked.json")
+    jq -c --arg sha "$head" '
+      map({id, body, submitted_at, state: "COMMENTED", commit_id: $sha,
+           user: {login: "coderabbitai[bot]"}})' "$WORKDIR/ser-picked.json" > "$reviews"
+    pr=$(make_pr_fixture "$head")
+    comments=$(make_comments_fixture "$(jq -c --arg sha "$head" "$defs [$inline_expr]
+      | map({id, body, path, line: (.line // 1), commit_id: \$sha, original_commit_id: \$sha,
+             user: {login: \"coderabbitai[bot]\"}})" "$fixture")")
+    threads=$(make_threads_fixture "$threads_expr")
+    rc=0
+    out=$(FIXTURE_PR="$pr" FIXTURE_COMMENTS="$comments" FIXTURE_THREADS="$threads" \
+      FIXTURE_ISSUE_COMMENTS='' FIXTURE_REVIEWS="$reviews" REQUIRE_REVIEW_SUMMARY=true \
+      run_gate "$scratch" 99 owner/repo 2>&1) || rc=$?
+    if [ "$rc" = "$expected" ] && { [ -z "$diagnostic" ] || grep -qF -- "$diagnostic" <<<"$out"; }; then
+      pass "#2927: $label → exit $expected"
+    else
+      fail "#2927: $label expected exit $expected/$diagnostic, got $rc"
+      printf '%s\n' "$out" >&2
+    fi
+  }
+  # Positive: the real bodies are recognised as the evidence they are.
+  ser_case '#2963 status-only root 5747872230 is a completed report' 0 'rev(5747872230)' '' '' 'recognised by: publication-root-status-only'
+  ser_case '#2963 status-only root 5747737952 is a completed report' 0 'rev(5747737952)' '' '' 'recognised by: publication-root-status-only'
+  ser_case '#2924 status-only root 5739983887 is a completed report' 0 'rev(5739983887)' '' '' 'recognised by: publication-root-status-only'
+  ser_case '#2924 follow-up root 5739617104 grades its Trivial finding' 0 'rev(5739617104)' '' '' 'recognised by: publication-root-follow-up'
+  ser_case 'checked autofix box keeps the root recognised' 0 'rev(5747872230) | .body |= sub("- \\[ \\]"; "- [x]")'
+  ser_case 'CRLF line endings keep the root recognised' 0 'rev(5747872230) | .body |= gsub("\n"; "\r\n")'
+  # A review that carries a blocking finding still blocks.
+  ser_case 'root with its real unresolved icon-label Major inline blocks' 1 'rev(5747872230)' 'com(4451423418)' '[{isResolved:false, comment_ids:[4451423418]}]' 'CodeRabbit blocking-tier unresolved: 1'
+  ser_case 'root with its real icon-label Major resolved clears' 0 'rev(5747872230)' 'com(4451423418)' '[{isResolved:true, comment_ids:[4451423418]}]'
+  ser_case 'root with an unresolved icon-label Minor stays non-blocking' 0 'rev(5747737952)' 'com(4451315353)' '[{isResolved:false, comment_ids:[4451315353]}]'
+  ser_case 'unknown icon label on an inline finding fails closed' 1 'rev(5747872230)' 'com(4451423418) | .body |= sub("> Major\\*\\*"; "> Severe**")' '[{isResolved:false, comment_ids:[4451423418]}]' 'gating it as unclassified (p1)'
+  ser_case 'unknown row beside a recognised Minor row still fails closed' 1 'rev(5747737952)' 'com(4451315353) | .body += ("\n\n" + icon("Severe") + " · **Security & Privacy** · **Quick win**")' '[{isResolved:false, comment_ids:[4451315353]}]' 'gating it as unclassified (p1)'
+  ser_case 'unknown icon label on a resolved inline finding clears' 0 'rev(5747872230)' 'com(4451423418) | .body |= sub("> Major\\*\\*"; "> Severe**")' '[{isResolved:true, comment_ids:[4451423418]}]'
+  ser_case 'follow-up root with a Major emoji row blocks' 1 'rev(5739617104) | .body |= sub("🔵 Trivial"; "🟠 Major")' '' '' 'CodeRabbit blocking-tier unresolved: 1'
+  ser_case 'follow-up root with an icon-label Major row blocks' 1 'rev(5739617104) | .body |= sub("\\*\\*🔵 Trivial\\*\\*"; icon("Major"))' '' '' 'CodeRabbit blocking-tier unresolved: 1'
+  ser_case 'follow-up root with an unknown severity label fails closed' 1 'rev(5739617104) | .body |= sub("🔵 Trivial"; "🟣 Severe")' '' '' 'CodeRabbit blocking-tier unresolved: 1'
+  ser_case 'overridebroadway#277 5747953237 outside-diff icon-label Major blocks' 1 'rev(5747953237)' '' '' 'CodeRabbit blocking-tier unresolved: 1'
+  ser_case 'overridebroadway#277 5748027323 outside-diff icon-label Majors block' 1 'rev(5748027323)'
+  # Unknown, truncated and malformed variants still hold.
+  ser_case 'truncated root missing its autofix closer holds' 3 'rev(5747872230) | .body |= sub("\n<!-- autofix_checkbox_end -->"; "")'
+  ser_case 'root truncated before its publication marker holds' 3 'rev(5747872230) | .body |= (split("<!-- coderabbit-review-publication")[0])'
+  ser_case 'multi-batch root 1/2 holds' 3 'rev(5747872230) | .body |= sub("batch=1/1"; "batch=1/2")'
+  ser_case 'uppercase publication identity holds' 3 'rev(5747872230) | .body |= sub("publication=e435766f"; "publication=E435766F")'
+  ser_case 'marker missing its attempt identity holds' 3 'rev(5747872230) | .body |= sub(" attempt=[0-9a-f-]+"; "")'
+  ser_case 'unheaded prose between marker and checkbox holds' 3 'rev(5747872230) | .body |= sub("\n<!-- autofix_checkbox_start -->"; "\nUnread finding text.\n\n<!-- autofix_checkbox_start -->")'
+  ser_case 'root without the vendor header at byte zero holds' 3 'rev(5747872230) | .body |= ltrimstr("<!-- coderabbit-ai-generated:v1 -->\n\n")'
+  ser_case 'autofix block ahead of the marker holds' 3 'rev(5747872230) | .body |= ("<!-- coderabbit-ai-generated:v1 -->\n\n<!-- autofix_checkbox_start -->\n- [ ] <!-- {\"checkboxId\":\"4b0d0e0a-96d7-4f10-b296-3a18ea78f0b9\"} --> Fix comments: Fix CodeRabbit comments on this PR\n<!-- autofix_checkbox_end -->\n\n<!-- coderabbit-review-publication v1 publication=e435766f-a8b6-41c1-8862-0909820e8add attempt=fc79fb02-7f28-4f1c-b4e6-d0dc47debbb5 batch=1/1 -->")'
+  ser_case 'follow-up root declaring a rate limit holds' 3 'rev(5739617104) | .body |= sub("## Follow-up Comments"; "## Follow-up Comments\n\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->")'
+  ser_case 'root followed by a later unknown run holds' 3 'rev(5747872230), (rev(5747872230) | .id = 5747872231 | .submitted_at = "2026-11-03T06:07:00Z" | .body = "Unknown next report")'
+  unset -f ser_case
+}
+test_review_serialization_2927
+if [ "${1:-}" = --review-serialization-only ]; then
+  printf 'review serialization: %s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 # ---------------------------------------------------------------------------
 # Test 1: Gate disabled — exit 0, no API calls.
 # ---------------------------------------------------------------------------

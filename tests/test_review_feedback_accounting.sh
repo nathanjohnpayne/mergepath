@@ -1386,6 +1386,58 @@ JSON
 run_gate
 assert_eq 0 "$RUN_RC" "a configured identity named by an earlier stacked confirmation keeps its same-second allowance"
 
+# #2927: CodeRabbit's icon-label severity row, from verbatim bodies. Before the
+# fix overridebroadway#277 accounted these reviews as posted 0 / clear: the
+# outside-diff Major sat in a blockquoted CAUTION block whose only severity was
+# `<picture>...</picture> Major`, which no marker matched.
+SERIALIZATION_FIXTURE="$ROOT/tests/fixtures/coderabbit_review_serialization_2927.json"
+serialization_review() {
+  jq -c --argjson id "$1" '
+    [.reviews[] | select(.id == $id)
+     | {id, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", submitted_at, state,
+        user: {login: "coderabbitai[bot]"}, body}]' "$SERIALIZATION_FIXTURE"
+}
+reset_fixtures
+serialization_review 5747953237 >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: icon-label outside-diff Major review body blocks"
+assert_eq review-body "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "#2927: icon-label Major is a review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label Major grades p1"
+
+reset_fixtures
+serialization_review 5747953237 | jq -c 'map(.body |= gsub("</picture> Major"; "</picture> Severe"))' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: unknown icon label in a review body fails closed"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: unclassified severity row grades at the top CodeRabbit tier"
+
+reset_fixtures
+jq -c '[.inline_comments[] | select(.id == 4451423418)
+        | {id, created_at: "2026-08-18T22:00:00Z", user: {login: "coderabbitai[bot]"},
+           path, line, body}]' "$SERIALIZATION_FIXTURE" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: unanswered icon-label inline Major blocks"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label inline Major grades p1"
+
+reset_fixtures
+jq -c '[.inline_comments[] | select(.id == 4451315353)
+        | {id, created_at: "2026-08-18T22:00:00Z", user: {login: "coderabbitai[bot]"},
+           path, line: (.line // 1), body}]' "$SERIALIZATION_FIXTURE" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label inline Minor grades p2"
+jq -c 'map(.body += "\n\n**<picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg\" alt=\"\"></picture> Severe** · **Security & Privacy** · **Quick win**")' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: an unknown row beside a recognised Minor row still grades p1"
+
+reset_fixtures
+jq -cn '[{id: 902, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", submitted_at: "2026-08-18T22:00:00Z",
+          state: "COMMENTED", user: {login: "coderabbitai[bot]"},
+          body: "<!-- coderabbit-ai-generated:v1 -->\n\n<details>\n<summary>🔇 Additional comments: 1</summary><blockquote>\n\n`3-3`: LGTM!\n\n<!-- cr-comment:v1:1d0917d279ece1649e83f86d -->\n\n</blockquote></details>"}]' \
+  >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "#2927: an untiered LGTM additional comment is not an unclassified finding"
+
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
 [

@@ -536,7 +536,7 @@ test_tier_extraction_error_refuses_supplied_fallback() {
     # Only the fixed marker extractor fails; config/JSON/API reads stay real.
     cat >"$dir/bin/grep" <<EOF
 #!/usr/bin/env bash
-if [ "\${1:-}" = -oE ] && [ "\${2:-}" = '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' ]; then
+if [ "\${1:-}" = -oE ] && [ "\${2:-}" = '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor|</picture> (Critical|Major|Minor|Trivial)\*\*' ]; then
   printf '%s' '$partial'
   exit 2
 fi

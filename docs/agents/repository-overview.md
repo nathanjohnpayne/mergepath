@@ -1,5 +1,7 @@
 # Repository Overview
 
+The CodeRabbit severity gate recognizes the single-batch publication root review object (status-only or `## Follow-up Comments`) and grades CodeRabbit's icon-label severity rows; a severity row no reader can grade counts as an unclassified p1 finding in the gate and in feedback accounting instead of as no finding. Other shapes still hold; the contract and native controls live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_severity_gate.sh --review-serialization-only` (#2927).
+
 The CodeRabbit severity gate recognizes complete metadata-only batched continuations paired to an existing same-head root report, preserving that report's findings and correlation floor. Incomplete, ambiguous or unread publications still hold; the parser contract and native controls live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_severity_gate.sh --batch-continuations-only` (#2804).
 
 The polling requester checks existing resume vetoes before its optional force-push tie read, preserving eligible-request retry and failure behavior. The reporting timeline read remains independent; the contract and native controls live in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_ack.sh --resume-tie-order-only` (#2793).
