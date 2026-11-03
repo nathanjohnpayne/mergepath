@@ -357,7 +357,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-154.** Repeat-after-rebuttal — the reviewer re-flags after a rebuttal — is a disagreement and escalates. ● — REVIEW_POLICY.md § Detection signals
 
-**R-155.** Runaway rounds — the counter exceeding the cap — escalates. ● — REVIEW_POLICY.md § Detection signals
+**R-155.** Runaway — the Phase 4b barrier's `runaway` stop, where a spent request ceiling saw every allowed request draw a blocking review whose findings were not all proven fixed — escalates to the human tiebreaker, alongside the separate blocking-review budget stop; a spent request ceiling alone is cost exhaustion routed to Phase 4b, proven-fixed rounds leave the runaway count only (they still spend the blocking budget), and an exact-head owner tiebreak clears only its named stop and grants no approval or budget refund. ● — REVIEW_POLICY.md § Detection signals (signals 2–4), AGENTS.md
 
 **R-156.** On escalation the loop stops entirely: no more commits, no re-trigger, no merge gate, no merge. ○ — REVIEW_POLICY.md § Escalation procedure
 
