@@ -35,6 +35,8 @@ TESTS=(
   "tests/test_cloud_environment.sh"
   # #1057 D + G: the local-agent handback and the thread-resolution CI lane.
   "tests/test_local_agent_handback.sh"
+  # #2938: --mode pr-assets, the scoped upload credential's own slot.
+  "tests/test_op_preflight_pr_assets.sh"
 )
 
 FAILED=0

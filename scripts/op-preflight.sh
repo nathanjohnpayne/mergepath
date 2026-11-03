@@ -48,10 +48,16 @@
 #             because a cache hit can also export review PATs into the caller
 #   all     — review and deploy credentials together; do not use for repository
 #             builds or as a deployment setup because it combines both contexts
+#   pr-assets — ONLY the author credential scoped to nathanjohnpayne/pr-assets
+#             (OP_PREFLIGHT_PR_ASSETS_PAT), for scripts/pr-assets-upload.sh
+#             (#2938). Cached in its own slot with its own TTL anchor and
+#             emitted alone: it never reads, rewrites or exports the review
+#             PATs, and review/all never fetch it. `--check --mode pr-assets
+#             --print-exports` re-emits it without op; --purge removes it.
 #
 # Flags:
 #   --agent <name>   Agent name: claude, cursor, or codex (required except --purge-all)
-#   --mode <mode>    review, deploy, or all (default: review). #282
+#   --mode <mode>    review, deploy, all, or pr-assets (default: review). #282
 #   --check          Validate the session file is fresh, WITHOUT invoking
 #   --status         (alias for --check) op. Never burns biometric, never
 #                    warms SSH, never reads ADC. Exits non-zero if cache
@@ -150,6 +156,11 @@ umask 077  # Restrict file permissions before any mktemp/cache writes
 # ── PAT lookup table ──────────────────────────────────────────────────
 # Must match REVIEW_POLICY.md § PAT lookup table.
 AUTHOR_PAT_ITEM="sm5kopwk6t6p3xmu2igesndzhe"
+# The author's fine-grained PAT scoped to nathanjohnpayne/pr-assets (#2936
+# owner decision, #2938). Its secret is the item's `credential` field, not
+# `token`. Fetched only by --mode pr-assets.
+PR_ASSETS_PAT_ITEM="5yaa7l2s7lrxp2vl6cem43ksre"
+PR_ASSETS_PAT_REF="op://Private/${PR_ASSETS_PAT_ITEM}/credential"
 
 reviewer_pat_item_for() {
   case "$1" in
@@ -312,7 +323,7 @@ fi
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*-deploy-*.slot' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*-deploy-*.slot' -o -name 'op-preflight-*-pr-assets.slot' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -325,8 +336,8 @@ fi
 # that concurrent agent sessions clobber. This was added in #259, silently
 # dropped by a bulk sync, and restored in #534 — the regression test
 # test_deploy_mode_requires_agent guards against another drop.
-if [[ "$MODE" == "review" || "$MODE" == "all" || "$MODE" == "deploy" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
-  arg_error "--agent is required for review, deploy, all, --purge, or --check mode." "$ARG_USAGE"
+if [[ "$MODE" == "review" || "$MODE" == "all" || "$MODE" == "deploy" || "$MODE" == "pr-assets" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
+  arg_error "--agent is required for review, deploy, all, pr-assets, --purge, or --check mode." "$ARG_USAGE"
 fi
 
 if [[ -n "$AGENT" ]] && [[ -z "$(reviewer_pat_item_for "$AGENT" 2>/dev/null || true)" ]]; then
@@ -346,6 +357,8 @@ fi
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
 SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
+# `.slot`, never `.env`, for the same reason as the deploy slots below.
+PR_ASSETS_SLOT="$CACHE_DIR/op-preflight-$AGENT-pr-assets.slot"
 BIOMETRIC_LOG="$CACHE_DIR/biometric-log"  # #282: append a one-line
                                           # record on each fresh fetch.
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
@@ -676,13 +689,13 @@ log_biometric_trigger() {
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
-  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER"
+  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER" "$PR_ASSETS_SLOT"
   # Per-project SA keys + deploy slots, and the pre-slot single SA file.
   rm -f "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json" \
         "$CACHE_DIR/op-preflight-$AGENT-firebase-sa-"*.json \
         "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.slot \
         "$CACHE_DIR/op-preflight-$AGENT-"*.staged.*
-  echo "# Purged session file + ADC tempfile + Firebase SA tempfiles + deploy slots + SSH-warm marker for agent=$AGENT" >&2
+  echo "# Purged session file + ADC tempfile + Firebase SA tempfiles + deploy slots + pr-assets slot + SSH-warm marker for agent=$AGENT" >&2
   exit 0
 fi
 
@@ -719,6 +732,11 @@ if $DRY_RUN; then
     echo "# Session age:    n/a (no session file)" >&2
   fi
   echo "#" >&2
+  if [[ "$MODE" == "pr-assets" ]]; then
+    echo "# pr-assets slot: $PR_ASSETS_SLOT" >&2
+    echo "# Would read: pr-assets upload PAT ($PR_ASSETS_PAT_ITEM, field credential)" >&2
+    echo "# Would skip: reviewer/author PATs, SSH warming, deploy credentials" >&2
+  fi
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
     if $SERVICE_ACCOUNT_TOKEN_MODE; then
       if [[ -n "${OP_PREFLIGHT_REVIEWER_PAT_REF:-}" ]]; then
@@ -1375,6 +1393,111 @@ emit_deploy_failure_guard() {
   printf '%s\n' "$DEPLOY_CLEAR_STMT"
   emit_eval_guard "--mode deploy loaded no deploy credential for Firebase project '${firebase_project:-none}'; deploy variables cleared (see stderr)"
 }
+
+# ── pr-assets mode (#2938) ────────────────────────────────────────────
+# Self-contained, and it exits here. The scoped upload credential lives in
+# its own slot ($PR_ASSETS_SLOT) with its own TTL anchor and source ref, so
+# this mode never reads, rewrites or exports the session file's PATs, and
+# review/all never fetch or emit it: the scoped token reaches a shell only
+# when an upload asks for it. Same contracts as the PAT paths above: --check
+# never invokes op, prints exports only with --print-exports, and every
+# failure leaves a statement on stdout that fails when evaluated.
+pr_assets_slot_fresh() {
+  [[ -f "$PR_ASSETS_SLOT" ]] || return 1
+  local created now
+  created=$(grep '^OP_PREFLIGHT_PR_ASSETS_CREATED_AT_EPOCH=' "$PR_ASSETS_SLOT" 2>/dev/null | cut -d= -f2- | tr -d "'\"" || true)
+  [[ "$created" =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  (( now - 10#$created < TTL_SECONDS )) || return 1
+  # A slot minted from another 1Password item (a remap) is a miss, exactly
+  # as for the reviewer PAT's source ref above.
+  grep -qxF "OP_PREFLIGHT_PR_ASSETS_PAT_SOURCE_REF=$(printf '%q' "$PR_ASSETS_PAT_REF")" "$PR_ASSETS_SLOT" 2>/dev/null
+}
+pr_assets_slot_token() { # only ever called inside $( ), into a variable
+  # shellcheck disable=SC1090
+  ( unset OP_PREFLIGHT_PR_ASSETS_PAT; . "$PR_ASSETS_SLOT" 2>/dev/null; printf '%s' "${OP_PREFLIGHT_PR_ASSETS_PAT:-}" )  # TOKEN_OUTPUT_EXEMPT: returns the cached value to a $( ) capture, never to a terminal (#2938)
+}
+emit_pr_assets_failure_guard() { # <message>
+  # Drop a value an earlier eval left in the caller's shell, then fail.
+  printf 'unset OP_PREFLIGHT_PR_ASSETS_PAT\n'
+  emit_eval_guard "$1"
+}
+
+if [[ "$MODE" == "pr-assets" ]]; then
+  if $CHECK; then
+    pr_assets_token=""
+    if pr_assets_slot_fresh; then
+      pr_assets_token="$(pr_assets_slot_token)"
+    fi
+    if [[ -z "$pr_assets_token" ]]; then
+      echo "# preflight: pr-assets credential cache missing or stale for agent=$AGENT" >&2
+      echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode pr-assets" >&2
+      emit_check_failure_guard
+      exit 2
+    fi
+    if $PRINT_EXPORTS; then
+      printf 'export OP_PREFLIGHT_PR_ASSETS_PAT=%q\n' "$pr_assets_token"  # TOKEN_OUTPUT_EXEMPT: emitting the cached value for the caller's eval IS --print-exports' contract (#2938)
+    else
+      emit_check_compat_guard
+    fi
+    echo "# preflight: --check ok (pr-assets credential cached, no biometric)" >&2
+    exit 0
+  fi
+
+  if ! $REFRESH && pr_assets_slot_fresh; then
+    pr_assets_token="$(pr_assets_slot_token)"
+    if [[ -n "$pr_assets_token" ]]; then
+      printf 'export OP_PREFLIGHT_PR_ASSETS_PAT=%q\n' "$pr_assets_token"  # TOKEN_OUTPUT_EXEMPT: emitting the cached value for the caller's eval IS this mode's contract (#2938)
+      echo "# preflight: pr-assets credential cache hit, no biometric burned" >&2
+      exit 0
+    fi
+  fi
+
+  if ! command -v op &>/dev/null; then
+    echo "Error: 1Password CLI (op) not found." >&2
+    emit_pr_assets_failure_guard "--mode pr-assets: 1Password CLI (op) not found"
+    exit 1
+  fi
+  echo "# Preflight: reading the pr-assets upload credential (one biometric prompt)..." >&2
+  if $REFRESH; then log_biometric_trigger "refresh"; else log_biometric_trigger "full-fetch"; fi
+  pr_assets_err_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-read-err-XXXXXX")"
+  pr_assets_token=""
+  pr_assets_rc=0
+  if pr_assets_token="$(op read "$PR_ASSETS_PAT_REF" 2>"$pr_assets_err_file")"; then
+    pr_assets_rc=0
+  else
+    pr_assets_rc=$?
+  fi
+  if [[ "$pr_assets_rc" -ne 0 || -z "$pr_assets_token" ]]; then
+    pr_assets_error="$(scrub_op_error "$pr_assets_err_file")"
+    rm -f "$pr_assets_err_file"
+    echo "Error: failed to read the pr-assets upload credential ($PR_ASSETS_PAT_ITEM)." >&2
+    if [[ -n "$pr_assets_error" ]]; then
+      echo "1Password CLI: $pr_assets_error" >&2
+    fi
+    # A failed (re)fetch must not leave an older token for the next hit.
+    rm -f "$PR_ASSETS_SLOT"
+    emit_pr_assets_failure_guard "--mode pr-assets could not read the upload credential (see stderr)"
+    exit 1
+  fi
+  rm -f "$pr_assets_err_file"
+
+  # Stage then rename, so a concurrent reader never sources a half-written
+  # slot. Every value is %q-quoted: the slot is sourced on the next read.
+  pr_assets_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-pr-assets.staged.XXXXXX")"
+  {
+    printf '# op-preflight pr-assets credential slot — do NOT edit by hand.\n'
+    printf 'OP_PREFLIGHT_PR_ASSETS_CREATED_AT_EPOCH=%s\n' "$(date +%s)"
+    printf 'OP_PREFLIGHT_PR_ASSETS_PAT_SOURCE_REF=%q\n' "$PR_ASSETS_PAT_REF"
+    printf 'OP_PREFLIGHT_PR_ASSETS_PAT=%q\n' "$pr_assets_token"  # TOKEN_OUTPUT_EXEMPT: writing the value to the chmod-600 slot IS the cache's contract (#2938)
+  } > "$pr_assets_staged"
+  chmod 600 "$pr_assets_staged"
+  mv -f "$pr_assets_staged" "$PR_ASSETS_SLOT"
+
+  printf 'export OP_PREFLIGHT_PR_ASSETS_PAT=%q\n' "$pr_assets_token"  # TOKEN_OUTPUT_EXEMPT: emitting the fetched value for the caller's eval IS this mode's contract (#2938)
+  echo "# preflight: pr-assets credential loaded (slot $PR_ASSETS_SLOT, TTL ${TTL_SECONDS}s)" >&2
+  exit 0
+fi
 
 if $CHECK; then
   if ! session_is_fresh; then

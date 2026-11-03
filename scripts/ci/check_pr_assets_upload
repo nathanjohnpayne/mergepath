@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# scripts/ci/check_pr_assets_upload — CI entry point for #2938.
+#
+# Runs tests/test_pr_assets_upload.sh, the hermetic suite for
+# scripts/pr-assets-upload.sh: a local bare repository stands in for
+# nathanjohnpayne/pr-assets and a PATH-shimmed gh serves the REST reads.
+# It covers the refusals (private/internal/other-owner source, wrong
+# identity, wrong destination, non-image, unsafe name, collision), the
+# SHA-pinned output, the concurrent-push retry and its bound, signing, and
+# that no ref is created in the source repository.
+#
+# The script and its suite are manifest-canonical (consumers: all), so a
+# missing file is a broken sync, never a consumer SKIP. Needs git and jq.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_pr_assets_upload.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_pr_assets_upload: ERROR (missing tests/test_pr_assets_upload.sh)" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_pr_assets_upload: ERROR (jq is required by the suite's gh stub)" >&2
+  exit 1
+fi
+
+if ! bash "$TEST_SCRIPT"; then
+  echo "check_pr_assets_upload: FAIL"
+  exit 1
+fi
+echo "check_pr_assets_upload: PASS"

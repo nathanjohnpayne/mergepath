@@ -1996,6 +1996,27 @@ paths:
   - path: tests/test_op_preflight_token_mode.sh
     type: canonical
     consumers: all
+  # `--mode pr-assets` suite (#2938), run by check_op_preflight_contract.
+  - path: tests/test_op_preflight_pr_assets.sh
+    type: canonical
+    consumers: all
+  # The canonical PR-screenshot upload (#2938, part of #2935): commits files
+  # to nathanjohnpayne/pr-assets with the identity-checked, pr-assets-scoped
+  # author credential (op-preflight --mode pr-assets) and prints SHA-pinned
+  # Markdown image lines. Refuses private source repositories (public-only
+  # v1). Its suite runs under check_pr_assets_upload.
+  - path: scripts/pr-assets-upload.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity on the upload credential
+      - "scripts/lib/credential-class.sh"   # fine-grained token gate; identity-check.sh sources it too
+      - "scripts/op-preflight.sh"           # --mode pr-assets caches OP_PREFLIGHT_PR_ASSETS_PAT
+  - path: tests/test_pr_assets_upload.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/pr-assets-upload.sh"       # the subject
   - path: tests/test_helper_autosource.sh
     type: canonical
     consumers: all
@@ -2871,6 +2892,9 @@ paths:
       - "tests/test_agent_capability_probe.sh" # check_op_preflight_contract (#1057)
       - "tests/test_cloud_environment.sh"      # check_op_preflight_contract (#1057 F)
       - "tests/test_local_agent_handback.sh"   # check_op_preflight_contract (#1057 D, G)
+      - "tests/test_op_preflight_pr_assets.sh"  # check_op_preflight_contract (#2938)
+      - "tests/test_pr_assets_upload.sh"       # check_pr_assets_upload (#2938)
+      - "scripts/pr-assets-upload.sh"          # check_pr_assets_upload subject (#2938)
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
       - "tests/fixtures/coderabbit_quota_refusal.json"  # check_phase_4b_automation quota probes (#2120)
       - "tests/fixtures/coderabbit_status_refusal.json" # check_phase_4b_automation status probes (#2120)
