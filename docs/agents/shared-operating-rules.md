@@ -184,6 +184,54 @@ Finish the round instead: fix or rebut the findings and push, request the next r
 
 A pull request with no handoff is fair game for any later session, including a scheduled resume routine, to pick up and continue from its newest event; a pull request with a handoff is left to the identity the handoff names. A handoff stays in force for as long as its marker is on the pull request, whatever happens after it; no later push, review or comment clears it. The identity it names clears it when the round is taken back, by editing or deleting the handoff comment so it no longer carries the marker. This rule is about the state a session leaves behind, not about who caused the wait: a session that is waiting on CI or on a requested review may end, because a machine acts next; a session that is holding an answered-for verdict may not.
 
+## Filing an issue: fill out every triage field at creation
+
+The agent that files an issue holds the context a later board-triage pass would have to reconstruct from a cold read, so it fills out every triage field when it creates the issue, using only evidence it can name. Where a field cannot be decided from that evidence, the issue gets `decision-needed` and the open question in its body; a field is never filled by guessing. Issue writes go through `scripts/gh-as-author.sh` as `nathanjohnpayne`, with the body passed by `--body-file`.
+
+1. **Labels.** Exactly one `size:` label, exactly one `priority:` label, and exactly one of `agent-action` / `human-action`, plus `decision-needed` when the issue cannot proceed until a human decides something. Choose each by its canonical description. The canonical label set has one source, the `BOOTSTRAP_LABELS` list in the hub's new-repo bootstrap, specified in [`specs/bootstrap_label_seeding.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/bootstrap_label_seeding.md) (hub-only, so the link is absolute), which names the file that holds it; the fleet label sync keeps every repository's labels in step with it. `priority:normal` is the default; `priority:high` and `priority:critical` need the evidence their descriptions require, cited in the body, and `priority:low` applies only when the issue itself says the work is optional. Add the repository's own type or area labels where it defines them, and never create a label outside the canonical set and the repository's own. Do not add or remove the merge-gate labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`) or `needs-local-agent` when filing.
+2. **Dependencies.** Record every blocked-by / blocking relationship with GitHub's native issue relationships (the issue's *Relationships* sidebar, or `POST repos/OWNER/REPO/issues/N/dependencies/blocked_by` with the blocker's numeric database `id`, not its number), not as body text. A dependency exists only when one issue cannot be completed until the other lands. A shared topic is not a dependency, and neither is a sub-issue link.
+3. **Lane.** Leave the issue in `Backlog`, where the board's *Item added to project* workflow puts it, unless the `Ready` entry rule in [`scripts/gh-projects/README.md` § Status lanes](../../scripts/gh-projects/README.md#status-lanes) is met (the issue states the problem, the expected outcome, and how to verify it, and every blocker is closed) and, for a `size:L` issue, its sub-issues are filed. Move it with `scripts/gh-projects/move-item.sh` (`--add-if-missing` when it is not on the board yet), then place it as [Ordering the Ready column](#ordering-the-ready-column) says.
+4. **Routing.** Unless the issue is a `size:L` parent, pick its tier from [Model Routing § Routing tiers](model-routing.md#routing-tiers) and write both of that tier's routes into the body as the [route marker](#the-route-marker). When the repository's board has the four routing fields, set them to the same values in the same step. When the evidence does not settle the tier, leave the marker and the fields unset and add `decision-needed` with the question; the issue stays in `Backlog` and is not started until its route is decided.
+5. **`size:L` decomposition.** File a `size:L` issue together with its `size:S` / `size:M` sub-issues. Create each sub-issue through the author wrapper like any other issue, then link it to the parent as a native sub-issue: `POST repos/OWNER/REPO/issues/<parent>/sub_issues` with the child's numeric database `id` as `sub_issue_id`, which `link_sub_issue` in `scripts/gh-projects/lib.sh` wraps. Each sub-issue has **Inputs**, **Outputs**, **Acceptance criteria**, and **Validation** sections and its own labels, dependencies, and route. If the scope cannot be split without inventing it, file the parent alone with `decision-needed`, leave it in `Backlog`, and list the questions that would unblock the split.
+6. **Body.** Acceptance criteria an agent can verify, and a validation step (a test, command, or check) or a note on why none applies.
+
+### The route marker
+
+An issue's model and effort route lives on the issue, as one hidden line in its body. The board's routing fields mirror it but are not its source: a Claude cloud session can read an issue body with one REST call (`GET repos/OWNER/REPO/issues/N`), but it cannot read the boards, which belong to the `nathanjohnpayne` user account, outside the `repos/<owner>/<repo>/...` paths its GitHub proxy allows. The format is:
+
+```markdown
+<!-- mergepath-route: anthropic=<model>/<effort> openai=<model>/<effort> -->
+```
+
+Each value is the board option's name, lowercased, with spaces replaced by `-`. These are the only valid values:
+
+| Half | Model: board option → value (fields `Anthropic model`, `OpenAI model`) | Effort (fields `Anthropic effort`, `OpenAI effort`) |
+|---|---|---|
+| `anthropic` | Haiku 4.5 → `haiku-4.5`, Sonnet 5.5 → `sonnet-5.5`, Opus 5.5 → `opus-5.5`, Fable 5.1 → `fable-5.1` | `low`, `medium`, `high` |
+| `openai` | GPT-6 Luna → `gpt-6-luna`, GPT-6.1 Sol → `gpt-6.1-sol`, GPT-6 Astra → `gpt-6-astra` | `low`, `medium`, `high`, `xhigh` |
+
+- An issue carries exactly one marker, on its own line, with both halves.
+- A `size:L` parent carries no marker; each of its sub-issues does.
+- Changing a route means replacing the marker line in place, never adding a second one, and updating the board fields in the same step when the board has them. Replacing the marker is the only routing edit a triage pass makes to an existing issue body.
+- When the marker and the board fields disagree, the marker wins. Whoever notices reports the drift to the owner instead of silently rewriting either side.
+
+### Ordering the Ready column
+
+The `Ready` entry rule says an issue can be started, not that it should be next, and no workflow orders the column. So an agent that moves an issue to `Ready`, whether at filing, in triage, or when its last blocker closes, also places it in the column: by priority tier first (`priority:critical`, then `high`, `normal`, `low`), then in dependency order within a tier, blockers above what they block, so an issue that other open issues are waiting on sits above one that nothing waits on. The top `Ready` item is then the next one to take, skipping any `size:L` parent: a parent never gets a branch of its own, so its work is taken through its sub-issues. Whoever changes the priority of an issue already in `Ready` places it again the same way.
+
+No helper in `scripts/gh-projects/` positions items. Place one by dragging its card on the board, or with the Projects GraphQL mutation `updateProjectV2ItemPosition` (`projectId`, `itemId`, and `afterId`, the item it should follow; omit `afterId` to move it to the top), run as `nathanjohnpayne`, the identity the board helpers verify. This is the board's manual order, which a view sorted by a field does not show. A session that cannot reach GraphQL hands the placement to one that can, like any other board move.
+
+## Starting an issue: read and honor its route
+
+Before starting work on an issue, and after the claim check in [Link the issue a pull request resolves](#link-the-issue-a-pull-request-resolves), read the issue's [route marker](#the-route-marker) and honor the half for the provider your session runs on: `anthropic` for a Claude model, `openai` for an OpenAI model. Read it with `scripts/gh-projects/read-route.sh` when your checkout has that helper (nathanjohnpayne/mergepath#2848 adds it to the board kit); without it, read the issue body over REST (`gh api repos/OWNER/REPO/issues/N --jq .body`) and apply the marker rules yourself.
+
+- **No marker:** keep the session's model and effort, unless the issue carries `decision-needed` for its route, in which case it is not ready to start.
+- **A different model or effort:** a session cannot change its own model, so delegate the implementation to a subagent configured with the route's model and effort.
+- **An unavailable model:** if neither the session nor any subagent it can start runs the route's model, do not substitute another. Report the mismatch to the owner once, leave the issue unstarted, and continue with other work.
+- **A malformed or duplicated marker:** do not guess which route was meant. Report it to the owner once, leave the issue unstarted, and continue with other work.
+
+A single comment on the issue is enough for either report; check for an earlier one before posting.
+
 ## Link the issue a pull request resolves
 
 When a pull request resolves an issue, its body names that issue with a closing keyword: `Closes #N` on its own line, one line per issue, or `Closes OWNER/REPO#N` for an issue in another repository (the same qualification applies to `Refs`). An issue number in the title, a `(#N)` suffix, or `Refs #N` mentions the issue without linking it. GitHub honors a closing keyword only when the pull request targets the repository's default branch; for a pull request into any other branch the keyword links nothing, so move the issue between lanes by hand.
