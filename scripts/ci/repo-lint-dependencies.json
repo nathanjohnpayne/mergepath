@@ -461,6 +461,7 @@
       "tests/test_helper_autosource.sh",
       "tests/test_local_agent_handback.sh",
       "tests/test_op_preflight_check.sh",
+      "tests/test_op_preflight_pr_assets.sh",
       "tests/test_op_preflight_token_mode.sh",
       "tests/test_preflight_agent_name.sh",
       "scripts/agent-capability-probe.sh",
@@ -553,6 +554,12 @@
       ".github/workflows/trusted-policy-mutations.yml",
       ".github/workflows/weekly-drift-audit.yml",
       ".github/workflows/weekly-feedback-sweep.yml"
+    ],
+    "check_pr_assets_upload": [
+      "tests/test_pr_assets_upload.sh",
+      "scripts/pr-assets-upload.sh",
+      "scripts/identity-check.sh",
+      "scripts/lib/credential-class.sh"
     ],
     "check_pr_audit_codex_clearance": [
       "scripts/ci/fixtures/pr-audit-codex-clearance/*",
