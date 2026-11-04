@@ -519,7 +519,7 @@ echo "${REPO_LINT_FULL:-unset} ${REPO_LINT_CHECKS_JSON:-unset} ${REPO_LINT_SHARD
 printf '%s\n' "$1" >> "$out/start-order"
 touch "$out/ran.$1"
 if [ -f "$out/slow.$1" ]; then sleep 3; fi
-if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 120; touch "$out/unhung.$1"; fi
+if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 30; touch "$out/unhung.$1"; fi
 sleep 1
 rm -f "$out/running/$1"
 SH
@@ -1214,8 +1214,10 @@ case "$out" in *"needs flock(1) or a python3 with fcntl"*) bad "the versioned in
 
 # A supervisor killed mid-run leaves its started checks running, and they
 # keep the lock: a waiting push starts only after they end.
-# The first check hangs (the probe's hang.<check>, about two minutes), so the
-# surviving worker plainly outlives its supervisor.
+# The first check hangs (the probe's hang.<check>, 30 seconds), so the
+# surviving worker plainly outlives its supervisor: a waiter that the lock
+# did not hold back runs its three one-second checks and finishes well
+# inside the hang.
 reset_probe
 for c in check_ok check_flag check_env; do touch "$PROBE_DIR/hang.$c"; done
 git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m killed-holder
