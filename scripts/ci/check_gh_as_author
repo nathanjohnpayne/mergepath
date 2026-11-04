@@ -3,10 +3,10 @@
 #
 # Runs the unit tests for scripts/gh-as-author.sh AND for the
 # identity-check addition to scripts/hooks/gh-pr-guard.sh. Both test
-# files are under tests/; this wrapper invokes them in sequence and
-# fails on the first failure. Hard-fails (exit 1, not skip) when
-# either test script is missing, so an accidental delete/rename
-# can't silently disable this check.
+# files are under tests/; this wrapper runs them concurrently through
+# tests/lib/case-pool.sh (#2990) and fails if any one fails. Hard-fails
+# (exit 1, not skip) when either test script is missing, so an
+# accidental delete/rename can't silently disable this check.
 #
 # Mirrors the pattern used by scripts/ci/check_sync_overrides.
 
@@ -49,28 +49,55 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-FAILED=0
-if ! python3 "$REPO_ROOT/tests/test_owner_admin_override.py"; then
-  echo "check_gh_as_author: FAIL (owner admin override)" >&2
-  FAILED=1
-fi
-if ! python3 "$REPO_ROOT/tests/test_gh_comment_trigger_guard.py"; then
-  echo "check_gh_as_author: FAIL (comment trigger guard)" >&2
-  FAILED=1
-fi
-for rel in "${TESTS[@]}"; do
-  full="$REPO_ROOT/$rel"
+# Each suite is one case: a failing or missing suite adds to FAIL, which is
+# what the pool counts (#2990). The suites share no state, so the pool runs
+# them side by side and replays their output in this order.
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # both runners are invoked through the SUITES entries
+run_python_suite() { # <label> <rel>
+  if ! python3 "$REPO_ROOT/$2"; then
+    echo "check_gh_as_author: FAIL ($1)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+# shellcheck disable=SC2329
+run_bash_suite() { # <rel>
+  local full="$REPO_ROOT/$1"
   if [ ! -f "$full" ]; then
-    echo "check_gh_as_author: ERROR (missing $rel)" >&2
-    FAILED=1
-    continue
+    echo "check_gh_as_author: ERROR (missing $1)" >&2
+    FAIL=$((FAIL + 1))
+    return 0
   fi
-  echo "check_gh_as_author: running $rel"
+  echo "check_gh_as_author: running $1"
   if ! bash "$full"; then
-    echo "check_gh_as_author: FAIL ($rel)" >&2
-    FAILED=1
+    echo "check_gh_as_author: FAIL ($1)" >&2
+    FAIL=$((FAIL + 1))
   fi
+}
+SUITES=(
+  "run_python_suite 'owner admin override' tests/test_owner_admin_override.py"
+  "run_python_suite 'comment trigger guard' tests/test_gh_comment_trigger_guard.py"
+)
+for rel in "${TESTS[@]}"; do
+  SUITES+=("run_bash_suite $rel")
 done
+# A checkout behind the wave that delivers the pool runs the same suites one
+# after another: the skew costs time, never a suite.
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source "$REPO_ROOT/tests/lib/case-pool.sh"
+  for suite in "${SUITES[@]}"; do
+    eval "case_pool_add $suite"
+  done
+  case_pool_wait
+else
+  for suite in "${SUITES[@]}"; do
+    eval "$suite"
+  done
+fi
+FAILED=0
+[ "$FAIL" -eq 0 ] || FAILED=1
 
 if [ "$FAILED" -ne 0 ]; then
   echo "check_gh_as_author: FAIL"

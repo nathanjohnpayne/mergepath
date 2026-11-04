@@ -585,7 +585,26 @@ crqe_verdicts() { # issue-comments-json bot-login
 }
 
 # Read-side normalization preserves raw malformed/ambiguous observations.
+#
+# The resolver rewrites only a bot comment whose body names a `reviewed
+# commit`. When no bot body can (#2990), its output is its input, so one jq
+# pass returns the input and skips a Python start on every poll scan. The
+# fast path is a strict subset of the inputs the resolver accepts unchanged:
+# one JSON array of objects, each `user` an object or Python-falsy (a truthy
+# non-object `user` crashes the resolver, and that refusal is kept), and no
+# bot body matching the phrase case-insensitively. The `i` letters also
+# accept the dotted and dotless forms Python's IGNORECASE folds to `i`. Any
+# other input, including one jq cannot read, goes to the resolver as before.
 crqe_resolve_verdict_anchors() { # comments-json repository bot-login
+  printf '%s\n' "$1" | jq -cse --arg bot "$3" '
+    if length == 1 and (.[0] | type == "array" and all(.[];
+         type == "object"
+         and (.user | type == "object" or . == null or . == false or . == "" or . == 0 or . == [])
+         and ((if (.user | type) == "object" then .user.login else null end) == $bot
+              and (.body | type) == "string"
+              and (.body | test("rev[iİı]ewed comm[iİı]t"; "i"))
+              | not)))
+    then .[0] else error("resolve") end' 2>/dev/null && return 0
   printf '%s\n' "$1" | python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../workflow" && pwd)/resolve-codex-verdict-anchors.py" --repo "$2" --bot "$3"
 }
 

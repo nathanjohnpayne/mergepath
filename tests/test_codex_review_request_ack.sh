@@ -39,6 +39,9 @@ PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+# #2990: queued cases run concurrently; see tests/lib/case-pool.sh.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
 
 # #951: a diagnostic must never carry a value that could be a credential.
 # The bridge assertions below read whatever OP_PREFLIGHT_AUTHOR_PAT the
@@ -1639,7 +1642,7 @@ test_default_reply_deadline_is_1800() {
   fi
 }
 
-[ "${1:-}" = --resume-tie-order-only ] || test_prior_reaction_cannot_clear_backdated_ordinary_push
+[ "${1:-}" = --resume-tie-order-only ] || case_pool_add test_prior_reaction_cannot_clear_backdated_ordinary_push
 # Drive the shipped author wrapper and its canonical trigger authorization.
 # The existing transport fake remains only the final GH write sink.
 make_real_wrapper_case() {
@@ -1737,7 +1740,7 @@ test_real_wrapper_duplicate_ack_retry_keeps_polling() {
   done
 }
 
-[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_duplicate_ack_retry_keeps_polling
+[ "${1:-}" = --resume-tie-order-only ] || case_pool_add --first test_real_wrapper_duplicate_ack_retry_keeps_polling
 
 # #1362: two requesters for the same PR both decide to post against an empty
 # timeline. The first wrapper is held at its authorization recount; the second
@@ -1790,7 +1793,7 @@ test_real_wrapper_claim_lets_one_of_two_requesters_post() {
   done
 }
 
-[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_claim_lets_one_of_two_requesters_post
+[ "${1:-}" = --resume-tie-order-only ] || case_pool_add test_real_wrapper_claim_lets_one_of_two_requesters_post
 
 # #1362 staggered interleaving (direct Codex review on #2715): B completes its
 # pre-flight scan and resume check while the PR has no request, A then posts,
@@ -1832,7 +1835,7 @@ test_real_wrapper_staggered_requester_refuses() {
   [ "$FAIL" -ne "$before" ] || pass "#1362 real wrapper: a requester decided before another posted refuses, even after its later reads see that request"
 }
 
-[ "${1:-}" = --resume-tie-order-only ] || test_real_wrapper_staggered_requester_refuses
+[ "${1:-}" = --resume-tie-order-only ] || case_pool_add test_real_wrapper_staggered_requester_refuses
 
 # #2664 (supersedes the #2582 case): a polling run that finds an unanswered
 # request on the current head waits on it instead of posting another, so the
@@ -1936,65 +1939,66 @@ test_eligible_resume_tie_read_still_fails_closed() {
   done
 }
 
-test_eligible_resume_tie_read_still_fails_closed
-test_resume_tie_read_follows_cheap_vetoes
+case_pool_add test_eligible_resume_tie_read_still_fails_closed
+case_pool_add --first test_resume_tie_read_follows_cheap_vetoes
 if [ "${1:-}" = --resume-tie-order-only ]; then
+  case_pool_wait
   echo "Results: $PASS passed, $FAIL failed"
   [ "$FAIL" -eq 0 ]
   exit
 fi
 
-test_real_wrapper_authorizes_polling_mode_new_requests
+case_pool_add test_real_wrapper_authorizes_polling_mode_new_requests
 
-test_eyes_ack_does_not_retrigger_or_clear
-test_missing_ack_retriggers_once
-test_ack_retry_ignores_blocking_budget_value
-test_retry_cap_respected
-test_request_attempt_cap_suppresses_ack_retry_but_polls
-test_reused_final_slot_trigger_polls_arriving_response
-test_reused_final_slot_polls_on_a_young_head
-test_reused_final_slot_polls_despite_unreadable_ledger
-test_reused_final_slot_pending_stops_without_timeout_authority
-test_reused_final_slot_preserves_recorded_timeout
-test_reused_final_slot_timeout_marker_controls
-test_stale_trigger_is_not_reused_as_pending
-test_current_terminal_finding_is_not_reused_as_pending
-test_current_terminal_finding_at_cap_does_not_claim_reuse
-test_older_finding_before_final_trigger_does_not_block_reuse
-test_malformed_request_cap_does_not_change_clearance_skip
-test_skip_path_posts_no_trigger_or_ack_check
-test_missing_comment_id_fails_closed_without_timeout_marker
-test_retry_missing_comment_id_stops_without_extra_retry
-test_retry_resets_review_deadline
-test_retry_preserves_original_trigger_response
-test_ack_wait_window_is_bounded
-test_inline_author_pat_bridged_into_wrapper
-test_bridge_passes_configured_author_identity
-test_candidate_author_cannot_reset_governing_request_cap
-test_invalid_governing_author_refuses_new_write
-test_non_author_token_is_not_bridged
-test_non_bridge_path_passes_configured_identity
-test_missing_identity_checker_skips_bridge
-test_ambient_author_pat_is_not_inherited_or_echoed
-test_secret_descriptor_never_reveals_the_value
-test_resume_running_request_posts_nothing
-test_resume_requires_provider_evidence
-test_answered_request_is_not_resumed
-test_resumed_block_does_not_clear_on_stale_review
-test_resume_survives_short_freshness_window
-test_resume_survives_future_committer_date
-test_resume_read_failure_is_retried_not_reposted
-test_malformed_timeout_marker_fails_closed_on_resume
-test_expired_rerun_never_resumes
-test_marker_for_older_request_does_not_block_resume
-test_request_with_timeout_marker_is_not_resumed
-test_resume_past_deadline_posts_new_request
-test_resumed_request_expiry_posts_new_request
-test_transient_poll_failure_is_retried
-test_persistent_transient_failure_fails_closed
-test_permanent_poll_failure_is_not_retried
-test_missing_classifier_degrades_to_fail_closed
-test_default_reply_deadline_is_1800
+case_pool_add test_eyes_ack_does_not_retrigger_or_clear
+case_pool_add test_missing_ack_retriggers_once
+case_pool_add test_ack_retry_ignores_blocking_budget_value
+case_pool_add test_retry_cap_respected
+case_pool_add test_request_attempt_cap_suppresses_ack_retry_but_polls
+case_pool_add test_reused_final_slot_trigger_polls_arriving_response
+case_pool_add test_reused_final_slot_polls_on_a_young_head
+case_pool_add test_reused_final_slot_polls_despite_unreadable_ledger
+case_pool_add test_reused_final_slot_pending_stops_without_timeout_authority
+case_pool_add test_reused_final_slot_preserves_recorded_timeout
+case_pool_add test_reused_final_slot_timeout_marker_controls
+case_pool_add test_stale_trigger_is_not_reused_as_pending
+case_pool_add test_current_terminal_finding_is_not_reused_as_pending
+case_pool_add test_current_terminal_finding_at_cap_does_not_claim_reuse
+case_pool_add test_older_finding_before_final_trigger_does_not_block_reuse
+case_pool_add test_malformed_request_cap_does_not_change_clearance_skip
+case_pool_add test_skip_path_posts_no_trigger_or_ack_check
+case_pool_add test_missing_comment_id_fails_closed_without_timeout_marker
+case_pool_add test_retry_missing_comment_id_stops_without_extra_retry
+case_pool_add test_retry_resets_review_deadline
+case_pool_add test_retry_preserves_original_trigger_response
+case_pool_add test_ack_wait_window_is_bounded
+case_pool_add test_inline_author_pat_bridged_into_wrapper
+case_pool_add test_bridge_passes_configured_author_identity
+case_pool_add test_candidate_author_cannot_reset_governing_request_cap
+case_pool_add test_invalid_governing_author_refuses_new_write
+case_pool_add test_non_author_token_is_not_bridged
+case_pool_add test_non_bridge_path_passes_configured_identity
+case_pool_add test_missing_identity_checker_skips_bridge
+case_pool_add test_ambient_author_pat_is_not_inherited_or_echoed
+case_pool_add test_secret_descriptor_never_reveals_the_value
+case_pool_add test_resume_running_request_posts_nothing
+case_pool_add --first test_resume_requires_provider_evidence
+case_pool_add test_answered_request_is_not_resumed
+case_pool_add test_resumed_block_does_not_clear_on_stale_review
+case_pool_add test_resume_survives_short_freshness_window
+case_pool_add test_resume_survives_future_committer_date
+case_pool_add test_resume_read_failure_is_retried_not_reposted
+case_pool_add test_malformed_timeout_marker_fails_closed_on_resume
+case_pool_add test_expired_rerun_never_resumes
+case_pool_add test_marker_for_older_request_does_not_block_resume
+case_pool_add test_request_with_timeout_marker_is_not_resumed
+case_pool_add test_resume_past_deadline_posts_new_request
+case_pool_add test_resumed_request_expiry_posts_new_request
+case_pool_add test_transient_poll_failure_is_retried
+case_pool_add test_persistent_transient_failure_fails_closed
+case_pool_add test_permanent_poll_failure_is_not_retried
+case_pool_add test_missing_classifier_degrades_to_fail_closed
+case_pool_add --first test_default_reply_deadline_is_1800
 
 # --- #2664 bounded wait: diagnostics and handoff, no automatic retry ---------
 
@@ -2014,9 +2018,13 @@ FAILED_ROW='❌ **Failed**'
 
 # Active, unknown and stale-placeholder runs: a 300 s diagnostic, then a
 # report at the 1800 s limit and the ordinary timeout handoff. No new request.
+# One row per call when a label is given, so the pool runs the four 1800 s
+# waits side by side (#2990); no argument runs every row.
 test_codex_run_diagnostic_and_report() {
-  local label status updated want dir rc before
+  local only=${1:-} label status updated want dir rc before ran=0
   while IFS='|' read -r label status updated want; do
+    [ -z "$only" ] || [ "$label" = "$only" ] || continue
+    ran=$((ran + 1))
     before=$FAIL
     dir=$(make_case "run-report-$label" 0 0 1800)
     seed_codex_summary "$dir" "$status" aaaaaaa "$updated"
@@ -2034,6 +2042,7 @@ stale-placeholder|⏳ **Running**|2026-06-03T23:00:00Z|unknown
 unknown-status|❓ **Queued**|2026-06-04T00:00:10Z|unknown
 failed|❌ **Failed**|2026-06-04T00:00:10Z|failed
 CASES
+  [ "$ran" -gt 0 ] || fail "#2664 run report: no row is labelled '$only'"
 }
 
 # #2664, Phase 4b P1s on #2779 (review 5623593261): a held request whose tie
@@ -2139,40 +2148,52 @@ test_round4_head_tie_edges() {
 
 # Overlapping requests on one head: the row cannot be tied to either, so a
 # Failed row reads as ambiguous, and nothing is retried or re-posted.
+# A variant name runs that one sub-run only, so the pool can run the three
+# 400 s waits side by side (#2990); no argument runs all three.
 test_overlapping_requests_are_ambiguous() {
-  local dir rc before=$FAIL
-  dir=$(make_case "run-overlap" 0 0 400)
-  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
-  set_clock_after_request "$dir" 0
-  # The head predates both requests, so both are on it.
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
-  [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 overlap: $(trigger_count "$dir") triggers posted, expected only the original"
-  jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
-    || fail "#2664 overlap: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
-  # A request from the earlier head does not overlap: its commit is dated
-  # before it but the head was pushed after it (Codex P2 on #2779), so the
-  # Failed row is reported as such.
-  dir=$(make_case "run-overlap-old-head" 0 0 400)
-  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z \
-    CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:55Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
-  jq -e '.codex_run.final_state == "failed" and .codex_run.overlapping_request == false' "$dir/out.json" >/dev/null \
-    || fail "#2664 overlap, old head: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
-  # A workflow run created after both requests does not exclude the earlier
-  # one: only the proven head transition (23:59 here) is a cutoff (direct
-  # adapter review of #2779 on 8483ba27).
-  dir=$(make_case "run-overlap-late-dispatch" 0 0 400)
-  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z \
-    CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
-  jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
-    || fail "#2664 overlap, late dispatch: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
-  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; a late workflow run excludes nothing; nothing is retried"
+  local only=${1:-} dir rc before=$FAIL
+  case "$only" in
+    ''|same-head|old-head|late-dispatch) ;;
+    *) fail "#2664 overlap: unknown variant '$only'"; return 0 ;;
+  esac
+  if [ -z "$only" ] || [ "$only" = same-head ]; then
+    dir=$(make_case "run-overlap" 0 0 400)
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 0
+    # The head predates both requests, so both are on it.
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
+    [ "$(trigger_count "$dir")" = 1 ] || fail "#2664 overlap: $(trigger_count "$dir") triggers posted, expected only the original"
+    jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
+      || fail "#2664 overlap: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  fi
+  if [ -z "$only" ] || [ "$only" = old-head ]; then
+    # A request from the earlier head does not overlap: its commit is dated
+    # before it but the head was pushed after it (Codex P2 on #2779), so the
+    # Failed row is reported as such.
+    dir=$(make_case "run-overlap-old-head" 0 0 400)
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_COMMIT_DATE=2026-06-03T23:59:00Z \
+      CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:55Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
+    jq -e '.codex_run.final_state == "failed" and .codex_run.overlapping_request == false' "$dir/out.json" >/dev/null \
+      || fail "#2664 overlap, old head: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  fi
+  if [ -z "$only" ] || [ "$only" = late-dispatch ]; then
+    # A workflow run created after both requests does not exclude the earlier
+    # one: only the proven head transition (23:59 here) is a cutoff (direct
+    # adapter review of #2779 on 8483ba27).
+    dir=$(make_case "run-overlap-late-dispatch" 0 0 400)
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:10Z"
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_PUSH_DISPATCHED_AT=2026-06-04T00:00:20Z \
+      CODEX_TEST_GQL_FORCE_PUSHES='[{"createdAt":"2026-06-03T23:59:00Z","afterCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]' CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":950,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-03T23:59:50Z"}')
+    jq -e '.codex_run.final_state == "ambiguous" and .codex_run.overlapping_request == true' "$dir/out.json" >/dev/null \
+      || fail "#2664 overlap, late dispatch: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "#2664: overlapping requests on this head make the row ambiguous; one from the earlier head does not; a late workflow run excludes nothing; nothing is retried${only:+ ($only)}"
 }
 
 # #2791: a newer author request lands while this run waits. The scan then
@@ -2181,85 +2202,105 @@ test_overlapping_requests_are_ambiguous() {
 # end of the wait the waited-on request is superseded: no timeout marker is
 # minted (the newer request is still within its own wait), no request is
 # posted, and the run exits 3 with its JSON, codex_run included.
+# A variant name runs that one sub-run only, so the pool can run the seven
+# 1800 s waits side by side (#2990); no argument runs all seven.
 test_newer_request_supersedes_the_waited_on_one() {
-  local dir rc before=$FAIL
-  dir=$(make_case "run-superseded" 0 0 1800)
-  seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:40Z"
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] \
-    && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
-    || fail "#2791 superseded: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")"
-  jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous"
-      and .codex_run.overlapping_request == true and .codex_run.handoff == "superseded"
-      and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded: $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
-  grep -q 'superseded by newer author request 5000' "$dir/err.log" \
-    || fail "#2791 superseded: the log does not name the newer request; $(tail -3 "$dir/err.log")"
+  local only=${1:-} dir rc before=$FAIL
+  case "$only" in
+    ''|superseded|no-row|answered|deleted|ack-deleted|ack-retry|blocked) ;;
+    *) fail "#2791 superseded: unknown variant '$only'"; return 0 ;;
+  esac
+  if [ -z "$only" ] || [ "$only" = superseded ]; then
+    dir=$(make_case "run-superseded" 0 0 1800)
+    seed_codex_summary "$dir" "$FAILED_ROW" aaaaaaa "2026-06-04T00:00:40Z"
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] \
+      && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+      || fail "#2791 superseded: exit $rc, $(trigger_count "$dir") trigger(s); stderr=$(tail -2 "$dir/err.log")"
+    jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous"
+        and .codex_run.overlapping_request == true and .codex_run.handoff == "superseded"
+        and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded: $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+    grep -q 'superseded by newer author request 5000' "$dir/err.log" \
+      || fail "#2791 superseded: the log does not name the newer request; $(tail -3 "$dir/err.log")"
+  fi
   # With no Review Summary row at all, a superseded request still reads
   # ambiguous, not unknown (CodeRabbit on #2846).
-  dir=$(make_case "run-superseded-no-row" 0 0 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 3 ] && jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous" and .codex_run.handoff == "superseded"' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded, no row: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  if [ -z "$only" ] || [ "$only" = no-row ]; then
+    dir=$(make_case "run-superseded-no-row" 0 0 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 3 ] && jq -e '.codex_run.diagnostic.run_state == "ambiguous" and .codex_run.final_state == "ambiguous" and .codex_run.handoff == "superseded"' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded, no row: exit $rc, $(jq -c .codex_run "$dir/out.json" 2>/dev/null)"
+  fi
   # A Codex review of HEAD after the newer request is still this run's
   # result (exit 0), but it is not reported as this request's answer.
-  dir=$(make_case "run-superseded-answered" 0 0 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" review-after-inject CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 1 ] \
-    && jq -e '.codex_run.final_state == "ambiguous" and .codex_run.superseded_by == 5000 and .codex_run.overlapping_request == true
-        and .codex_run.handoff == null and .review.id == 97' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded, answered: exit $rc, $(jq -c '{codex_run, review: .review.id}' "$dir/out.json" 2>/dev/null)"
+  if [ -z "$only" ] || [ "$only" = answered ]; then
+    dir=$(make_case "run-superseded-answered" 0 0 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" review-after-inject CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 0 ] && [ "$(trigger_count "$dir")" = 1 ] \
+      && jq -e '.codex_run.final_state == "ambiguous" and .codex_run.superseded_by == 5000 and .codex_run.overlapping_request == true
+          and .codex_run.handoff == null and .review.id == 97' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded, answered: exit $rc, $(jq -c '{codex_run, review: .review.id}' "$dir/out.json" 2>/dev/null)"
+  fi
   # A newer request seen during the wait and then deleted still supersedes
   # the waited-on one: the final scan selects the older request again, but
   # the newer run may still be active, so no marker is minted (CodeRabbit on
   # #2846).
-  dir=$(make_case "run-superseded-deleted" 0 0 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=900 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
-    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+  if [ -z "$only" ] || [ "$only" = deleted ]; then
+    dir=$(make_case "run-superseded-deleted" 0 0 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=900 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+      && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+  fi
   # The same inside the eyes-ack window: the newer request lands and is
   # deleted before the main poll starts, and the run still remembers it
   # (Phase 4b on #2846).
-  dir=$(make_case "run-superseded-ack-deleted" 120 0 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=90 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
-    && grep -q 'no Codex eyes acknowledgment' "$dir/err.log" \
-    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded in the ack window, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null); $(grep -c 'eyes acknowledgment' "$dir/err.log") ack log line(s)"
+  if [ -z "$only" ] || [ "$only" = ack-deleted ]; then
+    dir=$(make_case "run-superseded-ack-deleted" 120 0 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=90 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+      && grep -q 'no Codex eyes acknowledgment' "$dir/err.log" \
+      && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .terminal_determination == null' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded in the ack window, then deleted: exit $rc, deleted=$([ -f "$dir/state/deleted" ] && echo y || echo n), $(jq -c '{codex_run, terminal_determination}' "$dir/out.json" 2>/dev/null); $(grep -c 'eyes acknowledgment' "$dir/err.log") ack log line(s)"
+  fi
   # An unacknowledged request is not re-posted once a newer request has been
   # seen: the retry would be refused as a duplicate and the run would die
   # without codex_run (Phase 4b on #2846).
-  dir=$(make_case "run-superseded-ack-retry" 120 1 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
-  [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] && grep -q 'no acknowledgement retry' "$dir/err.log" \
-    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded in the ack window with a retry left: exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c .codex_run "$dir/out.json" 2>/dev/null); $(tail -2 "$dir/err.log")"
+  if [ -z "$only" ] || [ "$only" = ack-retry ]; then
+    dir=$(make_case "run-superseded-ack-retry" 120 1 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}')
+    [ "$rc" = 3 ] && [ "$(trigger_count "$dir")" = 1 ] && grep -q 'no acknowledgement retry' "$dir/err.log" \
+      && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded in the ack window with a retry left: exit $rc, $(trigger_count "$dir") trigger(s), $(jq -c .codex_run "$dir/out.json" 2>/dev/null); $(tail -2 "$dir/err.log")"
+  fi
   # A provider refusal posted before the newer request is filtered out while
   # that request is selected. When the newer request is deleted, the refusal
   # resurfaces against the waited-on one; the run stays superseded (exit 3),
   # not blocked (exit 4), and still reports the refusal (Phase 4b on #2846).
-  dir=$(make_case "run-superseded-blocked" 0 0 1800)
-  set_clock_after_request "$dir" 0
-  rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=300 \
-    CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}
+  if [ -z "$only" ] || [ "$only" = blocked ]; then
+    dir=$(make_case "run-superseded-blocked" 0 0 1800)
+    set_clock_after_request "$dir" 0
+    rc=$(run_fake_clock_case "$dir" absent CODEX_TEST_INJECT_AT=30 CODEX_TEST_DELETE_AT=300 \
+      CODEX_TEST_INJECT_JSON='{"id":5000,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-06-04T00:00:30Z","updated_at":"2026-06-04T00:00:30Z"}
 {"id":901,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"You have reached your Codex usage limits for code reviews.","created_at":"2026-06-04T00:00:20Z"}')
-  [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
-    && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .blocked_reason == "usage_limit" and .terminal_determination == null' "$dir/out.json" >/dev/null \
-    || fail "#2791 superseded, then a refusal resurfaces: exit $rc, $(jq -c '{codex_run, blocked_reason, terminal_determination}' "$dir/out.json" 2>/dev/null)"
-  [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker"
+    [ "$rc" = 3 ] && [ -f "$dir/state/deleted" ] && ! grep -q 'mergepath-phase-4a-terminal' "$dir/state/comments.jsonl" \
+      && jq -e '.codex_run.handoff == "superseded" and .codex_run.superseded_by == 5000 and .blocked_reason == "usage_limit" and .terminal_determination == null' "$dir/out.json" >/dev/null \
+      || fail "#2791 superseded, then a refusal resurfaces: exit $rc, $(jq -c '{codex_run, blocked_reason, terminal_determination}' "$dir/out.json" 2>/dev/null)"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "#2791: a newer request during the wait reads ambiguous, and the superseded request exits 3 with codex_run and no marker${only:+ ($only)}"
 }
 
 # A restated provider window moves the reported not-before time by its
@@ -2364,17 +2405,29 @@ test_delayed_claim_then_rerun_holds() {
   [ "$FAIL" -ne "$before" ] || pass "#2664: after a delayed claim refuses, the rerun holds the request that posted first"
 }
 
-test_codex_run_diagnostic_and_report
-test_round4_head_tie_edges
-test_weak_tie_mints_no_timeout
-test_overlapping_requests_are_ambiguous
-test_newer_request_supersedes_the_waited_on_one
-test_refreshed_provider_window
-test_retry_window_parser
-test_uncertain_publication_is_held_on_rerun
-test_already_retried_request_is_held
-test_delayed_claim_then_rerun_holds
+case_pool_add --first test_codex_run_diagnostic_and_report active
+case_pool_add --first test_codex_run_diagnostic_and_report stale-placeholder
+case_pool_add --first test_codex_run_diagnostic_and_report unknown-status
+case_pool_add --first test_codex_run_diagnostic_and_report failed
+case_pool_add --first test_round4_head_tie_edges
+case_pool_add --first test_weak_tie_mints_no_timeout
+case_pool_add --first test_overlapping_requests_are_ambiguous same-head
+case_pool_add --first test_overlapping_requests_are_ambiguous old-head
+case_pool_add --first test_overlapping_requests_are_ambiguous late-dispatch
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one superseded
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one no-row
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one answered
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one deleted
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one ack-deleted
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one ack-retry
+case_pool_add --first test_newer_request_supersedes_the_waited_on_one blocked
+case_pool_add test_refreshed_provider_window
+case_pool_add test_retry_window_parser
+case_pool_add test_uncertain_publication_is_held_on_rerun
+case_pool_add test_already_retried_request_is_held
+case_pool_add test_delayed_claim_then_rerun_holds
 
+case_pool_wait
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
