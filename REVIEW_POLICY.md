@@ -37,7 +37,7 @@ git -C <pr-worktree> merge --no-edit origin/main
 git -C <pr-worktree> push origin HEAD
 ```
 
-For routine freshening, do not use `gh pr update-branch` or `PUT .../pulls/<n>/update-branch`: those create a commit with GitHub's `web-flow` committer, inviting identity findings that cost a review round ([mergepath#1288](https://github.com/nathanjohnpayne/mergepath/issues/1288)). A local merge keeps both author and committer on `nathanjohnpayne` and signs the commit under the local signing configuration. When no local checkout is possible, `update-branch` remains allowed as an exception; the identity and merge rules remain unchanged.
+For routine freshening, do not use `gh pr update-branch` or `PUT .../pulls/<n>/update-branch`: those create a commit with GitHub's `web-flow` committer, inviting identity findings that cost a review round ([mergepath#1288](https://github.com/nathanjohnpayne/mergepath/issues/1288)). A local merge keeps both author and committer on `nathanjohnpayne` and follows the local signing configuration (currently off; see [SSH Signing Keys](#ssh-signing-keys)). When no local checkout is possible, `update-branch` remains allowed as an exception; the identity and merge rules remain unchanged.
 
 ### Reviewer Identities
 
@@ -176,7 +176,9 @@ Every identity in the [PAT lookup table](#pat-lookup-table) above also has an SS
 | nathanpayne-codex   | `~/.ssh/keys/github_codex.pub`           | 949667                                |
 | nathanpayne-robot   | `~/.ssh/keys/github_robot.pub`           | 1128521                               |
 
-**Why all five — including the bot and CI accounts.** Local `git commit` only ever signs as `nathanjohnpayne` (`git config --global user.signingkey` is the human identity per the active-account convention above), so the human's key is the one git invokes day-to-day. The bot accounts need keys uploaded so that GitHub-attributed activity verifies correctly under their logins: web-flow commits a bot makes via the GitHub UI, future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`, or any other surface where GitHub does the signing on behalf of the bot identity. Without the upload, every such commit renders with the "this user has not yet uploaded their public signing key" notice and a yellow "Partial Verified" badge.
+**Why all five — including the bot and CI accounts.** Local `git commit` is set up to sign only as `nathanjohnpayne` (`git config --global user.signingkey` is the human identity per the active-account convention above), so the human's key is the one git invokes whenever local signing is on. The bot accounts need keys uploaded so that GitHub-attributed activity verifies correctly under their logins: web-flow commits a bot makes via the GitHub UI, future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`, or any other surface where GitHub does the signing on behalf of the bot identity. Without the upload, every such commit renders with the "this user has not yet uploaded their public signing key" notice and a yellow "Partial Verified" badge.
+
+**Local signing is currently off.** Signing is the intended configuration and stays fully set up (`user.signingkey`, `gpg.format ssh`, and 1Password's `op-ssh-sign` as `gpg.ssh.program`), but global `commit.gpgsign` is `false` by owner choice (decided 2026-11-03), so commits made locally on branches are unsigned. That blocks nothing: no repo requires signed commits, and every repo squash-merges, so the commits that land on `main` are created and signed by GitHub. Don't add a repo- or worktree-local `commit.gpgsign` override to work around it (`check_git_identity_hygiene` rejects those). If signing is turned back on, test one commit first, because 1Password may prompt per commit and stall unattended agents.
 
 **Verify** — read-only check, should return exactly one entry per account (titled `mergepath-mac signing key` on this Mac):
 
@@ -1368,7 +1370,7 @@ Agents must automate identity switching so that commits and PR activity are attr
 
 ### Git commit identity (user.name / user.email)
 
-Commit identity is **not** switched per session, and never per repository. In a local session every agent commits as the human author identity, which lives in the machine's **global** git config (`~/.gitconfig`) next to `user.signingkey`—so `git commit` attributes and signs correctly in every repo and every worktree with no per-session step. Reviewer identities (`nathanpayne-{agent}`) never author commits; they exist for GitHub API activity only, and that attribution comes from the PAT wrappers described below, not from git config.
+Commit identity is **not** switched per session, and never per repository. In a local session every agent commits as the human author identity, which lives in the machine's **global** git config (`~/.gitconfig`) next to `user.signingkey`—so `git commit` attributes correctly in every repo and every worktree with no per-session step, and signs the same way whenever global signing is on (it is currently off; see [SSH Signing Keys](#ssh-signing-keys)). Reviewer identities (`nathanpayne-{agent}`) never author commits; they exist for GitHub API activity only, and that attribution comes from the PAT wrappers described below, not from git config.
 
 ```bash
 # Verify the identity a commit here would use, and where it comes from.

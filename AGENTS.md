@@ -51,7 +51,7 @@ git -C <pr-worktree> merge --no-edit origin/main
 git -C <pr-worktree> push origin HEAD
 ```
 
-For routine freshening, do not use `gh pr update-branch` or `PUT .../pulls/<n>/update-branch`: those create a commit with GitHub's `web-flow` committer, inviting identity findings that cost a review round ([mergepath#1288](https://github.com/nathanjohnpayne/mergepath/issues/1288)). A local merge keeps both author and committer on `nathanjohnpayne` and signs the commit under the local signing configuration. When no local checkout is possible, `update-branch` remains allowed as an exception; the identity rules above still apply.
+For routine freshening, do not use `gh pr update-branch` or `PUT .../pulls/<n>/update-branch`: those create a commit with GitHub's `web-flow` committer, inviting identity findings that cost a review round ([mergepath#1288](https://github.com/nathanjohnpayne/mergepath/issues/1288)). A local merge keeps both author and committer on `nathanjohnpayne` and follows the local signing configuration (currently off; see [REVIEW_POLICY.md § SSH Signing Keys](REVIEW_POLICY.md#ssh-signing-keys)). When no local checkout is possible, `update-branch` remains allowed as an exception; the identity rules above still apply.
 
 ### Workflow Summary
 
