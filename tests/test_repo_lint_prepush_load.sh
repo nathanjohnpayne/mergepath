@@ -62,14 +62,21 @@ ok() { PASS=$((PASS + 1)); echo "  ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  FAIL $1"; }
 
 SUITE_MODE=real
-MISSES=0
+# #2990: in mutant mode the first failed assertion ends the property at
+# once. It records which assertion failed and exits the property's subshell
+# with MUTANT_KILLED, the only status mutation_check counts as a kill, so the
+# property's remaining runs are skipped and nothing else (a harness error,
+# set -e, the watchdog) can pass for a kill.
+MUTANT_KILLED=86
+MUTANT_TIMEOUT_S=300
+mutant_killed() { printf '%s\n' "$1" > "$TMP/mutant-killer"; exit "$MUTANT_KILLED"; }
 expect() {   # $1 description, $2 actual, $3 expected
   if [ "$2" = "$3" ]; then
     [ "$SUITE_MODE" != real ] || ok "$1"
   elif [ "$SUITE_MODE" = real ]; then
     bad "$1 (expected '$3', got '$2')"
   else
-    MISSES=$((MISSES + 1))
+    mutant_killed "$1"
   fi
 }
 expect_has() {   # $1 description, $2 text, $3 literal substring it must contain
@@ -312,21 +319,71 @@ open(dst, "w").write(s.replace(old, new))
 PY
   printf '%s' "$dst"
 }
+# Runs property $1 against runner $2 in mutant mode and prints its verdict:
+# `killed<TAB>assertion`, `survived`, or `error<TAB>status`. The property runs
+# in a subshell, so mutant_killed can end it early, under a watchdog: a
+# mutant that hangs is stopped and reported, never counted. Its output goes
+# to $3, kept for the diagnostics below.
+mutant_verdict() {   # $1 property function, $2 runner, $3 log file
+  local pid rc waited=0
+  rm -f "$TMP/mutant-killer"
+  # errexit is set again inside: a command substitution (the caller's
+  # verdict=$(...)) drops it, and a property must stop at a failed command
+  # as it does in a real run, not go on to a miss that reads as a kill.
+  ( set -euo pipefail; SUITE_MODE=mutant; "$1" "$2" ) > "$3" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge $((MUTANT_TIMEOUT_S * 5)) ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2; waited=$((waited + 1))
+  done
+  rc=0; wait "$pid" || rc=$?
+  if [ "$rc" -eq "$MUTANT_KILLED" ] && [ -s "$TMP/mutant-killer" ]; then
+    printf 'killed\t%s\n' "$(cat "$TMP/mutant-killer")"
+  elif [ "$rc" -eq 0 ]; then
+    echo survived
+  else
+    printf 'error\t%s\n' "$rc"
+  fi
+}
 mutation_check() {   # $1 property function, $2 name, $3 old, $4 new
-  local m
+  local m verdict
   if ! m=$(mutant "$2" "$3" "$4"); then
     bad "mutation $2: its anchor is gone from the runner; update the mutation"
     return
   fi
-  SUITE_MODE=mutant; MISSES=0
-  "$1" "$m"
-  SUITE_MODE=real
-  if [ "$MISSES" -gt 0 ]; then
-    ok "mutation $2 breaks $1 ($MISSES assertions fail)"
-  else
-    bad "mutation $2 leaves $1 passing: the property is not tested"
-  fi
+  verdict=$(mutant_verdict "$1" "$m" "$TMP/mutant-$2.log")
+  case "$verdict" in
+    killed*) ok "mutation $2 breaks $1 (killed by: ${verdict#killed?})" ;;
+    survived) bad "mutation $2 leaves $1 passing: the property is not tested" ;;
+    *)
+      bad "mutation $2: $1 ended with status ${verdict#error?} before any assertion failed (a harness error or the ${MUTANT_TIMEOUT_S}s watchdog), which is not a kill"
+      tail -n 5 "$TMP/mutant-$2.log" | sed 's/^/        /'
+      ;;
+  esac
 }
+# #2990: the harness itself. Only a failed assertion of the property kills a
+# mutant: a property that completes, crashes, or outlives the watchdog is
+# not a kill, whatever it printed.
+harness_ok() { expect "harness self-test: a passing assertion" yes yes; }
+harness_miss() { expect "harness self-test: a missed assertion" 1 2; }
+harness_crash() { false; expect "harness self-test: unreachable" 1 2; }
+harness_exit() { exit 3; }
+harness_hang() { sleep 30; expect "harness self-test: unreachable" 1 2; }
+v=$(mutant_verdict harness_miss "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'killed\tharness self-test: a missed assertion')" ] && ok "harness: a failed assertion kills the mutant and is named" || bad "harness: a failed assertion read as '$v'"
+v=$(mutant_verdict harness_ok "$RUNNER" "$TMP/harness.log")
+[ "$v" = survived ] && ok "harness: a property that passes is a survivor" || bad "harness: a passing property read as '$v'"
+v=$(mutant_verdict harness_crash "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'error\t1')" ] && ok "harness: a command failure is an error, not a kill" || bad "harness: a command failure read as '$v'"
+v=$(mutant_verdict harness_exit "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'error\t3')" ] && ok "harness: an early exit is an error, not a kill" || bad "harness: an early exit read as '$v'"
+v=$(MUTANT_TIMEOUT_S=1; mutant_verdict harness_hang "$RUNNER" "$TMP/harness.log")
+case "$v" in error*) ok "harness: the watchdog stops a hang and it is not a kill" ;; *) bad "harness: a hang read as '$v'" ;; esac
+
 # The first reading is kept for the whole run (the pre-#2842 behaviour).
 mutation_check assert_falls_and_rises pin-first-reading \
   '  [ -z "$JOBS_SRC" ] || return 0

@@ -70,17 +70,23 @@ ok() { PASS=$((PASS + 1)); echo "  ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  FAIL $1"; }
 
 # Run normally the property checks pass or fail the suite; run against a
-# mutant (SUITE_MODE=mutant) they only count their misses in MISSES, and the
-# mutation check requires at least one.
+# mutant (SUITE_MODE=mutant) the first miss ends it (mutant_killed below).
 SUITE_MODE=real
-MISSES=0
+# #2990: in mutant mode the first failed assertion ends the property at
+# once. It records which assertion failed and exits the property's subshell
+# with MUTANT_KILLED, the only status mutation_check counts as a kill, so the
+# property's remaining runs are skipped and nothing else (a harness error,
+# set -e, the watchdog) can pass for a kill.
+MUTANT_KILLED=86
+MUTANT_TIMEOUT_S=300
+mutant_killed() { printf '%s\n' "$1" > "$TMP/mutant-killer"; exit "$MUTANT_KILLED"; }
 expect() {   # $1 description, $2 actual, $3 expected
   if [ "$2" = "$3" ]; then
     [ "$SUITE_MODE" != real ] || ok "$1"
   elif [ "$SUITE_MODE" = real ]; then
     bad "$1 (expected '$3', got '$2')"
   else
-    MISSES=$((MISSES + 1))
+    mutant_killed "$1"
   fi
 }
 expect_has() {   # $1 description, $2 text, $3 literal substring it must contain
@@ -115,14 +121,24 @@ cat > "$FIX/scripts/ci/repo-lint-dependencies.json" <<'JSON'
               "check_owner": ["scripts/ci/repo-lint-dependencies.json"],
               "check_unrelated": ["unrelated/*"]}}
 JSON
-# Each check records that it ran; PROBE_FAIL names checks that fail, and
-# PROBE_SLOW one that first sleeps PROBE_SLOW_SECS.
+# Each check records that it ran, and that it finished; PROBE_FAIL names
+# checks that fail, and PROBE_SLOW one that first spends PROBE_SLOW_SECS: on
+# the fixture clock when one is running (below), otherwise in a real sleep.
 cat > "$FIX/scripts/ci/probe.sh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 touch "$PROBE_DIR/ran.$1"
-if [ "$1" = "${PROBE_SLOW:-}" ]; then sleep "${PROBE_SLOW_SECS:-0}"; fi
+if [ "$1" = "${PROBE_SLOW:-}" ]; then
+  if [ -n "${FAKE_CLOCK_FILE:-}" ]; then
+    now=$(cat "$FAKE_CLOCK_FILE")
+    printf '%s\n' "$((now + ${PROBE_SLOW_SECS:-0}))" > "$FAKE_CLOCK_FILE.tmp"
+    mv "$FAKE_CLOCK_FILE.tmp" "$FAKE_CLOCK_FILE"
+  else
+    sleep "${PROBE_SLOW_SECS:-0}"
+  fi
+fi
 case " ${PROBE_FAIL:-} " in *" $1 "*) echo "probe: $1 fails" >&2; exit 1 ;; esac
+touch "$PROBE_DIR/done.$1"
 SH
 for c in check_live check_live2 check_graphed check_owner check_unrelated check_harness; do
   printf '#!/usr/bin/env bash\nset -eu\nbash "$(dirname "$0")/probe.sh" %s\n' "$c" > "$FIX/scripts/ci/$c"
@@ -210,6 +226,22 @@ esac
 SH
 chmod +x "$FAKEBIN/sysctl"
 export PATH="$FAKEBIN:$PATH"
+# The fixture clock (#2990). The runner reads the time only through
+# `date +%s`; on CLOCKBIN's PATH that answers the epoch second in
+# FAKE_CLOCK_FILE, which stands still until a check advances it, and every
+# other `date` call goes to the real one. So the budget's expiry is exact:
+# the elapsed time the feeder sees is whatever the slow check added, not a
+# real minute plus scheduling noise. No production code knows about it.
+CLOCKBIN="$TMP/clockbin"
+mkdir -p "$CLOCKBIN"
+cat > "$CLOCKBIN/date" <<'SH'
+#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = +%s ] && [ -n "${FAKE_CLOCK_FILE:-}" ]; then
+  exec cat "$FAKE_CLOCK_FILE"
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$CLOCKBIN/date"
 
 POLICY="$FIX/.github/prepush.yml"
 TIMINGS="$FIX/.mergepath/prepush-timings.tsv"
@@ -350,14 +382,39 @@ assert_defer_selects_changed_paths "$RUNNER"
 echo "Part 2: max_minutes does not start a step that would pass the budget"
 assert_budget_defers_unstarted "$RUNNER"
 # Once the budget is spent nothing more starts: one check outlasts a
-# 1-minute budget (one at a time), and every later one is deferred.
-clear_state
-seed_timings "$(printf 'check_graphed\t30')" "$(printf 'check_live\t1')" "$(printf 'check_live2\t1')" "$(printf 'check_owner\t1')"
-PROBE_SLOW=check_graphed PROBE_SLOW_SECS=61 run_paths "$RUNNER" other/input.txt --set max_minutes=1 --jobs 1
-expect "spent budget: the run passes" "$RC" "0"
-expect "spent budget: the long check ran to the end" "$(ran check_graphed)" "ran"
-expect "spent budget: the later checks were not started" "$(ran check_live)$(ran check_live2)" "not runnot run"
-expect_has "spent budget: the last line counts them" "$(last_line "$OUT")" "2 by the 1-minute budget"
+# 1-minute budget (one at a time), and every later one is deferred. The
+# long check spends its time on the fixture clock, so these cases also pin
+# the expiry's boundaries exactly (#2990): a step starts while elapsed time
+# is under the budget and elapsed plus its previous duration does not pass
+# it, and is deferred from the second the budget is spent.
+clock_run() {   # $1 runner, $2 seconds the long check spends, $3 later checks' previous duration
+  clear_state
+  seed_timings "$(printf 'check_graphed\t30')" "$(printf 'check_live\t%s' "$3")" "$(printf 'check_live2\t%s' "$3")" "$(printf 'check_owner\t1')"
+  printf '%s\n' 1700000000 > "$TMP/clock"
+  PATH="$CLOCKBIN:$PATH" FAKE_CLOCK_FILE="$TMP/clock" PROBE_SLOW=check_graphed PROBE_SLOW_SECS="$2" \
+    run_paths "$1" other/input.txt --set max_minutes=1 --jobs 1
+}
+done_set() { for c in check_graphed check_live check_live2; do [ ! -f "$PROBE_DIR/done.$c" ] || printf '%s ' "$c"; done; }
+assert_budget_expiry() {   # $1 runner
+  clock_run "$1" 61 1
+  expect "spent budget: the run passes" "$RC" "0"
+  expect "spent budget: the long check ran to the end" "$(ran check_graphed) $(done_set)" "ran check_graphed "
+  expect "spent budget: the later checks were not started" "$(ran check_live)$(ran check_live2)" "not runnot run"
+  expect_has "spent budget: the last line counts them" "$(last_line "$OUT")" "2 by the 1-minute budget"
+  clock_run "$1" 60 0
+  expect "budget spent to the second: the run passes" "$RC" "0"
+  expect "budget spent to the second: only the check started in time ran, and it finished" "$(done_set)" "check_graphed "
+  expect_has "budget spent to the second: both later checks are deferred" "$(last_line "$OUT")" "2 by the 1-minute budget"
+  clock_run "$1" 59 1
+  expect "a second left, elapsed plus previous at the budget: the run passes" "$RC" "0"
+  expect "a second left, elapsed plus previous at the budget: every check starts and finishes" "$(done_set)" "check_graphed check_live check_live2 "
+  expect_lacks "a second left, elapsed plus previous at the budget: nothing is deferred" "$OUT" "DEFERRED"
+  clock_run "$1" 59 2
+  expect "a second left, elapsed plus previous past the budget: the run passes" "$RC" "0"
+  expect "a second left, elapsed plus previous past the budget: only the started check ran" "$(done_set)" "check_graphed "
+  expect_has "a second left, elapsed plus previous past the budget: both are deferred" "$(last_line "$OUT")" "2 by the 1-minute budget"
+}
+assert_budget_expiry "$RUNNER"
 
 # A zero concurrency, however it is spelled, is refused rather than left to
 # a feeder that would wait for a free slot forever.
@@ -413,22 +470,72 @@ open(dst, "w").write(s.replace(old, new))
 PY
   printf '%s' "$dst"
 }
+# Runs property $1 against runner $2 in mutant mode and prints its verdict:
+# `killed<TAB>assertion`, `survived`, or `error<TAB>status`. The property runs
+# in a subshell, so mutant_killed can end it early, under a watchdog: a
+# mutant that hangs is stopped and reported, never counted. Its output goes
+# to $3, kept for the diagnostics below.
+mutant_verdict() {   # $1 property function, $2 runner, $3 log file
+  local pid rc waited=0
+  rm -f "$TMP/mutant-killer"
+  # errexit is set again inside: a command substitution (the caller's
+  # verdict=$(...)) drops it, and a property must stop at a failed command
+  # as it does in a real run, not go on to a miss that reads as a kill.
+  ( set -euo pipefail; SUITE_MODE=mutant; "$1" "$2" ) > "$3" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge $((MUTANT_TIMEOUT_S * 5)) ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2; waited=$((waited + 1))
+  done
+  rc=0; wait "$pid" || rc=$?
+  if [ "$rc" -eq "$MUTANT_KILLED" ] && [ -s "$TMP/mutant-killer" ]; then
+    printf 'killed\t%s\n' "$(cat "$TMP/mutant-killer")"
+  elif [ "$rc" -eq 0 ]; then
+    echo survived
+  else
+    printf 'error\t%s\n' "$rc"
+  fi
+}
 mutation_check() {   # $1 property function, $2 name, $3 old, $4 new
-  local m
+  local m verdict
   if ! m=$(mutant "$2" "$3" "$4"); then
     bad "mutation $2: its anchor is gone from the runner; update the mutation"
     return
   fi
-  SUITE_MODE=mutant; MISSES=0
-  "$1" "$m"
-  SUITE_MODE=real
-  if [ "$MISSES" -gt 0 ]; then
-    ok "mutation $2 breaks $1 ($MISSES assertions fail)"
-  else
-    bad "mutation $2 leaves $1 passing: the property is not tested"
-  fi
+  verdict=$(mutant_verdict "$1" "$m" "$TMP/mutant-$2.log")
+  case "$verdict" in
+    killed*) ok "mutation $2 breaks $1 (killed by: ${verdict#killed?})" ;;
+    survived) bad "mutation $2 leaves $1 passing: the property is not tested" ;;
+    *)
+      bad "mutation $2: $1 ended with status ${verdict#error?} before any assertion failed (a harness error or the ${MUTANT_TIMEOUT_S}s watchdog), which is not a kill"
+      tail -n 5 "$TMP/mutant-$2.log" | sed 's/^/        /'
+      ;;
+  esac
   clear_state
 }
+# #2990: the harness itself. Only a failed assertion of the property kills a
+# mutant: a property that completes, crashes, or outlives the watchdog is
+# not a kill, whatever it printed.
+harness_ok() { expect "harness self-test: a passing assertion" yes yes; }
+harness_miss() { expect "harness self-test: a missed assertion" 1 2; }
+harness_crash() { false; expect "harness self-test: unreachable" 1 2; }
+harness_exit() { exit 3; }
+harness_hang() { sleep 30; expect "harness self-test: unreachable" 1 2; }
+v=$(mutant_verdict harness_miss "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'killed\tharness self-test: a missed assertion')" ] && ok "harness: a failed assertion kills the mutant and is named" || bad "harness: a failed assertion read as '$v'"
+v=$(mutant_verdict harness_ok "$RUNNER" "$TMP/harness.log")
+[ "$v" = survived ] && ok "harness: a property that passes is a survivor" || bad "harness: a passing property read as '$v'"
+v=$(mutant_verdict harness_crash "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'error\t1')" ] && ok "harness: a command failure is an error, not a kill" || bad "harness: a command failure read as '$v'"
+v=$(mutant_verdict harness_exit "$RUNNER" "$TMP/harness.log")
+[ "$v" = "$(printf 'error\t3')" ] && ok "harness: an early exit is an error, not a kill" || bad "harness: an early exit read as '$v'"
+v=$(MUTANT_TIMEOUT_S=1; mutant_verdict harness_hang "$RUNNER" "$TMP/harness.log")
+case "$v" in error*) ok "harness: the watchdog stops a hang and it is not a kill" ;; *) bad "harness: a hang read as '$v'" ;; esac
+
 # full_suite=defer is ignored: the complete surface runs.
 mutation_check assert_defer_selects_changed_paths defer-ignored \
   'if [ "$P_FULL" = true ] && [ "$(policy_value full_suite)" = defer ]; then' \
@@ -457,6 +564,15 @@ mutation_check assert_budget_defers_unstarted empty-invocation-fails \
 mutation_check assert_failure_blocks_after_budget failure-masked \
   $'if [ "$failed" -eq 0 ]; then\n  if [ "${MERGEPATH_PREPUSH_KEEP_LOGS' \
   $'if [ "$failed" -eq 0 ] || [ "$BUDGET_N" -gt 0 ]; then\n  if [ "${MERGEPATH_PREPUSH_KEEP_LOGS'
+# #2990: the budget's two boundaries, pinned by the fixture clock. A spent
+# budget that still starts steps until it is passed by a second:
+mutation_check assert_budget_expiry spent-at-the-second-starts \
+  'if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then' \
+  'if [ "$el" -gt "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then'
+# A prediction that defers a step which would end exactly at the budget:
+mutation_check assert_budget_expiry prediction-at-the-budget-defers \
+  'if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -gt "$BUDGET_S" ]; then' \
+  'if [ "$el" -ge "$BUDGET_S" ] || [ $((el + prev)) -ge "$BUDGET_S" ]; then'
 # The default turns into defer.
 mutation_check assert_run_unchanged default-defers \
   'full_suite|MERGEPATH_PREPUSH_FULL_SUITE|run' \

@@ -18,11 +18,13 @@
 #     `[ -f scripts/<gate>.sh ] || exit 0` one-liner).
 #   - EVERY check step in `lint_fast` is pinned to exactly ONE shard with
 #     `if: matrix.shard == N` (#2163). The fast lane is a 4-leg matrix
-#     balanced by measured step time; a step with no pin runs on every
+#     balanced by measured step time, plus a hub-only shard 5 (#2990) that
+#     holds only hub-only checks; a step with no pin runs on every
 #     shard (wasted minutes, not a missed assertion), and a pin naming a
 #     shard outside the matrix never runs anywhere — which is why
 #     tests/test_repo_lint_optimization.sh asserts both. Put a new check
-#     on the shard with the smallest measured sum (see the job comment).
+#     on the shard 1-4 with the smallest measured sum (see the job
+#     comment); never on shard 5, which consumers do not run.
 #   - EVERY `run: ./scripts/ci/check_X` step carries the #590 missing-file
 #     soft-pass tail (#979), without exception:
 #
@@ -78,11 +80,31 @@ jobs:
       consumer_replay: ${{ steps.classify.outputs.consumer_replay }}
       self_tests: ${{ steps.classify.outputs.self_tests }}
       tooling: ${{ steps.tooling.outputs.tooling }}
+      fast_shards: ${{ steps.shards.outputs.fast_shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # #2990: lint_fast's shard list. Every repository runs shards 1-4; the
+      # hub adds shard 5, which holds only hub-only checks (the pre-push
+      # mirror's suites), so a consumer starts no runner that would only run
+      # setup. The hub is identified the way every hub-only check identifies
+      # it, by scripts/sync-to-downstream.sh, so shard 5 exists exactly where
+      # its checks do more than SKIP. The `lint` aggregator accepts only these
+      # two lists; anything else, including an empty output, fails it.
+      - name: lint-fast shards
+        id: shards
+        run: |
+          set -euo pipefail
+          if [ -f scripts/sync-to-downstream.sh ]; then
+            shards='[1,2,3,4,5]'
+          else
+            shards='[1,2,3,4]'
+          fi
+          echo "fast_shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "repo-lint fast shards: $shards"
 
       # #2926: `--no-renames` lists a moved file's source as well as its
       # destination, so a tooling file moved out of a tooling path still
@@ -187,6 +209,19 @@ jobs:
     # shard closes with `--verify`, the Parts A/B re-assertion that proves
     # that shard's suites left .git/config alone (#777).
     #
+    # Hub-only shard 5 (#2990): the scope job's `lint-fast shards` step
+    # writes the matrix list, [1,2,3,4] on a consumer and [1,2,3,4,5] on the
+    # hub. Shard 5 holds check_repo_lint_prepush alone, a hub-only check
+    # that took ~400 s and so set the hub's slowest leg wherever it sat,
+    # while consumers spend nothing on it. Only hub-only checks may be
+    # pinned to it (tests/test_repo_lint_optimization.sh runs each one on a
+    # consumer-shaped tree and requires its SKIP), so consumer coverage is
+    # the four shards' and no consumer starts a setup-only runner. The same
+    # change moved two hub-only steps, check_sync_manifest and
+    # check_doc_ownership, to shard 4, evening the hub's shards 1-4 (about
+    # 410-440 s each on run 41776606282 with #2994's step times) without
+    # moving any time on a consumer.
+    #
     # No `concurrency:` here: the workflow-level group already cancels a
     # superseded PR head, and a job-level group on a required-gate input
     # cancels a PENDING leg of the same head (memory: never add one).
@@ -209,7 +244,9 @@ jobs:
       # evidence, and the aggregator fails on any non-success leg anyway.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # [1,2,3,4] on a consumer, [1,2,3,4,5] on the hub (the scope job's
+        # `lint-fast shards` step). Shard 5 carries only hub-only checks.
+        shard: ${{ fromJSON(needs.scope.outputs.fast_shards) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -764,9 +801,11 @@ jobs:
       # the scope job and the if: expressions here select; its suite
       # evaluates them, so it reads this file and needs yq. The mirror
       # propagates to consumers (#2844), but its suites are hub-only, so the
-      # wrapper SKIPs there.
+      # wrapper SKIPs there. It is the hub-only shard 5's one check (#2990):
+      # at ~400 s it would set any shard's critical path it shared, and a
+      # consumer, which has no shard 5, loses nothing but a SKIP line.
       - name: check_repo_lint_prepush
-        if: matrix.shard == 2
+        if: matrix.shard == 5
         run: ./scripts/ci/check_repo_lint_prepush || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # The mirror's fleet adoption (#2844): its manifest entries, the
@@ -1041,7 +1080,7 @@ jobs:
         run: ./scripts/ci/check_cockpit --check || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_manifest
-        if: matrix.shard == 2
+        if: matrix.shard == 4
         # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
         # which now runs earlier (before check_resolve_pr_threads, the
         # first yq-dependent step; see that step for the pin rationale).
@@ -1059,7 +1098,7 @@ jobs:
         run: ./scripts/ci/check_propagation_closure || { rc=$?; if [ ! -f scripts/ci/check_propagation_closure ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_propagation_closure not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_doc_ownership
-        if: matrix.shard == 3
+        if: matrix.shard == 4
         # Validates the manifest's doc_ownership: inventory (#780) —
         # every docs/agents/*.md must carry EXACTLY ONE of canonical /
         # per-repo-owned / hub-only, and the class must not contradict
@@ -1515,6 +1554,11 @@ jobs:
           CONSUMER_REPLAY: ${{ needs.scope.outputs.consumer_replay }}
           SELF_TESTS: ${{ needs.scope.outputs.self_tests }}
           SCOPE_RESULT: ${{ needs.scope.result }}
+          # The shard list lint_fast expanded (#2990). The rolled-up result
+          # below says nothing about how many legs ran, so a list that
+          # dropped a shard would pass with that shard's checks unrun: only
+          # the consumer and hub lists the scope step can write are accepted.
+          FAST_SHARDS: ${{ needs.scope.outputs.fast_shards }}
           # lint_fast is a shard matrix (#2163): this is the ROLLED-UP job
           # result — `success` only when every leg succeeded; `failure` or
           # `cancelled` when any leg did; `skipped` can only mean the job
@@ -1529,6 +1573,13 @@ jobs:
             echo "FAIL: scope=$SCOPE_RESULT lint-fast=$FAST_RESULT" >&2
             exit 1
           fi
+          case "$FAST_SHARDS" in
+            '[1,2,3,4]' | '[1,2,3,4,5]') ;;
+            *)
+              echo "FAIL: lint-fast ran an unexpected shard list: '$FAST_SHARDS'" >&2
+              exit 1
+              ;;
+          esac
           # Each deep job is read against the scope decision that selected
           # it: a selected job must have succeeded (failure, cancellation and
           # an unexpected skip all fail), and an unselected job must have been

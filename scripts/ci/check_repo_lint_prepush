@@ -41,10 +41,10 @@ for t in "$TEST_SCRIPT" "$POLICY_TEST" "$DEFER_TEST" "$LOAD_TEST"; do
 done
 
 # Two lanes at once (#2990): the main suite in one, the policy, defer and
-# load suites back to back in the other. Their time is mostly real sleeps
-# (slow and hanging probes, lock graces, a 61-second budget, the 5-second
-# load re-read), so overlapping them halves the step without changing what
-# any case waits for. What they observe is unchanged too: each suite keeps
+# load suites back to back in the other. Their time is mostly real waiting
+# (slow probes, lock graces, the 5-second load re-read; the hangs and the
+# budget's minute became handshakes and a fixture clock), so overlapping
+# them shortens the step without changing what any case waits for. What they observe is unchanged too: each suite keeps
 # its own fixtures, XDG_CACHE_HOME (so its own machine lock) and probe
 # directory; the second lane's suites read the host load only from a fake
 # sysctl they put on PATH, so the first lane's load cannot reach them; and
