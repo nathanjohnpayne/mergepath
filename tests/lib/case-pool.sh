@@ -40,6 +40,10 @@
 # order, exactly as the plain calls did (no subshell), which is the shape to
 # use when bisecting a case that only fails alongside others. Bash older than
 # 4.3 has no `wait -n` and also runs serially.
+#
+# MERGEPATH_TEST_TIMINGS=1 prints the slowest pooled cases (wall seconds) to
+# stderr after the replay, which is how to find the case that sets a suite's
+# wall time before rebalancing it.
 
 CASE_POOL_QUEUE=()
 CASE_POOL_FIRST=()
@@ -116,8 +120,10 @@ case_pool_wait() {
         WORKDIR="$WORKDIR/case-pool-$CASE_POOL_SEQ-$i"
         mkdir -p "$WORKDIR"
       fi
+      SECONDS=0
       eval "${CASE_POOL_QUEUE[$i]}"
       printf '%s %s\n' "$PASS" "$FAIL" >"$pool_dir/$i.counts"
+      printf '%s\n' "$SECONDS" >"$pool_dir/$i.secs"
     ) >"$pool_dir/$i.out" 2>"$pool_dir/$i.err" </dev/null &
     pids[i]=$!
     running=$((running + 1))
@@ -139,6 +145,11 @@ case_pool_wait() {
       FAIL=$((FAIL + 1))
     fi
   done
+  if [ -n "${MERGEPATH_TEST_TIMINGS:-}" ]; then
+    for ((i = 0; i < count; i++)); do
+      [ -s "$pool_dir/$i.secs" ] && printf '%6ss  %s\n' "$(cat "$pool_dir/$i.secs")" "${CASE_POOL_QUEUE[$i]}"
+    done | sort -rn | head -15 | sed 's/^/case-pool timing: /' >&2
+  fi
   rm -rf "$pool_dir"
   CASE_POOL_QUEUE=()
   CASE_POOL_FIRST=()

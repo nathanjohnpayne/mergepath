@@ -58,74 +58,90 @@ fi
 echo "check_codex_scripts: running case-pool tests (#2990)"
 "$REPO_ROOT/tests/test_case_pool.sh"
 
-echo "check_codex_scripts: running codex-review-request ack tests"
-"$REPO_ROOT/tests/test_codex_review_request_ack.sh"
+# Every suite below is one pool case (#2990): they share no state, so the pool
+# runs them side by side and replays their output in this order. A failing or
+# missing suite adds to FAIL. The long codex-review-request suites start first.
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through the SUITES entries
+run_suite() { # <label> <rel> [<rel>...]
+  local label=$1 rel
+  shift
+  echo "check_codex_scripts: running $label"
+  for rel in "$@"; do
+    if [ ! -f "$REPO_ROOT/$rel" ]; then
+      echo "check_codex_scripts: ERROR (missing $rel)" >&2
+      FAIL=$((FAIL + 1))
+      return 0
+    fi
+    case "$rel" in
+      *.py) python3 "$REPO_ROOT/$rel" ;;
+      *) "$REPO_ROOT/$rel" ;;
+    esac || { echo "check_codex_scripts: FAIL ($rel)" >&2; FAIL=$((FAIL + 1)); return 0; }
+  done
+}
 
-echo "check_codex_scripts: running codex-review-request --trigger-only tests (#489)"
-"$REPO_ROOT/tests/test_codex_review_request_trigger_only.sh"
-
-echo "check_codex_scripts: running codex-review-request Phase 4a entry-decision tests"
-"$REPO_ROOT/tests/test_codex_review_request_entry.sh"
-
-echo "check_codex_scripts: running codex-review-request verdict-comment clearance tests (#609)"
-python3 "$REPO_ROOT/tests/test_codex_verdict_anchor_resolution.py"
-"$REPO_ROOT/tests/test_codex_review_request_verdict.sh"
-
-echo "check_codex_scripts: running codex-review-request write-token / keyring-fallback tests (#737)"
-"$REPO_ROOT/tests/test_codex_review_request_token_fallback.sh"
-
-echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
-"$REPO_ROOT/tests/test_codex_review_check_resolution.sh"
-
-echo "check_codex_scripts: running blocked request evidence tests (#1276)"
-"$REPO_ROOT/tests/test_codex_request_evidence.sh"
-
-echo "check_codex_scripts: running late Codex findings detector tests (#2881)"
-"$REPO_ROOT/tests/test_late_codex_findings.sh"
-
-echo "check_codex_scripts: running Codex review ledger tests (#1560)"
-"$REPO_ROOT/tests/test_codex_review_ledger.sh"
-
-echo "check_codex_scripts: running codex-review-check verdict-comment clearance tests (#600)"
-"$REPO_ROOT/tests/test_codex_review_check_verdict.sh"
-
-echo "check_codex_scripts: running codex-review-check gate (a) required-check scoping tests (#655)"
-"$REPO_ROOT/tests/test_codex_review_check_required_checks.sh"
-
-# #1219: that suite's #1215 publisher probe reads .github/workflows relative to
-# the CWD, so a checkout carrying none of the five publisher workflows -- a
-# freshly bootstrapped repo, a consumer behind the wave that delivered them, or
-# any invocation not rooted at the repo root -- takes its skip branch. That
-# branch increments a SKIP counter that was never initialized, so `set -u`
-# aborted the suite mid-run: it reported failure and every assertion after the
-# skip silently stopped running. Re-run it from a workflow-less CWD so the skip
-# branch stays exercised rather than only the hub shape above.
-echo "check_codex_scripts: re-running gate (a) suite in the no-publisher shape (#1219)"
+# #1219: the gate (a) suite's #1215 publisher probe reads .github/workflows
+# relative to the CWD, so a checkout carrying none of the five publisher
+# workflows -- a freshly bootstrapped repo, a consumer behind the wave that
+# delivered them, or any invocation not rooted at the repo root -- takes its
+# skip branch. That branch increments a SKIP counter that was never
+# initialized, so `set -u` aborted the suite mid-run: it reported failure and
+# every assertion after the skip silently stopped running. Re-run it from a
+# workflow-less CWD so the skip branch stays exercised rather than only the hub
+# shape.
 G1219_DIR="$(mktemp -d "${TMPDIR:-/tmp}/check-codex-scripts-1219.XXXXXX")"
 # This file registers no other EXIT trap, so this one cannot replace an
 # existing handler -- a second `trap ... EXIT` REPLACES rather than extends.
 trap 'rm -rf "$G1219_DIR"' EXIT
-if ! ( cd "$G1219_DIR" && "$REPO_ROOT/tests/test_codex_review_check_required_checks.sh" ) \
-     >"$G1219_DIR/suite.log" 2>&1; then
-  echo "FAIL: gate (a) suite does not survive the no-publisher shape (#1219)" >&2
-  tail -20 "$G1219_DIR/suite.log" >&2
+# shellcheck disable=SC2329 # invoked through the SUITES entries
+run_g1219() {
+  echo "check_codex_scripts: re-running gate (a) suite in the no-publisher shape (#1219)"
+  if ! ( cd "$G1219_DIR" && "$REPO_ROOT/tests/test_codex_review_check_required_checks.sh" ) \
+       >"$G1219_DIR/suite.log" 2>&1; then
+    echo "FAIL: gate (a) suite does not survive the no-publisher shape (#1219)" >&2
+    tail -20 "$G1219_DIR/suite.log" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+SUITES=(
+  "--first run_suite 'codex-review-request ack tests' tests/test_codex_review_request_ack.sh"
+  "--first run_suite 'codex-review-request --trigger-only tests (#489)' tests/test_codex_review_request_trigger_only.sh"
+  "--first run_suite 'codex-review-request Phase 4a entry-decision tests' tests/test_codex_review_request_entry.sh"
+  "--first run_suite 'blocked request evidence tests (#1276)' tests/test_codex_request_evidence.sh"
+  "--first run_suite 'Codex review ledger tests (#1560)' tests/test_codex_review_ledger.sh"
+  "run_suite 'codex-review-request verdict-comment clearance tests (#609)' tests/test_codex_verdict_anchor_resolution.py tests/test_codex_review_request_verdict.sh"
+  "run_suite 'codex-review-request write-token / keyring-fallback tests (#737)' tests/test_codex_review_request_token_fallback.sh"
+  "run_suite 'codex-review-check gate (c) resolution tests' tests/test_codex_review_check_resolution.sh"
+  "run_suite 'late Codex findings detector tests (#2881)' tests/test_late_codex_findings.sh"
+  "run_suite 'codex-review-check verdict-comment clearance tests (#600)' tests/test_codex_review_check_verdict.sh"
+  "run_suite 'codex-review-check gate (a) required-check scoping tests (#655)' tests/test_codex_review_check_required_checks.sh"
+  "run_g1219"
+  "run_suite 'branch-requirement resolver tests (#1064)' tests/test_branch_requirements.sh"
+  "run_suite '#465 fail-closed structural guards' tests/test_465_fail_closed.sh"
+  "run_suite '#655 repo-lint-local observation structural guards' tests/test_655_repo_lint_local_observed.sh"
+  "run_suite 'codex-record-feedback tests' tests/test_codex_record_feedback.sh"
+  "run_suite 'Codex usage-limit / not-connected marker detection tests (#722)' tests/test_codex_usage_limit_marker.sh"
+)
+# A checkout behind the wave that delivers the pool runs the same suites one
+# after another: the skew costs time, never a suite.
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source "$REPO_ROOT/tests/lib/case-pool.sh"
+  for suite in "${SUITES[@]}"; do
+    eval "case_pool_add $suite"
+  done
+  case_pool_wait
+else
+  for suite in "${SUITES[@]}"; do
+    eval "${suite#--first }"
+  done
+fi
+if [ "$FAIL" -ne 0 ]; then
+  echo "check_codex_scripts: FAIL ($FAIL suite(s))"
   exit 1
 fi
-
-echo "check_codex_scripts: running branch-requirement resolver tests (#1064)"
-"$REPO_ROOT/tests/test_branch_requirements.sh"
-
-echo "check_codex_scripts: running #465 fail-closed structural guards"
-"$REPO_ROOT/tests/test_465_fail_closed.sh"
-
-echo "check_codex_scripts: running #655 repo-lint-local observation structural guards"
-"$REPO_ROOT/tests/test_655_repo_lint_local_observed.sh"
-
-echo "check_codex_scripts: running codex-record-feedback tests"
-"$REPO_ROOT/tests/test_codex_record_feedback.sh"
-
-echo "check_codex_scripts: running Codex usage-limit / not-connected marker detection tests (#722)"
-"$REPO_ROOT/tests/test_codex_usage_limit_marker.sh"
 
 echo "check_codex_scripts: PASS"
 exit 0

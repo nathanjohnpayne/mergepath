@@ -112,14 +112,16 @@ case_pool_add --first fast b
 case_pool_wait"
   [ "$(grep '^PASS' "$WORKDIR/out" | tr '\n' '|')" = 'PASS: fast a|PASS: fast b|' ] \
     || fail "--first: serial mode must keep queue order"
+  # Two slots: c and a start together (in either order), and b waits for one
+  # of them to finish. Without --first, c would be the one left waiting.
   run_suite 2 "
-mark() { printf '%s\n' \"\$1\" >>\"$WORKDIR/started\"; pass \"mark \$1\"; }
+mark() { printf '%s\n' \"\$1\" >>\"$WORKDIR/started\"; sleep 1; pass \"mark \$1\"; }
 case_pool_add mark a
 case_pool_add mark b
 case_pool_add --first mark c
 case_pool_wait"
-  if [ "$(head -1 "$WORKDIR/started")" != c ]; then
-    fail "--first: start order $(tr '\n' ' ' <"$WORKDIR/started"), expected c first"
+  if [ "$(tail -1 "$WORKDIR/started")" != b ]; then
+    fail "--first: start order $(tr '\n' ' ' <"$WORKDIR/started"), expected c in the first wave and b last"
   elif [ "$(grep '^PASS' "$WORKDIR/out" | tr '\n' '|')" != 'PASS: mark a|PASS: mark b|PASS: mark c|' ]; then
     fail "--first: output must still replay in queue order"
   else
@@ -153,7 +155,24 @@ case_pool_wait"
   [ "$FAIL" -ne "$before" ] || pass "a non-positive job count and an undefined case are refused"
 }
 
+test_timings_report() {
+  local before=$FAIL
+  MERGEPATH_TEST_TIMINGS=1 run_suite 2 "$COMMON_CASES
+case_pool_add slow a
+case_pool_add fast b
+case_pool_wait"
+  [ "$(cat "$WORKDIR/rc")" = 0 ] && grep -q '^case-pool timing: .*s  slow a$' "$WORKDIR/err" \
+    && grep -q '^case-pool timing: .*s  fast b$' "$WORKDIR/err" && ! grep -q 'case-pool timing' "$WORKDIR/out" \
+    || fail "MERGEPATH_TEST_TIMINGS=1: no per-case timing on stderr: $(cat "$WORKDIR/err")"
+  run_suite 2 "$COMMON_CASES
+case_pool_add fast a
+case_pool_wait"
+  ! grep -q 'case-pool timing' "$WORKDIR/err" || fail "timings printed without MERGEPATH_TEST_TIMINGS"
+  [ "$FAIL" -ne "$before" ] || pass "MERGEPATH_TEST_TIMINGS=1 reports each case's wall time on stderr, and only when set"
+}
+
 test_counts_and_order
+test_timings_report
 test_aborted_case_fails_closed
 test_parallel_and_first
 test_per_case_workdir
