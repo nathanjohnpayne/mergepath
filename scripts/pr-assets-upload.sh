@@ -12,9 +12,12 @@
 #     not grow with the store), the new blobs hashed into it, a tree written
 #     through a private index, and `git commit-tree` on top of the fetched
 #     tip. Nothing in the store is downloaded. The commit honours the
-#     caller's signing configuration: commit.gpgSign is read and passed to
-#     commit-tree as -S (commit-tree ignores the setting on its own), and
-#     user.signingkey / gpg.format / gpg.*.program apply as for `git commit`.
+#     caller's signing configuration as resolved in the directory the script
+#     was invoked from (repository-local and includeIf settings included):
+#     commit.gpgSign is read and passed to commit-tree as -S (commit-tree
+#     ignores the setting on its own), and the user.* / author.* /
+#     committer.* / gpg.* settings are passed with -c, so user.signingkey,
+#     gpg.format and gpg.*.program apply as for `git commit` there.
 #     A signing failure stops the upload; an unsigned commit (signing not
 #     configured) is pushed with a warning.
 #
@@ -160,6 +163,17 @@ unset OP_PREFLIGHT_PR_ASSETS_PAT OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_P
   GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST \
   GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_COMMON_DIR
+# Where the caller's own git configuration (identity, signing) is resolved.
+CALLER_DIR="$(pwd -P)"
+# Every git trace control, by prefix rather than by list: Trace2
+# (GIT_TRACE2_EVENT with GIT_TRACE2_ENV_VARS=PR_ASSETS_PUSH_CREDENTIAL)
+# records named environment variables, so the push credential would be
+# written to the trace target in plain text, and the classic GIT_TRACE_*
+# family can trace the HTTP exchange. A new trace variable is covered too.
+for _v in $(compgen -e); do
+  case "$_v" in GIT_TRACE*) unset "$_v" ;; esac
+done
+unset _v
 
 # ── Arguments ─────────────────────────────────────────────────────────
 SRC_REPO=""
@@ -461,7 +475,7 @@ $REF_LINE"
   # commit-tree does not read commit.gpgSign itself (only `git commit`
   # does), so the setting is read here and turned into -S; the key, format
   # and program then come from user.signingkey / gpg.* as usual.
-  if ! NEW_COMMIT="$(printf '%s\n' "$msg" | git -C "$WORK" commit-tree ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} "$tree" -p "$base" 2>"$WORK_PARENT/commit.err")"; then
+  if ! NEW_COMMIT="$(printf '%s\n' "$msg" | git ${COMMIT_CFG[@]+"${COMMIT_CFG[@]}"} -C "$WORK" commit-tree ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} "$tree" -p "$base" 2>"$WORK_PARENT/commit.err")"; then
     sed 's/^/pr-assets-upload:   git: /' "$WORK_PARENT/commit.err" >&2 || true
     die "$EXIT_FAILED" "could not create the commit (signing failure?). Nothing was pushed."
   fi
@@ -480,16 +494,36 @@ fetch_tip() {
 BASE="$(git_h -C "$WORK" rev-parse --verify "refs/heads/$STORE_BRANCH^{commit}")" \
   || die "$EXIT_FAILED" "fetched $STORE_REPO has no $STORE_BRANCH."
 
-# Read with the caller's config (not git_h): the same answer `git commit`
-# would act on. An unreadable value is an error, not "off".
+# Read with the caller's config (not git_h), in the caller's directory: the
+# same answer `git commit` would act on there. Read in "$WORK" instead, a
+# repository-local or includeIf-scoped setting of the invoking repository
+# would be lost. An unreadable value is an error, not "off".
 SIGN_ARGS=()
 gpgsign_rc=0
-gpgsign="$(git -C "$WORK" config --type=bool --get commit.gpgsign 2>/dev/null)" || gpgsign_rc=$?
+gpgsign="$(git -C "$CALLER_DIR" config --type=bool --get commit.gpgsign 2>/dev/null)" || gpgsign_rc=$?
 case "$gpgsign_rc" in
   0) [ "$gpgsign" != "true" ] || SIGN_ARGS=(-S) ;;
   1) ;;
   *) die "$EXIT_FAILED" "could not read commit.gpgSign from your git config." ;;
 esac
+# Identity and signing settings (user.*, author.*, committer.*, gpg.*) as
+# resolved in the caller's directory, passed to commit-tree with -c so they
+# apply inside "$WORK". Whole sections, so a key commit-tree consults is not
+# dropped by an incomplete list. Only commit-tree gets them; it is local.
+COMMIT_CFG=()
+cfg_rc=0
+cfg_dump="$WORK_PARENT/commit-config"
+git -C "$CALLER_DIR" config -z --get-regexp '^(user|author|committer|gpg)\.' >"$cfg_dump" 2>/dev/null || cfg_rc=$?
+case "$cfg_rc" in
+  0|1) ;;
+  *) die "$EXIT_FAILED" "could not read identity and signing settings from your git config." ;;
+esac
+while IFS= read -r -d '' cfg_entry; do
+  case "$cfg_entry" in
+    *$'\n'*) COMMIT_CFG+=(-c "${cfg_entry%%$'\n'*}=${cfg_entry#*$'\n'}") ;;
+    *) COMMIT_CFG+=(-c "$cfg_entry") ;;
+  esac
+done <"$cfg_dump"
 
 PINNED=""
 attempt=1
