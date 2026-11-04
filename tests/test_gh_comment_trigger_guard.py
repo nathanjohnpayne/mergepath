@@ -223,6 +223,22 @@ class TriggerGuardTests(unittest.TestCase):
                 self.assertTrue(self.check(["pr", "review", "7", "--approve", "--body", body])[1]["guarded"])
         # A PR comment discussing an orchestrator review is not a review write.
         self.assertTrue(self.check(["pr", "comment", "7", "--body", orchestrator], role="author")[1]["guarded"])
+        # GraphQL: only the review-body mutations are review writes (wave audit
+        # P2 on swipewatch#230). A conversation comment quoting the footer is
+        # allowed, as its REST twin is; a review mutation carrying it is not.
+        for call in ("addPullRequestReview(input: {pullRequestId: \"P\", event: APPROVE, body: $b})",
+                     "submitPullRequestReview(input: {pullRequestReviewId: \"R\", event: APPROVE, body: $b})",
+                     "updatePullRequestReview(input: {pullRequestReviewId: \"R\", body: $b})"):
+            query = "mutation($b: String!) { " + call + " { clientMutationId } }"
+            for role in ("reviewer", "author"):
+                with self.subTest(graphql_review=call[:24], role=role), self.assertRaises(guard.Refused):
+                    self.check(["api", "graphql", "-f", "query=" + query, "-f", "b=" + orchestrator], role=role)
+        for call in ("addComment(input: {subjectId: \"I\", body: $b})",
+                     "updateIssueComment(input: {id: \"C\", body: $b})"):
+            query = "mutation($b: String!) { " + call + " { clientMutationId } }"
+            with self.subTest(graphql_comment=call[:18]):
+                self.assertTrue(self.check(["api", "graphql", "-f", "query=" + query, "-f", "b=" + orchestrator],
+                                           role="author")[1]["guarded"])
 
     def test_owner_tiebreak_placeholders_and_prose_remain_allowed(self):
         for body in ("Post TIEBREAK_REBUTTAL_ACCEPTED=<PR-URL>@<full-head-sha>#<finding-id> to settle it.",
