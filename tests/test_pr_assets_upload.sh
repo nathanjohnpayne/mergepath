@@ -421,8 +421,20 @@ test_no_source_ref_created() {
   expect_rc 0 "upload from inside a source checkout" || return 0
   after_refs="$("$REAL_GIT" ls-remote "$src"; "$REAL_GIT" -C "$clone" for-each-ref)"
   [ "$before_refs" = "$after_refs" ] || { fail "source repository refs changed"; return 0; }
-  if grep -q -- "-C $clone\|$src" "$MOCK_DIR/git.argv.log"; then fail "git ran against the source repository"; return 0; fi
-  pass "no ref is created in the source repository (ls-remote and local refs unchanged)"
+  # The only git calls allowed against the caller's directory are the two
+  # read-only queries for its identity and signing settings. Match the
+  # resolved path too: the script logs `pwd -P`, which differs from $clone
+  # where the temp directory sits behind a symlink (macOS /var).
+  local clone_real
+  clone_real="$(cd "$clone" && pwd -P)"
+  if grep -F -e "$clone" -e "$clone_real" -e "$src" "$MOCK_DIR/git.argv.log" \
+       | grep -v -x -F \
+           -e "-C $clone_real config --type=bool --get commit.gpgsign" \
+           -e "-C $clone_real config -z --get-regexp ^(user|author|committer|gpg)\\." \
+       | grep -q .; then
+    fail "git ran against the source repository beyond the read-only config queries"; return 0
+  fi
+  pass "no ref is created in the source repository (ls-remote and local refs unchanged; only config reads run there)"
 }
 
 test_relative_paths() {
@@ -601,9 +613,12 @@ test_trace_controls_do_not_record_credential() {
   GIT_TRACE2_EVENT="$t2" GIT_TRACE2="$t2n" GIT_TRACE2_ENV_VARS=PR_ASSETS_PUSH_CREDENTIAL \
     GIT_TRACE="$t1" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
   expect_rc 0 "upload with trace controls set" || return 0
-  if cat "$t2" "$t2n" "$t1" 2>/dev/null | grep -qF "$TOKEN"; then
-    fail "the push credential was written to a git trace target"; return 0
-  fi
+  local trace
+  for trace in "$t2" "$t2n" "$t1"; do
+    if [ -f "$trace" ] && grep -qF "$TOKEN" "$trace"; then
+      fail "the push credential was written to a git trace target"; return 0
+    fi
+  done
   pass "git trace controls (Trace2 env-var logging included) never record the push credential"
 }
 
