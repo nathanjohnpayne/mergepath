@@ -53,10 +53,18 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-# #2990: the three codex-review-request suites below run their cases through
-# this pool, so prove its fail-closed contract before trusting their counts.
-echo "check_codex_scripts: running case-pool tests (#2990)"
-"$REPO_ROOT/tests/test_case_pool.sh"
+# #2990: the suites below run through this pool, so prove its fail-closed
+# contract before trusting their counts. A checkout behind the wave that
+# delivers the pool runs them serially (below) and has nothing to prove here;
+# the test itself stays required.
+if [ ! -f "$REPO_ROOT/tests/test_case_pool.sh" ]; then
+  echo "check_codex_scripts: ERROR (missing tests/test_case_pool.sh)" >&2
+  exit 1
+fi
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  echo "check_codex_scripts: running case-pool tests (#2990)"
+  "$REPO_ROOT/tests/test_case_pool.sh"
+fi
 
 # Every suite below is one pool case (#2990): they share no state, so the pool
 # runs them side by side and replays their output in this order. A failing or
