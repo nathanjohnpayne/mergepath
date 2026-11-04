@@ -1006,7 +1006,7 @@ else
   aggregate() {  # DEEP REPLAY SELF SCOPE FAST DEEP_RESULT REPLAY_RESULT SELF_RESULT
     DEEP="$1" CONSUMER_REPLAY="$2" SELF_TESTS="$3" SCOPE_RESULT="$4" FAST_RESULT="$5" \
       DEEP_RESULT="$6" REPLAY_RESULT="$7" SELF_TESTS_RESULT="$8" \
-      FAST_SHARDS="${AGG_FAST_SHARDS-[1,2,3,4,5]}" \
+      FAST_SHARDS="${AGG_FAST_SHARDS-[1,2,3,4,5,6]}" \
       bash --noprofile --norc -e -o pipefail -c "$aggregator_run" >/dev/null 2>&1
   }
   aggregator_ok=1
@@ -1070,12 +1070,12 @@ else
   shard_count=$(printf '%s\n' "$consumer_members" | sed '/^$/d' | wc -l | tr -d ' ')
   if [ "$shard_count" -ge 2 ] && [ "$shard_count" -le 4 ] \
      && printf '%s' "$consumer_fast_shards" | jq -e 'type == "array" and all(.[]; type == "number" and . == floor)' >/dev/null 2>&1 \
-     && printf '%s' "$hub_fast_shards" | jq -e --argjson c "$consumer_fast_shards" 'type == "array" and all(.[]; type == "number" and . == floor) and .[:($c | length)] == $c and (length - ($c | length)) == 1' >/dev/null 2>&1 \
+     && printf '%s' "$hub_fast_shards" | jq -e --argjson c "$consumer_fast_shards" 'type == "array" and all(.[]; type == "number" and . == floor) and .[:($c | length)] == $c and (length - ($c | length)) >= 1' >/dev/null 2>&1 \
      && yq -e '.jobs.lint_fast.strategy.matrix.shard == "${{ fromJSON(needs.scope.outputs.fast_shards) }}" and .jobs.scope.outputs.fast_shards == "${{ steps.shards.outputs.fast_shards }}" and ([.jobs.scope.steps[] | select(.id == "shards")] | length == 1) and ([.jobs.scope.steps[] | select(.id == "shards") | .if] | .[0] == null)' "$REPO_LINT" >/dev/null \
      && yq -e '.jobs.lint_fast.strategy."fail-fast" == false and .jobs.lint_fast.if == null and .jobs.lint_fast.name == "lint-fast" and (.jobs.lint_fast."timeout-minutes" | tag == "!!int")' "$REPO_LINT" >/dev/null; then
     pass "lint-fast runs $consumer_fast_shards on a consumer and $hub_fast_shards on the hub, from the scope job; every leg reports, is never skipped, and is time-bounded"
   else
-    fail "lint-fast must expand the scope job's fast_shards: a 2-4 integer list on a consumer, that list plus one hub-only shard on the hub, with fail-fast: false, no job-level if:, and a timeout (hub: '$hub_fast_shards', consumer: '$consumer_fast_shards')"
+    fail "lint-fast must expand the scope job's fast_shards: a 2-4 integer list on a consumer, that list plus hub-only shards on the hub, with fail-fast: false, no job-level if:, and a timeout (hub: '$hub_fast_shards', consumer: '$consumer_fast_shards')"
   fi
 
   # The aggregator accepts exactly the lists the step writes, so a list that
@@ -1085,7 +1085,7 @@ else
   for good in "$consumer_fast_shards" "$hub_fast_shards"; do
     AGG_FAST_SHARDS="$good" aggregate false false false success success skipped skipped skipped || shard_list_ok=0
   done
-  for bad in '' '[]' '[1,2,3]' '[1,2,3,5]' '[1,2,3,4,5,6]' '[1, 2, 3, 4]' 'null'; do
+  for bad in '' '[]' '[1,2,3]' '[1,2,3,5]' '[1,2,3,4,5]' '[1,2,3,4,6]' '[1,2,3,4,5,6,7]' '[1, 2, 3, 4]' 'null'; do
     if AGG_FAST_SHARDS="$bad" aggregate false false false success success skipped skipped skipped; then
       shard_list_ok=0
       echo "INFO: aggregator accepted fast_shards '$bad'" >&2
@@ -1187,9 +1187,9 @@ else
 
   # #2990: a consumer has no hub-only shard, so a check pinned there runs on
   # the hub alone. Each one must be a wrapper that SKIPs on a consumer, and
-  # SKIPs because the hub marker is absent: run on a tree holding only the
-  # wrapper, it must exit 0 and print SKIP; with the marker added it must
-  # not SKIP. A consumer-applicable check pinned there would silently lose
+  # SKIPs because the hub's markers are absent: run on a tree holding only
+  # the wrapper, it must exit 0 and print SKIP; with the hub markers
+  # (scripts/sync-to-downstream.sh, .mergepath-sync.yml) added it must not. A consumer-applicable check pinned there would silently lose
   # its consumer coverage, and fails here.
   hub_only_ok=1
   hub_only_steps=""
@@ -1208,7 +1208,7 @@ else
       cp "$ROOT/scripts/ci/$wrapper" "$skip_tree/scripts/ci/$wrapper"
       consumer_rc=0
       consumer_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1) || consumer_rc=$?
-      touch "$skip_tree/scripts/sync-to-downstream.sh"
+      touch "$skip_tree/scripts/sync-to-downstream.sh" "$skip_tree/.mergepath-sync.yml"
       hub_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1 || true)
       if [ "$consumer_rc" -ne 0 ] || ! grep -q 'SKIP' <<<"$consumer_out" || grep -q 'SKIP' <<<"$hub_out"; then
         hub_only_ok=0
@@ -1218,9 +1218,9 @@ else
     done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select(.if == ("matrix.shard == " + strenv(member))) | .run' "$REPO_LINT")
   done
   if [ -n "$hub_only_members" ] && [ -n "$hub_only_steps" ] && [ "$hub_only_ok" -eq 1 ]; then
-    pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer because the hub marker is absent"
+    pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer because the hub markers are absent"
   else
-    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when scripts/sync-to-downstream.sh is absent (hub-only shards: '$hub_only_members'; checks:$hub_only_steps)"
+    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when the hub markers are absent (hub-only shards: '$hub_only_members'; checks:$hub_only_steps)"
   fi
 
   # The #777 closing pair: the plain call (Parts A-C + suite) on one shard and
