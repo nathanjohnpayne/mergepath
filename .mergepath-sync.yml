@@ -1699,6 +1699,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's cases concurrently
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
       - "scripts/codex-review-request.sh"                 # changed by #1057 A2; the test asserts its new behavior
@@ -1712,6 +1713,8 @@ paths:
   - path: tests/test_codex_review_request_trigger_only.sh
     type: canonical
     consumers: all
+    requires:
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's cases concurrently
   # Phase 4a entry-decision regression (#486): codex.request_by_default +
   # codex.enabled gating of whether `@codex review` is posted at all.
   # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
@@ -1719,6 +1722,20 @@ paths:
   - path: tests/test_codex_review_request_entry.sh
     type: canonical
     consumers: all
+    requires:
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's cases concurrently
+  # #2990 case pool: the three codex-review-request suites above source it to
+  # run their independent cases concurrently. Without it each suite fails at
+  # its `source` line, so check_codex_scripts fails closed on every consumer.
+  - path: tests/lib/case-pool.sh
+    type: canonical
+    consumers: all
+  # #2990: check_codex_scripts runs it ahead of the suites that use the pool.
+  - path: tests/test_case_pool.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "tests/lib/case-pool.sh"
   # HEAD-anchored Codex issue-comment verdict recognition in the request
   # poller (#609). check_codex_scripts hard-runs it (same `No such file`
   # exit-127 coupling class as the ack suite above), so it must travel to
@@ -2969,6 +2986,8 @@ paths:
       - "tests/test_phase_4b_escalation.cjs" # deterministic dispatch tripwires (#1757)
       - "tests/test_phase_4b_accounting.sh"  # check_phase_4b_accounting (#602)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
+      - "tests/lib/case-pool.sh"  # check_codex_scripts (#2990), sourced by the three codex-review-request suites
+      - "tests/test_case_pool.sh"  # check_codex_scripts (#2990)
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
       - "tests/test_codex_verdict_anchor_resolution.py" # check_codex_scripts (#1752)

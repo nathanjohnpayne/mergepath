@@ -49,6 +49,9 @@ PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+# #2990: queued cases run concurrently; see tests/lib/case-pool.sh.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
 
 make_case() {
   local name=$1
@@ -302,6 +305,9 @@ case "$endpoint" in
       cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
       cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      # #2666: past the ceiling (11 distinct counted requests), e.g. after a
+      # racing requester (#1362) or a lowered max_review_rounds.
+      cap_over_limit)   jq -cn --arg who "$author" --arg t "$old" '[range(11) | {id:(8170 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_four)          jq -cn --arg who "$author" --arg t "$old" '[range(4) | {id:(8700 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_five)          jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8710 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
@@ -497,11 +503,14 @@ test_reviewer_trigger_does_not_count() {
 # not reliably create a review object.
 test_request_attempt_cap() {
   local scenario expected_rc expected_posts description dir rc before
-  for scenario in cap_at_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
+  for scenario in cap_at_limit cap_over_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
     case "$scenario" in
       cap_at_limit)
         expected_rc=7; expected_posts=0
         description="ten prior author requests stop additional advisory requests" ;;
+      cap_over_limit)
+        expected_rc=7; expected_posts=0
+        description="eleven prior author requests are refused like ten" ;;
       cap_below_limit)
         expected_rc=0; expected_posts=1
         description="nine prior author requests permit the tenth" ;;
@@ -519,6 +528,12 @@ test_request_attempt_cap() {
       || fail "#813: $description expected exit $expected_rc, got $rc; err=$(cat "$dir/err.log")"
     [ "$(trig_count "$dir")" = "$expected_posts" ] \
       || fail "#813: $description expected $expected_posts posts, got $(trig_count "$dir")"
+    if [ "$scenario" = cap_over_limit ]; then
+      grep -q 'request-attempt cap reached.*11/10' "$dir/err.log" \
+        || fail "#2666: over-limit refusal did not expose consumed/limit evidence"
+      [ "$(jqf "$dir" '[.cap_exhausted.kind, .cap_exhausted.request_attempts, .cap_exhausted.max_request_attempts] | tostring')" = '["request-ceiling",11,10]' ] \
+        || fail "#2666: over-limit exhaustion did not report kind request-ceiling at 11/10"
+    fi
     if [ "$scenario" = cap_at_limit ]; then
       grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
         || fail "#813: cap refusal did not expose consumed/limit evidence"
@@ -2064,67 +2079,67 @@ CASES
   [ "$FAIL" -ne "$before" ] || pass "#2582: authorization applies the caller's request mode; trigger-only stays the default"
 }
 
-test_guard_dates_queued_checks
-test_guard_unknown_suite_branch
-test_write_boundary_authorization
-test_write_boundary_authorization_caller_mode
+case_pool_add test_guard_dates_queued_checks
+case_pool_add test_guard_unknown_suite_branch
+case_pool_add test_write_boundary_authorization
+case_pool_add test_write_boundary_authorization_caller_mode
 
-test_fresh_posts_once_no_poll
-test_pr_open_reaction_still_posts
-test_dup_author_skips
-test_uppercase_author_command_skips
-test_author_containment_posts
-test_stale_author_command_posts
-test_reviewer_trigger_does_not_count
-test_request_attempt_cap
-test_request_checkpoint
-test_nondefault_request_attempt_cap
-test_candidate_cannot_raise_governing_request_attempt_cap
-test_governing_cap_read_failure_refuses_new_write
-test_invalid_present_governing_cap_refuses_new_write
-test_invalid_present_governing_codex_block_refuses_new_write
-test_missing_governing_codex_block_defaults_request_cap
-test_idempotent_skip_requires_governing_freshness
-test_governing_request_freshness
-test_governing_freshness_revalidation
-test_governing_freshness_validation_preserves_no_spend_caps
-test_gated_cap_leaves_routing_to_caller
-test_cap_preserves_provider_block_as_diagnostic_only
-test_blocking_budget_boundary
-test_blocking_budget_counting_rule
-test_blocking_budget_wins_simultaneous_exhaustion
-test_blocking_budget_governing_value
-test_blocking_budget_fails_closed
-test_blocking_budget_not_read_without_a_write
-test_gate_skips_content_free_head
-test_gate_triggers_on_real_content_change
-test_gate_triggers_without_prior_review
-test_gate_fails_open_on_api_error
-test_gate_triggers_when_only_signal_is_a_review_object
-test_gate_triggers_when_verdict_is_superseded
-test_gate_requires_boolean_carried
-test_wiring_auto_caller_honors_skip
-test_wiring_manual_caller_ignores_gate
-test_wiring_missing_gate_fails_open
-test_feedback_accounting_blocks_trigger
-test_workflow_declares_auto_trigger_flag
-test_guard_refuses_young_head
-test_guard_allow_flag_posts_with_warning
-test_guard_refuses_unscheduled_check
-test_guard_reports_both_reasons
-test_guard_accepts_queued_check
-test_guard_unreadable_check_runs_fails_open
-test_guard_policy_knobs_disable_signals
-test_guard_check_signal_yaml_forms
-test_guard_exempts_automatic_caller
-test_guard_does_not_run_on_no_write_paths
-test_guard_applies_in_polling_mode
-test_guard_anchors_on_push_dispatch
-test_guard_workflow_event_anchors
-test_policy_resolved_from_script_checkout
-test_guard_workflow_signal_shapes
-test_guard_override_paginates_and_scopes
-test_guard_runs_after_the_cap_branch
+case_pool_add test_fresh_posts_once_no_poll
+case_pool_add test_pr_open_reaction_still_posts
+case_pool_add test_dup_author_skips
+case_pool_add test_uppercase_author_command_skips
+case_pool_add test_author_containment_posts
+case_pool_add test_stale_author_command_posts
+case_pool_add test_reviewer_trigger_does_not_count
+case_pool_add test_request_attempt_cap
+case_pool_add test_request_checkpoint
+case_pool_add test_nondefault_request_attempt_cap
+case_pool_add test_candidate_cannot_raise_governing_request_attempt_cap
+case_pool_add test_governing_cap_read_failure_refuses_new_write
+case_pool_add test_invalid_present_governing_cap_refuses_new_write
+case_pool_add test_invalid_present_governing_codex_block_refuses_new_write
+case_pool_add test_missing_governing_codex_block_defaults_request_cap
+case_pool_add test_idempotent_skip_requires_governing_freshness
+case_pool_add test_governing_request_freshness
+case_pool_add test_governing_freshness_revalidation
+case_pool_add test_governing_freshness_validation_preserves_no_spend_caps
+case_pool_add test_gated_cap_leaves_routing_to_caller
+case_pool_add test_cap_preserves_provider_block_as_diagnostic_only
+case_pool_add test_blocking_budget_boundary
+case_pool_add test_blocking_budget_counting_rule
+case_pool_add test_blocking_budget_wins_simultaneous_exhaustion
+case_pool_add test_blocking_budget_governing_value
+case_pool_add test_blocking_budget_fails_closed
+case_pool_add test_blocking_budget_not_read_without_a_write
+case_pool_add test_gate_skips_content_free_head
+case_pool_add test_gate_triggers_on_real_content_change
+case_pool_add test_gate_triggers_without_prior_review
+case_pool_add test_gate_fails_open_on_api_error
+case_pool_add test_gate_triggers_when_only_signal_is_a_review_object
+case_pool_add test_gate_triggers_when_verdict_is_superseded
+case_pool_add test_gate_requires_boolean_carried
+case_pool_add test_wiring_auto_caller_honors_skip
+case_pool_add test_wiring_manual_caller_ignores_gate
+case_pool_add test_wiring_missing_gate_fails_open
+case_pool_add test_feedback_accounting_blocks_trigger
+case_pool_add test_workflow_declares_auto_trigger_flag
+case_pool_add test_guard_refuses_young_head
+case_pool_add test_guard_allow_flag_posts_with_warning
+case_pool_add test_guard_refuses_unscheduled_check
+case_pool_add test_guard_reports_both_reasons
+case_pool_add test_guard_accepts_queued_check
+case_pool_add test_guard_unreadable_check_runs_fails_open
+case_pool_add test_guard_policy_knobs_disable_signals
+case_pool_add test_guard_check_signal_yaml_forms
+case_pool_add test_guard_exempts_automatic_caller
+case_pool_add test_guard_does_not_run_on_no_write_paths
+case_pool_add test_guard_applies_in_polling_mode
+case_pool_add test_guard_anchors_on_push_dispatch
+case_pool_add test_guard_workflow_event_anchors
+case_pool_add test_policy_resolved_from_script_checkout
+case_pool_add test_guard_workflow_signal_shapes
+case_pool_add test_guard_override_paginates_and_scopes
+case_pool_add test_guard_runs_after_the_cap_branch
 
 test_trigger_only_preserves_known_provider_block() {
   local reason dir rc before
@@ -2138,7 +2153,7 @@ test_trigger_only_preserves_known_provider_block() {
     [ "$FAIL" -ne "$before" ] || pass "trigger-only preserves known $reason without changing request authority or budgets"
   done
 }
-test_trigger_only_preserves_known_provider_block
+case_pool_add test_trigger_only_preserves_known_provider_block
 
 test_trigger_only_ignores_stale_provider_block() {
   local reason dir rc before
@@ -2152,7 +2167,7 @@ test_trigger_only_ignores_stale_provider_block() {
     [ "$FAIL" -ne "$before" ] || pass "trigger-only ignores $reason before the current freshness threshold"
   done
 }
-test_trigger_only_ignores_stale_provider_block
+case_pool_add test_trigger_only_ignores_stale_provider_block
 
 test_trigger_only_future_head_preserves_recent_blocks() {
   local reason age dir rc before expected
@@ -2211,9 +2226,9 @@ test_trigger_timestamp_validation() {
   [ "$FAIL" -ne "$before" ] || pass "#2317: unsupported commit metadata refuses before writes; canonical and future UTC keep JSON"
 }
 
-test_trigger_timestamp_validation
+case_pool_add test_trigger_timestamp_validation
 
-test_trigger_only_future_head_preserves_recent_blocks
+case_pool_add test_trigger_only_future_head_preserves_recent_blocks
 
 # #2534: the CodeRabbit rate-limit failover does not spend the request
 # ceiling. --failover marks the trigger it posts, and the ceiling skips a
@@ -2321,8 +2336,9 @@ EOF
     || fail "#2534: --trigger-only without --failover wrote a marker (rc=$rc)"
   [ "$FAIL" -ne "$before" ] || pass "#2534: --failover marks only the trigger it posts, a marked failover spends no ceiling slot, and a failed marker write is not fatal"
 }
-test_failover_marker
+case_pool_add test_failover_marker
 
+case_pool_wait
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

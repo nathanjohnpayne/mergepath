@@ -208,7 +208,9 @@ gh_api_array() {
   errfile=$(mktemp "${TMPDIR:-/tmp}/gh-api-array.XXXXXX" 2>/dev/null) || errfile=""
   if [ -n "$errfile" ]; then
     raw=$(gh api --paginate "$endpoint" 2>"$errfile") || rc=$?
-    GH_API_ARRAY_DETAIL=$(cat "$errfile" 2>/dev/null) || GH_API_ARRAY_DETAIL=""
+    # `$(<file)` reads without starting a `cat` (#2990); the group's redirect
+    # keeps an unreadable capture file as quiet as `cat … 2>/dev/null` was.
+    { GH_API_ARRAY_DETAIL=$(<"$errfile"); } 2>/dev/null || GH_API_ARRAY_DETAIL=""
     rm -f "$errfile"
   else
     raw=$(gh api --paginate "$endpoint" 2>/dev/null) || rc=$?
@@ -223,31 +225,35 @@ gh_api_array() {
   fi
 
   # #967: judge the RAW stream before the empty-list fallback can manufacture
-  # an array out of it — see "The third response mode" above. A probe failure
-  # here is a PARSE failure, i.e. exactly what the flatten below would have
-  # reported, so it keeps the flatten wording and kind rather than inventing a
-  # second name for one condition.
-  local shape=""
-  shape=$(printf '%s\n' "$raw" | jq -rs 'if length == 0 then "no JSON documents at all"
-                                         elif any(.[]; type != "array") then
-                                           "a stream of " + ([.[] | type] | unique | join("+")) + " values"
-                                         else "array" end' 2>/dev/null) || {
+  # an array out of it — see "The third response mode" above. The judgement
+  # and the flatten run in ONE jq pass (#2990: this read runs several times
+  # per poll tick, so every process here is paid on every tick). A usable
+  # stream yields the flattened ARRAY; an unusable one yields the shape as a
+  # JSON STRING, which no flatten can produce, so the two cannot be confused.
+  # A parse failure is exactly what the flatten would have reported, so it
+  # keeps the flatten wording and kind rather than inventing a second name
+  # for one condition. `jq -s` slurps the whole stream before emitting
+  # anything, and the result is held until it is judged, so the rc-3
+  # "nothing on stdout" half of the contract holds.
+  local out=""
+  out=$(printf '%s\n' "$raw" | jq -s 'if length == 0 then "no JSON documents at all"
+                                      elif any(.[]; type != "array") then
+                                        "a stream of " + ([.[] | type] | unique | join("+")) + " values"
+                                      else add // [] end' 2>/dev/null) || {
     GH_API_ARRAY_ERROR="failed to flatten $label pagination output${GH_API_ARRAY_DETAIL:+ (gh stderr: $GH_API_ARRAY_DETAIL)}"
     GH_API_ARRAY_ERROR_KIND="flatten"
     return 3
   }
-  if [ "$shape" != "array" ]; then
-    GH_API_ARRAY_ERROR="$label ($endpoint) came back as $shape, not a stream of JSON arrays — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967). The empty-list fallback is deliberately NOT applied here: it would turn an unreadable response into a confident zero."
-    GH_API_ARRAY_ERROR_KIND="shape"
-    return 3
-  fi
-
-  # `jq -s` slurps the whole stream before emitting anything, so a parse
-  # failure leaves stdout untouched — the rc-3 "nothing on stdout" half of
-  # the contract holds without an explicit suppression here.
-  printf '%s\n' "$raw" | jq -s 'add // []' 2>/dev/null || {
-    GH_API_ARRAY_ERROR="failed to flatten $label pagination output${GH_API_ARRAY_DETAIL:+ (gh stderr: $GH_API_ARRAY_DETAIL)}"
-    GH_API_ARRAY_ERROR_KIND="flatten"
-    return 3
-  }
+  case "$out" in
+    \"*)
+      # The shape strings are built from jq type names only, so stripping the
+      # quotes is the whole decode.
+      local shape=${out#\"}
+      shape=${shape%\"}
+      GH_API_ARRAY_ERROR="$label ($endpoint) came back as $shape, not a stream of JSON arrays — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967). The empty-list fallback is deliberately NOT applied here: it would turn an unreadable response into a confident zero."
+      GH_API_ARRAY_ERROR_KIND="shape"
+      return 3
+      ;;
+  esac
+  printf '%s\n' "$out"
 }

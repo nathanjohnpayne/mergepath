@@ -2558,7 +2558,10 @@ if [ "$__p4b_claims" -gt 0 ]; then
     if p4b_prov_cites_authorization "$REVIEWS_JSON"; then
       __p4b_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (Phase 4b owner authorization)")
     fi
-    if ! __p4b_class=$(p4b_prov_classify "$REVIEWS_JSON" "$__p4b_ledger" "$__p4b_comments" "$AUTHOR_IDENTITY" "$(p4b_prov_pr_url "$REPO" "$PR_NUMBER")") \
+    # Only the reviewer identities' header-bearing reviews count as carriers
+    # of a run id, so a quoted trailer cannot neutralize an approval.
+    __p4b_trusted=$(printf '%s\n' "$REVIEWERS" | jq -R . | jq -sc 'map(select(length > 0))')
+    if ! __p4b_class=$(p4b_prov_classify "$REVIEWS_JSON" "$__p4b_ledger" "$__p4b_comments" "$AUTHOR_IDENTITY" "$(p4b_prov_pr_url "$REPO" "$PR_NUMBER")" "$__p4b_trusted") \
        || ! REVIEWS_JSON=$(p4b_prov_neutralize "$REVIEWS_JSON" "$__p4b_class"); then
       die 3 "cannot classify Phase 4b review provenance (#2968)"
     fi

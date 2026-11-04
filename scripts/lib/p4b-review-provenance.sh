@@ -158,12 +158,12 @@ p4b_prov_cites_authorization() {
     any(.[]?; p4b_claiming and ((.body | p4b_owner_authorization) != null))' >/dev/null 2>&1
 }
 
-# p4b_prov_classify <reviews-json> <ledger-entries-json|null> <comments-json|null> <author> <pr-url>
+# p4b_prov_classify <reviews-json> <ledger-entries-json|null> <comments-json|null> <author> <pr-url> [trusted-logins-json]
 # Pure. Classifies every review that claims automated provenance:
 #   ledger            header, run marker before the footer, exactly one
 #                     reserved ledger entry for that run on the review's
-#                     commit, the only review carrying that run id, and no
-#                     authorization on either side;
+#                     commit, the only publisher-shaped review carrying that
+#                     run id, and no authorization on either side;
 #   owner-authorized  the same, and the review's anchored authorization
 #                     record equals its ledger entry's authorization, no other
 #                     entry consumed it, and the cited comment is a valid
@@ -172,6 +172,14 @@ p4b_prov_cites_authorization() {
 #   unverified        anything else, with the reason. It is never clearance.
 # A review that claims nothing (a manual handoff review), or one by a bot, is
 # not listed.
+# Run-id uniqueness counts only publisher-shaped carriers: reviews that open
+# with the orchestrator header and, when trusted-logins-json (a JSON array of
+# the reviewer identities) is given, are by one of those logins. A run marker
+# and footer are public text, so a review that merely quotes them (a
+# COMMENTED discussion, an unregistered account) must not turn a legitimate
+# approval into a duplicate and get it neutralized. A surplus publication by
+# the orchestrator itself is still header-bearing and by a reviewer identity,
+# so it still counts.
 # Prints [{id, login, state, commit_id, class, reason, run, authorization}];
 # returns 1 on malformed input.
 # The reviews arrive on stdin and the comments through a file: either can
@@ -179,19 +187,25 @@ p4b_prov_cites_authorization() {
 # oversized --argjson would keep jq from starting at all. Only the small
 # ledger rides on argv.
 p4b_prov_classify() {
-  local ledger="${2:-null}" comments="${3:-null}" cf rc=0
+  local ledger="${2:-null}" comments="${3:-null}" trusted="${6:-null}" cf rc=0
   [ -n "$ledger" ] || ledger=null
   [ -n "$comments" ] || comments=null
+  [ -n "$trusted" ] || trusted=null
   cf=$(mktemp "${TMPDIR:-/tmp}/p4b-prov-comments.XXXXXX") || return 1
   printf '%s' "$comments" >"$cf" || { rm -f "$cf"; return 1; }
-  printf '%s' "${1:-}" | jq -ce --argjson ledger "$ledger" --slurpfile cs "$cf" \
+  printf '%s' "${1:-}" | jq -ce --argjson ledger "$ledger" --argjson trusted "$trusted" --slurpfile cs "$cf" \
     --arg author "${4:-}" --arg url "${5:-}" "$P4B_PROV_JQ_DEFS"'
     (if ($cs | length) == 1 then $cs[0] else error("comments") end) as $comments
     | if type != "array" then error("reviews are not an array") else . end
     | if $ledger != null and ($ledger | type) != "array" then error("ledger") else . end
     | if $comments != null and ($comments | type) != "array" then error("comments") else . end
+    | if $trusted != null and (($trusted | type) != "array" or any($trusted[]; type != "string"))
+        then error("trusted") else . end
     | . as $all
-    | [ $all[] | select(p4b_claiming) | .body | p4b_run_marker | strings ] as $runs
+    | [ $all[] | select(p4b_claiming)
+        | select((.body // "") | startswith("**Automated Phase 4b review**"))
+        | select($trusted == null or ((.user.login // "") as $l | any($trusted[]; . == $l)))
+        | .body | p4b_run_marker | strings ] as $runs
     | [ $all[] | select(p4b_claiming)
         | . as $r
         | ($r.body | p4b_run_marker) as $run

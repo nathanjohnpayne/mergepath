@@ -42,6 +42,9 @@ FAIL=0
 TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+# #2990: queued cases run concurrently; see tests/lib/case-pool.sh.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
 
 # Build a case directory with a review-policy.yml whose codex: block is
 # exactly the lines passed as $2 (a newline-joined string of "  key: val"
@@ -317,10 +320,10 @@ test_target_entry_policy() {
     fail "#2273 $name: expected rc=$expected/posts=$posts, got rc=$rc/posts=$(trigger_count "$dir"): $(cat "$dir/err.log")"
   fi
 }
-test_target_entry_policy enabled-target-on false true true true true 4 1
-test_target_entry_policy enabled-target-off true true false true true 5 0
-test_target_entry_policy default-target-on true false true true '' 4 1
-test_target_entry_policy default-target-off true true true false '' 5 0
+case_pool_add test_target_entry_policy enabled-target-on false true true true true 4 1
+case_pool_add test_target_entry_policy enabled-target-off true true false true true 5 0
+case_pool_add test_target_entry_policy default-target-on true false true true '' 4 1
+case_pool_add test_target_entry_policy default-target-off true true true false '' 5 0
 
 # --- defaults: absent keys on a gated PR ⇒ trigger + durable timeout ------
 # Absent enabled/request_by_default on a Phase-4a-gated PR: the request is
@@ -1327,29 +1330,29 @@ test_unparseable_checkout_policy_refuses() {
   fi
 }
 
-test_defaults_request_on_gated_pr
-test_request_by_default_unset_skips_under_threshold
-test_request_by_default_true_triggers_under_threshold
-test_request_by_default_unreadable_requests
-test_request_by_default_policy_shapes
-test_request_by_default_missing_policy_requests
-test_gated_requests_in_every_case
-test_request_by_default_false_skips_under_threshold
-test_request_by_default_false_triggers_when_gated
-test_enabled_false_never_triggers
-test_codex_enabled_spellings
-test_unparseable_checkout_policy_refuses
-test_malformed_head_age_fails_only_the_write_path
-test_derive_signals
-test_derive_failsafe
-test_derive_reads_governing_policy
-test_derive_threshold_parity
-test_derive_paths_parity
-test_derive_helpers_get_no_credentials
-test_policy_helpers_verify_locale_semantics
-test_derive_not_run_when_decided
-test_timeout_head_drift_fails_closed_without_marker
-test_new_trigger_replaces_superseded_timeout_marker
+case_pool_add test_defaults_request_on_gated_pr
+case_pool_add test_request_by_default_unset_skips_under_threshold
+case_pool_add test_request_by_default_true_triggers_under_threshold
+case_pool_add test_request_by_default_unreadable_requests
+case_pool_add test_request_by_default_policy_shapes
+case_pool_add test_request_by_default_missing_policy_requests
+case_pool_add test_gated_requests_in_every_case
+case_pool_add test_request_by_default_false_skips_under_threshold
+case_pool_add test_request_by_default_false_triggers_when_gated
+case_pool_add test_enabled_false_never_triggers
+case_pool_add test_codex_enabled_spellings
+case_pool_add test_unparseable_checkout_policy_refuses
+case_pool_add test_malformed_head_age_fails_only_the_write_path
+case_pool_add test_derive_signals
+case_pool_add test_derive_failsafe
+case_pool_add test_derive_reads_governing_policy
+case_pool_add test_derive_threshold_parity
+case_pool_add test_derive_paths_parity
+case_pool_add test_derive_helpers_get_no_credentials
+case_pool_add test_policy_helpers_verify_locale_semantics
+case_pool_add test_derive_not_run_when_decided
+case_pool_add test_timeout_head_drift_fails_closed_without_marker
+case_pool_add test_new_trigger_replaces_superseded_timeout_marker
 
 # ── #1100: the accounting precondition is scoped to the provider REQUESTED ──
 #
@@ -1700,6 +1703,7 @@ else
 fi
 rm -rf "${G1100_FAKE:-/nonexistent}"
 
+case_pool_wait
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
