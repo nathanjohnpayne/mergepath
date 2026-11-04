@@ -15,6 +15,24 @@ COMMAND = re.compile(r"\s*@codex\s+review\s*", re.IGNORECASE)
 # in prose or in a code fence. Placeholders such as
 # <PR-URL>@<full-head-sha>#<finding-id> do not match.
 TIEBREAK = re.compile(r"TIEBREAK_(?:REBUTTAL_ACCEPTED=\S+@[0-9a-f]{40}#[0-9]+|RUNAWAY_ACCEPTED=\S+@[0-9a-f]{40})", re.IGNORECASE)
+# The owner's authorization for one Phase 4b round beyond a spent round cap
+# (#2968) follows the same rule: the owner types it, no agent body carries it.
+# The placeholder <canonical-https-PR-URL>@<full-head-sha> does not match.
+P4B_OWNER_AUTHORIZATION = re.compile(r"P4B_EXTRA_ROUND_AUTHORIZED=\S+@[0-9a-f]{40}", re.IGNORECASE)
+# A review body that claims automated Phase 4b provenance (#2968): the bold
+# "Automated" or "Direct" Phase 4b review heading that opens it, the run
+# marker, the owner-authorization record or the orchestrator footer. Only
+# scripts/phase-4b-review.sh writes such a review, as a reviewer-wrapper REST
+# POST with MERGEPATH_P4B_REVIEW_WRITE=1 set; a hand-posted one would read as
+# an automated round that no ledger reservation accounts for (mergepath#2887).
+# The merge gate classifies whatever gets past this guard by other routes.
+P4B_PROVENANCE = re.compile(
+    r"\A\s*\*\*\s*(?:automated|direct)\s+phase\s*4b\s+review\s*\*\*"
+    r"|<!--\s*mergepath-p4b-(?:run\s*:\s*[A-Za-z0-9._-]+|owner-authorization\s*:\s*[0-9]+)\s*-->"
+    r"|_Posted by scripts/phase-4b-review\.sh",
+    re.IGNORECASE,
+)
+P4B_REVIEW_PATH = re.compile(r"repos/[^/]+/[^/]+/pulls/[0-9]+/reviews(?:/[0-9]+(?:/events)?)?")
 # A well-formed Codex failover marker (#2534) exempts its trigger from the
 # request ceiling, so only codex-review-request.sh --failover may write it: the
 # exact marker as the whole body of an author PR comment, with the write
@@ -190,6 +208,8 @@ def inspect(argv, role, state=None):
     verb = args[i] if i < len(args) else ""
     channel = ""
     pr = ""
+    path = ""
+    method = ""
     if noun in ("pr", "issue") and verb in ("comment", "review", "close"):
         if verb == "close" and not any(
             value in ("--comment", "-c") or value.startswith("--comment=") or re.match(r"^-d*c", value)
@@ -346,6 +366,18 @@ def inspect(argv, role, state=None):
 
     if any(TIEBREAK.search(body) for body in bodies):
         raise Refused("Reserved owner tiebreak text is not allowed in an agent-authored comment; the owner posts it.")
+    if any(P4B_OWNER_AUTHORIZATION.search(body) for body in bodies):
+        raise Refused("Reserved Phase 4b owner authorization text is not allowed in an agent-authored comment; the owner posts it (#2968).")
+    review_write = (channel == "pr-review" or channel == "graphql-comment"
+                    or (channel == "api-comment" and P4B_REVIEW_PATH.fullmatch(path) is not None))
+    if review_write and any(P4B_PROVENANCE.search(body) for body in bodies):
+        if not (role == "reviewer" and channel == "api-comment" and method == "POST"
+                and re.fullmatch(r"repos/[^/]+/[^/]+/pulls/[0-9]+/reviews", path) and len(bodies) == 1
+                and os.environ.get("MERGEPATH_P4B_REVIEW_WRITE") == "1"):
+            raise Refused("Automated Phase 4b review provenance (the automated or direct Phase 4b heading, run marker, "
+                          "owner-authorization record or orchestrator footer) is written only by scripts/phase-4b-review.sh. "
+                          "Post a manual Phase 4b review without them, or rerun the orchestrator, with an owner "
+                          "authorization when the round cap is spent (#2968).")
     hits = [body for body in bodies if PHRASE.search(body)]
     metadata = {"guarded": True, "trigger": False, "deferred": deferred, "cli_stdin": cli_stdin}
     if any(FAILOVER.search(body) for body in bodies):

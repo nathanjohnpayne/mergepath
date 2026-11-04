@@ -256,6 +256,8 @@
     "check_codex_scripts": [
       "scripts/lib/credential-class.sh",
       "scripts/lib/codex-request-evidence.sh",
+      "scripts/lib/p4b-review-provenance.sh",
+      "scripts/phase-4b-review.sh",
       "tests/test_codex_request_evidence.sh",
       "tests/fixtures/codex_late_review_format_1120.json",
       "tests/test_late_codex_findings.sh",
@@ -499,6 +501,7 @@
     ],
     "check_phase_4b_automation": [
       "scripts/lib/gh-comment-trigger-guard.sh",
+      "scripts/lib/p4b-review-provenance.sh",
       "scripts/workflow/gh-comment-trigger-guard.py",
       "scripts/lib/credential-class.sh",
       "scripts/lib/coderabbit-fence.sh",

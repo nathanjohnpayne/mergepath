@@ -51,6 +51,7 @@ REQUIRED_FILES=(
   "scripts/phase-4b/verdict.schema.json"
   "scripts/lib/codex-failure-markers.sh"
   "scripts/lib/gh-api-array.sh"
+  "scripts/lib/p4b-review-provenance.sh"
 )
 TEST="tests/test_phase_4b_automation.sh"
 

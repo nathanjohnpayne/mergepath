@@ -448,6 +448,14 @@ paths:
   # declared in each of their requires: so the lib can never ship behind its
   # callers. Each caller keeps only its own failure ACTION (die 2 / die 3 /
   # return 3 / return 1), which is the part that genuinely differs.
+  # Automated Phase 4b review provenance (#2968): the owner-authorized round
+  # beyond a spent round cap and the gate (b)/(c) classification of reviews
+  # that claim automated provenance. Pure jq helpers plus one `gh api` ledger
+  # read; hard-sourced by scripts/codex-review-check.sh and
+  # scripts/phase-4b-review.sh, which both declare it in requires:.
+  - path: scripts/lib/p4b-review-provenance.sh
+    type: canonical
+    consumers: all
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
@@ -702,6 +710,7 @@ paths:
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/branch-requirements.sh"   # #1064, hard-sourced gate (a) required-check resolution
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, hard-sourced Phase 4b review provenance classifier for gates (b)/(c)
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
   # Codex solicits on each finding. WRITE path — every reaction POST goes
   # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
@@ -772,6 +781,7 @@ paths:
       # gh_api_scalar so an unreadable head is empty rather than a JSON blob.
       # Absent, the script exits 3 by design.
       - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, hard-sourced owner-authorized round and provenance record
   # Chat-side Phase 4b handoff block renderer (#281). Read-only,
   # stdout-only: emits the single-PR or batch handoff variant per
   # REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff
@@ -992,6 +1002,7 @@ paths:
       - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/dependabot-commit-provenance.sh"   # Dependabot arm requires Dependabot-only commits
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, the delegated checker hard-sources it
   - path: scripts/gate-api-lineage-blocking.sh
     # #2247: the event-driven Merge clearance gate job runs it from the
     # trusted checkout before concluding its job-native run non-failing while
@@ -1256,6 +1267,7 @@ paths:
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/hooks/gh-pr-guard.sh"      # self-approval refusal string is asserted
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, case 17 runs the orchestrator, which hard-sources it
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
@@ -1905,6 +1917,7 @@ paths:
     requires:
       - "scripts/phase-4b-review.sh"
       - "scripts/phase-4b/"
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, sourced for the provenance and owner-authorization cases
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
@@ -1939,6 +1952,7 @@ paths:
       - "tests/fixtures/phase_4b_verdicts.jsonl"
       - "tests/test_coderabbit_wait_status_probe.sh" # bounded quota production probes (#2120)
       - "tests/fixtures/coderabbit_quota_refusal.json" # exact native consumer refusal body
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, the orchestrator and checker under test hard-source it
   # Advisory heartbeat tests execute the real orchestrator with fake boundaries.
   # Core assertions run on consumers; curated-wave fixtures run only on the hub.
   - path: tests/test_phase_4b_immutable_input.sh
@@ -1981,6 +1995,7 @@ paths:
       - "tests/fixtures/phase_4b_verdicts.jsonl"
       - "scripts/codex-review-ledger.sh"
       - "scripts/lib/codex-review-ledger.sh"
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, the orchestrator and checker under test hard-source it
   # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
   # prices.json, all carried by the scripts/phase-4b/ kit) and is
   # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:
@@ -3037,6 +3052,7 @@ paths:
       - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait (#1084)
       - "scripts/workflow/feedback-archive-relay-source.sh"  # check_codex_p1_gate source-binding runtime (#1413)
       - "tests/test_feedback_archive_relay_source.sh"  # check_codex_p1_gate source-binding fixtures (#1413)
+      - "scripts/lib/p4b-review-provenance.sh"   # #2968, check_phase_4b_automation and check_codex_scripts suites source it
   - path: scripts/gh-projects/
     type: kit
     consumers: all

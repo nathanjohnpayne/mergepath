@@ -76,6 +76,23 @@
 #                    overridden, an adapter that yields no usable verdict
 #                    exits 8 (the tripwire still holds), never the exit-4
 #                    manual fallback that wave fan-out may proceed on.
+#   --owner-authorization <comment-id>
+#                    one round beyond a spent phase_4b_automation.max_review_rounds
+#                    cap (#2968; specs/phase_4b_round_cap.md). The comment must
+#                    be the owner's (author_identity) unedited PR comment with
+#                    exactly one line
+#                    P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why>
+#                    naming this PR and its current head, newer than every
+#                    automated Phase 4b review. The ledger reservation records
+#                    the comment id, so it authorizes exactly one run; a new
+#                    head or another run needs a fresh comment. The posted
+#                    review cites it beside its run marker. Every barrier,
+#                    hold, tripwire, accounting and writer-boundary check
+#                    still applies. Refused with --dry-run, with
+#                    --wave-scope-file, with no governing cap and with a cap
+#                    that is not spent (exit 3); an invalid or consumed
+#                    authorization keeps the spent stop (exit 8). A comment
+#                    from the owner's account is not proof the owner typed it.
 #   --force-enabled  run this one invocation even when
 #                    phase_4b_automation.enabled is false/absent in
 #                    .github/review-policy.yml (#1046). Overrides ONLY
@@ -144,6 +161,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
+# #2968: owner authorization of one round beyond a spent round cap, and the
+# provenance record the merge gate reads. Hard-sourced: the round-cap block
+# below calls it whenever --owner-authorization is given.
+[ -r "$ROOT/lib/p4b-review-provenance.sh" ] || p4b_die 3 "missing helper: $ROOT/lib/p4b-review-provenance.sh (see #2968)"
+# shellcheck source=lib/p4b-review-provenance.sh
+. "$ROOT/lib/p4b-review-provenance.sh"
 # Raw adapter evidence is independent of the presentation rewritten for GitHub.
 P4B_VALIDATED_VERDICT=""
 P4B_VERDICT_EVIDENCE_FILE=""
@@ -304,12 +327,15 @@ FORCE_ENABLED=false
 ADMIN_OVERRIDE_SET=false
 ADMIN_OVERRIDE_QUOTE=""
 ADMIN_OVERRIDDEN='[]'
+# #2968: the owner-authorization comment id for one round beyond a spent
+# round cap. Consumed once, through the round ledger.
+P4B_OWNER_AUTH_ID=""
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--wave-codex-request <comment-id>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--wave-codex-request <comment-id>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>] [--owner-authorization <comment-id>]" >&2
   exit 3
 }
 
@@ -334,6 +360,10 @@ while [ $# -gt 0 ]; do
       # --dry-run`), never authorization text: refuse rather than consume it.
       case "${2:-}" in ''|-*) p4b_die 3 "--admin-override requires the owner's quoted authorization" ;; esac
       ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
+    --owner-authorization)
+      case "${2:-}" in [1-9]*) ;; *) p4b_die 3 "--owner-authorization requires the owner's authorization comment id" ;; esac
+      case "$2" in *[!0-9]*) p4b_die 3 "--owner-authorization requires a numeric comment id" ;; esac
+      P4B_OWNER_AUTH_ID="$2"; shift 2 ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
     *)
@@ -351,6 +381,13 @@ if [ "$ADMIN_OVERRIDE_SET" = true ]; then
     *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
   esac
   [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
+fi
+
+# #2968: an owner authorization spends one round beyond a spent cap on one
+# live PR head. A preview cannot consume it, and a wave canary never needs it.
+if [ -n "$P4B_OWNER_AUTH_ID" ]; then
+  [ "$DRY_RUN" != true ] || p4b_die 3 "--owner-authorization cannot be combined with --dry-run: only a posting run consumes it"
+  [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "--owner-authorization does not apply to a wave canary (--wave-scope-file)"
 fi
 
 if [ "$RETAIN_EVIDENCE" = true ]; then
@@ -1031,6 +1068,18 @@ stop_for_human_tiebreaker() {
 # stop keep precedence. Enforcement holds only where every automated
 # publisher reserves through this ledger; an older orchestrator that does not
 # is outside it.
+#
+# #2968: the one sanctioned round beyond a spent cap. With
+# --owner-authorization <comment-id>, a spent cap (nothing in flight) is not
+# a stop when that PR comment is a valid owner authorization for this PR and
+# this head (p4b_prov_authorization), newer than every automated Phase 4b
+# review, and no ledger entry has consumed it. The reservation then records
+# `authorization: <comment-id>`: that entry is the single-use consumption,
+# and the same fast-forward-only write that admits one competing writer
+# admits one consumer. A consumed, invalid, stale or edited authorization
+# keeps the spent stop (exit 8); a cap that is not spent refuses the flag
+# (exit 3) and consumes nothing. The binding check before the POST re-reads
+# the authorization, and the posted review cites it next to its run marker.
 P4B_ROUND_CAP_JSON=null
 P4B_ROUND_CAP=none
 P4B_ROUND_AUTHOR=""
@@ -1039,6 +1088,9 @@ P4B_ROUND_POST_ATTEMPTED=false
 P4B_ROUND_LEDGER_REF=""
 P4B_ROUND_TREE=""
 P4B_ROUND_WHERE=""
+P4B_OWNER_AUTH_JSON=null
+P4B_OWNER_AUTH_FLOOR=""
+ROUND_REVIEWS='[]'
 round_cap_evidence_error() {
   local reason="$1"
   # At the writer boundary the loop already says posted and approval
@@ -1117,7 +1169,7 @@ round_rounds_read() {
     second=$(p4b_completed_rounds_from_reviews "$reviews" "$P4B_ROUND_AUTHOR") \
       || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
     if [ "$(printf '%s' "$first" | jq -c '[.rounds[].id]')" = "$(printf '%s' "$second" | jq -c '[.rounds[].id]')" ]; then
-      ROUND_STATE="$second"; return 0
+      ROUND_STATE="$second"; ROUND_REVIEWS="$reviews"; return 0
     fi
     p4b_log "round cap: consecutive review reads disagreed (attempt $attempt); re-reading (#2663)"
   done
@@ -1183,6 +1235,74 @@ round_ledger_write() {
   return 1
 }
 round_my_entries() { printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" '[.[] | select(.run == $run)]'; }
+# round_provenance_trailer: the end of every posted review body. A per-run
+# nonce lets an uncertain POST be reconciled against THIS run's review, never
+# another caller's identical body on the same head (#2663). An authorized
+# round writes its authorization record directly before that marker, the only
+# place the merge gate reads it (p4b_owner_authorization), so a quoted copy
+# elsewhere in the body is never the citation (#2968).
+round_provenance_trailer() {
+  if [ -n "$P4B_OWNER_AUTH_ID" ]; then
+    printf '\n<!-- mergepath-p4b-owner-authorization: %s -->\n' "$P4B_OWNER_AUTH_ID"
+  fi
+  printf '\n<!-- mergepath-p4b-run: %s -->\n' "$P4B_ACCT_RUN_ID"
+  printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
+}
+# round_owner_authorization_line: the Review Metadata line of an authorized
+# round (#2968). The reason is owner-typed free text in a reviewer-authored
+# body, so every ASCII punctuation character is escaped, as the #2633
+# admin-override quote is: it renders unchanged but cannot form a tier marker,
+# ack token or HTML-comment record. A quoted reserved Codex command first gets
+# the zero-width break adapter strings get, or the comment guard would refuse
+# the POST after the single-use authorization was consumed.
+round_owner_authorization_line() {
+  [ -n "$P4B_OWNER_AUTH_ID" ] || return 0
+  printf -- '- Owner authorization (#2968): one round beyond the spent Phase 4b round cap, authorized for this head by https://github.com/%s/pull/%s#issuecomment-%s; reason: "%s"\n' \
+    "$REPO" "$PR" "$P4B_OWNER_AUTH_ID" \
+    "$(jq -rn --argjson v "$P4B_OWNER_AUTH_JSON" '($v.reason // "")
+        | gsub("@(?<command>codex[\\s\u001c-\u001f]+rev[i\u0130\u0131]ew)"; "@\u200b\(.command)"; "i")
+        | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')"
+}
+# round_owner_authorization_check <where> -> validates --owner-authorization
+# against fresh PR comments and the current ledger (#2968). Pre-dispatch an
+# invalid authorization keeps the spent stop (exit 8); at the writer boundary
+# it refuses the POST through pre-POST cleanup (exit 10). Unreadable evidence
+# exits 10 either way.
+round_owner_authorization_check() {
+  local where="$1" comments v consumed
+  command -v gh_api_array >/dev/null 2>&1 \
+    || round_cap_evidence_error "Phase 4b round cap: the paginated reader is unavailable"
+  comments=$(gh_api_array "repos/$REPO/issues/$PR/comments" "Phase 4b owner authorization") \
+    || round_cap_evidence_error "Phase 4b round cap: the PR comments holding owner authorization $P4B_OWNER_AUTH_ID are unreadable"
+  if [ "$where" = pre-dispatch ]; then
+    P4B_OWNER_AUTH_FLOOR=$(p4b_prov_latest_claim_at "$ROUND_REVIEWS") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+  fi
+  v=$(p4b_prov_authorization "$comments" "$P4B_OWNER_AUTH_ID" "$P4B_ROUND_AUTHOR" \
+        "$(p4b_prov_pr_url "$REPO" "$PR")" "$HEAD" "$P4B_OWNER_AUTH_FLOOR") \
+    || round_cap_evidence_error "Phase 4b round cap: the PR comments are malformed"
+  # Consumed by any entry but this run's own, in any state: a released run
+  # still spent its authorization, so a retry needs a fresh one.
+  consumed=$(printf '%s' "$LEDGER_ENTRIES" | jq -r --argjson id "$P4B_OWNER_AUTH_ID" --arg run "$P4B_ACCT_RUN_ID" \
+    '[.[] | select(.authorization == $id and .run != $run) | .run] | join(", ")') \
+    || round_cap_evidence_error "Phase 4b round cap: the round ledger is malformed"
+  if [ -n "$consumed" ]; then
+    v=$(jq -nc --arg r "$consumed" --arg id "$P4B_OWNER_AUTH_ID" \
+      '{ok:false, why:"owner authorization \($id) was already consumed by run \($r); another run needs a fresh authorization"}')
+  fi
+  # Pre-dispatch a valid authorization is "valid" until the reservation that
+  # consumes it lands; at the writer boundary it is already consumed.
+  P4B_ROUND_CAP_JSON=$(printf '%s' "${P4B_ROUND_CAP_JSON:-null}" | jq -c --argjson v "$v" --argjson id "$P4B_OWNER_AUTH_ID" --arg where "$where" \
+    '(. // {}) + {owner_authorization:({comment_id:$id, state:(if ($v.ok | not) then "refused" elif $where == "pre-post" then "consumed" else "valid" end)}
+                  + (if $v.ok then {head:$v.head, created_at:$v.created_at} else {why:$v.why} end))}')
+  if [ "$(printf '%s' "$v" | jq -r '.ok')" != true ]; then
+    if [ "$where" = pre-dispatch ]; then
+      round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR}; $(printf '%s' "$v" | jq -r '.why'). The owner may authorize one further round on this head with a new PR comment line P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why> (#2968)" pre-dispatch
+    fi
+    round_cap_evidence_error "Phase 4b round cap: owner authorization $P4B_OWNER_AUTH_ID no longer holds ($(printf '%s' "$v" | jq -r '.why')); not publishing"
+  fi
+  P4B_OWNER_AUTH_JSON="$v"
+}
 release_round_reservation() { # <why>; writer-only, never after a POST attempt
   [ "$P4B_ROUND_RESERVED" = true ] || return 0
   [ "$P4B_ROUND_POST_ATTEMPTED" != true ] || return 0
@@ -1211,16 +1331,22 @@ enforce_phase4b_round_cap() {
       || round_cap_evidence_error "Phase 4b round cap: author_identity is unreadable"
     P4B_ROUND_LEDGER_REF="refs/mergepath/p4b-rounds/pr-$PR"
   fi
-  [ "$P4B_ROUND_CAP" != none ] || return 0
+  if [ "$P4B_ROUND_CAP" = none ]; then
+    [ -z "$P4B_OWNER_AUTH_ID" ] || p4b_die 3 "--owner-authorization applies only where phase_4b_automation.max_review_rounds caps Phase 4b rounds; the governing policy of ${REPO}#${PR} sets no cap (#2968)"
+    return 0
+  fi
   if [ "$where" = pre-post ]; then
     P4B_ROUND_WHERE=pre-post
-    # Binding check: this run's slot must still be its own, exactly once.
+    # Binding check: this run's slot must still be its own, exactly once,
+    # carrying exactly the authorization it reserved under (#2968).
     round_ledger_read
     mine=$(round_my_entries)
-    if [ "$(printf '%s' "$mine" | jq 'length')" != 1 ] || [ "$(printf '%s' "$mine" | jq -r '.[0].state')" != reserved ]; then
+    if [ "$(printf '%s' "$mine" | jq 'length')" != 1 ] || [ "$(printf '%s' "$mine" | jq -r '.[0].state')" != reserved ] \
+       || [ "$(printf '%s' "$mine" | jq -r '.[0].authorization // ""')" != "$P4B_OWNER_AUTH_ID" ]; then
       P4B_ROUND_RESERVED=false
-      round_cap_evidence_error "Phase 4b round cap: this run's ledger slot is missing, duplicated or no longer reserved; not publishing"
+      round_cap_evidence_error "Phase 4b round cap: this run's ledger slot is missing, duplicated, no longer reserved or no longer bound to its owner authorization; not publishing"
     fi
+    [ -z "$P4B_OWNER_AUTH_ID" ] || round_owner_authorization_check pre-post
     return 0
   fi
   for attempt in 1 2 3 4 5; do
@@ -1238,16 +1364,25 @@ enforce_phase4b_round_cap() {
       if [ "$in_flight" -gt 0 ]; then
         round_cap_stop 6 held "Phase 4b round slots on ${REPO}#${PR} are occupied (${occupied}/${P4B_ROUND_CAP}, ${in_flight} in flight); not dispatching a competing round. An in-flight slot frees only if its writer releases it before publishing (#2663)" pre-dispatch
       fi
-      round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR} (${occupied}/${P4B_ROUND_CAP} occupied); an owner decision or a reduced scope is required, and no further automated round runs (#2663)" pre-dispatch
+      if [ -z "$P4B_OWNER_AUTH_ID" ]; then
+        round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR} (${occupied}/${P4B_ROUND_CAP} occupied); an owner decision or a reduced scope is required, and no further automated round runs (#2663). The owner may authorize one further round on this head with a PR comment line P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why>, run with --owner-authorization <comment-id> (#2968)" pre-dispatch
+      fi
+      round_owner_authorization_check pre-dispatch
+    elif [ -n "$P4B_OWNER_AUTH_ID" ]; then
+      p4b_die 3 "--owner-authorization applies only to a spent round cap; ${REPO}#${PR} has ${occupied}/${P4B_ROUND_CAP} round slots occupied, so run without it (the authorization stays unconsumed) (#2968)"
     fi
-    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" --arg head "$HEAD" '. + [{run:$run,head:$head,state:"reserved"}]')
+    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" --arg head "$HEAD" --arg auth "$P4B_OWNER_AUTH_ID" \
+      '. + [{run:$run,head:$head,state:"reserved"} + (if $auth == "" then {} else {authorization:($auth | tonumber)} end)]')
     # Called directly, never in $( ): an unknown outcome re-reads the ledger
     # into this shell. An unknown outcome may have applied, so it reserves
     # nothing this run could release; the slot stays occupied.
     local wrc=0
     round_ledger_write "$entries" || wrc=$?
     case "$wrc" in
-      0) P4B_ROUND_RESERVED=true; return 0 ;;
+      0) P4B_ROUND_RESERVED=true
+         [ -z "$P4B_OWNER_AUTH_ID" ] \
+           || P4B_ROUND_CAP_JSON=$(printf '%s' "$P4B_ROUND_CAP_JSON" | jq -c '.owner_authorization.state = "consumed"')
+         return 0 ;;
       1) p4b_log "round ledger moved under this run (attempt $attempt); re-reading and re-evaluating (#2663)" ;;
       *) round_cap_evidence_error "Phase 4b round cap: the round ledger could not be updated" ;;
     esac
@@ -2216,6 +2351,9 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
       "$(jq -rn --arg q "$ADMIN_OVERRIDE_QUOTE" '$q | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')" \
       "$(jq -r 'map(if .tripwires then "tripwire (" + (.tripwires | join(", ")) + ")" else (.reason // .decision) end) | join("; ")' <<<"$ADMIN_OVERRIDDEN")"
   fi
+  # #2968: a round beyond the spent round cap names the owner authorization
+  # it consumed (round_owner_authorization_line, in the round-cap block).
+  round_owner_authorization_line
   # #1335: likewise for a CodeRabbit review carried from identical content.
   if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
     printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \
@@ -2247,10 +2385,9 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   if [ "$VERDICT" = "APPROVED" ] && [ -n "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
     printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$P4B_AUTHORIZED_REQUEST_GENERATION"
   fi
-  # #2663: a per-run nonce lets an uncertain POST be reconciled against THIS
-  # run's review, never another caller's identical body on the same head.
-  printf '\n<!-- mergepath-p4b-run: %s -->\n' "$P4B_ACCT_RUN_ID"
-  printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
+  # #2663/#2968: the run marker, the authorization record when there is one,
+  # and the footer (round_provenance_trailer, in the round-cap block).
+  round_provenance_trailer
 } > "$BODY_FILE"
 
 # --- Phase 4b approval-loop accounting (#602) --------------------------------
@@ -2527,7 +2664,10 @@ post_review() {
   # A definitive refusal here cannot publish; only this writer may return its
   # reservation at EXIT. Once the wrapper is invoked, every failure remains an
   # uncertain POST and keeps its slot, including a lost response (#2663/#2790).
-  if ! python3 "$ROOT/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+  # MERGEPATH_P4B_REVIEW_WRITE marks this as the orchestrator's own review
+  # write: the guard refuses automated Phase 4b provenance in any other review
+  # body (#2968).
+  if ! MERGEPATH_P4B_REVIEW_WRITE=1 python3 "$ROOT/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
     gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file" >/dev/null; then # NO_BARE_GH_WRITE_EXEMPT: inert argv to the preceding pure Python payload inspector; actual POST uses the reviewer wrapper below.
     rm -f "$payload_file"
     cleanup_pre_post_refusal_side_effects "review payload refused by local comment guard" true \
@@ -2537,7 +2677,7 @@ post_review() {
   P4B_ROUND_POST_ATTEMPTED=true
   set +e
   review_response="$(
-    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" MERGEPATH_P4B_REVIEW_WRITE=1 "$GH_AS_REVIEWER" -- \
       "$gh_bin" "$api_cmd" "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file"
   )"
   review_rc=$?
