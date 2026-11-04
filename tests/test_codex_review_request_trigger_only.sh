@@ -302,6 +302,9 @@ case "$endpoint" in
       cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
       cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      # #2666: past the ceiling (11 distinct counted requests), e.g. after a
+      # racing requester (#1362) or a lowered max_review_rounds.
+      cap_over_limit)   jq -cn --arg who "$author" --arg t "$old" '[range(11) | {id:(8170 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_four)          jq -cn --arg who "$author" --arg t "$old" '[range(4) | {id:(8700 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       cp_five)          jq -cn --arg who "$author" --arg t "$old" '[range(5) | {id:(8710 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
@@ -497,11 +500,14 @@ test_reviewer_trigger_does_not_count() {
 # not reliably create a review object.
 test_request_attempt_cap() {
   local scenario expected_rc expected_posts description dir rc before
-  for scenario in cap_at_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
+  for scenario in cap_at_limit cap_over_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
     case "$scenario" in
       cap_at_limit)
         expected_rc=7; expected_posts=0
         description="ten prior author requests stop additional advisory requests" ;;
+      cap_over_limit)
+        expected_rc=7; expected_posts=0
+        description="eleven prior author requests are refused like ten" ;;
       cap_below_limit)
         expected_rc=0; expected_posts=1
         description="nine prior author requests permit the tenth" ;;
@@ -519,6 +525,12 @@ test_request_attempt_cap() {
       || fail "#813: $description expected exit $expected_rc, got $rc; err=$(cat "$dir/err.log")"
     [ "$(trig_count "$dir")" = "$expected_posts" ] \
       || fail "#813: $description expected $expected_posts posts, got $(trig_count "$dir")"
+    if [ "$scenario" = cap_over_limit ]; then
+      grep -q 'request-attempt cap reached.*11/10' "$dir/err.log" \
+        || fail "#2666: over-limit refusal did not expose consumed/limit evidence"
+      [ "$(jqf "$dir" '[.cap_exhausted.kind, .cap_exhausted.request_attempts, .cap_exhausted.max_request_attempts] | tostring')" = '["request-ceiling",11,10]' ] \
+        || fail "#2666: over-limit exhaustion did not report kind request-ceiling at 11/10"
+    fi
     if [ "$scenario" = cap_at_limit ]; then
       grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
         || fail "#813: cap refusal did not expose consumed/limit evidence"
