@@ -176,11 +176,21 @@ if [ "$1" = "api" ]; then
     # unreadable read rather than reading it as "no results". Modelling "no
     # fixture" as an empty body made these stubs assert a shape gh never
     # produces, which is the harness being wrong, not the guard.
+    # FIXTURE_PUBLISH_FLAG models a CodeRabbit publication landing between
+    # the gate's reads: whichever of the inline-comment and review reads comes
+    # first is served its *_PRE fixture (the state before the publication) and
+    # raises the flag; every later read sees the published state.
     repos/*/pulls/*/comments)
+      if [ -n "${FIXTURE_PUBLISH_FLAG:-}" ] && [ ! -e "$FIXTURE_PUBLISH_FLAG" ]; then
+        cat "${FIXTURE_COMMENTS_PRE:?}"; : > "$FIXTURE_PUBLISH_FLAG"; exit 0
+      fi
       if [ -n "${FIXTURE_COMMENTS:-}" ]; then cat "$FIXTURE_COMMENTS"; else printf '[]\n'; fi
       exit 0
       ;;
     repos/*/pulls/*/reviews)
+      if [ -n "${FIXTURE_PUBLISH_FLAG:-}" ] && [ ! -e "$FIXTURE_PUBLISH_FLAG" ]; then
+        cat "${FIXTURE_REVIEWS_PRE:?}"; : > "$FIXTURE_PUBLISH_FLAG"; exit 0
+      fi
       if [ -n "${FIXTURE_REVIEWS:-}" ]; then cat "$FIXTURE_REVIEWS"; else printf '[]\n'; fi
       exit 0
       ;;
@@ -685,6 +695,26 @@ test_review_serialization_2927() {
   ser_case 'autofix block ahead of the marker holds' 3 'rev(5747872230) | .body |= ("<!-- coderabbit-ai-generated:v1 -->\n\n<!-- autofix_checkbox_start -->\n- [ ] <!-- {\"checkboxId\":\"4b0d0e0a-96d7-4f10-b296-3a18ea78f0b9\"} --> Fix comments: Fix CodeRabbit comments on this PR\n<!-- autofix_checkbox_end -->\n\n<!-- coderabbit-review-publication v1 publication=e435766f-a8b6-41c1-8862-0909820e8add attempt=fc79fb02-7f28-4f1c-b4e6-d0dc47debbb5 batch=1/1 -->")'
   ser_case 'follow-up root declaring a rate limit holds' 3 'rev(5739617104) | .body |= sub("## Follow-up Comments"; "## Follow-up Comments\n\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->")'
   ser_case 'root followed by a later unknown run holds' 3 'rev(5747872230), (rev(5747872230) | .id = 5747872231 | .submitted_at = "2026-11-03T06:07:00Z" | .body = "Unknown next report")'
+  # Publication between the gate's reads (wave audit P1 on swipewatch#230):
+  # the status-only root and its unresolved Major inline land after the first
+  # of the two reads. Reading reviews first means a review the gate accepts
+  # always has its inline findings in the comments it reads afterwards, so
+  # the gate never clears on the root while missing its finding.
+  ser_case 'race baseline: root with its unresolved Major inline blocks' 1 'rev(5747872230)' 'com(4451423418)' '[{isResolved:false, comment_ids:[4451423418]}]'
+  printf '[]\n' > "$WORKDIR/ser-empty.json"
+  rm -f "$WORKDIR/ser-published.flag"
+  rc=0
+  out=$(FIXTURE_PR="$pr" FIXTURE_COMMENTS="$comments" FIXTURE_THREADS="$threads" \
+    FIXTURE_ISSUE_COMMENTS='' FIXTURE_REVIEWS="$reviews" REQUIRE_REVIEW_SUMMARY=true \
+    FIXTURE_PUBLISH_FLAG="$WORKDIR/ser-published.flag" \
+    FIXTURE_COMMENTS_PRE="$WORKDIR/ser-empty.json" FIXTURE_REVIEWS_PRE="$WORKDIR/ser-empty.json" \
+    run_gate "$scratch" 99 owner/repo 2>&1) || rc=$?
+  if [ "$rc" != 0 ] && [ -e "$WORKDIR/ser-published.flag" ]; then
+    pass "#2927: a publication landing between the review and inline reads never clears (exit $rc)"
+  else
+    fail "#2927: a publication between the reads cleared the gate (exit $rc) without its Major inline"
+    printf '%s\n' "$out" >&2
+  fi
   unset -f ser_case
 }
 test_review_serialization_2927

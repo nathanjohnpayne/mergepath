@@ -475,8 +475,19 @@ cr_evidence_exit() {
 trap cr_evidence_exit EXIT
 
 
-# --- fetch CodeRabbit blocking-tier inline comments -------------------------
-
+# --- fetch CodeRabbit review objects, then blocking-tier inline comments ----
+#
+# Read order is load-bearing. The reads are separate requests, and CodeRabbit
+# can publish a review (with its inline findings) between them. Reading the
+# review objects first means every review this gate later recognises as a
+# completed report was already published when the inline comments are read,
+# so its findings are in COMMENTS_JSON; a publication landing in between can
+# only add findings or an unrecognised newer run, both of which hold or block.
+# Reading the comments first let a status-only root accept on zero findings
+# while its Major inline was missing from the earlier snapshot (wave audit P1
+# on swipewatch#230). Why the reviews are read unconditionally is explained
+# where they are classified, below.
+REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit review objects")
 COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
 
 log "blocking tier set: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')"
@@ -1084,7 +1095,7 @@ MARKER_SUMMARY_FRESH_AT=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.fresh_at')
 # findings are on — a false CLEAR of a required gate rather than a saving. A
 # failed read is fetch_api_array's die 2, never an empty result read as "no
 # findings".
-REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit review objects")
+# REVIEWS_JSON is read above, before the inline comments (read-order note).
 
 # Only a review RUN carries (and anchors) a summary — a NON-EMPTY body is the
 # discriminator, the same one mergepath#900 measured. CodeRabbit also creates a
