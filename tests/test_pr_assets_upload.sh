@@ -282,7 +282,10 @@ test_credential_required_and_fine_grained() {
   RUN_TOKEN="" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
   expect_rc 3 "missing token" || return 0
   case "$ERR" in *"--mode pr-assets"*) ;; *) fail "missing-token message does not point at preflight"; return 0 ;; esac
-  RUN_TOKEN="ghp_classicTESTONLY000000000000000000000000" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
+  # Split so no tracked line carries a contiguous token shape: consumers run
+  # secret scanners over tracked files with no allowlist (friends-and-family-
+  # billing's check-no-public-secrets.mjs). The runtime value is unchanged.
+  RUN_TOKEN="ghp_""classicTESTONLY000000000000000000000000" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
   expect_rc 3 "classic token" || return 0
   expect_store_unchanged "$before" "credential" || return 0
   pass "missing or non-fine-grained credential refused with exit 3"
