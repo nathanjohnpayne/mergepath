@@ -742,6 +742,18 @@ for variant in older edited other; do
   H_AUTH=501 run extra reserve
   [ "$RC" = 8 ] && [ "$(auth_of extra)" = '[]' ] && pass "#2968 A6: an $variant authorization keeps the spent stop" || fail "#2968 A6 $variant rc=$RC $OUT"
 done
+# A6b (#2666 matrix row 19): a valid exact-head owner runaway tiebreak clears
+# only the Codex runaway stop. It is not an extra-round authorization, so at a
+# spent round cap it grants no fourth round, whether merely present on the PR
+# or cited as the authorization comment.
+for variant in present cited; do
+  spent3 "a6b-$variant"
+  printf '[%s]' "$(acomment 502 "$HEAD_A" "$T2" "" nathanjohnpayne "TIEBREAK_RUNAWAY_ACCEPTED=$PRURL@$HEAD_A")" >"$S/comments.json"
+  if [ "$variant" = cited ]; then H_AUTH=502 run extra reserve; else run extra reserve; fi
+  [ "$RC" = 8 ] && [ "$(jq -r .round_cap.state <<<"$OUT")" = spent ] && [ "$(auth_of extra)" = '[]' ] \
+    && pass "#2666: a valid owner runaway tiebreak ($variant) grants no round beyond the spent cap (exit 8, nothing reserved)" \
+    || fail "#2666 A6b $variant rc=$RC $OUT $(cat "$S/err.extra")"
+done
 # A7: a cap that is not spent, or no cap, refuses the flag and consumes nothing.
 fresh a7 3; printf '[%s]' "$(acomment 501 "$HEAD_A" "$T2")" >"$S/comments.json"
 H_AUTH=501 run extra reserve

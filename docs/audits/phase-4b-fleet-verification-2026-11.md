@@ -91,13 +91,13 @@ Ledger refs under `refs/mergepath/p4b-rounds/` on 2026-11-03, read separately fr
 
 ## Verification matrix for the #2663 and #2664 boundaries
 
-Run on hub `c6e146fe`. Every suite below passed with no failure (totals in [Test runs](#test-runs)). The "expected" and "observed" columns are the same fact checked two ways: the expectation is what `REVIEW_POLICY.md` § Disagreements and Tiebreaking states, the observation is what the named test asserts and recorded on this run. A case marked "gap" has no dedicated test, and this report says so instead of inferring coverage.
+Run on hub `c6e146fe`. Every suite below passed with no failure (totals in [Test runs](#test-runs)). The "expected" and "observed" columns are the same fact checked two ways: the expectation is what `REVIEW_POLICY.md` § Disagreements and Tiebreaking states, the observation is what the named test asserts and recorded on this run. A case marked "gap" had no dedicated test on this run, and this report said so instead of inferring coverage. Rows 3 and 19 were gaps on this run; their tests were added afterwards by the #2666 follow-up and are marked as such.
 
 | # | Boundary | Expected stop or routing | Observed on this run | Test file and case |
 | --- | --- | --- | --- | --- |
 | 1 | Request ceiling, 9 of 10 counted requests | One more request is permitted (exit 0, one post) | Pass | `tests/test_codex_review_request_trigger_only.sh`, `test_request_attempt_cap`, scenario `cap_below_limit` |
 | 2 | Request ceiling, 10 of 10 | Request refused, exit 7, `cap_exhausted.kind: "request-ceiling"`, no post | Pass | same, scenario `cap_at_limit` |
-| 3 | Request ceiling, 11 | Refused like 10 | Gap: no 11-request fixture. `cap_duplicate_ids` seeds 12 comments with 9 distinct ids and permits the request, which proves duplicates do not consume slots, not an over-limit refusal | same, `cap_duplicate_ids`; malformed record fails closed in `cap_bad_id` (exit 3) |
+| 3 | Request ceiling, 11 | Refused like 10 | Pass, test added after this run (#2666 follow-up). On this run it was a gap: `cap_duplicate_ids` seeds 12 comments with 9 distinct ids and permits the request, which proves duplicates do not consume slots, not an over-limit refusal | same, scenario `cap_over_limit` (11 distinct requests: exit 7, `kind: "request-ceiling"` at 11/10, no post); duplicates in `cap_duplicate_ids`; malformed record fails closed in `cap_bad_id` (exit 3) |
 | 4 | Blocking budget 9 of 10 | One more request permitted | Pass | same file, `test_blocking_budget_boundary` (n = 9) |
 | 5 | Blocking budget 10 and 11 | Refused, exit 7, `kind: "blocking-reviews"`, no post | Pass | same, `test_blocking_budget_boundary` (n = 10, 11) |
 | 6 | Counting rule | Unsolicited, discretionary, clean, no-findings and provider-block responses do not count; unknown-tier and conflicting responses do | Pass | same, `test_blocking_budget_counting_rule` |
@@ -113,7 +113,7 @@ Run on hub `c6e146fe`. Every suite below passed with no failure (totals in [Test
 | 16 | Fourth Phase 4b round | With 3 of 3 completed rounds, refused: exit 8, `round_cap.state: "spent"`, no ledger write | Pass | `tests/test_phase_4b_round_cap.sh` P2 ("3/3 completed -> the fourth round is refused") |
 | 17 | Fourth round while a slot is in flight | A competing run holds (exit 6) and takes no slot | Pass | `tests/test_phase_4b_round_cap.sh` P3 |
 | 18 | A surplus publication | Two reviews under one reserved run id occupy two slots; the cap stays spent | Pass | `tests/test_phase_4b_round_cap.sh` P19 |
-| 19 | Owner tiebreak against a spent round cap | The marker grants no fourth round | Gap: no test combines a valid runaway marker with a spent `max_review_rounds`. By construction the round cap counts ledger reservations and completed reviews and never reads the tiebreak, but this report does not claim a test proves it | `tests/test_phase_4b_round_cap.sh` P2 proves the refusal without a marker |
+| 19 | Owner tiebreak against a spent round cap | The marker grants no fourth round | Pass, test added after this run (#2666 follow-up). On this run it was a gap: no test combined a valid runaway marker with a spent `max_review_rounds` | `tests/test_phase_4b_round_cap.sh` case A6b: a well-formed exact-head owner `TIEBREAK_RUNAWAY_ACCEPTED` marker, whether merely present or cited as the authorization comment, leaves the spent cap at exit 8 with nothing reserved; P2 proves the refusal without a marker |
 | 20 | Failover deduplication | The CodeRabbit failover trigger carries one author-owned marker, exempts at most one trigger per head from the ceiling, and a foreign, late or malformed marker leaves the trigger counted; the response still counts toward the blocking budget | Pass | `tests/test_codex_review_request_trigger_only.sh` `test_failover_marker`; `tests/test_codex_review_ledger.sh` checks "stops: a failover request is not a runaway window" and "stops: the failover response still counts toward the blocking budget"; `tests/test_phase_4b_automation.sh` labels "failover-ceiling-read" and "failover-forced-ceiling-read"; `tests/test_coderabbit_wait_codex_failover.sh` |
 | 21 | Late evidence at the publication fence | A review that commits after the client times out and becomes visible late is neither double-counted nor lost; an uncertain POST stays occupied and is not reposted | Pass | `tests/test_phase_4b_round_cap.sh` P12 and P13 |
 | 22 | Changed head | A head change does not reset the count; a changed or unreadable budget snapshot refuses with exit 10 | Pass | `tests/test_phase_4b_round_cap.sh` P17; `tests/test_phase_4b_automation.sh` section S3-4 mode `other-head` and the case "A base retarget/advance with an unchanged head invalidates the cap read" |
@@ -223,7 +223,7 @@ Run from the hub worktree at `c6e146fe`, no script modified. `tests/test_phase_4
 ## Acceptance of #2666
 
 - **Four states per repository, kept distinct:** met (tables above).
-- **Boundary matrix with expected routing, observed result and test evidence:** met, with two named gaps (no 11-request fixture; no test combining a valid owner tiebreak with a spent `max_review_rounds`).
+- **Boundary matrix with expected routing, observed result and test evidence:** met. This run had two named gaps (no 11-request fixture; no test combining a valid owner tiebreak with a spent `max_review_rounds`), both closed afterwards by the #2666 follow-up (rows 3 and 19).
 - **Ledger, initialization, publisher coverage, concurrency and recovery, permission blockers:** met; no permission blocker.
 - **#1362 reported as remediated at the guarded-path layer, host-local, out-of-band requests only counted:** met.
 - **Explicit disclosures (a) to (e):** met.
