@@ -14,6 +14,10 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# The timing report is asserted on and off below; an exported value from the
+# caller must not decide the "off" case.
+unset MERGEPATH_TEST_TIMINGS
+
 # run_suite <jobs> <body>: run <body> as a suite that sources the pool, with
 # MERGEPATH_TEST_JOBS=<jobs>. Its stdout, stderr and exit status land in
 # $WORKDIR/{out,err,rc}.
@@ -171,12 +175,38 @@ case_pool_wait"
   [ "$FAIL" -ne "$before" ] || pass "MERGEPATH_TEST_TIMINGS=1 reports each case's wall time on stderr, and only when set"
 }
 
-test_counts_and_order
-test_timings_report
-test_aborted_case_fails_closed
-test_parallel_and_first
-test_per_case_workdir
-test_rejects_bad_input
+# Bash older than 4.3 (the `bash` the suites run under) has no `wait -n`, so
+# the pool runs every case in the suite's own shell, in queue order, whatever
+# MERGEPATH_TEST_JOBS says. That shape has its own guarantees to check.
+test_serial_fallback() {
+  MERGEPATH_TEST_TIMINGS=1 run_suite 4 "
+setg() { G=\$1; pass \"set \$1\"; }
+case_pool_add setg a
+case_pool_add --first setg b
+case_pool_wait
+[ \"\${G:-}\" = b ] || fail 'cases did not run in the suite shell in queue order'"
+  if [ "$(cat "$WORKDIR/rc")" != 0 ] || [ "$(grep '^PASS' "$WORKDIR/out" | tr '\n' '|')" != 'PASS: set a|PASS: set b|' ]; then
+    fail "serial fallback: exit $(cat "$WORKDIR/rc"), output $(cat "$WORKDIR/out" "$WORKDIR/err")"
+  elif grep -q 'case-pool timing' "$WORKDIR/err"; then
+    fail "serial fallback: printed pool timings, but no case ran in the pool"
+  else
+    pass "bash $(bash -c 'echo "${BASH_VERSION}"') runs every case in the suite shell, in queue order, at any job count"
+  fi
+}
+
+if bash -c '[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }'; then
+  test_counts_and_order
+  test_timings_report
+  test_aborted_case_fails_closed
+  test_parallel_and_first
+  test_per_case_workdir
+  test_rejects_bad_input
+else
+  echo "bash on PATH is $(bash -c 'echo "${BASH_VERSION}"'), older than 4.3: checking the serial fallback only"
+  test_counts_and_order
+  test_serial_fallback
+  test_rejects_bad_input
+fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
