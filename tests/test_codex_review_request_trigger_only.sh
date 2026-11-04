@@ -49,6 +49,9 @@ PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+# #2990: queued cases run concurrently; see tests/lib/case-pool.sh.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
 
 make_case() {
   local name=$1
@@ -2064,67 +2067,67 @@ CASES
   [ "$FAIL" -ne "$before" ] || pass "#2582: authorization applies the caller's request mode; trigger-only stays the default"
 }
 
-test_guard_dates_queued_checks
-test_guard_unknown_suite_branch
-test_write_boundary_authorization
-test_write_boundary_authorization_caller_mode
+case_pool_add test_guard_dates_queued_checks
+case_pool_add test_guard_unknown_suite_branch
+case_pool_add test_write_boundary_authorization
+case_pool_add test_write_boundary_authorization_caller_mode
 
-test_fresh_posts_once_no_poll
-test_pr_open_reaction_still_posts
-test_dup_author_skips
-test_uppercase_author_command_skips
-test_author_containment_posts
-test_stale_author_command_posts
-test_reviewer_trigger_does_not_count
-test_request_attempt_cap
-test_request_checkpoint
-test_nondefault_request_attempt_cap
-test_candidate_cannot_raise_governing_request_attempt_cap
-test_governing_cap_read_failure_refuses_new_write
-test_invalid_present_governing_cap_refuses_new_write
-test_invalid_present_governing_codex_block_refuses_new_write
-test_missing_governing_codex_block_defaults_request_cap
-test_idempotent_skip_requires_governing_freshness
-test_governing_request_freshness
-test_governing_freshness_revalidation
-test_governing_freshness_validation_preserves_no_spend_caps
-test_gated_cap_leaves_routing_to_caller
-test_cap_preserves_provider_block_as_diagnostic_only
-test_blocking_budget_boundary
-test_blocking_budget_counting_rule
-test_blocking_budget_wins_simultaneous_exhaustion
-test_blocking_budget_governing_value
-test_blocking_budget_fails_closed
-test_blocking_budget_not_read_without_a_write
-test_gate_skips_content_free_head
-test_gate_triggers_on_real_content_change
-test_gate_triggers_without_prior_review
-test_gate_fails_open_on_api_error
-test_gate_triggers_when_only_signal_is_a_review_object
-test_gate_triggers_when_verdict_is_superseded
-test_gate_requires_boolean_carried
-test_wiring_auto_caller_honors_skip
-test_wiring_manual_caller_ignores_gate
-test_wiring_missing_gate_fails_open
-test_feedback_accounting_blocks_trigger
-test_workflow_declares_auto_trigger_flag
-test_guard_refuses_young_head
-test_guard_allow_flag_posts_with_warning
-test_guard_refuses_unscheduled_check
-test_guard_reports_both_reasons
-test_guard_accepts_queued_check
-test_guard_unreadable_check_runs_fails_open
-test_guard_policy_knobs_disable_signals
-test_guard_check_signal_yaml_forms
-test_guard_exempts_automatic_caller
-test_guard_does_not_run_on_no_write_paths
-test_guard_applies_in_polling_mode
-test_guard_anchors_on_push_dispatch
-test_guard_workflow_event_anchors
-test_policy_resolved_from_script_checkout
-test_guard_workflow_signal_shapes
-test_guard_override_paginates_and_scopes
-test_guard_runs_after_the_cap_branch
+case_pool_add test_fresh_posts_once_no_poll
+case_pool_add test_pr_open_reaction_still_posts
+case_pool_add test_dup_author_skips
+case_pool_add test_uppercase_author_command_skips
+case_pool_add test_author_containment_posts
+case_pool_add test_stale_author_command_posts
+case_pool_add test_reviewer_trigger_does_not_count
+case_pool_add test_request_attempt_cap
+case_pool_add test_request_checkpoint
+case_pool_add test_nondefault_request_attempt_cap
+case_pool_add test_candidate_cannot_raise_governing_request_attempt_cap
+case_pool_add test_governing_cap_read_failure_refuses_new_write
+case_pool_add test_invalid_present_governing_cap_refuses_new_write
+case_pool_add test_invalid_present_governing_codex_block_refuses_new_write
+case_pool_add test_missing_governing_codex_block_defaults_request_cap
+case_pool_add test_idempotent_skip_requires_governing_freshness
+case_pool_add test_governing_request_freshness
+case_pool_add test_governing_freshness_revalidation
+case_pool_add test_governing_freshness_validation_preserves_no_spend_caps
+case_pool_add test_gated_cap_leaves_routing_to_caller
+case_pool_add test_cap_preserves_provider_block_as_diagnostic_only
+case_pool_add test_blocking_budget_boundary
+case_pool_add test_blocking_budget_counting_rule
+case_pool_add test_blocking_budget_wins_simultaneous_exhaustion
+case_pool_add test_blocking_budget_governing_value
+case_pool_add test_blocking_budget_fails_closed
+case_pool_add test_blocking_budget_not_read_without_a_write
+case_pool_add test_gate_skips_content_free_head
+case_pool_add test_gate_triggers_on_real_content_change
+case_pool_add test_gate_triggers_without_prior_review
+case_pool_add test_gate_fails_open_on_api_error
+case_pool_add test_gate_triggers_when_only_signal_is_a_review_object
+case_pool_add test_gate_triggers_when_verdict_is_superseded
+case_pool_add test_gate_requires_boolean_carried
+case_pool_add test_wiring_auto_caller_honors_skip
+case_pool_add test_wiring_manual_caller_ignores_gate
+case_pool_add test_wiring_missing_gate_fails_open
+case_pool_add test_feedback_accounting_blocks_trigger
+case_pool_add test_workflow_declares_auto_trigger_flag
+case_pool_add test_guard_refuses_young_head
+case_pool_add test_guard_allow_flag_posts_with_warning
+case_pool_add test_guard_refuses_unscheduled_check
+case_pool_add test_guard_reports_both_reasons
+case_pool_add test_guard_accepts_queued_check
+case_pool_add test_guard_unreadable_check_runs_fails_open
+case_pool_add test_guard_policy_knobs_disable_signals
+case_pool_add test_guard_check_signal_yaml_forms
+case_pool_add test_guard_exempts_automatic_caller
+case_pool_add test_guard_does_not_run_on_no_write_paths
+case_pool_add test_guard_applies_in_polling_mode
+case_pool_add test_guard_anchors_on_push_dispatch
+case_pool_add test_guard_workflow_event_anchors
+case_pool_add test_policy_resolved_from_script_checkout
+case_pool_add test_guard_workflow_signal_shapes
+case_pool_add test_guard_override_paginates_and_scopes
+case_pool_add test_guard_runs_after_the_cap_branch
 
 test_trigger_only_preserves_known_provider_block() {
   local reason dir rc before
@@ -2138,7 +2141,7 @@ test_trigger_only_preserves_known_provider_block() {
     [ "$FAIL" -ne "$before" ] || pass "trigger-only preserves known $reason without changing request authority or budgets"
   done
 }
-test_trigger_only_preserves_known_provider_block
+case_pool_add test_trigger_only_preserves_known_provider_block
 
 test_trigger_only_ignores_stale_provider_block() {
   local reason dir rc before
@@ -2152,7 +2155,7 @@ test_trigger_only_ignores_stale_provider_block() {
     [ "$FAIL" -ne "$before" ] || pass "trigger-only ignores $reason before the current freshness threshold"
   done
 }
-test_trigger_only_ignores_stale_provider_block
+case_pool_add test_trigger_only_ignores_stale_provider_block
 
 test_trigger_only_future_head_preserves_recent_blocks() {
   local reason age dir rc before expected
@@ -2211,9 +2214,9 @@ test_trigger_timestamp_validation() {
   [ "$FAIL" -ne "$before" ] || pass "#2317: unsupported commit metadata refuses before writes; canonical and future UTC keep JSON"
 }
 
-test_trigger_timestamp_validation
+case_pool_add test_trigger_timestamp_validation
 
-test_trigger_only_future_head_preserves_recent_blocks
+case_pool_add test_trigger_only_future_head_preserves_recent_blocks
 
 # #2534: the CodeRabbit rate-limit failover does not spend the request
 # ceiling. --failover marks the trigger it posts, and the ceiling skips a
@@ -2321,8 +2324,9 @@ EOF
     || fail "#2534: --trigger-only without --failover wrote a marker (rc=$rc)"
   [ "$FAIL" -ne "$before" ] || pass "#2534: --failover marks only the trigger it posts, a marked failover spends no ceiling slot, and a failed marker write is not fatal"
 }
-test_failover_marker
+case_pool_add test_failover_marker
 
+case_pool_wait
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

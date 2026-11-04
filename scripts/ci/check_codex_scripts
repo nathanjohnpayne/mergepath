@@ -53,6 +53,11 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# #2990: the three codex-review-request suites below run their cases through
+# this pool, so prove its fail-closed contract before trusting their counts.
+echo "check_codex_scripts: running case-pool tests (#2990)"
+"$REPO_ROOT/tests/test_case_pool.sh"
+
 echo "check_codex_scripts: running codex-review-request ack tests"
 "$REPO_ROOT/tests/test_codex_review_request_ack.sh"
 
