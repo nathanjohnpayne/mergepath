@@ -34,6 +34,11 @@
 #   - errexit stays on inside each case: a background subshell is not part of
 #     an `||` / `&&` list, so `set -e` is not suspended the way it would be
 #     for `( case ) || rc=$?`.
+#   - In the serial shape (below) a case runs in the suite's own shell, so an
+#     early exit ends the suite and the cases after it do not run. An EXIT
+#     trap held while the cases run reports that case as a FAIL, runs the
+#     suite's own EXIT trap, and exits 1, so even `exit 0` cannot read as a
+#     pass.
 #
 # Concurrency: MERGEPATH_TEST_JOBS (a positive integer) pins it; otherwise the
 # online CPU count. MERGEPATH_TEST_JOBS=1 runs every case in this shell, in
@@ -48,6 +53,16 @@
 CASE_POOL_QUEUE=()
 CASE_POOL_FIRST=()
 CASE_POOL_SEQ=0
+CASE_POOL_CURRENT=
+CASE_POOL_SUITE_EXIT=
+
+# EXIT trap for the serial shape: the running case left the suite shell.
+case_pool_serial_exit() {
+  local rc=$?
+  echo "FAIL: case '$CASE_POOL_CURRENT' exited with status $rc before reporting its counts (case-pool, #2990)" >&2
+  eval "$CASE_POOL_SUITE_EXIT"
+  exit 1
+}
 
 case_pool_jobs() {
   local n="${MERGEPATH_TEST_JOBS:-}"
@@ -83,10 +98,21 @@ case_pool_wait() {
 
   if [ "$jobs" -le 1 ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] \
      || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
-    local entry
+    local entry saved
+    # A second `trap ... EXIT` replaces the suite's own, so keep its command
+    # (`trap -p` prints it shell-quoted) to run from ours and to restore.
+    saved=$(trap -p EXIT)
+    CASE_POOL_SUITE_EXIT=
+    if [ -n "$saved" ]; then
+      eval "set -- ${saved#trap -- }"
+      CASE_POOL_SUITE_EXIT=$1
+    fi
+    trap case_pool_serial_exit EXIT
     for entry in "${CASE_POOL_QUEUE[@]}"; do
+      CASE_POOL_CURRENT=$entry
       eval "$entry"
     done
+    if [ -n "$saved" ]; then eval "$saved"; else trap - EXIT; fi
     CASE_POOL_QUEUE=()
     CASE_POOL_FIRST=()
     return 0

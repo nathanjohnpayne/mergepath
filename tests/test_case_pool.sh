@@ -194,17 +194,49 @@ case_pool_wait
   fi
 }
 
+# In the serial shape a case that leaves the suite shell ends the suite; it
+# must end it as a failure that names the case, with the suite's own EXIT trap
+# still run, and never as a pass.
+test_serial_early_exit() {
+  local before=$FAIL kind
+  for kind in exits dies; do
+    rm -f "$WORKDIR/trap-ran"
+    run_suite 1 "$COMMON_CASES
+trap 'echo ran >\"$WORKDIR/trap-ran\"' EXIT
+exits() { exit 0; }
+dies() { false; }
+case_pool_add fast a
+case_pool_add $kind
+case_pool_add fast b
+case_pool_wait"
+    [ "$(cat "$WORKDIR/rc")" = 1 ] && [ "$(grep '^PASS' "$WORKDIR/out" | tr '\n' '|')" = 'PASS: fast a|' ] \
+      || fail "serial $kind: exit $(cat "$WORKDIR/rc"), output $(tr '\n' '|' <"$WORKDIR/out"); expected exit 1 after case a"
+    grep -q "case '$kind' exited with status $([ "$kind" = exits ] && echo 0 || echo 1) before reporting its counts" "$WORKDIR/err" \
+      || fail "serial $kind: the failure does not name the case and its status: $(cat "$WORKDIR/err")"
+    [ -s "$WORKDIR/trap-ran" ] || fail "serial $kind: the suite's own EXIT trap did not run"
+  done
+  run_suite 1 "$COMMON_CASES
+trap 'echo ran >\"$WORKDIR/trap-ran\"' EXIT
+case_pool_add fast a
+case_pool_wait
+case \"\$(trap -p EXIT)\" in *trap-ran*) ;; *) fail 'the suite EXIT trap was not restored after the cases' ;; esac"
+  [ "$(cat "$WORKDIR/rc")" = 0 ] || fail "serial: a clean run did not restore the suite's EXIT trap: $(cat "$WORKDIR/err")"
+  [ "$FAIL" -ne "$before" ] || pass "serially, a case that exits (even exit 0) or dies fails the suite, names itself, and keeps the suite's EXIT trap"
+}
+
 if bash -c '[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }'; then
   test_counts_and_order
   test_timings_report
   test_aborted_case_fails_closed
   test_parallel_and_first
   test_per_case_workdir
+  test_serial_early_exit
   test_rejects_bad_input
 else
   echo "bash on PATH is $(bash -c 'echo "${BASH_VERSION}"'), older than 4.3: checking the serial fallback only"
   test_counts_and_order
   test_serial_fallback
+  test_serial_early_exit
   test_rejects_bad_input
 fi
 
