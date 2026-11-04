@@ -1657,12 +1657,22 @@ paths:
   - path: tests/test_review_feedback_accounting.sh
     type: canonical
     consumers: all
+    requires:
+      - "tests/fixtures/coderabbit_review_serialization_2927.json"  # icon-severity and single-batch publication cases (#2927)
   # Pairs with scripts/coderabbit-severity-gate.sh + scripts/ci/
   # check_coderabbit_severity_gate (kit-propagated, #577). The check wrapper
   # hard-requires this test file; without it propagated, every consumer's
   # check_coderabbit_severity_gate fails pre-flight with `Missing required
   # file`. Same #264/#266 coupling class as test_codex_p1_gate.sh above.
   - path: tests/test_coderabbit_severity_gate.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "tests/fixtures/coderabbit_review_serialization_2927.json"  # icon-severity and single-batch publication cases (#2927)
+  # Real CodeRabbit review serialization (#2927): read by both tests above.
+  # Without it every consumer's check_coderabbit_severity_gate and
+  # check_review_feedback_accounting fail with `Could not open file`.
+  - path: tests/fixtures/coderabbit_review_serialization_2927.json
     type: canonical
     consumers: all
   # Pairs with scripts/lib/feedback-policy-helpers.sh + scripts/ci/
@@ -2938,6 +2948,7 @@ paths:
       - "tests/test_post_phase_4b_handoff.sh"  # manual-dispatch accounting case (#1000)
       - "scripts/post-phase-4b-handoff.sh"  # manual-dispatch accounting gate (#1000)
       - "tests/test_coderabbit_severity_gate.sh"  # check_coderabbit_severity_gate (#577)
+      - "tests/fixtures/coderabbit_review_serialization_2927.json"  # check_coderabbit_severity_gate, check_review_feedback_accounting (#2927)
       - "tests/test_feedback_policy_helpers.sh"  # check_feedback_policy_helpers (#576)
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
