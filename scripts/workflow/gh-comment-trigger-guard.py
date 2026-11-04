@@ -46,6 +46,14 @@ GRAPHQL_COMMENTS = frozenset({
     "updateDiscussionComment", "updateIssueComment",
     "updatePullRequestReview", "updatePullRequestReviewComment",
 })
+# The GraphQL calls that write a pull request review body, the GraphQL twin of
+# P4B_REVIEW_PATH: only these can carry review clearance, so only these are
+# held to the Phase 4b provenance refusal below. An issue or PR conversation
+# comment (addComment, updateIssueComment) cannot clear a review gate, just as
+# the equivalent REST issue comment is not refused.
+GRAPHQL_REVIEWS = frozenset({
+    "addPullRequestReview", "submitPullRequestReview", "updatePullRequestReview",
+})
 GRAPHQL_TOKENS = re.compile(
     r'"""(?:\\"""|(?!"""|\\""")[\s\S])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*|[_A-Za-z][_0-9A-Za-z]*|[^\s,]'
 )
@@ -56,7 +64,10 @@ class Refused(ValueError):
 
 
 def graphql_comment_document(query):
-    """Recognize known comment calls without interpreting GraphQL execution."""
+    """Recognize known comment calls without interpreting GraphQL execution.
+
+    Returns (writes_comment, literals, writes_review); writes_review is set
+    when any recognized call is a review-body write (GRAPHQL_REVIEWS)."""
     tokens, literals = [], []
     unsupported_literal = False
     for match in GRAPHQL_TOKENS.finditer(query):
@@ -72,20 +83,21 @@ def graphql_comment_document(query):
                 unsupported_literal = True
         else:
             tokens.append(token)
-    comment, depth = False, 0
+    comment, review, depth = False, False, 0
     for index, token in enumerate(tokens):
         operation_name = (depth == 0 and index > 0
                           and tokens[index - 1] in ("query", "mutation", "subscription"))
         if (token in GRAPHQL_COMMENTS and index + 1 < len(tokens)
                 and tokens[index + 1] == "(" and not operation_name):
             comment = True
+            review = review or token in GRAPHQL_REVIEWS
         if token == "{":
             depth += 1
         elif token == "}":
             depth -= 1
     if comment and unsupported_literal:
         raise Refused("Unsupported GraphQL string escape in a comment mutation; no write performed.")
-    return comment, literals
+    return comment, literals, review
 
 
 def inspect(argv, role, state=None):
@@ -96,6 +108,7 @@ def inspect(argv, role, state=None):
     deferred = False
     serial = 0
     cli_stdin = False
+    graphql_review = False
 
     def file_body(value, json_input=False):
         nonlocal serial, deferred
@@ -332,8 +345,9 @@ def inspect(argv, role, state=None):
                     queries.append(payload["query"])
             comment = False
             for query in queries:
-                writes_comment, literals = graphql_comment_document(query)
+                writes_comment, literals, writes_review = graphql_comment_document(query)
                 comment = comment or writes_comment
+                graphql_review = graphql_review or writes_review
                 bodies.extend(literals)
             if not comment:
                 # Freeze even read inputs: a later file edit cannot turn the
@@ -368,7 +382,7 @@ def inspect(argv, role, state=None):
         raise Refused("Reserved owner tiebreak text is not allowed in an agent-authored comment; the owner posts it.")
     if any(P4B_OWNER_AUTHORIZATION.search(body) for body in bodies):
         raise Refused("Reserved Phase 4b owner authorization text is not allowed in an agent-authored comment; the owner posts it (#2968).")
-    review_write = (channel == "pr-review" or channel == "graphql-comment"
+    review_write = (channel == "pr-review" or (channel == "graphql-comment" and graphql_review)
                     or (channel == "api-comment" and P4B_REVIEW_PATH.fullmatch(path) is not None))
     if review_write and any(P4B_PROVENANCE.search(body) for body in bodies):
         if not (role == "reviewer" and channel == "api-comment" and method == "POST"

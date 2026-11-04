@@ -1477,6 +1477,11 @@ PV_LEDGER="[{\"run\":\"r1\",\"head\":\"$PV_HEAD\",\"state\":\"reserved\"},{\"run
 PV_SPENT="$(pv_review 11 CHANGES_REQUESTED r1 2026-09-14T00:02:00Z),$(pv_review 12 CHANGES_REQUESTED r2 2026-09-14T00:03:00Z)"
 # (1) A ledger-reserved automated approval still clears.
 pv_run ledger-reserved-clears cap-policy.yml "[$PV_REQ]" "[$PV_SPENT,$(pv_review 13 APPROVED r3 "$PV_T")]" 0 'cleared — Phase 4b substitute' "$PV_LEDGER"
+# A copied trailer from an account outside available_reviewers is not a
+# second carrier of the run id, so the approval still clears (wave audit P1
+# on swipewatch#230).
+pv_run copied-trailer-by-outsider-does-not-neutralize cap-policy.yml "[$PV_REQ]" \
+  "[$PV_SPENT,$(pv_review 13 APPROVED r3 "$PV_T"),$(pv_review 18 COMMENTED r3 "$PV_T" "" "" drive-by-user)]" 0 'cleared — Phase 4b substitute' "$PV_LEDGER"
 grep -qF 'review 13 by nathanpayne-codex (APPROVED) is ledger' "$DIR/out" || { cat "$DIR/out"; echo 'FAIL #2968 gate: ledger class not logged'; exit 1; }
 # (2) After a spent cap, a direct review with no authorization does not clear
 # and is flagged: the #2887 shapes, and a forged header, marker and footer.

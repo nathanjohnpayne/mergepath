@@ -648,6 +648,23 @@ want_cls "any claim on a PR with no ledger is unverified" unverified "no Phase 4
 want_cls "a released entry does not reserve its review" unverified "is released" "[$(areview 1 APPROVED "$HEAD_A" r3 "$T2")]"
 want_cls "a review on another head than its reservation is unverified" unverified "for head $HEAD_A" "[$(areview 1 APPROVED "$HEAD_B" r1 "$T2")]"
 want_cls "two reviews carrying one run id are unverified" unverified "2 reviews carry run id r1" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$(areview 2 APPROVED "$HEAD_A" r1 "$T2")]"
+# Run-id uniqueness counts only publisher-shaped carriers (wave audit P1 on
+# swipewatch#230): a quoted trailer must not neutralize a legitimate approval.
+TRUSTED_R='["nathanpayne-claude","nathanpayne-codex"]'
+cls_t() { p4b_prov_classify "$1" "$LEDGER_R" "$COMMENTS_R" nathanjohnpayne "$PRURL" "${2:-$TRUSTED_R}" | jq -r --argjson id "${3:-1}" '.[] | select(.id == $id) | "\(.class)|\(.reason // "")"'; }
+quoter=$(jq -c '.id = 2 | .state = "COMMENTED" | .user.login = "drive-by-user"' <<<"$(areview 2 COMMENTED "$HEAD_A" r1 "$T2")")
+[ "$(cls_t "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$quoter]")" = "ledger|" ] \
+  && pass "#2968: classify: an unregistered account copying the header, run marker and footer does not neutralize the approval" \
+  || fail "#2968: classify: unregistered quoter gave '$(cls_t "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$quoter]")'"
+noheader=$(areview 2 COMMENTED "$HEAD_A" r1 "$T2" "" "Discussing the trailer of review 1:")
+[ "$(cls "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$noheader]")" = "ledger|" ] \
+  && pass "#2968: classify: a reviewer's comment quoting the run marker and footer without the header is not a carrier" \
+  || fail "#2968: classify: header-less quoter gave '$(cls "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$noheader]")'"
+[ "$(cls_t "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$(areview 2 APPROVED "$HEAD_A" r1 "$T2")]")" = "unverified|2 reviews carry run id r1" ] \
+  && pass "#2968: classify: a surplus publication by a reviewer identity still makes the run ambiguous" \
+  || fail "#2968: classify: surplus with trusted list gave '$(cls_t "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2"),$(areview 2 APPROVED "$HEAD_A" r1 "$T2")]")'"
+p4b_prov_classify "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2")]" "$LEDGER_R" null nathanjohnpayne "$PRURL" '{"not":"array"}' >/dev/null \
+  && fail "#2968: classify accepted a malformed trusted-login list" || pass "#2968: classify fails closed on a malformed trusted-login list"
 want_cls "an authorized reservation cited without its record is unverified" unverified "does not match the ledger" "[$(areview 1 APPROVED "$HEAD_A" r2 "$T2")]"
 want_cls "a record on an unauthorized reservation is unverified" unverified "does not match the ledger" "[$(areview 1 APPROVED "$HEAD_A" r1 "$T2" 501)]"
 want_cls "a review that only quotes an authorization line is unverified" unverified "0 ledger entries" \
