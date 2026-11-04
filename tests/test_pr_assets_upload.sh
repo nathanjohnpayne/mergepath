@@ -528,9 +528,7 @@ test_smoke_mode() {
   pass "--smoke uploads to _smoke/ and prints a pinned line"
 }
 
-test_signing_config_honoured() {
-  reset_store
-  local after
+make_fake_gpg() {
   cat > "$T/bin/fake-gpg" <<'EOF'
 #!/bin/sh
 cat >/dev/null
@@ -539,6 +537,12 @@ printf '[GNUPG:] BEGIN_SIGNING\n[GNUPG:] SIG_CREATED D 1 8 00 0 0 FAKE\n' >&2
 printf -- '-----BEGIN PGP SIGNATURE-----\n\nZmFrZS1zaWduYXR1cmU=\n-----END PGP SIGNATURE-----\n'
 EOF
   chmod +x "$T/bin/fake-gpg"
+}
+
+test_signing_config_honoured() {
+  reset_store
+  local after
+  make_fake_gpg
   cp "$T/gitconfig" "$T/gitconfig.plain"
   cat >> "$T/gitconfig" <<EOF
 [commit]
@@ -565,6 +569,42 @@ EOF
   expect_rc 0 "unsigned upload" || return 0
   case "$ERR" in *"is unsigned"*) ;; *) fail "unsigned commit not warned about"; return 0 ;; esac
   pass "the commit honours the caller's signing config; a signing failure pushes nothing"
+}
+
+# Signing configured only in the invoking repository (not globally) still
+# signs: the settings are resolved in the caller's directory, not in the
+# temporary store clone where repository-local config does not exist.
+test_signing_config_from_caller_repository() {
+  reset_store
+  local caller="$T/caller-signing" after
+  make_fake_gpg
+  rm -rf "$caller"
+  "$REAL_GIT" init -q "$caller"
+  "$REAL_GIT" -C "$caller" config commit.gpgsign true
+  "$REAL_GIT" -C "$caller" config user.signingkey TESTKEY
+  "$REAL_GIT" -C "$caller" config gpg.program "$T/bin/fake-gpg"
+  RUN_CWD="$caller" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
+  expect_rc 0 "upload with repository-local signing" || return 0
+  after="$(main_sha)"
+  "$REAL_GIT" --git-dir="$BARE" cat-file commit "$after" | grep -q '^gpgsig' \
+    || { fail "repository-local commit.gpgSign in the caller's directory did not produce a signed commit"; return 0; }
+  case "$ERR" in *unsigned*) fail "repository-local signed commit reported as unsigned"; return 0 ;; esac
+  pass "signing settings are read in the caller's directory, so repository-local signing config applies"
+}
+
+# Trace2 records named environment variables (GIT_TRACE2_ENV_VARS) to its
+# target; the push credential must never reach a trace file.
+test_trace_controls_do_not_record_credential() {
+  reset_store
+  local t2="$T/trace2.event" t1="$T/trace.classic" t2n="$T/trace2.normal"
+  rm -f "$t2" "$t1" "$t2n"
+  GIT_TRACE2_EVENT="$t2" GIT_TRACE2="$t2n" GIT_TRACE2_ENV_VARS=PR_ASSETS_PUSH_CREDENTIAL \
+    GIT_TRACE="$t1" run --repo nathanjohnpayne/mergepath --pr 42 "$T/img/desktop.png"
+  expect_rc 0 "upload with trace controls set" || return 0
+  if cat "$t2" "$t2n" "$t1" 2>/dev/null | grep -qF "$TOKEN"; then
+    fail "the push credential was written to a git trace target"; return 0
+  fi
+  pass "git trace controls (Trace2 env-var logging included) never record the push credential"
 }
 
 test_unconfirmed_commit_not_printed() {
@@ -595,6 +635,8 @@ test_concurrent_collision_refused
 test_push_retries_bounded
 test_smoke_mode
 test_signing_config_honoured
+test_signing_config_from_caller_repository
+test_trace_controls_do_not_record_credential
 test_unconfirmed_commit_not_printed
 
 echo ""
