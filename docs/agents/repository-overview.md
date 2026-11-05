@@ -1,5 +1,7 @@
 # Repository Overview
 
+Non-app OIDC provenance registrations are documented in [ADR 0004](../architecture/0004-trusted-privileged-jobs.md); `scripts/ci/ci_app_trust.py` owns the repository-specific registry and embedded regression tests (`scripts/ci/check_ci_app_trust --self-test`, #3001).
+
 The CodeRabbit severity gate recognizes the single-batch publication root review object (status-only or `## Follow-up Comments`) and grades CodeRabbit's icon-label severity rows; a severity row no reader can grade counts as an unclassified p1 finding in the gate and in feedback accounting instead of as no finding. Other shapes still hold; the contract and native controls live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_severity_gate.sh --review-serialization-only` (#2927).
 
 The CodeRabbit severity gate recognizes complete metadata-only batched continuations paired to an existing same-head root report, preserving that report's findings and correlation floor. Incomplete, ambiguous or unread publications still hold; the parser contract and native controls live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_severity_gate.sh --batch-continuations-only` (#2804).
