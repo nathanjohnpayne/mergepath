@@ -241,6 +241,12 @@ jobs:
     # otherwise hold the required `lint` context open for the 6 h runner
     # default. The slowest leg measured ~5 min of check time.
     timeout-minutes: 30
+    # The case pool prints each wrapper's slowest suites to stderr when this is
+    # set (tests/lib/case-pool.sh), so a leg's log names the suite that sets
+    # its step time when the pins next need re-balancing (#2990). Diagnostic
+    # output only: no check reads it.
+    env:
+      MERGEPATH_TEST_TIMINGS: '1'
     strategy:
       # Every leg reports; a failing shard must not cancel its siblings'
       # evidence, and the aggregator fails on any non-success leg anyway.
