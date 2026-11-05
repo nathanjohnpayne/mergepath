@@ -1325,6 +1325,7 @@ paths:
     consumers: all
     requires:
       - "tests/test_merge_writer.py"
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's sections concurrently
   - path: tests/test_merge_writer.py
     type: canonical
     consumers: all

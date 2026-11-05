@@ -39,20 +39,42 @@ TESTS=(
   "tests/test_op_preflight_pr_assets.sh"
 )
 
-FAILED=0
-for rel in "${TESTS[@]}"; do
-  full="$REPO_ROOT/$rel"
+# Each suite is one case-pool case (#2990): they share no state, so the pool
+# runs them side by side and replays their output in this order. A failing or
+# missing suite adds to FAIL, which is what the pool counts. A checkout behind
+# the wave that delivers the pool runs the same suites one after another: the
+# skew costs time, never a suite.
+# shellcheck disable=SC2034 # case_pool_wait adds each suite's passes here
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through case_pool_add / the serial loop
+run_suite() { # <rel>
+  local full="$REPO_ROOT/$1"
   if [ ! -f "$full" ]; then
-    echo "check_op_preflight_contract: ERROR (missing $rel)" >&2
-    FAILED=1
-    continue
+    echo "check_op_preflight_contract: ERROR (missing $1)" >&2
+    FAIL=$((FAIL + 1))
+    return 0
   fi
-  echo "check_op_preflight_contract: running $rel"
+  echo "check_op_preflight_contract: running $1"
   if ! bash "$full"; then
-    echo "check_op_preflight_contract: FAIL ($rel)" >&2
-    FAILED=1
+    echo "check_op_preflight_contract: FAIL ($1)" >&2
+    FAIL=$((FAIL + 1))
   fi
-done
+}
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source "$REPO_ROOT/tests/lib/case-pool.sh"
+  for rel in "${TESTS[@]}"; do
+    case_pool_add run_suite "$rel"
+  done
+  case_pool_wait
+else
+  for rel in "${TESTS[@]}"; do
+    run_suite "$rel"
+  done
+fi
+FAILED=0
+[ "$FAIL" -eq 0 ] || FAILED=1
 
 if [ "$FAILED" -ne 0 ]; then
   echo "check_op_preflight_contract: FAIL"
