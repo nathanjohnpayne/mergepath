@@ -190,6 +190,9 @@ ALLOWED_ID_TOKEN_JOBS = {
 # token; the entry exists so that the allow-list above is not the only
 # control and the grant is still recorded and reviewed.
 REVIEWED_OTHER_OIDC_JOBS = {
+    ("nathanjohnpayne/friends-and-family-billing", "build-artifact.yml", "attest"):
+        "SLSA build provenance for isolated deploy artifacts (mergepath#3001, FFB#594): "
+        "actions/attest-build-provenance needs id-token: write; reviewed job has no checkout or candidate execution",
     ("nathanjohnpayne/nathanpaynedotcom", "build-artifact.yml", "attest"):
         "SLSA build provenance for the deploy artifact (#1238): "
         "actions/attest-build-provenance needs id-token: write; no checkout, no repository code",
@@ -867,6 +870,34 @@ def self_test(load):
              "    uses: nathanjohnpayne/x/.github/workflows/y.yml@%s\n" % SHA, "build-artifact.yml", site, 1)):
         v, _ = scan_workflow(load(text), base, {}, repo, other)
         check(name, len(v) == want, "want %d, got %r" % (want, v))
+    # #3001: exercise the shipped registry, so deleting or broadening the
+    # production registration cannot be hidden by the fixture-only map above.
+    ffb = "nathanjohnpayne/friends-and-family-billing"
+    ffb_key = (ffb, "build-artifact.yml", "attest")
+    v, matched = scan_workflow(load(attest), "build-artifact.yml", {}, ffb, REVIEWED_OTHER_OIDC_JOBS)
+    check("the shipped FFB provenance registration passes its exact tuple",
+          v == [] and matched == {ffb_key}, repr(v))
+    for name, text, base, repo, diagnostic in (
+            ("another repository", attest, "build-artifact.yml", REPO, "not in ALLOWED_ID_TOKEN_JOBS"),
+            ("unknown repository", attest, "build-artifact.yml", None, "not in ALLOWED_ID_TOKEN_JOBS"),
+            ("another workflow", attest, "other-artifact.yml", ffb, "not in ALLOWED_ID_TOKEN_JOBS"),
+            ("another job", attest.replace("  attest:", "  publish:"), "build-artifact.yml", ffb,
+             "not in ALLOWED_ID_TOKEN_JOBS"),
+            ("workflow-level grant", attest.replace("on: push\n", "on: push\npermissions:\n  id-token: write\n"),
+             "build-artifact.yml", ffb, "workflow-level"),
+            ("Octo STS exchange", attest + EXCHANGE, "build-artifact.yml", ffb, "mentions Octo STS"),
+            ("tag-pinned action", attest.replace("attest-build-provenance@" + SHA,
+                                                "attest-build-provenance@v4"),
+             "build-artifact.yml", ffb, "not pinned"),
+            ("non-canonical action", attest.replace("actions/attest-build-provenance@",
+                                                   "actions/attest-build-provenance/@"),
+             "build-artifact.yml", ffb, "canonical"),
+            ("reusable call", "on: push\njobs:\n  attest:\n    permissions:\n      id-token: write\n"
+             "    uses: nathanjohnpayne/x/.github/workflows/y.yml@%s\n" % SHA,
+             "build-artifact.yml", ffb, "reusable-workflow")):
+        v, _ = scan_workflow(load(text), base, {}, repo, REVIEWED_OTHER_OIDC_JOBS)
+        check("shipped FFB registration refuses " + name,
+              len(v) == 1 and diagnostic in v[0], repr(v))
     in_identity = {(site, WF, "attest"): "fixture"}
     v, _ = scan_workflow(load(attest), WF, {}, site, in_identity)
     check("a reviewed entry inside a pinned identity workflow fails",
@@ -916,6 +947,9 @@ def self_test(load):
             fh.write(attest.replace("      id-token: write\n", ""))
         v = scan_workflows(tmp, load, {}, site, other)
         check("a stale reviewed entry fails in its repository", len(v) == 1 and "stale" in v[0], repr(v))
+        v = scan_workflows(tmp, load, {}, ffb, REVIEWED_OTHER_OIDC_JOBS)
+        check("a stale shipped FFB provenance registration fails",
+              len(v) == 1 and "stale REVIEWED_OTHER_OIDC_JOBS" in v[0], repr(v))
         check("a reviewed entry for another repository is not stale here",
               scan_workflows(tmp, load, {}, REPO, other) == [])
         os.remove(os.path.join(wf_dir, "build-artifact.yml"))
