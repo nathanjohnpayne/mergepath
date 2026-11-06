@@ -1227,11 +1227,13 @@ else
   fi
   # hub_only_oracle WORKFLOW [WRAPPER]: 0 when every check WORKFLOW pins to a
   # hub-only shard (only WRAPPER, when named) passes both trees; the checks
-  # it ran are left in HUB_ONLY_STEPS.
+  # it ran are left in HUB_ONLY_STEPS, and each rejection as wrapper:tree
+  # (marker or delivered) in HUB_ONLY_REJECTS.
   hub_only_oracle() {
     local workflow="$1" only="${2:-}" oracle_ok=1 member run_line wrapper skip_tree
     local consumer_rc consumer_out hub_out delivered_rc delivered_out
     HUB_ONLY_STEPS=""
+    HUB_ONLY_REJECTS=""
     for member in $hub_only_members; do
       while IFS= read -r run_line; do
         [ -n "$run_line" ] || continue
@@ -1256,12 +1258,14 @@ else
           oracle_ok=0
           echo "INFO: $wrapper on hub-only shard $member does not SKIP on the hub marker alone (consumer rc=$consumer_rc)" >&2
           HUB_ONLY_STEPS="$HUB_ONLY_STEPS $wrapper"
+          HUB_ONLY_REJECTS="$HUB_ONLY_REJECTS $wrapper:marker"
           continue
         fi
         delivered_rc=0
         delivered_out=$(cd "$delivered_tree" && env -u GH_TOKEN -u GITHUB_TOKEN bash "./scripts/ci/$wrapper" </dev/null 2>&1) || delivered_rc=$?
         if [ "$delivered_rc" -ne 0 ] || ! grep -q "^$wrapper: SKIP" <<<"$delivered_out"; then
           oracle_ok=0
+          HUB_ONLY_REJECTS="$HUB_ONLY_REJECTS $wrapper:delivered"
           echo "INFO: $wrapper on hub-only shard $member runs on a consumer that has every delivered path (rc=$delivered_rc): $(head -n 1 <<<"$delivered_out" | cut -c1-160)" >&2
         fi
         HUB_ONLY_STEPS="$HUB_ONLY_STEPS $wrapper"
@@ -1279,9 +1283,12 @@ else
   # fail it. check_codex_review_request (moved with its tooling-scope entry)
   # holds the selector to tooling-gated pins; check_template_substitution,
   # whose wrapper SKIPs on the wrapper-only tree, holds the delivered fixture
-  # to suites the manifest sends (#2995). Each mutant runs only its own check.
+  # to suites the manifest sends (#2995), so it must be rejected there and not
+  # by the marker check. Each mutant runs only its own check.
   oracle_mutants_ok=1
-  for mutant in check_codex_review_request check_template_substitution; do
+  for mutant_case in check_codex_review_request: check_template_substitution:delivered; do
+    mutant="${mutant_case%%:*}"
+    mutant_reason="${mutant_case#*:}"
     mutant_workflow="$SCOPE_FIXTURES/hub-only-mutant-$mutant.yml"
     if ! mutant="$mutant" yq '(.jobs.lint_fast.steps[] | select(.name == strenv(mutant)) | .if) |= sub("^matrix\\.shard == [0-9]+", "matrix.shard == 8")' "$REPO_LINT" >"$mutant_workflow" \
        || ! mutant="$mutant" yq -e '.jobs.lint_fast.steps[] | select(.name == strenv(mutant)) | .if | test("^matrix\\.shard == 8( &&|$)")' "$mutant_workflow" >/dev/null; then
@@ -1290,13 +1297,14 @@ else
       continue
     fi
     sed -i.bak -E "s/(^|[[:space:]])[0-9]+:$mutant([[:space:]]|$)/\18:$mutant\2/" "$mutant_workflow" && rm -f "$mutant_workflow.bak"
-    if hub_only_oracle "$mutant_workflow" "$mutant" 2>/dev/null || [ "$HUB_ONLY_STEPS" != " $mutant" ]; then
+    if hub_only_oracle "$mutant_workflow" "$mutant" 2>/dev/null || [ "$HUB_ONLY_STEPS" != " $mutant" ] \
+       || { [ -n "$mutant_reason" ] && [ "$HUB_ONLY_REJECTS" != " $mutant:$mutant_reason" ]; }; then
       oracle_mutants_ok=0
-      echo "INFO: the hub-only oracle accepted $mutant on shard 8 (ran:$HUB_ONLY_STEPS)" >&2
+      echo "INFO: the hub-only oracle accepted $mutant on shard 8, or rejected it on the wrong tree (ran:$HUB_ONLY_STEPS; rejected:$HUB_ONLY_REJECTS)" >&2
     fi
   done
   if [ "$oracle_mutants_ok" -eq 1 ]; then
-    pass "the hub-only oracle rejects a consumer check moved to shard 8, tooling-gated or with a manifest-delivered suite"
+    pass "the hub-only oracle rejects a consumer check moved to shard 8, tooling-gated or with a manifest-delivered suite (the latter on the delivered tree)"
   else
     fail "the hub-only oracle must reject check_codex_review_request (tooling-gated) and check_template_substitution (delivered suite) on shard 8"
   fi
