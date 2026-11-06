@@ -1225,42 +1225,80 @@ else
      || [ ! -f "$delivered_tree/scripts/lib/template-substitution.sh" ] || [ ! -f "$delivered_tree/tests/test_template_substitution.sh" ]; then
     fail "the consumer-delivered fixture must hold the manifest's paths and requires (a check whose suite travels must find it there)"
   fi
-  hub_only_ok=1
-  hub_only_steps=""
-  for member in $hub_only_members; do
-    while IFS= read -r run_line; do
-      [ -n "$run_line" ] || continue
-      wrapper=$(printf '%s' "$run_line" | sed -n 's|^\./scripts/ci/\(check_[A-Za-z0-9_]*\).*|\1|p')
-      if [ -z "$wrapper" ] || [ ! -f "$ROOT/scripts/ci/$wrapper" ]; then
-        hub_only_ok=0
-        echo "INFO: hub-only shard $member runs something other than a scripts/ci wrapper: $run_line" >&2
-        continue
-      fi
-      skip_tree="$SCOPE_FIXTURES/hub-only-$wrapper"
-      rm -rf "$skip_tree"
-      mkdir -p "$skip_tree/scripts/ci"
-      cp "$ROOT/scripts/ci/$wrapper" "$skip_tree/scripts/ci/$wrapper"
-      consumer_rc=0
-      consumer_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1) || consumer_rc=$?
-      touch "$skip_tree/scripts/sync-to-downstream.sh" "$skip_tree/.mergepath-sync.yml"
-      hub_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1 || true)
-      if [ "$consumer_rc" -ne 0 ] || ! grep -q 'SKIP' <<<"$consumer_out" || grep -q 'SKIP' <<<"$hub_out"; then
-        hub_only_ok=0
-        echo "INFO: $wrapper on hub-only shard $member does not SKIP on the hub marker alone (consumer rc=$consumer_rc)" >&2
-      fi
-      delivered_rc=0
-      delivered_out=$(cd "$delivered_tree" && env -u GH_TOKEN -u GITHUB_TOKEN bash "./scripts/ci/$wrapper" </dev/null 2>&1) || delivered_rc=$?
-      if [ "$delivered_rc" -ne 0 ] || ! grep -q "^$wrapper: SKIP" <<<"$delivered_out"; then
-        hub_only_ok=0
-        echo "INFO: $wrapper on hub-only shard $member runs on a consumer that has every delivered path (rc=$delivered_rc): $(head -n 1 <<<"$delivered_out" | cut -c1-160)" >&2
-      fi
-      hub_only_steps="$hub_only_steps $wrapper"
-    done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select((.if // "") | test("^matrix\\.shard == " + strenv(member) + "( &&|$)")) | .run' "$REPO_LINT")
-  done
-  if [ -n "$hub_only_members" ] && [ -n "$hub_only_steps" ] && [ "$hub_only_ok" -eq 1 ]; then
-    pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer, even one holding every delivered path, because the hub markers are absent"
+  # hub_only_oracle WORKFLOW [WRAPPER]: 0 when every check WORKFLOW pins to a
+  # hub-only shard (only WRAPPER, when named) passes both trees; the checks
+  # it ran are left in HUB_ONLY_STEPS.
+  hub_only_oracle() {
+    local workflow="$1" only="${2:-}" oracle_ok=1 member run_line wrapper skip_tree
+    local consumer_rc consumer_out hub_out delivered_rc delivered_out
+    HUB_ONLY_STEPS=""
+    for member in $hub_only_members; do
+      while IFS= read -r run_line; do
+        [ -n "$run_line" ] || continue
+        wrapper=$(printf '%s' "$run_line" | sed -n 's|^\./scripts/ci/\(check_[A-Za-z0-9_]*\).*|\1|p')
+        if [ -z "$wrapper" ] || [ ! -f "$ROOT/scripts/ci/$wrapper" ]; then
+          oracle_ok=0
+          echo "INFO: hub-only shard $member runs something other than a scripts/ci wrapper: $run_line" >&2
+          continue
+        fi
+        if [ -n "$only" ] && [ "$wrapper" != "$only" ]; then
+          continue
+        fi
+        skip_tree="$SCOPE_FIXTURES/hub-only-$wrapper"
+        rm -rf "$skip_tree"
+        mkdir -p "$skip_tree/scripts/ci"
+        cp "$ROOT/scripts/ci/$wrapper" "$skip_tree/scripts/ci/$wrapper"
+        consumer_rc=0
+        consumer_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1) || consumer_rc=$?
+        touch "$skip_tree/scripts/sync-to-downstream.sh" "$skip_tree/.mergepath-sync.yml"
+        hub_out=$(bash "$skip_tree/scripts/ci/$wrapper" 2>&1 || true)
+        if [ "$consumer_rc" -ne 0 ] || ! grep -q 'SKIP' <<<"$consumer_out" || grep -q 'SKIP' <<<"$hub_out"; then
+          oracle_ok=0
+          echo "INFO: $wrapper on hub-only shard $member does not SKIP on the hub marker alone (consumer rc=$consumer_rc)" >&2
+          HUB_ONLY_STEPS="$HUB_ONLY_STEPS $wrapper"
+          continue
+        fi
+        delivered_rc=0
+        delivered_out=$(cd "$delivered_tree" && env -u GH_TOKEN -u GITHUB_TOKEN bash "./scripts/ci/$wrapper" </dev/null 2>&1) || delivered_rc=$?
+        if [ "$delivered_rc" -ne 0 ] || ! grep -q "^$wrapper: SKIP" <<<"$delivered_out"; then
+          oracle_ok=0
+          echo "INFO: $wrapper on hub-only shard $member runs on a consumer that has every delivered path (rc=$delivered_rc): $(head -n 1 <<<"$delivered_out" | cut -c1-160)" >&2
+        fi
+        HUB_ONLY_STEPS="$HUB_ONLY_STEPS $wrapper"
+      done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select((.if // "") | test("^matrix\\.shard == " + strenv(member) + "( &&|$)")) | .run' "$workflow")
+    done
+    [ "$oracle_ok" -eq 1 ]
+  }
+  if [ -n "$hub_only_members" ] && hub_only_oracle "$REPO_LINT" && [ -n "$HUB_ONLY_STEPS" ]; then
+    pass "the hub-only shard's checks ($HUB_ONLY_STEPS ) each SKIP on a consumer, even one holding every delivered path, because the hub markers are absent"
   else
-    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when the hub markers are absent, including on a tree with every consumer-delivered path (hub-only shards: '$hub_only_members'; checks:$hub_only_steps)"
+    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when the hub markers are absent, including on a tree with every consumer-delivered path (hub-only shards: '$hub_only_members'; checks:$HUB_ONLY_STEPS)"
+  fi
+
+  # The oracle's own mutants: a consumer check moved to a hub-only shard must
+  # fail it. check_codex_review_request (moved with its tooling-scope entry)
+  # holds the selector to tooling-gated pins; check_template_substitution,
+  # whose wrapper SKIPs on the wrapper-only tree, holds the delivered fixture
+  # to suites the manifest sends (#2995). Each mutant runs only its own check.
+  oracle_mutants_ok=1
+  for mutant in check_codex_review_request check_template_substitution; do
+    mutant_workflow="$SCOPE_FIXTURES/hub-only-mutant-$mutant.yml"
+    if ! mutant="$mutant" yq '(.jobs.lint_fast.steps[] | select(.name == strenv(mutant)) | .if) |= sub("^matrix\\.shard == [0-9]+", "matrix.shard == 8")' "$REPO_LINT" >"$mutant_workflow" \
+       || ! mutant="$mutant" yq -e '.jobs.lint_fast.steps[] | select(.name == strenv(mutant)) | .if | test("^matrix\\.shard == 8( &&|$)")' "$mutant_workflow" >/dev/null; then
+      oracle_mutants_ok=0
+      echo "INFO: could not build the $mutant hub-only mutant" >&2
+      continue
+    fi
+    sed -i.bak -E "s/(^|[[:space:]])[0-9]+:$mutant([[:space:]]|$)/\18:$mutant\2/" "$mutant_workflow" && rm -f "$mutant_workflow.bak"
+    if hub_only_oracle "$mutant_workflow" "$mutant" 2>/dev/null || [ "$HUB_ONLY_STEPS" != " $mutant" ]; then
+      oracle_mutants_ok=0
+      echo "INFO: the hub-only oracle accepted $mutant on shard 8 (ran:$HUB_ONLY_STEPS)" >&2
+    fi
+  done
+  if [ "$oracle_mutants_ok" -eq 1 ]; then
+    pass "the hub-only oracle rejects a consumer check moved to shard 8, tooling-gated or with a manifest-delivered suite"
+  else
+    fail "the hub-only oracle must reject check_codex_review_request (tooling-gated) and check_template_substitution (delivered suite) on shard 8"
   fi
 
   # The #777 closing pair: the plain call (Parts A-C + suite) on one shard and
