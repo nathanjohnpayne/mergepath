@@ -1180,7 +1180,7 @@ jobs:
         run: ./scripts/ci/check_sync_to_downstream || { rc=$?; if [ ! -f scripts/ci/check_sync_to_downstream ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sync_to_downstream not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_template_substitution
-        if: matrix.shard == 8
+        if: matrix.shard == 3
         # Exercises tests/test_template_substitution.sh — verifies the
         # Layer 5 template-substitution lib's v1 syntax (variable
         # substitution, conditional blocks, comment-prefix flexibility,

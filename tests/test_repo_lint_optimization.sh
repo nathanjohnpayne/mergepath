@@ -1191,6 +1191,38 @@ else
   # the wrapper, it must exit 0 and print SKIP; with the hub markers
   # (scripts/sync-to-downstream.sh, .mergepath-sync.yml) added it must not. A consumer-applicable check pinned there would silently lose
   # its consumer coverage, and fails here.
+  #
+  # The wrapper-only tree proves the marker logic but not that the check is
+  # hub-only: a wrapper whose suite and library the manifest delivers to every
+  # consumer also SKIPs there, because the suite is missing (#2995 Phase 4b,
+  # check_template_substitution). So each wrapper must also SKIP on a tree
+  # holding everything the hub sends a consumer: every `paths:` entry (a
+  # templated source lands at its dest) and every `requires:` path, for any
+  # consumer, minus the two hub markers.
+  delivered_tree="$SCOPE_FIXTURES/hub-only-delivered"
+  rm -rf "$delivered_tree"
+  mkdir -p "$delivered_tree"
+  delivered_ok=1
+  while IFS=$'\t' read -r src dest; do
+    [ -n "$src" ] || continue
+    src="${src%/}"
+    dest="${dest%/}"
+    if [ ! -e "$ROOT/$src" ]; then
+      continue
+    fi
+    if [ -d "$ROOT/$src" ]; then
+      mkdir -p "$delivered_tree/$dest"
+      cp -R "$ROOT/$src/." "$delivered_tree/$dest/" || delivered_ok=0
+    else
+      mkdir -p "$delivered_tree/$(dirname "$dest")"
+      cp "$ROOT/$src" "$delivered_tree/$dest" || delivered_ok=0
+    fi
+  done < <(yq -r '.paths[] | ((.source // .path) + "\t" + (.dest // .path)), ((.requires // [])[] | . + "\t" + .)' "$ROOT/.mergepath-sync.yml")
+  rm -f "$delivered_tree/scripts/sync-to-downstream.sh" "$delivered_tree/.mergepath-sync.yml"
+  if [ "$delivered_ok" -ne 1 ] || [ ! -f "$delivered_tree/scripts/ci/check_template_substitution" ] \
+     || [ ! -f "$delivered_tree/scripts/lib/template-substitution.sh" ] || [ ! -f "$delivered_tree/tests/test_template_substitution.sh" ]; then
+    fail "the consumer-delivered fixture must hold the manifest's paths and requires (a check whose suite travels must find it there)"
+  fi
   hub_only_ok=1
   hub_only_steps=""
   for member in $hub_only_members; do
@@ -1214,13 +1246,19 @@ else
         hub_only_ok=0
         echo "INFO: $wrapper on hub-only shard $member does not SKIP on the hub marker alone (consumer rc=$consumer_rc)" >&2
       fi
+      delivered_rc=0
+      delivered_out=$(cd "$delivered_tree" && env -u GH_TOKEN -u GITHUB_TOKEN bash "./scripts/ci/$wrapper" </dev/null 2>&1) || delivered_rc=$?
+      if [ "$delivered_rc" -ne 0 ] || ! grep -q "^$wrapper: SKIP" <<<"$delivered_out"; then
+        hub_only_ok=0
+        echo "INFO: $wrapper on hub-only shard $member runs on a consumer that has every delivered path (rc=$delivered_rc): $(head -n 1 <<<"$delivered_out" | cut -c1-160)" >&2
+      fi
       hub_only_steps="$hub_only_steps $wrapper"
     done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select(.if == ("matrix.shard == " + strenv(member))) | .run' "$REPO_LINT")
   done
   if [ -n "$hub_only_members" ] && [ -n "$hub_only_steps" ] && [ "$hub_only_ok" -eq 1 ]; then
-    pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer because the hub markers are absent"
+    pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer, even one holding every delivered path, because the hub markers are absent"
   else
-    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when the hub markers are absent (hub-only shards: '$hub_only_members'; checks:$hub_only_steps)"
+    fail "every check on a hub-only shard must be a wrapper that SKIPs exactly when the hub markers are absent, including on a tree with every consumer-delivered path (hub-only shards: '$hub_only_members'; checks:$hub_only_steps)"
   fi
 
   # The #777 closing pair: the plain call (Parts A-C + suite) on one shard and
