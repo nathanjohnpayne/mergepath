@@ -1977,7 +1977,7 @@ case_pool_add pr_guard_case_29
 # in the loader's deterministic order is k mod n, so the slices partition the
 # one discovered list. A slice that discovers no tests, selects none, or has
 # a failing or erroring test fails.
-MERGE_WRITER_SLICES=4
+MERGE_WRITER_SLICES=8
 merge_writer_slice() { # <k> <n>
   if python3 - "$ROOT/tests/test_merge_writer.py" "$1" "$2" <<'PY'
 import importlib.util, sys, unittest
