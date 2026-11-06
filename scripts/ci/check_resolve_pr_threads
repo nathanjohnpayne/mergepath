@@ -566,6 +566,38 @@ else
   echo "      env capture:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
 fi
 
+# ── Delegated suites run concurrently (#2990) ─────────────────────────
+# Tests 8-10 below each delegate to a fixture suite in tests/ that shares no
+# state with the others, so all five start here, side by side, and each test
+# block below waits for its own suite's exit status instead of running it
+# inline. The blocks keep their order, their PASS/FAIL accounting, their
+# missing-file failure and their diagnostic re-run on failure. A suite whose
+# file is missing is not started, and its block fails as before.
+DELEGATE_DIR="$SCRATCH/delegates"
+mkdir -p "$DELEGATE_DIR"
+delegate_key() { basename "$1" .sh; }
+start_delegate() { # <path>
+  [ -f "$1" ] || return 0
+  bash "$1" >"$DELEGATE_DIR/$(delegate_key "$1").log" 2>&1 &
+  echo "$!" >"$DELEGATE_DIR/$(delegate_key "$1").pid"
+}
+# Exit status of a suite start_delegate launched; a suite that was never
+# started (no pid file) fails.
+delegate_result() { # <path>
+  local pid_file
+  pid_file="$DELEGATE_DIR/$(delegate_key "$1").pid"
+  [ -s "$pid_file" ] || return 1
+  wait "$(cat "$pid_file")"
+}
+for delegate in \
+  "$ROOT/tests/test_resolve_pr_threads_rationale_tag.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_staleness_pagination.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_read_failure.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_bind_head.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_verified_propagation.sh"; do
+  start_delegate "$delegate"
+done
+
 # ── Test 8: delegate to tests/test_resolve_pr_threads_rationale_tag.sh
 # Exercises the mergepath#305 tag-emission flow (derive_tag_class +
 # post_tag_reply + --rationale override + --no-tag-reply). The test
@@ -580,7 +612,7 @@ TAG_TEST="$ROOT/tests/test_resolve_pr_threads_rationale_tag.sh"
 if [ ! -f "$TAG_TEST" ]; then
   fail=$((fail + 1))
   echo "  FAIL: missing $TAG_TEST" >&2
-elif bash "$TAG_TEST" >/dev/null 2>&1; then
+elif delegate_result "$TAG_TEST"; then
   pass=$((pass + 1))
   echo "  PASS: tests/test_resolve_pr_threads_rationale_tag.sh"
 else
@@ -605,7 +637,7 @@ PAGINATION_TEST="$ROOT/tests/test_resolve_pr_threads_staleness_pagination.sh"
 if [ ! -f "$PAGINATION_TEST" ]; then
   fail=$((fail + 1))
   echo "  FAIL: missing $PAGINATION_TEST" >&2
-elif bash "$PAGINATION_TEST" >/dev/null 2>&1; then
+elif delegate_result "$PAGINATION_TEST"; then
   pass=$((pass + 1))
   echo "  PASS: tests/test_resolve_pr_threads_staleness_pagination.sh"
 else
@@ -631,7 +663,7 @@ READFAIL_TEST="$ROOT/tests/test_resolve_pr_threads_read_failure.sh"
 if [ ! -f "$READFAIL_TEST" ]; then
   fail=$((fail + 1))
   echo "  FAIL: missing $READFAIL_TEST" >&2
-elif bash "$READFAIL_TEST" >/dev/null 2>&1; then
+elif delegate_result "$READFAIL_TEST"; then
   pass=$((pass + 1))
   echo "  PASS: tests/test_resolve_pr_threads_read_failure.sh"
 else
@@ -654,7 +686,7 @@ BIND_TEST="$ROOT/tests/test_resolve_pr_threads_bind_head.sh"
 if [ ! -f "$BIND_TEST" ]; then
   fail=$((fail + 1))
   echo "  FAIL: missing $BIND_TEST" >&2
-elif bash "$BIND_TEST" >/dev/null 2>&1; then
+elif delegate_result "$BIND_TEST"; then
   pass=$((pass + 1))
   echo "  PASS: tests/test_resolve_pr_threads_bind_head.sh"
 else
@@ -688,7 +720,7 @@ VERIFIED_PROPAGATION_TEST="$ROOT/tests/test_resolve_pr_threads_verified_propagat
 if [ ! -f "$VERIFIED_PROPAGATION_TEST" ]; then
   fail=$((fail + 1))
   echo "  FAIL: missing $VERIFIED_PROPAGATION_TEST" >&2
-elif bash "$VERIFIED_PROPAGATION_TEST" >/dev/null 2>&1; then
+elif delegate_result "$VERIFIED_PROPAGATION_TEST"; then
   pass=$((pass + 1))
   echo "  PASS: tests/test_resolve_pr_threads_verified_propagation.sh"
 else

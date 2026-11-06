@@ -1377,7 +1377,7 @@ case_pool_add test_new_trigger_replaces_superseded_timeout_marker
 # Inside WORKDIR, so the EXIT trap registered with it at the top of this file
 # is the only one. A second `trap ... EXIT` REPLACES the first rather than
 # extending it, which leaked the whole WORKDIR tree on every run -- and this
-# suite runs in required CI via scripts/ci/check_codex_scripts.
+# suite runs in required CI via scripts/ci/check_codex_review_request.
 G1100_LASTDIR="$(mktemp "$WORKDIR/g1100-lastdir.XXXXXX")"
 
 g1100_extract() {  # <fn-name> -- the REAL function body, so a revert is executed

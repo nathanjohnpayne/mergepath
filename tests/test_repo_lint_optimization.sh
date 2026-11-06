@@ -1006,7 +1006,7 @@ else
   aggregate() {  # DEEP REPLAY SELF SCOPE FAST DEEP_RESULT REPLAY_RESULT SELF_RESULT
     DEEP="$1" CONSUMER_REPLAY="$2" SELF_TESTS="$3" SCOPE_RESULT="$4" FAST_RESULT="$5" \
       DEEP_RESULT="$6" REPLAY_RESULT="$7" SELF_TESTS_RESULT="$8" \
-      FAST_SHARDS="${AGG_FAST_SHARDS-[1,2,3,4,5,6]}" \
+      FAST_SHARDS="${AGG_FAST_SHARDS-[1,2,3,4,5,6,7]}" \
       bash --noprofile --norc -e -o pipefail -c "$aggregator_run" >/dev/null 2>&1
   }
   aggregator_ok=1
@@ -1085,7 +1085,7 @@ else
   for good in "$consumer_fast_shards" "$hub_fast_shards"; do
     AGG_FAST_SHARDS="$good" aggregate false false false success success skipped skipped skipped || shard_list_ok=0
   done
-  for bad in '' '[]' '[1,2,3]' '[1,2,3,5]' '[1,2,3,4,5]' '[1,2,3,4,6]' '[1,2,3,4,5,6,7]' '[1, 2, 3, 4]' 'null'; do
+  for bad in '' '[]' '[1,2,3]' '[1,2,3,5]' '[1,2,3,4,5]' '[1,2,3,4,6]' '[1,2,3,4,5,6]' '[1,2,3,4,5,7]' '[1,2,3,4,5,6,7,8]' '[1, 2, 3, 4]' 'null'; do
     if AGG_FAST_SHARDS="$bad" aggregate false false false success success skipped skipped skipped; then
       shard_list_ok=0
       echo "INFO: aggregator accepted fast_shards '$bad'" >&2
