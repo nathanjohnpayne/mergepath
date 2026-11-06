@@ -264,12 +264,12 @@ fi
 
 # #2990: lint_fast's matrix is the scope job's fast_shards output, so the
 # evaluator needs it too. The fixture carries the hub marker, so CI's step
-# answers the hub's list, shards 5 to 7 included; the hook runs every shard's pins.
+# answers the hub's list, shards 6 to 8 included; the hook runs every shard's pins.
 yq '.jobs.scope.steps[] | select(.id == "shards") | .run' \
   "$HUB/.github/workflows/repo_lint.yml" > "$TMP/ci_shards.sh"
 : > "$TMP/ci_shards"
 (cd "$HUB" && GITHUB_OUTPUT="$TMP/ci_shards" bash -e "$TMP/ci_shards.sh") > /dev/null
-check "CI's shards step answers the hub's list on the hub fixture" "$(cat "$TMP/ci_shards")" "fast_shards=[1,2,3,4,5,6,7]"
+check "CI's shards step answers the hub's list on the hub fixture" "$(cat "$TMP/ci_shards")" "fast_shards=[1,2,3,4,5,6,7,8]"
 
 # id | branch | ;-separated changed paths | ;-separated undeclared paths
 CASES='docs|feat/docs|README.md;docs/guide.md|
