@@ -1190,7 +1190,9 @@ else
   # SKIPs because the hub's markers are absent: run on a tree holding only
   # the wrapper, it must exit 0 and print SKIP; with the hub markers
   # (scripts/sync-to-downstream.sh, .mergepath-sync.yml) added it must not. A consumer-applicable check pinned there would silently lose
-  # its consumer coverage, and fails here.
+  # its consumer coverage, and fails here. A tooling-gated pin
+  # (`matrix.shard == N && needs.scope.outputs.tooling != 'false'`) is held to
+  # the same rule: the gate narrows when the step runs, not where.
   #
   # The wrapper-only tree proves the marker logic but not that the check is
   # hub-only: a wrapper whose suite and library the manifest delivers to every
@@ -1253,7 +1255,7 @@ else
         echo "INFO: $wrapper on hub-only shard $member runs on a consumer that has every delivered path (rc=$delivered_rc): $(head -n 1 <<<"$delivered_out" | cut -c1-160)" >&2
       fi
       hub_only_steps="$hub_only_steps $wrapper"
-    done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select(.if == ("matrix.shard == " + strenv(member))) | .run' "$REPO_LINT")
+    done < <(member="$member" yq -r '.jobs.lint_fast.steps[] | select((.if // "") | test("^matrix\\.shard == " + strenv(member) + "( &&|$)")) | .run' "$REPO_LINT")
   done
   if [ -n "$hub_only_members" ] && [ -n "$hub_only_steps" ] && [ "$hub_only_ok" -eq 1 ]; then
     pass "the hub-only shard's checks ($hub_only_steps ) each SKIP on a consumer, even one holding every delivered path, because the hub markers are absent"
