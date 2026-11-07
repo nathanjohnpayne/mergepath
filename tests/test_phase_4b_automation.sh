@@ -9480,15 +9480,53 @@ p4b_barrier_claim "$_cp"     && bad="$bad ownerless-stolen"
 rm -rf "$_cp"
 # Two contenders reaping the SAME dead claim: rename is single-winner, so
 # exactly one may take it over (rm+mkdir let both in — Codex P2, round 2).
-mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
-( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-a" 2>/dev/null &
-_rp_a=$!
-( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-b" 2>/dev/null &
-_rp_b=$!
-wait "$_rp_a" || true
-wait "$_rp_b" || true
-_wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
-[ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins"
+#
+# Each contender HOLDS after its attempt until both have attempted. The
+# recorded owner is the contender subshell itself, so a winner that exited
+# straight after `echo win` left a dead owner behind, and a contender
+# scheduled late then correctly reaped THAT claim too: two wins from correct
+# code (main push run 42386682145). Holding keeps the winner's owner alive
+# for the whole contest, so a second win can only come from a broken reap.
+# The waits are bounded so a fixture fault fails the case instead of hanging.
+# The reap window is microseconds wide, so one contest catches a broken
+# reap only some of the time; every round must produce exactly one win.
+_reap_contender() {
+  # Start gate: both contenders spin on one file so they enter the claim
+  # together, keeping the reap genuinely concurrent rather than whichever
+  # fork happened to be scheduled first.
+  : >"$WORK/$1.ready"
+  local _n=0
+  while [ ! -e "$WORK/reap-start" ] && [ "$_n" -lt 200000 ]; do _n=$((_n + 1)); done
+  p4b_barrier_claim "$_cp" && echo win
+  : >"$WORK/$1.tried"
+  _n=0
+  while [ ! -e "$WORK/reap-go" ] && [ "$_n" -lt 600 ]; do sleep 0.05; _n=$((_n + 1)); done
+}
+for _round in 1 2 3 4 5 6 7 8; do
+  rm -f "$WORK"/reap-a* "$WORK"/reap-b* "$WORK/reap-go" "$WORK/reap-start"
+  rm -rf "$_cp"
+  mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
+  ( _reap_contender reap-a ) >"$WORK/reap-a" 2>/dev/null &
+  _rp_a=$!
+  ( _reap_contender reap-b ) >"$WORK/reap-b" 2>/dev/null &
+  _rp_b=$!
+  _n=0
+  while { [ ! -e "$WORK/reap-a.ready" ] || [ ! -e "$WORK/reap-b.ready" ]; } && [ "$_n" -lt 600 ]; do
+    sleep 0.05; _n=$((_n + 1))
+  done
+  : >"$WORK/reap-start"
+  _n=0
+  while { [ ! -e "$WORK/reap-a.tried" ] || [ ! -e "$WORK/reap-b.tried" ]; } && [ "$_n" -lt 600 ]; do
+    sleep 0.05; _n=$((_n + 1))
+  done
+  [ -e "$WORK/reap-a.tried" ] && [ -e "$WORK/reap-b.tried" ] || bad="$bad reap-contenders-never-attempted"
+  : >"$WORK/reap-go"
+  wait "$_rp_a" || true
+  wait "$_rp_b" || true
+  _wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
+  [ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins(round-$_round)"
+done
+unset -f _reap_contender
 rm -rf "$_cp"
 ( P4B_CLAIM_DIR=/dev/null/nope p4b_barrier_claim "$(P4B_CLAIM_DIR=/dev/null/nope p4b_barrier_claim_path o/r 1 h trigger)" ) \
   && bad="$bad unusable-dir-claimed"
