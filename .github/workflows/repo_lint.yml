@@ -17,12 +17,15 @@
 #     backing script is absent (the #590-style
 #     `[ -f scripts/<gate>.sh ] || exit 0` one-liner).
 #   - EVERY check step in `lint_fast` is pinned to exactly ONE shard with
-#     `if: matrix.shard == N` (#2163). The fast lane is a 4-leg matrix
-#     balanced by measured step time; a step with no pin runs on every
+#     `if: matrix.shard == N` (#2163). The fast lane is a 5-leg matrix
+#     balanced by measured step time, plus hub-only shards 6-8 (#2990)
+#     that hold only hub-only checks; a step with no pin runs on every
 #     shard (wasted minutes, not a missed assertion), and a pin naming a
 #     shard outside the matrix never runs anywhere — which is why
 #     tests/test_repo_lint_optimization.sh asserts both. Put a new check
-#     on the shard with the smallest measured sum (see the job comment).
+#     on the shard 1-5 with the smallest measured sum (see the job
+#     comment) for a check consumers run; a hub-only check may also go on
+#     shards 6-8, which consumers do not run.
 #   - EVERY `run: ./scripts/ci/check_X` step carries the #590 missing-file
 #     soft-pass tail (#979), without exception:
 #
@@ -78,11 +81,32 @@ jobs:
       consumer_replay: ${{ steps.classify.outputs.consumer_replay }}
       self_tests: ${{ steps.classify.outputs.self_tests }}
       tooling: ${{ steps.tooling.outputs.tooling }}
+      fast_shards: ${{ steps.shards.outputs.fast_shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # #2990: lint_fast's shard list. Every repository runs shards 1-5; the
+      # hub adds shards 6-8, which hold only hub-only checks (the pre-push
+      # mirror's suites and the fleet tooling suites), so a consumer starts no
+      # runner that would only run setup. The hub is identified the way the
+      # hub-only checks identify it, by scripts/sync-to-downstream.sh, so the
+      # extra shards exist exactly where their checks do more than SKIP. The
+      # `lint` aggregator accepts only these two lists; anything else,
+      # including an empty output, fails it.
+      - name: lint-fast shards
+        id: shards
+        run: |
+          set -euo pipefail
+          if [ -f scripts/sync-to-downstream.sh ]; then
+            shards='[1,2,3,4,5,6,7,8]'
+          else
+            shards='[1,2,3,4,5]'
+          fi
+          echo "fast_shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "repo-lint fast shards: $shards"
 
       # #2926: `--no-renames` lists a moved file's source as well as its
       # destination, so a tooling file moved out of a tooling path still
@@ -187,6 +211,21 @@ jobs:
     # shard closes with `--verify`, the Parts A/B re-assertion that proves
     # that shard's suites left .git/config alone (#777).
     #
+    # Shards 1-5 and hub-only shards 6-8 (#2990): the scope job's `lint-fast
+    # shards` step writes the matrix list, [1,2,3,4,5] on a consumer and
+    # [1,2,3,4,5,6,7,8] on the hub. Shard 6 holds check_repo_lint_prepush
+    # (~255 s) and shards 7 and 8 the hub's other hub-only suites; consumers
+    # spend nothing on them.
+    # Only hub-only checks may be pinned to them
+    # (tests/test_repo_lint_optimization.sh runs each one on a
+    # consumer-shaped tree and requires its SKIP), so consumer coverage is
+    # the five shards' and no consumer starts a setup-only runner. Shards 1-5
+    # hold every shared check, so their sum is the floor: the CPU-bound
+    # suites are pooled (tests/lib/case-pool.sh) and check_codex_scripts is
+    # split with check_codex_review_request, and the pins were laid out
+    # longest-first on runs 42158277320 and 42158271803's step times (the
+    # MERGEPATH_TEST_TIMINGS lines name each pooled step's slowest suites).
+    #
     # No `concurrency:` here: the workflow-level group already cancels a
     # superseded PR head, and a job-level group on a required-gate input
     # cancels a PENDING leg of the same head (memory: never add one).
@@ -204,12 +243,20 @@ jobs:
     # otherwise hold the required `lint` context open for the 6 h runner
     # default. The slowest leg measured ~5 min of check time.
     timeout-minutes: 30
+    # The case pool prints each wrapper's slowest suites to stderr when this is
+    # set (tests/lib/case-pool.sh), so a leg's log names the suite that sets
+    # its step time when the pins next need re-balancing (#2990). Diagnostic
+    # output only: no check reads it.
+    env:
+      MERGEPATH_TEST_TIMINGS: '1'
     strategy:
       # Every leg reports; a failing shard must not cancel its siblings'
       # evidence, and the aggregator fails on any non-success leg anyway.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # [1,2,3,4,5] on a consumer, [1,2,3,4,5,6,7,8] on the hub (the scope
+        # job's `lint-fast shards` step). Shards 6-8 carry only hub-only checks.
+        shard: ${{ fromJSON(needs.scope.outputs.fast_shards) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -257,14 +304,15 @@ jobs:
           TOOLING: ${{ needs.scope.outputs.tooling }}
           SHARD: ${{ matrix.shard }}
           TOOLING_ONLY_CHECKS: >-
+            1:check_coderabbit_severity_gate
             1:check_codex_scripts
-            1:check_op_preflight_contract
-            2:check_gh_as_author
-            2:check_coderabbit_severity_gate
-            2:check_stalled_pr_resume
-            3:check_review_feedback_accounting
-            3:check_resolve_pr_threads
-            4:check_codex_p1_gate
+            2:check_resolve_pr_threads
+            2:check_review_feedback_accounting
+            3:check_codex_review_request
+            3:check_op_preflight_contract
+            4:check_stalled_pr_resume
+            5:check_codex_p1_gate
+            5:check_gh_as_author
         run: |
           set -euo pipefail
           if [ "$TOOLING" != "false" ]; then
@@ -457,31 +505,31 @@ jobs:
         run: ./scripts/ci/check_bootstrap_sh || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_sh ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_bootstrap_sh not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_wizard
-        if: matrix.shard == 4
+        if: matrix.shard == 8
         # Sub-A: top-level bootstrap wizard scaffolding + flow.
         run: ./scripts/ci/check_bootstrap_wizard || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_wizard ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_bootstrap_wizard not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_template_mirror
-        if: matrix.shard == 1
+        if: matrix.shard == 8
         # Sub-B: template-mirror bootstrap that seeds a downstream
         # repo with the canonical mergepath template files.
         run: ./scripts/ci/check_bootstrap_template_mirror || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_template_mirror ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_bootstrap_template_mirror not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_github_infra
-        if: matrix.shard == 4
+        if: matrix.shard == 8
         # Sub-C: GitHub infrastructure bootstrap (labels, branch
         # protection, required workflows) for a fresh consumer repo.
         run: ./scripts/ci/check_bootstrap_github_infra || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_github_infra ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_bootstrap_github_infra not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_firebase_and_codereview
-        if: matrix.shard == 3
+        if: matrix.shard == 7
         # Sub-D: Firebase + code-review configuration bootstrap.
         # Validates the wizard correctly disables CodeRabbit for
         # private consumer repos (free tier is public-only).
         run: ./scripts/ci/check_bootstrap_firebase_and_codereview || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_firebase_and_codereview ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_bootstrap_firebase_and_codereview not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_board_and_summary
-        if: matrix.shard == 3
+        if: matrix.shard == 8
         # Sub-E: Project board + bootstrap-summary generation.
         # Ensures the wizard's end-state artifacts stay in sync with
         # the canonical templates.
@@ -514,8 +562,15 @@ jobs:
         if: matrix.shard == 1 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_codex_scripts || { rc=$?; if [ ! -f scripts/ci/check_codex_scripts ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_codex_scripts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
-      - name: check_review_feedback_accounting
+      # The other half of check_codex_scripts' suites (#2990): the
+      # entry-decision, --trigger-only and ledger suites, on another shard so
+      # neither half's CPU-bound fixture runs exceed one leg's budget.
+      - name: check_codex_review_request
         if: matrix.shard == 3 && needs.scope.outputs.tooling != 'false'
+        run: ./scripts/ci/check_codex_review_request || { rc=$?; if [ ! -f scripts/ci/check_codex_review_request ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_codex_review_request not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_review_feedback_accounting
+        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_review_feedback_accounting || { rc=$?; if [ ! -f scripts/ci/check_review_feedback_accounting ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_review_feedback_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_daily_feedback_rollup
@@ -529,7 +584,7 @@ jobs:
         run: ./scripts/ci/check_daily_feedback_rollup || { rc=$?; if [ ! -f scripts/ci/check_daily_feedback_rollup ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_daily_feedback_rollup not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_canonical_bugs_263caf3
-        if: matrix.shard == 2
+        if: matrix.shard == 3
         # Regression coverage for nathanpayne-codex findings on the
         # 263caf3 propagation wave and follow-up review-policy bugs:
         #   - request-label-removal.sh set -e abort in no-`--repo` path
@@ -541,11 +596,11 @@ jobs:
         run: ./scripts/ci/check_canonical_bugs_263caf3 || { rc=$?; if [ ! -f scripts/ci/check_canonical_bugs_263caf3 ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_canonical_bugs_263caf3 not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_workflow_parsers
-        if: matrix.shard == 2
+        if: matrix.shard == 4
         run: ./scripts/ci/check_workflow_parsers || { rc=$?; if [ ! -f scripts/ci/check_workflow_parsers ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_workflow_parsers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_merge_group_required_checks
-        if: matrix.shard == 2
+        if: matrix.shard == 8
         run: ./scripts/ci/check_merge_group_required_checks || { rc=$?; if [ ! -f scripts/ci/check_merge_group_required_checks ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_merge_group_required_checks not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_session_finalization
@@ -630,11 +685,11 @@ jobs:
         run: ./scripts/ci/check_phase_4b_classifier || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_classifier ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_classifier not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation
-        if: matrix.shard == 4
+        if: matrix.shard == 3
         run: ./scripts/ci/check_phase_4b_automation --check || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_accounting
-        if: matrix.shard == 1
+        if: matrix.shard == 2
         # Phase 4b approval-loop accounting (#602), wired like
         # check_phase_4b_automation above. Self-bootstrap guard (#590
         # class): repo_lint.yml reaches consumers via the template mirror
@@ -651,11 +706,11 @@ jobs:
         run: ./scripts/ci/check_lint_tooling || { rc=$?; if [ ! -f scripts/ci/check_lint_tooling ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_lint_tooling not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_codex_p1_gate
-        if: matrix.shard == 4 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 5 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_codex_p1_gate || { rc=$?; if [ ! -f scripts/ci/check_codex_p1_gate ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_codex_p1_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_wave_audit
-        if: matrix.shard == 1
+        if: matrix.shard == 7
         # Hub-only wave-audit regression suite (#662/#663): watermark/tag
         # rules, curated-diff scope (incl. newly-manifested paths), canary
         # lane precondition, config fail-closed validation. Consumer
@@ -663,7 +718,7 @@ jobs:
         run: ./scripts/ci/check_wave_audit || { rc=$?; if [ ! -f scripts/ci/check_wave_audit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_wave_audit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_external_review_helpers
-        if: matrix.shard == 1
+        if: matrix.shard == 8
         # Hub-only regression suite for the external-review helpers
         # (#715/#716 gh stdout-stderr separation, #718 current-head short
         # circuit). These helpers gate whether external review is required
@@ -674,7 +729,7 @@ jobs:
         run: ./scripts/ci/check_external_review_helpers || { rc=$?; if [ ! -f scripts/ci/check_external_review_helpers ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_external_review_helpers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_severity_gate
-        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 1 && needs.scope.outputs.tooling != 'false'
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
         # scripts/coderabbit-severity-gate.sh +
         # .github/workflows/coderabbit-severity-gate.yml +
@@ -752,7 +807,7 @@ jobs:
         run: ./scripts/ci/check_sync_labels || { rc=$?; if [ ! -f scripts/ci/check_sync_labels ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sync_labels not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_repo_lint_optimization
-        if: matrix.shard == 2
+        if: matrix.shard == 8
         # The delegated test parses workflow YAML with mikefarah/yq.
         run: ./scripts/ci/check_repo_lint_optimization || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_optimization ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_optimization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
@@ -764,16 +819,18 @@ jobs:
       # the scope job and the if: expressions here select; its suite
       # evaluates them, so it reads this file and needs yq. The mirror
       # propagates to consumers (#2844), but its suites are hub-only, so the
-      # wrapper SKIPs there.
+      # wrapper SKIPs there. It is the largest check on hub-only shard 5
+      # (#2990): at ~260 s it would set any shard's critical path it shared,
+      # and a consumer, which has no shard 5, loses nothing but a SKIP line.
       - name: check_repo_lint_prepush
-        if: matrix.shard == 2
+        if: matrix.shard == 6
         run: ./scripts/ci/check_repo_lint_prepush || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # The mirror's fleet adoption (#2844): its manifest entries, the
       # rendered consumer policies, and the runner on a consumer-shaped
       # checkout. Reads the hub-only manifest, so it SKIPs on consumers.
       - name: check_repo_lint_prepush_fleet
-        if: matrix.shard == 4
+        if: matrix.shard == 7
         run: ./scripts/ci/check_repo_lint_prepush_fleet || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush_fleet ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush_fleet not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Hermetic suite for the stalled-PR finder + resume entry point
@@ -781,7 +838,7 @@ jobs:
       # Both travel with the scripts/workflow/ kit, so the suite runs on
       # every consumer too; it is fixture-driven with a PATH-shimmed gh.
       - name: check_stalled_pr_resume
-        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 4 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # GitHub blocks pull_request_target in public repositories from
@@ -798,7 +855,7 @@ jobs:
       # one open PR at the run's head, a live PR still at that head on the
       # default branch). Hermetic; travels to every consumer with the kit.
       - name: check_trusted_consumer_admission
-        if: matrix.shard == 3
+        if: matrix.shard == 2
         run: ./scripts/ci/check_trusted_consumer_admission || { rc=$?; if [ ! -f scripts/ci/check_trusted_consumer_admission ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_trusted_consumer_admission not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # #2727 slice 3c: trusted-policy-mutations.yml (C6/C7) and its helpers.
@@ -808,14 +865,14 @@ jobs:
         run: ./scripts/ci/check_policy_mutations || { rc=$?; if [ ! -f scripts/ci/check_policy_mutations ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_policy_mutations not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_resolve_pr_threads
-        if: matrix.shard == 3 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
         # Requires yq via the delegated verified-propagation suite —
         # runs after install_yq_for_sync_manifest above (Codex P2 on
         # #616, finding 3509567286).
         run: ./scripts/ci/check_resolve_pr_threads || { rc=$?; if [ ! -f scripts/ci/check_resolve_pr_threads ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_resolve_pr_threads not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_gh_as_author
-        if: matrix.shard == 2 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 5 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_gh_as_author || { rc=$?; if [ ! -f scripts/ci/check_gh_as_author ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_as_author not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_bare_gh_writes
@@ -882,7 +939,7 @@ jobs:
         run: ./scripts/ci/check_no_token_in_output --scan || { rc=$?; if [ -f scripts/ci/check_no_token_in_output ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/token_output_gate.py ]; then echo "check_no_token_in_output is absent while its gate payload scripts/ci/token_output_gate.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_op_preflight_contract
-        if: matrix.shard == 1 && needs.scope.outputs.tooling != 'false'
+        if: matrix.shard == 3 && needs.scope.outputs.tooling != 'false'
         run: ./scripts/ci/check_op_preflight_contract || { rc=$?; if [ ! -f scripts/ci/check_op_preflight_contract ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_op_preflight_contract not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # scripts/pr-assets-upload.sh (#2938): hermetic suite against a local
@@ -977,11 +1034,11 @@ jobs:
         run: ./scripts/ci/check_dependabot_coupled_groups --check || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow
-        if: matrix.shard == 2
+        if: matrix.shard == 4
         run: ./scripts/ci/check_auto_clear_workflow --check || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_audit_codex_clearance
-        if: matrix.shard == 3
+        if: matrix.shard == 4
         run: ./scripts/ci/check_pr_audit_codex_clearance || { rc=$?; if [ ! -f scripts/ci/check_pr_audit_codex_clearance ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_audit_codex_clearance not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_audit_sync_exemption
@@ -997,7 +1054,7 @@ jobs:
         run: ./scripts/ci/check_pr_review_policy_nudge --check || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sweep_unresolved_feedback
-        if: matrix.shard == 1
+        if: matrix.shard == 7
         run: ./scripts/ci/check_sweep_unresolved_feedback || { rc=$?; if [ ! -f scripts/ci/check_sweep_unresolved_feedback ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sweep_unresolved_feedback not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_disagreement_detector
@@ -1029,7 +1086,7 @@ jobs:
         run: ./scripts/ci/check_ci_app_trust || { rc=$?; if [ -f scripts/ci/check_ci_app_trust ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_ci_app_trust is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/ci_app_trust.py ]; then echo "check_ci_app_trust is absent while its gate payload scripts/ci/ci_app_trust.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_ci_app_trust not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_self_approval_detector
-        if: matrix.shard == 4
+        if: matrix.shard == 5
         run: ./scripts/ci/check_self_approval_detector || { rc=$?; if [ ! -f scripts/ci/check_self_approval_detector ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_self_approval_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_agent_review_triage_defers
@@ -1041,7 +1098,7 @@ jobs:
         run: ./scripts/ci/check_cockpit --check || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_manifest
-        if: matrix.shard == 2
+        if: matrix.shard == 8
         # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
         # which now runs earlier (before check_resolve_pr_threads, the
         # first yq-dependent step; see that step for the pin rationale).
@@ -1071,7 +1128,7 @@ jobs:
         run: ./scripts/ci/check_doc_ownership --check || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_branch_protection_audit
-        if: matrix.shard == 1
+        if: matrix.shard == 7
         # Hub-only fleet branch-protection audit suite (#774): the
         # --fleet loop in scripts/audit-branch-protection.sh plus the
         # scheduled .github/workflows/branch-protection-audit.yml that
@@ -1089,7 +1146,7 @@ jobs:
         run: ./scripts/ci/check_branch_protection_audit || { rc=$?; if [ ! -f scripts/ci/check_branch_protection_audit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_branch_protection_audit not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
 
       - name: check_project_doc_sync
-        if: matrix.shard == 4
+        if: matrix.shard == 7
         # Hub-only project-doc-sync regression suite (#642): PRD/spec
         # mirror drift detection, orphan sweeps, manifest validation, and
         # cache-safety guards for scripts/project-doc-sync.sh. Consumer
@@ -1104,7 +1161,7 @@ jobs:
         run: ./scripts/ci/check_project_doc_sync || { rc=$?; if [ ! -f scripts/ci/check_project_doc_sync ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_project_doc_sync not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_overrides
-        if: matrix.shard == 1
+        if: matrix.shard == 8
         # Exercises tests/test_sync_overrides.sh — verifies the
         # per-consumer sync override semantics (#200) so a downstream
         # repo can opt files out of the propagation lane without the
@@ -1112,7 +1169,7 @@ jobs:
         run: ./scripts/ci/check_sync_overrides || { rc=$?; if [ ! -f scripts/ci/check_sync_overrides ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sync_overrides not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_to_downstream
-        if: matrix.shard == 3
+        if: matrix.shard == 7
         # Exercises tests/test_sync_to_downstream.sh — the propagation
         # engine suite that structurally guards scripts/sync-to-downstream.sh:
         # the executable-bit mode-mirror chmod branches (#217), mktemp
@@ -1123,7 +1180,7 @@ jobs:
         run: ./scripts/ci/check_sync_to_downstream || { rc=$?; if [ ! -f scripts/ci/check_sync_to_downstream ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_sync_to_downstream not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_template_substitution
-        if: matrix.shard == 3
+        if: matrix.shard == 4
         # Exercises tests/test_template_substitution.sh — verifies the
         # Layer 5 template-substitution lib's v1 syntax (variable
         # substitution, conditional blocks, comment-prefix flexibility,
@@ -1515,6 +1572,11 @@ jobs:
           CONSUMER_REPLAY: ${{ needs.scope.outputs.consumer_replay }}
           SELF_TESTS: ${{ needs.scope.outputs.self_tests }}
           SCOPE_RESULT: ${{ needs.scope.result }}
+          # The shard list lint_fast expanded (#2990). The rolled-up result
+          # below says nothing about how many legs ran, so a list that
+          # dropped a shard would pass with that shard's checks unrun: only
+          # the consumer and hub lists the scope step can write are accepted.
+          FAST_SHARDS: ${{ needs.scope.outputs.fast_shards }}
           # lint_fast is a shard matrix (#2163): this is the ROLLED-UP job
           # result — `success` only when every leg succeeded; `failure` or
           # `cancelled` when any leg did; `skipped` can only mean the job
@@ -1529,6 +1591,13 @@ jobs:
             echo "FAIL: scope=$SCOPE_RESULT lint-fast=$FAST_RESULT" >&2
             exit 1
           fi
+          case "$FAST_SHARDS" in
+            '[1,2,3,4,5]' | '[1,2,3,4,5,6,7,8]') ;;
+            *)
+              echo "FAIL: lint-fast ran an unexpected shard list: '$FAST_SHARDS'" >&2
+              exit 1
+              ;;
+          esac
           # Each deep job is read against the scope decision that selected
           # it: a selected job must have succeeded (failure, cancellation and
           # an unexpected skip all fail), and an unselected job must have been

@@ -19,7 +19,7 @@
 # the same change, by evaluating every job and step `if:` expression in the
 # workflow independently and comparing step sets.
 #
-# What runs. Every `lint_fast` check step (all four shards' pins) falls in
+# What runs. Every `lint_fast` check step (every shard's pins) falls in
 # one of the first three lanes below, by its wrapper; `deep` is the rest:
 #   live       - steps whose wrapper is NOT in the dependency graph's
 #                `wrappers` map, and inline steps: the cheap repository

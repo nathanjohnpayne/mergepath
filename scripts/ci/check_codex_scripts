@@ -69,6 +69,9 @@ fi
 # Every suite below is one pool case (#2990): they share no state, so the pool
 # runs them side by side and replays their output in this order. A failing or
 # missing suite adds to FAIL. The long codex-review-request suites start first.
+# The entry-decision, --trigger-only and ledger suites run in
+# check_codex_review_request, pinned to another lint-fast shard: together the
+# suites are CPU-bound past one leg's budget (#2990).
 PASS=0
 FAIL=0
 # shellcheck disable=SC2329 # invoked through the SUITES entries
@@ -115,10 +118,7 @@ run_g1219() {
 
 SUITES=(
   "--first run_suite 'codex-review-request ack tests' tests/test_codex_review_request_ack.sh"
-  "--first run_suite 'codex-review-request --trigger-only tests (#489)' tests/test_codex_review_request_trigger_only.sh"
-  "--first run_suite 'codex-review-request Phase 4a entry-decision tests' tests/test_codex_review_request_entry.sh"
   "--first run_suite 'blocked request evidence tests (#1276)' tests/test_codex_request_evidence.sh"
-  "--first run_suite 'Codex review ledger tests (#1560)' tests/test_codex_review_ledger.sh"
   "run_suite 'codex-review-request verdict-comment clearance tests (#609)' tests/test_codex_verdict_anchor_resolution.py tests/test_codex_review_request_verdict.sh"
   "run_suite 'codex-review-request write-token / keyring-fallback tests (#737)' tests/test_codex_review_request_token_fallback.sh"
   "run_suite 'codex-review-check gate (c) resolution tests' tests/test_codex_review_check_resolution.sh"

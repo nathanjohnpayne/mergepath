@@ -54,8 +54,37 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
-bash "$TEST"
-bash "$HANDOFF_TEST"
-python3 "$MARKER_TEST"
+# The four suites share no state, so they run as case-pool cases side by side
+# and replay their output in this order (#2990); the accounting suite starts
+# first because it sets the step's wall time. A failing suite adds to FAIL and
+# the check fails after all four report. A checkout behind the wave that
+# delivers the pool runs them one after another.
+# shellcheck disable=SC2034 # case_pool_wait adds each suite's passes here
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through case_pool_add / the serial loop
+run_suite() { # <interpreter> <path>
+  if ! "$1" "$2"; then
+    echo "check_review_feedback_accounting: FAIL (${2#"$REPO_ROOT/"})" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source "$REPO_ROOT/tests/lib/case-pool.sh"
+  case_pool_add run_suite bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
+  case_pool_add --first run_suite bash "$TEST"
+  case_pool_add run_suite bash "$HANDOFF_TEST"
+  case_pool_add run_suite python3 "$MARKER_TEST"
+  case_pool_wait
+else
+  run_suite bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
+  run_suite bash "$TEST"
+  run_suite bash "$HANDOFF_TEST"
+  run_suite python3 "$MARKER_TEST"
+fi
+if [ "$FAIL" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL ($FAIL suite(s))"
+  exit 1
+fi
 echo "check_review_feedback_accounting: PASS"

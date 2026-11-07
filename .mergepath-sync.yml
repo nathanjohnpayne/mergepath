@@ -1325,6 +1325,7 @@ paths:
     consumers: all
     requires:
       - "tests/test_merge_writer.py"
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's sections concurrently
   - path: tests/test_merge_writer.py
     type: canonical
     consumers: all
@@ -1452,6 +1453,8 @@ paths:
   - path: tests/test_git_identity_hygiene.sh
     type: canonical
     consumers: all
+    requires:
+      - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's cases concurrently
   # Pairs with scripts/identity-check.sh (#284). The helper is called
   # from the top of every WRITE-path helper script; the test exercises
   # all four assert modes against `gh config get` shims plus an
@@ -1707,7 +1710,8 @@ paths:
       - "scripts/lib/gh-retry-helpers.sh"         # #1550, staged into fixtures; transient-read classifier
   # #489 CodeRabbit-rate-limit Codex-failover trigger-only path of
   # codex-review-request.sh (posts `@codex review` when CodeRabbit is rate-
-  # limited). check_codex_scripts hard-runs it (same `No such file` exit-127
+  # limited). check_codex_review_request (split from check_codex_scripts,
+  # #2990) hard-runs it (same `No such file` exit-127
   # closure class as the ack suite above), so it must travel to every consumer.
   # Undeclared by #489; surfaced by the swipewatch canary on the 2120dec wave.
   - path: tests/test_codex_review_request_trigger_only.sh
@@ -1717,8 +1721,9 @@ paths:
       - "tests/lib/case-pool.sh"            # #2990, sourced: runs the suite's cases concurrently
   # Phase 4a entry-decision regression (#486): codex.request_by_default +
   # codex.enabled gating of whether `@codex review` is posted at all.
-  # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
-  # class as the ack suite above), so it must travel to every consumer.
+  # check_codex_review_request (split from check_codex_scripts, #2990)
+  # hard-runs it (same `No such file` exit-127 coupling class as the ack suite
+  # above), so it must travel to every consumer.
   - path: tests/test_codex_review_request_entry.sh
     type: canonical
     consumers: all
@@ -2988,8 +2993,8 @@ paths:
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/lib/case-pool.sh"  # check_codex_scripts (#2990), sourced by the three codex-review-request suites
       - "tests/test_case_pool.sh"  # check_codex_scripts (#2990)
-      - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
-      - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
+      - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_review_request (#489; split from check_codex_scripts, #2990)
+      - "tests/test_codex_review_request_entry.sh"  # check_codex_review_request (#486; split from check_codex_scripts, #2990)
       - "tests/test_codex_verdict_anchor_resolution.py" # check_codex_scripts (#1752)
       - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)

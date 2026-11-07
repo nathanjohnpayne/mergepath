@@ -568,6 +568,7 @@ echo "test_repo_lint_consumer_safety: running $WIRED_COUNT wired checks against 
 REPLAY_HEAVY=(
   check_codex_scripts               # 164s
   check_gh_as_author                # 144s
+  check_codex_review_request        # split from check_codex_scripts (#2990)
   check_review_feedback_accounting  # 107s
   check_codex_p1_gate               #  85s
   check_git_identity_hygiene        #  49s

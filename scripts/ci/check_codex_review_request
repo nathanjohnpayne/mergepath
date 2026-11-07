@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# check_codex_review_request
+#
+# Runs the codex-review-request.sh entry-decision, --trigger-only (#489) and
+# review-ledger (#1560) suites. They were the second half of
+# check_codex_scripts until #2990 split that check in two: its suites are
+# CPU-bound fixture runs that no single 4-vCPU lint-fast leg could finish in
+# the per-shard budget, so each half is pinned to its own shard.
+# check_codex_scripts keeps the helper presence checks, the case-pool
+# self-test, the ack and blocked-evidence suites and the small suites.
+#
+# Hard-fails (exit 1, not skip) when a suite is missing, so a delete or
+# rename cannot silently drop it.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+if [[ ! -x "$REPO_ROOT/scripts/codex-review-request.sh" ]]; then
+  echo "check_codex_review_request: FAIL (scripts/codex-review-request.sh is missing or not executable)"
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_codex_review_request: ERROR (jq is required — the wrapped suites would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+if [ ! -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  echo "check_codex_review_request: ERROR (missing tests/lib/case-pool.sh)" >&2
+  exit 1
+fi
+
+# Every suite is one pool case: they share no state, so the pool runs them
+# side by side and replays their output in this order. A failing or missing
+# suite adds to FAIL.
+# shellcheck disable=SC2034 # case_pool_wait adds each suite's passes here
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through case_pool_add
+run_suite() { # <label> <rel>
+  echo "check_codex_review_request: running $1"
+  if [ ! -f "$REPO_ROOT/$2" ]; then
+    echo "check_codex_review_request: ERROR (missing $2)" >&2
+    FAIL=$((FAIL + 1))
+    return 0
+  fi
+  "$REPO_ROOT/$2" || { echo "check_codex_review_request: FAIL ($2)" >&2; FAIL=$((FAIL + 1)); }
+}
+
+# shellcheck source=tests/lib/case-pool.sh
+source "$REPO_ROOT/tests/lib/case-pool.sh"
+case_pool_add --first run_suite 'codex-review-request --trigger-only tests (#489)' tests/test_codex_review_request_trigger_only.sh
+case_pool_add --first run_suite 'codex-review-request Phase 4a entry-decision tests' tests/test_codex_review_request_entry.sh
+case_pool_add run_suite 'Codex review ledger tests (#1560)' tests/test_codex_review_ledger.sh
+case_pool_wait
+
+if [ "$FAIL" -ne 0 ]; then
+  echo "check_codex_review_request: FAIL ($FAIL suite(s))"
+  exit 1
+fi
+
+echo "check_codex_review_request: PASS"
+exit 0

@@ -40,8 +40,38 @@ for t in "$TEST_SCRIPT" "$POLICY_TEST" "$DEFER_TEST" "$LOAD_TEST"; do
   fi
 done
 
-bash "$TEST_SCRIPT"
-bash "$POLICY_TEST"
-bash "$DEFER_TEST"
-bash "$LOAD_TEST"
+# Two lanes at once (#2990): the main suite in one, the policy, defer and
+# load suites back to back in the other. Their time is mostly real waiting
+# (slow probes, lock graces, the 5-second load re-read; the hangs and the
+# budget's minute became handshakes and a fixture clock), so overlapping
+# them shortens the step without changing what any case waits for. What they observe is unchanged too: each suite keeps
+# its own fixtures, XDG_CACHE_HOME (so its own machine lock) and probe
+# directory; the second lane's suites read the host load only from a fake
+# sysctl they put on PATH, so the first lane's load cannot reach them; and
+# the main suite's verdict holds at any host load (its load-sized cases use
+# their own fake sysctl, and every other case passes at jobs=1 and jobs=2,
+# which a constant high, a constant low and a flapping fake load all show).
+# REPO_LINT_PREPUSH_SERIAL=1 runs the four one after another, as before.
+if [ "${REPO_LINT_PREPUSH_SERIAL:-}" = 1 ]; then
+  bash "$TEST_SCRIPT"
+  bash "$POLICY_TEST"
+  bash "$DEFER_TEST"
+  bash "$LOAD_TEST"
+  echo "check_repo_lint_prepush: PASS"
+  exit 0
+fi
+LANES=$(mktemp -d "${TMPDIR:-/tmp}/check_repo_lint_prepush.XXXXXX")
+trap 'rm -rf "$LANES"' EXIT
+bash "$TEST_SCRIPT" > "$LANES/main.out" 2>&1 &
+main_pid=$!
+side_rc=0
+{ bash "$POLICY_TEST" && bash "$DEFER_TEST" && bash "$LOAD_TEST"; } > "$LANES/side.out" 2>&1 || side_rc=$?
+main_rc=0
+wait "$main_pid" || main_rc=$?
+# Replay in the serial order, so the log reads as it always has.
+cat "$LANES/main.out" "$LANES/side.out"
+if [ "$main_rc" -ne 0 ] || [ "$side_rc" -ne 0 ]; then
+  echo "check_repo_lint_prepush: FAIL (main suite exit $main_rc; policy/defer/load lane exit $side_rc)" >&2
+  exit 1
+fi
 echo "check_repo_lint_prepush: PASS"

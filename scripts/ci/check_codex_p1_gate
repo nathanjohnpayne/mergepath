@@ -699,21 +699,45 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-# Run the fixture-driven test suite.
-if ! bash "$TEST"; then
-  echo "check_codex_p1_gate: FAIL (test suite)"
-  exit 1
+# The four fixture-driven suites share no state, so they run as case-pool
+# cases side by side and replay their output in this order (#2990). A failing
+# or missing suite adds to FAIL and the check fails after all four report. A
+# checkout behind the wave that delivers the pool runs them one after another.
+# shellcheck disable=SC2034 # case_pool_wait adds each suite's passes here
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through case_pool_add / the serial loop
+run_suite() { # <rel> <label>
+  if [ ! -f "$1" ]; then
+    echo "check_codex_p1_gate: FAIL (missing $1)" >&2
+    FAIL=$((FAIL + 1))
+    return 0
+  fi
+  if ! bash "$1"; then
+    echo "check_codex_p1_gate: FAIL ($2)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+SUITES=(
+  "$TEST|test suite"
+  "$RELAY_TEST|relay source binding suite"
+  "$WORKFLOW_RUNTIME_TEST|workflow runtime suite"
+  "$PENDING_TEST|pending verdict suite, #2618"
+)
+if [ -f tests/lib/case-pool.sh ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source tests/lib/case-pool.sh
+  for suite in "${SUITES[@]}"; do
+    case_pool_add run_suite "${suite%%|*}" "${suite#*|}"
+  done
+  case_pool_wait
+else
+  for suite in "${SUITES[@]}"; do
+    run_suite "${suite%%|*}" "${suite#*|}"
+  done
 fi
-if ! bash "$RELAY_TEST"; then
-  echo "check_codex_p1_gate: FAIL (relay source binding suite)"
-  exit 1
-fi
-if ! bash "$WORKFLOW_RUNTIME_TEST"; then
-  echo "check_codex_p1_gate: FAIL (workflow runtime suite)"
-  exit 1
-fi
-if ! bash "$PENDING_TEST"; then
-  echo "check_codex_p1_gate: FAIL (pending verdict suite, #2618)"
+if [ "$FAIL" -ne 0 ]; then
+  echo "check_codex_p1_gate: FAIL ($FAIL suite(s))"
   exit 1
 fi
 

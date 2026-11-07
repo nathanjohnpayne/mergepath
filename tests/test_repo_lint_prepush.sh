@@ -134,7 +134,7 @@ def coerce_eq(a, b):
     if isinstance(a, str) and isinstance(b, str): return a.lower() == b.lower()
     return a == b
 
-def evaluate(src, matrix):
+def evaluate(src, matrix, raw=False):
     toks, i = tokenize(src), [0]
     def peek(): return toks[i[0]] if i[0] < len(toks) else (None, None)
     def take(kind=None, val=None):
@@ -186,7 +186,7 @@ def evaluate(src, matrix):
         raise SystemExit("ci_eval: unexpected token %r in %r" % (t, src))
     v = expr_or()
     if i[0] != len(toks): raise SystemExit("ci_eval: trailing tokens in %r" % src)
-    return truthy(v)
+    return v if raw else truthy(v)
 
 def strip(cond):
     cond = cond.strip()
@@ -194,7 +194,12 @@ def strip(cond):
     return m.group(1) if m else cond
 
 for job_id, job in jobs.items():
-    matrix = (job.get("strategy") or {}).get("matrix") or {}
+    matrix = dict((job.get("strategy") or {}).get("matrix") or {})
+    # A matrix value may be an expression that yields the list (#2990: the
+    # lint_fast shards come from the scope job); it is evaluated like an if:.
+    for k, v in matrix.items():
+        if isinstance(v, str) and re.fullmatch(r"\$\{\{.*\}\}", v.strip(), re.S):
+            matrix[k] = evaluate(strip(v), {}, raw=True)
     if any(k in matrix for k in ("include", "exclude")) or any(not isinstance(v, list) for v in matrix.values()):
         raise SystemExit("ci_eval: unsupported matrix shape in " + job_id)
     keys = sorted(matrix)
@@ -256,6 +261,15 @@ if ! grep -q 'repo-lint-tooling-scope.sh' "$TMP/ci_tooling.sh"; then
   echo "test_repo_lint_prepush: FAIL (could not extract the CI tooling step)" >&2
   exit 1
 fi
+
+# #2990: lint_fast's matrix is the scope job's fast_shards output, so the
+# evaluator needs it too. The fixture carries the hub marker, so CI's step
+# answers the hub's list, shards 6 to 8 included; the hook runs every shard's pins.
+yq '.jobs.scope.steps[] | select(.id == "shards") | .run' \
+  "$HUB/.github/workflows/repo_lint.yml" > "$TMP/ci_shards.sh"
+: > "$TMP/ci_shards"
+(cd "$HUB" && GITHUB_OUTPUT="$TMP/ci_shards" bash -e "$TMP/ci_shards.sh") > /dev/null
+check "CI's shards step answers the hub's list on the hub fixture" "$(cat "$TMP/ci_shards")" "fast_shards=[1,2,3,4,5,6,7,8]"
 
 # id | branch | ;-separated changed paths | ;-separated undeclared paths
 CASES='docs|feat/docs|README.md;docs/guide.md|
@@ -366,6 +380,8 @@ while IFS='|' read -r id branch paths undeclared; do
   check "[$id] CI's tooling step runs the full set on this fixture" "$(cat "$TMP/ci_tooling.$id")" "tooling=true"
   cat "$TMP/ci_tooling.$id" >> "$TMP/ci_scope.$id"
   cat "$TMP/ci_tooling.$id" >> "$TMP/ci_local_scope.$id"
+  cat "$TMP/ci_shards" >> "$TMP/ci_scope.$id"
+  cat "$TMP/ci_shards" >> "$TMP/ci_local_scope.$id"
 
   # (a) Coverage: every check step CI executes is in exactly the hook's plan
   # (any lane, the undeclared-path fallback lanes included), nothing more.
@@ -519,8 +535,21 @@ echo "${REPO_LINT_FULL:-unset} ${REPO_LINT_CHECKS_JSON:-unset} ${REPO_LINT_SHARD
 printf '%s\n' "$1" >> "$out/start-order"
 touch "$out/ran.$1"
 if [ -f "$out/slow.$1" ]; then sleep 3; fi
-if [ -f "$out/hang.$1" ]; then touch "$out/hanging.$1"; sleep 120; touch "$out/unhung.$1"; fi
-sleep 1
+# Bounded handshakes (#2990) instead of fixed sleeps: a check whose start
+# ordinal has a gate.<n> file, or that is named by a hang.<check> file,
+# blocks until the suite writes release.<n> or release.<check>, at most 60
+# seconds. It marks gated.<n> or hanging.<check> first, so the suite knows
+# the run is held at that point.
+k=$(wc -l < "$out/start-order" | tr -d ' ')
+if [ -f "$out/gate.$k" ]; then
+  touch "$out/gated.$k"
+  i=0; until [ -f "$out/release.$k" ] || [ "$i" -ge 600 ]; do sleep 0.1; i=$((i + 1)); done
+fi
+if [ -f "$out/hang.$1" ]; then
+  touch "$out/hanging.$1"
+  i=0; until [ -f "$out/release.$1" ] || [ "$i" -ge 600 ]; do sleep 0.1; i=$((i + 1)); done
+  touch "$out/unhung.$1"
+fi
 rm -f "$out/running/$1"
 SH
 for c in check_ok check_flag check_env check_graphed check_harness check_replay check_selftested; do
@@ -1142,6 +1171,19 @@ wait_for_lock_field() {  # $1 = field, $2 = glob it must match; up to 60 s
   return 1
 }
 
+# Waits (up to 60 s) until push output file $1 says it is queued behind the
+# run of $2, or of anyone when $2 is empty, or the push $3 has exited.
+# Returns 0 only for the first.
+wait_for_waiting() {  # $1 = output file, $2 = holder, $3 = the push's pid
+  local i=0
+  while [ "$i" -lt 600 ]; do
+    grep -qF "waiting for the run of ${2:+$2 (}" "$1" 2>/dev/null && return 0
+    kill -0 "$3" 2>/dev/null || return 1
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
 # Every Part 2 push took and released the lock: a clean release leaves an
 # empty record, and the lock file itself stays (the flock lives on its inode).
 check "a finished run leaves an empty lock record" "$(cat "$LOCK_FILE" 2>/dev/null)" ""
@@ -1151,10 +1193,13 @@ for want in MERGEPATH_PREPUSH_LOCK_GRACE MERGEPATH_PREPUSH_LOCK_TOOL 'load avera
   case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
 done
 
-# Contention. Three slow live checks at jobs=1 hold the lock for about twelve
-# seconds; a second push arriving meanwhile waits, names the holder, runs
-# only after it, and both pushes land.
-reset_probe; slow_all
+# Contention. The holder runs three live checks at jobs=1, held by gates on
+# its first and second check; a second push arriving meanwhile waits, names
+# the holder, runs only after it, and both pushes land. The first gate opens
+# once the waiter says it is queued, the second once the holder's record shows
+# one completed check and the waiter has queued for two seconds (its queue
+# time is reported in whole seconds and must be at least one).
+reset_probe; touch "$PROBE_DIR/gate.1" "$PROBE_DIR/gate.2"
 commit_change feat/lock-a README.md
 commit_change feat/lock-b README.md
 (cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a.out" 2>&1 &
@@ -1165,7 +1210,12 @@ case "$holder_pid" in ''|*[!0-9]*) bad "lock record pid: '$holder_pid'" ;; *) ok
 case "$(lock_field started)" in [0-9][0-9]:[0-9][0-9]' UTC') ok "the lock record carries the start time" ;; *) bad "lock record start time: '$(lock_field started)'" ;; esac
 (cd "$FIX" && MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b) > "$TMP/lock-b.out" 2>&1 &
 B_PID=$!
+if wait_for_waiting "$TMP/lock-b.out" feat/lock-a "$B_PID"; then ok "the second push queues behind the gated holder"; else bad "the second push never reported waiting: $(cat "$TMP/lock-b.out")"; fi
+t_queued=$(date +%s)
+touch "$PROBE_DIR/release.1"
 if wait_for_lock_field progress '[1-3] of 3'; then ok "the holder refreshes its progress per completed check"; else bad "the progress never advanced: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
+while [ $(( $(date +%s) - t_queued )) -lt 2 ]; do sleep 0.1; done
+touch "$PROBE_DIR/release.2"
 rc_a=0; wait "$A_PID" || rc_a=$?
 rc_b=0; wait "$B_PID" || rc_b=$?
 out=$(cat "$TMP/lock-b.out")
@@ -1182,14 +1232,20 @@ check "the waiter's checks all ran after the holder's" "$(sed -n '1,3p' "$PROBE_
 # The python3 fcntl path is the one every macOS machine takes; a Linux runner
 # has flock(1) and would otherwise never exercise it, so contention is
 # repeated with that path forced.
-reset_probe; slow_all
+# The holder is gated on its first check until the waiter reports waiting.
+reset_probe; touch "$PROBE_DIR/gate.1"
 git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m py-hold
 git -C "$FIX" checkout -q feat/lock-b && git -C "$FIX" commit -q --allow-empty -m py-wait
 (cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='python3' MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-a) > "$TMP/lock-a-py.out" 2>&1 &
 A_PID=$!
 if wait_for_lock_field branch feat/lock-a; then ok "python3 fcntl lock: the holder records its branch"; else bad "python3 fcntl lock: no holder record: $(cat "$LOCK_FILE" 2>/dev/null)"; fi
 holder_pid=$(lock_field pid)
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='python3' MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
+(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_TOOL='python3' MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b) > "$TMP/lock-b-py.out" 2>&1 &
+B_PID=$!
+if wait_for_waiting "$TMP/lock-b-py.out" feat/lock-a "$B_PID"; then ok "python3 fcntl lock: the second push queues behind the gated holder"; else bad "python3 fcntl lock: the second push never reported waiting"; fi
+touch "$PROBE_DIR/release.1"
+rc=0; wait "$B_PID" || rc=$?
+out=$(cat "$TMP/lock-b-py.out")
 check "python3 fcntl lock: a second push waits, then succeeds" "$rc" "0"
 case "$out" in *"waiting for the run of feat/lock-a (pid $holder_pid, started "*) ok "python3 fcntl lock: the waiter names the holder" ;; *) bad "python3 fcntl lock waiter output: $out" ;; esac
 rc_a=0; wait "$A_PID" || rc_a=$?
@@ -1214,8 +1270,12 @@ case "$out" in *"needs flock(1) or a python3 with fcntl"*) bad "the versioned in
 
 # A supervisor killed mid-run leaves its started checks running, and they
 # keep the lock: a waiting push starts only after they end.
-# The first check hangs (the probe's hang.<check>, about two minutes), so the
-# surviving worker plainly outlives its supervisor.
+# The first check hangs (the probe's hang.<check>) until the suite releases
+# it, so the surviving worker outlives its supervisor. The waiter must report
+# that it is queued and then stay held, with no check of its own started,
+# for three seconds before the survivor is released: a waiter that the lock
+# did not hold back starts its checks at once (they are not gated) and
+# finishes inside that window.
 reset_probe
 for c in check_ok check_flag check_env; do touch "$PROBE_DIR/hang.$c"; done
 git -C "$FIX" checkout -q feat/lock-a && git -C "$FIX" commit -q --allow-empty -m killed-holder
@@ -1230,12 +1290,25 @@ fix_phys=$(cd "$FIX" && pwd -P)
 sup=$(pgrep -o -f -- "--committed-snapshot --timings-root $fix_phys " || true)
 if [ -n "$sup" ]; then ok "the holder's supervisor is running a check"; else bad "no supervisor found to kill"; fi
 [ -z "$sup" ] || kill "$sup" 2>/dev/null || true
-# A grace past the hang keeps this waiter waiting (#2878), so it tests the lock.
-rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=600 MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b 2>&1) || rc=$?
+hung=$(hung_marker || true)
+# A grace past the release keeps this waiter waiting (#2878), so it tests the lock.
+(cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=600 MERGEPATH_PREPUSH_JOBS=1 git push origin feat/lock-b) > "$TMP/killed-b.out" 2>&1 &
+B_PID=$!
+held=no
+# The killed supervisor clears its record as it dies (the waiter then names
+# `?`), unless the waiter reads it first, so either holder name is accepted.
+if wait_for_waiting "$TMP/killed-b.out" '' "$B_PID"; then
+  held=yes; j=0
+  while [ "$j" -lt 30 ]; do
+    if ! kill -0 "$B_PID" 2>/dev/null || [ "$(ran_set_lock)" != "$hung " ]; then held=no; break; fi
+    sleep 0.1; j=$((j + 1))
+  done
+fi
+[ -z "$hung" ] || touch "$PROBE_DIR/release.$hung"
+rc=0; wait "$B_PID" || rc=$?
 wait "$A_PID" 2>/dev/null || true
 check "a push after a killed supervisor still succeeds" "$rc" "0"
-hung=$(hung_marker || true)
-if [ -n "$hung" ] && [ -f "$PROBE_DIR/unhung.$hung" ]; then ok "the killed supervisor's surviving check finished before the next push did"; else bad "the next push finished while the killed supervisor's $hung check was still running"; fi
+if [ -n "$hung" ] && [ "$held" = yes ] && [ -f "$PROBE_DIR/unhung.$hung" ]; then ok "the killed supervisor's surviving check finished before the next push did"; else bad "the next push was not held behind the killed supervisor's $hung check (held=$held): $(cat "$TMP/killed-b.out")"; fi
 
 # Contended means deferred (#2878). A fake holder keeps the machine lock for
 # five minutes, the way another session's full run would. A push that still
@@ -1310,8 +1383,14 @@ rm -f "$PROBE_DIR/FLAG"
 # keeps waiting instead of deferring.
 git -C "$FIX" commit -q --allow-empty -m contended-direct
 reset_probe
+t_real=$(date +%s)
 rc=$(contended_run "$FIX/scripts/repo-lint-prepush.sh" real 45)
+t_real=$(( $(date +%s) - t_real ))
 check "contended (python3 lock): the run passes before the deadline" "$rc" "0"
+# The mutant below is judged at twice the real run's time plus two seconds
+# (6 to 20 s): still queued then, it has demonstrably not done what the real
+# runner did in half the time.
+mutant_deadline=$((t_real * 2 + 2)); [ "$mutant_deadline" -ge 6 ] || mutant_deadline=6; [ "$mutant_deadline" -le 20 ] || mutant_deadline=20
 CMUTANT="$TMP/mutant-wait/repo-lint-prepush.sh"
 mkdir -p "$TMP/mutant-wait"
 python3 - "$RUNNER" "$CMUTANT" <<'PY2'
@@ -1323,9 +1402,9 @@ assert src.count(old) == 1
 open(sys.argv[2], 'w').write(src.replace(old, new, 1))
 PY2
 reset_probe
-rc=$(contended_run "$CMUTANT" mutant 20)
+rc=$(contended_run "$CMUTANT" mutant "$mutant_deadline")
 if ! cmp -s "$CMUTANT" "$RUNNER" && [ "$rc" = waiting ] && [ -z "$(ran_set_lock)" ]; then
-  ok "mutation: a runner that keeps waiting is still queued after 20 s with no check run, so the assertions above discriminate"
+  ok "mutation: a runner that keeps waiting is still queued after $mutant_deadline s (the real run took ${t_real}s) with no check run, so the assertions above discriminate"
 else
   bad "mutation: expected the waiting mutant to be still queued (got '$rc', ran: $(ran_set_lock))"
 fi
@@ -1348,14 +1427,16 @@ contended_guard_run() {  # $1 = runner, $2 = a 6-character label; prints "<guard
   m12=$(git -C "$FIX" rev-parse main | cut -c1-12)
   stale="$snaps/prepush-$m12.$2"
   git -C "$FIX" worktree add -q --detach "$stale" main
-  reset_probe; slow_all
+  # The first check is gated until the guard has been probed (#2990).
+  reset_probe; touch "$PROBE_DIR/gate.1"
   git -C "$FIX" commit -q --allow-empty -m "contended-guard-$2"
   sha=$(git -C "$FIX" rev-parse feat/contended)
   (cd "$FIX" && MERGEPATH_PREPUSH_LOCK_GRACE=2 bash "$1" --hook origin \
     <<<"refs/heads/feat/contended $sha refs/heads/feat/contended $ZERO") > "$TMP/contended-guard-$2.out" 2>&1 &
   pid=$!
-  until [ -n "$(ls "$PROBE_DIR/running" 2>/dev/null)" ] || ! kill -0 "$pid" 2>/dev/null || [ "$i" -ge 300 ]; do sleep 0.1; i=$((i + 1)); done
-  [ -z "$(ls "$PROBE_DIR/running" 2>/dev/null)" ] || guard=$(python3 -I "$TMP/guard-probe.py" "$LOCK_DIR/prepush-snapshots.lock")
+  until [ -f "$PROBE_DIR/gated.1" ] || ! kill -0 "$pid" 2>/dev/null || [ "$i" -ge 300 ]; do sleep 0.1; i=$((i + 1)); done
+  [ ! -f "$PROBE_DIR/gated.1" ] || guard=$(python3 -I "$TMP/guard-probe.py" "$LOCK_DIR/prepush-snapshots.lock")
+  touch "$PROBE_DIR/release.1"
   wait "$pid" 2>/dev/null || true
   if [ -d "$stale" ]; then printf '%s survived\n' "$guard"; else printf '%s removed\n' "$guard"; fi
   git -C "$FIX" worktree remove --force "$stale" 2>/dev/null || true

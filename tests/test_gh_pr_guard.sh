@@ -190,8 +190,19 @@ assert_rc_contains() {
   fi
 }
 
+# #2990: every section below is one case-pool case. Each builds its own
+# fixtures under its own WORKDIR (case-pool.sh gives each case one) and reads
+# only the stubs and helpers above, so the pool runs them side by side and
+# replays their output in this order.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
+# The sections that cd into a fixture return here.
+ORIG_DIR="$(pwd)"
+
+
 # Summary-only change requests have no review thread. Read every review
 # page and keep each reviewer's latest opinion, even on an older head.
+pr_guard_case_01() {
 change_review='{"id":1,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
 review_pages="[[$change_review]]"
 merge_overrides='BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -371,6 +382,8 @@ assert_rc_contains "wrapper substring spoof still blocked" 2 "token-verifying wr
 
 ## Self-Review
 - ok"'
+}
+case_pool_add pr_guard_case_01
 
 # --- `gh pr new` is a working alias for `gh pr create` -----------------------
 # gh 2.97: `gh pr new --help` prints the create help and lists `new` under
@@ -379,6 +392,7 @@ assert_rc_contains "wrapper substring spoof still blocked" 2 "token-verifying wr
 # create guard never ran -- no Authoring-Agent check, no ## Self-Review check,
 # no byline verification. A complete bypass reachable by typing a documented
 # alias, so these cases are the regression fence around it.
+pr_guard_case_02() {
 assert_rc_contains "gh pr new is guarded like gh pr create" 2 "guarded GitHub write" \
   'gh pr new --title "t" --body "Authoring-Agent: claude
 
@@ -673,11 +687,14 @@ assert_rc_contains "real declaration wins over a later prose mention (#927)" 2 "
 
 assert_rc_contains "indented author line is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "  Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_02
 
 # --- #1057 item A: in a Claude cloud session `gh pr view` is GraphQL and the
 # proxy refuses it, so the self-approve read falls back to REST, only for the
 # canonical `<number> --repo OWNER/REPO` form. Any other read failure still
 # blocks.
+pr_guard_case_03() {
 API_LOG="$WORKDIR/guard-api.log"
 : >"$API_LOG"
 STUB_GRAPHQL_CEILING=1 STUB_API_LOG="$API_LOG" assert_rc_contains "GraphQL ceiling: same-agent over-threshold approve still blocked from the REST read" 2 "self-approve detected" \
@@ -805,12 +822,15 @@ for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://g
 done
 STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+}
+case_pool_add pr_guard_case_03
 
 # --- #671: the self-approve sub-guard resolves the reviewer the same way
 # the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
 # the default), honoring an inline same-segment MERGEPATH_AGENT prefix.
 # Session default (expected reviewer arg) stays nathanpayne-claude in all
 # of these — exactly the PR #663 incident shape.
+pr_guard_case_04() {
 assert_rc_contains "cross-agent approve via inline MERGEPATH_AGENT allowed (#671)" 0 "" \
   'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
 
@@ -841,6 +861,8 @@ assert_rc_contains "non-slug inline MERGEPATH_AGENT approve blocked (#671)" 2 "n
 # reads MERGEPATH_AGENT in that case (#679 review P3).
 assert_rc_contains "non-slug MERGEPATH_AGENT ignored when explicit reviewer identity wins (#679 P3)" 0 "" \
   'MERGEPATH_AGENT="codex or claude" GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_04
 
 # --- #679 review P1: the wrapper chain's third link. A session warmed
 # with op-preflight --agent <agent> exports OP_PREFLIGHT_AGENT, and the
@@ -848,6 +870,7 @@ assert_rc_contains "non-slug MERGEPATH_AGENT ignored when explicit reviewer iden
 # GH_AS_REVIEWER_IDENTITY nor MERGEPATH_AGENT is set. Bottoming out at
 # the claude default instead would fail OPEN on a cursor-preflight
 # session approving a cursor-authored PR.
+pr_guard_case_05() {
 TEST_OP_PREFLIGHT_AGENT=cursor \
   assert_rc_contains "same-agent approve via OP_PREFLIGHT_AGENT session blocked (#679 P1)" 2 "self-approve detected" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
@@ -861,31 +884,43 @@ TEST_OP_PREFLIGHT_AGENT=codex \
 TEST_OP_PREFLIGHT_AGENT=claude \
   assert_rc_contains "inline MERGEPATH_AGENT outranks OP_PREFLIGHT_AGENT (#679 P1)" 0 "" \
   'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_05
 
 # --- #679 round 2: env-unset OP_PREFLIGHT_AGENT must not be trusted from
 # the stale hook environment — the wrapper falls to its claude default, so
 # a codex-preflight session approving a claude-authored PR is same-agent.
+pr_guard_case_06() {
 TEST_OP_PREFLIGHT_AGENT=codex \
   assert_rc_contains "env -u OP_PREFLIGHT_AGENT approve resolves to default and blocks (#679 r2)" 2 "self-approve detected" \
   'env -u OP_PREFLIGHT_AGENT -u OP_PREFLIGHT_REVIEWER_PAT scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_06
 
 # --- #679 round 2: a command-substitution GH_AS_REVIEWER_IDENTITY is the
 # wrapper chain FIRST link — it must fail closed (the substitution could
 # emit the authoring identity), not fall through to MERGEPATH_AGENT.
+pr_guard_case_07() {
 assert_rc_contains "cmdsub GH_AS_REVIEWER_IDENTITY approve blocked (#679 r2)" 2 "not expected reviewer" \
   'GH_AS_REVIEWER_IDENTITY=$(cat /tmp/id) MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_07
 
 # --- #679 round 2: an EMBEDDED substitution with a literal prefix
 # (MERGEPATH_AGENT=cla$(x)e) flattens into the prefix token plus an
 # adjacent placeholder; the guard must fail closed on the whole segment,
 # never trust the literal prefix as the agent slug.
+pr_guard_case_08() {
 assert_rc_contains "embedded-cmdsub MERGEPATH_AGENT approve blocked (#679 r2)" 2 "unverifiable command substitution" \
   'MERGEPATH_AGENT=cla$(cat /tmp/a)e scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+}
+case_pool_add pr_guard_case_08
 
 # --- same adjacency hole, bare-write form: an embedded substitution in
 # ANY prefix assignment used to derail the walk (the placeholder took
 # command position, the real gh write was classified as unrelated-command
 # args) and a BARE guarded write escaped the guard entirely.
+pr_guard_case_09() {
 assert_rc_contains "bare gh pr merge behind embedded-cmdsub prefix blocked (#679 r2)" 2 "unverifiable command substitution" \
   'FOO=a$(cat /tmp/x)b gh pr merge 123 --squash'
 
@@ -926,6 +961,8 @@ cd "$WORKDIR/repo-with-policy"
 assert_rc_contains "same-agent under-threshold approve allowed" 0 "" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "small"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "5"
 cd "$ORIG_DIR"
+}
+case_pool_add pr_guard_case_09
 
 # --- #533 item 2: propagation lane bypass honors propagation_prs.enabled
 # A mergepath-sync/* PR authored by the author identity skips the
@@ -934,6 +971,7 @@ cd "$ORIG_DIR"
 # as enabled; an explicit `enabled: false` must re-impose the guard, and
 # per #540 any other present non-`true` value (e.g. `yes`, a typo) also
 # re-imposes it (fail-closed exact-match).
+pr_guard_case_10() {
 mkdir -p "$WORKDIR/repo-lane-default/.github"
 cat >"$WORKDIR/repo-lane-default/.github/review-policy.yml" <<'YML'
 external_review_threshold: 300
@@ -982,12 +1020,15 @@ cd "$ORIG_DIR"
 
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
+}
+case_pool_add pr_guard_case_10
 
 # --- #533 item 1: eval / sh -c / bash -c admin-merge bypass -----------
 # Each of these returned rc=0 (BYPASS) before the python tokenizer
 # re-tokenized eval/shell -c payloads: shlex kept the inner command as
 # one opaque token, so SAW_GH stayed 0 and the guard exited early. They
 # must now surface the inner guarded gh write and BLOCK (rc=2).
+pr_guard_case_11() {
 assert_rc_contains "eval-wrapped gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
   'eval "gh pr merge 123 --admin"'
 
@@ -1020,12 +1061,15 @@ assert_rc_contains "eval echo allowed (no gh)" 0 "" \
 
 assert_rc_contains "bash -c echo of gh text allowed (gh not in cmd position)" 0 "" \
   'bash -c "echo gh pr merge --admin"'
+}
+case_pool_add pr_guard_case_11
 
 # --- #540 Phase-4b: nathanpayne-codex found two more guard bypasses ----
 # (1) bash --noprofile --norc -c "<payload>": the option scan matched any
 #     flag containing a 'c', so --norc consumed the real -c and dropped the
 #     command string. Long (--) options are now skipped so the real -c is
 #     found.
+pr_guard_case_12() {
 assert_rc_contains "bash --norc -c gh pr merge --admin blocked (#540)" 2 "" \
   'bash --noprofile --norc -c "gh pr merge 1 --admin"'
 assert_rc_contains "bash --rcfile -c still finds the real -c (#540)" 2 "" \
@@ -1079,9 +1123,12 @@ assert_rc_contains "gh write in backtick substitution blocked (#540)" 2 "" \
 # Control: a READ inside a substitution is not a guarded write -> allowed.
 assert_rc_contains "gh read inside command substitution allowed (#540)" 0 "" \
   'echo "$(gh pr view 1)"'
+}
+case_pool_add pr_guard_case_12
 
 # --- author-wrapper identity pin (#438) -------------------------------
 
+pr_guard_case_13() {
 assert_rc_contains "author wrapper inline non-author identity blocked" 2 "author identity" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
@@ -1359,6 +1406,8 @@ if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
 else
   fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
 fi
+}
+case_pool_add pr_guard_case_13
 
 # --- #546: parser-completeness hardening (gap 1 + gap 2) --------------
 # Gap 1 — a blessed wrapper must not hide a shell-c payload. Before #546 the
@@ -1366,6 +1415,7 @@ fi
 # -c <gh write>" left the inner write opaque and it ran under the verified
 # token WITHOUT the merge-state / admin / CODEX gate. The inner write must
 # now surface and face the same checks as a visible "<wrapper> -- gh ...".
+pr_guard_case_14() {
 assert_rc_contains "author wrapper hides bash -c merge: state still checked (#546 gap 1)" 2 "mergeStateStatus is BLOCKED" \
   'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "BLOCKED" ""
 assert_rc_contains "author wrapper bash -c clean merge still allowed (#546 gap 1, no false block)" 0 "" \
@@ -1393,10 +1443,13 @@ assert_rc_contains "time -f value option bash -c gh write surfaced (#546 gap 2)"
 # the bash table wrongly skipped it and lost the gh write.
 assert_rc_contains "sudo -s no-value flag does not swallow the gh write (#546 gap 2)" 2 "token-verifying wrapper" \
   'sudo -s gh pr merge 123 --admin'
+}
+case_pool_add pr_guard_case_14
 
 # --- #546 follow-on (CodeRabbit #551): spec correctness for ionice/env ----
 # ionice -t/--ignore is a no-value FLAG, so it must not consume the next
 # token; before this it swallowed the bash that followed and hid the write.
+pr_guard_case_15() {
 assert_rc_contains "ionice -t flag does not swallow bash -c gh write (#551)" 2 "token-verifying wrapper" \
   'ionice -t bash -c "gh pr merge 123 --admin"'
 # ionice -c is still a real value option (regression: must skip its value).
@@ -1517,12 +1570,15 @@ assert_rc_contains "cmdsub as value-taking flag arg stays allowed (#560)" 0 "" \
   'env -u $(printf "\147\150") pr merge 1'
 assert_rc_contains "cmdsub as echo argument stays allowed (#560)" 0 "" \
   'echo $(printf "\147\150") pr merge'
+}
+case_pool_add pr_guard_case_15
 
 # --- #611 round 3 (Codex P1 x2): escape spellings + split placeholder runs ---
 # (1) The write verb can be escape-spelled (m\erge): bash unescapes it at
 # execution, but no literal probe can enumerate escape spellings. The
 # fast-path now force-tokenizes on ANY substitution; shlex canonicalizes the
 # escape and synth_cmdsub_write_label sees the bare verb.
+pr_guard_case_16() {
 assert_rc_contains "cmdsub-synth exe+noun then ESCAPED verb fails closed (#611 r3)" 2 "wrapper" \
   '$(printf "\147\150\40\160\162") m\erge 123 --admin'
 # (2) The exe and noun split across a placeholder RUN with a literal verb:
@@ -1559,6 +1615,8 @@ assert_rc_contains "gh read with cmdsub argument stays allowed (#611 r3)" 0 "" \
   'gh pr view $(printf "\61") --json title'
 assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611 r3)" 0 "" \
   '$(printf a) $(printf b) c'
+}
+case_pool_add pr_guard_case_16
 
 # --- #611 round 2 (Codex P1): FULLY synthesized guarded writes ------------
 # $(printf "...") can emit the ENTIRE gh pr merge sequence, leaving zero
@@ -1568,6 +1626,7 @@ assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611
 # exactly: synthesized writes block, synthesized data stays allowed, and
 # dynamic spans still fall back to the placeholder + evidence scan.
 # \147\150\40\160\162\40\155\145\162\147\145 = "gh pr merge".
+pr_guard_case_17() {
 assert_rc_contains "FULLY synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
   '$(printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
 assert_rc_contains "echo-synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
@@ -1583,12 +1642,15 @@ assert_rc_contains "statically expanded benign printf stays allowed (#611 r2)" 0
   '$(printf hello) world'
 assert_rc_contains "non-static printf form still fails closed on evidence (#611 r2)" 2 "wrapper" \
   '$(printf "\147\150" x) pr merge 1'
+}
+case_pool_add pr_guard_case_17
 
 # --- #611 round 4: IFS whitespace in expansions + benign parse failures ---
 # (P1) printf can emit NEWLINES between synthesized words; bash word-splits
 # them exactly like spaces. The expansion is whitespace-normalized before
 # the splice-safety check, so the walk sees the real gh pr merge.
 # \147\150 \n \160\162 \n \155\145\162\147\145 = gh<NL>pr<NL>merge.
+pr_guard_case_18() {
 assert_rc_contains "newline-separated synthesized gh pr merge fails closed (#611 r4)" 2 "wrapper" \
   '$(printf "\147\150\n\160\162\n\155\145\162\147\145") 123 --admin'
 assert_rc_contains "tab-separated synthesized gh pr fails closed (#611 r4)" 2 "wrapper" \
@@ -1601,11 +1663,14 @@ assert_rc_contains "parse failure with no guarded evidence stays allowed (#611 r
   '$(date) "oops'
 assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)" 2 "tokenize" \
   '$(date) "oops gh pr merge 1'
+}
+case_pool_add pr_guard_case_18
 
 # --- #611 round 9: assignment prefixes, escaped shells, unquoted bodies ---
 # (P1) a bare-assignment token consumes its VALUE in every walk: the
 # flattened FOO=$(date) leaves FOO= + placeholder, and the following
 # spliced gh write is the real command, not the placeholder-as-command.
+pr_guard_case_19() {
 assert_rc_contains "assignment-substitution prefix before synthesized write fails closed (#611 r9)" 2 "wrapper" \
   'FOO=$(date) $(printf gh) pr merge 1'
 assert_rc_contains "assignment-substitution prefix with benign command stays allowed (#611 r9)" 0 "" \
@@ -1624,10 +1689,13 @@ assert_rc_contains "parse failure with gh in an unquoted heredoc body fails clos
 "unmatched
 $(gh pr merge 1)
 EOF'
+}
+case_pool_add pr_guard_case_19
 
 # --- #611 round 10: path-qualified synth, quoted-delim forms, cmd word ----
 # (P1) a path-qualified printf/echo word-splits into the same synthesized
 # write as the bare form — the basename is the literal-synth source.
+pr_guard_case_20() {
 assert_rc_contains "path-qualified /bin/echo synthesized write fails closed (#611 r10)" 2 "wrapper" \
   '$(/bin/echo gh pr merge) 123 --squash'
 assert_rc_contains "path-qualified /usr/bin/printf synthesized write fails closed (#611 r10)" 2 "wrapper" \
@@ -1655,10 +1723,13 @@ assert_rc_contains "bash command word with redirection still scans body (#611 r1
   'bash > /tmp/out <<'"'"'EOF'"'"'
 $(printf "\147\150\40\160\162") merge 1
 EOF'
+}
+case_pool_add pr_guard_case_20
 
 # --- #611 round 11: quoted heredoc PIPED into a shell executes the body ---
 # cat <<'EOF' | bash runs the body even though the first command word is
 # cat, so any pipeline segment being an interpreter forces body scanning.
+pr_guard_case_21() {
 assert_rc_contains "quoted heredoc piped into bash fails closed (#611 r11)" 2 "wrapper" \
   'cat <<'"'"'EOF'"'"' | bash
 $(printf "\147\150\40\160\162") merge 1
@@ -1673,11 +1744,14 @@ assert_rc_contains "quoted heredoc piped into grep stays allowed (#611 r11)" 0 "
   'cat <<'"'"'EOF'"'"' | grep merge
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+}
+case_pool_add pr_guard_case_21
 
 # --- #611 round 12: multi-heredoc, process substitution, prefixed synth ----
 # (P1) an UNQUOTED heredoc before a quoted one: the unquoted A body expands
 # its substitutions, so it must be scanned — the line is not simple (more
 # heredocs than quoted), so no body is skipped and the A-body write blocks.
+pr_guard_case_22() {
 assert_rc_contains "unquoted-before-quoted heredoc scans the unquoted body (#611 r12)" 2 "" \
   'cat <<A <<'"'"'B'"'"'
 $(gh pr merge 1)
@@ -1706,11 +1780,14 @@ assert_rc_contains "single quoted heredoc fixture still allowed (#611 r12 regres
   'cat <<'"'"'EOF'"'"' > /tmp/fx
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+}
+case_pool_add pr_guard_case_22
 
 # --- #611 round 13: value-taking prefix option before a piped shell --------
 # The pipeline command-word scan must consume a value-taking prefix option's
 # VALUE (sudo -u nobody bash) so the real interpreter (bash) is seen and the
 # heredoc body scanned.
+pr_guard_case_23() {
 assert_rc_contains "quoted heredoc piped to sudo -u USER bash fails closed (#611 r13)" 2 "" \
   'cat <<'"'"'EOF'"'"' | sudo -u nobody bash
 gh pr merge 1
@@ -1721,9 +1798,12 @@ assert_rc_contains "value-option value named bash is not the interpreter (#611 r
   'cat <<'"'"'EOF'"'"' | sudo -u bash cat
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+}
+case_pool_add pr_guard_case_23
 
 # --- #611 round 14: -R cmdsub, prefix value-opt in synth, eval-quoted, ANSI-C word
 # (P1) a cmdsub as the -R/--repo value can word-split a guarded verb into argv.
+pr_guard_case_24() {
 assert_rc_contains "cmdsub as -R value fails closed (#611 r14)" 2 "" \
   'gh pr -R $(cat file) 1'
 # (P1) a value-taking prefix option inside a synth span: env -u X printf ...
@@ -1745,6 +1825,8 @@ assert_rc_contains "echo of quoted printf expansion stays allowed (#611 r14)" 0 
   'echo "$(printf "\147\150\40\160\162")"'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
+}
+case_pool_add pr_guard_case_24
 
 # --- #611 round 5: unexpandable literal printf + assignment-word splices ---
 # (P1a) printf %b decodes escapes in its ARGUMENT — not emulated, so the
@@ -1752,6 +1834,7 @@ assert_rc_contains "parse failure with octal gh spelling still fails closed (#61
 # expanded now fails closed in command position (it can synthesize an
 # entire guarded write with zero outside evidence), instead of degrading to
 # an anonymous placeholder the evidence scan cannot see through.
+pr_guard_case_25() {
 assert_rc_contains "unexpandable percent-b printf synthesis fails closed (#611 r5)" 2 "wrapper" \
   '$(printf %b "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
 assert_rc_contains "unexpandable percent-d printf in command position fails closed (#611 r5)" 2 "wrapper" \
@@ -1772,11 +1855,14 @@ assert_rc_contains "assignment-word spacey splice keeps command position on the 
   'X=$(printf "a b") $(printf "\147\150") pr merge 7 --admin'
 assert_rc_contains "assignment-word spacey splice with benign command stays allowed (#611 r5)" 0 "" \
   'X=$(printf "a b") true'
+}
+case_pool_add pr_guard_case_25
 
 # --- #611 round 6: ANSI-C quoting, heredoc evidence, splice fidelity ------
 # (P1) $-single-quote ANSI-C strings are decoded and re-wrapped before the
 # literal classification, so an ANSI-C-synthesized write is spliced and
 # decided exactly like the plain-quoted octal forms.
+pr_guard_case_26() {
 assert_rc_contains "ANSI-C-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
   "\$(echo \$'\\147\\150\\40\\160\\162\\40\\155\\145\\162\\147\\145') 1 --admin"
 assert_rc_contains "ANSI-C-quoted benign expansion stays allowed (#611 r6)" 0 "" \
@@ -1787,10 +1873,13 @@ assert_rc_contains "locale-quoted synthesized gh pr merge fails closed (#611 r6)
   '$(echo $"gh pr merge") 1 --admin'
 assert_rc_contains "locale-quoted benign expansion stays allowed (#611 r6)" 0 "" \
   '$(echo $"hello") world'
+}
+case_pool_add pr_guard_case_26
 
 # --- #611 round 7: source-fed heredocs + IFS-dependent splices ------------
 # (P1) source / the dot builtin execute their input: a parse failure whose
 # gh evidence sits in a source-fed heredoc body must keep failing closed.
+pr_guard_case_27() {
 assert_rc_contains "parse failure in source-fed heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
   'source /dev/stdin <<EOF
 gh pr merge 1 "oops
@@ -1809,11 +1898,14 @@ assert_rc_contains "IFS-modified synthesized write fails closed (#611 r7)" 2 "wr
 # command word is gh-slash (not gh), which executes nothing gh-related.
 assert_rc_contains "default-IFS gh-slash expansion stays allowed (#611 r7)" 0 "" \
   '$(printf "gh/") pr merge 1'
+}
+case_pool_add pr_guard_case_27
 
 # --- #611 round 8: quoted-tag heredoc bodies are inert data ---------------
 # bash performs NO expansion inside a quoted-tag heredoc body, so an encoded
 # substitution there is fixture text, not a command — the flattener skips
 # such bodies instead of statically expanding them into command segments.
+pr_guard_case_28() {
 assert_rc_contains "quoted-heredoc fixture with encoded write stays allowed (#611 r8)" 0 "" \
   'cat <<'"'"'EOF'"'"' > /tmp/fixture
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
@@ -1860,26 +1952,66 @@ assert_rc_contains "assignment-looking expansion in command position fails close
   '$(printf "X=Y") gh pr merge 1'
 assert_rc_contains "assignment-looking expansion as argument stays allowed (#611 r6)" 0 "" \
   'echo $(printf "X=Y")'
+}
+case_pool_add pr_guard_case_28
 
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior
 # max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an
 # UNSTABLE PR with a check still re-running could merge before CI finished).
+pr_guard_case_29() {
 GH_JQ_def=$(grep -m1 '^GH_JQ=' "$HOOK")
 eval "$GH_JQ_def"
 _ng=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"ci","state":"PENDING"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
 if [ "${_ng:-0}" -ge 1 ]; then pass "merge-state jq: un-timestamped PENDING re-run counts non-green (#553)"; else fail "merge-state jq (#553): expected non-green >= 1, got '$_ng'"; fi
 _ng2=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"lint","conclusion":"SUCCESS","completedAt":"2026-06-28T11:00:00Z"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
 if [ "${_ng2:-x}" = "0" ]; then pass "merge-state jq: all-terminal-green stays 0 (no false block) (#553)"; else fail "merge-state jq (#553): expected 0, got '$_ng2'"; fi
+}
+case_pool_add pr_guard_case_29
 
 # #1609: static admission must reach the real writer's fresh trusted gate.
 # Fake immutable-code/API transports only; includes stale/current generations,
 # missing evidence, poisoned candidate/env, cancellation/holds and a mutant.
-if python3 "$ROOT/tests/test_merge_writer.py"; then
-  pass "production merge writer freshly rejects uncovered request generations"
-else
-  fail "production merge writer freshness integration"
-fi
+# Its tests are independent (each builds its own temp tree), so they run as
+# MERGE_WRITER_SLICES pool cases (#2990): slice k runs every test whose index
+# in the loader's deterministic order is k mod n, so the slices partition the
+# one discovered list. A slice that discovers no tests, selects none, or has
+# a failing or erroring test fails.
+MERGE_WRITER_SLICES=8
+merge_writer_slice() { # <k> <n>
+  if python3 - "$ROOT/tests/test_merge_writer.py" "$1" "$2" <<'PY'
+import importlib.util, sys, unittest
+path, k, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+spec = importlib.util.spec_from_file_location('test_merge_writer', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules['test_merge_writer'] = module
+spec.loader.exec_module(module)
+def flatten(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from flatten(item)
+        else:
+            yield item
+tests = list(flatten(unittest.defaultTestLoader.loadTestsFromModule(module)))
+chosen = [t for i, t in enumerate(tests) if i % n == k]
+if not tests or not chosen:
+    print(f'merge writer slice {k}/{n}: no tests selected out of {len(tests)}', file=sys.stderr)
+    sys.exit(1)
+result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(chosen))
+print(f'merge writer slice {k}/{n}: ran {result.testsRun} of {len(tests)}')
+sys.exit(0 if result.wasSuccessful() and result.testsRun == len(chosen) else 1)
+PY
+  then
+    pass "production merge writer freshly rejects uncovered request generations (slice $1 of $2)"
+  else
+    fail "production merge writer freshness integration (slice $1 of $2)"
+  fi
+}
+for ((mw = 0; mw < MERGE_WRITER_SLICES; mw++)); do
+  case_pool_add --first merge_writer_slice "$mw" "$MERGE_WRITER_SLICES"
+done
+
+case_pool_wait
 
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"

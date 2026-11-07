@@ -52,9 +52,17 @@ run_on_fixture() {
   set -e
 }
 
+# #2990: every case below is one case-pool case. Each builds its fixtures
+# under its own WORKDIR (case-pool.sh gives each case one) and reads only the
+# helpers above, so the pool runs them side by side and replays their output
+# in this order. SKIP lines still print; the summary counts passes and fails.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
+
 # ── Part C: the static scan ───────────────────────────────────────────
 
 # Case 1: a fixture whose every write targets a repo explicitly → PASS.
+hygiene_case_001() {
 run_on_fixture "tests/clean.sh" '#!/usr/bin/env bash
 git init -q "$FIX"
 git -C "$FIX" config user.email "t@t"
@@ -66,8 +74,11 @@ if [ "$RC" = "0" ] && grep -q "PASS" <<<"$OUT"; then
 else
   fail "scoped -C writes: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_001
 
 # Case 2: the #777 shape — an unscoped write in a shell script → FAIL.
+hygiene_case_002() {
 run_on_fixture "tests/leaky.sh" '#!/usr/bin/env bash
 cd "$FIX"
 git config user.email "test@example.com"
@@ -79,10 +90,13 @@ if [ "$RC" = "1" ] \
 else
   fail "unscoped user.email in a shell script: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_002
 
 # Case 3: the ACTUAL #777 writer was a documented snippet, not a test —
 # REVIEW_POLICY.md instructed a bare repo-local `git config user.email`
 # with a fixture address, and agents ran it. Markdown must be in scope.
+hygiene_case_003() {
 run_on_fixture "REVIEW_POLICY.md" '# Policy
 
 ```bash
@@ -97,8 +111,11 @@ if [ "$RC" = "1" ] \
 else
   fail "unscoped identity write in Markdown: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_003
 
 # Case 4: `--global` is an out-of-repo scope and is the documented form.
+hygiene_case_004() {
 run_on_fixture "docs/setup.md" '# Setup
 
 ```bash
@@ -111,9 +128,12 @@ if [ "$RC" = "0" ]; then
 else
   fail "--global writes: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_004
 
 # Case 4b: Git accepts the unique long-option prefixes --gl/--sy and up.
 # Scan-only snippets do not write any global or system configuration.
+hygiene_case_005() {
 for SCOPE in --gl --glo --glob --globa --global --sy --sys --syst --syste --system; do
   run_on_fixture "tests/scope-prefix.sh" "git config $SCOPE user.email fixture@example.com
 "
@@ -146,10 +166,13 @@ if [ "$RC" = "1" ]; then
 else
   fail "trailing scope prefix hid writer: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_005
 
 # Case 5: `git -c key=value <cmd>` is an ephemeral per-command override.
 # It writes no file, so it must never be flagged. Note the lowercase -c
 # is a different flag from the -C the check accepts as a repo target.
+hygiene_case_006() {
 run_on_fixture "tests/ephemeral.sh" '#!/usr/bin/env bash
 git -C "$FIX" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m x
 '
@@ -158,8 +181,11 @@ if [ "$RC" = "0" ]; then
 else
   fail "ephemeral git -c overrides: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_006
 
 # Case 6: reads and removals are not identity writes.
+hygiene_case_007() {
 run_on_fixture "tests/reads.sh" '#!/usr/bin/env bash
 who=$(git config --get user.email)
 git config --local --unset user.email
@@ -171,8 +197,11 @@ if [ "$RC" = "0" ]; then
 else
   fail "--get / --unset forms: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_007
 
 # Case 7: signing keys are part of the identity surface.
+hygiene_case_008() {
 run_on_fixture "tests/signing.sh" '#!/usr/bin/env bash
 git config commit.gpgsign false
 git config tag.gpgsign false
@@ -186,8 +215,11 @@ if [ "$RC" = "1" ] \
 else
   fail "unscoped gpgsign / signingkey writes: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_008
 
 # Case 8: a documented exception opts a line out.
+hygiene_case_009() {
 run_on_fixture "tests/exempt.sh" '#!/usr/bin/env bash
 git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: deliberate, runs only in a container
 '
@@ -196,10 +228,13 @@ if [ "$RC" = "0" ]; then
 else
   fail "GIT_IDENTITY_SCOPE_EXEMPT with a reason: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_009
 
 # Case 9: generated PRD mirrors are excluded — a hit there is only
 # fixable at the central docs canonical source, so failing on it would
 # be unactionable in this repo.
+hygiene_case_010() {
 run_on_fixture "docs/projects/mergepath/prds/mergepath.md" '# PRD
 
 ```bash
@@ -211,10 +246,13 @@ if [ "$RC" = "0" ]; then
 else
   fail "generated PRD mirror: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_010
 
 # Case 10: consumers need the SAME scan on repo-owned scripts and policy.
 # Use a real index and the production path, without a fixture-root override,
 # to cover tracked enumeration and the separate hub-suite gate together.
+hygiene_case_011() {
 CONSUMER="$WORKDIR/consumer"
 mkdir -p "$CONSUMER/scripts/ci" "$CONSUMER/tests" "$CONSUMER/docs/projects/app/prds"
 git init -q -b main "$CONSUMER"
@@ -282,11 +320,14 @@ if [ "$RC" = "1" ] && grep -q "regression test suite failed" <<<"$OUT"; then
 else
   fail "hub suite gate: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_011
 
 # Case 10b: the real Git index must preserve names Git normally C-quotes.
 # The copied production check runs markerless; all commands below are scan
 # input, never executed. Clear each writer before probing the next path so
 # a previous finding cannot mask a skipped file.
+hygiene_case_012() {
 PATHS_CONSUMER="$WORKDIR/consumer-paths"
 mkdir -p "$PATHS_CONSUMER/scripts/ci" "$PATHS_CONSUMER/docs" "$PATHS_CONSUMER/tests" "$PATHS_CONSUMER/tools"
 git init -q -b main "$PATHS_CONSUMER"
@@ -328,10 +369,13 @@ for REL in 'docs/résumé.md' $'docs/line\nbreak.md'; do
     fail "fixture pathname skipped: '$REL' rc=$RC out=$OUT"
   fi
 done
+}
+case_pool_add hygiene_case_012
 
 # Case 10c: tracked symlinks name link objects, not source on this machine.
 # Exercise missing, clean and offending external targets in a real index.
 # The companion regular source must still be scanned in every state.
+hygiene_case_013() {
 LINKS_CONSUMER="$WORKDIR/consumer-links"
 mkdir -p "$LINKS_CONSUMER/scripts/ci" "$LINKS_CONSUMER/docs" "$WORKDIR/external-source"
 git init -q -b main "$LINKS_CONSUMER"
@@ -378,11 +422,14 @@ if [ "$RC" = "0" ]; then
 else
   fail "symlinked parent directory followed: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_013
 
 # BEGIN STARTUP_ADMISSION_CONTROLS
 # Case 10d: shell-startup basenames and immediate Husky hook files need no
 # shebang. Exercise every admitted name at root and nested paths through a
 # genuine private Git index, with no root/suite override or hub marker.
+hygiene_case_014() {
 STARTUP_CONSUMER="$WORKDIR/consumer-startup-admission"
 mkdir -p "$STARTUP_CONSUMER/scripts/ci" "$STARTUP_CONSUMER/tests"
 git init -q -b main "$STARTUP_CONSUMER"
@@ -489,12 +536,15 @@ if [ "$RC" = 0 ] && [[ "$OUT" == *"regression test suite skipped (consumer check
   pass "startup/Husky symlink files and symlinked parents retain regular-source boundary"
 else fail "startup/Husky followed external link bytes: rc=$RC out=$OUT"; fi
 # END STARTUP_ADMISSION_CONTROLS
+}
+case_pool_add hygiene_case_014
 
 # Case 11: a backslash continuation between `git` and `config`. Neither
 # physical line matches on its own — the first carries no `config`, the
 # second no `git` — so a line-at-a-time scan waves through exactly the
 # write this check exists to reject. The command is reported at the line
 # the logical command STARTS on.
+hygiene_case_015() {
 run_on_fixture "tests/split-verb.sh" '#!/usr/bin/env bash
 git \
 config user.email "leak@example.com"
@@ -506,9 +556,12 @@ if [ "$RC" = "1" ] \
 else
   fail "continuation between git and config: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_015
 
 # Case 12: the other split — the value moves to the next physical line,
 # so the key is followed by a line continuation rather than a value token.
+hygiene_case_016() {
 run_on_fixture "tests/split-value.sh" '#!/usr/bin/env bash
 git config user.email \
   "leak@example.com"
@@ -519,10 +572,13 @@ if [ "$RC" = "1" ] \
 else
   fail "continuation between key and value: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_016
 
 # Case 12b: backslash-newline deletion happens inside words too. Adding a
 # separator while joining turns this executable `git config` into unrelated
 # `gi t con fig` tokens and makes the static scan pass open.
+hygiene_case_017() {
 run_on_fixture "tests/split-words.sh" '#!/usr/bin/env bash
 gi\
 t con\
@@ -534,10 +590,13 @@ if [ "$RC" = "1" ] \
 else
   fail "intra-word continuation hid identity write: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_017
 
 # Case 13: joining must not invent hits. A continued command whose scope
 # flag sits on its own physical line is correctly scoped and must pass —
 # the suppressors are read off the whole logical command, not one line.
+hygiene_case_018() {
 run_on_fixture "tests/split-global.sh" '#!/usr/bin/env bash
 git config \
   --global \
@@ -548,11 +607,14 @@ if [ "$RC" = "0" ]; then
 else
   fail "continued --global write: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_018
 
 # Case 14: a shell command cannot carry a trailing `#` comment on any
 # physical line but its last, so a multi-line command has nowhere else
 # to put its exemption marker. The marker must therefore exempt the
 # whole logical command, not just the physical line it sits on.
+hygiene_case_019() {
 run_on_fixture "tests/split-exempt.sh" '#!/usr/bin/env bash
 git config user.email \
   "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: deliberate, runs only in a container
@@ -562,11 +624,14 @@ if [ "$RC" = "0" ]; then
 else
   fail "exemption marker on a continued command: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_019
 
 # Case 15: the marker must not bleed across the lines a backslash joins.
 # An exempt write whose line happens to end in `\` swallows the next
 # physical line into its group — but that line is a self-contained
 # unscoped write and nothing exempts it, so it must still be caught.
+hygiene_case_020() {
 run_on_fixture "tests/bleed-first.sh" '#!/usr/bin/env bash
 git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only \
 git config user.email "leak@example.com"
@@ -578,9 +643,12 @@ if [ "$RC" = "1" ] \
 else
   fail "marker bleeding forward across a join: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_020
 
 # Case 16: the same in the other order — the marker arriving LATER in the
 # group must not reach back and exempt the write that opened it.
+hygiene_case_021() {
 run_on_fixture "tests/bleed-second.sh" '#!/usr/bin/env bash
 git config user.email "leak@example.com" \
 git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only
@@ -592,10 +660,13 @@ if [ "$RC" = "1" ] \
 else
   fail "marker bleeding backward across a join: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_021
 
 # Case 17: Markdown is where an accidental join is easiest to arrange —
 # a trailing `\` is a hard line break there, not a shell continuation, so
 # an exempt example can end in one with a live write on the next line.
+hygiene_case_022() {
 run_on_fixture "docs/bleed.md" '# Doc
 
     git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only \
@@ -607,10 +678,13 @@ if [ "$RC" = "1" ] \
 else
   fail "marker bleeding across a Markdown hard break: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_022
 
 # Case 18: a group holding more than one offending physical line reports
 # EVERY one of them. Listing only the first hands an operator one line to
 # fix, after which the re-run fails on the next.
+hygiene_case_023() {
 run_on_fixture "tests/two-hits.sh" '#!/usr/bin/env bash
 git config user.email "leak1@example.com" \
 git config user.name "leak2"
@@ -622,12 +696,15 @@ if [ "$RC" = "1" ] \
 else
   fail "joined group reporting only its first offender: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_023
 
 # Case 19: a suppressor belongs to the command it was typed on, not to
 # the line. Every predicate in the scan is a substring test, so a line
 # holding two commands lets the first answer for the second: a targeted
 # `-C` read followed by an untargeted write, or a `--get` read followed
 # by a write, is the #777 shape with a harmless neighbour in front of it.
+hygiene_case_024() {
 run_on_fixture "tests/multi-command.sh" '#!/usr/bin/env bash
 git -C "$FIX" status && git config user.email "leak@example.com"
 who=$(git config --get user.email); git config user.name "leak2"
@@ -640,10 +717,13 @@ if [ "$RC" = "1" ] \
 else
   fail "earlier-command suppressor masking a later write: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_024
 
 # Case 20: the converse — cutting at separators must not invent hits.
 # Each of these commands carries its OWN target or out-of-repo scope, so
 # every piece is clean on its own and the line must pass.
+hygiene_case_025() {
 run_on_fixture "tests/multi-command-clean.sh" '#!/usr/bin/env bash
 git -C "$FIX" config user.email "t@t" && git -C "$FIX" config user.name "t"
 git config --global user.email "you@example.com"; git config --global user.name "You"
@@ -654,6 +734,8 @@ if [ "$RC" = "0" ]; then
 else
   fail "separators inventing a hit: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_025
 
 # Case 21: a value that starts with a PATH character. Recognising the
 # value token by an allow-list of letters, digits, quotes and `$` waves
@@ -661,6 +743,7 @@ fi
 # that decides which key signs every commit this repo makes, is
 # overwhelmingly given a path. All three of these are ordinary
 # repo-local writes of a checked key.
+hygiene_case_026() {
 run_on_fixture "tests/path-value.sh" '#!/usr/bin/env bash
 git config user.signingkey ~/.ssh/id_ed25519.pub
 git config user.signingkey /tmp/key.pub
@@ -674,10 +757,13 @@ if [ "$RC" = "1" ] \
 else
   fail "path-valued signingkey writes: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_026
 
 # Case 22: the converse of case 21 — widening the value token must not
 # turn reads into hits. What follows the key on each of these lines is
 # a comment, a redirection or a closing substitution, not a value.
+hygiene_case_027() {
 run_on_fixture "tests/not-values.sh" '#!/usr/bin/env bash
 git config user.email  # which address is this repo using?
 git config user.email > /tmp/who
@@ -689,10 +775,13 @@ if [ "$RC" = "0" ]; then
 else
   fail "non-value token after the key: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_027
 
 # Case 22b: one literal post-key > / >> target is shell data, not the
 # assignment value. Use the real production index without root/suite
 # overrides; the copied hub suite stays present but marker-gated.
+hygiene_case_028() {
 REDIRECT_CONSUMER="$WORKDIR/consumer-redirection"
 mkdir -p "$REDIRECT_CONSUMER/scripts/ci" "$REDIRECT_CONSUMER/tests"
 git init -q -b main "$REDIRECT_CONSUMER"
@@ -730,6 +819,8 @@ done <<'REDIRECT_CASES'
 0|expansion target gains no coverage guarantee|git config user.email >"$SINK" leak@example.com
 0|multiple redirections gain no coverage guarantee|git config user.email >/dev/null >>sink leak@example.com
 REDIRECT_CASES
+}
+case_pool_add hygiene_case_028
 
 # Case 23: case 19 in Markdown. A prose sentence carries no shell
 # separator, so the whole paragraph arrives as ONE piece and a `--global`
@@ -737,6 +828,7 @@ REDIRECT_CASES
 # inverts the guard where it matters most: the correct form is exactly
 # what a doc puts next to the wrong one, so writing the rule down is what
 # silences it. Backticks are cut on in Markdown for this reason.
+hygiene_case_029() {
 run_on_fixture "docs/prose.md" '# Identity
 
 Use `git config --global user.email you@example.com`, never `git config user.email you@example.com`.
@@ -747,10 +839,13 @@ if [ "$RC" = "1" ] \
 else
   fail "prose --global example suppressing the write beside it: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_029
 
 # Case 24: the converse of case 23 — the code-span cut must not invent
 # hits. Each span here is individually scoped, and the prose between them
 # is not part of any command.
+hygiene_case_030() {
 run_on_fixture "docs/prose-clean.md" '# Identity
 
 Run `git config --global user.email you@example.com`, or `git -C "$FIX" config user.email t@t` for a fixture.
@@ -760,6 +855,8 @@ if [ "$RC" = "0" ]; then
 else
   fail "code-span cut inventing a hit in prose: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_030
 
 # Case 25: a doc that DESCRIBES the marker must not be exempted by
 # describing it. The marker regex matched a mention anywhere on the line,
@@ -767,6 +864,7 @@ fi
 # one place in the tree whose job is to write the forbidden shape down
 # the one place that was never scanned. A mention inside a code span is a
 # citation; a real marker sits outside the spans.
+hygiene_case_031() {
 run_on_fixture "docs/describes-marker.md" '# Identity
 
 A deliberate exception carries `GIT_IDENTITY_SCOPE_EXEMPT: <reason>`, as in `git config user.email you@example.com`.
@@ -777,11 +875,14 @@ if [ "$RC" = "1" ] \
 else
   fail "prose mention of the marker exempting a live write: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_031
 
 # Case 26: the converse of case 25 — a real Markdown marker still works.
 # An HTML comment is the documented spelling: it sits outside the code
 # spans and renders invisibly, which is what
 # docs/audits/git-identity-leak-2026-07.md uses to quote the #777 writer.
+hygiene_case_032() {
 run_on_fixture "docs/real-marker.md" '# Identity
 
 The writer was `git config user.email nathan@nathanjohnpayne.example`. <!-- GIT_IDENTITY_SCOPE_EXEMPT: verbatim quote, recorded as evidence -->
@@ -791,10 +892,13 @@ if [ "$RC" = "0" ]; then
 else
   fail "real Markdown marker not honoured: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_032
 
 # Case 26b: the policy must not ship runnable global writes carrying fixture
 # placeholders. A reader pasting them would replace the machine-wide human
 # author identity, and the local-identity guard intentionally cannot catch it.
+hygiene_case_033() {
 if ! grep -Eq '^[[:space:]]*git config --global user\.(name|email)[[:space:]]+.*(Your Name|you@example\.com)' \
      "$ROOT/REVIEW_POLICY.md" \
   && grep -qF 'verified machine setup' "$ROOT/REVIEW_POLICY.md"; then
@@ -802,6 +906,8 @@ if ! grep -Eq '^[[:space:]]*git config --global user\.(name|email)[[:space:]]+.*
 else
   fail "REVIEW_POLICY.md still publishes executable global placeholder identity writes"
 fi
+}
+case_pool_add hygiene_case_033
 
 # Case 26c: #865's "Superseded CHANGES_REQUESTED reviews" precondition
 # (REVIEW_POLICY.md § Real-Time Per-Finding Disposition) must match the
@@ -816,6 +922,7 @@ fi
 # dismissible the instant a reply lands. Losing either half re-opens the
 # short-circuit § No-self-approve scoping exists to prevent: dismissing a
 # cross-agent CHANGES_REQUESTED review the reviewer never accepted.
+hygiene_case_034() {
 if grep -qF 'fixed with the commit pushed, or rebutted/deferred with the record posted' "$ROOT/REVIEW_POLICY.md"; then
   pass "#865: dismissal precondition names fixed/rebutted/deferred with the record posted"
 else
@@ -831,9 +938,12 @@ if grep -qF '(fixed-and-pushed, or rebutted on-thread)' "$ROOT/REVIEW_POLICY.md"
 else
   pass "#865: pre-fix permissive precondition wording ('fixed-and-pushed, or rebutted on-thread') is gone"
 fi
+}
+case_pool_add hygiene_case_034
 
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
+hygiene_case_035() {
 IDREPO="$WORKDIR/idrepo"
 git init -q -b main "$IDREPO"
 printf '#!/usr/bin/env bash\n' > "$IDREPO/marker.sh"
@@ -1259,6 +1369,8 @@ if [ "$RC" = "1" ] \
 else
   fail "mutated .git/config: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_035
 
 # ── Part B, --verify: the per-shard closing form (#2163) ───────────────
 
@@ -1269,6 +1381,7 @@ fi
 # scanned the tree or ran the suite is visible as either a hit or a file.
 # The contrast run proves the fixture is not vacuous: the plain call on
 # the same tree DOES fail on the offender.
+hygiene_case_036() {
 VERIFY_REPO="$WORKDIR/verify-repo"
 git init -q -b main "$VERIFY_REPO"
 mkdir -p "$VERIFY_REPO/scripts"
@@ -1319,9 +1432,12 @@ if [ "$RC" = "1" ] \
 else
   fail "--verify missed a config write: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_036
 
 # Case 39x: `--verify` still runs Part A. The override is written BEFORE
 # the snapshot so Part B is clean and only the live assertion can fail.
+hygiene_case_037() {
 VERIFY_IDREPO="$WORKDIR/verify-identity-repo"
 git init -q -b main "$VERIFY_IDREPO"
 git -C "$VERIFY_IDREPO" config --local user.email "verify-local@example.com"
@@ -1338,10 +1454,13 @@ if [ "$RC" = "1" ] \
 else
   fail "--verify skipped Part A: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_037
 
 # Case 39y: `--verify` with no snapshot fails closed. A shard whose
 # snapshot step never recorded a baseline has nothing to compare, and a
 # verify that passed over that would bless the shard with no evidence.
+hygiene_case_038() {
 VERIFY_NOSNAP="$WORKDIR/verify-nosnapshot-repo"
 git init -q -b main "$VERIFY_NOSNAP"
 set +e
@@ -1355,9 +1474,12 @@ if [ "$RC" = "1" ] \
 else
   fail "--verify passed with nothing to compare against: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_038
 
 # Case 39z: and the same when the snapshot was requested but its baseline
 # is gone — Part B's own fail-closed arm, reached through --verify.
+hygiene_case_039() {
 VERIFY_GONE="$WORKDIR/verify-baseline-gone-repo"
 git init -q -b main "$VERIFY_GONE"
 MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_GONE" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -1373,10 +1495,13 @@ if [ "$RC" = "1" ] \
 else
   fail "--verify forgot a requested comparison: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_039
 
 # Case 39b: linked worktrees share `.git/config` but must not share the
 # snapshot slot. Otherwise worktree B can overwrite worktree A's baseline
 # after a mutation, causing A's later comparison to bless the changed config.
+hygiene_case_040() {
 MULTI_REPO="$WORKDIR/multi-worktree-repo"
 MULTI_B="$WORKDIR/multi-worktree-b"
 git init -q -b main "$MULTI_REPO"
@@ -1399,6 +1524,8 @@ if [ "$RC" = "1" ] \
 else
   fail "linked worktree snapshot overwrote another baseline: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_040
 
 # ── Post-suite re-assertion ───────────────────────────────────────────
 # Parts A and B finish before the paired regression suite runs, and the
@@ -1408,6 +1535,7 @@ fi
 # claims to cover. MERGEPATH_GIT_IDENTITY_SUITE substitutes a stub suite
 # that does exactly that.
 
+hygiene_case_041() {
 STUB_SUITE="$WORKDIR/stub-suite.sh"
 cat > "$STUB_SUITE" <<'EOF'
 #!/usr/bin/env bash
@@ -1434,9 +1562,12 @@ if [ "$RC" = "1" ] \
 else
   fail "post-suite baseline comparison: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_041
 
 # Case 41: a suite that writes an identity key is caught by the
 # post-suite live-repo assertion, even with no baseline recorded.
+hygiene_case_042() {
 IDENTSTUB="$WORKDIR/stub-suite-identity.sh"
 cat > "$IDENTSTUB" <<'EOF'
 #!/usr/bin/env bash
@@ -1457,8 +1588,11 @@ if [ "$RC" = "1" ] \
 else
   fail "post-suite identity assertion: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_042
 
 # Case 42: the post-suite pass must not turn a clean suite red.
+hygiene_case_043() {
 CLEANSTUB="$WORKDIR/stub-suite-clean.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$CLEANSTUB"
 CLEANREPO="$WORKDIR/cleanrepo"
@@ -2469,6 +2603,8 @@ if [ "$RC" = "0" ] \
 else
   fail "metadata assertion firing on a non-repository: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_043
 
 # Case 62: the check cleans up its own scratch files, on the failure path
 # as much as the passing one. They are registered in one list with one
@@ -2477,6 +2613,7 @@ fi
 # happens in a subshell that exits immediately, leaving the parent with an
 # empty list and every file on disk. TMPDIR is repointed at a scratch
 # directory so the assertion sees only this invocation's files.
+hygiene_case_044() {
 LEAKTMP="$WORKDIR/leaktmp"
 LEAKTREE="$WORKDIR/leaktree"
 mkdir -p "$LEAKTMP" "$LEAKTREE/scripts" "$LEAKTREE/tests"
@@ -2493,6 +2630,8 @@ if [ "$RC" = "1" ] && [ "$LEFTOVER" = "0" ]; then
 else
   fail "scratch files left behind: rc=$RC leftover=$LEFTOVER"
 fi
+}
+case_pool_add hygiene_case_044
 
 # ── Fail-closed: a snapshot whose subject was deleted (#803) ───────────
 
@@ -2505,6 +2644,7 @@ fi
 # destroyed the very thing it was asserting about. The marker is asserted
 # to live outside `.git` and to survive its deletion, because that is what
 # leaves anything behind for the final run to fail on.
+hygiene_case_045() {
 SNAPGONE_REPO="$WORKDIR/snapshot-subject-gone-repo"
 git init -q -b main "$SNAPGONE_REPO"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPGONE_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2527,10 +2667,13 @@ if [ "$RC" = "1" ] \
 else
   fail "deleted checkout blessed after --snapshot: under_git=$MARKER_UNDER_GIT kept=$MARKER_KEPT rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_045
 
 # Case 63b: the converse — the branch above fires on a missing SUBJECT, not
 # on the mere presence of a recorded snapshot. An intact checkout still
 # reports the ordinary unchanged-since-snapshot result.
+hygiene_case_046() {
 SNAPOK_REPO="$WORKDIR/snapshot-subject-intact-repo"
 git init -q -b main "$SNAPOK_REPO"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2546,6 +2689,8 @@ if [ "$RC" = "0" ] \
 else
   fail "intact snapshotted checkout: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_046
 
 # Case 63c: keeping the request in the working tree also means it travels
 # with a COPY of that tree, while the baseline it refers to — which lives in
@@ -2558,6 +2703,7 @@ fi
 # the resulting failure reds every consumer's repo-lint. The request names
 # the config it was taken from, so the copy is recognisable as somebody
 # else's and left alone.
+hygiene_case_047() {
 SNAPSRC_REPO="$WORKDIR/snapshot-copy-source-repo"
 git init -q -b main "$SNAPSRC_REPO"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPSRC_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2579,11 +2725,14 @@ if [ "$RC" = "0" ] \
 else
   fail "copied snapshot request failed a checkout nobody snapshotted: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_047
 
 # Case 63d: the converse, so recognising a foreign request cannot have been
 # implemented by ignoring requests generally. In the checkout the snapshot
 # was actually taken in, removing the baseline while the request stands is
 # still the missing-evidence failure it was before.
+hygiene_case_048() {
 SNAPOWN_REPO="$WORKDIR/snapshot-own-baseline-gone-repo"
 git init -q -b main "$SNAPOWN_REPO"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2599,6 +2748,8 @@ if [ "$RC" = "1" ] \
 else
   fail "own request with a deleted baseline was waved through: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_048
 
 # Case 63e: the marker records a config PATH, and a filesystem path may
 # contain a newline. Framed by newline, the recorded path split across two
@@ -2606,6 +2757,7 @@ fi
 # checkout failed to recognise its OWN request, reported it as somebody
 # else's, and returned PASS on the deleted baseline that case 63d fails
 # on. Fail-open, on a path the filesystem accepts.
+hygiene_case_049() {
 SNAPNL_REPO="$WORKDIR/snapshot-newline"$'\n'"path-repo"
 git init -q -b main "$SNAPNL_REPO"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2621,6 +2773,8 @@ if [ "$RC" = "1" ] \
 else
   fail "newline-path marker read as a foreign request: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_049
 
 # Case 63f: the copy case 63c covers with the git dir it does NOT have.
 # `tests/test_repo_lint_consumer_safety.sh` rsyncs this working tree with
@@ -2630,6 +2784,7 @@ fi
 # have a marker and no resolvable config — and claimed it, reporting a
 # checkout nobody snapshotted as one whose metadata had been destroyed.
 # That reds every consumer's repo-lint through the fixture.
+hygiene_case_050() {
 SNAPNR_SRC="$WORKDIR/snapshot-nonrepo-source-repo"
 git init -q -b main "$SNAPNR_SRC"
 MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_SRC" bash "$CHECK" --snapshot >/dev/null 2>&1
@@ -2649,12 +2804,15 @@ if [ "$RC" = "0" ] \
 else
   fail "inherited request failed a non-repository fixture: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_050
 
 # Case 63g: the marker path is WORKING-TREE content now, so a pull request
 # can make its directory a symlink. `>` follows one, which would turn
 # `--snapshot` — the job's FIRST repo_lint step, before this check has
 # asserted anything — into a write to whatever the link names. The old
 # `.git`-local path was not checkout-controlled and had nothing to refuse.
+hygiene_case_051() {
 SNAPLINK_REPO="$WORKDIR/snapshot-symlinked-state-repo"
 git init -q -b main "$SNAPLINK_REPO"
 SNAPLINK_TARGET="$WORKDIR/snapshot-symlink-target"
@@ -2671,9 +2829,12 @@ if [ "$RC" = "1" ] \
 else
   fail "snapshot wrote through a symlinked state dir: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_051
 
 # Case 63h: the converse — refusing a link cannot have been implemented by
 # refusing the ordinary case. A real directory still records normally.
+hygiene_case_052() {
 SNAPPLAIN_REPO="$WORKDIR/snapshot-plain-state-repo"
 git init -q -b main "$SNAPPLAIN_REPO"
 set +e
@@ -2687,6 +2848,8 @@ if [ "$RC" = "0" ] \
 else
   fail "ordinary snapshot refused: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_052
 
 # ── Newline-safe include-target collection (#804) ──────────────────────
 
@@ -2695,6 +2858,7 @@ fi
 # one such file into two entries that named nothing; neither existed, both
 # were dropped by the file test, and the dormant identity behind it was
 # never inspected — free to reactivate the moment its condition matched.
+hygiene_case_053() {
 NLREPO="$WORKDIR/newline-include-repo"
 git init -q -b main "$NLREPO"
 NL_INCLUDE="$NLREPO/.git/dormant"$'\n'"identity"
@@ -2719,6 +2883,8 @@ if [ "$RC" = "1" ] \
 else
   fail "newline include target escaped the walk: rc=$RC remedy='$REMEDY' left='$NL_LEFT' after=$RC_AFTER out=$OUT after_out=$OUT_AFTER"
 fi
+}
+case_pool_add hygiene_case_053
 
 # Case 64c: the same filename shape with the newline LAST. Case 64's name
 # carries its newline in the middle, which survives a command substitution;
@@ -2726,6 +2892,7 @@ fi
 # canonicalised target came back one byte short, the file test asked about
 # a name no file has, and the identity behind it was dropped exactly as
 # before the newline-safe collection was written.
+hygiene_case_054() {
 NLTREPO="$WORKDIR/newline-tail-include-repo"
 git init -q -b main "$NLTREPO"
 NLT_INCLUDE="$NLTREPO/.git/dormant-identity"$'\n'
@@ -2742,6 +2909,8 @@ if [ "$RC" = "1" ] \
 else
   fail "trailing-newline include target escaped the walk: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_054
 
 # Case 64d: the same filename shape reached by an ACTIVE include, which is
 # seen twice — once by the scope read (as an origin) and once by the walk.
@@ -2749,6 +2918,7 @@ fi
 # only the walk's half lossless, the truncated origin matched nothing, one
 # override was reported twice, and the first `--file` remediation named a
 # path no file has.
+hygiene_case_055() {
 NLTA_REPO="$WORKDIR/newline-tail-active-include-repo"
 git init -q -b main "$NLTA_REPO"
 NLTA_INCLUDE="$NLTA_REPO/.git/active-identity"$'\n'
@@ -2764,12 +2934,15 @@ if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ]; then
 else
   fail "trailing-newline active include double-reported: entries=$N_ENTRIES rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_055
 
 # Case 64b: two `includeIf` entries pointing at the SAME target still yield
 # one entry and one remediation. The dedupe moved from a substring test
 # over joined text to an element comparison over an array, and an array
 # whose membership test is wrong duplicates instead of losing — the failure
 # in the opposite direction, and just as visible to an operator.
+hygiene_case_056() {
 DEDUPE_INC_REPO="$WORKDIR/dedupe-include-repo"
 git init -q -b main "$DEDUPE_INC_REPO"
 printf '[user]\n\temail = deduped@example.com\n' > "$DEDUPE_INC_REPO/.git/shared-identity"
@@ -2786,6 +2959,8 @@ if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ]; then
 else
   fail "duplicate include-target reporting: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_056
 
 # ── Precision: the protected keys are COMPLETE keys (#805) ─────────────
 
@@ -2795,6 +2970,7 @@ fi
 # git config keys, none of them protected and none of them touching commit
 # attribution, and every one of them was reported as a write to the key it
 # merely ends with.
+hygiene_case_057() {
 run_on_fixture "tests/suffix-keys.sh" '#!/usr/bin/env bash
 git config notuser.email "not-protected@example.com"
 git config precommit.gpgsign false
@@ -2806,10 +2982,13 @@ if [ "$RC" = "0" ]; then
 else
   fail "suffix-sharing config keys falsely flagged: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_057
 
 # Case 65b: the converse, so anchoring the pattern cannot have been
 # achieved by turning the scan off. Suffix-sharing keys sit either side of
 # a real write, and only the real write is reported.
+hygiene_case_058() {
 run_on_fixture "tests/suffix-mixed.sh" '#!/usr/bin/env bash
 git config notuser.email "not-protected@example.com"
 git config user.email "leak@example.com"
@@ -2823,12 +3002,15 @@ if [ "$RC" = "1" ] \
 else
   fail "mixed suffix/protected keys: hits=$N_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_058
 
 # Case 65c: the same mix inside ONE logical command. The line is cut at
 # shell separators and each piece judged alone, so the suffix key must not
 # stand in for the protected one in either direction: the write is still
 # reported, and the piece that only carries a suffix key contributes
 # nothing of its own.
+hygiene_case_059() {
 run_on_fixture "tests/suffix-same-line.sh" '#!/usr/bin/env bash
 git config retag.gpgsign false && git config user.email "leak@example.com"
 git config precommit.gpgsign false && git config notuser.email "not-protected@example.com"
@@ -2841,6 +3023,8 @@ if [ "$RC" = "1" ] \
 else
   fail "same-line suffix/protected mix: hits=$N_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_059
 
 # Case 65d: a git config SUBSECTION accepts any byte, so a key can end in
 # a protected key behind a separator no character class can call a
@@ -2848,6 +3032,7 @@ fi
 # and leaves `git config --get user.email` unset (git 2.50.1); the `:`
 # spelling behaves the same. Neither is a write to a protected key, and
 # neither may red repo_lint.
+hygiene_case_060() {
 run_on_fixture "tests/subsection-keys.sh" '#!/usr/bin/env bash
 git config foo.bar/user.email "not-protected@example.com"
 git config foo.bar:user.email "not-protected@example.com"
@@ -2860,9 +3045,12 @@ if [ "$RC" = "0" ]; then
 else
   fail "subsection-qualified config keys falsely flagged: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_060
 
 # Case 65e: the converse, so the word boundary cannot have been achieved
 # by narrowing the scan away from real writes standing beside one.
+hygiene_case_061() {
 run_on_fixture "tests/subsection-mixed.sh" '#!/usr/bin/env bash
 git config foo.bar/user.email "not-protected@example.com"
 git config user.email "leak@example.com"
@@ -2876,11 +3064,14 @@ if [ "$RC" = "1" ] \
 else
   fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_061
 
 # Case 65h: the key may be QUOTED as a whole word. The shell removes the
 # quotes and Git is handed the protected key, so the write happens; the
 # closing quote is also what stands between the key and the whitespace the
 # matcher requires after it, so both ends have to be admitted together.
+hygiene_case_062() {
 run_on_fixture "tests/quoted-key.sh" '#!/usr/bin/env bash
 git config "user.email" "leak@example.com"
 git config '"'"'commit.gpgsign'"'"' false
@@ -2891,10 +3082,13 @@ if [ "$RC" = "1" ] && [ "$N_HITS" -eq 2 ]; then
 else
   fail "quoted protected key missed: hits=$N_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_062
 
 # Case 65i: the converse. Admitting a quote PAIR must not admit a quote
 # anywhere — a subsection-qualified key inside quotes is still not a write
 # to a protected key, and an unterminated word is not one Git ever receives.
+hygiene_case_063() {
 run_on_fixture "tests/quoted-subsection-keys.sh" '#!/usr/bin/env bash
 git config "foo.bar/user.email" "not-protected@example.com"
 git config '"'"'a.b:commit.gpgsign'"'"' true
@@ -2904,12 +3098,15 @@ if [ "$RC" = "0" ]; then
 else
   fail "quoted subsection keys falsely flagged: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_063
 
 # Case 65j: the key may be quoted in PART, not just as a whole word or
 # not at all (#921). The shell still delivers the protected key to Git
 # once its quote characters are removed, in any of these three shapes:
 # a quote around a trailing segment, a quote around a leading segment,
 # and a quote that splits a single segment in two.
+hygiene_case_064() {
 run_on_fixture "tests/partially-quoted-key.sh" '#!/usr/bin/env bash
 git config user.'"'"'email'"'"' "leak@example.com"
 git config "user".email "leak2@example.com"
@@ -2921,11 +3118,14 @@ if [ "$RC" = "1" ] && [ "$N_PARTIAL_HITS" -eq 3 ]; then
 else
   fail "partially-quoted protected key missed: hits=$N_PARTIAL_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_064
 
 # Case 65k: the converse of 65j — a subsection-qualified key must not
 # start over-matching just because dequoting now happens per-word. The
 # quotes here still fall inside a word whose dequoted form carries the
 # `foo.bar/` subsection prefix, so it never equals the bare protected key.
+hygiene_case_065() {
 run_on_fixture "tests/partially-quoted-subsection.sh" '#!/usr/bin/env bash
 git config foo.bar/us"er".email "not-protected@example.com"
 '
@@ -2934,12 +3134,15 @@ if [ "$RC" = "0" ]; then
 else
   fail "partially-quoted subsection key falsely flagged: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_065
 
 # Case 65g: a shell escape may stand between the boundary and the key.
 # `git config \user.email x` writes the identity — the shell drops the
 # backslash and Git is handed `user.email` — while the word as written does
 # not begin with `u`. A word boundary that admits nothing between itself
 # and the key reads this as no write at all.
+hygiene_case_066() {
 run_on_fixture "tests/escaped-key.sh" '#!/usr/bin/env bash
 git config \user.email "leak@example.com"
 '
@@ -2949,12 +3152,15 @@ if [ "$RC" = "1" ] \
 else
   fail "escaped protected key missed: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_066
 
 # Case 65l: the escape may stand INSIDE the key, not just before it
 # (CodeRabbit, #1011). The shell removes an unquoted backslash escape at
 # any position in the word, so `git config us\er.email x` hands Git
 # `user.email` too — a rule that only stripped a single LEADING
 # backslash missed this one.
+hygiene_case_067() {
 run_on_fixture "tests/internally-escaped-key.sh" '#!/usr/bin/env bash
 git config us\er.email "leak@example.com"
 '
@@ -2964,6 +3170,8 @@ if [ "$RC" = "1" ] \
 else
   fail "internally-escaped protected key missed: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_067
 
 # Case 65m: dequoting follows the shell, so an UNMATCHED quote is not
 # removed (Codex P2 on #1011). `git config "user.email leak@example.com`
@@ -2973,6 +3181,7 @@ fi
 # not reported, while the genuine partially-quoted write below them,
 # which this scanner exists to catch, still is. Exactly one hit, on the
 # genuine line.
+hygiene_case_068() {
 run_on_fixture "tests/unmatched-quote-key.sh" '#!/usr/bin/env bash
 git config "user.email leak@example.com
 git config '"'"'user.email leak2@example.com
@@ -2986,9 +3195,12 @@ if [ "$RC" = "1" ] \
 else
   fail "unmatched-quote dequoting wrong: hits=$N_UNMATCHED_HITS rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_068
 
 # Case 65n: literal Git executable words dequote exactly, without expanding
 # variables or guessing executable lookup. All snippets below are scan input.
+hygiene_case_069() {
 for GIT_WORD in 'g\it' 'gi\t' 'g"i"t' "g'it'" '/usr/bin/g\it'; do
   run_on_fixture "tests/literal-git.sh" "$GIT_WORD config user.email leak@example.invalid
 "
@@ -3014,8 +3226,11 @@ for GIT_WORD in "'g\it'" '"g\it"' 'notgit' 'git-helper' '$GIT'; do
     fail "non-Git word overmatched: '$GIT_WORD' rc=$RC out=$OUT"
   fi
 done
+}
+case_pool_add hygiene_case_069
 
 # Case 65o: quoted/escaped command separators before config are option data.
+hygiene_case_070() {
 for VALUE in "'a;b'" '"a&b"' "'a|b'" 'a\;b' '"a ; b"'; do
   run_on_fixture "tests/quoted-option.sh" "git -c foo.bar=$VALUE config user.email leak@example.invalid
 "
@@ -3054,9 +3269,12 @@ if [ "$RC" = "1" ]; then
 else
   fail "Markdown spans merged through quoted option: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_070
 
 # Case 65r: scope/read spellings inside complete option-value words are
 # data. Paired real options still exempt, including quoted option tokens.
+hygiene_case_071() {
 for FLAG in --global --system --get --get-all --list --unset --unset-all --remove-section --rename-section; do
   for QUOTE in "'" '"'; do
     run_on_fixture "tests/quoted-flag-data.sh" "git -c foo.bar=${QUOTE}a; $FLAG b${QUOTE} config user.email leak@example.invalid
@@ -3111,9 +3329,12 @@ if [ "$RC" = "1" ]; then
 else
   fail "option data after terminator exempted writer: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_071
 
 # Case 65s: prose punctuation cannot supply shell quote state before Git.
 # Keep argument quotes and independent command/code-span boundaries intact.
+hygiene_case_072() {
 for SOURCE in \
   "If you can't, run git config user.email leak@example.invalid" \
   'Use "git config user.email leak@example.invalid"' \
@@ -3222,9 +3443,12 @@ if [ "$RC" = "1" ]; then
 else
   fail "quoted option data in span hid writer: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_072
 
 # Case 65s1: a literal colon may precede a complete prose Git instruction.
 # Keep option operands, complete words, scopes, spans and genuine markers.
+hygiene_case_073() {
 while IFS='|' read -r EXPECTED LABEL SOURCE; do
   run_on_fixture docs/colon-instruction.md "$SOURCE
 "
@@ -3248,8 +3472,11 @@ done <<'COLON_CASES'
 0|unrelated executable suffix is not Git|Run:mygit config user.email leak@example.com
 0|unprotected complete key remains allowed|Run:git config notuser.email leak@example.com
 COLON_CASES
+}
+case_pool_add hygiene_case_073
 
 # Case 65t: a standalone Git mention cannot anchor a later prose command.
+hygiene_case_074() {
 for PREFIX in \
   "Use git if you can't, then " \
   "Use git status if you can't, then " \
@@ -3307,9 +3534,12 @@ for SPAN in '`' '``'; do
     fi
   done
 done
+}
+case_pool_add hygiene_case_074
 
 # Case 65u: literal targets, opaque substitution operands and complete
 # Markdown delimiters retain the same instruction/exemption boundaries.
+hygiene_case_075() {
 for OPENER in '<!-->' '<!--->'; do
   run_on_fixture "docs/short-html-marker.md" "git config user.email leak@example.invalid $OPENER GIT_IDENTITY_SCOPE_EXEMPT: literal -->
 "
@@ -3430,8 +3660,11 @@ for SOURCE in \
     fail "real equal-width comment rejected: source='$SOURCE' rc=$RC out=$OUT"
   fi
 done
+}
+case_pool_add hygiene_case_075
 
 # Case 65x: complete literal config words and effective known selectors.
+hygiene_case_076() {
 for CONFIG_WORD in 'c\onfig' 'con"fig"' "'config'"; do
   for REL in tests/literal-config.sh docs/literal-config.md; do
     run_on_fixture "$REL" "git $CONFIG_WORD user.email leak@example.invalid
@@ -3489,8 +3722,11 @@ for SOURCE in \
     fail "retained selector/data rejected: source='$SOURCE' rc=$RC out=$OUT"
   fi
 done
+}
+case_pool_add hygiene_case_076
 
 # Case 65y: only an open ordinary substitution gains physical continuation.
+hygiene_case_077() {
 for SOURCE in \
   $'git -c foo.bar=$(printf a\nprintf b) config user.email leak@example.invalid' \
   $'git -c foo.bar="$(printf a\nprintf b)" config user.email leak@example.invalid' \
@@ -3627,10 +3863,13 @@ run_on_fixture tests/body-comment-printed-data.sh $'value=$(\nprintf "%s" "# som
 if [ "$RC" = 0 ]; then pass "quoted printed comment/command data does not become an instruction"; else
   fail "printed comment data became instruction: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_077
 
 # Case 65y1: literal env split-string admission reuses known interpreters.
 # Source is scan-only; neither a shebang nor its dynamic operands executes.
 # Keep a real index, the authentic paired suite and consumer marker gate.
+hygiene_case_078() {
 ENV_CONSUMER="$WORKDIR/consumer-env-split"
 mkdir -p "$ENV_CONSUMER/scripts/ci" "$ENV_CONSUMER/tests"
 git init -q -b main "$ENV_CONSUMER"
@@ -3683,8 +3922,11 @@ done <<'ENV_SPLIT_CASES'
 0|#!/usr/bin/env -Spython|git config user.email leak@example.com
 0|#!/usr/bin/notenv -Sbash|git config user.email leak@example.com
 ENV_SPLIT_CASES
+}
+case_pool_add hygiene_case_078
 
 # Case 65z: owner-ratified Bats admission is bounded to .bats/env-bats.
+hygiene_case_079() {
 for REL in tests/setup.bats tests/setup.BATS tests/setup; do
   run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
   if [ "$RC" = 1 ] && grep -q "$REL:3" <<<"$OUT"; then pass "Bats extension/shebang admits literal fixture setup"; else
@@ -3703,8 +3945,11 @@ run_on_fixture tests/other $'#!/usr/bin/env batsman\ngit config user.email fixtu
 if [ "$RC" = 0 ]; then pass "Bats admission does not match arbitrary interpreter suffixes"; else
   fail "Bats interpreter matcher broadened: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_079
 
 # Case 65aa: a shell-file marker belongs to its terminating command.
+hygiene_case_080() {
 for SEP in ';' '&&' '||' '&' '|'; do
   for LAST in 'echo ok' 'git config --get user.email' 'git -C "$FIX" config user.name fixture'; do
     run_on_fixture tests/command-marker-neighbour.sh "git config user.email leak@example.invalid $SEP $LAST # GIT_IDENTITY_SCOPE_EXEMPT: last command only
@@ -3781,9 +4026,12 @@ for SOURCE in \
     fail "later substitution marker widened: source='$SOURCE' rc=$RC out=$OUT"
   fi
 done
+}
+case_pool_add hygiene_case_080
 
 # Case 65aa1: equal-width spans retain marker-data context across physical
 # lines only inside the existing inline block. An unmatched opener is text.
+hygiene_case_081() {
 for SPAN in '`' '``' '```'; do
   run_on_fixture docs/crossline-marker.md "Paragraph ${SPAN}marker citation
 <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\`
@@ -3877,9 +4125,12 @@ for CONTROL in crossline same-line genuine-comment; do
     pass "real tracked-index span control: $CONTROL"
   else fail "tracked-index span control: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
 done
+}
+case_pool_add hygiene_case_081
 
 # Case 65aa1b: owner-admitted literal repairs after the bounded contract review.
 # Every SOURCE below is inert scanner input, never an executed command.
+hygiene_case_082() {
 for SOURCE in \
   '**git config user.email fixture@example.invalid**' \
   '<code>git config user.email fixture@example.invalid</code>' \
@@ -4221,10 +4472,13 @@ for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-
     pass "real tracked-index literal repair/control: $CONTROL"
   else fail "tracked-index literal repair: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
 done
+}
+case_pool_add hygiene_case_082
 
 # Case 65aa1: omitted blockquote markers can lazily continue the same
 # paragraph. Complete equal-width spans still make cited markers data;
 # real comments and actual paragraph/block boundaries retain their scope.
+hygiene_case_083() {
 for PREFIX in '> ' '> > ' '- > ' '> - ' '> 1. > '; do
   for CONTINUATION in '' '  '; do
   for TICKS in '`' '``'; do
@@ -4272,8 +4526,11 @@ run_on_fixture docs/lazy-quote-fence.md $'> Use `literal\n~~~bash\ngit config us
 if [ "$RC" = 1 ]; then pass "actual fence interrupts lazy quote and keeps HTML code marker literal"; else
   fail "lazy quote absorbed new fenced block: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_083
 
 # Case 65aa2: only one through nine digits form an ordered list marker.
+hygiene_case_084() {
 for ENDING in '.' ')'; do
   for NUMBER in 123456789 1234567890; do
     EXPECTED=1; [ "$NUMBER" != 1234567890 ] || EXPECTED=0
@@ -4292,8 +4549,11 @@ ${INDENT}git config user.email fixture@example.invalid
     fi
   done
 done
+}
+case_pool_add hygiene_case_084
 
 # Case 65ab: only ordered start 1 can interrupt an open paragraph.
+hygiene_case_085() {
 for NUMBER in 0 2 3 10; do
   ORDERED_INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"
   run_on_fixture docs/ordered-paragraph.md "Paragraph
@@ -4343,8 +4603,11 @@ run_on_fixture docs/ordered-paragraph-no-exemption.md $'Paragraph\n2. ```bash\n 
 if [ "$RC" = 1 ]; then pass "corrected paragraph context still flags unexempted literal writer"; else
   fail "numeric context correction hid writer: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_085
 
 # Case 65ac: empty list items cannot interrupt a paragraph either.
+hygiene_case_086() {
 for MARKER in '1.' '01.' '*' '+'; do
   EMPTY_CODE_INDENT="$(printf '%*s' "$((${#MARKER} + 5))" '')"
   run_on_fixture docs/empty-list-paragraph.md "Paragraph
@@ -4394,8 +4657,11 @@ run_on_fixture docs/empty-dash-setext.md $'Paragraph\n-\n       git config user.
 if [ "$RC" = 1 ]; then pass "empty dash retains existing setext heading boundary"; else
   fail "empty list guard weakened setext/code boundary: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_086
 
 # Case 65p: the modern rename verb moves a section, not the protected key.
+hygiene_case_087() {
 for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
   run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
 "
@@ -4522,9 +4788,12 @@ EOF
       fi ;;
   esac
 done
+}
+case_pool_add hygiene_case_087
 
 # Case 65q: indented Markdown code contains literal HTML, including in
 # list/quote containers. Shell exemptions and real comments after code survive.
+hygiene_case_088() {
 for PREFIX in '    ' $'\t' '>     ' '-     ' '1.     ' '> -     '; do
   run_on_fixture "docs/indented-html.md" "${PREFIX}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
 "
@@ -4586,6 +4855,8 @@ if [ "$RC" = "1" ] && grep -q 'docs/b-code.md:1:' <<<"$OUT"; then
 else
   fail "paragraph state leaked between files: rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_088
 
 # ── Linked worktrees: identity lives in every one of them (#806) ───────
 
@@ -4595,6 +4866,7 @@ fi
 # commit made in that sibling was attributed and signed under it. The
 # offending file is what the remediation has to name: no scope reachable
 # from the main worktree would clear it.
+hygiene_case_089() {
 LWMAIN="$WORKDIR/linked-identity-main"
 LWSIB="$WORKDIR/linked-identity-sibling"
 git init -q -b main "$LWMAIN"
@@ -4629,12 +4901,15 @@ if [ -z "$LW_OWN_SCOPE" ] && [ -z "$LW_LOCAL" ] \
 else
   fail "sibling linked-worktree identity escaped: own='$LW_OWN_SCOPE' local='$LW_LOCAL' rc=$RC remedy='$REMEDY' left='$LW_LEFT' after=$RC_AFTER out=$OUT"
 fi
+}
+case_pool_add hygiene_case_089
 
 # Case 66b: a sibling's file is read outright rather than through a scope,
 # so a DORMANT one is inspected on the same terms as an active one.
 # Disabling extensions.worktreeConfig deletes nobody's config.worktree, and
 # re-enabling it reactivates every identity in them with no fresh write for
 # a later run to catch.
+hygiene_case_090() {
 DLWMAIN="$WORKDIR/dormant-linked-main"
 DLWSIB="$WORKDIR/dormant-linked-sibling"
 git init -q -b main "$DLWMAIN"
@@ -4670,11 +4945,14 @@ if [ "$DLW_PRESENT" = "1" ] && [ "$RC" = "1" ] \
 else
   fail "dormant sibling worktree identity escaped: present=$DLW_PRESENT rc=$RC remedy='$REMEDY' left='$DLW_LEFT' after=$RC_AFTER out=$OUT"
 fi
+}
+case_pool_add hygiene_case_090
 
 # Case 66c: the converse — the invoking worktree's OWN config.worktree is
 # not also enumerated as a sibling. It is reachable through its scope, and
 # reporting it twice would hand an operator two remediation commands for
 # one override.
+hygiene_case_091() {
 SELFWT_REPO="$WORKDIR/self-worktree-repo"
 git init -q -b main "$SELFWT_REPO"
 git -C "$SELFWT_REPO" config --local extensions.worktreeConfig true
@@ -4691,6 +4969,10 @@ if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ] \
 else
   fail "own config.worktree double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
 fi
+}
+case_pool_add hygiene_case_091
+
+case_pool_wait
 
 # ── Summary ───────────────────────────────────────────────────────────
 echo
