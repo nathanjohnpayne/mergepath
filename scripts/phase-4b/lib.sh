@@ -1463,7 +1463,9 @@ p4b_barrier_self_pid() {
 # fallback, not even where it is GNU or BSD today: which coreutils a host
 # ships is exactly what changed under this code. With neither interpreter, or
 # when the call errors, the result is non-zero and the caller DECLINES, which
-# is the bounded-escalation direction rather than a possible double write.
+# is the bounded-escalation direction rather than a possible double write. The
+# no-interpreter case says so on stderr, since every claim on that host will
+# decline and the barrier will escalate rather than post.
 p4b_barrier_atomic_mkdir() {
   [ -n "${1:-}" ] || return 1
   if command -v perl >/dev/null 2>&1; then
@@ -1474,6 +1476,7 @@ p4b_barrier_atomic_mkdir() {
     python3 -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
     return
   fi
+  echo "p4b_barrier_atomic_mkdir: neither perl nor python3 is available; declining the claim" >&2
   return 1
 }
 

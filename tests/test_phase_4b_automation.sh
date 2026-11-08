@@ -9547,6 +9547,10 @@ _reap_hold() {
     if [ "${1:-}" = -0 ] && [ "${2:-}" = "$_deadpid" ] && [ ! -e "$WORK/reap-b.read" ]; then
       : >"$WORK/reap-b.read"
       _reap_hold reap-a.tried
+      # A bounded wait that EXPIRES must fail the case: B would then go on
+      # without the forced ordering (A might still hold the reap lock, and B
+      # would decline there without ever re-reading A's live pid).
+      [ -e "$WORK/reap-a.tried" ] || : >"$WORK/reap-b.timeout"
     fi
     return "$_rc"
   }
@@ -9561,6 +9565,7 @@ _rp_a=$!
 _reap_hold reap-b.tried
 [ -e "$WORK/reap-b.read" ] && [ -e "$WORK/reap-a.tried" ] && [ -e "$WORK/reap-b.tried" ] \
   || bad="$bad forced-reap-never-interleaved"
+[ ! -e "$WORK/reap-b.timeout" ] || bad="$bad forced-reap-wait-expired"
 # Live-owner retention: while A is alive the claim stays A's, and fresh
 # concurrent contenders all decline without disturbing it.
 [ "$(cat "$_cp/pid" 2>/dev/null)" = "$_rp_a" ] || bad="$bad live-owner-not-retained"
@@ -9598,9 +9603,22 @@ p4b_barrier_release "$_cp"
 # GNU-looking mkdir that "succeeds" is not used, and nothing is created.
 printf '#!/bin/sh\nif [ "${1:-}" = --version ]; then echo "mkdir (GNU coreutils) 9.5"; fi\n/bin/mkdir "$@" 2>/dev/null; exit 0\n' >"$WORK/nx-only/mkdir"
 chmod +x "$WORK/nx-only/mkdir"
+# shellcheck disable=SC2123  # PATH is replaced on purpose: it hides perl and python3.
 ( PATH="$WORK/nx-only"; p4b_barrier_atomic_mkdir "$WORK/nx-noperl" ) && bad="$bad no-syscall-create-not-declined"
 [ ! -e "$WORK/nx-noperl" ] || bad="$bad no-syscall-create-used-mkdir1"
 p4b_barrier_atomic_mkdir "" && bad="$bad empty-path-created"
+# The python3 branch, which hosts with perl never reach: with python3 the only
+# interpreter on PATH, a fresh path is created once and a repeat is refused.
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$WORK/py-only"
+  ln -s "$(command -v python3)" "$WORK/py-only/python3"
+  # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) || bad="$bad python-create-failed"
+  [ -d "$WORK/nx-py" ] || bad="$bad python-create-made-nothing"
+  # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) && bad="$bad python-create-not-exclusive"
+  rm -rf "$WORK/py-only" "$WORK/nx-py"
+fi
 # A syscall create that ERRORS declines too, and a claim built on it declines
 # without leaving a claim behind.
 printf '#!/bin/sh\nexit 2\n' >"$WORK/nx-bin/perl"
