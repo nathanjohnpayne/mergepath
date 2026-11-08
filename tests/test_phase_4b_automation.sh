@@ -816,6 +816,17 @@ SH
     if [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$BX_WORK/o9")" = "one two three rc=6 " ]; then
       bx_pass "stall supervisor streams output and keeps a finished suite's exit status"
     else bx_fail "stall supervisor passthrough (watch rc=$rc out=$(cat "$BX_WORK/o9"))"; fi
+    # A suite that closes its output and then hangs still hits the stall
+    # bound: EOF on the pipe does not end the supervision.
+    rm -f "$BX_WORK/o12.pid"
+    printf '%s\n' 'echo "  PASS: last case before closing output"' 'exec >/dev/null 2>&1' 'sleep 60 & echo $! > "$1"; wait' > "$BX_WORK/closed-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o12" "$(type -P bash)" -c ". '$BX_SUP'; P4B_SELF_TEST_STALL_SECONDS=2 p4b_self_test_supervise bash '$BX_WORK/closed-suite.sh' '$BX_WORK/o12.pid' 2>&1; echo \"rc=\$?\"")
+    o12pid="$(cat "$BX_WORK/o12.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 12000 ] && grep -qx 'rc=124' "$BX_WORK/o12" \
+       && grep -q 'last line: "  PASS: last case before closing output"' "$BX_WORK/o12" \
+       && [ -n "$o12pid" ] && ! bx_alive "$o12pid"; then
+      bx_pass "stall supervisor keeps the stall bound after the suite closes its output"
+    else bx_fail "stall supervisor after EOF (watch rc=$rc ms=$ms grandchild=$o12pid out=$(cat "$BX_WORK/o12"))"; fi
     # A TERM to the supervisor (Ctrl-C, a cancelled job) takes the suite
     # group with it instead of orphaning it.
     rm -f "$BX_WORK/o10.pid"

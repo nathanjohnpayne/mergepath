@@ -184,13 +184,17 @@ p4b_self_test_supervise() {
       };
     }
     close $w;
-    my ($buf, $last, $quiet, $st, $done_at) = ("", "", 0, undef, undef);
+    my ($buf, $last, $quiet, $st, $done_at, $eof) = ("", "", 0, undef, undef, 0);
     my $rin = ""; vec($rin, fileno($r), 1) = 1;
     while (1) {
-      my $n = select(my $rout = $rin, undef, undef, 1);
+      # After EOF (the suite may have closed its output and still be running)
+      # keep the clock: sleep instead of reading, so the stall bound applies.
+      my $n = 0;
+      if ($eof) { select(undef, undef, undef, 1) }
+      else { $n = select(my $rout = $rin, undef, undef, 1) }
       if ($n > 0) {
         my $got = sysread($r, my $chunk, 65536);
-        last if !$got;
+        if (!$got) { $eof = 1; next }
         print $chunk; $buf .= $chunk; $quiet = 0;
         my @l = grep { /\S/ } split /\n/, $buf;
         $last = $l[-1] if @l;
@@ -201,7 +205,7 @@ p4b_self_test_supervise() {
       if (!defined $st && waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $?; $done_at = time }
       # The suite exited but something it started still holds the pipe: give
       # it 5 wall-clock seconds, however much it keeps printing.
-      last if defined $st && time - $done_at >= 5;
+      last if defined $st && ($eof || time - $done_at >= 5);
       if (!defined $st && $quiet >= $stall) {
         print STDERR "check_phase_4b_automation: STALL: no output for ${stall}s from: @ARGV\n";
         print STDERR "check_phase_4b_automation: last line: \"$last\"\n";
