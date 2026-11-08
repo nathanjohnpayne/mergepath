@@ -3542,25 +3542,174 @@ p4b_extract_json_block() {
 }
 
 # p4b_run_with_timeout <seconds> <command> [args...]
-# Portable bounded execution for reviewer CLIs/adapters. GNU coreutils
-# `timeout` is common on Linux; macOS has perl, and the inherited alarm
-# timer survives exec so the target process is still bounded.
+# Bounded execution for reviewer CLIs and adapters (#3007). The command runs
+# as the leader of its own process group. When <seconds> pass, the WHOLE group
+# gets SIGTERM (plus SIGCONT, so a stopped member can act on it), and
+# P4B_TIMEOUT_KILL_GRACE_SECONDS later (default 2) SIGKILL, so no member
+# still running when the bound fires (a stuck command, or a grandchild holding
+# a caller's `$( ... )` pipe) can outlive it by more than the grace period. A
+# command that finishes on its own is left as timeout(1) leaves it: the
+# supervisor returns at once and does not wait for or kill what it started. A
+# timed-out run returns 124. Otherwise the command's own status comes back
+# (128+N when signal N killed it; 127/126 when it could not be found or
+# executed, as GNU timeout reports).
+#
+# timeout(1) is no longer used. Which coreutils a host ships is what changed
+# under this code. On the ubuntu-26.04 hosted runners (bash 5.3.9, uutils
+# coreutils 0.10.0) an adapter bash that took timeout's SIGTERM could run its
+# EXIT trap and then spin at 100% CPU with SIGCHLD blocked and its children
+# unreaped. timeout(1) has no bound on its own wait for the child unless it
+# is given -k, so it waited forever, and the deep-safety (phase-4b) self-test
+# hung to the 60-minute job timeout on three consumers. The old perl
+# fallback was weaker still: its alarm reached only the exec'd process, so a
+# grandchild kept the pipe open for its full runtime. The supervisor is perl,
+# else python3 (the same order as p4b_barrier_atomic_mkdir); with neither, the
+# run is refused with exit 3 rather than run unbounded.
+#
+# p4b_is_timeout_rc keeps accepting 142 (SIGALRM) as a timeout, so a status
+# from the pre-#3007 perl path still reads as one.
 p4b_run_with_timeout() {
-  local seconds="$1"
+  local seconds="$1" grace="${P4B_TIMEOUT_KILL_GRACE_SECONDS:-2}"
   shift
   case "$seconds" in
     ''|0) "$@"; return $? ;;
     *[!0-9]*) p4b_die 3 "timeout seconds must be a non-negative integer; got '$seconds'" ;;
   esac
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-    return $?
-  fi
+  case "$grace" in
+    ''|*[!0-9]*|0) grace=2 ;;
+  esac
+  [ "$#" -gt 0 ] || p4b_die 3 "p4b_run_with_timeout: no command given"
   if command -v perl >/dev/null 2>&1; then
-    perl -e 'alarm shift @ARGV; exec @ARGV or die "exec failed: $!\n"' "$seconds" "$@"
+    perl -e '
+      use strict; use warnings; use POSIX (); use Time::HiRes ();
+      my $secs = shift @ARGV; my $grace = shift @ARGV;
+      # Hold ALRM/TERM/INT/HUP across the fork: one that lands before the
+      # handlers below exist must not kill the supervisor and orphan the group.
+      my $held = POSIX::SigSet->new(POSIX::SIGALRM(), POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
+      POSIX::sigprocmask(POSIX::SIG_BLOCK(), $held);
+      my $pid = fork;
+      defined $pid or do { print STDERR "p4b_run_with_timeout: fork failed: $!\n"; exit 125 };
+      if (!$pid) {
+        POSIX::setpgid(0, 0);
+        # The command always starts with SIGPIPE/SIGXFSZ at their defaults,
+        # whatever the caller ignored (GitHub runner steps ignore SIGPIPE).
+        $SIG{$_} = "DEFAULT" for qw(ALRM TERM INT HUP PIPE XFSZ);
+        POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $held);
+        { no warnings "exec"; exec { $ARGV[0] } @ARGV; }
+        print STDERR "p4b_run_with_timeout: cannot run $ARGV[0]: $!\n";
+        POSIX::_exit($!{ENOENT} ? 127 : 126);
+      }
+      # Both sides set the group, so no signal can land before it exists.
+      POSIX::setpgid($pid, $pid);
+      # phase 1: timed out; phase 2: a forwarded TERM/INT/HUP (typically an
+      # enclosing p4b_run_with_timeout timing out) is being escalated.
+      my ($phase, $termed_at, $limit) = (0, 0, $grace);
+      $SIG{ALRM} = sub {
+        if ($phase == 0) {
+          $phase = 1; $termed_at = Time::HiRes::time();
+          kill "TERM", -$pid; kill "CONT", -$pid;
+          alarm $grace;
+        } else {
+          kill "KILL", -$pid;
+        }
+      };
+      # A forwarded signal also starts an escalation here, on half the grace
+      # period. An enclosing supervisor SIGKILLs its own group at the full
+      # grace; that group holds this supervisor but not the command group
+      # below it, so the command group has to be gone before then.
+      for my $sig (qw(TERM INT HUP)) {
+        $SIG{$sig} = sub {
+          kill $sig, -$pid; kill "CONT", -$pid;
+          if ($phase == 0) {
+            $phase = 2; $termed_at = Time::HiRes::time(); $limit = $grace / 2;
+            Time::HiRes::alarm($limit);
+          }
+        };
+      }
+      alarm $secs;
+      POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $held);
+      my $r;
+      do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
+      my $st = $?;
+      alarm 0;
+      if ($phase) {
+        # The rest of the group gets what is left of the grace period to act
+        # on the signal, then SIGKILL.
+        Time::HiRes::sleep(0.05) while kill(0, -$pid) && Time::HiRes::time() - $termed_at < $limit;
+        kill "KILL", -$pid;
+        exit 124 if $phase == 1;
+      }
+      $r == $pid or exit 125;
+      exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);
+    ' "$seconds" "$grace" "$@"
     return $?
   fi
-  p4b_die 3 "bounded review execution requires GNU timeout or perl"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import os, signal, sys, time
+secs, grace = int(sys.argv[1]), int(sys.argv[2]); argv = sys.argv[3:]
+held = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+signal.pthread_sigmask(signal.SIG_BLOCK, held)
+pid = os.fork()
+if pid == 0:
+    try:
+        os.setpgid(0, 0)
+        # Python starts with SIGPIPE and SIGXFSZ ignored, and an ignored
+        # signal stays ignored across exec; as in the perl path, the command
+        # gets the defaults.
+        for s in held | {signal.SIGPIPE, signal.SIGXFSZ}:
+            signal.signal(s, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+        os.execvp(argv[0], argv)
+    except OSError as e:
+        sys.stderr.write("p4b_run_with_timeout: cannot run %s: %s\n" % (argv[0], e))
+        os._exit(127 if isinstance(e, FileNotFoundError) else 126)
+try:
+    os.setpgid(pid, pid)
+except OSError:
+    pass
+phase = [0, 0.0, float(grace)]
+def group(sig):
+    try:
+        os.killpg(pid, sig)
+    except OSError:
+        pass
+def on_alarm(_s, _f):
+    if phase[0] == 0:
+        phase[0] = 1; phase[1] = time.time()
+        group(signal.SIGTERM); group(signal.SIGCONT)
+        signal.alarm(grace)
+    else:
+        group(signal.SIGKILL)
+def forward(s, _f):
+    group(s); group(signal.SIGCONT)
+    if phase[0] == 0:
+        phase[0] = 2; phase[1] = time.time(); phase[2] = grace / 2.0
+        signal.setitimer(signal.ITIMER_REAL, phase[2])
+signal.signal(signal.SIGALRM, on_alarm)
+for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(s, forward)
+signal.alarm(secs)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+_, st = os.waitpid(pid, 0)
+signal.setitimer(signal.ITIMER_REAL, 0)
+def group_alive():
+    try:
+        os.killpg(pid, 0)
+        return True
+    except OSError:
+        return False
+if phase[0]:
+    while group_alive() and time.time() - phase[1] < phase[2]:
+        time.sleep(0.05)
+    group(signal.SIGKILL)
+    if phase[0] == 1:
+        sys.exit(124)
+sys.exit(128 + os.WTERMSIG(st) if os.WIFSIGNALED(st) else os.WEXITSTATUS(st))
+' "$seconds" "$grace" "$@"
+    return $?
+  fi
+  p4b_die 3 "bounded review execution requires perl or python3"
 }
 
 p4b_is_timeout_rc() {

@@ -142,17 +142,96 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# p4b_self_test_supervise <command...>
+# Runs one suite with stdin closed, its stdout and stderr merged and streamed,
+# as the leader of its own process group. If the suite prints nothing for
+# P4B_SELF_TEST_STALL_SECONDS (default 300), the supervisor reports the stall
+# and the last line the suite printed (the last case that finished), kills the
+# whole group (SIGTERM, then SIGKILL 2s later) and returns 124 (#3007). A
+# stuck case used to run to the job's 60-minute timeout and print nothing.
+# The longest gap between lines in a passing CI run is about 15s, so 300s is
+# far outside normal pacing. A suite that finishes keeps its own exit status;
+# group members it leaves behind are killed. Without perl the suite is not
+# started at all (exit 1): an unsupervised suite is exactly the unbounded run
+# this exists to prevent.
+p4b_self_test_supervise() {
+  local stall="${P4B_SELF_TEST_STALL_SECONDS:-300}"
+  case "$stall" in ''|*[!0-9]*|0) stall=300 ;; esac
+  if ! command -v perl >/dev/null 2>&1; then
+    echo "check_phase_4b_automation: ERROR perl is required for the ${stall}s stall supervisor; not running unsupervised: $*" >&2
+    return 1
+  fi
+  perl -e '
+    use strict; use warnings; use POSIX (); use IO::Handle;
+    my $stall = shift @ARGV;
+    STDOUT->autoflush(1);
+    pipe(my $r, my $w) or die "pipe: $!";
+    my $pid = fork; defined $pid or die "fork: $!";
+    if (!$pid) {
+      POSIX::setpgid(0, 0);
+      close $r;
+      open STDIN, "<", "/dev/null"; open STDOUT, ">&", $w; open STDERR, ">&", $w;
+      { no warnings "exec"; exec { $ARGV[0] } @ARGV; }
+      print STDERR "cannot run $ARGV[0]: $!\n"; POSIX::_exit(127);
+    }
+    POSIX::setpgid($pid, $pid);
+    # Ctrl-C or a TERM/HUP to this supervisor takes the suite group with it.
+    for my $sig (qw(INT TERM HUP)) {
+      $SIG{$sig} = sub {
+        kill $sig, -$pid; kill "CONT", -$pid;
+        sleep 2; kill "KILL", -$pid; waitpid($pid, 0);
+        exit 128 + { INT => POSIX::SIGINT(), TERM => POSIX::SIGTERM(), HUP => POSIX::SIGHUP() }->{$sig};
+      };
+    }
+    close $w;
+    my ($buf, $last, $quiet, $st, $done_at, $eof) = ("", "", 0, undef, undef, 0);
+    my $rin = ""; vec($rin, fileno($r), 1) = 1;
+    while (1) {
+      # After EOF (the suite may have closed its output and still be running)
+      # keep the clock: sleep instead of reading, so the stall bound applies.
+      my $n = 0;
+      if ($eof) { select(undef, undef, undef, 1) }
+      else { $n = select(my $rout = $rin, undef, undef, 1) }
+      if ($n > 0) {
+        my $got = sysread($r, my $chunk, 65536);
+        if (!$got) { $eof = 1; next }
+        print $chunk; $buf .= $chunk; $quiet = 0;
+        my @l = grep { /\S/ } split /\n/, $buf;
+        $last = $l[-1] if @l;
+        $buf = substr($buf, rindex($buf, "\n") + 1) if index($buf, "\n") >= 0;
+      } else {
+        $quiet++;
+      }
+      if (!defined $st && waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $?; $done_at = time }
+      # The suite exited but something it started still holds the pipe: give
+      # it 5 wall-clock seconds, however much it keeps printing.
+      last if defined $st && ($eof || time - $done_at >= 5);
+      if (!defined $st && $quiet >= $stall) {
+        print STDERR "check_phase_4b_automation: STALL: no output for ${stall}s from: @ARGV\n";
+        print STDERR "check_phase_4b_automation: last line: \"$last\"\n";
+        print STDERR "check_phase_4b_automation: killing the suite process group\n";
+        kill "TERM", -$pid; kill "CONT", -$pid;
+        sleep 2; kill "KILL", -$pid; waitpid($pid, 0);
+        exit 124;
+      }
+    }
+    if (!defined $st) { waitpid($pid, 0); $st = $? }
+    kill "KILL", -$pid;
+    exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);
+  ' "$stall" "$@"
+}
+
 echo "check_phase_4b_automation: running $TEST"
-node --test "$REPO_ROOT/tests/test_phase_4b_escalation.cjs"
-bash "$REPO_ROOT/$TEST" --rate-limit-only
-bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-refusal-only
-bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --marker-led-heading-only
-bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-active-only
-bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --phase4b-quota-only
-"$REPO_ROOT/$TEST"
-bash "$REPO_ROOT/$TEST" --heartbeat-only
-bash "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh"
-bash "$REPO_ROOT/tests/test_phase_4b_round_cap.sh"
+p4b_self_test_supervise node --test "$REPO_ROOT/tests/test_phase_4b_escalation.cjs"
+p4b_self_test_supervise bash "$REPO_ROOT/$TEST" --rate-limit-only
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-refusal-only
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --marker-led-heading-only
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-active-only
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --phase4b-quota-only
+p4b_self_test_supervise "$REPO_ROOT/$TEST"
+p4b_self_test_supervise bash "$REPO_ROOT/$TEST" --heartbeat-only
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh"
+p4b_self_test_supervise bash "$REPO_ROOT/tests/test_phase_4b_round_cap.sh"
 
 echo "check_phase_4b_automation: PASS"
 exit 0

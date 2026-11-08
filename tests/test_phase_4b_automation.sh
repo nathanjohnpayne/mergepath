@@ -648,6 +648,218 @@ Blocking finding on this head."
   exit
 fi
 
+# Focused bounded-execution coverage (#3007; expected about 30s, every call
+# under a 25s test-side watchdog). On ubuntu-26.04 an adapter bash that took
+# timeout(1)'s SIGTERM could spin at 100% CPU with its children unreaped, and
+# timeout(1) (uutils or GNU) waited on it forever: the deep-safety job hung to
+# its 60-minute limit. p4b_run_with_timeout now supervises the command's
+# process group itself and escalates to SIGKILL. The cases here model that
+# with a direct child that survives SIGTERM, plus a grandchild holding the
+# caller's capture pipe, through the perl supervisor and the python3 fallback.
+if [ "${1:-}" = --bounded-exec-only ]; then
+  BX_PASS=0; BX_FAIL=0
+  bx_pass() { echo "  PASS: $*"; BX_PASS=$((BX_PASS + 1)); }
+  bx_fail() { echo "  FAIL: $*" >&2; BX_FAIL=$((BX_FAIL + 1)); }
+  BX_WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-bounded-exec.XXXXXX")"
+  trap 'rm -rf "$BX_WORK"' EXIT
+  command -v perl >/dev/null 2>&1 || { echo "ERROR: perl is required for the bounded-exec cases" >&2; exit 1; }
+  # Test-side watchdog, independent of the code under test: a regression that
+  # hangs fails this case in 25s instead of wedging the suite.
+  bx_watch() { # bx_watch <out-file> <command...>; prints "rc elapsed-ms"
+    local out="$1"; shift
+    perl -MTime::HiRes=time -e '
+      my $out = shift @ARGV; my $t0 = time;
+      my $pid = fork;
+      if (!$pid) { setpgrp(0, 0); open STDOUT, ">", $out or die; open STDIN, "<", "/dev/null"; exec { $ARGV[0] } @ARGV; exit 127 }
+      local $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); printf "WATCHDOG %d\n", (time - $t0) * 1000; exit 0 };
+      alarm 25;
+      waitpid($pid, 0); my $st = $?; alarm 0;
+      kill "KILL", -$pid;
+      printf "%d %d\n", (($st & 127) ? 128 + ($st & 127) : $st >> 8), (time - $t0) * 1000;
+    ' "$out" "$@"
+  }
+  # A killed process can linger as a zombie when its reaper is gone (PID 1 in
+  # a container need not reap); a zombie holds no pipe, so it counts as dead.
+  bx_alive() {
+    local st
+    st="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+    case "$st" in ''|*Z*) return 1 ;; esac
+    return 0
+  }
+  # Load only the function under test; p4b_die is the lib contract it calls.
+  BX_FN="$BX_WORK/fn.sh"
+  {
+    printf 'p4b_die() { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }\n'
+    sed -n '/^p4b_run_with_timeout() {/,/^}/p' "$LIB"
+    sed -n '/^p4b_is_timeout_rc() {/,/^}/p' "$LIB"
+  } > "$BX_FN"
+  grep -q '^p4b_run_with_timeout() {' "$BX_FN" || { echo "ERROR: p4b_run_with_timeout not found in $LIB" >&2; exit 1; }
+  # A python3-only PATH (no perl) and a PATH with neither interpreter.
+  BX_PY="$BX_WORK/py-bin"; BX_NONE="$BX_WORK/none-bin"; mkdir -p "$BX_PY" "$BX_NONE"
+  for t in bash sleep cat env mkdir rm; do
+    p="$(type -P "$t")" || { echo "ERROR: $t not found" >&2; exit 1; }
+    ln -s "$p" "$BX_PY/$t"; ln -s "$p" "$BX_NONE/$t"
+  done
+  BX_HAVE_PY=0
+  # Link the concrete interpreter, not a shim (pyenv's needs a full PATH).
+  if p="$(type -P python3)" \
+     && p="$("$p" -c 'import sys; assert sys.version_info >= (3, 5); print(sys.executable)' 2>/dev/null)" \
+     && [ -x "$p" ]; then
+    ln -s "$p" "$BX_PY/python3"; BX_HAVE_PY=1
+  fi
+  # bx_run <impl> <out> <bash-snippet>: run the snippet with the function
+  # loaded, under the impl's PATH, inside the watchdog.
+  bx_run() {
+    local impl="$1" out="$2" snippet="$3" path="$PATH"
+    case "$impl" in python3) path="$BX_PY" ;; none) path="$BX_NONE" ;; esac
+    bx_watch "$out" "$(type -P bash)" -c ". '$BX_FN'; export PATH='$path'; $snippet"
+  }
+  impls=perl
+  [ "$BX_HAVE_PY" = 1 ] && impls="perl python3" || echo "  NOTE: python3 >= 3.5 unavailable; python3 fallback cases skipped"
+  for impl in $impls; do
+    # 1. A direct child that survives SIGTERM is SIGKILLed after the grace
+    # period (the ubuntu-26.04 spin). timeout(1) waits on it for the full 30s.
+    rm -f "$BX_WORK/o1.pid"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o1" "P4B_TIMEOUT_KILL_GRACE_SECONDS=1 p4b_run_with_timeout 1 bash -c 'trap \"\" TERM; sleep 30 & echo \$! > \"$BX_WORK/o1.pid\"; wait; echo late'; echo \"rc=\$?\"")
+    o1pid="$(cat "$BX_WORK/o1.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124' "$BX_WORK/o1" && ! grep -q late "$BX_WORK/o1" \
+       && [ -n "$o1pid" ] && ! bx_alive "$o1pid"; then
+      bx_pass "$impl: a SIGTERM-surviving child is SIGKILLed after the grace period and returns 124"
+    else bx_fail "$impl: SIGTERM-surviving child (watch rc=$rc ms=$ms grandchild=$o1pid out=$(cat "$BX_WORK/o1"))"; fi
+    # 2. A grandchild holding the caller's capture pipe dies with the group,
+    # so \$( ... ) returns at the bound instead of waiting it out.
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2" "o=\$(p4b_run_with_timeout 1 bash -c 'sleep 30 & wait'); echo \"rc=\$? out=[\$o]\"")
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124 out=\[\]' "$BX_WORK/o2"; then
+      bx_pass "$impl: a grandchild holding the capture pipe is killed with the group"
+    else bx_fail "$impl: grandchild pipe holder (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o2"))"; fi
+    # 2b. The first signal is a graceful SIGTERM to the whole group: a
+    # grandchild with a slow TERM trap (0.5s) gets to finish it, even after
+    # the direct child has already died, before the group is SIGKILLed.
+    rm -f "$BX_WORK/o2b.mark"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2b" "p4b_run_with_timeout 1 bash -c 'bash -c \"trap \\\"sleep 0.5; echo termed > $BX_WORK/o2b.mark; exit 0\\\" TERM; sleep 30 & wait\" & wait'; echo \"rc=\$?\"")
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124' "$BX_WORK/o2b" && grep -qx termed "$BX_WORK/o2b.mark" 2>/dev/null; then
+      bx_pass "$impl: the timeout SIGTERM reaches grandchildren, not only the direct child"
+    else bx_fail "$impl: group SIGTERM (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o2b") mark=$(cat "$BX_WORK/o2b.mark" 2>/dev/null))"; fi
+    # 2c. A grandchild that ignores SIGTERM after the direct child has died is
+    # still SIGKILLed, so it cannot hold the capture pipe.
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2c" "o=\$(p4b_run_with_timeout 1 bash -c '(trap \"\" TERM; exec sleep 30) & wait'); echo \"rc=\$? out=[\$o]\"")
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124 out=\[\]' "$BX_WORK/o2c"; then
+      bx_pass "$impl: a SIGTERM-ignoring grandchild is SIGKILLed once the direct child is gone"
+    else bx_fail "$impl: SIGTERM-ignoring grandchild (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o2c"))"; fi
+    # 2d. Nested supervisors (orchestrator -> adapter -> CLI): when the outer
+    # bound fires, the inner supervisor escalates its own group too, so a
+    # SIGTERM-ignoring CLI below it is SIGKILLed before the outer SIGKILL
+    # removes the inner supervisor. The CLI holds the capture pipe.
+    rm -f "$BX_WORK/o2d.pid"
+    printf '%s\n' 'trap "" TERM; echo $$ > "$1"; exec sleep 30' > "$BX_WORK/cli-ignores-term.sh"
+    printf '%s\n' ". '$BX_FN'" "p4b_run_with_timeout 20 bash '$BX_WORK/cli-ignores-term.sh' '$BX_WORK/o2d.pid'" 'echo inner-done' > "$BX_WORK/nested-adapter.sh"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2d" "o=\$(p4b_run_with_timeout 1 bash '$BX_WORK/nested-adapter.sh'); echo \"rc=\$? out=[\$o]\"")
+    o2dpid="$(cat "$BX_WORK/o2d.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124 out=\[\]' "$BX_WORK/o2d" \
+       && [ -n "$o2dpid" ] && ! bx_alive "$o2dpid"; then
+      bx_pass "$impl: a nested supervisor escalates its own group when the outer bound fires"
+    else bx_fail "$impl: nested supervisors (watch rc=$rc ms=$ms cli=$o2dpid out=$(cat "$BX_WORK/o2d"))"; fi
+    # 3. Status, stdout, stdin and argv pass through untouched.
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o3" "o=\$(printf in | p4b_run_with_timeout 5 bash -c 'cat; printf \"[%s]\" \"\$@\"; exit 7' x 'a b' '\$y;z'); echo \"rc=\$? out=\$o\"")
+    if [ "$rc" = 0 ] && grep -qx 'rc=7 out=in\[a b\]\[\$y;z\]' "$BX_WORK/o3"; then
+      bx_pass "$impl: exit status, stdin, stdout and argv pass through"
+    else bx_fail "$impl: passthrough (watch rc=$rc out=$(cat "$BX_WORK/o3"))"; fi
+    # 4. Death by signal reads as 128+N; a missing command as 127; the
+    # command starts with SIGPIPE at its default even where the caller (a
+    # GitHub runner step) or python3 itself ignores it.
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o4" "trap '' PIPE; p4b_run_with_timeout 5 bash -c 'kill -9 \$\$'; a=\$?; p4b_run_with_timeout 5 '$BX_WORK/no-such-cmd' 2>'$BX_WORK/o4.err'; b=\$?; p4b_run_with_timeout 5 bash -c 'kill -PIPE \$\$'; echo \"rc=\$a,\$b,\$?\"")
+    if [ "$rc" = 0 ] && grep -qx 'rc=137,127,141' "$BX_WORK/o4"; then
+      bx_pass "$impl: signal death returns 128+N, a missing command 127, and SIGPIPE starts at its default"
+    else bx_fail "$impl: signal/missing status (watch rc=$rc out=$(cat "$BX_WORK/o4") err=$(cat "$BX_WORK/o4.err" 2>/dev/null))"; fi
+    # 5. SIGTERM to the supervisor (the command's parent) reaches the
+    # command's group: the command dies and nothing is left behind.
+    rm -f "$BX_WORK/o5.pid"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o5" "p4b_run_with_timeout 20 bash -c 'echo \$\$ > \"$BX_WORK/o5.pid\"; kill -TERM \$PPID; exec sleep 20'; echo \"rc=\$?\"")
+    o5pid="$(cat "$BX_WORK/o5.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=143' "$BX_WORK/o5" \
+       && [ -n "$o5pid" ] && ! bx_alive "$o5pid"; then
+      bx_pass "$impl: SIGTERM to the supervisor is forwarded to the command"
+    else bx_fail "$impl: SIGTERM forwarding (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o5"))"; fi
+  done
+  # 6. A completed command is not reported as a timeout, and 0 means unbounded.
+  read -r rc ms < <(bx_run perl "$BX_WORK/o6" "p4b_run_with_timeout 3 true; a=\$?; p4b_run_with_timeout 0 bash -c 'exit 5'; b=\$?; p4b_is_timeout_rc 124 && p4b_is_timeout_rc 142 && ! p4b_is_timeout_rc 143 && echo \"rc=\$a,\$b\"")
+  if [ "$rc" = 0 ] && grep -qx 'rc=0,5' "$BX_WORK/o6"; then
+    bx_pass "a fast command returns its own status; 0 seconds runs unbounded; 124 and 142 read as timeouts"
+  else bx_fail "fast/unbounded status (watch rc=$rc out=$(cat "$BX_WORK/o6"))"; fi
+  # 7. With neither perl nor python3 the run is refused (exit 3), never run unbounded.
+  read -r rc ms < <(bx_run none "$BX_WORK/o7" "( p4b_run_with_timeout 5 bash -c 'echo ran' ) 2>&1; echo \"rc=\$?\"")
+  if [ "$rc" = 0 ] && grep -qx 'rc=3' "$BX_WORK/o7" && ! grep -qx ran "$BX_WORK/o7" && grep -q 'requires perl or python3' "$BX_WORK/o7"; then
+    bx_pass "no perl and no python3: bounded execution refuses with exit 3"
+  else bx_fail "no-interpreter refusal (watch rc=$rc out=$(cat "$BX_WORK/o7"))"; fi
+  # 8. The self-test stall supervisor (check_phase_4b_automation) stops a
+  # suite that goes silent, names the last line it printed, and kills the
+  # suite's whole process group; a suite that finishes keeps its status.
+  BX_SUP="$BX_WORK/sup.sh"
+  sed -n '/^p4b_self_test_supervise() {/,/^}/p' "$ROOT/scripts/ci/check_phase_4b_automation" > "$BX_SUP"
+  if grep -q '^p4b_self_test_supervise() {' "$BX_SUP"; then
+    cat > "$BX_WORK/stall-suite.sh" <<'SH'
+#!/usr/bin/env bash
+echo "section — stalls"
+echo "  PASS: case before the hang"
+sleep 60 &
+echo $! > "$1"
+wait
+SH
+    read -r rc ms < <(bx_watch "$BX_WORK/o8" "$(type -P bash)" -c ". '$BX_SUP'; P4B_SELF_TEST_STALL_SECONDS=2 p4b_self_test_supervise bash '$BX_WORK/stall-suite.sh' '$BX_WORK/stall.pid' 2>&1; echo \"rc=\$?\"")
+    gpid="$(cat "$BX_WORK/stall.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 12000 ] && grep -qx 'rc=124' "$BX_WORK/o8" \
+       && grep -q 'STALL: no output for 2s' "$BX_WORK/o8" \
+       && grep -q 'last line: "  PASS: case before the hang"' "$BX_WORK/o8" \
+       && [ -n "$gpid" ] && ! bx_alive "$gpid"; then
+      bx_pass "stall supervisor stops a silent suite, names its last line, and kills its group"
+    else bx_fail "stall supervisor (watch rc=$rc ms=$ms grandchild=$gpid out=$(cat "$BX_WORK/o8"))"; fi
+    read -r rc ms < <(bx_watch "$BX_WORK/o9" "$(type -P bash)" -c ". '$BX_SUP'; P4B_SELF_TEST_STALL_SECONDS=4 p4b_self_test_supervise bash -c 'echo one; sleep 1; echo two >&2; sleep 1; echo three; exit 6' 2>&1; echo \"rc=\$?\"")
+    if [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$BX_WORK/o9")" = "one two three rc=6 " ]; then
+      bx_pass "stall supervisor streams output and keeps a finished suite's exit status"
+    else bx_fail "stall supervisor passthrough (watch rc=$rc out=$(cat "$BX_WORK/o9"))"; fi
+    # A suite that closes its output and then hangs still hits the stall
+    # bound: EOF on the pipe does not end the supervision.
+    rm -f "$BX_WORK/o12.pid"
+    printf '%s\n' 'echo "  PASS: last case before closing output"' 'exec >/dev/null 2>&1' 'sleep 60 & echo $! > "$1"; wait' > "$BX_WORK/closed-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o12" "$(type -P bash)" -c ". '$BX_SUP'; P4B_SELF_TEST_STALL_SECONDS=2 p4b_self_test_supervise bash '$BX_WORK/closed-suite.sh' '$BX_WORK/o12.pid' 2>&1; echo \"rc=\$?\"")
+    o12pid="$(cat "$BX_WORK/o12.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 12000 ] && grep -qx 'rc=124' "$BX_WORK/o12" \
+       && grep -q 'last line: "  PASS: last case before closing output"' "$BX_WORK/o12" \
+       && [ -n "$o12pid" ] && ! bx_alive "$o12pid"; then
+      bx_pass "stall supervisor keeps the stall bound after the suite closes its output"
+    else bx_fail "stall supervisor after EOF (watch rc=$rc ms=$ms grandchild=$o12pid out=$(cat "$BX_WORK/o12"))"; fi
+    # Without perl the supervisor refuses to start the suite (fail closed).
+    rm -f "$BX_WORK/o13.ran"
+    read -r rc ms < <(bx_watch "$BX_WORK/o13" "$(type -P bash)" -c ". '$BX_SUP'; export PATH='$BX_NONE'; p4b_self_test_supervise bash -c 'echo ran > \"$BX_WORK/o13.ran\"' 2>&1; echo \"rc=\$?\"")
+    if [ "$rc" = 0 ] && grep -qx 'rc=1' "$BX_WORK/o13" && grep -q 'perl is required' "$BX_WORK/o13" && [ ! -e "$BX_WORK/o13.ran" ]; then
+      bx_pass "stall supervisor refuses to run a suite unsupervised when perl is missing"
+    else bx_fail "stall supervisor without perl (watch rc=$rc out=$(cat "$BX_WORK/o13"))"; fi
+    # A TERM to the supervisor (Ctrl-C, a cancelled job) takes the suite
+    # group with it instead of orphaning it.
+    rm -f "$BX_WORK/o10.pid"
+    printf '%s\n' 'sleep 30 & echo $! > "$1"; kill -TERM $PPID; wait' > "$BX_WORK/term-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o10" "$(type -P bash)" -c ". '$BX_SUP'; p4b_self_test_supervise bash '$BX_WORK/term-suite.sh' '$BX_WORK/o10.pid' 2>&1; echo \"rc=\$?\"")
+    o10pid="$(cat "$BX_WORK/o10.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 10000 ] && grep -qx 'rc=143' "$BX_WORK/o10" && [ -n "$o10pid" ] && ! bx_alive "$o10pid"; then
+      bx_pass "stall supervisor forwards a TERM to the suite group"
+    else bx_fail "stall supervisor TERM forwarding (watch rc=$rc ms=$ms grandchild=$o10pid out=$(cat "$BX_WORK/o10"))"; fi
+    # A suite that exits while a periodic writer it started still holds the
+    # pipe is drained for 5 wall-clock seconds, then the writer is killed.
+    rm -f "$BX_WORK/o11.pid"
+    printf '%s\n' '( while :; do echo tick; sleep 0.3; done ) & echo $! > "$1"; exit 3' > "$BX_WORK/writer-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o11" "$(type -P bash)" -c ". '$BX_SUP'; p4b_self_test_supervise bash '$BX_WORK/writer-suite.sh' '$BX_WORK/o11.pid' >/dev/null 2>&1; echo \"rc=\$?\"")
+    o11pid="$(cat "$BX_WORK/o11.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 12000 ] && grep -qx 'rc=3' "$BX_WORK/o11" && [ -n "$o11pid" ] && ! bx_alive "$o11pid"; then
+      bx_pass "stall supervisor bounds the post-exit drain by wall clock and kills a leftover writer"
+    else bx_fail "stall supervisor post-exit drain (watch rc=$rc ms=$ms writer=$o11pid out=$(cat "$BX_WORK/o11"))"; fi
+  else
+    bx_fail "p4b_self_test_supervise not found in scripts/ci/check_phase_4b_automation"
+  fi
+  printf 'bounded-exec: %s passed, %s failed\n' "$BX_PASS" "$BX_FAIL"
+  [ "$BX_FAIL" = 0 ]
+  exit
+fi
+
 # Focused lifecycle coverage (expected about 80s; adapter calls capped at 3s).
 # This mode never mutation-tests lib.sh or enters the long legacy suite.
 if [ "${1:-}" = --heartbeat-only ]; then
@@ -678,6 +890,7 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 
 # Keep the focused real-reader controls in the default CI run too.
 if [ "$#" -eq 0 ]; then
+  bash "$0" --bounded-exec-only < /dev/null
   bash "$0" --policy-tuple-only
   bash "$0" --status-description-only
   bash "$0" --publication-summary-only
