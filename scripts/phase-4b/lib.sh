@@ -3599,7 +3599,9 @@ p4b_run_with_timeout() {
       }
       # Both sides set the group, so no signal can land before it exists.
       POSIX::setpgid($pid, $pid);
-      my ($phase, $termed_at) = (0, 0);
+      # phase 1: timed out; phase 2: a forwarded TERM/INT/HUP (typically an
+      # enclosing p4b_run_with_timeout timing out) is being escalated.
+      my ($phase, $termed_at, $limit) = (0, 0, $grace);
       $SIG{ALRM} = sub {
         if ($phase == 0) {
           $phase = 1; $termed_at = Time::HiRes::time();
@@ -3609,8 +3611,18 @@ p4b_run_with_timeout() {
           kill "KILL", -$pid;
         }
       };
+      # A forwarded signal also starts an escalation here, on half the grace
+      # period. An enclosing supervisor SIGKILLs its own group at the full
+      # grace; that group holds this supervisor but not the command group
+      # below it, so the command group has to be gone before then.
       for my $sig (qw(TERM INT HUP)) {
-        $SIG{$sig} = sub { kill $sig, -$pid; kill "CONT", -$pid };
+        $SIG{$sig} = sub {
+          kill $sig, -$pid; kill "CONT", -$pid;
+          if ($phase == 0) {
+            $phase = 2; $termed_at = Time::HiRes::time(); $limit = $grace / 2;
+            Time::HiRes::alarm($limit);
+          }
+        };
       }
       alarm $secs;
       POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $held);
@@ -3620,10 +3632,10 @@ p4b_run_with_timeout() {
       alarm 0;
       if ($phase) {
         # The rest of the group gets what is left of the grace period to act
-        # on the SIGTERM, then SIGKILL.
-        Time::HiRes::sleep(0.1) while kill(0, -$pid) && Time::HiRes::time() - $termed_at < $grace;
+        # on the signal, then SIGKILL.
+        Time::HiRes::sleep(0.05) while kill(0, -$pid) && Time::HiRes::time() - $termed_at < $limit;
         kill "KILL", -$pid;
-        exit 124;
+        exit 124 if $phase == 1;
       }
       $r == $pid or exit 125;
       exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);
@@ -3640,7 +3652,9 @@ pid = os.fork()
 if pid == 0:
     try:
         os.setpgid(0, 0)
-        for s in held:
+        # Python starts with SIGPIPE and SIGXFSZ ignored, and an ignored
+        # signal stays ignored across exec; the command gets the defaults.
+        for s in held | {signal.SIGPIPE, signal.SIGXFSZ}:
             signal.signal(s, signal.SIG_DFL)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
         os.execvp(argv[0], argv)
@@ -3651,7 +3665,7 @@ try:
     os.setpgid(pid, pid)
 except OSError:
     pass
-phase = [0, 0.0]
+phase = [0, 0.0, float(grace)]
 def group(sig):
     try:
         os.killpg(pid, sig)
@@ -3666,13 +3680,16 @@ def on_alarm(_s, _f):
         group(signal.SIGKILL)
 def forward(s, _f):
     group(s); group(signal.SIGCONT)
+    if phase[0] == 0:
+        phase[0] = 2; phase[1] = time.time(); phase[2] = grace / 2.0
+        signal.setitimer(signal.ITIMER_REAL, phase[2])
 signal.signal(signal.SIGALRM, on_alarm)
 for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(s, forward)
 signal.alarm(secs)
 signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
 _, st = os.waitpid(pid, 0)
-signal.alarm(0)
+signal.setitimer(signal.ITIMER_REAL, 0)
 def group_alive():
     try:
         os.killpg(pid, 0)
@@ -3680,10 +3697,11 @@ def group_alive():
     except OSError:
         return False
 if phase[0]:
-    while group_alive() and time.time() - phase[1] < grace:
-        time.sleep(0.1)
+    while group_alive() and time.time() - phase[1] < phase[2]:
+        time.sleep(0.05)
     group(signal.SIGKILL)
-    sys.exit(124)
+    if phase[0] == 1:
+        sys.exit(124)
 sys.exit(128 + os.WTERMSIG(st) if os.WIFSIGNALED(st) else os.WEXITSTATUS(st))
 ' "$seconds" "$grace" "$@"
     return $?

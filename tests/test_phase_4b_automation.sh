@@ -701,7 +701,10 @@ if [ "${1:-}" = --bounded-exec-only ]; then
     ln -s "$p" "$BX_PY/$t"; ln -s "$p" "$BX_NONE/$t"
   done
   BX_HAVE_PY=0
-  if p="$(type -P python3)" && "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 5) else 1)' 2>/dev/null; then
+  # Link the concrete interpreter, not a shim (pyenv's needs a full PATH).
+  if p="$(type -P python3)" \
+     && p="$("$p" -c 'import sys; assert sys.version_info >= (3, 5); print(sys.executable)' 2>/dev/null)" \
+     && [ -x "$p" ]; then
     ln -s "$p" "$BX_PY/python3"; BX_HAVE_PY=1
   fi
   # bx_run <impl> <out> <bash-snippet>: run the snippet with the function
@@ -716,10 +719,13 @@ if [ "${1:-}" = --bounded-exec-only ]; then
   for impl in $impls; do
     # 1. A direct child that survives SIGTERM is SIGKILLed after the grace
     # period (the ubuntu-26.04 spin). timeout(1) waits on it for the full 30s.
-    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o1" "P4B_TIMEOUT_KILL_GRACE_SECONDS=1 p4b_run_with_timeout 1 bash -c 'trap \"\" TERM; sleep 30; echo late'; echo \"rc=\$?\"")
-    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124' "$BX_WORK/o1" && ! grep -q late "$BX_WORK/o1"; then
+    rm -f "$BX_WORK/o1.pid"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o1" "P4B_TIMEOUT_KILL_GRACE_SECONDS=1 p4b_run_with_timeout 1 bash -c 'trap \"\" TERM; sleep 30 & echo \$! > \"$BX_WORK/o1.pid\"; wait; echo late'; echo \"rc=\$?\"")
+    o1pid="$(cat "$BX_WORK/o1.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124' "$BX_WORK/o1" && ! grep -q late "$BX_WORK/o1" \
+       && [ -n "$o1pid" ] && ! bx_alive "$o1pid"; then
       bx_pass "$impl: a SIGTERM-surviving child is SIGKILLed after the grace period and returns 124"
-    else bx_fail "$impl: SIGTERM-surviving child (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o1"))"; fi
+    else bx_fail "$impl: SIGTERM-surviving child (watch rc=$rc ms=$ms grandchild=$o1pid out=$(cat "$BX_WORK/o1"))"; fi
     # 2. A grandchild holding the caller's capture pipe dies with the group,
     # so \$( ... ) returns at the bound instead of waiting it out.
     read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2" "o=\$(p4b_run_with_timeout 1 bash -c 'sleep 30 & wait'); echo \"rc=\$? out=[\$o]\"")
@@ -740,15 +746,29 @@ if [ "${1:-}" = --bounded-exec-only ]; then
     if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124 out=\[\]' "$BX_WORK/o2c"; then
       bx_pass "$impl: a SIGTERM-ignoring grandchild is SIGKILLed once the direct child is gone"
     else bx_fail "$impl: SIGTERM-ignoring grandchild (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o2c"))"; fi
+    # 2d. Nested supervisors (orchestrator -> adapter -> CLI): when the outer
+    # bound fires, the inner supervisor escalates its own group too, so a
+    # SIGTERM-ignoring CLI below it is SIGKILLed before the outer SIGKILL
+    # removes the inner supervisor. The CLI holds the capture pipe.
+    rm -f "$BX_WORK/o2d.pid"
+    printf '%s\n' 'trap "" TERM; echo $$ > "$1"; exec sleep 30' > "$BX_WORK/cli-ignores-term.sh"
+    printf '%s\n' ". '$BX_FN'" "p4b_run_with_timeout 20 bash '$BX_WORK/cli-ignores-term.sh' '$BX_WORK/o2d.pid'" 'echo inner-done' > "$BX_WORK/nested-adapter.sh"
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o2d" "o=\$(p4b_run_with_timeout 1 bash '$BX_WORK/nested-adapter.sh'); echo \"rc=\$? out=[\$o]\"")
+    o2dpid="$(cat "$BX_WORK/o2d.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 8000 ] && grep -qx 'rc=124 out=\[\]' "$BX_WORK/o2d" \
+       && [ -n "$o2dpid" ] && ! bx_alive "$o2dpid"; then
+      bx_pass "$impl: a nested supervisor escalates its own group when the outer bound fires"
+    else bx_fail "$impl: nested supervisors (watch rc=$rc ms=$ms cli=$o2dpid out=$(cat "$BX_WORK/o2d"))"; fi
     # 3. Status, stdout, stdin and argv pass through untouched.
     read -r rc ms < <(bx_run "$impl" "$BX_WORK/o3" "o=\$(printf in | p4b_run_with_timeout 5 bash -c 'cat; printf \"[%s]\" \"\$@\"; exit 7' x 'a b' '\$y;z'); echo \"rc=\$? out=\$o\"")
     if [ "$rc" = 0 ] && grep -qx 'rc=7 out=in\[a b\]\[\$y;z\]' "$BX_WORK/o3"; then
       bx_pass "$impl: exit status, stdin, stdout and argv pass through"
     else bx_fail "$impl: passthrough (watch rc=$rc out=$(cat "$BX_WORK/o3"))"; fi
-    # 4. Death by signal reads as 128+N; a missing command as 127.
-    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o4" "p4b_run_with_timeout 5 bash -c 'kill -9 \$\$'; a=\$?; p4b_run_with_timeout 5 '$BX_WORK/no-such-cmd' 2>'$BX_WORK/o4.err'; echo \"rc=\$a,\$?\"")
-    if [ "$rc" = 0 ] && grep -qx 'rc=137,127' "$BX_WORK/o4"; then
-      bx_pass "$impl: signal death returns 128+N and a missing command 127"
+    # 4. Death by signal reads as 128+N; a missing command as 127; the
+    # command starts with SIGPIPE at its default (python3 itself ignores it).
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o4" "p4b_run_with_timeout 5 bash -c 'kill -9 \$\$'; a=\$?; p4b_run_with_timeout 5 '$BX_WORK/no-such-cmd' 2>'$BX_WORK/o4.err'; b=\$?; p4b_run_with_timeout 5 bash -c 'kill -PIPE \$\$'; echo \"rc=\$a,\$b,\$?\"")
+    if [ "$rc" = 0 ] && grep -qx 'rc=137,127,141' "$BX_WORK/o4"; then
+      bx_pass "$impl: signal death returns 128+N, a missing command 127, and SIGPIPE starts at its default"
     else bx_fail "$impl: signal/missing status (watch rc=$rc out=$(cat "$BX_WORK/o4") err=$(cat "$BX_WORK/o4.err" 2>/dev/null))"; fi
     # 5. SIGTERM to the supervisor (the command's parent) reaches the
     # command's group: the command dies and nothing is left behind.
@@ -796,6 +816,24 @@ SH
     if [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$BX_WORK/o9")" = "one two three rc=6 " ]; then
       bx_pass "stall supervisor streams output and keeps a finished suite's exit status"
     else bx_fail "stall supervisor passthrough (watch rc=$rc out=$(cat "$BX_WORK/o9"))"; fi
+    # A TERM to the supervisor (Ctrl-C, a cancelled job) takes the suite
+    # group with it instead of orphaning it.
+    rm -f "$BX_WORK/o10.pid"
+    printf '%s\n' 'sleep 30 & echo $! > "$1"; kill -TERM $PPID; wait' > "$BX_WORK/term-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o10" "$(type -P bash)" -c ". '$BX_SUP'; p4b_self_test_supervise bash '$BX_WORK/term-suite.sh' '$BX_WORK/o10.pid' 2>&1; echo \"rc=\$?\"")
+    o10pid="$(cat "$BX_WORK/o10.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 10000 ] && grep -qx 'rc=143' "$BX_WORK/o10" && [ -n "$o10pid" ] && ! bx_alive "$o10pid"; then
+      bx_pass "stall supervisor forwards a TERM to the suite group"
+    else bx_fail "stall supervisor TERM forwarding (watch rc=$rc ms=$ms grandchild=$o10pid out=$(cat "$BX_WORK/o10"))"; fi
+    # A suite that exits while a periodic writer it started still holds the
+    # pipe is drained for 5 wall-clock seconds, then the writer is killed.
+    rm -f "$BX_WORK/o11.pid"
+    printf '%s\n' '( while :; do echo tick; sleep 0.3; done ) & echo $! > "$1"; exit 3' > "$BX_WORK/writer-suite.sh"
+    read -r rc ms < <(bx_watch "$BX_WORK/o11" "$(type -P bash)" -c ". '$BX_SUP'; p4b_self_test_supervise bash '$BX_WORK/writer-suite.sh' '$BX_WORK/o11.pid' >/dev/null 2>&1; echo \"rc=\$?\"")
+    o11pid="$(cat "$BX_WORK/o11.pid" 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && [ "$ms" -lt 12000 ] && grep -qx 'rc=3' "$BX_WORK/o11" && [ -n "$o11pid" ] && ! bx_alive "$o11pid"; then
+      bx_pass "stall supervisor bounds the post-exit drain by wall clock and kills a leftover writer"
+    else bx_fail "stall supervisor post-exit drain (watch rc=$rc ms=$ms writer=$o11pid out=$(cat "$BX_WORK/o11"))"; fi
   else
     bx_fail "p4b_self_test_supervise not found in scripts/ci/check_phase_4b_automation"
   fi

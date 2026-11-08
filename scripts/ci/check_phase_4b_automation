@@ -175,6 +175,14 @@ p4b_self_test_supervise() {
       print STDERR "cannot run $ARGV[0]: $!\n"; POSIX::_exit(127);
     }
     POSIX::setpgid($pid, $pid);
+    # Ctrl-C or a TERM/HUP to this supervisor takes the suite group with it.
+    for my $sig (qw(INT TERM HUP)) {
+      $SIG{$sig} = sub {
+        kill $sig, -$pid; kill "CONT", -$pid;
+        sleep 2; kill "KILL", -$pid; waitpid($pid, 0);
+        exit 128 + { INT => POSIX::SIGINT(), TERM => POSIX::SIGTERM(), HUP => POSIX::SIGHUP() }->{$sig};
+      };
+    }
     close $w;
     my ($buf, $last, $quiet, $st, $done_at) = ("", "", 0, undef, undef);
     my $rin = ""; vec($rin, fileno($r), 1) = 1;
@@ -190,9 +198,10 @@ p4b_self_test_supervise() {
       } else {
         $quiet++;
       }
-      if (!defined $st && waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $?; $done_at = $quiet }
-      # The suite exited but something it started still holds the pipe.
-      last if defined $st && $quiet - $done_at >= 5;
+      if (!defined $st && waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $?; $done_at = time }
+      # The suite exited but something it started still holds the pipe: give
+      # it 5 wall-clock seconds, however much it keeps printing.
+      last if defined $st && time - $done_at >= 5;
       if (!defined $st && $quiet >= $stall) {
         print STDERR "check_phase_4b_automation: STALL: no output for ${stall}s from: @ARGV\n";
         print STDERR "check_phase_4b_automation: last line: \"$last\"\n";
