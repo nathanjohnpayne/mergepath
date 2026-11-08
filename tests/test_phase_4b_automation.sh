@@ -9480,16 +9480,153 @@ p4b_barrier_claim "$_cp"     && bad="$bad ownerless-stolen"
 rm -rf "$_cp"
 # Two contenders reaping the SAME dead claim: rename is single-winner, so
 # exactly one may take it over (rm+mkdir let both in — Codex P2, round 2).
+#
+# Each contender HOLDS after its attempt until both have attempted. The
+# recorded owner is the contender subshell itself, so a winner that exited
+# straight after `echo win` left a dead owner behind, and a contender
+# scheduled late then correctly reaped THAT claim too: two wins from correct
+# code (main push run 42386682145). Holding keeps the winner's owner alive
+# for the whole contest, so a second win can only come from a broken reap.
+# The waits are bounded so a fixture fault fails the case instead of hanging.
+# The reap window is microseconds wide, so one contest catches a broken
+# reap only some of the time; every round must produce exactly one win.
+_reap_contender() {
+  # Start gate: both contenders spin on one file so they enter the claim
+  # together, keeping the reap genuinely concurrent rather than whichever
+  # fork happened to be scheduled first.
+  : >"$WORK/$1.ready"
+  local _n=0
+  while [ ! -e "$WORK/reap-start" ] && [ "$_n" -lt 200000 ]; do _n=$((_n + 1)); done
+  p4b_barrier_claim "$_cp" && echo win
+  : >"$WORK/$1.tried"
+  _n=0
+  while [ ! -e "$WORK/reap-go" ] && [ "$_n" -lt 600 ]; do sleep 0.05; _n=$((_n + 1)); done
+}
+for _round in 1 2 3 4 5 6 7 8; do
+  rm -f "$WORK"/reap-a* "$WORK"/reap-b* "$WORK/reap-go" "$WORK/reap-start"
+  rm -rf "$_cp"
+  mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
+  ( _reap_contender reap-a ) >"$WORK/reap-a" 2>/dev/null &
+  _rp_a=$!
+  ( _reap_contender reap-b ) >"$WORK/reap-b" 2>/dev/null &
+  _rp_b=$!
+  _n=0
+  while { [ ! -e "$WORK/reap-a.ready" ] || [ ! -e "$WORK/reap-b.ready" ]; } && [ "$_n" -lt 600 ]; do
+    sleep 0.05; _n=$((_n + 1))
+  done
+  : >"$WORK/reap-start"
+  _n=0
+  while { [ ! -e "$WORK/reap-a.tried" ] || [ ! -e "$WORK/reap-b.tried" ]; } && [ "$_n" -lt 600 ]; do
+    sleep 0.05; _n=$((_n + 1))
+  done
+  [ -e "$WORK/reap-a.tried" ] && [ -e "$WORK/reap-b.tried" ] || bad="$bad reap-contenders-never-attempted"
+  : >"$WORK/reap-go"
+  wait "$_rp_a" || true
+  wait "$_rp_b" || true
+  _wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
+  [ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins(round-$_round)"
+done
+unset -f _reap_contender
+# The free contest above rarely lands in the one ordering the reap lock exists
+# for, so force it: B reads the dead owner, then A completes its whole reap
+# before B continues. B's `kill` (a function shadowing the builtin, in B's
+# subshell only) pauses right after it sees the original owner dead. With the
+# lock, B re-reads under it, finds A alive and declines; without it, B removes
+# A's LIVE claim and re-creates it, and both win (Codex P2, rounds 2 and 5).
+rm -f "$WORK"/reap-a* "$WORK"/reap-b* "$WORK/reap-go"
+rm -rf "$_cp"
 mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
-( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-a" 2>/dev/null &
-_rp_a=$!
-( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-b" 2>/dev/null &
+_reap_hold() {
+  local _n=0
+  while [ ! -e "$WORK/$1" ] && [ "$_n" -lt 600 ]; do sleep 0.05; _n=$((_n + 1)); done
+}
+(
+  kill() {
+    local _rc=0
+    builtin kill "$@" || _rc=$?
+    if [ "${1:-}" = -0 ] && [ "${2:-}" = "$_deadpid" ] && [ ! -e "$WORK/reap-b.read" ]; then
+      : >"$WORK/reap-b.read"
+      _reap_hold reap-a.tried
+      # A bounded wait that EXPIRES must fail the case: B would then go on
+      # without the forced ordering (A might still hold the reap lock, and B
+      # would decline there without ever re-reading A's live pid).
+      [ -e "$WORK/reap-a.tried" ] || : >"$WORK/reap-b.timeout"
+    fi
+    return "$_rc"
+  }
+  p4b_barrier_claim "$_cp" && echo win
+  : >"$WORK/reap-b.tried"
+  _reap_hold reap-go
+) >"$WORK/reap-b" 2>/dev/null &
 _rp_b=$!
+_reap_hold reap-b.read
+( p4b_barrier_claim "$_cp" && echo win; : >"$WORK/reap-a.tried"; _reap_hold reap-go ) >"$WORK/reap-a" 2>/dev/null &
+_rp_a=$!
+_reap_hold reap-b.tried
+[ -e "$WORK/reap-b.read" ] && [ -e "$WORK/reap-a.tried" ] && [ -e "$WORK/reap-b.tried" ] \
+  || bad="$bad forced-reap-never-interleaved"
+[ ! -e "$WORK/reap-b.timeout" ] || bad="$bad forced-reap-wait-expired"
+# Live-owner retention: while A is alive the claim stays A's, and fresh
+# concurrent contenders all decline without disturbing it.
+[ "$(cat "$_cp/pid" 2>/dev/null)" = "$_rp_a" ] || bad="$bad live-owner-not-retained"
+( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-c" 2>/dev/null &
+_rp_c=$!
+( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-d" 2>/dev/null &
+_rp_d=$!
+wait "$_rp_c" || true
+wait "$_rp_d" || true
+[ -z "$(cat "$WORK/reap-c" "$WORK/reap-d" 2>/dev/null)" ] || bad="$bad live-owner-reaped"
+[ "$(cat "$_cp/pid" 2>/dev/null)" = "$_rp_a" ] || bad="$bad live-owner-replaced"
+: >"$WORK/reap-go"
 wait "$_rp_a" || true
 wait "$_rp_b" || true
+unset -f _reap_hold
 _wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
-[ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins"
+[ "$(cat "$WORK/reap-a" 2>/dev/null)" = win ] || bad="$bad forced-reap-a-lost"
+[ "${_wins:-0}" = "1" ] || bad="$bad forced-takeover-wins=$_wins"
 rm -rf "$_cp"
+# A NON-exclusive mkdir(1) must not be trusted (#846): uutils mkdir exits 0
+# for a directory another caller created a moment earlier, so on ubuntu-26.04
+# two claimants both took the claim. The fake below exits 0 for anything, the
+# extreme of that behaviour; the claim must still go through mkdir(2).
+mkdir -p "$WORK/nx-bin" "$WORK/nx-only"
+printf '#!/bin/sh\nif [ "${1:-}" = --version ]; then echo "mkdir (uutils coreutils) 0.10.0"; fi\nexit 0\n' >"$WORK/nx-bin/mkdir"
+chmod +x "$WORK/nx-bin/mkdir"
+mkdir -p "$WORK/nx-existing"
+( PATH="$WORK/nx-bin:$PATH"; p4b_barrier_atomic_mkdir "$WORK/nx-existing" ) && bad="$bad nonexclusive-mkdir-trusted"
+( PATH="$WORK/nx-bin:$PATH"; p4b_barrier_atomic_mkdir "$WORK/nx-fresh" ) || bad="$bad atomic-mkdir-fresh-failed"
+[ -d "$WORK/nx-fresh" ] || bad="$bad atomic-mkdir-made-nothing"
+p4b_barrier_claim "$_cp" || bad="$bad nx-first-claim"
+( PATH="$WORK/nx-bin:$PATH"; p4b_barrier_claim "$_cp" ) && bad="$bad nonexclusive-mkdir-stole-live-claim"
+p4b_barrier_release "$_cp"
+# Fail closed: mkdir(1) is never a fallback. With no perl or python3, even a
+# GNU-looking mkdir that "succeeds" is not used, and nothing is created.
+printf '#!/bin/sh\nif [ "${1:-}" = --version ]; then echo "mkdir (GNU coreutils) 9.5"; fi\n/bin/mkdir "$@" 2>/dev/null; exit 0\n' >"$WORK/nx-only/mkdir"
+chmod +x "$WORK/nx-only/mkdir"
+# shellcheck disable=SC2123  # PATH is replaced on purpose: it hides perl and python3.
+( PATH="$WORK/nx-only"; p4b_barrier_atomic_mkdir "$WORK/nx-noperl" ) && bad="$bad no-syscall-create-not-declined"
+[ ! -e "$WORK/nx-noperl" ] || bad="$bad no-syscall-create-used-mkdir1"
+p4b_barrier_atomic_mkdir "" && bad="$bad empty-path-created"
+# The python3 branch, which hosts with perl never reach: with python3 the only
+# interpreter on PATH, a fresh path is created once and a repeat is refused.
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$WORK/py-only"
+  ln -s "$(command -v python3)" "$WORK/py-only/python3"
+  # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) || bad="$bad python-create-failed"
+  [ -d "$WORK/nx-py" ] || bad="$bad python-create-made-nothing"
+  # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) && bad="$bad python-create-not-exclusive"
+  rm -rf "$WORK/py-only" "$WORK/nx-py"
+fi
+# A syscall create that ERRORS declines too, and a claim built on it declines
+# without leaving a claim behind.
+printf '#!/bin/sh\nexit 2\n' >"$WORK/nx-bin/perl"
+chmod +x "$WORK/nx-bin/perl"
+( PATH="$WORK/nx-bin:$PATH"; p4b_barrier_atomic_mkdir "$WORK/nx-perlerr" ) && bad="$bad erroring-create-not-declined"
+( PATH="$WORK/nx-bin:$PATH"; p4b_barrier_claim "$_cp" ) && bad="$bad erroring-create-claimed"
+[ ! -e "$_cp" ] || bad="$bad erroring-create-left-claim"
+rm -rf "$_cp" "$WORK/nx-bin" "$WORK/nx-only" "$WORK/nx-existing" "$WORK/nx-fresh" "$WORK/nx-noperl" "$WORK/nx-perlerr"
 ( P4B_CLAIM_DIR=/dev/null/nope p4b_barrier_claim "$(P4B_CLAIM_DIR=/dev/null/nope p4b_barrier_claim_path o/r 1 h trigger)" ) \
   && bad="$bad unusable-dir-claimed"
 if [ -z "$bad" ]; then

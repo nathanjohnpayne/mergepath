@@ -1448,6 +1448,38 @@ p4b_barrier_self_pid() {
   esac
 }
 
+# p4b_barrier_atomic_mkdir <path>
+# Create ONE directory with the mkdir(2) system call: 0 only to the caller
+# that created it, non-zero when it already exists or cannot be made. The
+# claim below depends on that exclusivity, and mkdir(1) no longer provides it
+# everywhere: uutils coreutils (the default coreutils on Ubuntu 25.10 and
+# later, including the ubuntu-26.04 hosted runners) checks for the directory
+# and then creates it, and swallows the EEXIST of a creator that lands in
+# between. Two concurrent `mkdir DIR` calls then BOTH exit 0 (112 of 300
+# trials on ubuntu:26.04, uutils 0.10.0), so two claimants each took the
+# claim, or each took the reap lock, and both posted (#846).
+#
+# perl's and python's mkdir are the bare system call. mkdir(1) is never a
+# fallback, not even where it is GNU or BSD today: which coreutils a host
+# ships is exactly what changed under this code. With neither interpreter, or
+# when the call errors, the result is non-zero and the caller DECLINES, which
+# is the bounded-escalation direction rather than a possible double write. The
+# no-interpreter case says so on stderr, since every claim on that host will
+# decline and the barrier will escalate rather than post.
+p4b_barrier_atomic_mkdir() {
+  [ -n "${1:-}" ] || return 1
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'mkdir($ARGV[0]) or exit 1' -- "$1" 2>/dev/null
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
+    return
+  fi
+  echo "p4b_barrier_atomic_mkdir: neither perl nor python3 is available; declining the claim" >&2
+  return 1
+}
+
 # p4b_barrier_claim <path>
 # mkdir(2) is create-or-fail with no window between test and set: exactly one
 # caller creates the directory, every concurrent other gets EEXIST. Returns 0
@@ -1488,7 +1520,7 @@ p4b_barrier_claim() {
   # does not depend on winning. Ordered this way the window is one printf.
   p4b_barrier_self_pid
   mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
-  if ! mkdir "$1" 2>/dev/null; then
+  if ! p4b_barrier_atomic_mkdir "$1"; then
     local owner
     owner="$(cat "$1/pid" 2>/dev/null || true)"
     case "$owner" in
@@ -1503,14 +1535,14 @@ p4b_barrier_claim() {
     # the bounded-escalation direction, never a double post. Re-reading the
     # owner under the lock is what closes the both-read-dead window: the
     # second reaper sees the winner's live PID and declines.
-    mkdir "$1.reaplock" 2>/dev/null || return 1
+    p4b_barrier_atomic_mkdir "$1.reaplock" || return 1
     owner="$(cat "$1/pid" 2>/dev/null || true)"
     if [ -z "$owner" ] || kill -0 "$owner" 2>/dev/null; then
       rmdir "$1.reaplock" 2>/dev/null || true
       return 1
     fi
     rm -rf "$1" 2>/dev/null || true
-    if ! mkdir "$1" 2>/dev/null; then
+    if ! p4b_barrier_atomic_mkdir "$1"; then
       rmdir "$1.reaplock" 2>/dev/null || true
       return 1
     fi
