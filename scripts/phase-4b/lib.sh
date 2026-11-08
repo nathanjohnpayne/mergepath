@@ -3591,7 +3591,9 @@ p4b_run_with_timeout() {
       defined $pid or do { print STDERR "p4b_run_with_timeout: fork failed: $!\n"; exit 125 };
       if (!$pid) {
         POSIX::setpgid(0, 0);
-        $SIG{$_} = "DEFAULT" for qw(ALRM TERM INT HUP);
+        # The command always starts with SIGPIPE/SIGXFSZ at their defaults,
+        # whatever the caller ignored (GitHub runner steps ignore SIGPIPE).
+        $SIG{$_} = "DEFAULT" for qw(ALRM TERM INT HUP PIPE XFSZ);
         POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $held);
         { no warnings "exec"; exec { $ARGV[0] } @ARGV; }
         print STDERR "p4b_run_with_timeout: cannot run $ARGV[0]: $!\n";
@@ -3653,7 +3655,8 @@ if pid == 0:
     try:
         os.setpgid(0, 0)
         # Python starts with SIGPIPE and SIGXFSZ ignored, and an ignored
-        # signal stays ignored across exec; the command gets the defaults.
+        # signal stays ignored across exec; as in the perl path, the command
+        # gets the defaults.
         for s in held | {signal.SIGPIPE, signal.SIGXFSZ}:
             signal.signal(s, signal.SIG_DFL)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, held)

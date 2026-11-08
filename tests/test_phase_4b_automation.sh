@@ -765,8 +765,9 @@ if [ "${1:-}" = --bounded-exec-only ]; then
       bx_pass "$impl: exit status, stdin, stdout and argv pass through"
     else bx_fail "$impl: passthrough (watch rc=$rc out=$(cat "$BX_WORK/o3"))"; fi
     # 4. Death by signal reads as 128+N; a missing command as 127; the
-    # command starts with SIGPIPE at its default (python3 itself ignores it).
-    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o4" "p4b_run_with_timeout 5 bash -c 'kill -9 \$\$'; a=\$?; p4b_run_with_timeout 5 '$BX_WORK/no-such-cmd' 2>'$BX_WORK/o4.err'; b=\$?; p4b_run_with_timeout 5 bash -c 'kill -PIPE \$\$'; echo \"rc=\$a,\$b,\$?\"")
+    # command starts with SIGPIPE at its default even where the caller (a
+    # GitHub runner step) or python3 itself ignores it.
+    read -r rc ms < <(bx_run "$impl" "$BX_WORK/o4" "trap '' PIPE; p4b_run_with_timeout 5 bash -c 'kill -9 \$\$'; a=\$?; p4b_run_with_timeout 5 '$BX_WORK/no-such-cmd' 2>'$BX_WORK/o4.err'; b=\$?; p4b_run_with_timeout 5 bash -c 'kill -PIPE \$\$'; echo \"rc=\$a,\$b,\$?\"")
     if [ "$rc" = 0 ] && grep -qx 'rc=137,127,141' "$BX_WORK/o4"; then
       bx_pass "$impl: signal death returns 128+N, a missing command 127, and SIGPIPE starts at its default"
     else bx_fail "$impl: signal/missing status (watch rc=$rc out=$(cat "$BX_WORK/o4") err=$(cat "$BX_WORK/o4.err" 2>/dev/null))"; fi
