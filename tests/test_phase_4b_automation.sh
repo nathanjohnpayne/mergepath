@@ -827,6 +827,12 @@ SH
        && [ -n "$o12pid" ] && ! bx_alive "$o12pid"; then
       bx_pass "stall supervisor keeps the stall bound after the suite closes its output"
     else bx_fail "stall supervisor after EOF (watch rc=$rc ms=$ms grandchild=$o12pid out=$(cat "$BX_WORK/o12"))"; fi
+    # Without perl the supervisor refuses to start the suite (fail closed).
+    rm -f "$BX_WORK/o13.ran"
+    read -r rc ms < <(bx_watch "$BX_WORK/o13" "$(type -P bash)" -c ". '$BX_SUP'; export PATH='$BX_NONE'; p4b_self_test_supervise bash -c 'echo ran > \"$BX_WORK/o13.ran\"' 2>&1; echo \"rc=\$?\"")
+    if [ "$rc" = 0 ] && grep -qx 'rc=1' "$BX_WORK/o13" && grep -q 'perl is required' "$BX_WORK/o13" && [ ! -e "$BX_WORK/o13.ran" ]; then
+      bx_pass "stall supervisor refuses to run a suite unsupervised when perl is missing"
+    else bx_fail "stall supervisor without perl (watch rc=$rc out=$(cat "$BX_WORK/o13"))"; fi
     # A TERM to the supervisor (Ctrl-C, a cancelled job) takes the suite
     # group with it instead of orphaning it.
     rm -f "$BX_WORK/o10.pid"

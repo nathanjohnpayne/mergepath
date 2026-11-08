@@ -151,15 +151,15 @@ fi
 # stuck case used to run to the job's 60-minute timeout and print nothing.
 # The longest gap between lines in a passing CI run is about 15s, so 300s is
 # far outside normal pacing. A suite that finishes keeps its own exit status;
-# group members it leaves behind are killed. Without perl the suite runs
-# unsupervised, with a warning.
+# group members it leaves behind are killed. Without perl the suite is not
+# started at all (exit 1): an unsupervised suite is exactly the unbounded run
+# this exists to prevent.
 p4b_self_test_supervise() {
   local stall="${P4B_SELF_TEST_STALL_SECONDS:-300}"
   case "$stall" in ''|*[!0-9]*|0) stall=300 ;; esac
   if ! command -v perl >/dev/null 2>&1; then
-    echo "check_phase_4b_automation: WARN perl unavailable; running without the ${stall}s stall bound: $*" >&2
-    "$@" </dev/null
-    return
+    echo "check_phase_4b_automation: ERROR perl is required for the ${stall}s stall supervisor; not running unsupervised: $*" >&2
+    return 1
   fi
   perl -e '
     use strict; use warnings; use POSIX (); use IO::Handle;
