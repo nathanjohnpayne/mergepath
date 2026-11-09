@@ -817,6 +817,12 @@ SH
     if [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$BX_WORK/o9")" = "one two three rc=6 " ]; then
       bx_pass "stall supervisor streams output and keeps a finished suite's exit status"
     else bx_fail "stall supervisor passthrough (watch rc=$rc out=$(cat "$BX_WORK/o9"))"; fi
+    # A zero stall setting in any spelling uses the default (#3010): with 00
+    # or 000 read as 0, a suite that pauses for a second was killed as stalled.
+    read -r rc ms < <(bx_watch "$BX_WORK/o14" "$(type -P bash)" -c ". '$BX_SUP'; for z in 0 00 000; do P4B_SELF_TEST_STALL_SECONDS=\$z p4b_self_test_supervise bash -c 'sleep 0.6; echo \"z=\$1\"; exit 6' x \$z 2>&1; echo \"rc=\$?\"; done")
+    if [ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$BX_WORK/o14")" = "z=0 rc=6 z=00 rc=6 z=000 rc=6 " ]; then
+      bx_pass "stall supervisor treats 0, 00 and 000 as unset and uses the default"
+    else bx_fail "stall supervisor zero settings (watch rc=$rc ms=$ms out=$(cat "$BX_WORK/o14"))"; fi
     # A suite that closes its output and then hangs still hits the stall
     # bound: EOF on the pipe does not end the supervision.
     rm -f "$BX_WORK/o12.pid"
@@ -9822,15 +9828,35 @@ chmod +x "$WORK/nx-only/mkdir"
 p4b_barrier_atomic_mkdir "" && bad="$bad empty-path-created"
 # The python3 branch, which hosts with perl never reach: with python3 the only
 # interpreter on PATH, a fresh path is created once and a repeat is refused.
-if command -v python3 >/dev/null 2>&1; then
+# The link targets the concrete interpreter, not whatever `python3` resolves
+# to: a pyenv, asdf or mise shim is a `#!/usr/bin/env bash` script that cannot
+# find bash on the one-entry PATH, which failed this branch falsely (#3008).
+_nx_real_python3() {
+  local p
+  p="$(command -v python3)" \
+    && p="$("$p" -c 'import sys; print(sys.executable)' 2>/dev/null)" \
+    && [ -n "$p" ] && [ -x "$p" ] && printf '%s\n' "$p"
+}
+_nx_python3_branch() { # _nx_python3_branch <tag>: run the branch under the current PATH's python3
+  local py tag="$1"
+  py="$(_nx_real_python3)" || { bad="$bad $tag-python3-unresolved"; return; }
   mkdir -p "$WORK/py-only"
-  ln -s "$(command -v python3)" "$WORK/py-only/python3"
+  ln -s "$py" "$WORK/py-only/python3"
   # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
-  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) || bad="$bad python-create-failed"
-  [ -d "$WORK/nx-py" ] || bad="$bad python-create-made-nothing"
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) || bad="$bad $tag-python-create-failed"
+  [ -d "$WORK/nx-py" ] || bad="$bad $tag-python-create-made-nothing"
   # shellcheck disable=SC2123  # PATH is replaced on purpose: only python3 is reachable.
-  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) && bad="$bad python-create-not-exclusive"
+  ( PATH="$WORK/py-only"; p4b_barrier_atomic_mkdir "$WORK/nx-py" ) && bad="$bad $tag-python-create-not-exclusive"
   rm -rf "$WORK/py-only" "$WORK/nx-py"
+}
+if command -v python3 >/dev/null 2>&1; then
+  _nx_python3_branch direct
+  # Behind a shim-style wrapper (what pyenv installs) the branch still passes.
+  mkdir -p "$WORK/py-shim"
+  printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(command -v python3)" >"$WORK/py-shim/python3"
+  chmod +x "$WORK/py-shim/python3"
+  PATH="$WORK/py-shim:$PATH" _nx_python3_branch shim
+  rm -rf "$WORK/py-shim"
 fi
 # A syscall create that ERRORS declines too, and a claim built on it declines
 # without leaving a claim behind.

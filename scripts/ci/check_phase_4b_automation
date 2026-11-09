@@ -145,7 +145,8 @@ fi
 # p4b_self_test_supervise <command...>
 # Runs one suite with stdin closed, its stdout and stderr merged and streamed,
 # as the leader of its own process group. If the suite prints nothing for
-# P4B_SELF_TEST_STALL_SECONDS (default 300), the supervisor reports the stall
+# P4B_SELF_TEST_STALL_SECONDS (default 300; an unset, empty, non-numeric or
+# zero value, including 00, uses the default), the supervisor reports the stall
 # and the last line the suite printed (the last case that finished), kills the
 # whole group (SIGTERM, then SIGKILL 2s later) and returns 124 (#3007). A
 # stuck case used to run to the job's 60-minute timeout and print nothing.
@@ -156,7 +157,12 @@ fi
 # this exists to prevent.
 p4b_self_test_supervise() {
   local stall="${P4B_SELF_TEST_STALL_SECONDS:-300}"
-  case "$stall" in ''|*[!0-9]*|0) stall=300 ;; esac
+  case "$stall" in ''|*[!0-9]*) stall=300 ;; esac
+  # Strip leading zeros: 007 is 7, and 0, 00 or 000 become empty. A bare
+  # `0` pattern missed 00, which perl reads as 0, so every suite was killed
+  # as stalled on its first poll (#3010).
+  stall="${stall#"${stall%%[!0]*}"}"
+  [ -n "$stall" ] || stall=300
   if ! command -v perl >/dev/null 2>&1; then
     echo "check_phase_4b_automation: ERROR perl is required for the ${stall}s stall supervisor; not running unsupervised: $*" >&2
     return 1
