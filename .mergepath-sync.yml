@@ -2859,6 +2859,28 @@ paths:
     consumers: all
     requires:
       - "scripts/git-hooks/pre-push"   # it refuses to install without the hook
+  # Canonical Firebase deploy wrapper (#2707, parent #1806): guards, build,
+  # `op-firebase-deploy`, Cloudflare purge. Explicit consumer list, Firebase
+  # repos only. No `requires:`: the script sources no repo path, and
+  # op-firebase-deploy is a PATH command, not a repo file.
+  # Absent on purpose:
+  #   - nathanpaynedotcom: artifact-only deployment path, out of scope per
+  #     the owner decision.
+  #   - fiveacross: its own 1,342-line wrapper would be overwritten. Its
+  #     skip_paths override can only be validated once this path is in the
+  #     manifest (scripts/sync/validate-overrides.sh rule 4), so the
+  #     fiveacross sub-issue adds it to this list after the override lands.
+  #   - device-source-of-truth: not a manifest consumer (dropped 2026-09-05).
+  # tests/test_deploy.sh stays hub-only and is NOT added: fiveacross carries
+  # its own tests/test_deploy.sh, which a mirror would clobber.
+  - path: scripts/deploy.sh
+    type: canonical
+    consumers:
+      - matchline
+      - tadlockpsychiatry
+      - overridebroadway
+      - friends-and-family-billing
+      - swipewatch
 
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
