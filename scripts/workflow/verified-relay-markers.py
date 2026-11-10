@@ -19,10 +19,26 @@ STEP = 'Persist archive and publish the exact-head gate'
 # written to a terminal, so allowing them is safe. Older gh lacks the flag.
 ESCAPE_FLAG = '--allow-escape-sequences'
 MARKER = re.compile(r'^<!-- mergepath-feedback-archive-relay:v(?P<version>[12]) run=(?P<source>[1-9][0-9]*)(?: publisher=(?P<publisher>[1-9][0-9]*))? status=(?P<status>complete|failed) -->$')
+# Transient read failures (#2722): one HTTP 503 on a relay log left the
+# required check unpublished. A server error or network failure is retried
+# after each delay here (three attempts in all), inside the same read
+# deadline; anything else, 429 and rate-limit 403s included, fails at once.
+RETRY_DELAYS = (1.0, 2.0)
+HTTP_STATUS = re.compile(r'\bHTTP ([1-5][0-9][0-9])\b')
+NETWORK_ERROR = re.compile(r'error connecting to|connection (?:reset|refused)|i/o timeout'
+                           r'|TLS handshake timeout|no such host|unexpected EOF|network is unreachable', re.I)
 
 
 class ReadBudgetExhausted(ValueError):
     pass
+
+
+def transient(stderr):
+    """A 5xx-only HTTP failure, or a network failure that names no status."""
+    codes = HTTP_STATUS.findall(stderr)
+    if codes:
+        return all(code.startswith('5') for code in codes)
+    return bool(NETWORK_ERROR.search(stderr))
 
 
 def log_binds_persist(log, source, pr):
@@ -84,20 +100,32 @@ class Evidence:
         argv = ([self.gh, 'api'] + (['--paginate', '--slurp'] if pages else [])
                 + ([ESCAPE_FLAG] if text and self.escape_flag() else [])
                 + [f'repos/{self.repo}' + ('/' + endpoint if endpoint else '')])
-        # Capability probing can consume the allowance computed above.
-        # Give the API subprocess only the time that remains after it.
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise ReadBudgetExhausted('relay provenance read budget exhausted')
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=min(remaining, 20))
-        if result.returncode:
+        failure = None
+        for attempt, delay in enumerate(RETRY_DELAYS + (None,), 1):
+            # Capability probing and retry backoff consume the allowance.
+            # Give each API subprocess only the time that remains after them.
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                if failure:
+                    raise ValueError(f'{failure}; read budget exhausted after attempt {attempt - 1}')
+                raise ReadBudgetExhausted('relay provenance read budget exhausted')
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=min(remaining, 20))
+            if not result.returncode:
+                break
             if 'HTTP 404' in result.stderr or 'HTTP 410' in result.stderr:
                 self.read_cache[key] = None
                 return None
             # Name the refusal: an opaque failure here hid #2159 for days.
             detail = ''.join(ch if ch.isprintable() else '?' for ch in ' '.join(result.stderr.split()))[:200]
-            raise ValueError(f'could not read relay provenance endpoint {endpoint} '
-                             f'(gh exit {result.returncode}: {detail or "no stderr"})')
+            failure = (f'could not read relay provenance endpoint {endpoint} '
+                       f'(gh exit {result.returncode}: {detail or "no stderr"})')
+            if not transient(result.stderr):
+                raise ValueError(failure)
+            if delay is None:
+                raise ValueError(f'{failure}; transient failure persisted through {attempt} attempts')
+            if self.deadline - time.monotonic() <= delay:
+                raise ValueError(f'{failure}; read budget leaves no time to retry after attempt {attempt}')
+            time.sleep(delay)
         value = result.stdout if text else json.loads(result.stdout)
         self.read_cache[key] = value
         return value

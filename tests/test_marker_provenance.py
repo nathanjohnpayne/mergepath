@@ -21,9 +21,13 @@ class ReadBudget(unittest.TestCase):
         self.now = 0.0
         self.probe_seconds = 0.0
         self.probe_results = []
+        self.api_results = []
+        self.sleeps = []
+        self.sleep_overrun = 0.0
         self.calls = []
         for patcher in (
                 mock.patch.object(self.module['time'], 'monotonic', side_effect=lambda: self.now),
+                mock.patch.object(self.module['time'], 'sleep', side_effect=self.fake_sleep),
                 mock.patch.object(self.module['shutil'], 'which', return_value='/fixture/gh'),
                 mock.patch.object(self.module['subprocess'], 'run', side_effect=self.fake_run)):
             patcher.start()
@@ -40,7 +44,16 @@ class ReadBudget(unittest.TestCase):
                     raise result
                 return subprocess.CompletedProcess(args, *result)
             return subprocess.CompletedProcess(args, 0, self.module['ESCAPE_FLAG'], '')
+        if self.api_results:
+            return subprocess.CompletedProcess(args, *self.api_results.pop(0))
         return subprocess.CompletedProcess(args, 0, '{}', '')
+
+    def fake_sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds + self.sleep_overrun
+
+    def api_calls(self):
+        return [(args, timeout) for args, timeout in self.calls if args[-1] != '--help']
 
     def test_slow_probe_leaves_only_fresh_remaining_api_allowance(self):
         self.now, self.probe_seconds = 55.0, 3.0
@@ -118,6 +131,85 @@ class ReadBudget(unittest.TestCase):
         self.assertEqual(self.calls[0][1], 1.0)
 
 
+    # #2722: transient relay reads retry inside the same deadline; every
+    # other failure, and an exhausted retry, still fails closed by name.
+    def test_transient_503_retries_with_backoff_then_reads(self):
+        self.api_results = [(1, '', 'gh: HTTP 503')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(self.sleeps, [1.0])
+        calls = self.api_calls()
+        self.assertEqual([args for args, _ in calls], [calls[0][0]] * 2)
+        self.assertEqual([timeout for _, timeout in calls], [20, 20])
+
+    def test_network_error_retries(self):
+        self.api_results = [(1, '', 'error connecting to api.github.com'),
+                            (1, '', 'read: connection reset by peer')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(len(self.api_calls()), 3)
+
+    def test_persistent_5xx_fails_closed_after_three_attempts(self):
+        self.api_results = [(1, '', 'gh: HTTP 503'), (1, '', 'HTTP 502: Bad Gateway'),
+                            (1, '', 'gh: Server Error (HTTP 500)')]
+        with self.assertRaises(ValueError) as caught:
+            self.evidence.api('actions/jobs/901/logs')
+        self.assertNotIsInstance(caught.exception, self.module['ReadBudgetExhausted'])
+        self.assertIn('actions/jobs/901/logs (gh exit 1: gh: Server Error (HTTP 500))', str(caught.exception))
+        self.assertIn('persisted through 3 attempts', str(caught.exception))
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(len(self.api_calls()), 3)
+        self.assertEqual(self.evidence.read_cache, {})
+
+    def test_permanent_and_rate_limit_failures_are_not_retried(self):
+        for stderr in ('gh: Resource not accessible by integration (HTTP 403)',
+                       'gh: API rate limit exceeded (HTTP 403)',
+                       'gh: You have exceeded a secondary rate limit (HTTP 429)',
+                       'gh: Bad credentials (HTTP 401)',
+                       'gh: HTTP 500 retried upstream, then HTTP 403',
+                       'Feedback snapshot API-command budget exhausted (200).', ''):
+            with self.subTest(stderr=stderr):
+                self.calls.clear()
+                self.api_results = [(1, '', stderr), (0, '{}', '')]
+                with self.assertRaisesRegex(ValueError, 'could not read relay provenance endpoint'):
+                    self.evidence.api('actions/runs/900')
+                self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_not_found_stays_an_absent_read_without_retry(self):
+        self.api_results = [(1, '', 'gh: Not Found (HTTP 404)')]
+        self.assertIsNone(self.evidence.api('actions/jobs/901/logs', text=True))
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_retry_never_extends_the_read_deadline(self):
+        self.now = 59.5
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        with self.assertRaisesRegex(ValueError, 'HTTP 503.*no time to retry after attempt 1'):
+            self.evidence.api('actions/runs/900')
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_backoff_overrun_fails_by_name_not_as_spent_budget(self):
+        # A late wake-up past the deadline is still the named read failure,
+        # never the ReadBudgetExhausted that legacy recovery treats as unproven.
+        self.now, self.sleep_overrun = 58.0, 2.0
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        with self.assertRaises(ValueError) as caught:
+            self.evidence.api('actions/runs/900')
+        self.assertNotIsInstance(caught.exception, self.module['ReadBudgetExhausted'])
+        self.assertIn('HTTP 503); read budget exhausted after attempt 1', str(caught.exception))
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, [1.0]))
+
+    def test_retry_timeout_uses_the_remaining_allowance(self):
+        self.now = 50.0
+        self.api_results = [(1, '', 'gh: HTTP 503'), (1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual([timeout for _, timeout in self.api_calls()], [10.0, 9.0, 7.0])
+
+    def test_text_retry_reuses_the_cached_probe(self):
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, 'log', '')]
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), 'log')
+        self.assertEqual(sum(args[-1] == '--help' for args, _ in self.calls), 1)
+        self.assertTrue(all(self.module['ESCAPE_FLAG'] in args for args, _ in self.api_calls()))
+
+
 REPO = 'acme/widget'
 MARKER = '<!-- mergepath-feedback-archive-relay:v2 run=12345 publisher=900 status=complete -->'
 LOG = '''2026-10-09T00:00:00Z ##[group]Run set -euo pipefail
@@ -192,16 +284,39 @@ if value is None:
     sys.stderr.write('Not Found (HTTP 404)'); raise SystemExit(1)
 if isinstance(value,dict) and '_error' in value:
     sys.stderr.write(value['_error']); raise SystemExit(1)
+if isinstance(value,dict) and '_fail_first' in value:
+    failed=root/'failed_calls'; seen=json.loads(failed.read_text()) if failed.exists() else {}
+    seen[endpoint]=seen.get(endpoint,0)+1; failed.write_text(json.dumps(seen))
+    if seen[endpoint]<=value['_fail_first']:
+        sys.stderr.write(value['_stderr']); raise SystemExit(1)
+    value=value['then']
 if mode in ('modern','probe-once') and isinstance(value,str) and chr(27) in value and not allow:
     sys.stderr.write('the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway'); raise SystemExit(1)
 print(value if isinstance(value,str) else json.dumps(value))
 ''')
         gh.chmod(0o755)
 
-    def invoke(self):
+    def invoke(self, record_sleeps=False):
         (self.path / 'responses').write_text(json.dumps(self.responses))
-        env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path))
-        result = subprocess.run(['python3', str(SCRIPT), '--repo', REPO, '--pr', '7'],
+        env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path),
+                   RELAY_SLEEP_LOG=str(self.path / 'sleeps'))
+        # Retry cases run the real entry point with only time.sleep replaced
+        # by a recorder, so backoff is asserted without waiting for it. The
+        # standard library's subprocess module polls a child through
+        # time.sleep when it waits with a timeout; those calls keep the real
+        # sleep and are not backoff, so they are not recorded.
+        command = ['python3', str(SCRIPT)]
+        if record_sleeps:
+            command[1:1] = ['-c', 'import os, runpy, sys, time\n'
+                            'real_sleep = time.sleep\n'
+                            'def sleep(seconds):\n'
+                            '    if sys._getframe(1).f_globals.get("__name__") == "subprocess":\n'
+                            '        return real_sleep(seconds)\n'
+                            '    with open(os.environ["RELAY_SLEEP_LOG"], "a") as log:\n'
+                            '        log.write(f"{seconds}\\n")\n'
+                            'time.sleep = sleep\n'
+                            'runpy.run_path(sys.argv.pop(1), run_name="__main__")']
+        result = subprocess.run(command + ['--repo', REPO, '--pr', '7'],
                                 input=json.dumps(self.comments), text=True, capture_output=True, env=env)
         return result.returncode, json.loads(result.stdout) if result.stdout else [], result.stderr
 
@@ -314,6 +429,42 @@ print(value if isinstance(value,str) else json.dumps(value))
         code, _, error = self.invoke()
         self.assertEqual(code, 2)
         self.assertIn('gh exit 1: HTTP 403: Resource not accessible by integration', error)
+
+    # #2722 acceptance: a transient 503 on the relay log retries, then
+    # publishes; a permanent read failure fails closed and stays visible.
+    def log_reads(self):
+        return (self.path / 'calls').read_text().splitlines().count('repos/' + REPO + '/actions/jobs/901/logs')
+
+    def sleeps(self):
+        log = self.path / 'sleeps'
+        return log.read_text().split() if log.exists() else []
+
+    def test_transient_503_on_relay_log_retries_then_promotes_completion(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 1, '_stderr': 'gh: HTTP 503', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual(code, 0, error)
+        self.assertEqual([comment['body'] for comment in comments],
+                         ['<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'])
+        self.assertEqual((self.log_reads(), self.sleeps()), (2, ['1.0']))
+
+    def test_persistent_503_on_relay_log_fails_closed_and_names_it(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 99, '_stderr': 'gh: HTTP 503', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertIn('relay provenance unavailable: could not read relay provenance endpoint '
+                      'actions/jobs/901/logs (gh exit 1: gh: HTTP 503); transient failure persisted '
+                      'through 3 attempts', error)
+        self.assertEqual((self.log_reads(), self.sleeps()), (3, ['1.0', '2.0']))
+
+    def test_permanent_relay_log_failure_fails_closed_without_retry(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 99, '_stderr': 'gh: Resource not accessible by integration (HTTP 403)', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertIn('actions/jobs/901/logs (gh exit 1: gh: Resource not accessible by integration (HTTP 403))', error)
+        self.assertEqual((self.log_reads(), self.sleeps()), (1, []))
 
     def test_duplicate_completions_reuse_provenance_within_one_read(self):
         self.comments *= 2
