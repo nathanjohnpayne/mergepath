@@ -92,10 +92,85 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaises(ValueError): isolation.assess(secrets, env, policies, 'main')
 
 
+QUEUE_TOKENS = ['AUTHOR_MERGE_TOKEN', 'MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN']
+# The live shape #2774 recorded on 2026-10-22: the three tokens every
+# repository holds at repository scope, and an environment that exists with
+# no deployment branch policy and admin bypass on.
+LIVE_REPO_SECRETS = [{'name': 'AUTHOR_MERGE_TOKEN'}, {'name': 'CI_ACTOR_TOKEN'}, {'name': 'REVIEWER_ASSIGNMENT_TOKEN'}]
+UNRESTRICTED = {'can_admins_bypass': True, 'deployment_branch_policy': None}
+LIVE_DRIFT = [
+    'AUTHOR_MERGE_TOKEN is a repository secret, but the code expects it only in environment merge-queue-policy',
+    'Environment merge-queue-policy, which the code treats as protected, has no deployment branch policy',
+]
+
+
+class CodePlacementTests(unittest.TestCase):
+    LIB = (ROOT / 'scripts/lib/merge-queue-protection.sh').read_text()
+
+    def test_expectation_is_read_from_the_queue_topology_validator(self):
+        self.assertEqual(isolation.code_placement_expectation(self.LIB), ('merge-queue-policy', QUEUE_TOKENS))
+
+    def test_unrecognised_or_inconsistent_library_fails_closed(self):
+        repository_list = '(["AUTHOR_MERGE_TOKEN","MERGE_QUEUE_POLICY_TOKEN",\n          "MERGE_QUEUE_SOURCE_TOKEN"] | index($name)) == null'
+        self.assertEqual(self.LIB.count(repository_list), 2)
+        mutants = {
+            'no environment constant': self.LIB.replace('MERGEPATH_MERGE_QUEUE_ENVIRONMENT=merge-queue-policy\n', ''),
+            'validator checks another environment': self.LIB.replace(
+                '.environment.name == "merge-queue-policy"', '.environment.name == "other"'),
+            'repository list drops a token': self.LIB.replace(
+                repository_list, repository_list.replace('"AUTHOR_MERGE_TOKEN",', ''), 1),
+            'exact list names a non-authority token': self.LIB.replace(
+                '"MERGE_QUEUE_SOURCE_TOKEN"\n      ] and', '"BUILD_KEY"\n      ] and'),
+            'exact list missing': self.LIB.replace('[.environment_secrets.secrets[].name] | sort', '[]'),
+        }
+        for label, text in mutants.items():
+            with self.subTest(label):
+                self.assertNotEqual(text, self.LIB)
+                with self.assertRaises(ValueError):
+                    isolation.code_placement_expectation(text)
+
+    def place(self, repo_secrets, environment, organization_secrets=None):
+        return isolation.assess_placement(repo_secrets, environment, 'merge-queue-policy', QUEUE_TOKENS,
+                                          organization_secrets)
+
+    def test_live_placement_reports_both_gaps_and_nothing_else(self):
+        # CI_ACTOR_TOKEN and REVIEWER_ASSIGNMENT_TOKEN are read by jobs that
+        # name no environment, so their repository placement matches the code.
+        self.assertEqual(self.place(LIVE_REPO_SECRETS, UNRESTRICTED), LIVE_DRIFT)
+
+    def test_passes_once_placement_matches_the_code(self):
+        moved = [item for item in LIVE_REPO_SECRETS if item['name'] != 'AUTHOR_MERGE_TOKEN']
+        self.assertEqual(self.place(moved, CLOSED), [])
+        # Any deployment branch policy satisfies (b); which one #2731 picks is
+        # not this mode's question.
+        self.assertEqual(self.place(moved, dict(UNRESTRICTED, deployment_branch_policy={
+            'protected_branches': True, 'custom_branch_policies': False})), [])
+
+    def test_every_expected_token_is_checked_at_both_shared_scopes(self):
+        for name in QUEUE_TOKENS:
+            with self.subTest(name):
+                self.assertEqual(self.place([{'name': name}], CLOSED, [{'name': name}]), [
+                    f'{name} is a repository secret, but the code expects it only in environment merge-queue-policy',
+                    f'{name} is an organization secret shared with this repository, but the code expects it only in environment merge-queue-policy',
+                ])
+
+    def test_missing_environment_is_drift(self):
+        self.assertEqual(self.place([], None),
+                         ['Environment merge-queue-policy, which the code treats as protected, does not exist'])
+
+    def test_malformed_metadata_is_error(self):
+        for secrets, environment, shared in ((None, CLOSED, []), ([{}], CLOSED, []), ([], CLOSED, 'x'),
+                                             ([], 'invalid', []), ([], {'can_admins_bypass': False}, []),
+                                             ([], dict(CLOSED, deployment_branch_policy={}), [])):
+            with self.assertRaises(ValueError):
+                self.place(secrets, environment, shared)
+
+
 class IsolationCliTests(unittest.TestCase):
     def run_audit(self, *, secrets=None, env=None, policies=None, failure=None,
                   owner_type='User', organization_secrets=None, failure_text='permission denied', inventory=None,
-                  repository=None, environment='merge-queue-policy', expect=None, env_secrets=None):
+                  repository=None, environment='merge-queue-policy', expect=None, env_secrets=None,
+                  placement=False):
         root = 'repos/owner/repo'
         observations = {
             root: [{'owner': {'type': owner_type}}] if repository is None else repository,
@@ -130,8 +205,10 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
                                AUDIT_FAILURE=failure or '', AUDIT_FAILURE_TEXT=failure_text)
             extra = ([] if environment == 'merge-queue-policy' else ['--environment', environment])
             extra += [] if expect is None else ['--expect-secrets', expect]
+            # --code-placement takes no --branch: it reads no branch policy.
+            argv = ['--code-placement'] if placement else ['--branch', 'main', *extra]
             result = subprocess.run(['python3', str(ROOT / 'scripts/audit-credential-isolation.py'),
-                                     '--repo', 'owner/repo', '--branch', 'main', *extra], env=environment_vars,
+                                     '--repo', 'owner/repo', *argv], env=environment_vars,
                                     text=True, capture_output=True)
             calls = (temp / 'calls').read_text().splitlines()
             return result.returncode, json.loads(result.stdout), calls
@@ -285,6 +362,56 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
     def test_unreadable_bypass_field_is_error(self):
         code, report, _ = self.run_audit(env=[{'deployment_branch_policy': None}])
         self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_code_placement_reports_the_live_drift_from_names_only(self):
+        marker = 'SYNTHETIC_VALUE_NOT_FOR_REPORTING'
+        secrets = [{'total_count': 3, 'secrets': [dict(item, value=marker) for item in LIVE_REPO_SECRETS]}]
+        code, report, calls = self.run_audit(placement=True, secrets=secrets, env=[UNRESTRICTED])
+        self.assertEqual((code, report['status'], report['mode'], report['environment']),
+                         (3, 'DRIFT', 'code-placement', 'merge-queue-policy'))
+        self.assertEqual(report['drift'], LIVE_DRIFT)
+        self.assertNotIn(marker, json.dumps(report))
+        # No environment-secret or branch-policy read: neither changes the verdict.
+        self.assertEqual(calls, ['repos/owner/repo/actions/secrets?per_page=100', 'repos/owner/repo',
+                                 'repos/owner/repo/environments/merge-queue-policy'])
+
+    def test_code_placement_passes_once_placement_matches(self):
+        moved = [{'total_count': 2, 'secrets': [{'name': 'CI_ACTOR_TOKEN'}, {'name': 'REVIEWER_ASSIGNMENT_TOKEN'}]}]
+        code, report, _ = self.run_audit(placement=True, secrets=moved)
+        self.assertEqual((code, report['status'], report['drift']), (0, 'PASS', []))
+
+    def test_code_placement_checks_organization_secrets_and_a_missing_environment(self):
+        code, report, calls = self.run_audit(
+            placement=True, owner_type='Organization',
+            organization_secrets=[{'total_count': 1, 'secrets': [{'name': 'MERGE_QUEUE_SOURCE_TOKEN'}]}],
+            failure='repos/owner/repo/environments/merge-queue-policy', failure_text='gh: Not Found (HTTP 404)')
+        self.assertEqual((code, report['status']), (3, 'DRIFT'))
+        self.assertEqual(report['drift'], [
+            'MERGE_QUEUE_SOURCE_TOKEN is an organization secret shared with this repository, but the code expects it only in environment merge-queue-policy',
+            'Environment merge-queue-policy, which the code treats as protected, does not exist',
+        ])
+        self.assertIn('repos/owner/repo/environments?per_page=100', calls)
+
+    def test_code_placement_unreadable_metadata_is_error(self):
+        for kwargs in ({'failure': 'repos/owner/repo/actions/secrets?per_page=100'},
+                       {'failure': 'repos/owner/repo/environments/merge-queue-policy'},
+                       {'failure': 'repos/owner/repo/environments/merge-queue-policy', 'failure_text': 'gh: Not Found (HTTP 404)',
+                        'inventory': [{'total_count': 1, 'environments': [{'name': 'merge-queue-policy'}]}]},
+                       {'env': [None]}, {'env': [{'can_admins_bypass': True}]}):
+            with self.subTest(kwargs):
+                code, report, _ = self.run_audit(placement=True, **kwargs)
+                self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_code_placement_refuses_its_own_environment_or_names(self):
+        for extra in (['--environment', 'dependabot-reviewer'], ['--expect-secrets', 'AUTHOR_MERGE_TOKEN']):
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/audit-credential-isolation.py'),
+                                     '--repo', 'owner/repo', '--code-placement', *extra], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('merge-queue-protection.sh', result.stderr)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/audit-credential-isolation.py'),
+                                 '--repo', 'owner/repo'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--branch is required', result.stderr)
 
 
 if __name__ == '__main__': unittest.main()

@@ -10,8 +10,11 @@ name: Dependabot Auto-merge
 #   approve  reads DEPENDABOT_REVIEWER_TOKEN from the `dependabot-reviewer`
 #            environment and uses it for exactly two calls: the identity
 #            check and the exact-head approval.
-#   merge    reads AUTHOR_MERGE_TOKEN from `merge-queue-policy` and runs
-#            only after `approve` reports an approval on a head it read back.
+#   merge    names `merge-queue-policy` and reads AUTHOR_MERGE_TOKEN, and
+#            runs only after `approve` reports an approval on a head it
+#            read back. The token is meant to live in that environment but
+#            today is a repository secret in every fleet repository, so the
+#            job resolves the repository copy (#2774; see the merge job).
 # Every other API call in both jobs runs under GITHUB_TOKEN, scoped by the
 # `permissions:` block below.
 #
@@ -436,9 +439,17 @@ jobs:
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.base.ref == github.event.repository.default_branch &&
       needs.approve.outputs.merge == 'true'
-    # AUTHOR_MERGE_TOKEN is an environment secret. The trusted
-    # pull_request_target definition runs on main and no candidate-controlled
-    # workflow can request this environment from a refs/pull/* merge ref.
+    # AUTHOR_MERGE_TOKEN is meant to be an environment secret of
+    # `merge-queue-policy` (R-107), but it is not one yet. As of the
+    # 2026-10-22 names-only readback it is a repository secret in the hub
+    # and every consumer, and `merge-queue-policy` holds no secrets, has no
+    # deployment branch policy and allows administrator bypass (#2774).
+    # A job that names an environment lacking the secret silently resolves
+    # the repository copy, so this job works, but the environment protects
+    # nothing: every workflow in the repository, including one added on a
+    # branch, can read the token. Where it should live, and the branch
+    # policy it needs, is #2731's decision; the hub's credential-isolation
+    # audit reports the gap with --code-placement until it is closed.
     # This job never sees DEPENDABOT_REVIEWER_TOKEN: no job names two
     # credential environments (ADR 0004).
     environment: merge-queue-policy
