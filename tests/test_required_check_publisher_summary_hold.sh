@@ -25,20 +25,25 @@ abort("could not extract the publisher publish step") unless matches.length == 1
 File.write(ARGV[1], matches[0]["run"])
 RUBY
 
+# #2689: gate() runs the Codex P1 context through codex_p1_evaluate, so both
+# shipped functions are extracted.
 awk '
-  /^gate\(\) \{$/ { inside=1 }
+  /^(gate|codex_p1_evaluate)\(\) \{$/ { inside=1 }
   inside { print }
-  inside && /^}$/ { exit }
+  inside && /^}$/ { inside=0 }
 ' "$TMP/publish.sh" >"$TMP/gate-helper.sh"
 grep '^[[:space:]]*gate scripts/' "$TMP/publish.sh" >"$TMP/gate-calls.sh" || true
 if ! grep -q '^gate() {$' "$TMP/gate-helper.sh" \
+    || ! grep -q '^codex_p1_evaluate() {$' "$TMP/gate-helper.sh" \
     || [ "$(wc -l <"$TMP/gate-calls.sh" | tr -d ' ')" -ne 3 ]; then
-  echo "FAIL: could not extract one gate helper and its three live callers"
+  echo "FAIL: could not extract the gate helpers and their three live callers"
   exit 1
 fi
 
 MCG_CALL=$(grep 'merge-clearance-gate.sh' "$TMP/gate-calls.sh")
-CODEX_CALL=$(grep 'codex-p1-gate.sh' "$TMP/gate-calls.sh")
+# The Codex P1 caller is found by its context, not by the script it names, so
+# a caller that names another script still runs here and fails behaviorally.
+CODEX_CALL=$(grep -F '"$CODEX_P1_CONTEXT"' "$TMP/gate-calls.sh")
 CR_CALL=$(grep 'coderabbit-severity-gate.sh' "$TMP/gate-calls.sh")
 [ -n "$MCG_CALL" ] && [ -n "$CODEX_CALL" ] && [ -n "$CR_CALL" ] \
   || { echo "FAIL: required live gate caller line missing"; exit 1; }
@@ -72,6 +77,29 @@ chmod +x "$TMP/scripts/fake-gate"
 for script in merge-clearance-gate.sh codex-p1-gate.sh coderabbit-severity-gate.sh; do
   ln -s fake-gate "$TMP/scripts/$script"
 done
+
+# #2689: the Codex P1 path's three collaborators. The driver double records
+# its arguments, whether it was asked for a report, and the summary flag; it
+# reports CODEX_RC unless DRIVER_NO_REPORT=1. The relay double exits RELAY_RC.
+mkdir -p "$TMP/scripts/workflow"
+cat >"$TMP/scripts/workflow/codex-p1-snapshot-retry.py" <<'SH'
+#!/usr/bin/env bash
+printf '%s\t%s\t%s\n' "$*" "${CODEX_P1_VERDICT_REPORT:+report}" "${REQUIRE_REVIEW_SUMMARY-unset}" >>"$DRIVER_LOG"
+echo "fixture driver rc=$CODEX_RC"
+if [ -n "${CODEX_P1_VERDICT_REPORT:-}" ] && [ "${DRIVER_NO_REPORT:-0}" != 1 ]; then
+  printf '{"rc":%s,"title":"fixture driver verdict rc=%s"}\n' "$CODEX_RC" "$CODEX_RC" >"$CODEX_P1_VERDICT_REPORT"
+fi
+exit "$CODEX_RC"
+SH
+cat >"$TMP/scripts/workflow/codex-p1-relay-pending.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$RELAY_LOG"
+echo "fixture relay rc=$RELAY_RC"
+exit "$RELAY_RC"
+SH
+printf '#!/bin/sh\necho fixture-fingerprint\n' >"$TMP/scripts/review-feedback-surface-fingerprint.sh"
+chmod +x "$TMP/scripts/workflow/codex-p1-snapshot-retry.py" "$TMP/scripts/workflow/codex-p1-relay-pending.sh" \
+  "$TMP/scripts/review-feedback-surface-fingerprint.sh"
 
 cat >"$TMP/gh" <<'SH'
 #!/usr/bin/env bash
@@ -133,7 +161,9 @@ export PR=7 head_sha=abc123
 export MCG_CONTEXT="Merge clearance gate"
 export CODEX_P1_CONTEXT="Codex P1 unresolved threads"
 export CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings"
-export MCG_RC=0 CODEX_RC=0 CR_RC=0
+export MCG_RC=0 CODEX_RC=0 CR_RC=0 RELAY_RC=0
+export DRIVER_LOG="$TMP/driver-log" RELAY_LOG="$TMP/relay-log"
+unset CODEX_P1_VERDICT_REPORT DRIVER_NO_REPORT
 
 run_call() {
   local call="$1" previous="$PWD"
@@ -145,6 +175,8 @@ run_call() {
 reset_case() {
   : >"$GATE_ENV_LOG"
   : >"$GH_CALL_LOG"
+  : >"$DRIVER_LOG"
+  : >"$RELAY_LOG"
   had_infra_error=0
 }
 
@@ -222,17 +254,115 @@ set -e
 record "unrelated rc 3 receives no flag and remains an infra red" "$case_rc"
 MCG_RC=0; export MCG_RC
 
+# #2689: the Codex P1 caller evaluates through the snapshot driver, behind the
+# guards of codex-p1-gate.yml's scheduled sweep. Driver rc 3 is exhausted
+# feedback-snapshot recovery (drift on every attempt): the sweep publishes it
+# red and counts it an infrastructure error, and so does the publisher.
 reset_case
 CODEX_RC=3; export CODEX_RC
 run_call "$CODEX_CALL" >"$TMP/codex3.out"
 set +e
-grep -qx $'codex-p1-gate.sh\tunset' "$GATE_ENV_LOG" \
+grep -q $'\treport\tunset$' "$DRIVER_LOG" && [ ! -s "$GATE_ENV_LOG" ] \
+  && [ "$had_infra_error" -eq 1 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && grep -q -- '-f output\[title\]=fixture driver verdict rc=3' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "Codex driver rc 3 (snapshot drift exhausted) receives no flag and remains an infra red" "$case_rc"
+CODEX_RC=0; export CODEX_RC
+
+# The driver runs in report mode on the generation gate() opened (id 17 from
+# the rcg_open double), never the gate script directly, after the relay scan;
+# gate() publishes its verdict and its title through the one owned PATCH.
+reset_case
+run_call "$CODEX_CALL" >"$TMP/codex0.out"
+set +e
+[ "$(cat "$DRIVER_LOG")" = $'7 example/repo abc123 17 fingerprint\treport\tunset' ] \
+  && [ "$(cat "$RELAY_LOG")" = "example/repo 7" ] && [ ! -s "$GATE_ENV_LOG" ] \
+  && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=success' "$GH_CALL_LOG" \
+  && grep -q -- '-f output\[title\]=fixture driver verdict rc=0' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "Codex P1 evaluates through the snapshot driver in report mode on its own generation" "$case_rc"
+
+reset_case
+CODEX_RC=1; export CODEX_RC
+run_call "$CODEX_CALL" >"$TMP/codex1.out"
+set +e
+[ -s "$DRIVER_LOG" ] && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "Codex driver rc 1 (blocked) publishes failure without an infra flag" "$case_rc"
+CODEX_RC=0; export CODEX_RC
+
+# A driver that exits 0 without reporting that verdict is not a clearance.
+reset_case
+DRIVER_NO_REPORT=1; export DRIVER_NO_REPORT
+run_call "$CODEX_CALL" >"$TMP/codex-no-report.out"
+set +e
+[ -s "$DRIVER_LOG" ] && [ "$had_infra_error" -eq 1 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "Codex driver exit 0 without a verdict report publishes an infra red" "$case_rc"
+unset DRIVER_NO_REPORT
+
+# Fingerprint-helper guard: missing or not executable, as in the sweep, is a
+# failure and an infra error, with no relay scan and no evaluation. The same
+# holds for a missing or non-executable driver.
+fingerprint_guard_case() {  # <label> <path> <rm|chmod>
+  local path="$TMP/$2"
+  reset_case
+  cp "$path" "$TMP/guard-saved"
+  if [ "$3" = rm ]; then rm -f "$path"; else chmod -x "$path"; fi
+  run_call "$CODEX_CALL" >"$TMP/codex-guard.out"
+  set +e
+  [ ! -s "$DRIVER_LOG" ] && [ ! -s "$RELAY_LOG" ] && [ ! -s "$GATE_ENV_LOG" ] \
+    && [ "$had_infra_error" -eq 1 ] && one_post \
+    && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+    && grep -q -- '-f output\[title\]=Codex P1 gate — fingerprint helper unavailable' "$GH_CALL_LOG"
+  case_rc=$?
+  set -e
+  cp "$TMP/guard-saved" "$path"
+  chmod +x "$path"
+  record "$1" "$case_rc"
+}
+fingerprint_guard_case "a missing feedback-fingerprint helper publishes failure without evaluating" \
+  scripts/review-feedback-surface-fingerprint.sh rm
+fingerprint_guard_case "a non-executable feedback-fingerprint helper publishes failure without evaluating" \
+  scripts/review-feedback-surface-fingerprint.sh chmod
+fingerprint_guard_case "a non-executable snapshot driver publishes failure without evaluating" \
+  scripts/workflow/codex-p1-snapshot-retry.py chmod
+
+# Relay guard: a fork or Dependabot head whose trusted archive relay is still
+# pending is withheld red (rc 1, no infra flag), and a failed relay scan is an
+# infra red (rc 2), both before any evaluation, as in the sweep.
+reset_case
+RELAY_RC=1; export RELAY_RC
+run_call "$CODEX_CALL" >"$TMP/codex-relay-pending.out"
+set +e
+[ -s "$RELAY_LOG" ] && [ ! -s "$DRIVER_LOG" ] && [ ! -s "$GATE_ENV_LOG" ] \
+  && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && grep -q -- '-f output\[title\]=Codex P1 gate — archive preparation failed' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "a pending read-only archive relay withholds Codex P1 clearance without evaluating" "$case_rc"
+
+reset_case
+RELAY_RC=2; export RELAY_RC
+run_call "$CODEX_CALL" >"$TMP/codex-relay-error.out"
+set +e
+[ -s "$RELAY_LOG" ] && [ ! -s "$DRIVER_LOG" ] \
   && [ "$had_infra_error" -eq 1 ] && one_post \
   && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG"
 case_rc=$?
 set -e
-record "Codex rc 3 also receives no flag and remains an infra red" "$case_rc"
-CODEX_RC=0; export CODEX_RC
+record "a failed relay scan withholds Codex P1 clearance as an infra red" "$case_rc"
+RELAY_RC=0; export RELAY_RC
 
 reset_case
 CR_RC=3; export CR_RC
@@ -381,8 +511,44 @@ expect_mutation_failure "unrecognized-evidence success mutation" "$mutation_rc" 
   'FAIL: unknown current-head CodeRabbit run closes its owned generation red' "$TMP/no-withhold.out" \
   || fail=$((fail + 1))
 
+# #2689: each ported Codex P1 guard, removed from the shipped workflow, must
+# fail the case that pins it. Each edit replaces exactly one shipped line.
+codex_guard_mutation() {  # <label> <old> <new> <expected FAIL line>
+  local out="$TMP/codex-mutation.out"
+  python3 - "$WORKFLOW" "$TMP/codex-mutation.yml" "$2" "$3" <<'PY4'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+old, new = sys.argv[3], sys.argv[4]
+assert text.count(old) == 1, old
+Path(sys.argv[2]).write_text(text.replace(old, new, 1))
+PY4
+  set +e
+  REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/codex-mutation.yml" \
+    SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$out" 2>&1
+  mutation_rc=$?
+  set -e
+  expect_mutation_failure "$1" "$mutation_rc" "$4" "$out" || fail=$((fail + 1))
+}
+codex_guard_mutation "removal of the Codex P1 fingerprint-helper guard" \
+  'if [ ! -x scripts/review-feedback-surface-fingerprint.sh ] || [ ! -x "$driver" ]; then' \
+  'if false; then' \
+  'FAIL: a missing feedback-fingerprint helper publishes failure without evaluating'
+codex_guard_mutation "a Codex P1 caller that runs the gate script instead of the snapshot driver" \
+  'gate scripts/workflow/codex-p1-snapshot-retry.py "$CODEX_P1_CONTEXT"' \
+  'gate scripts/codex-p1-gate.sh "$CODEX_P1_CONTEXT"' \
+  'FAIL: Codex P1 evaluates through the snapshot driver in report mode on its own generation'
+codex_guard_mutation "a gate() that bypasses the Codex P1 evaluation" \
+  'elif [ "$context" = "${CODEX_P1_CONTEXT:-}" ]; then' \
+  'elif false; then' \
+  'FAIL: Codex P1 evaluates through the snapshot driver in report mode on its own generation'
+codex_guard_mutation "removal of the Codex P1 relay-pending guard" \
+  'if [ "$relay_rc" -ne 0 ]; then' \
+  'if false; then' \
+  'FAIL: a pending read-only archive relay withholds Codex P1 clearance without evaluating'
+
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
   exit 1
 fi
-echo "All $pass required-check publisher summary-hold behavior tests, 2 mutations, and unrelated-failure control passed."
+echo "All $pass required-check publisher summary-hold behavior tests, 6 mutations, and unrelated-failure control passed."
