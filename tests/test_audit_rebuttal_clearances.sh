@@ -37,6 +37,13 @@
 #       → reread (the reviewer's own in-thread reply is a re-read)
 #   118 Codex P1, tag rebuttal, no request, owner TIEBREAK marker naming it
 #       → owner-marker (cleared by the owner route, not matching)
+#   119 Codex P1, a reply edited into a rebuttal after a request and a Codex
+#       review → no-reread (a rebuttal is dated by its last edit)
+#   120 Codex P1, tag rebuttal, owner marker quoted mid-line → no-reread
+#   121 Codex P1, tag rebuttal, owner marker naming a stale head → no-reread
+#
+# The policy is a fixture (below), not the repository's live file, so an
+# edit to the live feedback_policy or bot logins cannot fail this suite.
 
 set -euo pipefail
 
@@ -68,11 +75,12 @@ REBUT='Rebuttal: the caller validates the list before this point, so it is never
 TAG='[mergepath-resolve: rebuttal-recorded] substantive agent rebuttal after the latest re-raise.'
 
 # c <id> <login> <created_at> <body> [review_id] — one comment record.
-c() {
+c() { # [edited_at] as a sixth argument
   local type=User
   case "$2" in *"[bot]") type=Bot ;; esac
   jq -nc --argjson id "$1" --arg l "$2" --arg t "$type" --arg at "$3" --arg b "$4" --argjson rv "${5:-null}" \
-    '{id: $id, login: $l, type: $t, created_at: $at, edited_at: null, review_id: $rv, body: $b}'
+    --arg ed "${6:-}" \
+    '{id: $id, login: $l, type: $t, created_at: $at, edited_at: (if $ed == "" then null else $ed end), review_id: $rv, body: $b}'
 }
 # t <thread-id> <resolved> <downs-json> <comment-json>... — one thread record.
 t() {
@@ -91,17 +99,41 @@ rv() {
 # pr <n> <threads-json> <reviews-json> <comments-json> — writes the raw record.
 pr() {
   jq -nc --argjson n "$1" --argjson th "$2" --argjson rv "$3" --argjson ic "$4" \
-    '{pr: $n, merged_at: "2026-10-20T12:00:00Z", threads: $th, reviews: $rv, comments: $ic}' >"$RAW/pr-$1.json"
+    --arg head "$HEAD" \
+    '{pr: $n, merged_at: "2026-10-20T12:00:00Z", url: "https://github.com/o/r/pull/\($n)", head_sha: $head,
+      threads: $th, reviews: $rv, comments: $ic}' >"$RAW/pr-$1.json"
 }
 arr() { if [ $# -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -sc '.'; fi; }
 req() { c "$1" "$AUTHOR" "$2" '@codex review'; }
+
+HEAD=$(printf 'a%.0s' $(seq 40))
+STALE=$(printf 'b%.0s' $(seq 40))
+POLICY_FIX="$WORKDIR/review-policy.yml"
+cat >"$POLICY_FIX" <<'YAML'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+coderabbit:
+  bot_login: "coderabbitai[bot]"
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+YAML
 
 OUT="$WORKDIR/out"
 RAW="$OUT/raw"
 mkdir -p "$RAW"
 jq -nc '{repo: "o/r", since: "2026-10-11T00:00:00Z", until: "2026-11-10T00:00:00Z"}' >"$RAW/window.json"
 : >"$RAW/prs.jsonl"
-for n in $(seq 101 118); do
+for n in $(seq 101 121); do
   jq -nc --argjson n "$n" '{pr: $n, merged_at: "2026-10-20T12:00:00Z", url: "https://github.com/o/r/pull/\($n)"}' >>"$RAW/prs.jsonl"
 done
 printf 'search\t1\npr 101\t2\n' >"$RAW/api.tsv"
@@ -152,10 +184,19 @@ pr 117 "$(arr "$(t T117 true '[]' "$(c 1171 "$CODEX" 2026-10-20T01:00:00Z "$P1" 
 
 pr 118 "$(arr "$(t T118 true '[]' "$(c 1181 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9118)" "$(c 1182 "$AGENT" 2026-10-20T02:00:00Z "$TAG")")")" \
   "$(arr "$(rv 9118 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
-  "$(arr "$(c 1183 "$AUTHOR" 2026-10-20T03:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/118@$(printf 'a%.0s' $(seq 40))#1181")")"
+  "$(arr "$(c 1183 "$AUTHOR" 2026-10-20T03:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/118@$HEAD#1181")")"
+pr 119 "$(arr "$(t T119 true '[]' "$(c 1191 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9119)" "$(c 1192 "$AGENT" 2026-10-20T02:00:00Z "$REBUT" null 2026-10-20T05:00:00Z)")")" \
+  "$(arr "$(rv 9119 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')" "$(rv 9199 "$CODEX" 2026-10-20T04:00:00Z 'Codex review')")" \
+  "$(arr "$(req 1193 2026-10-20T03:00:00Z)")"
+pr 120 "$(arr "$(t T120 true '[]' "$(c 1201 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9120)" "$(c 1202 "$AGENT" 2026-10-20T02:00:00Z "$TAG")")")" \
+  "$(arr "$(rv 9120 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
+  "$(arr "$(c 1203 "$AUTHOR" 2026-10-20T03:00:00Z "The owner would type TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/120@$HEAD#1201 here.")")"
+pr 121 "$(arr "$(t T121 true '[]' "$(c 1211 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9121)" "$(c 1212 "$AGENT" 2026-10-20T02:00:00Z "$TAG")")")" \
+  "$(arr "$(rv 9121 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
+  "$(arr "$(c 1213 "$AUTHOR" 2026-10-20T03:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/121@$STALE#1211")")"
 
 rc=0
-bash "$SCRIPT" --analyze-only --out-dir "$OUT" --policy "$ROOT/.github/review-policy.yml" >/dev/null 2>"$WORKDIR/err.log" || rc=$?
+bash "$SCRIPT" --analyze-only --out-dir "$OUT" --policy "$POLICY_FIX" >/dev/null 2>"$WORKDIR/err.log" || rc=$?
 if [ "$rc" -eq 4 ]; then
   pass "--analyze-only exits 4 when a listed PR could not be measured"
 else
@@ -189,6 +230,9 @@ expect_status 1124 not-rebutted "the re-raised finding is itself an undispositio
 expect_status 1151 reread "substantive dating: the verdict after a post-rebuttal request is a re-read"
 expect_status 1171 reread "a Codex reply in the thread after the rebuttal is a re-read"
 expect_status 1181 owner-marker "an owner marker naming the finding is the owner clearance route"
+expect_status 1191 no-reread "a reply edited into a rebuttal is dated by its edit, after the Codex review"
+expect_status 1201 no-reread "an owner marker quoted mid-line is not a marker (the ledger reads whole lines)"
+expect_status 1211 no-reread "an owner marker naming a head other than the merged head does not count"
 
 [ "$(jq -r 'select(.finding == 1031) | .later_unrequested_response' "$F")" = true ] \
   && [ "$(jq -r 'select(.finding == 1011) | .later_unrequested_response' "$F")" = false ] \
@@ -212,17 +256,17 @@ expect_total() { # <key> <value>
   got=$(jq -r --arg k "$1" '.totals[$k]' "$S")
   [ "$got" = "$2" ] && pass "totals.$1 = $2" || fail "totals.$1 is $got, expected $2"
 }
-expect_total prs_merged_in_window 18
+expect_total prs_merged_in_window 21
 expect_total prs_not_measured 2
-expect_total prs_measured 16
-expect_total prs_with_required_finding 14
-expect_total prs_with_rebutted_resolved_required_finding 10
-expect_total prs_matching 4
-expect_total prs_matching_latest_dating 5
+expect_total prs_measured 19
+expect_total prs_with_required_finding 17
+expect_total prs_with_rebutted_resolved_required_finding 13
+expect_total prs_matching 7
+expect_total prs_matching_latest_dating 8
 expect_total prs_with_reraised_rebuttal 1
 expect_total prs_with_owner_marker 1
 expect_total prs_matching_with_later_unrequested_review 1
-[ "$(jq -c '[.matching_prs[].pr]' "$S")" = '[101,103,104,109]' ] \
+[ "$(jq -c '[.matching_prs[].pr]' "$S")" = '[101,103,104,109,119,120,121]' ] \
   && pass "matching_prs lists exactly the no-reread PRs" || fail "matching_prs is $(jq -c '[.matching_prs[].pr]' "$S")"
 [ "$(jq -c '.matching_prs_latest_dating_only' "$S")" = '[115]' ] \
   && pass "the PRs only latest dating matches are listed apart" || fail "matching_prs_latest_dating_only is wrong"
@@ -234,7 +278,7 @@ expect_total prs_matching_with_later_unrequested_review 1
   && pass "the API spend is read back from api.tsv" || fail "api is $(jq -c '.api' "$S")"
 [ "$(jq -c '.policy.required_tiers' "$S")" = '["p0","p1"]' ] \
   && pass "required tiers come from resolve_required_tiers on the policy file" || fail "required tiers are $(jq -c '.policy.required_tiers' "$S")"
-grep -q '^Matching PRs: #101, #103, #104, #109$' "$OUT/summary.md" \
+grep -q '^Matching PRs: #101, #103, #104, #109, #119, #120, #121$' "$OUT/summary.md" \
   && pass "summary.md names the matching PRs" || fail "summary.md does not name the matching PRs"
 
 # A clean extract (every listed PR measured) exits 0.
@@ -243,7 +287,7 @@ mkdir -p "$CLEAN/raw"
 cp "$RAW/window.json" "$RAW/pr-101.json" "$CLEAN/raw/"
 head -n 1 "$RAW/prs.jsonl" >"$CLEAN/raw/prs.jsonl"
 rc=0
-bash "$SCRIPT" --analyze-only --out-dir "$CLEAN" --policy "$ROOT/.github/review-policy.yml" >/dev/null 2>&1 || rc=$?
+bash "$SCRIPT" --analyze-only --out-dir "$CLEAN" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 0 ] && [ "$(jq '.totals.prs_matching' "$CLEAN/summary.json")" = 1 ] \
   && pass "a fully measured extract exits 0" || fail "a fully measured extract exited $rc"
 
@@ -253,7 +297,7 @@ mkdir -p "$TRUNC/raw"
 cp "$RAW/window.json" "$CLEAN/raw/prs.jsonl" "$TRUNC/raw/"
 jq -c '.threads[0].root_downs_truncated = true' "$RAW/pr-101.json" >"$TRUNC/raw/pr-101.json"
 rc=0
-bash "$SCRIPT" --analyze-only --out-dir "$TRUNC" --policy "$ROOT/.github/review-policy.yml" >/dev/null 2>&1 || rc=$?
+bash "$SCRIPT" --analyze-only --out-dir "$TRUNC" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 4 ] && [ "$(jq '.totals.prs_matching' "$TRUNC/summary.json")" = 0 ] \
   && [ "$(jq -r '.not_measured[0].reason' "$TRUNC/summary.json")" = "a finding root has more than 20 thumbs-down reactions" ] \
   && pass "a truncated reaction page makes the PR not measured" || fail "a truncated reaction page was not reported (exit $rc)"
@@ -261,7 +305,7 @@ bash "$SCRIPT" --analyze-only --out-dir "$TRUNC" --policy "$ROOT/.github/review-
 # The polarity vocabulary is loaded from the resolver, never guessed.
 : >"$WORKDIR/empty-resolver.sh"
 rc=0
-MERGEPATH_RESOLVER_SRC="$WORKDIR/empty-resolver.sh" bash "$SCRIPT" --analyze-only --out-dir "$CLEAN" >/dev/null 2>&1 || rc=$?
+MERGEPATH_RESOLVER_SRC="$WORKDIR/empty-resolver.sh" bash "$SCRIPT" --analyze-only --out-dir "$CLEAN" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 2 ] && pass "a resolver without the polarity functions stops the run (exit 2)" \
   || fail "a missing polarity vocabulary exited $rc, expected 2"
 
@@ -272,6 +316,63 @@ GH_TOKEN=unused bash "$SCRIPT" --out-dir "$WORKDIR/nowin" >/dev/null 2>&1 || rc=
 rc=0
 bash "$SCRIPT" --since 2026-10-11 --until 2026-11-10T00:00:00Z >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 1 ] && pass "a window bound that is not a UTC instant is refused (exit 1)" || fail "a date-only bound exited $rc"
+
+# An extract taken before head_sha and url were fetched is not measured.
+OLD="$WORKDIR/old"
+mkdir -p "$OLD/raw"
+cp "$RAW/window.json" "$CLEAN/raw/prs.jsonl" "$OLD/raw/"
+jq -c 'del(.head_sha)' "$RAW/pr-101.json" >"$OLD/raw/pr-101.json"
+rc=0
+bash "$SCRIPT" --analyze-only --out-dir "$OLD" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 4 ] && [ "$(jq '.totals.prs_matching' "$OLD/summary.json")" = 0 ] \
+  && pass "a record without head_sha is not measured rather than read without its owner markers" \
+  || fail "a record without head_sha exited $rc"
+
+# A report that cannot be written fails the run (errexit is off inside analyze).
+BADW="$WORKDIR/badwrite"
+mkdir -p "$BADW/raw" "$BADW/summary.json"
+cp "$RAW/window.json" "$RAW/pr-101.json" "$CLEAN/raw/prs.jsonl" "$BADW/raw/"
+rc=0
+bash "$SCRIPT" --analyze-only --out-dir "$BADW" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 3 ] && pass "an unwritable summary.json fails the run (exit 3)" || fail "an unwritable summary.json exited $rc, expected 3"
+BADM="$WORKDIR/badmd"
+mkdir -p "$BADM/raw" "$BADM/summary.md"
+cp "$RAW/window.json" "$RAW/pr-101.json" "$CLEAN/raw/prs.jsonl" "$BADM/raw/"
+rc=0
+bash "$SCRIPT" --analyze-only --out-dir "$BADM" --policy "$POLICY_FIX" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 3 ] && pass "an unwritable summary.md fails the run (exit 3)" || fail "an unwritable summary.md exited $rc, expected 3"
+
+# Fetch-side guards, against a fake gh that logs every call.
+FAKE="$WORKDIR/fakebin"
+mkdir -p "$FAKE"
+cat >"$FAKE/gh" <<'SH'
+#!/usr/bin/env bash
+echo call >>"$FAKE_GH_LOG"
+case "$FAKE_GH_MODE" in
+  network) echo "error connecting to api.github.com" >&2; exit 1 ;;
+  samecursor)
+    echo '{"data":{"search":{"issueCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"C1"},"nodes":[{"number":1,"mergedAt":"2026-10-20T00:00:00Z","url":"u"}]},"rateLimit":{"cost":1}}}' ;;
+esac
+SH
+chmod +x "$FAKE/gh"
+fetch_fake() { # <mode> <max-requests>; sets rc, and the log counts gh calls
+  : >"$WORKDIR/gh.log"
+  rc=0
+  PATH="$FAKE:$PATH" FAKE_GH_LOG="$WORKDIR/gh.log" FAKE_GH_MODE="$1" GH_TOKEN=unused GH_RETRY_BACKOFF_SECONDS=0 \
+    bash "$SCRIPT" --since 2026-10-11T00:00:00Z --until 2026-11-10T00:00:00Z --out-dir "$WORKDIR/fetch-$1" \
+    --policy "$POLICY_FIX" --max-requests "$2" >/dev/null 2>"$WORKDIR/fetch-$1.err" || rc=$?
+}
+fetch_fake network 2
+calls=$(wc -l <"$WORKDIR/gh.log" | tr -d ' ')
+logged=$(wc -l <"$WORKDIR/fetch-network/raw/api.tsv" | tr -d ' ')
+[ "$rc" -eq 3 ] && [ "$calls" = 2 ] && [ "$logged" = 2 ] \
+  && pass "the request ceiling and api.tsv count every retry attempt (2 calls under --max-requests 2)" \
+  || fail "retries escaped the ceiling or the count: exit $rc, $calls gh calls, $logged logged"
+fetch_fake samecursor 10
+calls=$(wc -l <"$WORKDIR/gh.log" | tr -d ' ')
+[ "$rc" -eq 3 ] && [ "$calls" = 2 ] && grep -q 'unchanged endCursor' "$WORKDIR/fetch-samecursor.err" \
+  && pass "a repeated search cursor stops the listing as a pagination error after 2 requests" \
+  || fail "a repeated search cursor was not caught: exit $rc after $calls calls"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -44,7 +44,9 @@
 #                           re-read being measured, so the whole thread is
 #                           read and a later "Fixed" reply still wins.
 #   resolved       the thread's isResolved is true when the audit reads it.
-#   rebuttal time  two datings, both reported:
+#   rebuttal time  two datings, both reported. A reply (tag or rebuttal) is
+#                  dated by the later of its creation and its last edit, since
+#                  an edit can turn an earlier reply into the rebuttal:
 #                    substantive  the latest reply or thumbs-down evidence,
 #                                 falling back to the tag only when there is
 #                                 neither (the tag is a generated marker and
@@ -65,10 +67,13 @@
 #                  An affirmative verdict is not blocking; any other verdict
 #                  and every in-thread reply is ungraded. CodeRabbit re-reads
 #                  are not graded.
-#   owner marker   a non-bot PR comment with the #2511 line
+#   owner marker   a #2511 line
 #                  `TIEBREAK_REBUTTAL_ACCEPTED=<url>@<40-hex>#<finding-id>`
-#                  naming the finding (status owner-marker, not matching).
-#                  Its head is not compared: a merged PR has no current head.
+#                  naming the finding, read by the ledger's own
+#                  crl_owner_tiebreaks (whole line, unedited comment by the
+#                  policy author_identity, this PR's URL) against the PR's
+#                  final head, the head it merged at (status owner-marker,
+#                  not matching).
 #   matching PR    a PR with at least one finding that is required-tier,
 #                  rebutted and resolved, with no re-read and no owner
 #                  marker (status no-reread). Each such Codex finding also
@@ -103,8 +108,9 @@
 #   --out-dir        Output dir (default .mergepath/rebuttal-clearance-audit).
 #   --policy         Review policy whose tiers, bot logins and reviewers apply
 #                    (default .github/review-policy.yml beside this script).
-#   --max-requests   GraphQL request ceiling for one fetch (default 1200).
-#                    Reaching it stops the fetch with exit 3.
+#   --max-requests   GraphQL request ceiling for one fetch (default 1200),
+#                    counting every retry attempt. Reaching it stops the
+#                    fetch with exit 3.
 #   --fetch-only     Fetch and persist raw records, skip analysis.
 #   --analyze-only   Analyze an existing raw extract offline (no network).
 #
@@ -113,15 +119,17 @@
 #   raw/pr-<n>.json     one normalized record per PR, or {pr, error}; holds
 #                       comment bodies, so it stays local (.mergepath/ is
 #                       gitignored)
-#   raw/api.tsv         one line per GraphQL request: label and point cost
+#   raw/api.tsv         one line per GraphQL attempt: label and point cost
+#                       (or "failed")
 #   raw/window.json     the window and repository the extract was taken for
 #   findings.jsonl      one body-free record per required-tier finding
 #   summary.json        totals, matching PRs, not-measured PRs, API spend
 #   summary.md          the same, as Markdown
 #
 # Exit codes: 0 success · 1 bad args · 2 missing dep / GH_TOKEN ·
-#             3 listing failed, the window is too large or the request
-#               ceiling was reached · 4 analysis finished but at least one
+#             3 listing failed, the window is too large, a cursor repeated,
+#               the request ceiling was reached or a report could not be
+#               written · 4 analysis finished but at least one
 #               PR could not be measured (listed in summary.json)
 
 set -euo pipefail
@@ -135,14 +143,8 @@ if [ -z "${GH_TOKEN:-}" ] && [ -r "$__AUDIT_DIR/lib/preflight-helpers.sh" ]; the
   preflight_require_token reviewer || true
 fi
 
-if [ -r "$__AUDIT_DIR/lib/gh-retry-helpers.sh" ]; then
-  # shellcheck source=lib/gh-retry-helpers.sh
-  . "$__AUDIT_DIR/lib/gh-retry-helpers.sh"
-else
-  with_gh_retry() { "$@"; }
-fi
-
-for __lib in feedback-policy-helpers.sh reviewers-helpers.sh codex-request-evidence.sh; do
+for __lib in gh-retry-helpers.sh feedback-policy-helpers.sh reviewers-helpers.sh codex-request-evidence.sh \
+             review-policy-scalar.sh codex-review-ledger.sh; do
   if [ ! -r "$__AUDIT_DIR/lib/$__lib" ]; then
     echo "[audit-rebuttal-clearances] ERROR: missing helper: $__AUDIT_DIR/lib/$__lib" >&2
     exit 2
@@ -221,6 +223,10 @@ CODEX_BOT=$(read_policy_block_field codex bot_login "$POLICY")
 CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
 CR_BOT=$(read_policy_block_field coderabbit bot_login "$POLICY")
 CR_BOT=${CR_BOT:-coderabbitai[bot]}
+# The owner, for the owner-marker reader (crl_owner_tiebreaks): the policy's
+# author_identity, defaulting to the shared author as the ledger does.
+AUTHOR=$(review_policy_scalar "$POLICY" author_identity)
+AUTHOR=${AUTHOR:-nathanjohnpayne}
 REVIEWERS_JSON=$(read_available_reviewers "$POLICY" | jq -Rsc 'split("\n") | map(select(length > 0))')
 # The agent-author set the resolver's polarity reader uses (same variable,
 # same default as scripts/resolve-pr-threads.sh).
@@ -241,7 +247,7 @@ Q_SEARCH='query($q: String!, $after: String) {
     nodes { ... on PullRequest { number mergedAt url } } }
   rateLimit { cost remaining } }'
 Q_PR="query(\$owner: String!, \$name: String!, \$n: Int!) {
-  repository(owner: \$owner, name: \$name) { pullRequest(number: \$n) { number mergedAt
+  repository(owner: \$owner, name: \$name) { pullRequest(number: \$n) { number mergedAt url headRefOid
     reviewThreads(first: 50) { pageInfo { hasNextPage endCursor } nodes { $THREAD_FIELDS } }
     reviews(first: 50) { pageInfo { hasNextPage endCursor } nodes { $REVIEW_FIELDS } }
     comments(first: 100) { pageInfo { hasNextPage endCursor } nodes { $ISSUE_COMMENT_FIELDS } } } }
@@ -259,26 +265,46 @@ Q_THREAD_COMMENTS="query(\$id: ID!, \$after: String!) {
 
 API_LOG=""
 CEILING_FLAG=""
-# gql <label> <query> [gh -f/-F args...] — one counted GraphQL request. The
-# ceiling is checked before the request, so a run never spends past it. gql
-# runs inside command substitutions, where `die` would end only the subshell,
-# so reaching the ceiling also leaves a flag that fetch_all stops on.
+# gql <label> <query> [gh -f/-F args...] — one GraphQL read, retried on a
+# transient failure the way with_gh_retry retries (its gh_failure_is_permanent
+# classifier, GH_RETRY_ATTEMPTS and GH_RETRY_BACKOFF_SECONDS). The retry loop
+# is here rather than in with_gh_retry so that EVERY attempt is checked
+# against the ceiling and written to api.tsv: a run never spends past
+# --max-requests and the reported total counts retries. gql runs inside
+# command substitutions, where `die` would end only the subshell, so reaching
+# the ceiling also leaves a flag that fetch_all stops on.
 gql() {
-  local label=$1 query=$2 out n
+  local label=$1 query=$2 out err n attempt=1 attempts=${GH_RETRY_ATTEMPTS:-3} backoff=${GH_RETRY_BACKOFF_SECONDS:-30}
   shift 2
-  n=$(wc -l <"$API_LOG" | tr -d ' ')
-  if [ "$n" -ge "$MAX_REQUESTS" ]; then
-    : >"$CEILING_FLAG"
-    die 3 "request ceiling $MAX_REQUESTS reached before '$label'; raise --max-requests or narrow the window"
-  fi
-  out=$(with_gh_retry gh api graphql -f query="$query" "$@") || { printf '%s\t%s\n' "$label" "failed" >>"$API_LOG"; return 1; }
-  printf '%s\t%s\n' "$label" "$(printf '%s' "$out" | jq -r '.data.rateLimit.cost // "unknown"' 2>/dev/null || echo unknown)" >>"$API_LOG"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=3
+  [[ "$backoff" =~ ^[0-9]+$ ]] || backoff=30
+  err=$(mktemp "${TMPDIR:-/tmp}/audit-rebuttal-gql.XXXXXX")
+  while :; do
+    n=$(wc -l <"$API_LOG" | tr -d ' ')
+    if [ "$n" -ge "$MAX_REQUESTS" ]; then
+      rm -f "$err"
+      : >"$CEILING_FLAG"
+      die 3 "request ceiling $MAX_REQUESTS reached before '$label'; raise --max-requests or narrow the window"
+    fi
+    if out=$(gh api graphql -f query="$query" "$@" 2>"$err"); then
+      printf '%s\t%s\n' "$label" "$(printf '%s' "$out" | jq -r '.data.rateLimit.cost // "unknown"' 2>/dev/null || echo unknown)" >>"$API_LOG"
+      break
+    fi
+    printf '%s\t%s\n' "$label" "failed" >>"$API_LOG"
+    if gh_failure_is_permanent "$(cat "$err") $out" || [ "$attempt" -ge "$attempts" ]; then
+      rm -f "$err"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep "$backoff"
+  done
+  rm -f "$err"
   printf '%s' "$out" | jq -e '(.errors // []) | length == 0' >/dev/null 2>&1 || return 1
   printf '%s\n' "$out"
 }
 
 fetch_listing() {
-  local q after="" page total=0 count=0
+  local q after="" next page total=0 count=0
   q="repo:$REPO is:pr is:merged merged:$SINCE..$UNTIL"
   : >"$RAW_DIR/prs.all.jsonl"
   while :; do
@@ -291,7 +317,9 @@ fetch_listing() {
     [ "$total" -le 1000 ] || die 3 "the window matches $total PRs, over the search API's 1000-result cap; narrow it"
     printf '%s' "$page" | jq -c '.data.search.nodes[] | select(.number != null) | {pr: .number, merged_at: .mergedAt, url}' >>"$RAW_DIR/prs.all.jsonl"
     [ "$(printf '%s' "$page" | jq -r '.data.search.pageInfo.hasNextPage')" = true ] || break
-    after=$(printf '%s' "$page" | jq -er '.data.search.pageInfo.endCursor') || die 3 "the search page has no endCursor"
+    next=$(printf '%s' "$page" | jq -er '.data.search.pageInfo.endCursor') || die 3 "the search page has no endCursor"
+    [ "$next" != "$after" ] || die 3 "the search returned hasNextPage with an unchanged endCursor"
+    after=$next
   done
   count=$(jq -s 'unique_by(.pr) | length' "$RAW_DIR/prs.all.jsonl")
   [ "$count" -eq "$total" ] || die 3 "the search listed $count of the $total PRs it counted; the listing is incomplete"
@@ -305,13 +333,15 @@ fetch_listing() {
 # fetch_more <work> <connection> <first> <fields> <cursor> — append the
 # remaining pages of one PR connection to <work>/<connection>.json.
 fetch_more() {
-  local work=$1 conn=$2 first=$3 fields=$4 after=$5 page q
+  local work=$1 conn=$2 first=$3 fields=$4 after=$5 next page q
   q=$(q_more "$conn" "$first" "$fields")
   while [ -n "$after" ]; do
     page=$(gql "pr $N $conn" "$q" -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F n="$N" -f after="$after") || return 1
     printf '%s' "$page" | jq -c --arg c "$conn" '.data.repository.pullRequest[$c].nodes' >>"$work/$conn.json" || return 1
     if [ "$(printf '%s' "$page" | jq -r --arg c "$conn" '.data.repository.pullRequest[$c].pageInfo.hasNextPage')" = true ]; then
-      after=$(printf '%s' "$page" | jq -er --arg c "$conn" '.data.repository.pullRequest[$c].pageInfo.endCursor') || return 1
+      next=$(printf '%s' "$page" | jq -er --arg c "$conn" '.data.repository.pullRequest[$c].pageInfo.endCursor') || return 1
+      [ "$next" != "$after" ] || return 1  # an unchanged cursor would loop on one page
+      after=$next
     else
       after=""
     fi
@@ -320,7 +350,7 @@ fetch_more() {
 
 fetch_pr() { # <pr-number> → writes raw/pr-<n>.json, a record or {pr, error}
   N=$1
-  local out="$RAW_DIR/pr-$N.json" work first conn after tid page
+  local out="$RAW_DIR/pr-$N.json" work first conn after next tid page
   work=$(mktemp -d "${TMPDIR:-/tmp}/audit-rebuttal.XXXXXX")
   record_error() { jq -nc --argjson pr "$N" --arg e "$1" '{pr: $pr, error: $e}' >"$out"; rm -rf "$work"; }
   if ! first=$(gql "pr $N" "$Q_PR" -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F n="$N"); then
@@ -348,7 +378,9 @@ fetch_pr() { # <pr-number> → writes raw/pr-<n>.json, a record or {pr, error}
       page=$(gql "pr $N thread comments" "$Q_THREAD_COMMENTS" -f id="$tid" -f after="$after") \
         || { record_error "a thread comments page failed"; return 0; }
       printf '%s' "$page" | jq -c '.data.node.comments.nodes' >>"$work/thread-more.json"
-      after=$(printf '%s' "$page" | jq -r 'if .data.node.comments.pageInfo.hasNextPage then .data.node.comments.pageInfo.endCursor else "" end')
+      next=$(printf '%s' "$page" | jq -r 'if .data.node.comments.pageInfo.hasNextPage then .data.node.comments.pageInfo.endCursor else "" end')
+      [ "$next" != "$after" ] || { record_error "a thread comments page repeated its cursor"; return 0; }
+      after=$next
     done
     jq -c --arg id "$tid" --slurpfile more "$work/thread-more.json" '
       map(if .id == $id then .comments.nodes += ($more | add // []) | .comments.pageInfo.hasNextPage = false else . end)' \
@@ -360,7 +392,7 @@ fetch_pr() { # <pr-number> → writes raw/pr-<n>.json, a record or {pr, error}
     def typ: .author.__typename // "";
     def comment: {id: .databaseId, login: login, type: typ, created_at: .createdAt, edited_at: .lastEditedAt,
                   review_id: (.pullRequestReview.databaseId // null), body: (.body // "")};
-    {pr: $pr, merged_at: $meta[0].mergedAt,
+    {pr: $pr, merged_at: $meta[0].mergedAt, url: $meta[0].url, head_sha: $meta[0].headRefOid,
      threads: [ $th[0][] | {id, is_resolved: .isResolved, path,
                 root_downs: [ (.root.nodes[0].reactions.nodes // [])[] | {login: (.user.login // ""), created_at: .createdAt} ],
                 root_downs_truncated: (.root.nodes[0].reactions.pageInfo.hasNextPage // false),
@@ -449,11 +481,10 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
     elif ($rr | length) > 0 then (if any($rr[]; .blocking == true) then "reread-reraised" else "reread" end)
     elif $owner then "owner-marker"
     else "no-reread" end;
-  # Owner tiebreak markers naming a finding (the #2511 line format). The
-  # head it names is not compared with anything: a merged PR has no current
-  # head to pin to, so any well-formed non-bot marker counts.
-  [ $p.comments[] | select(human) | (.body // "")
-    | scan("TIEBREAK_REBUTTAL_ACCEPTED=[^@#\\s]+@[0-9a-f]{40}#([0-9]+)") | .[0] | tonumber ] as $owner_marked
+  # Owner tiebreak markers (#2511), read by the ledger reader
+  # crl_owner_tiebreaks: a whole-line marker in an unedited comment by the
+  # policy author, naming this PR and its final (merged) head.
+  [ $owner[0][] | select(.kind == "rebuttal") | .finding ] as $owner_marked
   |
   [ $threads[] | . as $t | $t.comments[0] as $root
     | select($root.login == $codex or $root.login == $cr)
@@ -465,7 +496,7 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
     | [ $t.root_downs[] | select(.login != "" and .login != $bot and .login != ($bot | sub("\\[bot\\]$"; ""))) | .created_at ] as $down
     | (reduce $t.comments[1:][] as $e (null;
          if ($e | agent) and ($e | marker | not) and (($pol[0][($e.id | tostring)] // "") != "")
-         then {polarity: $pol[0][($e.id | tostring)], at: $e.created_at} else . end)) as $reply
+         then {polarity: $pol[0][($e.id | tostring)], at: ([$e.created_at, $e.edited_at] | tmax)} else . end)) as $reply
     | (if $reply != null and $reply.polarity == "rebutted" then [$reply.at] else [] end) as $prose
     | (($prose + $down) | tmax) as $sub
     | (if $sub != null then $sub else ($tag | tmax) end) as $at_sub
@@ -473,8 +504,8 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
     | ($at_sub != null) as $rebutted
     | rereads($t; $bot; $at_sub) as $rr
     | rereads($t; $bot; $at_late) as $rr_late
-    | (($owner_marked | index($root.id)) != null) as $owner
-    | status($rebutted; $t.is_resolved; $rr; $owner) as $st
+    | (($owner_marked | index($root.id)) != null) as $marked
+    | status($rebutted; $t.is_resolved; $rr; $marked) as $st
     | {pr: $p.pr, finding: $root.id, thread: $t.id,
        bot: (if $bot == $codex then "codex" else "coderabbit" end), tier: $tier, path: $t.path,
        resolved: $t.is_resolved, rebutted: $rebutted,
@@ -484,14 +515,14 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
        reply_polarity: ($reply.polarity // null),
        rebuttal_at: $at_sub, rebuttal_at_latest: $at_late,
        reread_first: ($rr[0] // null),
-       owner_marker: $owner,
+       owner_marker: $marked,
        # A no-reread Codex finding that Codex did review again, unasked (an
        # automatic review of a later push): not a re-read under the rule,
        # reported so the count can be read against a looser definition.
        later_unrequested_response: (if $st == "no-reread" and $bot == $codex
                                     then any($responses[]; .at > $at_sub) else null end),
        status: $st,
-       status_latest: status($rebutted; $t.is_resolved; $rr_late; $owner)} ]
+       status_latest: status($rebutted; $t.is_resolved; $rr_late; $marked)} ]
 '
 
 analyze_pr() { # <raw pr file> → findings JSON lines on stdout; nonzero when unmeasurable
@@ -545,13 +576,17 @@ analyze_pr() { # <raw pr file> → findings JSON lines on stdout; nonzero when u
       | {id, body}' "$f")
   printf '}' >>"$work/pol.json"
   # Codex verdict comments, by the shared verdict reader (REST-shaped input).
-  jq -c '[.comments[] | {id, user: {login}, body, created_at}]' "$f" >"$work/rest-comments.json" \
+  jq -c '[.comments[] | {id, user: {login}, body, created_at, updated_at: (.edited_at // .created_at)}]' "$f" >"$work/rest-comments.json" \
     || { rm -rf "$work"; echo "the PR comments could not be read"; return 1; }
+  # Owner tiebreak markers, by the ledger's reader, against the merged head.
+  crl_owner_tiebreaks "$(cat "$work/rest-comments.json")" "$AUTHOR" "$(jq -r '.url' "$f")" "$(jq -r '.head_sha' "$f")" \
+    >"$work/owner.json" && jq -e 'type == "array"' "$work/owner.json" >/dev/null \
+    || { rm -rf "$work"; echo "the owner-marker reader failed"; return 1; }
   crqe_verdicts "$(cat "$work/rest-comments.json")" "$CODEX_BOT" >"$work/verdicts.json" \
     && jq -e 'type == "array"' "$work/verdicts.json" >/dev/null \
     || { rm -rf "$work"; echo "the Codex verdict reader failed"; return 1; }
   jq -c --slurpfile pr "$f" --slurpfile tiers "$work/tiers.json" --slurpfile rvtiers "$work/rvtiers.json" \
-    --slurpfile pol "$work/pol.json" --slurpfile verdicts "$work/verdicts.json" \
+    --slurpfile pol "$work/pol.json" --slurpfile verdicts "$work/verdicts.json" --slurpfile owner "$work/owner.json" \
     --argjson required "$REQUIRED_JSON" --argjson agents "$AGENTS_JSON" \
     --arg codex "$CODEX_BOT" --arg cr "$CR_BOT" -n "$ANALYZE_JQ | .[]" \
     || { rm -rf "$work"; echo "the finding analysis failed"; return 1; }
@@ -570,8 +605,9 @@ analyze() {
   [ -f "$RAW_DIR/prs.jsonl" ] || die 1 "no raw extract at $RAW_DIR/prs.jsonl"
   [ -r "$RAW_DIR/window.json" ] || die 1 "no $RAW_DIR/window.json; the extract does not name its window"
   mkdir -p "$OUT_DIR"
-  : >"$OUT_DIR/findings.jsonl"
-  : >"$OUT_DIR/not-measured.jsonl"
+  # analyze runs on the left of `||`, where errexit is off, so every write
+  # that the report depends on is checked explicitly.
+  { : >"$OUT_DIR/findings.jsonl" && : >"$OUT_DIR/not-measured.jsonl"; } || die 3 "cannot write under $OUT_DIR"
   local n f reason
   while IFS= read -r n; do
     [ -n "$n" ] || continue
@@ -587,18 +623,21 @@ analyze() {
       reason="a finding root has more than 20 thumbs-down reactions"
     elif ! jq -e '(.threads | type) == "array" and (.reviews | type) == "array" and (.comments | type) == "array"' "$f" >/dev/null; then
       reason="the raw record is incomplete"
+    elif ! jq -e '(.head_sha | type) == "string" and (.head_sha | test("^[0-9a-f]{40}$")) and (.url | type) == "string"' "$f" >/dev/null; then
+      reason="the raw record has no head_sha or url (an older extract; fetch again)"
     fi
     if [ -z "$reason" ]; then
       if ! analyze_pr "$f" >"$OUT_DIR/pr.findings.tmp" 2>"$OUT_DIR/pr.err.tmp"; then
         reason=$(cat "$OUT_DIR/pr.findings.tmp" "$OUT_DIR/pr.err.tmp" | tail -n 1)
         reason=${reason:-the analysis failed}
       else
-        cat "$OUT_DIR/pr.findings.tmp" >>"$OUT_DIR/findings.jsonl"
+        cat "$OUT_DIR/pr.findings.tmp" >>"$OUT_DIR/findings.jsonl" || die 3 "cannot append to $OUT_DIR/findings.jsonl"
       fi
     fi
     if [ -n "$reason" ]; then
       log "WARN: PR #$n not measured: $reason"
-      jq -nc --argjson pr "$n" --arg r "$reason" '{pr: $pr, reason: $r}' >>"$OUT_DIR/not-measured.jsonl"
+      jq -nc --argjson pr "$n" --arg r "$reason" '{pr: $pr, reason: $r}' >>"$OUT_DIR/not-measured.jsonl" \
+        || die 3 "cannot append to $OUT_DIR/not-measured.jsonl"
     fi
   done < <(jq -r '.pr' "$RAW_DIR/prs.jsonl")
   rm -f "$OUT_DIR/pr.findings.tmp" "$OUT_DIR/pr.err.tmp"
@@ -644,7 +683,9 @@ analyze() {
      matching_prs_latest_dating_only: (prs_where(.status_latest == "no-reread") - prs_where(.status == "no-reread")),
      not_measured: $nm,
      out_of_scope: {registered_reviewer_required_threads: ([ $f[] | select(.bot == "registered-reviewer") ] | length),
-                    prs: ([ $f[] | select(.bot == "registered-reviewer") | .pr ] | unique | length)}}' >"$OUT_DIR/summary.json"
+                    prs: ([ $f[] | select(.bot == "registered-reviewer") | .pr ] | unique | length)}}' >"$OUT_DIR/summary.json" \
+    && jq -e '.totals.prs_merged_in_window | type == "number"' "$OUT_DIR/summary.json" >/dev/null \
+    || die 3 "could not write $OUT_DIR/summary.json"
   jq -r '
     "# Rebuttal-only clearances: \(.repo)\n",
     "Window: \(.window.since) to \(.window.until) (\(.window.bounds)). Required tiers: \(.policy.required_tiers | join(", ")). Script commit: \(.script_commit). GraphQL requests: \(.api.graphql_requests) (points: \(.api.graphql_points)).\n",
@@ -653,7 +694,8 @@ analyze() {
     "", "Findings by status: \(.findings.by_status | tojson). Latest dating: \(.findings.by_status_latest_dating | tojson).", "",
     "Matching PRs: \(if (.matching_prs | length) == 0 then "none" else ([.matching_prs[] | "#\(.pr)"] | join(", ")) end)",
     "", "Not measured: \(if (.not_measured | length) == 0 then "none" else ([.not_measured[] | "#\(.pr) (\(.reason))"] | join(", ")) end)"
-  ' "$OUT_DIR/summary.json" >"$OUT_DIR/summary.md"
+  ' "$OUT_DIR/summary.json" >"$OUT_DIR/summary.md" && [ -s "$OUT_DIR/summary.md" ] \
+    || die 3 "could not write $OUT_DIR/summary.md"
   rm -f "$OUT_DIR/not-measured.jsonl"
   log "wrote $OUT_DIR/summary.json and $OUT_DIR/summary.md"
   if [ "$(jq '.totals.prs_not_measured' "$OUT_DIR/summary.json")" -gt 0 ]; then
