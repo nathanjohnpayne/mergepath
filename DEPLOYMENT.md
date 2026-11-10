@@ -539,14 +539,14 @@ scripts/deploy.sh --skip-build
 # Skip the Cloudflare purge (no CF env vars set, or purge separately)
 scripts/deploy.sh --skip-cf-purge
 
-# Break-glass: bypass the main-only / must-be-current-with-origin guards
+# Break-glass: bypass the main-only / must-match-origin/main guards
 scripts/deploy.sh --force
 ```
 
 The guards (see [mergepath#77](https://github.com/nathanjohnpayne/mergepath/issues/77) for the incident that motivated them; the dirty-tree guard was added in [mergepath#286](https://github.com/nathanjohnpayne/mergepath/issues/286) after a closed-review backlog sweep):
 
 1. **Current branch must be `main`.** Deploys should ship the reviewed, merged state of the project, not a worktree's in-progress branch.
-2. **Local `main` must not be behind `origin/main`.** After `git fetch`, `git rev-list --count HEAD..origin/main` must be 0. Otherwise the deploy refuses.
+2. **Local `HEAD` must be exactly `origin/main`.** The script runs `git fetch origin main` and refuses if the fetch fails, if `origin/main` does not exist after a successful fetch, or if `HEAD` differs from `origin/main` in either direction: behind (a stale build) or ahead (local commits that were never reviewed and merged). The refusal reports both counts, so a diverged checkout shows as, for example, `1 commit(s) ahead, 2 commit(s) behind`. Deploying from a `main` with unpushed commits fails ([mergepath#2704](https://github.com/nathanjohnpayne/mergepath/issues/2704)).
 3. **Working tree must be clean.** `git status --porcelain` must return empty — no modified, staged, or untracked paths. A dirty tree means the deploy would ship whatever the in-progress edits compile to, which diverges from the merged-on-main state reviewers signed off on (same failure class as #77).
 
 Guards 1 and 2 are bypassed with `--force`. Guard 3 is bypassed by the dedicated env var `DEPLOY_ALLOW_DIRTY=1` — kept separate from `--force` so the override is deliberate, audit-greppable, and `--force` doesn't accidentally subsume the dirty-tree check:
