@@ -54,6 +54,14 @@
 #      whose newest auto-clear-blocking-labels run is a failure is nominated
 #      (one read per such PR), and the nominate-auto-clear job sends exactly
 #      one repository_dispatch per nominated PR carrying only its number.
+#  15. #2689: the Codex P1 context through the real snapshot driver and the
+#      real relay-pending scan: drift exhausted on one PR is that PR's infra
+#      red while later PRs are still evaluated; a rate-limited driver run
+#      stops the pass and publishes the back-off red; a missing
+#      fingerprint helper reds every Codex P1 context without evaluating it;
+#      fork and Dependabot heads with a pending relay, an unverified marker or
+#      a failed scan are withheld, and same-repository heads are not scanned.
+#      Everywhere else a boundary driver runs the stub gate and reports it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -104,7 +112,9 @@ printf '%s\t%s\n' "$(basename "$0")" "$1" >>"$GATE_LOG"
 # budget makes gh fail (#2220): the API message on stderr, an infra rc.
 # RL_EXHAUST_BUCKET=graphql words it the way the GraphQL bucket does. Either
 # way the failure marks the budget exhausted for the fake gh (EXHAUST_FLAG).
-if [ "${RL_FAIL_PR:-}" = "$1" ]; then
+# RL_FAIL_GATE (#2689) moves the failure to the named gate on that PR.
+if [ "${RL_FAIL_PR:-}" = "$1" ] \
+    && { [ -z "${RL_FAIL_GATE:-}" ] || [ "$(basename "$0")" = "$RL_FAIL_GATE" ]; }; then
   : >"$EXHAUST_FLAG"
   if [ "${RL_EXHAUST_BUCKET:-core}" = graphql ]; then
     echo "gh: API rate limit already exceeded for installation ID 4242." >&2
@@ -122,6 +132,32 @@ exit 0
 SH
   chmod +x "$TMP/work/scripts/$g"
 done
+# #2689: the Codex P1 context runs through the snapshot driver behind the
+# sweep's guards. These boundary doubles keep the cases above about targeting:
+# the driver runs the stub gate and reports its verdict, the relay scan finds
+# nothing pending, and the fingerprint helper is installed. Case 15 swaps in
+# the real driver and the real relay scan.
+cat >"$TMP/work/scripts/workflow/codex-p1-snapshot-retry.py" <<'SH'
+#!/usr/bin/env bash
+out=$(scripts/codex-p1-gate.sh "$1" "$2" 2>&1)
+rc=$?
+printf '%s\n' "$out"
+[ -z "${CODEX_P1_VERDICT_REPORT:-}" ] \
+  || printf '{"rc":%s,"title":"Codex feedback gate (boundary double)"}\n' "$rc" >"$CODEX_P1_VERDICT_REPORT"
+exit "$rc"
+SH
+printf '#!/bin/sh\necho "no relay pending (boundary double)"\n' >"$TMP/work/scripts/workflow/codex-p1-relay-pending.sh"
+cat >"$TMP/work/scripts/review-feedback-surface-fingerprint.sh" <<'SH'
+#!/usr/bin/env bash
+# FP_CHURN_PR (#2689): this PR's feedback surface changes on every read.
+if [ "${FP_CHURN_PR:-}" = "$1" ]; then
+  n=$(($(cat "$FP_COUNTER" 2>/dev/null || echo 0) + 1)); echo "$n" >"$FP_COUNTER"; echo "fp-$1-$n"
+else
+  echo "fp-$1"
+fi
+SH
+chmod +x "$TMP/work/scripts/workflow/codex-p1-snapshot-retry.py" "$TMP/work/scripts/workflow/codex-p1-relay-pending.sh" \
+  "$TMP/work/scripts/review-feedback-surface-fingerprint.sh"
 
 cat >"$TMP/bin/gh" <<'PY'
 #!/usr/bin/env python3
@@ -193,8 +229,11 @@ elif method == "GET" and path == "/pulls":
 elif method == "GET" and re.fullmatch(r"/pulls/\d+", path):
     n = int(path.rsplit("/", 1)[1])
     # moved_heads (#2239): the live head differs from the enumerated one.
-    sha = fx.get("moved_heads", {}).get(str(n)) or next(p["head"]["sha"] for p in fx["prs"] if p["number"] == n)
-    body = {"head": {"sha": sha}}
+    pr_obj = next(p for p in fx["prs"] if p["number"] == n)
+    sha = fx.get("moved_heads", {}).get(str(n)) or pr_obj["head"]["sha"]
+    # The whole fixture object (#2689: the relay scan reads its fork flag,
+    # author and creation time), with the live head.
+    body = dict(pr_obj, head=dict(pr_obj["head"], sha=sha))
 elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path) \
         and fields.get("check_name") == "auto-clear-blocking-labels":
     # #2205: the nomination step's read of the newest auto-clear run.
@@ -227,6 +266,14 @@ elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path):
         body = {"check_runs": runs_for}
     else:
         body = {"check_runs": []}  # freshness / superseded-head probes: nothing newer
+elif method == "GET" and path == "/actions/workflows/codex-p1-gate.yml/runs":
+    # #2689: the relay scan's source-run inventory for one event kind.
+    if os.environ.get("RELAY_RUNS_FAIL") == "1":
+        sys.stderr.write("HTTP 502\n"); sys.exit(1)
+    runs_for = fx.get("relay_runs", {}).get(fields.get("event", ""), [])
+    body = {"total_count": len(runs_for), "workflow_runs": runs_for}
+elif method == "GET" and re.fullmatch(r"/issues/\d+/comments", path):
+    body = fx.get("comments", {}).get(path.split("/")[2], [])
 elif method == "POST" and path == "/check-runs":
     body = {"id": 900000000 + sum(1 for _ in open(os.environ["GH_LOG"])),
             "head_sha": fields["head_sha"], "name": fields["name"], "status": fields["status"],
@@ -843,6 +890,122 @@ fp_pass fp-schedule schedule "$FPA" "$FPA"
 check "the schedule-parent sweep never skips" \
   eval 'grep -q "^merge-clearance-gate.sh	1$" "$TMP/gates.log"'
 rm -f "$TMP/work/scripts/workflow/gate-input-fingerprint.sh"
+
+# ── 15. #2689: the Codex P1 guards with the real driver and relay scan ─
+# The sweep in codex-p1-gate.yml refuses clearance without the fingerprint
+# helper, evaluates through the snapshot driver, and withholds fork and
+# Dependabot heads whose read-only archive relay is pending. The publisher
+# now does the same, closing its own generation through rcg_close. The relay
+# scan's two trusted collaborators are doubles here: the source binder binds
+# every listed run, and the marker verifier drops a comment flagged
+# `unverified` (the sweep's own suite runs the real verifier).
+echo "#2689 Codex P1 guard cases"
+for f in codex-p1-snapshot-retry.py codex-p1-relay-pending.sh; do
+  cp "$TMP/work/scripts/workflow/$f" "$TMP/boundary-$f"
+  cp "$ROOT/scripts/workflow/$f" "$TMP/work/scripts/workflow/$f"
+done
+printf '#!/usr/bin/env bash\njq -c '"'"'{requires_relay:true,source_run_id:.id}'"'"'\n' \
+  >"$TMP/work/scripts/workflow/feedback-archive-relay-source.sh"
+printf 'import json, sys\nprint(json.dumps([c for c in json.load(sys.stdin) if not c.get("unverified")]))\n' \
+  >"$TMP/work/scripts/workflow/verified-relay-markers.py"
+chmod +x "$TMP/work/scripts/workflow/"*
+# codex_verdict <head>: "<closes>|<conclusion>|<title>" for the Codex P1
+# generations on <head>: how many PATCHes closed one, and the last of them.
+codex_verdict() {
+  python3 - "$TMP/gh.log" "$1" <<'PY2'
+import json, sys
+opened, out, n = {}, "absent", 0
+for index, line in enumerate(open(sys.argv[1]), 1):
+    method, endpoint, fields = line.rstrip("\n").split(" ", 2)
+    f = json.loads(fields)
+    if method == "POST" and endpoint.endswith("/check-runs"):
+        opened[900000000 + index] = f
+    elif method == "PATCH":
+        o = opened.get(int(endpoint.rsplit("/", 1)[1]), {})
+        if o.get("name") == "Codex P1 unresolved threads" and o.get("head_sha") == sys.argv[2]:
+            n += 1
+            out = f"{f.get('conclusion')}|{f.get('output[title]')}"
+print(f"{n}|{out}")
+PY2
+}
+# shellcheck disable=SC2034  # read inside the eval'd assertions below
+H1=$(printf '%040x' 1) H3=$(printf '%040x' 3)
+
+# Feedback drift on every attempt exhausts the driver's three snapshots
+# (rc 3): the sweep publishes that red and counts an infra error; so does the
+# publisher, once, on its own generation, and it goes on to the later PRs.
+: >"$TMP/fp-counter"
+FP_CHURN_PR=3 FP_COUNTER="$TMP/fp-counter" run_pass codex-drift workflow_run maintip schedule ""
+check "drift exhausted: the driver evaluated PR 3 three times, and every PR once otherwise" \
+  eval '[ "$(grep -c "^codex-p1-gate.sh	3$" "$TMP/gates.log")" = 3 ] && [ "$EVALUATED" = "1 2 3 4 5 6 7 8 9 10 11" ] && [ "$(grep -c "^codex-p1-gate.sh	1$" "$TMP/gates.log")" = 1 ]'
+check "drift exhausted: one red close of PR 3's Codex P1 generation, titled as the sweep titles it" \
+  eval '[ "$(codex_verdict "$H3")" = "1|failure|Codex feedback gate — snapshot recovery exhausted" ]'
+check "drift exhausted: the pass ends as an infra error, as the sweep does" eval '[ "$RC" -ne 0 ]'
+check "a stable feedback surface: the driver's clear verdict is published once, through the publisher's own close" \
+  eval '[ "$(codex_verdict "$H1")" = "1|success|Codex feedback gate (leased re-evaluation)" ]'
+
+# #2220 through the ported path: the Codex P1 gate fails on the exhausted
+# installation budget inside the driver. The pass stops there, the red carries
+# the back-off mark and the reset, and no later PR or context is evaluated.
+RL_FAIL_PR=3 RL_FAIL_GATE=codex-p1-gate.sh run_pass codex-ratelimit workflow_run "$H1" pull_request ""
+check "rate-limited driver run: nothing is evaluated after it" \
+  [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 codex-p1-gate.sh:1 codex-p1-gate.sh:3 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
+check "rate-limited driver run: PR 3's Codex P1 red carries the back-off title and the reset" \
+  eval '[ "$(codex_verdict "$H3")" = "1|failure|Codex P1 unresolved threads — installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" ]'
+check "rate-limited driver run: PR 3's CodeRabbit context and every later PR are left as they were" \
+  eval '[ "$(posts "$H3" in_progress)" = 2 ] && [ "$(posts "$H3" completed)" = 2 ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
+
+# Fingerprint helper missing: every Codex P1 context is red without being
+# evaluated, the other two contexts are evaluated as usual, and the pass is an
+# infra error, as in the sweep.
+mv "$TMP/work/scripts/review-feedback-surface-fingerprint.sh" "$TMP/fp-helper"
+run_pass codex-no-fp workflow_run maintip schedule ""
+mv "$TMP/fp-helper" "$TMP/work/scripts/review-feedback-surface-fingerprint.sh"
+check "missing fingerprint helper: no Codex P1 evaluation, every other context still evaluated" \
+  eval '! grep -q "^codex-p1-gate.sh" "$TMP/gates.log" && [ "$EVALUATED" = "1 2 3 4 5 6 7 8 9 10 11" ] && [ "$(grep -c "^coderabbit-severity-gate.sh" "$TMP/gates.log")" = 11 ]'
+check "missing fingerprint helper: each Codex P1 generation closes red, as the sweep closes it" \
+  eval '[ "$(codex_verdict "$H1")" = "1|failure|Codex P1 gate — fingerprint helper unavailable" ] && [ "$(codex_verdict "$H3")" = "1|failure|Codex P1 gate — fingerprint helper unavailable" ] && [ "$RC" -ne 0 ]'
+
+# The relay guard. 21 is a fork whose source run has no terminal marker, 22 a
+# same-repository Dependabot PR whose source run has a verified one, 23 a fork
+# whose only marker the verifier does not verify, and 24 a same-repository
+# human PR. A title lookalike for PR #210 binds nothing here.
+python3 - "$TMP/fixture.json" "$TMP/fx-relay.json" <<'PY2'
+import json, sys
+fx = json.load(open(sys.argv[1]))
+def pr(n, fork, login):
+    return {"number": n, "head": {"sha": f"{n:040x}", "repo": {"fork": fork}}, "user": {"login": login},
+            "created_at": "2026-10-14T01:00:00Z", "updated_at": "2026-10-14T02:50:00Z"}
+fx["prs"] = [pr(21, True, "outside"), pr(22, False, "dependabot[bot]"), pr(23, True, "outside"), pr(24, False, "maintainer")]
+fx["relay_runs"] = {"pull_request": [{"id": 501, "display_title": "Codex P1 Gate relay-v1 PR #21"},
+                                     {"id": 601, "display_title": "Codex P1 Gate relay-v1 PR #22"},
+                                     {"id": 701, "display_title": "Codex P1 Gate relay-v1 PR #23"},
+                                     {"id": 901, "display_title": "Codex P1 Gate relay-v1 PR #210"}]}
+marker = "<!-- mergepath-feedback-archive-relay:v1 run=%d status=complete -->"
+fx["comments"] = {"22": [{"user": {"login": "github-actions[bot]"}, "body": marker % 601}],
+                  "23": [{"user": {"login": "github-actions[bot]"}, "body": marker % 701, "unverified": True}]}
+json.dump(fx, open(sys.argv[2], "w"))
+PY2
+# shellcheck disable=SC2034  # read inside the eval'd assertions below
+H21=$(printf '%040x' 21) H22=$(printf '%040x' 22) H23=$(printf '%040x' 23) H24=$(printf '%040x' 24)
+relay_reads() { grep -c 'actions/workflows/codex-p1-gate.yml/runs' "$TMP/gh.log" || true; }
+CASE_FIXTURE="$TMP/fx-relay.json" run_pass codex-relay workflow_run maintip schedule ""
+check "pending relay: the fork head is withheld red without a Codex P1 evaluation" \
+  eval '[ "$(codex_verdict "$H21")" = "1|failure|Codex P1 gate — archive preparation failed" ] && ! grep -q "^codex-p1-gate.sh	21$" "$TMP/gates.log" && grep -q "^merge-clearance-gate.sh	21$" "$TMP/gates.log"'
+check "verified relay: the Dependabot head is evaluated and cleared" \
+  eval '[ "$(codex_verdict "$H22")" = "1|success|Codex feedback gate (leased re-evaluation)" ]'
+check "unverified relay marker: the fork head stays withheld" \
+  eval '[ "$(codex_verdict "$H23")" = "1|failure|Codex P1 gate — archive preparation failed" ] && ! grep -q "^codex-p1-gate.sh	23$" "$TMP/gates.log"'
+check "same-repository head: evaluated, and no relay source scan is spent on it" \
+  eval '[ "$(codex_verdict "$H24")" = "1|success|Codex feedback gate (leased re-evaluation)" ] && [ "$(relay_reads)" = 12 ]'
+check "a pending relay is not an infra error, as in the sweep" eval '[ "$RC" -eq 0 ]'
+RELAY_RUNS_FAIL=1 CASE_FIXTURE="$TMP/fx-relay.json" run_pass codex-relay-error workflow_run maintip schedule ""
+check "failed relay scan: every relay head is withheld red and the pass is an infra error" \
+  eval '[ "$(codex_verdict "$H21")" = "1|failure|Codex P1 gate — archive preparation failed" ] && [ "$(codex_verdict "$H22")" = "1|failure|Codex P1 gate — archive preparation failed" ] && [ "$(codex_verdict "$H24")" = "1|success|Codex feedback gate (leased re-evaluation)" ] && [ "$RC" -ne 0 ] && grep -q "source run scan failed closed" "$TMP/out.log"'
+for f in codex-p1-snapshot-retry.py codex-p1-relay-pending.sh; do
+  cp "$TMP/boundary-$f" "$TMP/work/scripts/workflow/$f"
+done
+rm -f "$TMP/work/scripts/workflow/feedback-archive-relay-source.sh" "$TMP/work/scripts/workflow/verified-relay-markers.py"
 
 echo "required-check publisher due-only targeting tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

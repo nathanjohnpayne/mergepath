@@ -685,6 +685,8 @@
       ".github/workflows/merge-clearance-gate.yml",
       "scripts/gate-api-lineage-blocking.sh",
       "scripts/workflow/codex-p1-snapshot-retry.py",
+      "scripts/workflow/codex-p1-relay-pending.sh",
+      "scripts/codex-p1-gate.sh",
       "scripts/lib/gh-retry-helpers.sh",
       "scripts/audit-branch-protection.sh",
       "scripts/coderabbit-severity-gate.sh",

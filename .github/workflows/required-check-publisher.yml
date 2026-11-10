@@ -928,14 +928,67 @@ jobs:
           evaluated=0
           skipped=0
           handled_dups=""
+          # codex_p1_evaluate <driver> <pr> <head> <generation-id>: the Codex
+          # P1 evaluation, behind the guards codex-p1-gate.yml's scheduled
+          # sweep applies (#2689). It sets gate()'s output, rc and
+          # verdict_title; gate() maps rc and publishes through rcg_close as
+          # for every other context, and the generation gate() opened stays
+          # the only lease.
+          #   * The feedback-fingerprint helper and the snapshot driver must
+          #     both be installed. This checkout is the trusted default branch,
+          #     the revision this workflow runs from, so there is no
+          #     first-delivery window to allow: either one missing is an
+          #     infrastructure red, never an evaluation without it.
+          #   * A fork or Dependabot head whose trusted read-only archive relay
+          #     is still pending is red (rc 1), and one whose relay scan
+          #     cannot complete is an infrastructure red (rc 2).
+          #   * Otherwise the driver evaluates with its bounded feedback-
+          #     snapshot retries (#1825) in report mode: it closes nothing and
+          #     reports its exit code and title. A driver that reports no
+          #     matching verdict is an infrastructure red.
+          # Every message, including the driver's and the scan's gh errors,
+          # reaches output, so the #2220 rate-limit stop reads it as before.
+          codex_p1_evaluate() {
+            local driver="$1" pr="$2" head="$3" generation_id="$4" report relay_rc
+            if [ ! -x scripts/review-feedback-surface-fingerprint.sh ] || [ ! -x "$driver" ]; then
+              output="Installed feedback-fingerprint helper or feedback snapshot retry driver is missing or not executable; refusing clearance."
+              rc=2
+              verdict_title="Codex P1 gate — fingerprint helper unavailable"
+              return 0
+            fi
+            relay_rc=0
+            output=$(scripts/workflow/codex-p1-relay-pending.sh "$REPO" "$pr" 2>&1) || relay_rc=$?
+            if [ "$relay_rc" -ne 0 ]; then
+              rc=2
+              [ "$relay_rc" -ne 1 ] || rc=1
+              verdict_title="Codex P1 gate — archive preparation failed"
+              return 0
+            fi
+            if ! report=$(mktemp); then
+              output="Could not allocate the snapshot driver's verdict report; refusing clearance."
+              rc=2
+              return 0
+            fi
+            rc=0
+            output=$(CODEX_P1_VERDICT_REPORT="$report" "$driver" "$pr" "$REPO" "$head" "$generation_id" fingerprint 2>&1) || rc=$?
+            if jq -e --argjson rc "$rc" '.rc == $rc and (.title | type == "string" and length > 0)' "$report" >/dev/null 2>&1; then
+              verdict_title=$(jq -r .title "$report")
+            else
+              output="$output
+          The feedback snapshot driver exited $rc without reporting that verdict; refusing clearance."
+              [ "$rc" -ge 2 ] || rc=2
+            fi
+            rm -f "$report"
+          }
           # gate <script> <context> <sentinel-or-empty> <pr> <head>
           #      [require-review-summary]: evaluate one gate for one PR and
           # PATCH its owned pre-evaluation generation. The optional flag belongs
-          # only to CodeRabbit's #886/#1364 publication hold.
+          # only to CodeRabbit's #886/#1364 publication hold. For the Codex P1
+          # context, <script> is the snapshot driver codex_p1_evaluate runs.
           gate() {
             local script="$1" context="$2" sentinel="$3" pr="$4" head="$5"
             local summary_hold="${6:-false}"
-            local output rc conclusion title rate_limit_red=0
+            local output rc conclusion title rate_limit_red=0 verdict_title=""
             local CR_EVIDENCE_REPORT
             CR_EVIDENCE_REPORT=$(mktemp) || { had_infra_error=1; return 0; }
             export CR_EVIDENCE_REPORT
@@ -981,10 +1034,15 @@ jobs:
               set +e
               if [ "$summary_hold" = true ]; then
                 output=$(REQUIRE_REVIEW_SUMMARY=true "$script" "$pr" "$REPO" 2>&1)
+                rc=$?
+              elif [ "$context" = "${CODEX_P1_CONTEXT:-}" ]; then
+                # Red unless codex_p1_evaluate itself says otherwise.
+                output="" rc=2
+                codex_p1_evaluate "$script" "$pr" "$head" "$generation_id"
               else
                 output=$("$script" "$pr" "$REPO" 2>&1)
+                rc=$?
               fi
-              rc=$?
               set -e
               # The first gate that fails on the exhausted installation
               # budget stops the pass (#2220): every later PR would fail the
@@ -1044,6 +1102,11 @@ jobs:
                 fi
                 ;;
             esac
+            # The Codex P1 path names its verdict the way the gate sweep does
+            # (#2689). The rate-limit title stays, because due() reads it.
+            if [ -n "$verdict_title" ] && [ "$rate_limit_red" -eq 0 ]; then
+              title="$verdict_title"
+            fi
             if [ "$rc" -eq 0 ] && [ -n "$sentinel" ] && \
                 ! grep -qF "$sentinel" <<<"$output"; then
               # rc 0 without the script's own PASS line means the success
@@ -1225,7 +1288,7 @@ jobs:
             evaluated=$((evaluated + 1))
             echo "::group::Publish PR #$PR @ $head_sha"
             gate scripts/merge-clearance-gate.sh   "$MCG_CONTEXT"        "Merge clearance: PASS" "$PR" "$head_sha"
-            gate scripts/codex-p1-gate.sh          "$CODEX_P1_CONTEXT"   ""                      "$PR" "$head_sha"
+            gate scripts/workflow/codex-p1-snapshot-retry.py "$CODEX_P1_CONTEXT" ""         "$PR" "$head_sha"
             gate scripts/coderabbit-severity-gate.sh "$CODERABBIT_CONTEXT" ""                    "$PR" "$head_sha" true
             echo "::endgroup::"
           done <<<"$selected"

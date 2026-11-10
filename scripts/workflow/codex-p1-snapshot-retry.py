@@ -11,8 +11,18 @@ verdict file on that same attempt (codex-p1-gate.sh's MERGEPATH_GATE_VERDICT_FIL
 contract: the only blocker is a non-blocking finding awaiting disposition), and
 the lease PATCH that closed the generation red succeeded. A drifted attempt's
 file never counts, and every other outcome leaves the caller's file absent.
+
+Report mode (#2689): when the caller names CODEX_P1_VERDICT_REPORT, the driver
+removes that file first and does not close the lease. It writes one JSON
+object, {"rc": <exit code>, "title": <check title>}, to the file after the
+same bounded evaluation and final publication fingerprint, prints the summary
+as usual and exits with that code. The caller then publishes the verdict
+through its own owned-generation fence; the required-check publisher does.
+No pending verdict is ever recorded in this mode. Without the variable,
+nothing here changes.
 """
 import fcntl
+import json
 import os
 from pathlib import Path
 import shutil
@@ -52,6 +62,7 @@ def transport():
 ACCOUNTING_FAILURE = 'review feedback is unaccounted'
 PENDING_ENV = 'CODEX_P1_PENDING_VERDICT_FILE'
 GATE_VERDICT_ENV = 'MERGEPATH_GATE_VERDICT_FILE'
+REPORT_ENV = 'CODEX_P1_VERDICT_REPORT'
 
 
 def read_pending(path):
@@ -90,13 +101,17 @@ def main():
     if not real_gh:
         print('gh is unavailable; cannot close the existing check lease', file=sys.stderr)
         return 2
-    pending_out = os.environ.get(PENDING_ENV, '')
-    if pending_out:
-        # A stale file from an earlier run must never speak for this one.
-        try:
-            os.unlink(pending_out)
-        except FileNotFoundError:
-            pass
+    report_out = os.environ.get(REPORT_ENV, '')
+    pending_requested = os.environ.get(PENDING_ENV, '')
+    for stale in (report_out, pending_requested):
+        if stale:
+            # A stale file from an earlier run must never speak for this one.
+            try:
+                os.unlink(stale)
+            except FileNotFoundError:
+                pass
+    # A caller that publishes the verdict itself is never told about pending.
+    pending_out = '' if report_out else pending_requested
     start = time.monotonic()
     deadline = start + SECONDS
     messages = []
@@ -115,6 +130,7 @@ def main():
         # per-attempt file, never through anything inherited.
         env.pop(GATE_VERDICT_ENV, None)
         env.pop(PENDING_ENV, None)
+        env.pop(REPORT_ENV, None)
 
         def run(command, extra_env=None):
             remaining = deadline - time.monotonic()
@@ -200,6 +216,15 @@ def main():
 
         summary = '\n'.join(messages)
         print(summary, flush=True)
+        if report_out:
+            # Report mode (#2689): the caller closes its own generation
+            # through its own publication fence, so nothing is PATCHed here.
+            try:
+                Path(report_out).write_text(json.dumps({'rc': rc, 'title': title}) + '\n')
+            except OSError as error:
+                print(f'::error::Could not record the verdict report ({error}); the caller fails closed.', file=sys.stderr)
+                return 2
+            return rc
         # Reserve closure outside the spent read budget. An unsuccessful PATCH
         # is not retried as success: the remote write may have happened, and a
         # later successful write must not reuse a stale snapshot after a wait.

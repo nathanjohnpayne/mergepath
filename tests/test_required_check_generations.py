@@ -806,13 +806,25 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
 
     def test_consolidated_gate_opens_every_selected_context_before_evaluation(self):
         program = self.workflow_step("required-check-publisher.yml", "publish", "gate() {")
-        start = program.index("gate() {")
-        end = program.index("\n}", start) + 2
-        gate = program[start:end]
+        # #2689: the Codex P1 context evaluates through codex_p1_evaluate and
+        # the snapshot driver, in report mode, so both shipped functions run.
+        functions = []
+        for name in ("codex_p1_evaluate() {", "gate() {"):
+            start = program.index(name)
+            functions.append(program[start:program.index("\n}", start) + 2])
+        gate = "\n".join(functions)
+        (self.path / "scripts/review-feedback-surface-fingerprint.sh").write_text("#!/bin/sh\necho fp\n")
+        (self.path / "scripts/workflow/codex-p1-relay-pending.sh").write_text("#!/bin/sh\nexit 0\n")
+        (self.path / "scripts/workflow/codex-p1-snapshot-retry.py").write_text(
+            '#!/usr/bin/env bash\nscripts/codex-p1-gate.sh "$1" "$2"; rc=$?\n'
+            'printf \'{"rc":%s,"title":"driver"}\\n\' "$rc" >"$CODEX_P1_VERDICT_REPORT"\nexit "$rc"\n')
+        for name in ("review-feedback-surface-fingerprint.sh", "workflow/codex-p1-relay-pending.sh",
+                     "workflow/codex-p1-snapshot-retry.py"):
+            (self.path / "scripts" / name).chmod(0o755)
         setup = "OWN_GENERATIONS=''; RATE_LIMITED=0; had_infra_error=0; EVIDENCE_ESCALATIONS=''; MCG_GREEN_PRS=''\n"
         calls = "\n".join(f"gate scripts/{script} '{context}' '' 7 {HEAD} {flag}" for script, context, flag in [
             ("merge-clearance-gate.sh", "Merge clearance gate", "false"),
-            ("codex-p1-gate.sh", "Codex P1 unresolved threads", "false"),
+            ("workflow/codex-p1-snapshot-retry.py", "Codex P1 unresolved threads", "false"),
             ("coderabbit-severity-gate.sh", CONTEXT, "true")])
         result = self.shell(setup + gate + "\n" + calls)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

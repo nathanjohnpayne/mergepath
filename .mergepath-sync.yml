@@ -1620,6 +1620,8 @@ paths:
     requires:
       - ".github/workflows/required-check-publisher.yml"
       - "scripts/workflow/installation-budget.sh"   # #2286, staged into the extracted publish step
+      - "scripts/workflow/codex-p1-snapshot-retry.py"   # #2689, the real driver in case 15
+      - "scripts/workflow/codex-p1-relay-pending.sh"   # #2689, the real relay scan in case 15
   # Unit suite for the review-input fingerprint (#2920): the reads, the
   # per-context projection and the published-run decision. Hard-run by
   # check_required_check_publisher.
@@ -2777,6 +2779,16 @@ paths:
       - "scripts/coderabbit-severity-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+      # #2689: the Codex P1 evaluation runs the gate sweep's guards. The
+      # snapshot driver and its fingerprint helper are required, a missing
+      # one is an infrastructure red, and the relay scan binds source runs
+      # and verifies relay markers with the sweep's own helpers.
+      - "scripts/workflow/codex-p1-snapshot-retry.py"
+      - "scripts/review-feedback-surface-fingerprint.sh"
+      - "scripts/workflow/codex-p1-relay-pending.sh"
+      - "scripts/workflow/feedback-archive-relay-source.sh"
+      - "scripts/workflow/verified-relay-markers.py"
+      - "scripts/lib/gh-api-array.sh"   # sourced hard by feedback-archive-relay-source.sh
   # #2881: event and daily-sweep runner for the late-finding detector; the
   # script must travel with it or every consumer run fails on a missing file.
   - path: .github/workflows/late-codex-findings.yml
