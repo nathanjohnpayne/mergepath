@@ -184,6 +184,8 @@ CONSUMER_ABSENT=(
   "tests/fixtures/audit-codex-latency"
   "scripts/audit-review-latency.sh"
   "tests/test_audit_review_latency.sh"
+  "scripts/audit-rebuttal-clearances.sh"
+  "tests/test_audit_rebuttal_clearances.sh"
   "scripts/audit-canonical-mirrors.sh"
   "tests/test_audit_canonical_mirrors.sh"
   "scripts/wave-audit.sh"

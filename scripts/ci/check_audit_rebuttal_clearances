@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_audit_rebuttal_clearances
+#
+# Runs tests/test_audit_rebuttal_clearances.sh, the offline fixture suite for
+# scripts/audit-rebuttal-clearances.sh (the #2852 slice 1 baseline, #2943):
+# its tier grading through the shared classifiers, its three kinds of
+# rebuttal evidence, the resolver's reply polarity it loads, its re-read
+# rules and its not-measured accounting. Without this wiring an edit to the
+# audit, or to the resolver functions it loads, could break the rerunnable
+# baseline without CI noticing.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_audit_rebuttal_clearances.sh"
+
+# Hub-only: the audit script and its suite are not manifest-propagated.
+# The hub marker is tested first, so a consumer's verdict does not depend on
+# whether bootstrap residue left either file behind.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_audit_rebuttal_clearances: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the audit is hub-only)"
+  exit 0
+fi
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_audit_rebuttal_clearances: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_audit_rebuttal_clearances: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_audit_rebuttal_clearances: PASS"

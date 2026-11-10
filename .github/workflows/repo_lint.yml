@@ -624,6 +624,14 @@ jobs:
         if: matrix.shard == 4
         run: ./scripts/ci/check_audit_review_latency || { rc=$?; if [ ! -f scripts/ci/check_audit_review_latency ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_audit_review_latency not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # Offline fixture suite for the #2852 slice 1 rebuttal-clearance
+      # baseline (scripts/audit-rebuttal-clearances.sh, #2943) — guards its
+      # grading, rebuttal evidence and re-read rules. Hub-only (marker-first
+      # SKIP on consumers), so it runs on a hub-only shard.
+      - name: check_audit_rebuttal_clearances
+        if: matrix.shard == 8
+        run: ./scripts/ci/check_audit_rebuttal_clearances || { rc=$?; if [ ! -f scripts/ci/check_audit_rebuttal_clearances ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_audit_rebuttal_clearances not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       # Hermetic regression suite for the #739 canonical-mirror drift
       # triage aid (scripts/audit-canonical-mirrors.sh) — guards the
       # vendor-file section parser (fence nesting per the CommonMark

@@ -61,6 +61,11 @@
       "tests/test_audit_codex_latency.sh",
       "scripts/audit-codex-latency.sh"
     ],
+    "check_audit_rebuttal_clearances": [
+      "tests/test_audit_rebuttal_clearances.sh",
+      "scripts/audit-rebuttal-clearances.sh",
+      "scripts/resolve-pr-threads.sh"
+    ],
     "check_audit_review_latency": [
       "tests/test_audit_review_latency.sh",
       "scripts/audit-review-latency.sh"
@@ -488,6 +493,7 @@
       "scripts/audit-branch-protection.sh",
       "scripts/audit-canonical-mirrors.sh",
       "scripts/audit-codex-latency.sh",
+      "scripts/audit-rebuttal-clearances.sh",
       "scripts/audit-review-latency.sh",
       "scripts/bootstrap-config.sh",
       "scripts/bootstrap-new-repo.sh",
