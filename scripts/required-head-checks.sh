@@ -15,6 +15,14 @@
 #
 #   --list            print the resolved names, one per line
 #   --verify --sha X  exit 0 only if every configured name is green on X
+#   --verify --sha X --branch-requirements FILE
+#                     also require every rule in FILE, a `known` result of
+#                     scripts/lib/branch-requirements.sh's br_required_checks
+#                     that the CALLER resolved (#2722). Each rule is judged on
+#                     X by the same workflow-grouped check-run reduction, plus
+#                     the legacy commit-status surface for a rule any producer
+#                     can satisfy. Anything but a `known` result is exit 3,
+#                     never "nothing required".
 #
 # Exit codes: 0 ok / 1 not satisfied / 2 usage / 3 infra (fail closed).
 
@@ -23,21 +31,23 @@ set -euo pipefail
 CONFIG_PATH=".github/required-head-checks"
 DEFAULT_NAME="lint"
 
-usage() { echo "usage: required-head-checks.sh --repo <owner/repo> (--list | --verify --sha <sha>)" >&2; exit 2; }
+usage() { echo "usage: required-head-checks.sh --repo <owner/repo> (--list | --verify --sha <sha> [--branch-requirements <file>])" >&2; exit 2; }
 infra()  { echo "required-head-checks: ERROR — $*" >&2; exit 3; }
 
-REPO=""; MODE=""; SHA=""
+REPO=""; MODE=""; SHA=""; BRANCH_REQUIREMENTS_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo)   REPO="${2:-}"; shift 2 ;;
     --sha)    SHA="${2:-}";  shift 2 ;;
     --list)   MODE="list";   shift ;;
     --verify) MODE="verify"; shift ;;
+    --branch-requirements) BRANCH_REQUIREMENTS_FILE="${2:-}"; [ -n "$BRANCH_REQUIREMENTS_FILE" ] || usage; shift 2 ;;
     *) usage ;;
   esac
 done
 [ -n "$REPO" ] && [ -n "$MODE" ] || usage
 [ "$MODE" != "verify" ] || [ -n "$SHA" ] || usage
+[ -z "$BRANCH_REQUIREMENTS_FILE" ] || [ "$MODE" = "verify" ] || usage
 
 # ── Resolve ───────────────────────────────────────────────────────────
 # Read from the DEFAULT BRANCH, never the PR head or the workspace: on
@@ -86,6 +96,23 @@ if [ "$MODE" = "list" ]; then
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────
+# The branch rules, when given, are validated before any read: a file that is
+# not a `known` br_required_checks result says nothing about what the branch
+# requires, so it is an indeterminate input, not an empty requirement list.
+# One compact {context, app_id} object per line.
+requirement_lines=""
+if [ -n "$BRANCH_REQUIREMENTS_FILE" ]; then
+  [ -r "$BRANCH_REQUIREMENTS_FILE" ] || infra "branch requirements file '$BRANCH_REQUIREMENTS_FILE' is unreadable"
+  requirement_lines=$(jq -c '
+    if type == "object" and .state == "known" and (.requirements | type) == "array"
+       and all(.requirements[]; type == "object"
+               and (.context | type) == "string" and (.context | length) > 0
+               and (.app_id == null or ((.app_id | type) == "string" and (.app_id | length) > 0)))
+    then .requirements[] | {context, app_id}
+    else error("not a known br_required_checks result") end' "$BRANCH_REQUIREMENTS_FILE" 2>/dev/null) \
+    || infra "branch requirements in '$BRANCH_REQUIREMENTS_FILE' are not a known br_required_checks result; refusing to read them as nothing required"
+fi
+
 RUNS_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/head-check-runs.sh"
 [ -r "$RUNS_LIB" ] || infra "missing shared check-run reducer"
 # shellcheck source=lib/head-check-runs.sh
@@ -143,4 +170,63 @@ while IFS= read -r name; do
 done <<EOF
 $names
 EOF
+
+# ── Branch rules (#2722) ──────────────────────────────────────────────
+# Each rule is one requirement GitHub evaluates on its own (see the contract
+# in scripts/lib/branch-requirements.sh): a rule pinned to an app counts only
+# that app's check runs; a rule any producer satisfies counts every check run
+# of the name AND the legacy commit statuses of the name, because GitHub
+# accepts either surface and, when a head carries both, holds the merge until
+# both are green (#1193). A rule with no result on either surface is absent.
+# Check runs reduce exactly as the configured names above do, so success,
+# neutral and skipped count as green, and an in-flight run is pending.
+if [ -n "$requirement_lines" ]; then
+  statuses_json='[]'
+  if printf '%s\n' "$requirement_lines" | jq -e -s 'any(.[]; .app_id == null)' >/dev/null; then
+    statuses=$(gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" --paginate \
+      --jq '.[] | {context, state, id}' 2>/dev/null) \
+      || infra "could not read commit statuses for $SHA"
+    statuses_json=$(printf '%s\n' "$statuses" | jq -s '.') || infra "could not parse commit statuses for $SHA"
+  fi
+  while IFS= read -r requirement; do
+    [ -n "$requirement" ] || continue
+    ctx=$(jq -r '.context' <<<"$requirement")
+    app=$(jq -r '.app_id // ""' <<<"$requirement")
+    runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
+      -f check_name="$ctx" --paginate \
+      --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, app: .app.id}' 2>/dev/null) \
+      || infra "could not read check runs named '$ctx' for $SHA"
+    runs_json=$(printf '%s\n' "$runs" | jq -s --arg app "$app" \
+      'if $app == "" then . else map(select((.app // "" | tostring) == $app)) end') \
+      || infra "could not parse check runs named '$ctx'"
+    check_state=$(head_check_runs_reduce "$ctx" <(printf '%s\n' "$runs_json") <(printf '%s\n' "$suite_json") | jq -r '.state') \
+      || infra "could not reduce check runs named '$ctx'"
+    status_state=absent
+    if [ -z "$app" ]; then
+      status_state=$(jq -r --arg n "$ctx" '
+        [.[] | select(.context == $n)]
+        | if length == 0 then "absent"
+          else (max_by(.id) | .state
+                | if . == "success" then "green" elif . == "pending" then "pending" else "failed" end)
+          end' <<<"$statuses_json") || infra "could not reduce commit statuses named '$ctx'"
+    fi
+    if [ "$check_state" = absent ] && [ "$status_state" = absent ]; then
+      verdict=absent
+    elif [ "$check_state" = pending ] || [ "$status_state" = pending ]; then
+      verdict=pending
+    elif { [ "$check_state" = green ] || [ "$check_state" = absent ]; } && \
+         { [ "$status_state" = green ] || [ "$status_state" = absent ]; }; then
+      verdict=green
+    else
+      verdict=failed
+    fi
+    label="$ctx (required by the branch rules${app:+, app $app})"
+    case "$verdict" in
+      green) echo "required-head-checks: OK   $label" ;;
+      *)     echo "required-head-checks: WAIT $label ($verdict)"; rc=1 ;;
+    esac
+  done <<EOF
+$requirement_lines
+EOF
+fi
 exit "$rc"

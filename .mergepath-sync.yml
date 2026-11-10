@@ -2489,6 +2489,9 @@ paths:
       # Both jobs read available_reviewers plus dependabot_reviewer_identities
       # through the shared reader and fail closed without it (#2874).
       - "scripts/lib/reviewers-helpers.sh"
+      # The merge job resolves the contexts branch protection requires
+      # through it and refuses every merge without it (#2722).
+      - "scripts/lib/branch-requirements.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

@@ -15,8 +15,20 @@ name: Dependabot Auto-merge
 #            read back. The token is meant to live in that environment but
 #            today is a repository secret in every fleet repository, so the
 #            job resolves the repository copy (#2774; see the merge job).
+#            Besides the identity check and the merge calls, it makes one
+#            read: the contexts branch protection requires on the default
+#            branch, which GITHUB_TOKEN cannot read completely (#2722).
 # Every other API call in both jobs runs under GITHUB_TOKEN, scoped by the
 # `permissions:` block below.
+#
+# The merge job merges only after every required context is successful on
+# the exact head: each context branch protection requires on the default
+# branch, read live, plus the per-repository required-head-checks list. The
+# merge token is an administrator's and `enforce_admins` is off fleet-wide,
+# so a `gh pr merge --auto` issued earlier merged at once past a context that
+# had not posted yet (#2722 path B). When the wait ends without that, the job
+# merges nothing, withdraws any armed auto-merge request, says on the PR which
+# contexts are missing and since when, and fails.
 #
 # Both jobs require the PR's base to be the default branch. Since 2025-12-08
 # pull_request_target runs the default branch's definition, but these jobs
@@ -42,6 +54,11 @@ permissions:
   # and latest_check_run) reads check runs under GITHUB_TOKEN. Those reads ran
   # under the reviewer PAT before #2729 moved it out of every read path.
   checks: read
+  # The same wait reads legacy commit statuses, the other surface GitHub
+  # accepts for a required context (#2722).
+  statuses: read
+  # Also the required-context refusal comment the merge job keeps on the PR
+  # (one marker comment, updated in place; #2722).
   pull-requests: write
   contents: write
   # Required for the immediate-squash fallback's scripts/review-feedback-
@@ -544,24 +561,17 @@ jobs:
               | jq -sc --arg check "$1" '[.[] | .check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
           }
 
-          # NOTE (unfixed here, deliberately): the `lint` default is a
-          # proxy signal, not the actual merge gate. It is only ever "a
-          # check we expect to be green on HEAD" — it is NOT read from
-          # branch protection's required contexts. In fiveacross, for
-          # instance, the five genuinely-required contexts are CodeRabbit
-          # unresolved blocking findings / Codex P1 unresolved threads /
-          # Label Gate / Merge clearance gate / Self-Review Required, and
-          # `lint` is not among them — so this wait watches something
-          # unrelated to what actually blocks the merge. That is mostly
-          # benign because `--auto` (the primary path) defers to real
-          # branch protection anyway, and this wait is a belt-and-braces
-          # pre-check; it matters most on the no-branch-protection
-          # fallback squash below, which is exactly where a proxy signal
-          # is weakest. The default is intentionally NOT changed here:
-          # other repos may legitimately depend on `lint`, and deriving
-          # the list from branch protection is a behavior change that
-          # belongs in its own reviewed PR, not in a pagination fix.
-          # Repos can already override via REQUIRED_HEAD_CHECK_NAME.
+          # The singular waiter below is the pre-#1070 shape, kept for the
+          # REQUIRED_HEAD_CHECK_NAME contract its tests pin. The merge gate
+          # is the plural waiter further down, which waits for the
+          # per-repository list AND every context branch protection requires
+          # (#2722). The `lint` default alone was a proxy, not the gate: in
+          # fiveacross the five required contexts are CodeRabbit unresolved
+          # blocking findings / Codex P1 unresolved threads / Label Gate /
+          # Merge clearance gate / Self-Review Required, and `lint` is not
+          # among them. The assumption that `--auto` defers to branch
+          # protection anyway was wrong for this administrator token: it
+          # merged at once past a required context that had not posted.
           require_current_head_check_success() {
             local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name ever_seen
             # Optional explicit name so the plural wrapper below can loop
@@ -628,9 +638,120 @@ jobs:
           # Resolution, name splitting and per-workflow grouping all live in
           # scripts/required-head-checks.sh so the three call sites share one
           # implementation rather than three drifting copies.
+          #
+          # The set also holds every context branch protection requires on
+          # the default branch (#2722), read live once per pinned head by the
+          # shared resolver scripts/lib/branch-requirements.sh (the reader
+          # gate (a) of codex-review-check.sh uses). It reads under
+          # AUTHOR_MERGE_TOKEN because the resolver trusts the classic surface
+          # only through the rule's configuration (`branchProtectionRule`,
+          # Administration: read, which no `permissions:` block can grant
+          # GITHUB_TOKEN) or for a proven non-admin WRITE user, and GitHub
+          # documents `viewerPermission` as null for an App token. Under
+          # GITHUB_TOKEN it would answer `unknown` on every run. Anything but
+          # `known` refuses the merge; it is never read as "nothing required".
+          #
+          # Every way this wait ends without success, except a moved head,
+          # goes through report_required_contexts_refusal: nothing merges,
+          # any armed auto-merge request is withdrawn, the PR says which
+          # contexts are missing and since when, and the job fails. N, the
+          # time a context may take to post before that is reported, is the
+          # existing wait budget (TEST_CHECK_WAIT_SECONDS, 1200 s); the job
+          # timeout is unchanged.
+
+          # report_required_contexts_refusal <sha> <reason> [<bullet lines>]
+          # Never returns. One marker comment per PR, written by
+          # github-actions[bot] and updated in place, so repeated runs do
+          # not add comments. A failed comment write is a warning: the
+          # refusal stands either way.
+          report_required_contexts_refusal() {
+            local sha=$1 reason=$2 detail=${3:-} live body_file comment_id armed arm_note
+            local marker='<!-- mergepath-dependabot-required-contexts -->'
+            live=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null || true)
+            if [ -n "$live" ] && [ "$live" != "$sha" ]; then
+              echo "::notice::PR head moved from $sha to $live while the required checks were pending; not merging. The run for the new head handles it."
+              exit 0
+            fi
+            echo "::error::Refusing auto-merge on $sha: $reason"
+            [ -z "$detail" ] || printf '%s\n' "$detail" | sed 's/^/::error::  /'
+            # An auto-merge request armed by an earlier run is a merge this
+            # job has not cleared on this head; GitHub could complete it
+            # under the administrator's bypass. Withdraw it before saying so.
+            arm_note="No auto-merge request is left armed."
+            armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest == null then "false" else "true" end' 2>/dev/null || echo unknown)
+            case "$armed" in
+              true)
+                if gh pr merge --disable-auto "$PR_URL"; then
+                  echo "::warning::Withdrew the auto-merge request armed by an earlier run."
+                else
+                  echo "::error::Could not withdraw the auto-merge request armed on $PR_URL."
+                  arm_note="An auto-merge request is still armed and could not be withdrawn; withdraw it by hand."
+                fi
+                ;;
+              false) ;;
+              *)
+                echo "::error::Could not read whether $PR_URL has an armed auto-merge request."
+                arm_note="Whether an auto-merge request is armed could not be read; check, and withdraw it by hand if so."
+                ;;
+            esac
+            body_file=$(mktemp)
+            {
+              echo "$marker"
+              echo "**Dependabot auto-merge did not merge this PR: a required check is missing or not successful.**"
+              echo
+              echo "$reason"
+              if [ -n "$detail" ]; then
+                echo
+                printf '%s\n' "$detail"
+              fi
+              echo
+              echo "Required checks are every context branch protection on \`$DEFAULT_BRANCH\` requires, read live, plus this repository's \`.github/required-head-checks\` list (default \`lint\`). Nothing was merged. $arm_note The next push to this PR runs the wait again; to retry sooner, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}) once the checks have posted."
+            } >"$body_file"
+            if comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+                --jq '.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- mergepath-dependabot-required-contexts -->"))) | .id'); then
+              comment_id=$(printf '%s\n' "$comment_id" | sed '/^$/d' | tail -n 1)
+              if [ -n "$comment_id" ]; then
+                gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$body_file" >/dev/null \
+                  || echo "::warning::Could not update the required-check comment $comment_id on $PR_URL."
+              else
+                gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$body_file" >/dev/null \
+                  || echo "::warning::Could not post the required-check comment on $PR_URL."
+              fi
+            else
+              echo "::warning::Could not read the comments on $PR_URL, so the required-check comment was not written (it would risk a duplicate)."
+            fi
+            rm -f "$body_file"
+            exit 1
+          }
+
+          # Resolve, live, the contexts branch protection requires on the
+          # default branch, into BRANCH_REQUIREMENTS_FILE.
+          resolve_branch_requirements() {
+            local sha=$1 json state errors
+            # The resolver must be the one that reads the classic rule's
+            # configuration (#2614). An older copy reads only the viewer-
+            # scoped projection, which an administrator receives empty, and
+            # would answer "nothing required" for this token.
+            if [ ! -r scripts/lib/branch-requirements.sh ] || \
+               ! grep -Fq 'branchProtectionRule' scripts/lib/branch-requirements.sh; then
+              report_required_contexts_refusal "$sha" "The contexts branch protection requires could not be read: scripts/lib/branch-requirements.sh in the base checkout is missing or predates #2614. Propagate the scripts/lib kit, then rerun."
+            fi
+            # shellcheck source=/dev/null
+            . scripts/lib/branch-requirements.sh
+            json=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" br_required_checks "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" 2>/dev/null || true)
+            state=$(printf '%s' "$json" | jq -r '.state // "unknown"' 2>/dev/null || echo unknown)
+            if [ "$state" != "known" ]; then
+              errors=$(printf '%s' "$json" | jq -r '(.errors // []) | join("; ")' 2>/dev/null || true)
+              report_required_contexts_refusal "$sha" "The contexts branch protection requires on \`$DEFAULT_BRANCH\` could not be read, so they cannot be shown successful: ${errors:-no result from the resolver}."
+            fi
+            BRANCH_REQUIREMENTS_FILE=$(mktemp)
+            printf '%s\n' "$json" >"$BRANCH_REQUIREMENTS_FILE"
+            echo "::notice::$DEFAULT_BRANCH requires: $(printf '%s' "$json" | jq -r 'if (.contexts | length) == 0 then "no status checks" else (.contexts | join(", ")) end')."
+          }
+
           require_current_head_checks_success() {
             local wait_seconds poll_seconds deadline pinned attempts max_attempts
-            local infra_errors max_infra_errors
+            local infra_errors max_infra_errors verify_out waiting
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             max_attempts=${HEAD_DRIFT_MAX_RESTARTS:-3}
@@ -642,6 +763,9 @@ jobs:
             # the wait, and a persistent failure still fails closed.
             max_infra_errors=${HEAD_CHECKS_MAX_INFRA_ERRORS:-3}
             attempts=0
+            # "Since when" on the PR: the first time this run began waiting,
+            # which is right after the approve job's exact-head approval.
+            WAIT_STARTED_AT=${WAIT_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
             while :; do
               attempts=$((attempts + 1))
               pinned=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
@@ -649,6 +773,7 @@ jobs:
                 echo "::error::Could not resolve the PR head SHA; refusing auto-merge."
                 exit 1
               fi
+              resolve_branch_requirements "$pinned"
               deadline=$((SECONDS + wait_seconds))
               infra_errors=0
               while :; do
@@ -658,14 +783,14 @@ jobs:
                 # first not-ready poll and never wait at all.
                 rc=0
                 if [ ! -f scripts/required-head-checks.sh ]; then
-                  # First-rollout guard (#1070); see agent-review.yml for why
-                  # this falls back rather than failing closed.
-                  echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); falling back to the singular waiter."
-                  require_current_head_check_success
-                  CURRENT_HEAD_SHA="$pinned"
-                  return 0
+                  # A pre-#1070 checkout. This used to fall back to the
+                  # singular `lint` waiter, which cannot see the branch's
+                  # required contexts, so it now refuses (#2722).
+                  report_required_contexts_refusal "$pinned" "scripts/required-head-checks.sh is missing from the base checkout (it predates #1070), so the required contexts cannot be verified. Propagate the scripts kit, then rerun."
                 fi
-                bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned" || rc=$?
+                verify_out=$(bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned" \
+                  --branch-requirements "$BRANCH_REQUIREMENTS_FILE") || rc=$?
+                [ -z "$verify_out" ] || printf '%s\n' "$verify_out"
                 if [ "$rc" -eq 0 ]; then
                   break
                 fi
@@ -673,26 +798,29 @@ jobs:
                   infra_errors=$((infra_errors + 1))
                   if [ "$infra_errors" -ge "$max_infra_errors" ]; then
                     echo "::error::required-head-checks failed closed (rc=3, $infra_errors consecutive read failures); refusing auto-merge."
-                    exit 1
+                    report_required_contexts_refusal "$pinned" "The check state on \`$pinned\` could not be read ($infra_errors consecutive read failures), so the required checks cannot be shown successful."
                   fi
                   echo "::warning::required-head-checks could not read check state (rc=3, $infra_errors of $max_infra_errors consecutive); polling again."
                 elif [ "$rc" -ne 1 ]; then
                   echo "::error::required-head-checks failed closed (rc=$rc); refusing auto-merge."
-                  exit 1
+                  report_required_contexts_refusal "$pinned" "The required-check verifier exited $rc, so the required checks cannot be shown successful. A base checkout whose scripts/required-head-checks.sh predates #2722 does this; propagate the scripts kit, then rerun."
                 else
                   infra_errors=0
                 fi
                 if [ "$SECONDS" -ge "$deadline" ]; then
                   echo "::error::Timed out waiting for the configured required head checks on $pinned."
-                  exit 1
+                  waiting=$(printf '%s\n' "$verify_out" | sed -n 's/^required-head-checks: WAIT \(.*\) (\([a-z]*\))$/- \1: \2/p')
+                  report_required_contexts_refusal "$pinned" "This PR is approved on \`$pinned\`, but since $WAIT_STARTED_AT (UTC), when this run began waiting after that approval, its required checks have not all succeeded within the $((wait_seconds / 60))-minute wait. Not yet successful at the last check:" \
+                    "${waiting:-- (the last poll could not read the check state; see the job log)}"
                 fi
                 sleep "$poll_seconds"
               done
-              # Every configured check is green on $pinned. Accept only if the
-              # head has not moved underneath the verdict.
+              # Every configured check and every branch-required context is
+              # green on $pinned. Accept only if the head has not moved
+              # underneath the verdict.
               if [ "$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)" = "$pinned" ]; then
                 CURRENT_HEAD_SHA="$pinned"
-                echo "::notice::All configured required head checks are successful on $CURRENT_HEAD_SHA."
+                echo "::notice::All configured required head checks and branch-required contexts are successful on $CURRENT_HEAD_SHA."
                 return 0
               fi
               if [ "$attempts" -ge "$max_attempts" ]; then
@@ -922,8 +1050,11 @@ jobs:
           require_dependabot_provenance "$CURRENT_HEAD_SHA"
           require_exact_head_approval "$CURRENT_HEAD_SHA"
 
-          # Try GitHub-side auto-merge first (fires when required
-          # checks pass). Fall back to an immediate squash ONLY when
+          # Try GitHub-side auto-merge first. Every required context is
+          # already successful on CURRENT_HEAD_SHA (the wait above), so
+          # under the administrator's token this normally merges at once;
+          # it is never issued while a required context is absent or
+          # unsuccessful (#2722). Fall back to an immediate squash ONLY when
           # the failure cause is "auto-merge unavailable" — i.e., the
           # repo doesn't have branch protection / auto-merge enabled
           # in settings. Other failures (network, permissions, race,
