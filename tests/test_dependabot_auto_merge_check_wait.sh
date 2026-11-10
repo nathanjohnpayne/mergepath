@@ -1209,6 +1209,32 @@ case "$1 $2" in
 esac
 SHIM
 chmod +x "$RETRY_DIR/bin/gh"
+
+# #2722: the plural waiter resolves the branch's required contexts through
+# scripts/lib/branch-requirements.sh before it polls. This stub stands in for
+# the resolver: it logs the token and arguments it was called with and prints
+# BR_STUB_JSON_FILE (default: a known, empty requirement list). Its comment
+# names branchProtectionRule, which the workflow requires the resolver to read
+# (#2614); pass "stale" to write a copy without it.
+write_stub_branch_lib() {  # <repo dir> [stale]
+  mkdir -p "$1/scripts/lib"
+  if [ "${2:-}" = stale ]; then
+    printf '%s\n' '# A resolver older than #2614.' >"$1/scripts/lib/branch-requirements.sh"
+  else
+    printf '%s\n' '# Test stub; the real resolver reads branchProtectionRule (#2614).' >"$1/scripts/lib/branch-requirements.sh"
+  fi
+  cat >>"$1/scripts/lib/branch-requirements.sh" <<'LIB'
+br_required_checks() {
+  printf '%s|%s %s\n' "${GH_TOKEN:-<unset>}" "$1" "$2" >>"${BR_STUB_LOG:-/dev/null}"
+  if [ -n "${BR_STUB_JSON_FILE:-}" ]; then
+    cat "$BR_STUB_JSON_FILE"
+  else
+    printf '%s\n' '{"state":"known","partial":false,"contexts":[],"requirements":[],"surfaces":["classic","rulesets"],"errors":[]}'
+  fi
+}
+LIB
+}
+write_stub_branch_lib "$RETRY_DIR/repo"
 # The verifier stub pops one exit status per poll from verify-script.
 cat >"$RETRY_DIR/repo/scripts/required-head-checks.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -1217,7 +1243,12 @@ echo "verify poll rc=$rc" >>"$RETRY_DIR/verify.log"
 exit "${rc:-9}"
 STUB
 
-extract_function require_current_head_checks_success >"$RETRY_DIR/wait.sh"
+{
+  extract_function report_required_contexts_refusal
+  extract_function refuse_if_label_held
+  extract_function resolve_branch_requirements
+  extract_function require_current_head_checks_success
+} >"$RETRY_DIR/wait.sh"
 if grep -Fq 'HEAD_CHECKS_MAX_INFRA_ERRORS' "$RETRY_DIR/wait.sh"; then
   pass "#2932: extracted the live plural check waiter"
 else
@@ -1313,6 +1344,609 @@ if [ "$rc" -eq 0 ] && grep -Fq 'human-hold before the --auto retry' <<<"$out" \
   pass "#2932: a human-hold added between attempts stops the retry"
 else
   fail "#2932: the retry must re-read human-hold (rc=$rc): $out"
+fi
+
+# ---------------------------------------------------------------------------
+# #2722 (1): scripts/required-head-checks.sh --branch-requirements judges each
+# rule of a `known` br_required_checks result on the head, through the real
+# reducer, with a PATH-shimmed gh serving already-projected fixtures.
+# ---------------------------------------------------------------------------
+RHC_DIR="$WORK/rhc-2722"
+RHC_SHA=dddddddddddddddddddddddddddddddddddddddd
+mkdir -p "$RHC_DIR/bin"
+cat >"$RHC_DIR/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$RHC_LOG"
+name=""
+for a in "$@"; do case "$a" in check_name=*) name=${a#check_name=} ;; esac; done
+case "$1 ${2:-}" in
+  "api repos/owner/repo") echo main ;;
+  "api repos/owner/repo/contents/"*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  "api repos/owner/repo/actions/runs?head_sha=$RHC_SHA&per_page=100") cat "$RHC_DIR/suites.jsonl" ;;
+  "api repos/owner/repo/commits/$RHC_SHA/statuses?per_page=100") cat "$RHC_DIR/statuses.jsonl" ;;
+  "api --method")
+    [ "$4" = "repos/owner/repo/commits/$RHC_SHA/check-runs" ] || { echo "gh shim: unexpected check-run path: $*" >&2; exit 91; }
+    jq -c --arg n "$name" 'select(.name == $n)' "$RHC_DIR/runs.jsonl" ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 93 ;;
+esac
+SHIM
+chmod +x "$RHC_DIR/bin/gh"
+printf '%s\n' '{"suite":1,"wf":10}' '{"suite":2,"wf":20}' '{"suite":3,"wf":30}' >"$RHC_DIR/suites.jsonl"
+
+rhc_run() {  # <requirements json|-> ; fixtures already written; prints output, sets RHC_RC
+  : >"$RHC_DIR/gh.log"
+  local args=(--repo owner/repo --verify --sha "$RHC_SHA")
+  if [ "$1" != - ]; then
+    printf '%s\n' "$1" >"$RHC_DIR/requirements.json"
+    args+=(--branch-requirements "$RHC_DIR/requirements.json")
+  fi
+  set +e
+  RHC_OUT=$(PATH="$RHC_DIR/bin:$PATH" RHC_LOG="$RHC_DIR/gh.log" RHC_DIR="$RHC_DIR" RHC_SHA="$RHC_SHA" \
+    bash "$ROOT/scripts/required-head-checks.sh" "${args[@]}" 2>&1)
+  RHC_RC=$?
+  set -e
+}
+rhc_run_line() {  # <name> <status> <conclusion> <suite> <app> [started_at]
+  jq -nc --arg n "$1" --arg s "$2" --arg c "$3" --argjson suite "$4" --argjson app "$5" --arg t "${6:-2026-11-01T00:00:00Z}" \
+    '{name:$n, status:$s, conclusion:(if $c == "" then null else $c end), suite:$suite, started_at:$t, app:$app}'
+}
+known_reqs() {  # <requirement json>... -> a known br_required_checks result
+  jq -nc --argjson reqs "$(printf '%s\n' "$@" | jq -s '.')" \
+    '{state:"known", partial:false, contexts:($reqs | map(.context) | unique), requirements:$reqs,
+      surfaces:["classic","rulesets"], errors:[]}'
+}
+REQ_CODEX='{"context":"Codex P1 unresolved threads","app_id":null}'
+REQ_LABEL='{"context":"Label Gate","app_id":null}'
+REQ_PINNED='{"context":"Pinned gate","app_id":"999"}'
+ALL_REQS=$(known_reqs "$REQ_CODEX" "$REQ_LABEL" "$REQ_PINNED")
+
+# Green: lint and Codex P1 as check runs, Label Gate as a legacy status only,
+# the pinned rule satisfied by its own app's run.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Pinned gate" completed success 3 999
+} >"$RHC_DIR/runs.jsonl"
+printf '%s\n' '{"context":"Label Gate","state":"success","id":5}' >"$RHC_DIR/statuses.jsonl"
+rhc_run "$ALL_REQS"
+if [ "$RHC_RC" -eq 0 ] \
+   && grep -Fq 'OK   lint' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Codex P1 unresolved threads (required by the branch rules)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Label Gate (required by the branch rules)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules, app 999)' <<<"$RHC_OUT" \
+   && grep -Fq 'check_name=Codex P1 unresolved threads' "$RHC_DIR/gh.log"; then
+  pass "#2722: every branch rule green (check run, legacy status, app-pinned run) verifies, alongside the configured list"
+else
+  fail "#2722: all-green branch rules (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# Absent: the merge-time state of #2722 path B. No run and no status for
+# Codex P1, while everything else, lint included, is green.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Pinned gate" completed success 3 999
+} >"$RHC_DIR/runs.jsonl"
+rhc_run "$ALL_REQS"
+if [ "$RHC_RC" -eq 1 ] \
+   && grep -Fq 'WAIT Codex P1 unresolved threads (required by the branch rules) (absent)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   lint' <<<"$RHC_OUT"; then
+  pass "#2722: a branch-required context with no result on either surface is absent, and the verdict is not satisfied"
+else
+  fail "#2722: absent branch-required context (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# The same head with no --branch-requirements is the pre-#2722 contract the
+# other callers (agent-review.yml, approval continuation) keep: lint only.
+rhc_run -
+if [ "$RHC_RC" -eq 0 ] && ! grep -Fq 'branch rules' <<<"$RHC_OUT" \
+   && ! grep -Fq 'statuses' "$RHC_DIR/gh.log"; then
+  pass "#2722: without --branch-requirements the verifier still judges only the configured list"
+else
+  fail "#2722: the flag must be opt-in (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# Pending, a pinned rule satisfied only by another app's run, and a legacy
+# status failure beside a green check run of the same name.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" in_progress "" 2 15368
+  rhc_run_line "Label Gate" completed success 2 15368
+  rhc_run_line "Pinned gate" completed success 3 15368
+} >"$RHC_DIR/runs.jsonl"
+printf '%s\n' '{"context":"Label Gate","state":"success","id":5}' '{"context":"Label Gate","state":"failure","id":6}' >"$RHC_DIR/statuses.jsonl"
+rhc_run "$ALL_REQS"
+if [ "$RHC_RC" -eq 1 ] \
+   && grep -Fq 'WAIT Codex P1 unresolved threads (required by the branch rules) (pending)' <<<"$RHC_OUT" \
+   && grep -Fq 'WAIT Pinned gate (required by the branch rules, app 999) (absent)' <<<"$RHC_OUT" \
+   && grep -Fq 'WAIT Label Gate (required by the branch rules) (failed)' <<<"$RHC_OUT"; then
+  pass "#2722: in-flight runs are pending, another app cannot satisfy a pinned rule, and the newest failed status holds a green check run"
+else
+  fail "#2722: pending / pinned / two-surface cases (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# Neutral and skipped check runs are green, as for the configured list.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed skipped 2 15368
+  rhc_run_line "Label Gate" completed neutral 2 15368
+  rhc_run_line "Pinned gate" completed success 3 999
+} >"$RHC_DIR/runs.jsonl"
+: >"$RHC_DIR/statuses.jsonl"
+rhc_run "$ALL_REQS"
+if [ "$RHC_RC" -eq 0 ]; then
+  pass "#2722: skipped and neutral required check runs count as successful (the shared reducer's definition)"
+else
+  fail "#2722: skipped/neutral branch rules (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# Indeterminate inputs: never read as "nothing required", and refused before
+# any check-state read.
+for bad in \
+  '{"state":"unknown","partial":true,"contexts":[],"requirements":[],"surfaces":["rulesets"],"errors":["classic: x"]}' \
+  '{"state":"known","requirements":[{"app_id":null}]}' \
+  '{"state":"known","requirements":[{"context":"lint","app_id":7}]}' \
+  '{"state":"known"}' \
+  'not json'; do
+  rhc_run "$bad"
+  if [ "$RHC_RC" -eq 3 ] && grep -Fq 'not a known br_required_checks result' <<<"$RHC_OUT" \
+     && ! grep -Fq 'check-runs' "$RHC_DIR/gh.log"; then
+    pass "#2722: an indeterminate requirements file exits 3 before any check read: ${bad:0:40}"
+  else
+    fail "#2722: indeterminate requirements file must exit 3 (rc=$RHC_RC): $bad: $RHC_OUT"
+  fi
+done
+
+# One check-run read per name per verification: a branch rule naming a
+# configured check, or two rules naming one context, reuse the first listing.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Pinned gate" completed success 3 999
+} >"$RHC_DIR/runs.jsonl"
+: >"$RHC_DIR/statuses.jsonl"
+rhc_run "$(known_reqs '{"context":"lint","app_id":null}' "$REQ_PINNED" '{"context":"Pinned gate","app_id":null}')"
+if [ "$RHC_RC" -eq 0 ] \
+   && [ "$(grep -c 'check_name=lint' "$RHC_DIR/gh.log")" -eq 1 ] \
+   && [ "$(grep -c 'check_name=Pinned gate' "$RHC_DIR/gh.log")" -eq 1 ] \
+   && grep -Fq 'OK   lint (required by the branch rules)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules, app 999)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules)' <<<"$RHC_OUT"; then
+  pass "#2722: each name's check runs are read once per verification and reused by every rule naming it"
+else
+  fail "#2722: per-name reuse (rc=$RHC_RC) lint_reads=$(grep -c 'check_name=lint' "$RHC_DIR/gh.log"): $RHC_OUT"
+fi
+# The reused listing keeps the pin: another app's run still cannot satisfy it.
+printf '%s\n' "$(rhc_run_line lint completed success 1 15368)" "$(rhc_run_line "Pinned gate" completed success 3 15368)" >"$RHC_DIR/runs.jsonl"
+rhc_run "$(known_reqs '{"context":"Pinned gate","app_id":null}' "$REQ_PINNED")"
+if [ "$RHC_RC" -eq 1 ] && grep -Fq 'WAIT Pinned gate (required by the branch rules, app 999) (absent)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules)' <<<"$RHC_OUT" \
+   && [ "$(grep -c 'check_name=Pinned gate' "$RHC_DIR/gh.log")" -eq 1 ]; then
+  pass "#2722: a reused listing is still filtered to a pinned rule's app"
+else
+  fail "#2722: reused listing lost the pin (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# A known, empty list (a branch that requires no status checks) adds nothing
+# and reads no statuses.
+rhc_run "$(known_reqs)"
+if [ "$RHC_RC" -eq 0 ] && ! grep -Fq 'branch rules' <<<"$RHC_OUT" && ! grep -Fq 'statuses' "$RHC_DIR/gh.log"; then
+  pass "#2722: a known empty requirement list adds no rule"
+else
+  fail "#2722: known empty requirement list (rc=$RHC_RC): $RHC_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# #2722 (2): the whole merge step, run as Actions runs it, against a sandbox
+# holding the base checkout's pieces: the real libs, the real
+# required-head-checks.sh and head-check-runs.sh, a review policy, and the
+# resolver stub above. The gh shim serves a PR object (applying the step's own
+# --jq), the reviews, commits, comments and check state, and records every
+# merge, comment and auto-merge call with the token it ran under.
+# ---------------------------------------------------------------------------
+MS="$WORK/merge-step-2722"
+MS_HEAD=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+MS_NEW_HEAD=ffffffffffffffffffffffffffffffffffffffff
+mkdir -p "$MS/bin" "$MS/repo/scripts/lib" "$MS/repo/.github"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/dependabot-commit-provenance.sh" \
+   "$ROOT/scripts/lib/reviewers-helpers.sh" "$ROOT/scripts/lib/head-check-runs.sh" \
+   "$ROOT/scripts/lib/blocking-labels.sh" "$MS/repo/scripts/lib/"
+cp "$ROOT/scripts/required-head-checks.sh" "$MS/repo/scripts/"
+write_stub_branch_lib "$MS/repo"
+cat >"$MS/repo/.github/review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+dependabot_reviewer_identities:
+  - nathanpayne-deps
+YAML
+jq -nc --arg sha "$MS_HEAD" \
+  '[{sha:$sha, author:{login:"dependabot[bot]"}, committer:{login:"web-flow"}, commit:{verification:{verified:true}}}]' >"$MS/commits.json"
+jq -nc --arg sha "$MS_HEAD" '[{user:{login:"nathanpayne-deps"}, state:"APPROVED", commit_id:$sha}]' >"$MS/reviews.json"
+printf '%s\n' '{"suite":1,"wf":10}' '{"suite":2,"wf":20}' >"$MS/suites.jsonl"
+: >"$MS/statuses.jsonl"
+
+awk '
+  /- name: Merge the approved patch\/minor head/ { in_step = 1; next }
+  in_step && /^[[:space:]]*run: \|[[:space:]]*$/ { in_run = 1; indent = -1; next }
+  in_run && /^[[:space:]]*env:[[:space:]]*$/ { exit }
+  in_run {
+    if (indent < 0 && $0 ~ /[^[:space:]]/) { match($0, /^[[:space:]]*/); indent = RLENGTH }
+    print (length($0) >= indent ? substr($0, indent + 1) : "")
+  }
+' "$WORKFLOW" >"$MS/step.sh"
+if grep -Fq 'resolve_branch_requirements "$pinned"' "$MS/step.sh" && grep -Fq 'gh pr merge --squash --auto' "$MS/step.sh"; then
+  pass "#2722: extracted the live merge step"
+else
+  fail "#2722: could not extract the merge step from the workflow"
+fi
+
+cat >"$MS/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s\n' "${GH_TOKEN:-<unset>}" "$*" >>"$MS/gh.log"
+jq_expr="."; prev=""; name=""
+for a in "$@"; do
+  [ "$prev" = --jq ] && jq_expr=$a
+  case "$a" in check_name=*) name=${a#check_name=} ;; esac
+  prev=$a
+done
+head=$MS_HEAD
+[ ! -f "$MS/moved" ] || head=$MS_NEW_HEAD
+case "$1 ${2:-}" in
+  "api user")
+    [ "${GH_TOKEN:-}" = author-token ] || { echo "gh shim: user read under ${GH_TOKEN:-<unset>}" >&2; exit 94; }
+    echo nathanjohnpayne ;;
+  "pr view")
+    labels=${MS_LABELS:-}
+    case "$*" in
+      *"--json labels"*)
+        echo x >>"$MS/label-reads"
+        [ -z "${MS_LATE_LABELS:-}" ] || [ "$(wc -l <"$MS/label-reads")" -lt 2 ] || labels=$MS_LATE_LABELS
+        # The label clears once the verifier has run MS_LABEL_CLEARS_AT_POLL times.
+        [ -z "${MS_LABEL_CLEARS_AT_POLL:-}" ] || [ "$(wc -l <"$MS/polls")" -lt "$MS_LABEL_CLEARS_AT_POLL" ] || labels="" ;;
+    esac
+    jq -n --arg h "$head" --arg labels "$labels" --arg armed "${MS_ARMED:-false}" '
+      {headRefOid:$h, baseRefName:"main",
+       labels:($labels | split(",") | map(select(length > 0) | {name:.})),
+       autoMergeRequest:(if $armed == "true" then {enabledAt:"2026-11-01T00:00:00Z"} else null end)}' \
+      | jq -r "$jq_expr" ;;
+  "pr merge") printf '%s|%s\n' "${GH_TOKEN:-<unset>}" "$*" >>"$MS/merge.log" ;;
+  "api --paginate")
+    case "$3" in
+      "repos/owner/repo/pulls/1/commits?per_page=100") cat "$MS/commits.json" ;;
+      "repos/owner/repo/pulls/1/reviews?per_page=100") cat "$MS/reviews.json" ;;
+      "repos/owner/repo/issues/1/comments?per_page=100") jq -r "$jq_expr" "$MS/comments.json" ;;
+      *) echo "gh shim: unexpected paginated read: $*" >&2; exit 91 ;;
+    esac ;;
+  "api -X")
+    for a in "$@"; do
+      case "$a" in body=@*) { printf '%s %s\n' "$3" "$4"; cat "${a#body=@}"; printf '%s\n' '---'; } >>"$MS/comment-writes" ;; esac
+    done ;;
+  "api repos/owner/repo") echo main ;;
+  "api repos/owner/repo/contents/"*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  "api repos/owner/repo/actions/runs?head_sha="*"&per_page=100")
+    echo x >>"$MS/polls"
+    cat "$MS/suites.jsonl" ;;
+  "api repos/owner/repo/commits/"*"/statuses?per_page=100") cat "$MS/statuses.jsonl" ;;
+  "api --method")
+    [ -z "${MS_MOVE_ON_CHECK_READ:-}" ] || touch "$MS/moved"
+    runs_file="$MS/runs.jsonl"
+    if [ -n "${MS_GREEN_AFTER:-}" ] && [ "$(wc -l <"$MS/polls")" -gt "$MS_GREEN_AFTER" ]; then runs_file="$MS/runs-green.jsonl"; fi
+    jq -c --arg n "$name" 'select(.name == $n)' "$runs_file" ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 93 ;;
+esac
+SHIM
+chmod +x "$MS/bin/gh"
+# No real sleeps: the step's naps are recorded, one per line, and return at
+# once. The wait's budget is counted in scheduled seconds, so the number of
+# polls follows from these naps alone, whatever the host load.
+cat >"$MS/bin/sleep" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$MS/sleeps"
+SHIM
+chmod +x "$MS/bin/sleep"
+
+MS_REQS=$(known_reqs "$REQ_CODEX" '{"context":"Merge clearance gate","app_id":null}')
+printf '%s\n' "$MS_REQS" >"$MS/requirements-known.json"
+printf '%s\n' '{"state":"unknown","partial":true,"contexts":[],"requirements":[],"surfaces":["rulesets"],"errors":["classic: classic projection completeness unproven for this viewer"]}' >"$MS/requirements-unknown.json"
+
+run_merge_step() {  # env overrides via the caller; sets MS_RC and MS_OUT
+  : >"$MS/gh.log"; : >"$MS/merge.log"; : >"$MS/br.log"; : >"$MS/polls"; : >"$MS/sleeps"; : >"$MS/label-reads"; rm -f "$MS/comment-writes" "$MS/moved"
+  [ -f "$MS/comments.json" ] || printf '[]\n' >"$MS/comments.json"
+  set +e
+  MS_OUT=$(cd "$MS/repo" && PATH="$MS/bin:$PATH" MS="$MS" MS_HEAD="$MS_HEAD" MS_NEW_HEAD="$MS_NEW_HEAD" \
+    BR_STUB_LOG="$MS/br.log" BR_STUB_JSON_FILE="${MS_REQ_FILE:-$MS/requirements-known.json}" \
+    GITHUB_REPOSITORY=owner/repo GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=4242 \
+    PR_URL=https://github.com/owner/repo/pull/1 PR_NUMBER=1 \
+    APPROVED_SHA="$MS_HEAD" APPROVED_BY=nathanpayne-deps DEFAULT_BRANCH=main \
+    UPDATE_TYPE=version-update:semver-patch DEPENDENCY_GROUP= REQUIRED_HEAD_CHECK_NAME=lint \
+    GH_TOKEN=workflow-token AUTHOR_MERGE_TOKEN=author-token ACCOUNTING_GH_TOKEN=workflow-token \
+    TEST_CHECK_WAIT_SECONDS="${MS_WAIT:-0}" TEST_CHECK_POLL_SECONDS="${MS_POLL:-0}" \
+    bash -e "$MS/step.sh" 2>&1)
+  MS_RC=$?
+  set -e
+}
+squash_issued() { grep -Fq -- '--squash' "$MS/merge.log"; }
+
+# Path B: approved, lint green, Codex P1 not posted yet, an earlier run's
+# auto-merge request still armed. Nothing merges; the PR is told which
+# context and since when; the armed request is withdrawn.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+printf '[]\n' >"$MS/comments.json"
+MS_ARMED=true run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
+   && [ "$(grep -c -- '--disable-auto' "$MS/merge.log")" -eq 1 ] \
+   && grep -Fxq 'author-token|owner/repo main' "$MS/br.log"; then
+  pass "#2722: a required context absent at merge time issues no merge, withdraws the armed auto-merge under GITHUB_TOKEN, and read the requirements under the author token"
+else
+  fail "#2722: absent required context must not merge (rc=$MS_RC) merge.log=$(cat "$MS/merge.log") br.log=$(cat "$MS/br.log"): $MS_OUT"
+fi
+if [ -f "$MS/comment-writes" ] \
+   && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
+   && ! grep -q '^PATCH ' "$MS/comment-writes" \
+   && grep -Fq '<!-- mergepath-dependabot-required-contexts -->' "$MS/comment-writes" \
+   && grep -Fq -- '- Codex P1 unresolved threads (required by the branch rules): absent' "$MS/comment-writes" \
+   && ! grep -Fq 'Merge clearance gate (required by the branch rules)' "$MS/comment-writes" \
+   && grep -Fq "approved on \`$MS_HEAD\`" "$MS/comment-writes" \
+   && grep -Eq 'since 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \(UTC\)' "$MS/comment-writes" \
+   && grep -Fq 'https://github.com/owner/repo/actions/runs/4242' "$MS/comment-writes" \
+   && grep -Fq 'Nothing was merged. No auto-merge request is left armed.' "$MS/comment-writes" \
+   && grep -Fq 'workflow-token|api -X POST repos/owner/repo/issues/1/comments' "$MS/gh.log"; then
+  pass "#2722: the refusal posts one marker comment, under GITHUB_TOKEN, naming the missing context, its state, the head and since when"
+else
+  fail "#2722: refusal comment missing or wrong: $(cat "$MS/comment-writes" 2>/dev/null)"
+fi
+
+# Idempotent: the bot's existing marker comment is updated in place; a marker
+# quoted by anyone else is not ours to edit.
+jq -nc '[{id:11, user:{login:"someone"}, body:"<!-- mergepath-dependabot-required-contexts --> quoted"},
+         {id:12, user:{login:"github-actions[bot]"}, body:"<!-- mergepath-dependabot-required-contexts -->\nold"},
+         {id:13, user:{login:"github-actions[bot]"}, body:"unrelated"}]' >"$MS/comments.json"
+run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && [ "$(grep -c '^PATCH repos/owner/repo/issues/comments/12$' "$MS/comment-writes")" -eq 1 ] \
+   && ! grep -q '^POST ' "$MS/comment-writes" && ! grep -q 'comments/11' "$MS/comment-writes" \
+   && ! grep -Fq -- '--disable-auto' "$MS/merge.log"; then
+  pass "#2722: a repeat refusal updates the bot's marker comment instead of adding one, and withdraws nothing when nothing is armed"
+else
+  fail "#2722: refusal comment is not deduplicated (rc=$MS_RC): $(cat "$MS/comment-writes" 2>/dev/null) merge.log=$(cat "$MS/merge.log")"
+fi
+printf '[]\n' >"$MS/comments.json"
+
+# Every required context green: the merge proceeds exactly as before, under
+# the author token, pinned to the head, with no comment.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+run_merge_step
+if [ "$MS_RC" -eq 0 ] \
+   && grep -Fxq "author-token|pr merge --squash --auto --match-head-commit $MS_HEAD https://github.com/owner/repo/pull/1" "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/merge.log")" -eq 1 ] && [ ! -f "$MS/comment-writes" ]; then
+  pass "#2722: with every required context successful the step merges the exact head under the author token and comments nothing"
+else
+  fail "#2722: all-green merge (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+# An unreadable requirement list refuses before any check-state read.
+MS_REQ_FILE="$MS/requirements-unknown.json" run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && ! grep -Fq 'check-runs' "$MS/gh.log" \
+   && grep -Fq 'could not be read, so they cannot be shown successful: classic: classic projection completeness unproven' "$MS/comment-writes"; then
+  pass "#2722: an unknown requirement list refuses the merge, visibly, and is never read as nothing required"
+else
+  fail "#2722: unknown requirement list (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+# A resolver that predates #2614 would answer "nothing required" to an
+# administrator; the step refuses without calling it.
+write_stub_branch_lib "$MS/repo" stale
+run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ ! -s "$MS/br.log" ] \
+   && grep -Fq 'missing or predates #2614' "$MS/comment-writes"; then
+  pass "#2722: a stale resolver in the base checkout refuses the merge without being trusted"
+else
+  fail "#2722: stale resolver (rc=$MS_RC) br.log=$(cat "$MS/br.log"): $MS_OUT"
+fi
+write_stub_branch_lib "$MS/repo"
+
+# human-hold still stops the merge job before any wait, read or comment.
+MS_LABELS=human-hold run_merge_step
+if [ "$MS_RC" -eq 0 ] && [ ! -s "$MS/merge.log" ] && [ ! -s "$MS/br.log" ] && [ ! -f "$MS/comment-writes" ] \
+   && grep -Fq 'PR carries human-hold; skipping Dependabot auto-merge' <<<"$MS_OUT"; then
+  pass "#2722: human-hold is unchanged: no requirement read, no comment, no merge"
+else
+  fail "#2722: human-hold path changed (rc=$MS_RC): $MS_OUT"
+fi
+
+# The head moves while the checks are pending: this run neither comments nor
+# withdraws anything, and leaves the new head to its own run.
+{
+  rhc_run_line lint completed success 1 15368
+} >"$MS/runs.jsonl"
+MS_ARMED=true MS_MOVE_ON_CHECK_READ=1 run_merge_step
+if [ "$MS_RC" -eq 0 ] && [ ! -s "$MS/merge.log" ] && [ ! -f "$MS/comment-writes" ] \
+   && grep -Fq "PR head moved from $MS_HEAD to $MS_NEW_HEAD" <<<"$MS_OUT"; then
+  pass "#2722: a head that moved during the wait ends the run quietly, without a comment or a withdrawal"
+else
+  fail "#2722: moved head during the wait (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+# A base checkout without scripts/required-head-checks.sh used to fall back to
+# the lint-only waiter; it now refuses.
+mv "$MS/repo/scripts/required-head-checks.sh" "$MS/required-head-checks.sh.away"
+run_merge_step
+mv "$MS/required-head-checks.sh.away" "$MS/repo/scripts/required-head-checks.sh"
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && grep -Fq 'predates #1070' "$MS/comment-writes"; then
+  pass "#2722: a pre-#1070 base checkout refuses instead of waiting on lint alone"
+else
+  fail "#2722: pre-#1070 checkout (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+
+# ---------------------------------------------------------------------------
+# #2722 follow-up (a): a blocking label keeps Label Gate red by design, so the
+# wait cannot succeed. Refuse before any requirement or check-state read.
+# ---------------------------------------------------------------------------
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+printf '[]\n' >"$MS/comments.json"
+check_state_reads() { grep -Ec '\|api (repos/owner/repo( |/actions/runs|/contents/|/commits/)|--method GET)' "$MS/gh.log" || true; }
+MS_LABELS=policy-violation MS_ARMED=true run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/br.log" ] && [ ! -s "$MS/polls" ] && [ ! -s "$MS/sleeps" ] \
+   && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
+   && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
+   && grep -Fq '<!-- mergepath-dependabot-required-contexts -->' "$MS/comment-writes" \
+   && grep -Fq "approved on \`$MS_HEAD\` but carries \`policy-violation\`, which keeps the required \`Label Gate\` check red by design" "$MS/comment-writes" \
+   && grep -Fq 'Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](https://github.com/owner/repo/actions/runs/4242), or merge the PR as the author identity.' "$MS/comment-writes" \
+   && grep -Fq 'Nothing was merged. No auto-merge request is left armed.' "$MS/comment-writes" \
+   && ! grep -Fq 'once the checks have posted' "$MS/comment-writes"; then
+  pass "#2722: policy-violation refuses before any check read, with zero polls: no merge, the arm withdrawn, one comment naming the label and the re-run"
+else
+  fail "#2722: blocking-label early refusal (rc=$MS_RC) polls=$(wc -l <"$MS/polls") br=$(cat "$MS/br.log") merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+jq -nc '[{id:21, user:{login:"github-actions[bot]"}, body:"<!-- mergepath-dependabot-required-contexts -->\nearlier refusal"}]' >"$MS/comments.json"
+MS_LABELS=policy-violation,needs-human-review run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(check_state_reads)" -eq 0 ] \
+   && [ "$(grep -c '^PATCH repos/owner/repo/issues/comments/21$' "$MS/comment-writes")" -eq 1 ] \
+   && ! grep -q '^POST ' "$MS/comment-writes" \
+   && grep -Fq 'carries `policy-violation`, `needs-human-review`, which keeps' "$MS/comment-writes"; then
+  pass "#2722: a repeat blocking-label refusal updates the marker comment in place and names every blocking label"
+else
+  fail "#2722: blocking-label refusal dedupe (rc=$MS_RC): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+printf '[]\n' >"$MS/comments.json"
+# human-hold keeps its own path when it appears after the job's first label
+# read: the wait's label check stops quietly, with no comment and no read.
+MS_LATE_LABELS=human-hold,needs-external-review MS_ARMED=true run_merge_step
+if [ "$MS_RC" -eq 0 ] && [ ! -s "$MS/merge.log" ] && [ ! -f "$MS/comment-writes" ] \
+   && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/br.log" ] \
+   && grep -Fq 'PR carries human-hold; skipping Dependabot auto-merge' <<<"$MS_OUT"; then
+  pass "#2722: a human-hold seen by the wait's label check keeps the no-read, no-comment human-hold path"
+else
+  fail "#2722: late human-hold (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+# needs-external-review alongside another blocking label still refuses at once.
+MS_LABELS=needs-external-review,needs-human-review run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/polls" ] \
+   && grep -Fq 'carries `needs-external-review`, `needs-human-review`, which keeps' "$MS/comment-writes"; then
+  pass "#2722: needs-external-review with another blocking label is refused at once"
+else
+  fail "#2722: mixed blocking labels (rc=$MS_RC) polls=$(wc -l <"$MS/polls"): $MS_OUT"
+fi
+printf '[]\n' >"$MS/comments.json"
+
+# needs-external-review alone waits: the trusted lanes can remove it without
+# Phase 4. Every required check is green from the first poll (this fixture's
+# branch rules do not include Label Gate, as a consumer's might not), so only
+# the label read at the green verdict holds the merge until the label clears.
+MS_LABELS=needs-external-review MS_LABEL_CLEARS_AT_POLL=3 MS_WAIT=1200 MS_POLL=15 run_merge_step
+if [ "$MS_RC" -eq 0 ] \
+   && grep -Fxq "author-token|pr merge --squash --auto --match-head-commit $MS_HEAD https://github.com/owner/repo/pull/1" "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/merge.log")" -eq 1 ] && [ ! -f "$MS/comment-writes" ] \
+   && [ "$(wc -l <"$MS/polls")" -eq 3 ] && [ "$(paste -sd' ' "$MS/sleeps")" = "15 30" ] \
+   && grep -Fq 'needs-external-review is still present; waiting' <<<"$MS_OUT"; then
+  pass "#2722: needs-external-review cleared mid-wait with every check green merges once the label is gone, with no comment"
+else
+  fail "#2722: needs-external-review cleared mid-wait (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps=$(paste -sd' ' "$MS/sleeps") merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+# Held for the whole budget with every check green: no merge, the arm
+# withdrawn, the label-specific comment, and the read cost with a label read
+# on each of the 14 green polls.
+MS_LABELS=needs-external-review MS_ARMED=true MS_WAIT=1200 MS_POLL=15 run_merge_step
+ner_reads=$(grep -c '^workflow-token|' "$MS/gh.log" || true)
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/polls")" -eq 14 ] && [ "$ner_reads" -le 200 ] \
+   && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
+   && grep -Fq "approved on \`$MS_HEAD\` but still carries \`needs-external-review\` at the end of the 20-minute wait" "$MS/comment-writes" \
+   && grep -Fq -- '- the needs-external-review label: present' "$MS/comment-writes" \
+   && grep -Fq 'Nothing re-arms auto-merge when the label clears' "$MS/comment-writes" \
+   && ! grep -Fq 'once the checks have posted' "$MS/comment-writes"; then
+  pass "#2722: needs-external-review held for the whole budget refuses with the label-specific comment ($ner_reads GITHUB_TOKEN calls over 14 polls)"
+else
+  fail "#2722: needs-external-review whole budget (rc=$MS_RC) polls=$(wc -l <"$MS/polls") reads=$ner_reads merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null)"
+fi
+
+# Held for the whole budget with a required context still absent: the same
+# label-specific comment also lists the check.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+MS_LABELS=needs-external-review MS_WAIT=1200 MS_POLL=15 run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(wc -l <"$MS/polls")" -eq 14 ] \
+   && grep -Fq 'still carries `needs-external-review` at the end of the 20-minute wait' "$MS/comment-writes" \
+   && grep -Fq -- '- Codex P1 unresolved threads (required by the branch rules): absent' "$MS/comment-writes"; then
+  pass "#2722: the label-specific comment at the end of the wait also lists the checks still not successful"
+else
+  fail "#2722: needs-external-review with an absent check (rc=$MS_RC): $(cat "$MS/comment-writes" 2>/dev/null)"
+fi
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+
+# A label outside the shared predicate does not refuse.
+MS_LABELS=dependencies,needs-external-review-later run_merge_step
+if [ "$MS_RC" -eq 0 ] && grep -Fq -- "--squash --auto --match-head-commit $MS_HEAD" "$MS/merge.log" && [ ! -f "$MS/comment-writes" ]; then
+  pass "#2722: labels outside scripts/lib/blocking-labels.sh do not refuse"
+else
+  fail "#2722: a non-blocking label refused (rc=$MS_RC): $MS_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# #2722 follow-up (b): read budget. A PR whose required context never posts,
+# at the production budget and interval (1200 s, 15 s): the backoff gives 14
+# polls (0, 15, 45, 105, 225, ... 1065, 1185, 1200 s), naps summing to exactly
+# 1200 s, and fewer than 200 reads in all. Counted through the stub, never
+# timed.
+# ---------------------------------------------------------------------------
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+MS_WAIT=1200 MS_POLL=15 run_merge_step
+naps=$(paste -sd' ' "$MS/sleeps")
+nap_sum=$(awk '{s += $1} END {print s + 0}' "$MS/sleeps")
+total_reads=$(($(wc -l <"$MS/gh.log")))
+workflow_reads=$(grep -c '^workflow-token|' "$MS/gh.log" || true)
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && [ "$(wc -l <"$MS/polls")" -eq 14 ] \
+   && [ "$naps" = "15 30 60 120 120 120 120 120 120 120 120 120 15" ] && [ "$nap_sum" -eq 1200 ] \
+   && [ "$workflow_reads" -le 200 ] \
+   && grep -Fq -- '- Codex P1 unresolved threads (required by the branch rules): absent' "$MS/comment-writes" \
+   && grep -Fq 'within the 20-minute wait' "$MS/comment-writes"; then
+  pass "#2722: a stuck context costs 14 polls over exactly 1200 s ($workflow_reads GITHUB_TOKEN calls, $total_reads in all), then refuses"
+else
+  fail "#2722: read budget (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps='$naps' sum=$nap_sum workflow_reads=$workflow_reads total=$total_reads"
+fi
+
+# A context that posts during the backoff is merged on the next poll, and the
+# poll the merge acts on is a full read of every required context.
+cp "$MS/runs.jsonl" "$MS/runs-green.jsonl"
+rhc_run_line "Codex P1 unresolved threads" completed success 2 15368 >>"$MS/runs-green.jsonl"
+MS_WAIT=1200 MS_POLL=15 MS_GREEN_AFTER=5 run_merge_step
+last_poll=$(awk '/actions\/runs\?head_sha=/{n++} n == 6' "$MS/gh.log")
+if [ "$MS_RC" -eq 0 ] && grep -Fxq "author-token|pr merge --squash --auto --match-head-commit $MS_HEAD https://github.com/owner/repo/pull/1" "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/polls")" -eq 6 ] && [ "$(paste -sd' ' "$MS/sleeps")" = "15 30 60 120 120" ] \
+   && grep -Fq 'check_name=lint' <<<"$last_poll" \
+   && grep -Fq 'check_name=Codex P1 unresolved threads' <<<"$last_poll" \
+   && grep -Fq 'check_name=Merge clearance gate' <<<"$last_poll" \
+   && grep -Fq '/statuses?per_page=100' <<<"$last_poll"; then
+  pass "#2722: a context that posts during the backoff merges on the next poll, which re-read every required context"
+else
+  fail "#2722: late context (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps=$(paste -sd' ' "$MS/sleeps") merge.log=$(cat "$MS/merge.log")"
 fi
 
 echo "test_dependabot_auto_merge_check_wait: $PASS passed, $FAIL failed"

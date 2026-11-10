@@ -1417,12 +1417,20 @@ paths:
     # The suite also drives the Dependabot action-pin bump lane helper
     # (#2164) with a PATH-shimmed gh; shipped ahead of the helper it would
     # fail on every consumer, so the helper and the libs it sources travel
-    # with it.
+    # with it. The #2722 cases run the workflow's merge step against the real
+    # verifier, requirement resolver and blocking-label predicate, so those
+    # travel with it too: an older verifier rejects --branch-requirements.
     requires:
       - "scripts/workflow/dependabot_pin_bump_exemption.sh"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+      - ".github/workflows/dependabot-auto-merge.yml"
+      - "scripts/required-head-checks.sh"
+      - "scripts/lib/head-check-runs.sh"
+      - "scripts/lib/branch-requirements.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/reviewers-helpers.sh"
   # #2729: check_workflow_parsers runs it against the propagated
   # dependabot-auto-merge.yml (approve/merge job split, reviewer environment,
   # base-is-default guard). It copies the provenance libs into a sandbox and
@@ -2489,6 +2497,12 @@ paths:
       # Both jobs read available_reviewers plus dependabot_reviewer_identities
       # through the shared reader and fail closed without it (#2874).
       - "scripts/lib/reviewers-helpers.sh"
+      # The merge job resolves the contexts branch protection requires
+      # through it and refuses every merge without it (#2722).
+      - "scripts/lib/branch-requirements.sh"
+      # The merge job refuses a PR held by one of its blocking labels before
+      # the required-check wait (#2722); without it the job waits instead.
+      - "scripts/lib/blocking-labels.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all
