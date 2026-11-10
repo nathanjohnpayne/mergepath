@@ -41,6 +41,14 @@
 #       review → no-reread (a rebuttal is dated by its last edit)
 #   120 Codex P1, tag rebuttal, owner marker quoted mid-line → no-reread
 #   121 Codex P1, tag rebuttal, owner marker naming a stale head → no-reread
+#   122 Codex P1, rebuttal 02:00, merge 03:00, request 04:00, review 05:00
+#       → no-reread (activity after the merge cannot clear it)
+#   123 Codex P1, merge 01:30, rebuttal 02:00 → not-rebutted (a post-merge
+#       rebuttal is not the state the PR merged in)
+#   124 Codex P1, owner marker 01:30, rebuttal 02:00 → no-reread (a marker
+#       older than the rebuttal does not settle it)
+#   125 Codex P1, tag rebuttal 02:00, merge 03:00, owner marker 04:00
+#       → no-reread (a post-merge marker does not count)
 #
 # The policy is a fixture (below), not the repository's live file, so an
 # edit to the live feedback_policy or bot logins cannot fail this suite.
@@ -96,11 +104,11 @@ rv() {
   jq -nc --argjson id "$1" --arg l "$2" --arg t "$type" --arg at "$3" --arg b "$4" \
     '{id: $id, login: $l, type: $t, submitted_at: $at, body: $b}'
 }
-# pr <n> <threads-json> <reviews-json> <comments-json> — writes the raw record.
+# pr <n> <threads-json> <reviews-json> <comments-json> [merged_at] — writes the raw record.
 pr() {
   jq -nc --argjson n "$1" --argjson th "$2" --argjson rv "$3" --argjson ic "$4" \
-    --arg head "$HEAD" \
-    '{pr: $n, merged_at: "2026-10-20T12:00:00Z", url: "https://github.com/o/r/pull/\($n)", head_sha: $head,
+    --arg head "$HEAD" --arg m "${5:-2026-10-20T12:00:00Z}" \
+    '{pr: $n, merged_at: $m, url: "https://github.com/o/r/pull/\($n)", head_sha: $head,
       threads: $th, reviews: $rv, comments: $ic}' >"$RAW/pr-$1.json"
 }
 arr() { if [ $# -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -sc '.'; fi; }
@@ -133,7 +141,7 @@ RAW="$OUT/raw"
 mkdir -p "$RAW"
 jq -nc '{repo: "o/r", since: "2026-10-11T00:00:00Z", until: "2026-11-10T00:00:00Z"}' >"$RAW/window.json"
 : >"$RAW/prs.jsonl"
-for n in $(seq 101 121); do
+for n in $(seq 101 125); do
   jq -nc --argjson n "$n" '{pr: $n, merged_at: "2026-10-20T12:00:00Z", url: "https://github.com/o/r/pull/\($n)"}' >>"$RAW/prs.jsonl"
 done
 printf 'search\t1\npr 101\t2\n' >"$RAW/api.tsv"
@@ -194,6 +202,17 @@ pr 120 "$(arr "$(t T120 true '[]' "$(c 1201 "$CODEX" 2026-10-20T01:00:00Z "$P1" 
 pr 121 "$(arr "$(t T121 true '[]' "$(c 1211 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9121)" "$(c 1212 "$AGENT" 2026-10-20T02:00:00Z "$TAG")")")" \
   "$(arr "$(rv 9121 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
   "$(arr "$(c 1213 "$AUTHOR" 2026-10-20T03:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/121@$STALE#1211")")"
+pr 122 "$(arr "$(t T122 true '[]' "$(c 1221 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9122)" "$(c 1222 "$AGENT" 2026-10-20T02:00:00Z "$REBUT")")")" \
+  "$(arr "$(rv 9122 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')" "$(rv 9222 "$CODEX" 2026-10-20T05:00:00Z 'Codex review: no new findings')")" \
+  "$(arr "$(req 1223 2026-10-20T04:00:00Z)")" 2026-10-20T03:00:00Z
+pr 123 "$(arr "$(t T123 true '[]' "$(c 1231 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9123)" "$(c 1232 "$AGENT" 2026-10-20T02:00:00Z "$REBUT")")")" \
+  "$(arr "$(rv 9123 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" '[]' 2026-10-20T01:30:00Z
+pr 124 "$(arr "$(t T124 true '[]' "$(c 1241 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9124)" "$(c 1242 "$AGENT" 2026-10-20T02:00:00Z "$REBUT")")")" \
+  "$(arr "$(rv 9124 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
+  "$(arr "$(c 1243 "$AUTHOR" 2026-10-20T01:30:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/124@$HEAD#1241")")"
+pr 125 "$(arr "$(t T125 true '[]' "$(c 1251 "$CODEX" 2026-10-20T01:00:00Z "$P1" 9125)" "$(c 1252 "$AGENT" 2026-10-20T02:00:00Z "$TAG")")")" \
+  "$(arr "$(rv 9125 "$CODEX" 2026-10-20T01:00:00Z 'Codex review')")" \
+  "$(arr "$(c 1253 "$AUTHOR" 2026-10-20T04:00:00Z "TIEBREAK_REBUTTAL_ACCEPTED=https://github.com/o/r/pull/125@$HEAD#1251")")" 2026-10-20T03:00:00Z
 
 rc=0
 bash "$SCRIPT" --analyze-only --out-dir "$OUT" --policy "$POLICY_FIX" >/dev/null 2>"$WORKDIR/err.log" || rc=$?
@@ -233,6 +252,10 @@ expect_status 1181 owner-marker "an owner marker naming the finding is the owner
 expect_status 1191 no-reread "a reply edited into a rebuttal is dated by its edit, after the Codex review"
 expect_status 1201 no-reread "an owner marker quoted mid-line is not a marker (the ledger reads whole lines)"
 expect_status 1211 no-reread "an owner marker naming a head other than the merged head does not count"
+expect_status 1221 no-reread "a request and review after the merge do not clear a finding it merged with"
+expect_status 1231 not-rebutted "a rebuttal posted after the merge is not the state the PR merged in"
+expect_status 1241 no-reread "an owner marker older than the rebuttal does not settle it"
+expect_status 1251 no-reread "an owner marker posted after the merge does not count"
 
 [ "$(jq -r 'select(.finding == 1031) | .later_unrequested_response' "$F")" = true ] \
   && [ "$(jq -r 'select(.finding == 1011) | .later_unrequested_response' "$F")" = false ] \
@@ -256,17 +279,17 @@ expect_total() { # <key> <value>
   got=$(jq -r --arg k "$1" '.totals[$k]' "$S")
   [ "$got" = "$2" ] && pass "totals.$1 = $2" || fail "totals.$1 is $got, expected $2"
 }
-expect_total prs_merged_in_window 21
+expect_total prs_merged_in_window 25
 expect_total prs_not_measured 2
-expect_total prs_measured 19
-expect_total prs_with_required_finding 17
-expect_total prs_with_rebutted_resolved_required_finding 13
-expect_total prs_matching 7
-expect_total prs_matching_latest_dating 8
+expect_total prs_measured 23
+expect_total prs_with_required_finding 21
+expect_total prs_with_rebutted_resolved_required_finding 16
+expect_total prs_matching 10
+expect_total prs_matching_latest_dating 11
 expect_total prs_with_reraised_rebuttal 1
 expect_total prs_with_owner_marker 1
 expect_total prs_matching_with_later_unrequested_review 1
-[ "$(jq -c '[.matching_prs[].pr]' "$S")" = '[101,103,104,109,119,120,121]' ] \
+[ "$(jq -c '[.matching_prs[].pr]' "$S")" = '[101,103,104,109,119,120,121,122,124,125]' ] \
   && pass "matching_prs lists exactly the no-reread PRs" || fail "matching_prs is $(jq -c '[.matching_prs[].pr]' "$S")"
 [ "$(jq -c '.matching_prs_latest_dating_only' "$S")" = '[115]' ] \
   && pass "the PRs only latest dating matches are listed apart" || fail "matching_prs_latest_dating_only is wrong"
@@ -278,7 +301,7 @@ expect_total prs_matching_with_later_unrequested_review 1
   && pass "the API spend is read back from api.tsv" || fail "api is $(jq -c '.api' "$S")"
 [ "$(jq -c '.policy.required_tiers' "$S")" = '["p0","p1"]' ] \
   && pass "required tiers come from resolve_required_tiers on the policy file" || fail "required tiers are $(jq -c '.policy.required_tiers' "$S")"
-grep -q '^Matching PRs: #101, #103, #104, #109, #119, #120, #121$' "$OUT/summary.md" \
+grep -q '^Matching PRs: #101, #103, #104, #109, #119, #120, #121, #122, #124, #125$' "$OUT/summary.md" \
   && pass "summary.md names the matching PRs" || fail "summary.md does not name the matching PRs"
 
 # A clean extract (every listed PR measured) exits 0.

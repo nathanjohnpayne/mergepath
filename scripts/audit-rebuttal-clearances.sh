@@ -43,7 +43,14 @@
 #                           to a rebuttal discards it; here that reply is the
 #                           re-read being measured, so the whole thread is
 #                           read and a later "Fixed" reply still wins.
-#   resolved       the thread's isResolved is true when the audit reads it.
+#   merge cutoff   every piece of evidence below (rebuttal, re-read, owner
+#                  marker) counts only when strictly earlier than the PR's
+#                  mergedAt: the audit asks what state the PR merged in, so
+#                  a rebuttal or a re-read after the merge counts for
+#                  neither side, and a reply edited after the merge is not
+#                  read as a rebuttal (its merge-time text is unknown).
+#   resolved       the thread's isResolved is true when the audit reads it
+#                  (it cannot be bounded by the merge; see the limits).
 #   rebuttal time  two datings, both reported. A reply (tag or rebuttal) is
 #                  dated by the later of its creation and its last edit, since
 #                  an edit can turn an earlier reply into the rebuttal:
@@ -72,8 +79,9 @@
 #                  naming the finding, read by the ledger's own
 #                  crl_owner_tiebreaks (whole line, unedited comment by the
 #                  policy author_identity, this PR's URL) against the PR's
-#                  final head, the head it merged at (status owner-marker,
-#                  not matching).
+#                  final head, the head it merged at, and, as in
+#                  crl_apply_owner_tiebreaks, newer than the rebuttal it
+#                  settles, per dating (status owner-marker, not matching).
 #   matching PR    a PR with at least one finding that is required-tier,
 #                  rebutted and resolved, with no re-read and no owner
 #                  marker (status no-reread). Each such Codex finding also
@@ -450,27 +458,34 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
 ($required + ["p0"] | unique) as $blocking
 | def blocking_tier: . as $t | $blocking | index($t) != null;
   $pr[0] as $p
-| ($p.threads | map(select((.comments | length) > 0))) as $threads
+# The audit asks what state each PR merged in, so every piece of evidence,
+# rebuttal, re-read or owner marker, counts only when it is strictly earlier
+# than mergedAt (one-second timestamps cannot order an event in the merge
+# second). Later activity can neither clear nor rebut a merged finding.
+| $p.merged_at as $m
+| def pre: type == "string" and . < $m;
+  ($p.threads | map(select((.comments | length) > 0))) as $threads
 | [ ($p.comments[] | {at: .created_at, login, type, body}),
     ($threads[] | .comments[] | {at: .created_at, login, type, body}),
     ($p.reviews[] | {at: .submitted_at, login, type, body}) ]
-  | map(select(human and ((.body // "") | test("@codex review"; "i")) and .at != null) | .at) as $requests
+  | map(select(human and ((.body // "") | test("@codex review"; "i")) and (.at | pre)) | .at) as $requests
 | ( [ $p.reviews[] | select(.login == $codex and .submitted_at != null) | . as $r
       | {kind: "review", at: .submitted_at,
          blocking: ( (($rvtiers[0][($r.id | tostring)] // []))
                      + [ $threads[] | .comments[0] | select(.login == $codex and .review_id == $r.id)
                          | ($tiers[0][(.id | tostring)] // "") ]
                      | any(.[]; blocking_tier) )} ]
-    + [ $verdicts[0][] | {kind: "verdict", at: .created_at, blocking: (if .affirmative then false else null end)} ] ) as $responses
+    + [ $verdicts[0][] | {kind: "verdict", at: .created_at, blocking: (if .affirmative then false else null end)} ]
+    | map(select(.at | pre)) ) as $responses
 | def rereads($t; $bot; $at):
     if $at == null then []
     else
-      [ $t.comments[1:][] | select(.login == $bot and .created_at > $at) | {kind: "thread-reply", at: .created_at, blocking: null} ]
+      [ $t.comments[1:][] | select(.login == $bot and .created_at > $at and (.created_at | pre)) | {kind: "thread-reply", at: .created_at, blocking: null} ]
       + if $bot == $codex then
           ([ $requests[] | select(. > $at) ] | min) as $q
           | if $q == null then [] else [ $responses[] | select(.at > $q) ] end
         else
-          [ $p.reviews[] | select(.login == $cr and (.body | length) > 0 and .submitted_at != null and .submitted_at > $at)
+          [ $p.reviews[] | select(.login == $cr and (.body | length) > 0 and (.submitted_at | pre) and .submitted_at > $at)
             | {kind: "review", at: .submitted_at, blocking: null} ]
         end
     end
@@ -483,28 +498,32 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
     else "no-reread" end;
   # Owner tiebreak markers (#2511), read by the ledger reader
   # crl_owner_tiebreaks: a whole-line marker in an unedited comment by the
-  # policy author, naming this PR and its final (merged) head.
-  [ $owner[0][] | select(.kind == "rebuttal") | .finding ] as $owner_marked
-  |
+  # policy author, naming this PR and its final (merged) head. As in
+  # crl_apply_owner_tiebreaks, a marker settles a rebuttal only when it is
+  # newer than that rebuttal, so its time is kept and compared per dating.
+  [ $owner[0][] | select(.kind == "rebuttal" and (.at | pre)) | {finding, at} ] as $owner_marked
+  | def marked($id; $at): $at != null and any($owner_marked[]; .finding == $id and .at > $at);
+  
   [ $threads[] | . as $t | $t.comments[0] as $root
     | select($root.login == $codex or $root.login == $cr)
     | ($tiers[0][($root.id | tostring)] // "") as $tier
     | select($required | index($tier) != null)
     | $root.login as $bot
     | [ $t.comments[1:][] | select(.login != $bot and ((.body // "") | test("\\[mergepath-resolve:\\s*rebuttal-recorded\\]")))
-        | [.created_at, .edited_at] | tmax ] as $tag
-    | [ $t.root_downs[] | select(.login != "" and .login != $bot and .login != ($bot | sub("\\[bot\\]$"; ""))) | .created_at ] as $down
-    | (reduce $t.comments[1:][] as $e (null;
+        | [.created_at, .edited_at] | tmax | select(pre) ] as $tag
+    | [ $t.root_downs[] | select(.login != "" and .login != $bot and .login != ($bot | sub("\\[bot\\]$"; ""))) | .created_at | select(pre) ] as $down
+    | (reduce ($t.comments[1:][] | select(.created_at | pre)) as $e (null;
          if ($e | agent) and ($e | marker | not) and (($pol[0][($e.id | tostring)] // "") != "")
          then {polarity: $pol[0][($e.id | tostring)], at: ([$e.created_at, $e.edited_at] | tmax)} else . end)) as $reply
-    | (if $reply != null and $reply.polarity == "rebutted" then [$reply.at] else [] end) as $prose
+    # A reply edited after the merge may not have said this at merge time.
+    | (if $reply != null and $reply.polarity == "rebutted" and ($reply.at | pre) then [$reply.at] else [] end) as $prose
     | (($prose + $down) | tmax) as $sub
     | (if $sub != null then $sub else ($tag | tmax) end) as $at_sub
     | (($tag + $down + $prose) | tmax) as $at_late
     | ($at_sub != null) as $rebutted
     | rereads($t; $bot; $at_sub) as $rr
     | rereads($t; $bot; $at_late) as $rr_late
-    | (($owner_marked | index($root.id)) != null) as $marked
+    | marked($root.id; $at_sub) as $marked
     | status($rebutted; $t.is_resolved; $rr; $marked) as $st
     | {pr: $p.pr, finding: $root.id, thread: $t.id,
        bot: (if $bot == $codex then "codex" else "coderabbit" end), tier: $tier, path: $t.path,
@@ -521,8 +540,9 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
        # reported so the count can be read against a looser definition.
        later_unrequested_response: (if $st == "no-reread" and $bot == $codex
                                     then any($responses[]; .at > $at_sub) else null end),
+       merged_at: $m,
        status: $st,
-       status_latest: status($rebutted; $t.is_resolved; $rr_late; $marked)} ]
+       status_latest: status($rebutted; $t.is_resolved; $rr_late; marked($root.id; $at_late))} ]
 '
 
 analyze_pr() { # <raw pr file> → findings JSON lines on stdout; nonzero when unmeasurable
@@ -625,6 +645,8 @@ analyze() {
       reason="the raw record is incomplete"
     elif ! jq -e '(.head_sha | type) == "string" and (.head_sha | test("^[0-9a-f]{40}$")) and (.url | type) == "string"' "$f" >/dev/null; then
       reason="the raw record has no head_sha or url (an older extract; fetch again)"
+    elif ! jq -e '(.merged_at | type) == "string" and (.merged_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' "$f" >/dev/null; then
+      reason="the raw record has no merged_at instant to bound its evidence by"
     fi
     if [ -z "$reason" ]; then
       if ! analyze_pr "$f" >"$OUT_DIR/pr.findings.tmp" 2>"$OUT_DIR/pr.err.tmp"; then
