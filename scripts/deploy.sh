@@ -5,7 +5,9 @@ set -euo pipefail
 #
 # Enforces three guards before calling the deploy chain:
 #   1. Current branch is `main`.
-#   2. Local `main` is not behind `origin/main`.
+#   2. Local `HEAD` is exactly `origin/main`: neither behind it nor
+#      ahead of it (unpushed commits), and `origin/main` was fetched
+#      and exists. A failed fetch or a missing `origin/main` refuses.
 #   3. The working tree is clean (no modified or staged paths).
 #
 # These three guards together prevent the stale-worktree class of deploy
@@ -27,7 +29,7 @@ set -euo pipefail
 # Usage:
 #   scripts/deploy.sh                       # full deploy from main
 #   scripts/deploy.sh -- --only hosting     # scope the op-firebase-deploy call
-#   scripts/deploy.sh --force               # bypass branch + freshness guards
+#   scripts/deploy.sh --force               # bypass guards 1 + 2 (not the dirty-tree guard)
 #   scripts/deploy.sh --skip-build          # assume dist/ is already built
 #   scripts/deploy.sh --skip-cf-purge       # skip the Cloudflare purge step
 #
@@ -48,7 +50,7 @@ CF_PURGE_SKIP=false
 DEPLOY_ARGS=()
 
 usage() {
-  sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,35p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -81,7 +83,7 @@ EOF
   fi
 fi
 
-# Guard 2: must not be behind origin/main
+# Guard 2: local HEAD must be exactly origin/main
 # Fail closed on fetch failure — stale origin/main metadata would
 # silently defeat the freshness check and re-open the exact class
 # of failure #77 closes.
@@ -101,16 +103,45 @@ EOF
   fi
 fi
 
-if git rev-parse --verify --quiet origin/main >/dev/null; then
-  BEHIND="$(git rev-list --count HEAD..origin/main)"
-  if [[ "$BEHIND" -gt 0 ]]; then
+# A fetch can succeed without creating origin/main (for example, a
+# remote whose fetch refspec does not map main to refs/remotes/origin/main).
+# That leaves nothing to compare against, so it refuses too rather than
+# skipping the check (#2704).
+#
+# Otherwise HEAD must equal origin/main exactly. Behind ships a stale
+# build; ahead ships local commits no reviewer saw merged. Both counts
+# are reported so a diverged checkout is visible as such.
+if ! git rev-parse --verify --quiet origin/main >/dev/null; then
+  if [[ "$FORCE" == "true" ]]; then
+    echo "⚠️  --force: origin/main is unavailable after fetch; skipping exact-match verification" >&2
+  else
+    cat >&2 <<EOF
+Refusing to deploy: origin/main is unavailable after fetch, so local
+HEAD cannot be verified against the merged main commit.
+
+Check that the 'origin' remote fetches main into origin/main.
+
+To override (break-glass only): scripts/deploy.sh --force
+EOF
+    exit 1
+  fi
+else
+  LOCAL_HEAD="$(git rev-parse HEAD)"
+  ORIGIN_HEAD="$(git rev-parse origin/main)"
+  if [[ "$LOCAL_HEAD" != "$ORIGIN_HEAD" ]]; then
+    AHEAD="$(git rev-list --count origin/main..HEAD)"
+    BEHIND="$(git rev-list --count HEAD..origin/main)"
     if [[ "$FORCE" == "true" ]]; then
-      echo "⚠️  --force: deploying despite $BEHIND commit(s) behind origin/main" >&2
+      echo "⚠️  --force: deploying although local HEAD differs from origin/main ($AHEAD commit(s) ahead, $BEHIND commit(s) behind)" >&2
     else
       cat >&2 <<EOF
-Refusing to deploy: local HEAD is $BEHIND commit(s) behind origin/main.
+Refusing to deploy: local HEAD does not exactly match origin/main
+($AHEAD commit(s) ahead, $BEHIND commit(s) behind).
 
-Run: git pull --ff-only && scripts/deploy.sh
+Deploys must ship the reviewed, merged origin/main commit.
+  Behind: git pull --ff-only && scripts/deploy.sh
+  Ahead:  local-only commits have not been merged; land them through a
+          pull request or drop them, then update main and redeploy.
 
 To override (break-glass only): scripts/deploy.sh --force
 EOF
