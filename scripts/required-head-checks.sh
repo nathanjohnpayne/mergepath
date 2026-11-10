@@ -147,19 +147,24 @@ suite_map=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --pagin
 suite_json=$(printf '%s\n' "$suite_map" | jq -s '.') || infra "could not parse workflow runs for $SHA"
 
 rc=0
+# Each name's check runs, fetched once per verification and reused by a branch
+# rule naming the same context (#2722), keyed by name.
+fetched='{}'
 while IFS= read -r name; do
   [ -n "$name" ] || continue
   # Filtered per NAME rather than refetching every run on the SHA. This runs
-  # inside a poll loop of up to 20 minutes at 15s intervals, and a busy
+  # inside a poll loop of up to 20 minutes, and a busy
   # commit carries ~1100 check runs -- refetching all of them ~80 times per
   # PR is how a verifier walks into a secondary rate limit, which this
   # script correctly treats as indeterminate and fails closed on. The
   # cheaper query keeps the gate from breaking the merge it protects.
   runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
     -f check_name="$name" --paginate \
-    --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at}' 2>/dev/null) \
+    --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, app: .app.id}' 2>/dev/null) \
     || infra "could not read check runs named '$name' for $SHA"
   runs_json=$(printf '%s\n' "$runs" | jq -s '.') || infra "could not parse check runs named '$name'"
+  fetched=$(jq -c --arg n "$name" --argjson r "$runs_json" '. + {($n): $r}' <<<"$fetched") \
+    || infra "could not record check runs named '$name'"
   summary=$(head_check_runs_reduce "$name" <(printf '%s\n' "$runs_json") <(printf '%s\n' "$suite_json")) \
     || infra "could not reduce check runs named '$name'"
   verdict=$(jq -r '.state' <<<"$summary")
@@ -192,13 +197,18 @@ if [ -n "$requirement_lines" ]; then
     [ -n "$requirement" ] || continue
     ctx=$(jq -r '.context' <<<"$requirement")
     app=$(jq -r '.app_id // ""' <<<"$requirement")
-    runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
-      -f check_name="$ctx" --paginate \
-      --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, app: .app.id}' 2>/dev/null) \
-      || infra "could not read check runs named '$ctx' for $SHA"
-    runs_json=$(printf '%s\n' "$runs" | jq -s --arg app "$app" \
-      'if $app == "" then . else map(select((.app // "" | tostring) == $app)) end') \
-      || infra "could not parse check runs named '$ctx'"
+    if ! all_runs=$(jq -ce --arg n "$ctx" '.[$n]' <<<"$fetched"); then
+      runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
+        -f check_name="$ctx" --paginate \
+        --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started_at, app: .app.id}' 2>/dev/null) \
+        || infra "could not read check runs named '$ctx' for $SHA"
+      all_runs=$(printf '%s\n' "$runs" | jq -s '.') || infra "could not parse check runs named '$ctx'"
+      fetched=$(jq -c --arg n "$ctx" --argjson r "$all_runs" '. + {($n): $r}' <<<"$fetched") \
+        || infra "could not record check runs named '$ctx'"
+    fi
+    runs_json=$(jq -c --arg app "$app" \
+      'if $app == "" then . else map(select((.app // "" | tostring) == $app)) end' <<<"$all_runs") \
+      || infra "could not filter check runs named '$ctx'"
     check_state=$(head_check_runs_reduce "$ctx" <(printf '%s\n' "$runs_json") <(printf '%s\n' "$suite_json") | jq -r '.state') \
       || infra "could not reduce check runs named '$ctx'"
     status_state=absent

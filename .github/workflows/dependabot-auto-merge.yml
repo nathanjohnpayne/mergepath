@@ -658,14 +658,30 @@ jobs:
           # time a context may take to post before that is reported, is the
           # existing wait budget (TEST_CHECK_WAIT_SECONDS, 1200 s); the job
           # timeout is unchanged.
+          #
+          # GITHUB_TOKEN's 1,000 requests an hour per repository are shared
+          # with every gate workflow, and exhausting them stalls the required
+          # gates repo-wide, so the wait spends few reads:
+          #   * A PR held by a blocking label (scripts/lib/blocking-labels.sh,
+          #     the predicate the Label Gate is held to) keeps Label Gate red
+          #     by design, so it is refused at once, before any check read.
+          #   * The poll interval starts at TEST_CHECK_POLL_SECONDS (15 s) and
+          #     doubles after each poll up to HEAD_CHECKS_MAX_POLL_SECONDS
+          #     (120 s), the last nap clamped to the budget: polls at 0, 15,
+          #     45, 105, 225, ... 1065, 1185 and 1200 s, 14 in all. The budget
+          #     is counted in scheduled seconds as well as wall-clock seconds,
+          #     whichever ends first, so read time cannot add polls.
+          # Every poll is still a full read of every required context on the
+          # pinned head, so the verdict a merge acts on is never a partial one.
 
-          # report_required_contexts_refusal <sha> <reason> [<bullet lines>]
+          # report_required_contexts_refusal <sha> <reason> [<bullet lines>] [<retry note>]
           # Never returns. One marker comment per PR, written by
           # github-actions[bot] and updated in place, so repeated runs do
           # not add comments. A failed comment write is a warning: the
           # refusal stands either way.
           report_required_contexts_refusal() {
             local sha=$1 reason=$2 detail=${3:-} live body_file comment_id armed arm_note
+            local retry_note=${4:-"The next push to this PR runs the wait again; to retry sooner, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}) once the checks have posted."}
             local marker='<!-- mergepath-dependabot-required-contexts -->'
             live=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null || true)
             if [ -n "$live" ] && [ "$live" != "$sha" ]; then
@@ -705,7 +721,7 @@ jobs:
                 printf '%s\n' "$detail"
               fi
               echo
-              echo "Required checks are every context branch protection on \`$DEFAULT_BRANCH\` requires, read live, plus this repository's \`.github/required-head-checks\` list (default \`lint\`). Nothing was merged. $arm_note The next push to this PR runs the wait again; to retry sooner, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}) once the checks have posted."
+              echo "Required checks are every context branch protection on \`$DEFAULT_BRANCH\` requires, read live, plus this repository's \`.github/required-head-checks\` list (default \`lint\`). Nothing was merged. $arm_note $retry_note"
             } >"$body_file"
             if comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
                 --jq '.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- mergepath-dependabot-required-contexts -->"))) | .id'); then
@@ -722,6 +738,34 @@ jobs:
             fi
             rm -f "$body_file"
             exit 1
+          }
+
+          # Refuse at once when the PR carries a blocking label: the Label Gate
+          # fails by design while it is there, so the wait cannot succeed and
+          # would only spend reads. The set is scripts/lib/blocking-labels.sh,
+          # which check_pr_review_policy_nudge holds the Label Gate to.
+          # human-hold keeps its own path: no requirement read, no comment.
+          # A base checkout without the predicate skips this and waits.
+          refuse_if_label_held() {
+            local sha=$1 labels held
+            if [ ! -r scripts/lib/blocking-labels.sh ]; then
+              echo "::notice::scripts/lib/blocking-labels.sh is missing from the base checkout; not checking for a blocking label before the wait."
+              return 0
+            fi
+            # shellcheck source=/dev/null
+            . scripts/lib/blocking-labels.sh
+            if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
+              echo "::error::Failed to read labels for $PR_URL before the required-check wait."
+              exit 1
+            fi
+            if printf '%s\n' "$labels" | grep -Fxq human-hold; then
+              echo "::notice::PR carries human-hold; skipping Dependabot auto-merge until the human removes the label."
+              exit 0
+            fi
+            held=$(printf '%s\n' "$labels" | mergepath_blocking_labels_csv)
+            [ -n "$held" ] || return 0
+            report_required_contexts_refusal "$sha" "This PR is approved on \`$sha\` but carries \`${held//,/\`, \`}\`, which keeps the required \`Label Gate\` check red by design, so waiting for the required checks cannot succeed." "" \
+              "Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}), or merge the PR as the author identity."
           }
 
           # Resolve, live, the contexts branch protection requires on the
@@ -752,8 +796,10 @@ jobs:
           require_current_head_checks_success() {
             local wait_seconds poll_seconds deadline pinned attempts max_attempts
             local infra_errors max_infra_errors verify_out waiting
+            local max_poll_seconds interval nap elapsed
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
+            max_poll_seconds=${HEAD_CHECKS_MAX_POLL_SECONDS:-120}
             max_attempts=${HEAD_DRIFT_MAX_RESTARTS:-3}
             # rc=3 is the verifier's "could not read" exit: one failed API
             # call, not a verdict. A single transient 5xx or secondary rate
@@ -773,8 +819,11 @@ jobs:
                 echo "::error::Could not resolve the PR head SHA; refusing auto-merge."
                 exit 1
               fi
+              refuse_if_label_held "$pinned"
               resolve_branch_requirements "$pinned"
               deadline=$((SECONDS + wait_seconds))
+              elapsed=0
+              interval=$poll_seconds
               infra_errors=0
               while :; do
                 # Capture the verifier's OWN status. `rc=$?` after a failed
@@ -807,13 +856,19 @@ jobs:
                 else
                   infra_errors=0
                 fi
-                if [ "$SECONDS" -ge "$deadline" ]; then
+                if [ "$elapsed" -ge "$wait_seconds" ] || [ "$SECONDS" -ge "$deadline" ]; then
                   echo "::error::Timed out waiting for the configured required head checks on $pinned."
                   waiting=$(printf '%s\n' "$verify_out" | sed -n 's/^required-head-checks: WAIT \(.*\) (\([a-z]*\))$/- \1: \2/p')
                   report_required_contexts_refusal "$pinned" "This PR is approved on \`$pinned\`, but since $WAIT_STARTED_AT (UTC), when this run began waiting after that approval, its required checks have not all succeeded within the $((wait_seconds / 60))-minute wait. Not yet successful at the last check:" \
                     "${waiting:-- (the last poll could not read the check state; see the job log)}"
                 fi
-                sleep "$poll_seconds"
+                # Back off (see above); the last nap ends exactly at the budget.
+                nap=$interval
+                [ "$nap" -le $((wait_seconds - elapsed)) ] || nap=$((wait_seconds - elapsed))
+                sleep "$nap"
+                elapsed=$((elapsed + nap))
+                interval=$((interval * 2))
+                [ "$interval" -le "$max_poll_seconds" ] || interval=$max_poll_seconds
               done
               # Every configured check and every branch-required context is
               # green on $pinned. Accept only if the head has not moved

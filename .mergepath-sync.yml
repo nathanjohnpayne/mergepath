@@ -2492,6 +2492,9 @@ paths:
       # The merge job resolves the contexts branch protection requires
       # through it and refuses every merge without it (#2722).
       - "scripts/lib/branch-requirements.sh"
+      # The merge job refuses a PR held by one of its blocking labels before
+      # the required-check wait (#2722); without it the job waits instead.
+      - "scripts/lib/blocking-labels.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

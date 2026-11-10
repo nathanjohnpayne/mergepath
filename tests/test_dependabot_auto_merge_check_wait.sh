@@ -1245,6 +1245,7 @@ STUB
 
 {
   extract_function report_required_contexts_refusal
+  extract_function refuse_if_label_held
   extract_function resolve_branch_requirements
   extract_function require_current_head_checks_success
 } >"$RETRY_DIR/wait.sh"
@@ -1496,6 +1497,35 @@ for bad in \
   fi
 done
 
+# One check-run read per name per verification: a branch rule naming a
+# configured check, or two rules naming one context, reuse the first listing.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Pinned gate" completed success 3 999
+} >"$RHC_DIR/runs.jsonl"
+: >"$RHC_DIR/statuses.jsonl"
+rhc_run "$(known_reqs '{"context":"lint","app_id":null}' "$REQ_PINNED" '{"context":"Pinned gate","app_id":null}')"
+if [ "$RHC_RC" -eq 0 ] \
+   && [ "$(grep -c 'check_name=lint' "$RHC_DIR/gh.log")" -eq 1 ] \
+   && [ "$(grep -c 'check_name=Pinned gate' "$RHC_DIR/gh.log")" -eq 1 ] \
+   && grep -Fq 'OK   lint (required by the branch rules)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules, app 999)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules)' <<<"$RHC_OUT"; then
+  pass "#2722: each name's check runs are read once per verification and reused by every rule naming it"
+else
+  fail "#2722: per-name reuse (rc=$RHC_RC) lint_reads=$(grep -c 'check_name=lint' "$RHC_DIR/gh.log"): $RHC_OUT"
+fi
+# The reused listing keeps the pin: another app's run still cannot satisfy it.
+printf '%s\n' "$(rhc_run_line lint completed success 1 15368)" "$(rhc_run_line "Pinned gate" completed success 3 15368)" >"$RHC_DIR/runs.jsonl"
+rhc_run "$(known_reqs '{"context":"Pinned gate","app_id":null}' "$REQ_PINNED")"
+if [ "$RHC_RC" -eq 1 ] && grep -Fq 'WAIT Pinned gate (required by the branch rules, app 999) (absent)' <<<"$RHC_OUT" \
+   && grep -Fq 'OK   Pinned gate (required by the branch rules)' <<<"$RHC_OUT" \
+   && [ "$(grep -c 'check_name=Pinned gate' "$RHC_DIR/gh.log")" -eq 1 ]; then
+  pass "#2722: a reused listing is still filtered to a pinned rule's app"
+else
+  fail "#2722: reused listing lost the pin (rc=$RHC_RC): $RHC_OUT"
+fi
+
 # A known, empty list (a branch that requires no status checks) adds nothing
 # and reads no statuses.
 rhc_run "$(known_reqs)"
@@ -1518,7 +1548,8 @@ MS_HEAD=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 MS_NEW_HEAD=ffffffffffffffffffffffffffffffffffffffff
 mkdir -p "$MS/bin" "$MS/repo/scripts/lib" "$MS/repo/.github"
 cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/dependabot-commit-provenance.sh" \
-   "$ROOT/scripts/lib/reviewers-helpers.sh" "$ROOT/scripts/lib/head-check-runs.sh" "$MS/repo/scripts/lib/"
+   "$ROOT/scripts/lib/reviewers-helpers.sh" "$ROOT/scripts/lib/head-check-runs.sh" \
+   "$ROOT/scripts/lib/blocking-labels.sh" "$MS/repo/scripts/lib/"
 cp "$ROOT/scripts/required-head-checks.sh" "$MS/repo/scripts/"
 write_stub_branch_lib "$MS/repo"
 cat >"$MS/repo/.github/review-policy.yml" <<'YAML'
@@ -1566,7 +1597,13 @@ case "$1 ${2:-}" in
     [ "${GH_TOKEN:-}" = author-token ] || { echo "gh shim: user read under ${GH_TOKEN:-<unset>}" >&2; exit 94; }
     echo nathanjohnpayne ;;
   "pr view")
-    jq -n --arg h "$head" --arg labels "${MS_LABELS:-}" --arg armed "${MS_ARMED:-false}" '
+    labels=${MS_LABELS:-}
+    case "$*" in
+      *"--json labels"*)
+        echo x >>"$MS/label-reads"
+        [ -z "${MS_LATE_LABELS:-}" ] || [ "$(wc -l <"$MS/label-reads")" -lt 2 ] || labels=$MS_LATE_LABELS ;;
+    esac
+    jq -n --arg h "$head" --arg labels "$labels" --arg armed "${MS_ARMED:-false}" '
       {headRefOid:$h, baseRefName:"main",
        labels:($labels | split(",") | map(select(length > 0) | {name:.})),
        autoMergeRequest:(if $armed == "true" then {enabledAt:"2026-11-01T00:00:00Z"} else null end)}' \
@@ -1585,22 +1622,34 @@ case "$1 ${2:-}" in
     done ;;
   "api repos/owner/repo") echo main ;;
   "api repos/owner/repo/contents/"*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
-  "api repos/owner/repo/actions/runs?head_sha="*"&per_page=100") cat "$MS/suites.jsonl" ;;
+  "api repos/owner/repo/actions/runs?head_sha="*"&per_page=100")
+    echo x >>"$MS/polls"
+    cat "$MS/suites.jsonl" ;;
   "api repos/owner/repo/commits/"*"/statuses?per_page=100") cat "$MS/statuses.jsonl" ;;
   "api --method")
     [ -z "${MS_MOVE_ON_CHECK_READ:-}" ] || touch "$MS/moved"
-    jq -c --arg n "$name" 'select(.name == $n)' "$MS/runs.jsonl" ;;
+    runs_file="$MS/runs.jsonl"
+    if [ -n "${MS_GREEN_AFTER:-}" ] && [ "$(wc -l <"$MS/polls")" -gt "$MS_GREEN_AFTER" ]; then runs_file="$MS/runs-green.jsonl"; fi
+    jq -c --arg n "$name" 'select(.name == $n)' "$runs_file" ;;
   *) echo "gh shim: unexpected command: $*" >&2; exit 93 ;;
 esac
 SHIM
 chmod +x "$MS/bin/gh"
+# No real sleeps: the step's naps are recorded, one per line, and return at
+# once. The wait's budget is counted in scheduled seconds, so the number of
+# polls follows from these naps alone, whatever the host load.
+cat >"$MS/bin/sleep" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$MS/sleeps"
+SHIM
+chmod +x "$MS/bin/sleep"
 
 MS_REQS=$(known_reqs "$REQ_CODEX" '{"context":"Merge clearance gate","app_id":null}')
 printf '%s\n' "$MS_REQS" >"$MS/requirements-known.json"
 printf '%s\n' '{"state":"unknown","partial":true,"contexts":[],"requirements":[],"surfaces":["rulesets"],"errors":["classic: classic projection completeness unproven for this viewer"]}' >"$MS/requirements-unknown.json"
 
 run_merge_step() {  # env overrides via the caller; sets MS_RC and MS_OUT
-  : >"$MS/gh.log"; : >"$MS/merge.log"; : >"$MS/br.log"; rm -f "$MS/comment-writes" "$MS/moved"
+  : >"$MS/gh.log"; : >"$MS/merge.log"; : >"$MS/br.log"; : >"$MS/polls"; : >"$MS/sleeps"; : >"$MS/label-reads"; rm -f "$MS/comment-writes" "$MS/moved"
   [ -f "$MS/comments.json" ] || printf '[]\n' >"$MS/comments.json"
   set +e
   MS_OUT=$(cd "$MS/repo" && PATH="$MS/bin:$PATH" MS="$MS" MS_HEAD="$MS_HEAD" MS_NEW_HEAD="$MS_NEW_HEAD" \
@@ -1610,7 +1659,7 @@ run_merge_step() {  # env overrides via the caller; sets MS_RC and MS_OUT
     APPROVED_SHA="$MS_HEAD" APPROVED_BY=nathanpayne-deps DEFAULT_BRANCH=main \
     UPDATE_TYPE=version-update:semver-patch DEPENDENCY_GROUP= REQUIRED_HEAD_CHECK_NAME=lint \
     GH_TOKEN=workflow-token AUTHOR_MERGE_TOKEN=author-token ACCOUNTING_GH_TOKEN=workflow-token \
-    TEST_CHECK_WAIT_SECONDS=0 TEST_CHECK_POLL_SECONDS=0 \
+    TEST_CHECK_WAIT_SECONDS="${MS_WAIT:-0}" TEST_CHECK_POLL_SECONDS="${MS_POLL:-0}" \
     bash -e "$MS/step.sh" 2>&1)
   MS_RC=$?
   set -e
@@ -1734,6 +1783,105 @@ if [ "$MS_RC" -ne 0 ] && ! squash_issued && grep -Fq 'predates #1070' "$MS/comme
   pass "#2722: a pre-#1070 base checkout refuses instead of waiting on lint alone"
 else
   fail "#2722: pre-#1070 checkout (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+
+# ---------------------------------------------------------------------------
+# #2722 follow-up (a): a blocking label keeps Label Gate red by design, so the
+# wait cannot succeed. Refuse before any requirement or check-state read.
+# ---------------------------------------------------------------------------
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+printf '[]\n' >"$MS/comments.json"
+check_state_reads() { grep -Ec '\|api (repos/owner/repo( |/actions/runs|/contents/|/commits/)|--method GET)' "$MS/gh.log" || true; }
+MS_LABELS=needs-external-review MS_ARMED=true run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/br.log" ] && [ ! -s "$MS/polls" ] && [ ! -s "$MS/sleeps" ] \
+   && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
+   && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
+   && grep -Fq '<!-- mergepath-dependabot-required-contexts -->' "$MS/comment-writes" \
+   && grep -Fq "approved on \`$MS_HEAD\` but carries \`needs-external-review\`, which keeps the required \`Label Gate\` check red by design" "$MS/comment-writes" \
+   && grep -Fq 'Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](https://github.com/owner/repo/actions/runs/4242), or merge the PR as the author identity.' "$MS/comment-writes" \
+   && grep -Fq 'Nothing was merged. No auto-merge request is left armed.' "$MS/comment-writes" \
+   && ! grep -Fq 'once the checks have posted' "$MS/comment-writes"; then
+  pass "#2722: a blocking label refuses before any check read: no merge, the arm withdrawn, one comment naming the label and the re-run"
+else
+  fail "#2722: blocking-label early refusal (rc=$MS_RC) polls=$(wc -l <"$MS/polls") br=$(cat "$MS/br.log") merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+jq -nc '[{id:21, user:{login:"github-actions[bot]"}, body:"<!-- mergepath-dependabot-required-contexts -->\nearlier refusal"}]' >"$MS/comments.json"
+MS_LABELS=policy-violation,needs-human-review run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(check_state_reads)" -eq 0 ] \
+   && [ "$(grep -c '^PATCH repos/owner/repo/issues/comments/21$' "$MS/comment-writes")" -eq 1 ] \
+   && ! grep -q '^POST ' "$MS/comment-writes" \
+   && grep -Fq 'carries `policy-violation`, `needs-human-review`, which keeps' "$MS/comment-writes"; then
+  pass "#2722: a repeat blocking-label refusal updates the marker comment in place and names every blocking label"
+else
+  fail "#2722: blocking-label refusal dedupe (rc=$MS_RC): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+printf '[]\n' >"$MS/comments.json"
+# human-hold keeps its own path when it appears after the job's first label
+# read: the wait's label check stops quietly, with no comment and no read.
+MS_LATE_LABELS=human-hold,needs-external-review MS_ARMED=true run_merge_step
+if [ "$MS_RC" -eq 0 ] && [ ! -s "$MS/merge.log" ] && [ ! -f "$MS/comment-writes" ] \
+   && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/br.log" ] \
+   && grep -Fq 'PR carries human-hold; skipping Dependabot auto-merge' <<<"$MS_OUT"; then
+  pass "#2722: a human-hold seen by the wait's label check keeps the no-read, no-comment human-hold path"
+else
+  fail "#2722: late human-hold (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
+fi
+# A label outside the shared predicate does not refuse.
+MS_LABELS=dependencies,needs-external-review-later run_merge_step
+if [ "$MS_RC" -eq 0 ] && grep -Fq -- "--squash --auto --match-head-commit $MS_HEAD" "$MS/merge.log" && [ ! -f "$MS/comment-writes" ]; then
+  pass "#2722: labels outside scripts/lib/blocking-labels.sh do not refuse"
+else
+  fail "#2722: a non-blocking label refused (rc=$MS_RC): $MS_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# #2722 follow-up (b): read budget. A PR whose required context never posts,
+# at the production budget and interval (1200 s, 15 s): the backoff gives 14
+# polls (0, 15, 45, 105, 225, ... 1065, 1185, 1200 s), naps summing to exactly
+# 1200 s, and fewer than 200 reads in all. Counted through the stub, never
+# timed.
+# ---------------------------------------------------------------------------
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+MS_WAIT=1200 MS_POLL=15 run_merge_step
+naps=$(paste -sd' ' "$MS/sleeps")
+nap_sum=$(awk '{s += $1} END {print s + 0}' "$MS/sleeps")
+total_reads=$(($(wc -l <"$MS/gh.log")))
+workflow_reads=$(grep -c '^workflow-token|' "$MS/gh.log" || true)
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && [ "$(wc -l <"$MS/polls")" -eq 14 ] \
+   && [ "$naps" = "15 30 60 120 120 120 120 120 120 120 120 120 15" ] && [ "$nap_sum" -eq 1200 ] \
+   && [ "$workflow_reads" -le 200 ] \
+   && grep -Fq -- '- Codex P1 unresolved threads (required by the branch rules): absent' "$MS/comment-writes" \
+   && grep -Fq 'within the 20-minute wait' "$MS/comment-writes"; then
+  pass "#2722: a stuck context costs 14 polls over exactly 1200 s ($workflow_reads GITHUB_TOKEN calls, $total_reads in all), then refuses"
+else
+  fail "#2722: read budget (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps='$naps' sum=$nap_sum workflow_reads=$workflow_reads total=$total_reads"
+fi
+
+# A context that posts during the backoff is merged on the next poll, and the
+# poll the merge acts on is a full read of every required context.
+cp "$MS/runs.jsonl" "$MS/runs-green.jsonl"
+rhc_run_line "Codex P1 unresolved threads" completed success 2 15368 >>"$MS/runs-green.jsonl"
+MS_WAIT=1200 MS_POLL=15 MS_GREEN_AFTER=5 run_merge_step
+last_poll=$(awk '/actions\/runs\?head_sha=/{n++} n == 6' "$MS/gh.log")
+if [ "$MS_RC" -eq 0 ] && grep -Fxq "author-token|pr merge --squash --auto --match-head-commit $MS_HEAD https://github.com/owner/repo/pull/1" "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/polls")" -eq 6 ] && [ "$(paste -sd' ' "$MS/sleeps")" = "15 30 60 120 120" ] \
+   && grep -Fq 'check_name=lint' <<<"$last_poll" \
+   && grep -Fq 'check_name=Codex P1 unresolved threads' <<<"$last_poll" \
+   && grep -Fq 'check_name=Merge clearance gate' <<<"$last_poll" \
+   && grep -Fq '/statuses?per_page=100' <<<"$last_poll"; then
+  pass "#2722: a context that posts during the backoff merges on the next poll, which re-read every required context"
+else
+  fail "#2722: late context (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps=$(paste -sd' ' "$MS/sleeps") merge.log=$(cat "$MS/merge.log")"
 fi
 
 echo "test_dependabot_auto_merge_check_wait: $PASS passed, $FAIL failed"
