@@ -301,11 +301,20 @@ print(value if isinstance(value,str) else json.dumps(value))
         env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path),
                    RELAY_SLEEP_LOG=str(self.path / 'sleeps'))
         # Retry cases run the real entry point with only time.sleep replaced
-        # by a recorder, so backoff is asserted without waiting for it.
+        # by a recorder, so backoff is asserted without waiting for it. The
+        # standard library's subprocess module polls a child through
+        # time.sleep when it waits with a timeout; those calls keep the real
+        # sleep and are not backoff, so they are not recorded.
         command = ['python3', str(SCRIPT)]
         if record_sleeps:
             command[1:1] = ['-c', 'import os, runpy, sys, time\n'
-                            'time.sleep = lambda s: open(os.environ["RELAY_SLEEP_LOG"], "a").write(f"{s}\\n") and None\n'
+                            'real_sleep = time.sleep\n'
+                            'def sleep(seconds):\n'
+                            '    if sys._getframe(1).f_globals.get("__name__") == "subprocess":\n'
+                            '        return real_sleep(seconds)\n'
+                            '    with open(os.environ["RELAY_SLEEP_LOG"], "a") as log:\n'
+                            '        log.write(f"{seconds}\\n")\n'
+                            'time.sleep = sleep\n'
                             'runpy.run_path(sys.argv.pop(1), run_name="__main__")']
         result = subprocess.run(command + ['--repo', REPO, '--pr', '7'],
                                 input=json.dumps(self.comments), text=True, capture_output=True, env=env)
