@@ -665,6 +665,10 @@ jobs:
           #   * A PR held by a blocking label (scripts/lib/blocking-labels.sh,
           #     the predicate the Label Gate is held to) keeps Label Gate red
           #     by design, so it is refused at once, before any check read.
+          #     needs-external-review is the exception: the trusted lanes
+          #     remove it without Phase 4 (auto-clear's Dependabot pin-bump
+          #     lane and */5 sweep, the labeler's fail-closed reconcile), so
+          #     the PR waits the normal budget for it to clear instead.
           #   * The poll interval starts at TEST_CHECK_POLL_SECONDS (15 s) and
           #     doubles after each poll up to HEAD_CHECKS_MAX_POLL_SECONDS
           #     (120 s), the last nap clamped to the budget: polls at 0, 15,
@@ -740,16 +744,30 @@ jobs:
             exit 1
           }
 
-          # Refuse at once when the PR carries a blocking label: the Label Gate
-          # fails by design while it is there, so the wait cannot succeed and
-          # would only spend reads. The set is scripts/lib/blocking-labels.sh,
-          # which check_pr_review_policy_nudge holds the Label Gate to.
-          # human-hold keeps its own path: no requirement read, no comment.
-          # A base checkout without the predicate skips this and waits.
+          # Read the blocking labels (scripts/lib/blocking-labels.sh, which
+          # check_pr_review_policy_nudge holds the Label Gate to) at the start
+          # of the wait, at every green verdict, and when the budget ends.
+          #   human-hold             its own path: notice, exit 0, no comment.
+          #   needs-external-review  sets HELD_FOR_REVIEW=1 and returns. The
+          #                          trusted lanes can remove it without
+          #                          Phase 4 (a fail-closed classification
+          #                          on a Dependabot pin bump is cleared by
+          #                          auto-clear-blocking-labels.yml within
+          #                          about one */5 sweep), so the wait goes
+          #                          on, and a green verdict with it still
+          #                          present is not accepted: Label Gate can
+          #                          read green for a moment after a label
+          #                          lands, and a consumer may not require it.
+          #   any other blocking label (needs-human-review, policy-violation)
+          #                          Label Gate fails by design until a human
+          #                          acts, so refuse at once.
+          # A base checkout without the predicate skips this and relies on
+          # the required checks alone.
           refuse_if_label_held() {
-            local sha=$1 labels held
+            local sha=$1 labels held others
+            HELD_FOR_REVIEW=0
             if [ ! -r scripts/lib/blocking-labels.sh ]; then
-              echo "::notice::scripts/lib/blocking-labels.sh is missing from the base checkout; not checking for a blocking label before the wait."
+              echo "::notice::scripts/lib/blocking-labels.sh is missing from the base checkout; not checking for a blocking label."
               return 0
             fi
             # shellcheck source=/dev/null
@@ -764,6 +782,11 @@ jobs:
             fi
             held=$(printf '%s\n' "$labels" | mergepath_blocking_labels_csv)
             [ -n "$held" ] || return 0
+            others=$(printf '%s\n' "$held" | tr ',' '\n' | grep -Fxv needs-external-review || true)
+            if [ -z "$others" ]; then
+              HELD_FOR_REVIEW=1
+              return 0
+            fi
             report_required_contexts_refusal "$sha" "This PR is approved on \`$sha\` but carries \`${held//,/\`, \`}\`, which keeps the required \`Label Gate\` check red by design, so waiting for the required checks cannot succeed." "" \
               "Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}), or merge the PR as the author identity."
           }
@@ -820,6 +843,8 @@ jobs:
                 exit 1
               fi
               refuse_if_label_held "$pinned"
+              [ "$HELD_FOR_REVIEW" -eq 0 ] || \
+                echo "::notice::PR carries needs-external-review; waiting up to ${wait_seconds}s for it to clear and for the required checks."
               resolve_branch_requirements "$pinned"
               deadline=$((SECONDS + wait_seconds))
               elapsed=0
@@ -841,7 +866,15 @@ jobs:
                   --branch-requirements "$BRANCH_REQUIREMENTS_FILE") || rc=$?
                 [ -z "$verify_out" ] || printf '%s\n' "$verify_out"
                 if [ "$rc" -eq 0 ]; then
-                  break
+                  # A green verdict is accepted only with no blocking label
+                  # on the PR (another blocking label refuses here).
+                  refuse_if_label_held "$pinned"
+                  if [ "$HELD_FOR_REVIEW" -eq 0 ]; then
+                    break
+                  fi
+                  echo "::notice::Every required check is green on $pinned, but needs-external-review is still present; waiting."
+                  verify_out="required-head-checks: WAIT the needs-external-review label (present)"
+                  rc=1
                 fi
                 if [ "$rc" -eq 3 ]; then
                   infra_errors=$((infra_errors + 1))
@@ -859,6 +892,14 @@ jobs:
                 if [ "$elapsed" -ge "$wait_seconds" ] || [ "$SECONDS" -ge "$deadline" ]; then
                   echo "::error::Timed out waiting for the configured required head checks on $pinned."
                   waiting=$(printf '%s\n' "$verify_out" | sed -n 's/^required-head-checks: WAIT \(.*\) (\([a-z]*\))$/- \1: \2/p')
+                  # Still held by needs-external-review: say so, with the
+                  # label-specific retry note (nothing re-arms it).
+                  refuse_if_label_held "$pinned"
+                  if [ "$HELD_FOR_REVIEW" -eq 1 ]; then
+                    report_required_contexts_refusal "$pinned" "This PR is approved on \`$pinned\` but still carries \`needs-external-review\` at the end of the $((wait_seconds / 60))-minute wait that began $WAIT_STARTED_AT (UTC). The label keeps the required \`Label Gate\` check red by design. Not yet successful at the last check:" \
+                      "${waiting:-- (the last poll could not read the check state; see the job log)}" \
+                      "Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}), or merge the PR as the author identity."
+                  fi
                   report_required_contexts_refusal "$pinned" "This PR is approved on \`$pinned\`, but since $WAIT_STARTED_AT (UTC), when this run began waiting after that approval, its required checks have not all succeeded within the $((wait_seconds / 60))-minute wait. Not yet successful at the last check:" \
                     "${waiting:-- (the last poll could not read the check state; see the job log)}"
                 fi

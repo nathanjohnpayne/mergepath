@@ -1601,7 +1601,9 @@ case "$1 ${2:-}" in
     case "$*" in
       *"--json labels"*)
         echo x >>"$MS/label-reads"
-        [ -z "${MS_LATE_LABELS:-}" ] || [ "$(wc -l <"$MS/label-reads")" -lt 2 ] || labels=$MS_LATE_LABELS ;;
+        [ -z "${MS_LATE_LABELS:-}" ] || [ "$(wc -l <"$MS/label-reads")" -lt 2 ] || labels=$MS_LATE_LABELS
+        # The label clears once the verifier has run MS_LABEL_CLEARS_AT_POLL times.
+        [ -z "${MS_LABEL_CLEARS_AT_POLL:-}" ] || [ "$(wc -l <"$MS/polls")" -lt "$MS_LABEL_CLEARS_AT_POLL" ] || labels="" ;;
     esac
     jq -n --arg h "$head" --arg labels "$labels" --arg armed "${MS_ARMED:-false}" '
       {headRefOid:$h, baseRefName:"main",
@@ -1797,17 +1799,17 @@ fi
 } >"$MS/runs.jsonl"
 printf '[]\n' >"$MS/comments.json"
 check_state_reads() { grep -Ec '\|api (repos/owner/repo( |/actions/runs|/contents/|/commits/)|--method GET)' "$MS/gh.log" || true; }
-MS_LABELS=needs-external-review MS_ARMED=true run_merge_step
+MS_LABELS=policy-violation MS_ARMED=true run_merge_step
 if [ "$MS_RC" -ne 0 ] && ! squash_issued \
    && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/br.log" ] && [ ! -s "$MS/polls" ] && [ ! -s "$MS/sleeps" ] \
    && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
    && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
    && grep -Fq '<!-- mergepath-dependabot-required-contexts -->' "$MS/comment-writes" \
-   && grep -Fq "approved on \`$MS_HEAD\` but carries \`needs-external-review\`, which keeps the required \`Label Gate\` check red by design" "$MS/comment-writes" \
+   && grep -Fq "approved on \`$MS_HEAD\` but carries \`policy-violation\`, which keeps the required \`Label Gate\` check red by design" "$MS/comment-writes" \
    && grep -Fq 'Nothing re-arms auto-merge when the label clears: once it is removed, re-run [the workflow run](https://github.com/owner/repo/actions/runs/4242), or merge the PR as the author identity.' "$MS/comment-writes" \
    && grep -Fq 'Nothing was merged. No auto-merge request is left armed.' "$MS/comment-writes" \
    && ! grep -Fq 'once the checks have posted' "$MS/comment-writes"; then
-  pass "#2722: a blocking label refuses before any check read: no merge, the arm withdrawn, one comment naming the label and the re-run"
+  pass "#2722: policy-violation refuses before any check read, with zero polls: no merge, the arm withdrawn, one comment naming the label and the re-run"
 else
   fail "#2722: blocking-label early refusal (rc=$MS_RC) polls=$(wc -l <"$MS/polls") br=$(cat "$MS/br.log") merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
 fi
@@ -1832,6 +1834,69 @@ if [ "$MS_RC" -eq 0 ] && [ ! -s "$MS/merge.log" ] && [ ! -f "$MS/comment-writes"
 else
   fail "#2722: late human-hold (rc=$MS_RC) merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null) $MS_OUT"
 fi
+# needs-external-review alongside another blocking label still refuses at once.
+MS_LABELS=needs-external-review,needs-human-review run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(check_state_reads)" -eq 0 ] && [ ! -s "$MS/polls" ] \
+   && grep -Fq 'carries `needs-external-review`, `needs-human-review`, which keeps' "$MS/comment-writes"; then
+  pass "#2722: needs-external-review with another blocking label is refused at once"
+else
+  fail "#2722: mixed blocking labels (rc=$MS_RC) polls=$(wc -l <"$MS/polls"): $MS_OUT"
+fi
+printf '[]\n' >"$MS/comments.json"
+
+# needs-external-review alone waits: the trusted lanes can remove it without
+# Phase 4. Every required check is green from the first poll (this fixture's
+# branch rules do not include Label Gate, as a consumer's might not), so only
+# the label read at the green verdict holds the merge until the label clears.
+MS_LABELS=needs-external-review MS_LABEL_CLEARS_AT_POLL=3 MS_WAIT=1200 MS_POLL=15 run_merge_step
+if [ "$MS_RC" -eq 0 ] \
+   && grep -Fxq "author-token|pr merge --squash --auto --match-head-commit $MS_HEAD https://github.com/owner/repo/pull/1" "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/merge.log")" -eq 1 ] && [ ! -f "$MS/comment-writes" ] \
+   && [ "$(wc -l <"$MS/polls")" -eq 3 ] && [ "$(paste -sd' ' "$MS/sleeps")" = "15 30" ] \
+   && grep -Fq 'needs-external-review is still present; waiting' <<<"$MS_OUT"; then
+  pass "#2722: needs-external-review cleared mid-wait with every check green merges once the label is gone, with no comment"
+else
+  fail "#2722: needs-external-review cleared mid-wait (rc=$MS_RC) polls=$(wc -l <"$MS/polls") naps=$(paste -sd' ' "$MS/sleeps") merge.log=$(cat "$MS/merge.log"): $MS_OUT"
+fi
+
+# Held for the whole budget with every check green: no merge, the arm
+# withdrawn, the label-specific comment, and the read cost with a label read
+# on each of the 14 green polls.
+MS_LABELS=needs-external-review MS_ARMED=true MS_WAIT=1200 MS_POLL=15 run_merge_step
+ner_reads=$(grep -c '^workflow-token|' "$MS/gh.log" || true)
+if [ "$MS_RC" -ne 0 ] && ! squash_issued \
+   && grep -Fxq 'workflow-token|pr merge --disable-auto https://github.com/owner/repo/pull/1' "$MS/merge.log" \
+   && [ "$(wc -l <"$MS/polls")" -eq 14 ] && [ "$ner_reads" -le 200 ] \
+   && [ "$(grep -c '^POST repos/owner/repo/issues/1/comments$' "$MS/comment-writes")" -eq 1 ] \
+   && grep -Fq "approved on \`$MS_HEAD\` but still carries \`needs-external-review\` at the end of the 20-minute wait" "$MS/comment-writes" \
+   && grep -Fq -- '- the needs-external-review label: present' "$MS/comment-writes" \
+   && grep -Fq 'Nothing re-arms auto-merge when the label clears' "$MS/comment-writes" \
+   && ! grep -Fq 'once the checks have posted' "$MS/comment-writes"; then
+  pass "#2722: needs-external-review held for the whole budget refuses with the label-specific comment ($ner_reads GITHUB_TOKEN calls over 14 polls)"
+else
+  fail "#2722: needs-external-review whole budget (rc=$MS_RC) polls=$(wc -l <"$MS/polls") reads=$ner_reads merge.log=$(cat "$MS/merge.log"): $(cat "$MS/comment-writes" 2>/dev/null)"
+fi
+
+# Held for the whole budget with a required context still absent: the same
+# label-specific comment also lists the check.
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+MS_LABELS=needs-external-review MS_WAIT=1200 MS_POLL=15 run_merge_step
+if [ "$MS_RC" -ne 0 ] && ! squash_issued && [ "$(wc -l <"$MS/polls")" -eq 14 ] \
+   && grep -Fq 'still carries `needs-external-review` at the end of the 20-minute wait' "$MS/comment-writes" \
+   && grep -Fq -- '- Codex P1 unresolved threads (required by the branch rules): absent' "$MS/comment-writes"; then
+  pass "#2722: the label-specific comment at the end of the wait also lists the checks still not successful"
+else
+  fail "#2722: needs-external-review with an absent check (rc=$MS_RC): $(cat "$MS/comment-writes" 2>/dev/null)"
+fi
+{
+  rhc_run_line lint completed success 1 15368
+  rhc_run_line "Codex P1 unresolved threads" completed success 2 15368
+  rhc_run_line "Merge clearance gate" completed success 2 15368
+} >"$MS/runs.jsonl"
+
 # A label outside the shared predicate does not refuse.
 MS_LABELS=dependencies,needs-external-review-later run_merge_step
 if [ "$MS_RC" -eq 0 ] && grep -Fq -- "--squash --auto --match-head-commit $MS_HEAD" "$MS/merge.log" && [ ! -f "$MS/comment-writes" ]; then
