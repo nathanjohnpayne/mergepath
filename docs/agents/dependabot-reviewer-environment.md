@@ -11,7 +11,7 @@ This runbook sets up the credential that approves Dependabot pull requests, per 
 | Job | Environment | Secret | Uses it for |
 |---|---|---|---|
 | `approve` | `dependabot-reviewer` | `DEPENDABOT_REVIEWER_TOKEN` | Two calls only: `GET /user` (the identity must be in `available_reviewers` or `dependabot_reviewer_identities` and must not be the PR author) and the `APPROVE` review bound to the head's `commit_id` |
-| `merge` | `merge-queue-policy` | `AUTHOR_MERGE_TOKEN` | Unchanged: the identity check and the merge calls ([#2728](https://github.com/nathanjohnpayne/mergepath/issues/2728) owns this token) |
+| `merge` | `merge-queue-policy` | `AUTHOR_MERGE_TOKEN` | Unchanged: the identity check and the merge calls ([#2728](https://github.com/nathanjohnpayne/mergepath/issues/2728) owns this token). The environment does not hold it yet: it is a repository secret in every repository, so the job resolves that copy ([#2774](https://github.com/nathanjohnpayne/mergepath/issues/2774)) |
 
 Every other call in both jobs runs under `GITHUB_TOKEN`. Both jobs run only when the PR's base is the default branch, which makes their `pull_request.base.sha` checkout a default-branch commit. Each job also re-reads the live base before it writes, so a PR retargeted after the event is neither approved nor merged.
 

@@ -2,6 +2,7 @@
 """Read-only audit of merge-authority secret placement (#1547)."""
 import argparse
 import json
+from pathlib import Path
 import re
 import subprocess
 from urllib.parse import quote
@@ -10,6 +11,76 @@ AUTHORITY = {'AUTHOR_MERGE_TOKEN', 'REVIEWER_ASSIGNMENT_TOKEN', 'CLAUDE_PAT', 'C
              'MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN',
              'CURSOR_PAT', 'OP_SERVICE_ACCOUNT_TOKEN', 'BRANCH_PROTECTION_AUDIT_TOKEN', 'CI_ACTOR_TOKEN',
              'DEPENDABOT_REVIEWER_TOKEN'}
+
+# The code's own placement expectation (#2774): the merge-queue topology
+# validator in this library names the protected environment and the tokens
+# that must live only there. --code-placement reads it instead of keeping a
+# second copy here.
+PROTECTION_LIB = Path(__file__).resolve().parent / 'lib' / 'merge-queue-protection.sh'
+_NAME_LIST = r'\s*"[A-Z0-9_]+"(?:\s*,\s*"[A-Z0-9_]+")*\s*'
+
+
+def code_placement_expectation(text):
+    """Return (environment, names) from merge-queue-protection.sh's validator.
+
+    The validator requires the names to be absent from repository and
+    organization secrets and to be exactly the environment's secrets. Any
+    other shape is unrecognised and raises, so a refactor of the library fails
+    this audit closed instead of silently auditing nothing.
+    """
+    environments = re.findall(r'^MERGEPATH_MERGE_QUEUE_ENVIRONMENT=([A-Za-z0-9_.-]+)$', text, re.M)
+    if len(environments) != 1:
+        raise ValueError('merge-queue-protection.sh names no single protected environment')
+    environment = environments[0]
+    if re.findall(r'\.environment\.name == "([^"]*)"', text) != [environment]:
+        raise ValueError('merge-queue-protection.sh validates a different environment than it names')
+    patterns = [r'all\(\.' + scope + r'\.secrets\[\];\s*\.name as \$name \|\s*\(\[(' + _NAME_LIST
+                + r')\] \| index\(\$name\)\) == null\)' for scope in ('repository_secrets', 'organization_secrets')]
+    patterns.append(r'\(\[\.environment_secrets\.secrets\[\]\.name\] \| sort\) == \[(' + _NAME_LIST + r')\]')
+    lists = []
+    for pattern in patterns:
+        found = re.findall(pattern, text)
+        if len(found) != 1:
+            raise ValueError('merge-queue-protection.sh secret placement lists are unrecognised')
+        lists.append(re.findall(r'"([A-Z0-9_]+)"', found[0]))
+    names = lists[0]
+    if len(set(names)) != len(names) or any(sorted(other) != sorted(names) for other in lists):
+        raise ValueError('merge-queue-protection.sh secret placement lists disagree')
+    if not all(name in AUTHORITY for name in names):
+        raise ValueError('merge-queue-protection.sh names a credential outside the authority inventory')
+    return environment, sorted(names)
+
+
+def _secret_names(items, label):
+    if not isinstance(items, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in items):
+        raise ValueError(label + ' secret metadata is malformed')
+    return {item['name'] for item in items}
+
+
+def assess_placement(repo_secrets, environment, environment_name, expected_secrets, organization_secrets=None):
+    """Report where live placement departs from the code's expectation (#2774).
+
+    Flags (a) a token the code expects only in environment_name that is stored
+    as a repository or organization secret, and (b) that environment missing
+    or having no deployment branch policy at all. Other authority names at
+    repository scope are not this mode's concern; the default audit reports
+    them against #1547's isolation target. Labels come from AUTHORITY and the
+    library-validated environment name, never from observed metadata.
+    """
+    held = _secret_names(repo_secrets, 'repository')
+    shared = _secret_names([] if organization_secrets is None else organization_secrets, 'organization')
+    expected = [name for name in sorted(AUTHORITY) if name in expected_secrets]
+    drift = [f'{name} is a repository secret, but the code expects it only in environment {environment_name}'
+             for name in expected if name in held]
+    drift += [f'{name} is an organization secret shared with this repository, but the code expects it only in environment {environment_name}'
+              for name in expected if name in shared]
+    if environment is None:
+        return drift + [f'Environment {environment_name}, which the code treats as protected, does not exist']
+    if not isinstance(environment, dict):
+        raise ValueError('environment metadata must be one object')
+    if deployment_policy(environment) is None:
+        drift.append(f'Environment {environment_name}, which the code treats as protected, has no deployment branch policy')
+    return drift
 
 
 def deployment_policy(environment):
@@ -91,13 +162,22 @@ def assess(repo_secrets, environment, policies, branch, organization_secrets=Non
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True)
-    parser.add_argument('--branch', required=True)
-    parser.add_argument('--environment', default='merge-queue-policy')
+    parser.add_argument('--branch', help='the default branch (required except with --code-placement)')
+    parser.add_argument('--environment')
     parser.add_argument('--expect-secrets', metavar='NAME[,NAME...]',
                         help='also require the environment to hold exactly these secret names')
+    parser.add_argument('--code-placement', action='store_true',
+                        help='compare placement with what scripts/lib/merge-queue-protection.sh expects (#2774)')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo):
         parser.error('--repo must be owner/repository')
+    if args.code_placement:
+        if args.environment is not None or args.expect_secrets is not None:
+            parser.error('--code-placement takes its environment and secret names from merge-queue-protection.sh')
+    elif args.branch is None:
+        parser.error('--branch is required')
+    if args.environment is None:
+        args.environment = 'merge-queue-policy'
     expected = None
     if args.expect_secrets is not None:
         expected = sorted(set(args.expect_secrets.split(',')))
@@ -122,8 +202,12 @@ def main():
         return rows
 
     root = f'repos/{args.repo}'
-    env = quote(args.environment, safe='')
     try:
+        placement = None
+        if args.code_placement:
+            placement = code_placement_expectation(PROTECTION_LIB.read_text())
+            args.environment = placement[0]
+        env = quote(args.environment, safe='')
         secrets = items(root + '/actions/secrets?per_page=100', 'secrets')
         repository = api(root)
         if (len(repository) != 1 or not isinstance(repository[0], dict)
@@ -147,6 +231,16 @@ def main():
                 raise
             environments = [None]
             confirmed_missing_environment = True
+        if placement is not None:
+            # Names and settings only: no branch-policy or environment-secret
+            # read, because neither changes this mode's verdict.
+            if not confirmed_missing_environment and (len(environments) != 1 or not isinstance(environments[0], dict)):
+                raise ValueError('environment metadata must be one object')
+            drift = assess_placement(secrets, None if confirmed_missing_environment else environments[0],
+                                     placement[0], placement[1], organization_secrets)
+            print(json.dumps({'repo': args.repo, 'mode': 'code-placement', 'environment': placement[0],
+                              'status': 'DRIFT' if drift else 'PASS', 'drift': drift}))
+            return 3 if drift else 0
         if confirmed_missing_environment:
             drift = assess(secrets, None, [], args.branch, organization_secrets)
             print(json.dumps({'repo': args.repo, 'environment': args.environment,

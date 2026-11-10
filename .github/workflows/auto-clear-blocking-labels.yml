@@ -163,9 +163,12 @@ jobs:
   evaluate-and-clear:
     name: Re-evaluate codex-review-check gate
     runs-on: ubuntu-latest
-    # These are environment secrets, never repository secrets. The environment
-    # permits only main-associated deployments, so a candidate-controlled
-    # pull_request/pull_request_review workflow cannot request either PAT.
+    # The author and queue tokens are meant to be environment secrets of a
+    # main-only `merge-queue-policy` (R-107). They are not yet:
+    # AUTHOR_MERGE_TOKEN is a repository secret in every fleet repository
+    # and the environment has no deployment branch policy, so it restricts
+    # nothing and this job resolves the repository copy (#2774; the hub's
+    # credential-isolation audit reports it with --code-placement).
     environment: merge-queue-policy
     # Self-fire loop guard: when this workflow's label removal fires
     # the `unlabeled` event for `needs-external-review`, skip — we

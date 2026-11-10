@@ -33,9 +33,12 @@ jobs:
        (github.event.action == 'auto_merge_enabled' &&
         github.event.pull_request.auto_merge.enabled_by.login == github.event.pull_request.user.login))
     runs-on: ubuntu-latest
-    # All three credentials are environment-only secrets. The environment is
-    # restricted to literal main, disallows administrator bypass, and has no
-    # repository/organization secret with the same names.
+    # #1058 activation requires all three credentials to be environment-only
+    # secrets, in an environment restricted to literal main with
+    # administrator bypass off and no repository/organization secret of the
+    # same names. The queue is dormant and that is not the live placement:
+    # AUTHOR_MERGE_TOKEN is still a repository secret and the environment is
+    # unrestricted (#2774).
     environment: merge-queue-policy
     steps:
       # pull_request_target supplies trusted default-branch code. Pinning the
