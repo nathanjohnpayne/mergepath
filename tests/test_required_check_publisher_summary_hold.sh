@@ -84,6 +84,7 @@ case "$name" in
     : >"$SURFACE/gate-ran"
     [ -z "${CR_EVIDENCE_FAILURE:-}" ] || [ "$rc" -ne 0 ] || rc=3
     [ -z "${CR_TOUCH:-}" ] || printf 'moved\n' >>"$SURFACE/$CR_TOUCH"
+    [ -z "${CR_OUTPUT:-}" ] || printf '%s\n' "$CR_OUTPUT" >&2
     [ "${CR_ESCALATE:-0}" = 0 ] \
       || printf '{"repo":"example/repo","pr":7,"head":"abc123","state":"escalate"}\n' >"$CR_EVIDENCE_REPORT"
     ;;
@@ -134,7 +135,7 @@ surface_read() {  # <surface>
   local when=pre
   [ ! -e "$SURFACE/gate-ran" ] || when=post
   case "${FP_FAIL:-}" in
-    "$1:$when"|"$1:both") echo "HTTP 502: Bad Gateway (fixture $1 read)" >&2; exit 1 ;;
+    "$1:$when"|"$1:both") echo "${FP_FAIL_MESSAGE:-HTTP 502: Bad Gateway (fixture $1 read)}" >&2; exit 1 ;;
   esac
   cat "$SURFACE/$1"
   exit 0
@@ -179,6 +180,11 @@ unset REQUIRE_REVIEW_SUMMARY
 
 # shellcheck disable=SC1090,SC1091
 . "$TMP/gate-helper.sh"
+# The #2220 rate-limit reader gate() calls, the real one. No reset is read from
+# the fake gh, so the back-off title keeps the pass-start reset set here.
+# shellcheck source=scripts/workflow/installation-budget.sh
+. "$ROOT/scripts/workflow/installation-budget.sh"
+RATE_LIMIT_MARK="$IB_RATE_LIMIT_MARK" RATE_LIMIT_RESET_ISO=2026-09-25T01:00:00Z RATE_LIMITED=0 CLAIMED_HEADS=""
 export PATH="$TMP:$PATH"
 export REPO=example/repo PASS_START=2026-09-25T00:00:00Z OWN_PENDING_IDS="" OWN_GENERATIONS=""
 # Gate-mapping boundary doubles. The production generation binding, interleave
@@ -203,7 +209,7 @@ export CODEX_P1_CONTEXT="Codex P1 unresolved threads"
 export CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings"
 export MCG_RC=0 CODEX_RC=0 CR_RC=0 RELAY_RC=0
 export DRIVER_LOG="$TMP/driver-log" RELAY_LOG="$TMP/relay-log"
-unset CODEX_P1_VERDICT_REPORT DRIVER_NO_REPORT FP_FAIL CR_TOUCH CR_ESCALATE CR_EVIDENCE_FAILURE
+unset CODEX_P1_VERDICT_REPORT DRIVER_NO_REPORT FP_FAIL FP_FAIL_MESSAGE CR_TOUCH CR_ESCALATE CR_OUTPUT CR_EVIDENCE_FAILURE
 
 run_call() {
   local call="$1" previous="$PWD"
@@ -222,6 +228,7 @@ reset_case() {
   for s in comments reviews inline threads; do printf '%s-v1\n' "$s" >"$SURFACE/$s"; done
   had_infra_error=0
   EVIDENCE_ESCALATIONS=""
+  RATE_LIMITED=0
 }
 
 one_post() {
@@ -393,6 +400,35 @@ case_rc=$?
 set -e
 record "both surface reads failed: the gate's evidence hold closes the generation red as an infra error" "$case_rc"
 unset FP_FAIL
+
+# An rc 3 hold whose output shows the installation rate limit is the #2220
+# stop's back-off red, titled with the mark due() reads, like every other
+# rate-limited exit: from both surface reads failing on the limit, or from
+# the gate's own output. The pass stops, so a later unclaimed head is not
+# evaluated. An rc 3 without that text stays the evidence hold (above).
+rate_limited_hold_case() {  # <label> <expected had_infra_error>
+  run_call "$CR_CALL" >"$TMP/cr-rate-limited-hold.out" 2>&1
+  : >"$GH_CALL_LOG.after"
+  GH_CALL_LOG="$GH_CALL_LOG.after" run_call "$MCG_CALL" >"$TMP/cr-after-stop.out" 2>&1
+  set +e
+  [ "$RATE_LIMITED" -eq 1 ] && [ "$had_infra_error" -eq "$2" ] && one_post \
+    && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+    && [ "$(closed_title)" = "CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=3); re-evaluated after 2026-09-25T01:00:00Z" ] \
+    && [ ! -s "$GH_CALL_LOG.after" ]
+  case_rc=$?
+  set -e
+  record "$1" "$case_rc"
+}
+reset_case
+CR_RC=0 FP_FAIL=threads:both FP_FAIL_MESSAGE="gh: API rate limit already exceeded for installation ID 4242."
+export CR_RC FP_FAIL FP_FAIL_MESSAGE
+rate_limited_hold_case "both surface reads failed on the rate limit: the rc 3 hold publishes the back-off red and stops the pass" 1
+unset FP_FAIL FP_FAIL_MESSAGE
+reset_case
+CR_RC=3 CR_OUTPUT="gh: API rate limit exceeded for installation ID 4242. (HTTP 403)"; export CR_RC CR_OUTPUT
+rate_limited_hold_case "an rc 3 hold whose own output shows the rate limit publishes the back-off red as an infra error" 1
+unset CR_OUTPUT
+CR_RC=0; export CR_RC
 
 # The gate's own infrastructure exit outranks both comparisons. The sweep
 # reads the surface again and ignores it; the publisher does not read it.
@@ -759,6 +795,14 @@ guard_mutation "a surface change that keeps the evidence report" \
   "$(printf '%s\n%s' 'closing this generation red for a fresh evaluation."' '                  : >"$CR_EVIDENCE_REPORT"')" \
   'closing this generation red for a fresh evaluation."' \
   'FAIL: a inline change during the CodeRabbit evaluation closes the generation red, unpublished'
+guard_mutation "an rc 3 summary hold that ignores the rate-limit stop" \
+  'if [ "$summary_hold" = true ] && [ "$rate_limit_red" -eq 0 ]; then' \
+  'if [ "$summary_hold" = true ]; then' \
+  'FAIL: an rc 3 hold whose own output shows the rate limit publishes the back-off red as an infra error'
+guard_mutation "a back-off title written only for exits other than rc 3" \
+  'if [ "$rate_limit_red" -eq 1 ]; then' \
+  'if [ "$rate_limit_red" -eq 1 ] && [ "$rc" -ne 3 ]; then' \
+  'FAIL: both surface reads failed on the rate limit: the rc 3 hold publishes the back-off red and stops the pass'
 guard_mutation "a publisher fingerprint that drops a surface the sweep reads" \
   "printf '%s\035%s\035%s\035%s' \"\$comments\" \"\$reviews\" \"\$inline\" \"\$threads\"" \
   "printf '%s\035%s\035%s' \"\$comments\" \"\$reviews\" \"\$inline\"" \
@@ -768,4 +812,4 @@ if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
   exit 1
 fi
-echo "All $pass required-check publisher summary-hold behavior tests, 12 mutations, and unrelated-failure control passed."
+echo "All $pass required-check publisher summary-hold behavior tests, 14 mutations, and unrelated-failure control passed."

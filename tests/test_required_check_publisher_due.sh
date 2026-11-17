@@ -67,8 +67,9 @@
 #      that PR's generation red while later PRs are still evaluated; each
 #      evaluation reads the four surfaces once before and once after the
 #      gate; a rate-limited gate stops the pass with the back-off red and no
-#      second surface read; and a rate-limited fingerprint read after the gate
-#      stops it the same way.
+#      second surface read; a rate-limited fingerprint read after the gate
+#      stops it the same way; and an rc 3 hold after both reads failed on the
+#      limit is the back-off red.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -133,6 +134,9 @@ if [ "${RL_FAIL_PR:-}" = "$1" ] \
   fi
   exit 2
 fi
+# #2690: told that a surface read failed, the CodeRabbit gate holds (rc 3),
+# as the real one does when it reaches a clean verdict.
+[ "$(basename "$0")" != coderabbit-severity-gate.sh ] || [ -z "${CR_EVIDENCE_FAILURE:-}" ] || exit 3
 if [ "$(basename "$0")" = merge-clearance-gate.sh ]; then
   # MCG_RED_PRS (#2239): these PRs get a red clearance verdict.
   case " ${MCG_RED_PRS:-} " in *" $1 "*) echo "Merge clearance: FAIL"; exit 1 ;; esac
@@ -294,8 +298,10 @@ elif method == "GET" and re.fullmatch(r"/pulls/\d+/(reviews|comments)", path):
     # reads. CR_POST_RL_PR's review read after its CodeRabbit gate fails on the
     # exhausted installation budget.
     n = path.split("/")[2]
-    if path.endswith("/reviews") and os.environ.get("CR_POST_RL_PR") == n \
-            and os.path.exists(os.path.join(os.environ["CR_RAN_DIR"], n)):
+    # CR_BOTH_RL_PR's review read fails that way before the gate and after it.
+    if path.endswith("/reviews") and (os.environ.get("CR_BOTH_RL_PR") == n or (
+            os.environ.get("CR_POST_RL_PR") == n
+            and os.path.exists(os.path.join(os.environ["CR_RAN_DIR"], n)))):
         open(os.environ["EXHAUST_FLAG"], "w").close()
         sys.stderr.write("gh: API rate limit exceeded for installation ID 4242. (HTTP 403)\n"); sys.exit(1)
     body = []
@@ -1097,6 +1103,13 @@ check "rate-limited fingerprint read: the gate re-runs once, and nothing is eval
   [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 coderabbit-severity-gate.sh:3 coderabbit-severity-gate.sh:3 codex-p1-gate.sh:1 codex-p1-gate.sh:3 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
 check "rate-limited fingerprint read: PR 3's CodeRabbit generation closes with the back-off red" \
   eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
+
+# Both fingerprint reads fail on the exhausted budget, so the gate is told the
+# surface is unreadable and holds (rc 3). That hold is the #2220 stop's
+# back-off red, with the mark due() reads, not the ordinary evidence hold.
+CR_BOTH_RL_PR=3 run_pass cr-both-ratelimit workflow_run "$H1" pull_request ""
+check "both fingerprint reads rate-limited: the hold is the back-off red, and the pass stops" \
+  eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=3); re-evaluated after 2026-10-14T03:20:00Z" ] && [ "$(grep -c "^coderabbit-severity-gate.sh	3$" "$TMP/gates.log")" = 1 ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
 
 echo "required-check publisher due-only targeting tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

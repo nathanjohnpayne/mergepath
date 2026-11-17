@@ -1168,7 +1168,10 @@ jobs:
               1) conclusion="failure" ;;
               3)
                 conclusion="failure"
-                if [ "$summary_hold" = true ]; then
+                # A CodeRabbit hold whose output shows the installation rate
+                # limit is that stop's usual infra red, titled for the back-off
+                # below like every other rate-limited exit (#2690).
+                if [ "$summary_hold" = true ] && [ "$rate_limit_red" -eq 0 ]; then
                   title="$context — evidence hold; explicit recovery required after escalation"
                 else
                   had_infra_error=1
@@ -1183,18 +1186,19 @@ jobs:
                 had_infra_error=1
                 conclusion="failure"
                 title="$context — infra/config error (rc=$rc)"
-                if [ "$rate_limit_red" -eq 1 ]; then
-                  # Identifiable by due()'s rate-limit back-off (#2220): the
-                  # fixed mark plus the window's reset, so event passes leave
-                  # this PR alone until the budget refills, and the first
-                  # pass after the reset re-evaluates it with no manual rerun.
-                  title="$context — ${RATE_LIMIT_MARK:-installation API budget exhausted} (rc=$rc)"
-                  if [ -n "${RATE_LIMIT_RESET_ISO:-}" ]; then
-                    title="$title; re-evaluated after $RATE_LIMIT_RESET_ISO"
-                  fi
-                fi
                 ;;
             esac
+            if [ "$rate_limit_red" -eq 1 ]; then
+              # Identifiable by due()'s rate-limit back-off (#2220): the
+              # fixed mark plus the window's reset, so event passes leave
+              # this PR alone until the budget refills, and the first
+              # pass after the reset re-evaluates it with no manual rerun.
+              # Any exit but 0 or 1, rc 3 included (#2690).
+              title="$context — ${RATE_LIMIT_MARK:-installation API budget exhausted} (rc=$rc)"
+              if [ -n "${RATE_LIMIT_RESET_ISO:-}" ]; then
+                title="$title; re-evaluated after $RATE_LIMIT_RESET_ISO"
+              fi
+            fi
             # The Codex P1 path names its verdict the way the gate sweep does
             # (#2689). The rate-limit title stays, because due() reads it.
             if [ -n "$verdict_title" ] && [ "$rate_limit_red" -eq 0 ]; then
