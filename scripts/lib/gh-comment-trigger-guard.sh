@@ -1,12 +1,15 @@
 # shellcheck shell=bash
 # Shared runtime comment guard for the token-verifying wrappers (#2158).
 # Sourcing defines functions only; every payload file is private and ephemeral.
+# Every interpreter here runs isolated (-I -S, #2348), so the caller's
+# PYTHONPATH, PYTHONHOME, site and user customization and current directory
+# cannot change the guard's verdict or its snapshot cleanup.
 gh_comment_guard_prepare() {
   local argument
   GH_COMMENT_GUARD_ARGS=("$@")
   GH_COMMENT_GUARD_STATE=$(mktemp -d "${TMPDIR:-/tmp}/gh-comment-guard.XXXXXX") || return 1
   chmod 700 "$GH_COMMENT_GUARD_STATE" || return 1
-  python3 "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
+  python3 -I -S "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
     --role "$GH_COMMENT_GUARD_ROLE" --state-dir "$GH_COMMENT_GUARD_STATE" -- "$@" || return 1
   GH_COMMENT_GUARD_ARGS=()
   while IFS= read -r -d '' argument; do
@@ -183,7 +186,7 @@ gh_comment_guard_authorize() {
 }
 
 gh_comment_guard_cleanup() {
-  [ -z "${GH_COMMENT_GUARD_STATE:-}" ] || python3 - "$GH_COMMENT_GUARD_STATE" <<'PY'
+  [ -z "${GH_COMMENT_GUARD_STATE:-}" ] || python3 -I -S - "$GH_COMMENT_GUARD_STATE" <<'PY'
 import shutil, sys
 shutil.rmtree(sys.argv[1])
 PY

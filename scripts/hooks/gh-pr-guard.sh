@@ -360,7 +360,10 @@ GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
 . "$GUARD_REPO_ROOT/scripts/lib/gh-command-classifier.sh"
 PREFIX_VALUE_OPTS_SPEC="$GH_PREFIX_VALUE_OPTS_SPEC"
 export PREFIX_VALUE_OPTS_SPEC
-if ! printf '%s' "$COMMAND" | python3 -c '
+# Isolated (-I -S, #2348): the tokens decide what the guards below inspect, so
+# PYTHONPATH, PYTHONHOME, site and user customization, and modules in the
+# current directory (sys.path[0] for -c) must not reach this interpreter.
+if ! printf '%s' "$COMMAND" | python3 -I -S -c '
 import sys, shlex, re, os
 
 # chr(39)/chr(34) are single/double quote; chr() avoids embedding a
@@ -1881,7 +1884,8 @@ for i in "${!TOKENS[@]}"; do
         is_guard_separator "${TOKENS[$comment_arg]}" && break
         comment_guard_argv+=("${TOKENS[$comment_arg]}")
       done
-      comment_guard_result=$(python3 "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
+      # Isolated like the tokenizer above (#2348).
+      comment_guard_result=$(python3 -I -S "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
         --role hook -- "${comment_guard_argv[@]}") || exit 2
       if ! comment_guard_boolean=$(printf '%s' "$comment_guard_result" | jq -ers '
         if length == 1 and (.[0] | type) == "object" and
