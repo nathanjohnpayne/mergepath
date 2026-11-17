@@ -64,7 +64,10 @@ if [ "$1" = api ] && [ "$2" != --paginate ]; then
 elif [ "$1" = api ] && [ "$2" = --paginate ]; then
   printf '%s\n' "$3" >> "$LIVE_CALLS"
   case "$3" in
-    repos/octo/demo/actions/runs/*/jobs?per_page=100) echo '{"id":1,"name":"lint","conclusion":"success","started_at":"2026-09-27T00:01:00Z","completed_at":"2026-09-27T00:02:00Z","steps":[]}' ;;
+    repos/octo/demo/actions/runs/*/jobs?per_page=100)
+      # LIVE_JOBS_PAD_BYTES > 0 inflates the job object with a field the
+      # normalizer drops, modelling a run whose raw jobs JSON is large (#3012).
+      jq -nc --argjson pad "${LIVE_JOBS_PAD_BYTES:-0}" '{id:1,name:"lint",conclusion:"success",started_at:"2026-09-27T00:01:00Z",completed_at:"2026-09-27T00:02:00Z",steps:[]} + (if $pad > 0 then {padding:("x" * $pad)} else {} end)' ;;
     *) echo "unexpected jobs URL: $3" >&2; exit 1 ;;
   esac
 else
@@ -82,6 +85,33 @@ if PATH="$LIVE_SHIM:$PATH" LIVE_CALLS="$TMP/live-calls.log" GH_TOKEN=test-token 
   pass "historical live collection bounds the first page at both ends and retains the eligible runs"
 else
   fail "historical live collection must send a closed created range and report the in-window page"
+fi
+
+# #3012: a run's raw jobs JSON must reach jq through a file, never the command
+# line. One argument over 128 KiB fails execve on Linux (MAX_ARG_STRLEN) and
+# exits 126 with "Argument list too long"; 1.5 MB also exceeds the whole-argv
+# limit on macOS, so the unfixed script fails this case on either platform.
+# The normalized records must match the small-payload run byte for byte.
+EXPECTED_NORMALIZED='{"id":2,"run_attempt":1,"head_sha":"live-2","event":"pull_request","conclusion":"success","created_at":"2026-09-27T00:00:00Z","duration_seconds":60,"jobs":[{"name":"lint","conclusion":"success","duration_seconds":60,"steps":[]}]}
+{"id":1,"run_attempt":1,"head_sha":"live-1","event":"pull_request","conclusion":"success","created_at":"2026-09-27T00:00:00Z","duration_seconds":60,"jobs":[{"name":"lint","conclusion":"success","duration_seconds":60,"steps":[]}]}'
+if [ "$(cat "$LIVE_OUT/normalized-runs.jsonl" 2>/dev/null)" = "$EXPECTED_NORMALIZED" ]; then
+  pass "small live job payloads normalize to the pinned records"
+else
+  fail "normalized records for the small live fixture changed"
+fi
+BIG_OUT="$TMP/live-oversized"
+set +e
+PATH="$LIVE_SHIM:$PATH" LIVE_CALLS="$TMP/live-calls.log" LIVE_JOBS_PAD_BYTES=1500000 GH_TOKEN=test-token \
+  bash "$SUBJECT" --repo octo/demo --as-of "$AS_OF" --limit 2 --min-sample 1 --out-dir "$BIG_OUT" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] \
+   && [ "$(wc -c < "$BIG_OUT/jobs-1.json")" -gt 131072 ] \
+   && [ "$(cat "$BIG_OUT/normalized-runs.jsonl")" = "$EXPECTED_NORMALIZED" ] \
+   && cmp -s "$BIG_OUT/summary.json" "$LIVE_OUT/summary.json"; then
+  pass "a run whose jobs JSON exceeds the argument limit is normalized, with records identical to the small payload"
+else
+  fail "oversized jobs JSON must be normalized without passing it on the jq command line (rc=$rc)"
 fi
 
 jq -n '{runs:[range(0;20) as $i | {
@@ -120,6 +150,22 @@ if run_report --input "$TMP/healthy.json" --out-dir "$TMP/healthy" --min-sample 
   fi
 else
   fail "healthy sample must not alert"
+fi
+
+# #3012, replay path: the windowed runs array must also stay off the jq command
+# line. Padding every run with an ignored field makes the array exceed the
+# argument limit; the verdict must equal the unpadded sample's.
+jq '.runs |= map(. + {padding:("x" * 40000)})' "$TMP/healthy.json" > "$TMP/healthy-padded.json"
+set +e
+run_report --input "$TMP/healthy-padded.json" --out-dir "$TMP/healthy-padded" --min-sample 20 >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] \
+   && [ "$(wc -c < "$TMP/healthy-padded.json")" -gt 1500000 ] \
+   && cmp -s "$TMP/healthy-padded/summary.json" "$TMP/healthy/summary.json"; then
+  pass "an --input sample larger than the argument limit produces the same verdict as the unpadded sample"
+else
+  fail "oversized --input samples must not be passed on the jq command line (rc=$rc)"
 fi
 
 jq '.runs += [(.runs[0] | .id=99)]' "$TMP/healthy.json" > "$TMP/duplicate.json"
