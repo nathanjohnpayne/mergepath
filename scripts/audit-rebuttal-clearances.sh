@@ -49,6 +49,12 @@
 #                  a rebuttal or a re-read after the merge counts for
 #                  neither side, and a reply edited after the merge is not
 #                  read as a rebuttal (its merge-time text is unknown).
+#                  Such a reply also cannot supersede an earlier rebuttal:
+#                  it is left out of the reply-polarity reduction, as if
+#                  absent, the way a post-merge-edited tag is (#3021).
+#                  Excluded rather than reported as not measured because a
+#                  late typo fix is common and would exit 4 for findings
+#                  that are otherwise measurable.
 #   resolved       the thread's isResolved is true when the audit reads it
 #                  (it cannot be bounded by the merge; see the limits).
 #   rebuttal time  two datings, both reported. A reply (tag or rebuttal) is
@@ -512,7 +518,10 @@ def human: (.type != "Bot") and ((.login | endswith("[bot]")) | not) and .login 
     | [ $t.comments[1:][] | select(.login != $bot and ((.body // "") | test("\\[mergepath-resolve:\\s*rebuttal-recorded\\]")))
         | [.created_at, .edited_at] | tmax | select(pre) ] as $tag
     | [ $t.root_downs[] | select(.login != "" and .login != $bot and .login != ($bot | sub("\\[bot\\]$"; ""))) | .created_at | select(pre) ] as $down
-    | (reduce ($t.comments[1:][] | select(.created_at | pre)) as $e (null;
+    # A reply last edited at or after the merge is left out of the reduction
+    # whole: its merge-time text is unknown, so it can neither supersede an
+    # earlier rebuttal nor be one (#3021). A pre-merge edit still counts.
+    | (reduce ($t.comments[1:][] | select(([.created_at, .edited_at] | tmax) | pre)) as $e (null;
          if ($e | agent) and ($e | marker | not) and (($pol[0][($e.id | tostring)] // "") != "")
          then {polarity: $pol[0][($e.id | tostring)], at: ([$e.created_at, $e.edited_at] | tmax)} else . end)) as $reply
     # A reply edited after the merge may not have said this at merge time.
