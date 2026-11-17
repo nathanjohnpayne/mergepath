@@ -89,11 +89,13 @@ if [ -n "$INPUT" ]; then
   jq -e '.runs | type == "array"' "$INPUT" >/dev/null \
     || { echo "repo-lint latency: input must contain a runs array" >&2; exit 2; }
   jq '.runs' "$INPUT" > "$OUT_DIR/input-runs.json"
-  if ! windowed=$(window_runs "$OUT_DIR/input-runs.json"); then
+  # The windowed array goes to jq through a file: as a command-line argument
+  # it fails execve once the sample outgrows the argument limit (#3012).
+  if ! window_runs "$OUT_DIR/input-runs.json" > "$OUT_DIR/input-runs-windowed.json"; then
     echo "repo-lint latency: every input run must carry an ISO-8601 created_at" >&2
     exit 2
   fi
-  jq -n --argjson runs "$windowed" '{runs:$runs}' > "$DATA"
+  jq '{runs:.}' "$OUT_DIR/input-runs-windowed.json" > "$DATA"
 else
   [ -n "$REPO" ] || { echo "repo-lint latency: --repo or GITHUB_REPOSITORY is required" >&2; exit 2; }
   command -v gh >/dev/null 2>&1 || { echo "repo-lint latency: gh is required for live collection" >&2; exit 2; }
@@ -138,12 +140,17 @@ else
       echo "repo-lint latency: could not fetch jobs for run $run_id" >&2
       exit 3
     fi
-    jobs=$(<"$jobs_file")
-    jq -cn --argjson run "$run" --argjson jobs "$jobs" '
+    # The jobs array is read from its file (--slurpfile) and the run from
+    # stdin. Passing the jobs JSON as an --argjson value put a whole run's raw
+    # job and step records in one argument, which exceeds the kernel's
+    # per-argument limit (128 KiB on Linux) on a large run: execve fails and
+    # the collection exits 126 with no verdict (#3012).
+    jq -c --slurpfile jobs_doc "$jobs_file" '
       def seconds($start; $end):
         if ($start == null or $end == null) then null
         else (($end | fromdateiso8601) - ($start | fromdateiso8601))
         end;
+      . as $run | $jobs_doc[0] as $jobs |
       {
         id:$run.id,
         run_attempt:($run.run_attempt // 1),
@@ -160,7 +167,7 @@ else
             duration_seconds:seconds(.started_at; .completed_at)
           }]
         }]
-      }' >> "$OUT_DIR/normalized-runs.jsonl"
+      }' <<<"$run" >> "$OUT_DIR/normalized-runs.jsonl"
   done < <(jq -c '.[]' "$RUN_LIST")
   jq -s '{runs:.}' "$OUT_DIR/normalized-runs.jsonl" > "$DATA"
 fi
