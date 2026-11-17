@@ -62,6 +62,14 @@
 #      fork and Dependabot heads with a pending relay, an unverified marker or
 #      a failed scan are withheld, and same-repository heads are not scanned.
 #      Everywhere else a boundary driver runs the stub gate and reports it.
+#  16. #2690: the CodeRabbit context inside the sweep's pre/post surface
+#      fingerprint: a surface that changes while one PR's gate runs closes
+#      that PR's generation red while later PRs are still evaluated; each
+#      evaluation reads the four surfaces once before and once after the
+#      gate; a rate-limited gate stops the pass with the back-off red and no
+#      second surface read; a rate-limited fingerprint read after the gate
+#      stops it the same way; and an rc 3 hold after both reads failed on the
+#      limit is the back-off red.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -108,6 +116,9 @@ for g in merge-clearance-gate.sh codex-p1-gate.sh coderabbit-severity-gate.sh; d
   cat >"$TMP/work/scripts/$g" <<'SH'
 #!/usr/bin/env bash
 printf '%s\t%s\n' "$(basename "$0")" "$1" >>"$GATE_LOG"
+# #2690: the fake gh changes or fails this PR's CodeRabbit surface once its
+# CodeRabbit gate has run (CR_CHURN_PR, CR_POST_RL_PR).
+[ "$(basename "$0")" != coderabbit-severity-gate.sh ] || : >"$CR_RAN_DIR/$1"
 # RL_FAIL_PR: this PR's first gate fails the way an exhausted installation
 # budget makes gh fail (#2220): the API message on stderr, an infra rc.
 # RL_EXHAUST_BUCKET=graphql words it the way the GraphQL bucket does. Either
@@ -123,6 +134,9 @@ if [ "${RL_FAIL_PR:-}" = "$1" ] \
   fi
   exit 2
 fi
+# #2690: told that a surface read failed, the CodeRabbit gate holds (rc 3),
+# as the real one does when it reaches a clean verdict.
+[ "$(basename "$0")" != coderabbit-severity-gate.sh ] || [ -z "${CR_EVIDENCE_FAILURE:-}" ] || exit 3
 if [ "$(basename "$0")" = merge-clearance-gate.sh ]; then
   # MCG_RED_PRS (#2239): these PRs get a red clearance verdict.
   case " ${MCG_RED_PRS:-} " in *" $1 "*) echo "Merge clearance: FAIL"; exit 1 ;; esac
@@ -273,7 +287,28 @@ elif method == "GET" and path == "/actions/workflows/codex-p1-gate.yml/runs":
     runs_for = fx.get("relay_runs", {}).get(fields.get("event", ""), [])
     body = {"total_count": len(runs_for), "workflow_runs": runs_for}
 elif method == "GET" and re.fullmatch(r"/issues/\d+/comments", path):
-    body = fx.get("comments", {}).get(path.split("/")[2], [])
+    n = path.split("/")[2]
+    body = fx.get("comments", {}).get(n, [])
+    # #2690: CR_CHURN_PR's PR-comment surface gains an acknowledgement while
+    # its CodeRabbit gate runs, so the fingerprint read after it differs.
+    if os.environ.get("CR_CHURN_PR") == n and os.path.exists(os.path.join(os.environ["CR_RAN_DIR"], n)):
+        body = body + [{"id": 4242, "updated_at": "2026-10-14T03:00:30Z", "body": "late acknowledgement"}]
+elif method == "GET" and re.fullmatch(r"/pulls/\d+/(reviews|comments)", path):
+    # #2690: the CodeRabbit surface fingerprint's review-object and inline
+    # reads. CR_POST_RL_PR's review read after its CodeRabbit gate fails on the
+    # exhausted installation budget.
+    n = path.split("/")[2]
+    # CR_BOTH_RL_PR's review read fails that way before the gate and after it.
+    if path.endswith("/reviews") and (os.environ.get("CR_BOTH_RL_PR") == n or (
+            os.environ.get("CR_POST_RL_PR") == n
+            and os.path.exists(os.path.join(os.environ["CR_RAN_DIR"], n)))):
+        open(os.environ["EXHAUST_FLAG"], "w").close()
+        sys.stderr.write("gh: API rate limit exceeded for installation ID 4242. (HTTP 403)\n"); sys.exit(1)
+    body = []
+elif method == "GET" and endpoint == "graphql" and "reviewThreads" in fields.get("query", ""):
+    # #2690: the fingerprint's thread-resolution read; no threads.
+    body = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}}
 elif method == "POST" and path == "/check-runs":
     body = {"id": 900000000 + sum(1 for _ in open(os.environ["GH_LOG"])),
             "head_sha": fields["head_sha"], "name": fields["name"], "status": fields["status"],
@@ -342,11 +377,12 @@ PY
 
 run_pass() {  # run_pass <label> <event_name> <run_head> <parent_event> <dispatch_pr>
   : >"$TMP/gates.log"; : >"$TMP/gh.log"; : >"$TMP/github-output"; rm -f "$TMP/exhausted" "$TMP/gh.log.rejected"
+  rm -rf "$TMP/cr-ran"; mkdir "$TMP/cr-ran"
   local rc=0
   (
     cd "$TMP/work"
     export PATH="$TMP/bin:$PATH" FIXTURE="$TMP/fixture.json" GH_LOG="$TMP/gh.log" GATE_LOG="$TMP/gates.log"
-    export REPO="acme/widget" GITHUB_RUN_ID=4242 GH_TOKEN=x EXHAUST_FLAG="$TMP/exhausted"
+    export REPO="acme/widget" GITHUB_RUN_ID=4242 GH_TOKEN=x EXHAUST_FLAG="$TMP/exhausted" CR_RAN_DIR="$TMP/cr-ran"
     export EVENT_NAME="$2" RUN_HEAD="$3" PARENT_EVENT="$4" DISPATCH_PR="$5"
     export GITHUB_OUTPUT="$TMP/github-output"
     export PARENT_NAME="${CASE_PARENT_NAME:-Merge Clearance Gate}"
@@ -1006,6 +1042,74 @@ for f in codex-p1-snapshot-retry.py codex-p1-relay-pending.sh; do
   cp "$TMP/boundary-$f" "$TMP/work/scripts/workflow/$f"
 done
 rm -f "$TMP/work/scripts/workflow/feedback-archive-relay-source.sh" "$TMP/work/scripts/workflow/verified-relay-markers.py"
+
+# ── 16. #2690: the CodeRabbit surface fingerprint bracket ─────────────
+echo "#2690 CodeRabbit surface bracket cases"
+# cr_verdict <head>: "<closes>|<conclusion>|<title>" for the CodeRabbit
+# generations on <head>, as codex_verdict reads the Codex P1 ones.
+cr_verdict() {
+  python3 - "$TMP/gh.log" "$1" <<'PY2'
+import json, sys
+opened, out, n = {}, "absent", 0
+for index, line in enumerate(open(sys.argv[1]), 1):
+    method, endpoint, fields = line.rstrip("\n").split(" ", 2)
+    f = json.loads(fields)
+    if method == "POST" and endpoint.endswith("/check-runs"):
+        opened[900000000 + index] = f
+    elif method == "PATCH":
+        o = opened.get(int(endpoint.rsplit("/", 1)[1]), {})
+        if o.get("name") == "CodeRabbit unresolved blocking findings" and o.get("head_sha") == sys.argv[2]:
+            n += 1
+            out = f"{f.get('conclusion')}|{f.get('output[title]')}"
+print(f"{n}|{out}")
+PY2
+}
+# surface_reads <pr>: "<comments> <reviews> <inline> <threads>", how many
+# times this pass read each of the PR's four CodeRabbit surfaces.
+surface_reads() {
+  printf '%s %s %s %s' \
+    "$(grep -c "^GET repos/acme/widget/issues/$1/comments " "$TMP/gh.log" || true)" \
+    "$(grep -c "^GET repos/acme/widget/pulls/$1/reviews " "$TMP/gh.log" || true)" \
+    "$(grep -c "^GET repos/acme/widget/pulls/$1/comments " "$TMP/gh.log" || true)" \
+    "$(grep "^GET graphql " "$TMP/gh.log" | grep -c "\"pr\": \"$1\"" || true)"
+}
+
+# An acknowledgement lands on PR 3 while its CodeRabbit gate runs. As in the
+# sweep, that evaluation is not published over it: its generation closes red
+# as an infrastructure error, and every later PR is still evaluated.
+CR_CHURN_PR=3 run_pass cr-churn workflow_run maintip schedule ""
+check "surface changed: PR 3's CodeRabbit generation closes red, once, as an infrastructure error" \
+  eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — infra/config error (rc=2)" ] && [ "$RC" -ne 0 ] && grep -q "PR #3 comment surface changed while the gate ran" "$TMP/out.log"'
+check "surface changed: every PR is still evaluated, and an unchanged PR's verdict is published" \
+  eval '[ "$EVALUATED" = "1 2 3 4 5 6 7 8 9 10 11" ] && [ "$(grep -c "^coderabbit-severity-gate.sh" "$TMP/gates.log")" = 11 ] && [ "$(cr_verdict "$H1")" = "1|success|CodeRabbit unresolved blocking findings (publisher re-evaluation)" ]'
+check "the bracket reads each of the four surfaces once before and once after the gate" \
+  eval '[ "$(surface_reads 1)" = "2 2 2 2" ] && [ "$(surface_reads 3)" = "2 2 2 2" ]'
+
+# #2220 on the bracketed path: the CodeRabbit gate fails on the exhausted
+# budget. The pass stops, the red carries the back-off title, and the surface
+# is not read again after the failed gate.
+RL_FAIL_PR=3 RL_FAIL_GATE=coderabbit-severity-gate.sh run_pass cr-ratelimit workflow_run "$H1" pull_request ""
+check "rate-limited CodeRabbit gate: nothing is evaluated after it" \
+  [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 coderabbit-severity-gate.sh:3 codex-p1-gate.sh:1 codex-p1-gate.sh:3 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
+check "rate-limited CodeRabbit gate: the back-off red, and no surface read after the gate" \
+  eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" ] && [ "$(surface_reads 3)" = "1 1 1 1" ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
+
+# The fingerprint read after PR 3's clean gate fails on the exhausted budget.
+# Its error reaches the #2220 stop: the generation closes with the back-off
+# red, and no later PR is evaluated. The clean gate is re-run once under the
+# evidence failure first, as in the sweep.
+CR_POST_RL_PR=3 run_pass cr-fp-ratelimit workflow_run "$H1" pull_request ""
+check "rate-limited fingerprint read: the gate re-runs once, and nothing is evaluated after it" \
+  [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 coderabbit-severity-gate.sh:3 coderabbit-severity-gate.sh:3 codex-p1-gate.sh:1 codex-p1-gate.sh:3 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
+check "rate-limited fingerprint read: PR 3's CodeRabbit generation closes with the back-off red" \
+  eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
+
+# Both fingerprint reads fail on the exhausted budget, so the gate is told the
+# surface is unreadable and holds (rc 3). That hold is the #2220 stop's
+# back-off red, with the mark due() reads, not the ordinary evidence hold.
+CR_BOTH_RL_PR=3 run_pass cr-both-ratelimit workflow_run "$H1" pull_request ""
+check "both fingerprint reads rate-limited: the hold is the back-off red, and the pass stops" \
+  eval '[ "$(cr_verdict "$H3")" = "1|failure|CodeRabbit unresolved blocking findings — installation API budget exhausted (rc=3); re-evaluated after 2026-10-14T03:20:00Z" ] && [ "$(grep -c "^coderabbit-severity-gate.sh	3$" "$TMP/gates.log")" = 1 ] && [ -z "$(writes_outside "$H1" "$H3")" ] && [ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
 
 echo "required-check publisher due-only targeting tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -807,9 +807,11 @@ rcg_close owner/repo 7 {HEAD} '{CONTEXT}' "$old" success 'old success' clean'''
     def test_consolidated_gate_opens_every_selected_context_before_evaluation(self):
         program = self.workflow_step("required-check-publisher.yml", "publish", "gate() {")
         # #2689: the Codex P1 context evaluates through codex_p1_evaluate and
-        # the snapshot driver, in report mode, so both shipped functions run.
+        # the snapshot driver, in report mode, and #2690 the CodeRabbit context
+        # through coderabbit_evaluate and its surface fingerprint, so all four
+        # shipped functions run.
         functions = []
-        for name in ("codex_p1_evaluate() {", "gate() {"):
+        for name in ("codex_p1_evaluate() {", "cr_surface_fp() {", "coderabbit_evaluate() {", "gate() {"):
             start = program.index(name)
             functions.append(program[start:program.index("\n}", start) + 2])
         gate = "\n".join(functions)
