@@ -130,7 +130,12 @@ chmod +x "$STUB_DIR/gh"
 REAL_PYTHON="$(command -v python3)"
 cat >"$STUB_DIR/python3" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${1:-}" == */gh-comment-trigger-guard.py && "${STUB_COMMENT_GUARD_STUB:-0}" = 1 ]]; then
+# The script is the first argument after the interpreter options (-I -S, #2348).
+script=""
+for arg in "$@"; do
+  case "$arg" in -*) ;; *) script="$arg"; break ;; esac
+done
+if [[ "$script" == */gh-comment-trigger-guard.py && "${STUB_COMMENT_GUARD_STUB:-0}" = 1 ]]; then
   printf '%s' "${STUB_COMMENT_GUARD_OUTPUT:-}"
   exit "${STUB_COMMENT_GUARD_EXIT:-0}"
 fi
@@ -1968,6 +1973,102 @@ _ng2=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","c
 if [ "${_ng2:-x}" = "0" ]; then pass "merge-state jq: all-terminal-green stays 0 (no false block) (#553)"; else fail "merge-state jq (#553): expected 0, got '$_ng2'"; fi
 }
 case_pool_add pr_guard_case_29
+
+# #2348: the hook's two interpreters (the shlex tokenizer and the comment
+# guard) run isolated, so a caller's Python environment cannot change the
+# verdict. The hostile controls: a PYTHONPATH directory with sitecustomize and
+# usercustomize, plus shadows of the stdlib json (which defeats the guard's
+# trigger patterns) and shlex (which hides every gh token), the same shadows in
+# the current directory (sys.path[0] for -c), PYTHONSTARTUP, and separately a
+# PYTHONHOME that no interpreter can start from. Every hostile module appends
+# its name to a marker file, so the case asserts it was never imported rather
+# than inferring that from the verdict. Controlled copies with one call site's
+# flags removed prove the controls bite at each site.
+pr_guard_case_30() {
+local hostile="$WORKDIR/hostile-python" marker="$WORKDIR/hostile-python.imported" mod
+mkdir -p "$hostile/path" "$hostile/cwd"
+cat >"$hostile/shadow.py" <<'PY'
+import os, sys
+with open(os.environ["HOSTILE_PYTHON_MARKER"], "a") as _marker:
+    _marker.write(__name__ + " " + __file__ + "\n")
+# Load the real module from the rest of sys.path, then sabotage it.
+_here = os.path.dirname(os.path.abspath(__file__))
+_saved = sys.path[:]
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _here]
+del sys.modules[__name__]
+_real = __import__(__name__)
+sys.path[:] = _saved
+sys.modules[__name__] = _real
+if __name__ == "json":
+    import re
+    _compile = re.compile
+    re.compile = lambda pattern, flags=0: _compile("(?!)" if "codex" in str(pattern) else pattern, flags)
+elif __name__ == "shlex":
+    _real.split = lambda s, comments=False, posix=True: ["true"]
+PY
+for mod in json shlex; do
+  cp "$hostile/shadow.py" "$hostile/path/$mod.py"
+  cp "$hostile/shadow.py" "$hostile/cwd/$mod.py"
+done
+for mod in sitecustomize usercustomize startup; do
+  printf 'import os\nopen(os.environ["HOSTILE_PYTHON_MARKER"], "a").write("%s\\n")\n' "$mod" >"$hostile/path/$mod.py"
+done
+local trigger="@""codex review"
+local blocked="scripts/gh-as-reviewer.sh -- gh pr comment 123 --body \"Do not quote $trigger here.\""
+local allowed='scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"'
+local original_hook="$HOOK" tokenizer_open="$WORKDIR/tokenizer-open.sh" guard_open="$WORKDIR/guard-open.sh"
+hostile_hook() { # <label> <rc> <needle> <command> ; hostile PYTHONPATH, startup and cwd
+  cd "$hostile/cwd"
+  HOSTILE_PYTHON_MARKER="$marker" PYTHONPATH="$hostile/path" PYTHONSTARTUP="$hostile/path/startup.py" \
+    assert_rc_contains "$@"
+  cd "$ORIG_DIR"
+}
+homeless_hook() { # <label> <rc> <needle> <command> ; PYTHONHOME names no Python
+  HOSTILE_PYTHON_MARKER="$marker" PYTHONHOME="$hostile/no-python-home" assert_rc_contains "$@"
+}
+HOOK="$original_hook"
+assert_rc_contains "clean environment refuses trigger prose" 2 "Reword the comment" "$blocked"
+assert_rc_contains "clean environment permits an ordinary comment" 0 "" "$allowed"
+hostile_hook "hostile Python environment still refuses trigger prose" 2 "Reword the comment" "$blocked"
+hostile_hook "hostile Python environment still permits an ordinary comment" 0 "" "$allowed"
+homeless_hook "unusable PYTHONHOME still refuses trigger prose" 2 "Reword the comment" "$blocked"
+homeless_hook "unusable PYTHONHOME still permits an ordinary comment" 0 "" "$allowed"
+if [ -e "$marker" ]; then
+  fail "isolated hook interpreters imported hostile modules: $(tr '\n' ';' <"$marker")"
+else
+  pass "isolated hook interpreters imported no hostile module"
+fi
+# Positive controls: without the flags at one site, the same environment
+# reaches that interpreter and changes the verdict.
+if ! python3 - "$HOOK" "$ROOT/scripts/hooks" "$tokenizer_open" "$guard_open" <<'PYTHON'
+from pathlib import Path
+import shlex, sys
+source, helper_root, tokenizer_target, guard_target = sys.argv[1:]
+text = Path(source).read_text()
+root_line = next(line for line in text.splitlines() if line.startswith('HOOK_DIR='))
+text = text.replace(root_line, 'HOOK_DIR=' + shlex.quote(helper_root), 1)
+for target, isolated in ((tokenizer_target, "| python3 -I -S -c '"),
+                         (guard_target, 'python3 -I -S "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py"')):
+    assert text.count(isolated) == 1, 'isolation control lost its call site: ' + isolated
+    Path(target).write_text(text.replace(isolated, isolated.replace(' -I -S', ''), 1))
+PYTHON
+then
+  fail "isolation controls could not find both isolated hook call sites"
+  return 0
+fi
+rm -f "$marker"
+HOOK="$tokenizer_open"
+hostile_hook "unisolated tokenizer is hijacked by the hostile shlex" 0 "" "$blocked"
+if grep -q '^shlex ' "$marker" 2>/dev/null; then pass "unisolated tokenizer imported the hostile shlex"; else fail "unisolated tokenizer control did not import the hostile shlex"; fi
+homeless_hook "unisolated tokenizer cannot start under an unusable PYTHONHOME" 2 "could not tokenize" "$allowed"
+rm -f "$marker"
+HOOK="$guard_open"
+hostile_hook "unisolated guard is hijacked by the hostile json" 0 "" "$blocked"
+if grep -q '^json ' "$marker" 2>/dev/null; then pass "unisolated guard imported the hostile json"; else fail "unisolated guard control did not import the hostile json"; fi
+homeless_hook "unisolated guard cannot start under an unusable PYTHONHOME" 2 "" "$allowed"
+HOOK="$original_hook"
+}
+case_pool_add pr_guard_case_30
 
 # #1609: static admission must reach the real writer's fresh trusted gate.
 # Fake immutable-code/API transports only; includes stale/current generations,

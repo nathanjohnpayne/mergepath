@@ -100,6 +100,28 @@ fi
 printf '{"authorized":true,"repo":"o/r","pr_number":%s,"head_sha":"%s","author_identity":"nathanjohnpayne"}\n' "$3" "$MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD"
 """
 
+# A hostile stand-in for a stdlib module (#2348). It records its import in
+# HOSTILE_PYTHON_MARKER, loads the real module from the rest of sys.path, then
+# sabotages it: json defeats the guard's trigger patterns, so trigger prose
+# would pass, and shutil turns the snapshot cleanup into a no-op.
+HOSTILE_SHADOW = r"""import os, sys
+with open(os.environ["HOSTILE_PYTHON_MARKER"], "a") as _marker:
+    _marker.write(__name__ + " " + __file__ + "\n")
+_here = os.path.dirname(os.path.abspath(__file__))
+_saved = sys.path[:]
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _here]
+del sys.modules[__name__]
+_real = __import__(__name__)
+sys.path[:] = _saved
+sys.modules[__name__] = _real
+if __name__ == "json":
+    import re
+    _compile = re.compile
+    re.compile = lambda pattern, flags=0: _compile("(?!)" if "codex" in str(pattern) else pattern, flags)
+elif __name__ == "shutil":
+    _real.rmtree = lambda *args, **kwargs: None
+"""
+
 
 class TriggerGuardTests(unittest.TestCase):
     def setUp(self):
@@ -553,6 +575,83 @@ class TriggerGuardTests(unittest.TestCase):
         result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "  @CoDeX  review\n"], env=env, capture_output=True, timeout=10)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["pr comment 123 --repo o/r --body @codex review"], (fixture / "writes").read_text().splitlines())
+
+    def test_real_wrappers_keep_their_verdict_in_a_hostile_python_environment(self):
+        # #2348: the shared guard library runs its interpreters isolated, so a
+        # caller's PYTHONPATH (sitecustomize, usercustomize, shadowed json and
+        # shutil), PYTHONSTARTUP, current directory (the same shadows, read as
+        # sys.path[0] by the cleanup's stdin script) or PYTHONHOME cannot
+        # change what either token-verifying wrapper refuses, writes or cleans.
+        fixture, env = self.wrapper_fixture()
+        gh = fixture / "bin/gh"
+        gh.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$WRITE_LOG"\n')  # loads no Python itself
+        runtime = fixture / "runtime"
+        runtime.mkdir()
+        hostile = self.root / "hostile-python"
+        (hostile / "path").mkdir(parents=True)
+        (hostile / "cwd").mkdir()
+        for name in ("json", "shutil"):
+            for where in ("path", "cwd"):
+                (hostile / where / f"{name}.py").write_text(HOSTILE_SHADOW)
+        for name in ("sitecustomize", "usercustomize", "startup"):
+            (hostile / "path" / f"{name}.py").write_text(f'import os\nopen(os.environ["HOSTILE_PYTHON_MARKER"], "a").write("{name}\\n")\n')
+        marker = hostile / "imported"
+        for name in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"):
+            env.pop(name, None)
+        env.update(TMPDIR=str(runtime), HOSTILE_PYTHON_MARKER=str(marker))
+        variants = {
+            "shadowed": ({"PYTHONPATH": str(hostile / "path"), "PYTHONSTARTUP": str(hostile / "path/startup.py")}, hostile / "cwd"),
+            "homeless": ({"PYTHONHOME": str(hostile / "no-python-home")}, hostile),
+        }
+        blocked = "Do not quote @" + "codex review here."
+        allowed = "Safe hostile-environment comment"
+        library = fixture / "scripts/lib/gh-comment-trigger-guard.sh"
+        isolated = library.read_text()
+
+        def run(role, body, variant=None):
+            writes = fixture / "writes"
+            writes.unlink(missing_ok=True)
+            extra, cwd = variants[variant] if variant else ({}, fixture)
+            result = subprocess.run(["bash", str(fixture / f"scripts/gh-as-{role}.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", body],
+                                    env={**env, **extra}, cwd=cwd, capture_output=True, timeout=20)
+            left = sorted(p.name for p in runtime.glob("gh-comment-guard.*"))
+            for path in runtime.glob("gh-comment-guard.*"):
+                shutil.rmtree(path)
+            return result.returncode == 0, writes.read_text().splitlines() if writes.exists() else [], bool(left)
+
+        def outcomes(variant=None):
+            return {(role, body): run(role, body, variant) for role in ("author", "reviewer") for body in (blocked, allowed)}
+
+        clean = outcomes()
+        for role in ("author", "reviewer"):
+            self.assertEqual((False, [], False), clean[(role, blocked)], role)
+            self.assertEqual((True, [f"pr comment 123 --repo o/r --body {allowed}"], False), clean[(role, allowed)], role)
+        for variant in variants:
+            with self.subTest(variant=variant):
+                marker.unlink(missing_ok=True)
+                self.assertEqual(clean, outcomes(variant))
+                self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+
+        # Positive controls: without the flags at one call site, the same
+        # environment reaches that interpreter and changes the outcome.
+        sites = {"prepare": 'python3 -I -S "$ROOT/scripts/workflow/gh-comment-trigger-guard.py"',
+                 "cleanup": "python3 -I -S - "}
+        for site, call in sites.items():
+            self.assertEqual(1, isolated.count(call), site)
+            library.write_text(isolated.replace(call, call.replace(" -I -S", ""), 1))
+            for variant in variants:
+                with self.subTest(open_site=site, variant=variant):
+                    marker.unlink(missing_ok=True)
+                    if site == "prepare" and variant == "shadowed":
+                        self.assertEqual((True, [f"pr comment 123 --repo o/r --body {blocked}"]), run("reviewer", blocked, variant)[:2])
+                        self.assertIn("json", marker.read_text().split())
+                    elif site == "prepare":
+                        self.assertEqual((False, []), run("reviewer", allowed, variant)[:2])
+                    else:
+                        self.assertTrue(run("reviewer", allowed, variant)[2], "an unisolated cleanup must be the one that leaves the snapshot")
+                        if variant == "shadowed":
+                            self.assertIn("shutil", marker.read_text().split())
+        library.write_text(isolated)
 
     def claim_fixture(self):
         fixture, env = self.wrapper_fixture()
