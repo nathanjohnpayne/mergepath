@@ -190,6 +190,22 @@ consumers:
       prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
       frameworks: [react, typescript]
       testing: vitest
+  # sendermark is a Swift package (macOS app and command-line tool) with no
+  # JavaScript surface: no root package.json and no JavaScript or TypeScript
+  # sources of its own (verified 2026-11-17 against its bootstrap tree; the
+  # only .cjs/.mjs files there are the synced review tooling). It therefore
+  # declares no `frameworks`, `testing` or `jsx_in_js` fact and is in neither
+  # ESLint templated entry below: scripts/ci/check_eslint_config_present
+  # treats a repo without a root package.json as not applicable. It is also
+  # absent from the scripts/deploy.sh list, which is the Firebase deploy
+  # wrapper; the repo was bootstrapped with firebase=none. The first private
+  # consumer. Follow the canonical per-wave selection and fan-out gates in
+  # docs/agents/propagation-ordering.md.
+  - name: sendermark
+    repo: nathanjohnpayne/sendermark
+    visibility: private
+    facts:
+      prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
 
 # Path types:
 #   canonical  — byte-for-byte mirror. Any difference is drift.
