@@ -1664,6 +1664,7 @@ paths:
     requires:
       - ".github/workflows/required-check-publisher.yml"
       - "scripts/ci/check_required_check_publisher"
+      - ".github/workflows/coderabbit-severity-gate.yml"   # #2690, the sweep's cr_surface_fp the publisher copies
   # Complete-history inline + review-body finding inventory, disposition
   # evidence, pagination, API fail-closed behavior, and the four enforcement
   # call sites (#1000). Hard-run by check_review_feedback_accounting.

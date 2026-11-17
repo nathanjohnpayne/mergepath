@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-$ROOT/.github/workflows/required-check-publisher.yml}"
+# #2690: the CodeRabbit sweep, whose cr_surface_fp the publisher copies.
+SWEEP_WORKFLOW="${CODERABBIT_SWEEP_WORKFLOW:-$ROOT/.github/workflows/coderabbit-severity-gate.yml}"
 
 command -v ruby >/dev/null 2>&1 || { echo "ERROR: Ruby is required" >&2; exit 1; }
 ruby -e 'require "yaml"' >/dev/null 2>&1 \
@@ -25,16 +27,19 @@ abort("could not extract the publisher publish step") unless matches.length == 1
 File.write(ARGV[1], matches[0]["run"])
 RUBY
 
-# #2689: gate() runs the Codex P1 context through codex_p1_evaluate, so both
-# shipped functions are extracted.
+# #2689: gate() runs the Codex P1 context through codex_p1_evaluate, and
+# #2690 the CodeRabbit context through coderabbit_evaluate and its copy of the
+# sweep's cr_surface_fp, so all four shipped functions are extracted.
 awk '
-  /^(gate|codex_p1_evaluate)\(\) \{$/ { inside=1 }
+  /^(gate|codex_p1_evaluate|cr_surface_fp|coderabbit_evaluate)\(\) \{$/ { inside=1 }
   inside { print }
   inside && /^}$/ { inside=0 }
 ' "$TMP/publish.sh" >"$TMP/gate-helper.sh"
 grep '^[[:space:]]*gate scripts/' "$TMP/publish.sh" >"$TMP/gate-calls.sh" || true
 if ! grep -q '^gate() {$' "$TMP/gate-helper.sh" \
     || ! grep -q '^codex_p1_evaluate() {$' "$TMP/gate-helper.sh" \
+    || ! grep -q '^cr_surface_fp() {$' "$TMP/gate-helper.sh" \
+    || ! grep -q '^coderabbit_evaluate() {$' "$TMP/gate-helper.sh" \
     || [ "$(wc -l <"$TMP/gate-calls.sh" | tr -d ' ')" -ne 3 ]; then
   echo "FAIL: could not extract the gate helpers and their three live callers"
   exit 1
@@ -66,7 +71,22 @@ case "$name" in
     fi
     ;;
   codex-p1-gate.sh) rc=$CODEX_RC ;;
-  coderabbit-severity-gate.sh) rc=$CR_RC ;;
+  coderabbit-severity-gate.sh)
+    rc=$CR_RC
+    # #2690: what the real gate is told about the surface fingerprint, and
+    # what it does with it: an evidence failure holds (rc 3) a run that would
+    # otherwise clear. CR_TOUCH names a surface this run changes, the way a
+    # review or acknowledgement lands while the gate runs. CR_ESCALATE writes
+    # the evidence report an escalating hold writes. The marker in the call
+    # log orders the fingerprint reads around the evaluation.
+    printf '%s\n' "${CR_EVIDENCE_FAILURE:-none}" >>"$CR_EVIDENCE_LOG"
+    printf 'GATE coderabbit-severity-gate.sh\n' >>"$GH_CALL_LOG"
+    : >"$SURFACE/gate-ran"
+    [ -z "${CR_EVIDENCE_FAILURE:-}" ] || [ "$rc" -ne 0 ] || rc=3
+    [ -z "${CR_TOUCH:-}" ] || printf 'moved\n' >>"$SURFACE/$CR_TOUCH"
+    [ "${CR_ESCALATE:-0}" = 0 ] \
+      || printf '{"repo":"example/repo","pr":7,"head":"abc123","state":"escalate"}\n' >"$CR_EVIDENCE_REPORT"
+    ;;
   *) echo "unknown fake gate: $name" >&2; exit 9 ;;
 esac
 printf '%s\t%s\n' "$name" "${REQUIRE_REVIEW_SUMMARY-unset}" >>"$GATE_ENV_LOG"
@@ -101,10 +121,29 @@ printf '#!/bin/sh\necho fixture-fingerprint\n' >"$TMP/scripts/review-feedback-su
 chmod +x "$TMP/scripts/workflow/codex-p1-snapshot-retry.py" "$TMP/scripts/workflow/codex-p1-relay-pending.sh" \
   "$TMP/scripts/review-feedback-surface-fingerprint.sh"
 
+# #2690: the four CodeRabbit surfaces the fingerprint reads, one file each,
+# printed as the read's (already projected) value. FP_FAIL=<surface>:<when>
+# fails that surface's read before the gate runs (pre), after it (post) or
+# both, the way an unreadable endpoint does.
+SURFACE="$TMP/surface"
+mkdir -p "$SURFACE"
 cat >"$TMP/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
+surface_read() {  # <surface>
+  local when=pre
+  [ ! -e "$SURFACE/gate-ran" ] || when=post
+  case "${FP_FAIL:-}" in
+    "$1:$when"|"$1:both") echo "HTTP 502: Bad Gateway (fixture $1 read)" >&2; exit 1 ;;
+  esac
+  cat "$SURFACE/$1"
+  exit 0
+}
 case "$*" in
+  *"repos/example/repo/issues/7/comments --paginate"*) surface_read comments ;;
+  *"repos/example/repo/pulls/7/reviews --paginate"*) surface_read reviews ;;
+  *"repos/example/repo/pulls/7/comments --paginate"*) surface_read inline ;;
+  "api graphql --paginate "*"pr=7 "*) surface_read threads ;;
   *"-X POST"*"/check-runs"*)
     [ "${OPEN_FAIL:-0}" = 0 ] || exit 1
     printf '{}\n' ;;
@@ -153,6 +192,7 @@ rcg_close() {
     -f "output[title]=$7" -f "output[summary]=$8" >/dev/null
 }
 export GATE_ENV_LOG="$TMP/gate-env" GH_CALL_LOG="$TMP/gh-calls"
+export SURFACE CR_EVIDENCE_LOG="$TMP/cr-evidence"
 export GATE_VERDICT_LOG="$TMP/gate-verdict"
 # The real workflow never names a verdict file; clear an ambient export so the
 # pending case below proves the publisher does not ask for one.
@@ -163,7 +203,7 @@ export CODEX_P1_CONTEXT="Codex P1 unresolved threads"
 export CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings"
 export MCG_RC=0 CODEX_RC=0 CR_RC=0 RELAY_RC=0
 export DRIVER_LOG="$TMP/driver-log" RELAY_LOG="$TMP/relay-log"
-unset CODEX_P1_VERDICT_REPORT DRIVER_NO_REPORT
+unset CODEX_P1_VERDICT_REPORT DRIVER_NO_REPORT FP_FAIL CR_TOUCH CR_ESCALATE CR_EVIDENCE_FAILURE
 
 run_call() {
   local call="$1" previous="$PWD"
@@ -177,7 +217,11 @@ reset_case() {
   : >"$GH_CALL_LOG"
   : >"$DRIVER_LOG"
   : >"$RELAY_LOG"
+  : >"$CR_EVIDENCE_LOG"
+  rm -f "$SURFACE/gate-ran"
+  for s in comments reviews inline threads; do printf '%s-v1\n' "$s" >"$SURFACE/$s"; done
   had_infra_error=0
+  EVIDENCE_ESCALATIONS=""
 }
 
 one_post() {
@@ -241,6 +285,154 @@ grep -qx $'coderabbit-severity-gate.sh\ttrue' "$GATE_ENV_LOG" \
 case_rc=$?
 set -e
 record "unknown current-head CodeRabbit run closes its owned generation red" "$case_rc"
+
+# #2690: the CodeRabbit evaluation is bracketed by the scheduled sweep's
+# pre/post surface fingerprint (coderabbit-severity-gate.yml). surface_order
+# prints the calls this case made to the four surfaces and the gate, in order.
+surface_order() {
+  sed -n -e 's#^api repos/example/repo/issues/7/comments .*#comments#p' \
+    -e 's#^api repos/example/repo/pulls/7/reviews .*#reviews#p' \
+    -e 's#^api repos/example/repo/pulls/7/comments .*#inline#p' \
+    -e 's#^api graphql .*#threads#p' \
+    -e 's#^GATE .*#GATE#p' "$GH_CALL_LOG" | tr '\n' ' ' | sed 's/ $//'
+}
+closed_title() {  # the title of the one PATCH this case made
+  sed -n 's/.*-f output\[title\]=\(.*\) -f output\[summary\]=.*/\1/p' "$GH_CALL_LOG"
+}
+
+reset_case
+CR_RC=0; export CR_RC
+run_call "$CR_CALL" >"$TMP/cr-bracket.out"
+set +e
+[ "$(surface_order)" = "comments reviews inline threads GATE comments reviews inline threads" ] \
+  && [ "$(cat "$CR_EVIDENCE_LOG")" = none ] && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "an unchanged CodeRabbit surface, read before and after the gate, publishes the gate's verdict" "$case_rc"
+
+# A review, acknowledgement, inline finding or thread resolution that lands
+# while the gate runs: the evaluation is not published over it. As in the
+# sweep, the generation closes red as an infrastructure error and the
+# evidence report is emptied, so no hold escalation is recorded.
+for touched in comments reviews inline threads; do
+  reset_case
+  CR_RC=0 CR_TOUCH="$touched" CR_ESCALATE=1; export CR_RC CR_TOUCH CR_ESCALATE
+  run_call "$CR_CALL" >"$TMP/cr-moved-$touched.out"
+  set +e
+  [ "$had_infra_error" -eq 1 ] && one_post \
+    && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+    && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG" \
+    && grep -q 'comment surface changed while the gate ran, or one of its two reads failed' "$GH_CALL_LOG" \
+    && [ -z "$EVIDENCE_ESCALATIONS" ]
+  case_rc=$?
+  set -e
+  record "a $touched change during the CodeRabbit evaluation closes the generation red, unpublished" "$case_rc"
+done
+unset CR_TOUCH CR_ESCALATE
+
+# The change outranks the summary hold, as in the sweep: an rc 3 hold over a
+# moved surface is the same infrastructure red, not an evidence hold. The
+# unchanged hold escalates as before.
+reset_case
+CR_RC=3 CR_ESCALATE=1; export CR_RC CR_ESCALATE
+run_call "$CR_CALL" >"$TMP/cr-hold-escalates.out"
+set +e
+[ "$had_infra_error" -eq 0 ] && one_post && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && [ "$(closed_title)" = "CodeRabbit unresolved blocking findings — evidence hold; explicit recovery required after escalation" ] \
+  && [ "$EVIDENCE_ESCALATIONS" = " 7" ]
+case_rc=$?
+set -e
+record "an unchanged surface keeps the summary hold and its escalation on the bracketed path" "$case_rc"
+reset_case
+CR_RC=3 CR_TOUCH=reviews; export CR_RC CR_TOUCH
+run_call "$CR_CALL" >"$TMP/cr-hold-moved.out"
+set +e
+[ "$had_infra_error" -eq 1 ] && one_post && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && [ "$(closed_title)" = "CodeRabbit unresolved blocking findings — infra/config error (rc=2)" ]
+case_rc=$?
+set -e
+record "a surface change outranks the summary hold" "$case_rc"
+unset CR_TOUCH CR_ESCALATE
+
+# Read failures follow the sweep (the #906 contract). A failed read before
+# the gate is passed to it as an evidence failure; a clean rc 0 after a
+# failed read is re-run that way; any failed read is an infrastructure red.
+reset_case
+CR_RC=0 FP_FAIL=reviews:pre; export CR_RC FP_FAIL
+run_call "$CR_CALL" >"$TMP/cr-pre-fail.out" 2>&1
+set +e
+[ "$(cat "$CR_EVIDENCE_LOG")" = fingerprint-read-failed ] && [ "$had_infra_error" -eq 1 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG" \
+  && grep -q 'HTTP 502: Bad Gateway (fixture reviews read)' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "a failed surface read before the gate is passed to it and closes the generation red" "$case_rc"
+
+reset_case
+CR_RC=0 FP_FAIL=inline:post; export CR_RC FP_FAIL
+run_call "$CR_CALL" >"$TMP/cr-post-fail.out" 2>&1
+set +e
+[ "$(cat "$CR_EVIDENCE_LOG" | tr '\n' ' ')" = "none fingerprint-read-failed " ] \
+  && [ "$had_infra_error" -eq 1 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "a failed surface read after a clean gate re-runs it as an evidence failure and closes red" "$case_rc"
+
+# Both reads failed: nothing to compare, so the gate's evidence hold is what
+# is published, as an infrastructure error.
+reset_case
+CR_RC=0 FP_FAIL=threads:both; export CR_RC FP_FAIL
+run_call "$CR_CALL" >"$TMP/cr-both-fail.out" 2>&1
+set +e
+[ "$(cat "$CR_EVIDENCE_LOG")" = fingerprint-read-failed ] && [ "$had_infra_error" -eq 1 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && [ "$(closed_title)" = "CodeRabbit unresolved blocking findings — evidence hold; explicit recovery required after escalation" ]
+case_rc=$?
+set -e
+record "both surface reads failed: the gate's evidence hold closes the generation red as an infra error" "$case_rc"
+unset FP_FAIL
+
+# The gate's own infrastructure exit outranks both comparisons. The sweep
+# reads the surface again and ignores it; the publisher does not read it.
+reset_case
+CR_RC=2 CR_TOUCH=comments; export CR_RC CR_TOUCH
+run_call "$CR_CALL" >"$TMP/cr-gate-infra.out"
+set +e
+[ "$(surface_order)" = "comments reviews inline threads GATE" ] && [ "$had_infra_error" -eq 1 ] && one_post \
+  && [ "$(closed_title)" = "CodeRabbit unresolved blocking findings — infra/config error (rc=2)" ] \
+  && ! grep -q 'comment surface changed while the gate ran' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "the gate's own infra exit publishes red without a second surface read" "$case_rc"
+unset CR_TOUCH
+CR_RC=0; export CR_RC
+
+# The publisher's cr_surface_fp is a copy of the sweep's. Compared line by
+# line without leading whitespace, the two must be identical, so a change to
+# what the sweep reads cannot leave the publisher reading less.
+extract_fp() {  # <run script>: the function body, leading whitespace removed
+  awk 'match($0, /^[[:space:]]*cr_surface_fp\(\) \{$/) { inside=1; indent=substr($0, 1, RLENGTH - 17) }
+       inside { line=$0; sub(/^[[:space:]]+/, "", line); print line }
+       inside && $0 == indent "}" { exit }' "$1"
+}
+ruby - "$SWEEP_WORKFLOW" "$TMP/sweep.sh" <<'RUBY'
+require "yaml"
+steps = YAML.load_file(ARGV[0]).fetch("jobs").fetch("scheduled-sweep").fetch("steps")
+matches = steps.select { |step| step["run"].to_s.include?("cr_surface_fp() {") }
+abort("could not extract the CodeRabbit sweep's cr_surface_fp step") unless matches.length == 1
+File.write(ARGV[1], matches[0]["run"])
+RUBY
+set +e
+extract_fp "$TMP/publish.sh" >"$TMP/fp-publisher"
+extract_fp "$TMP/sweep.sh" >"$TMP/fp-sweep"
+[ "$(wc -l <"$TMP/fp-sweep" | tr -d ' ')" -gt 10 ] && grep -q 'reviewThreads' "$TMP/fp-sweep" \
+  && cmp -s "$TMP/fp-publisher" "$TMP/fp-sweep"
+case_rc=$?
+set -e
+[ "$case_rc" -eq 0 ] || diff "$TMP/fp-sweep" "$TMP/fp-publisher" || true
+record "the publisher's cr_surface_fp is the sweep's, line for line" "$case_rc"
 
 reset_case
 MCG_RC=3; export MCG_RC
@@ -511,9 +703,10 @@ expect_mutation_failure "unrecognized-evidence success mutation" "$mutation_rc" 
   'FAIL: unknown current-head CodeRabbit run closes its owned generation red' "$TMP/no-withhold.out" \
   || fail=$((fail + 1))
 
-# #2689: each ported Codex P1 guard, removed from the shipped workflow, must
-# fail the case that pins it. Each edit replaces exactly one shipped line.
-codex_guard_mutation() {  # <label> <old> <new> <expected FAIL line>
+# #2689 and #2690: each ported sweep guard, removed from the shipped workflow,
+# must fail the case that pins it. Each edit replaces exactly one shipped
+# passage.
+guard_mutation() {  # <label> <old> <new> <expected FAIL line>
   local out="$TMP/codex-mutation.out"
   python3 - "$WORKFLOW" "$TMP/codex-mutation.yml" "$2" "$3" <<'PY4'
 from pathlib import Path
@@ -530,25 +723,49 @@ PY4
   set -e
   expect_mutation_failure "$1" "$mutation_rc" "$4" "$out" || fail=$((fail + 1))
 }
-codex_guard_mutation "removal of the Codex P1 fingerprint-helper guard" \
+guard_mutation "removal of the Codex P1 fingerprint-helper guard" \
   'if [ ! -x scripts/review-feedback-surface-fingerprint.sh ] || [ ! -x "$driver" ]; then' \
   'if false; then' \
   'FAIL: a missing feedback-fingerprint helper publishes failure without evaluating'
-codex_guard_mutation "a Codex P1 caller that runs the gate script instead of the snapshot driver" \
+guard_mutation "a Codex P1 caller that runs the gate script instead of the snapshot driver" \
   'gate scripts/workflow/codex-p1-snapshot-retry.py "$CODEX_P1_CONTEXT"' \
   'gate scripts/codex-p1-gate.sh "$CODEX_P1_CONTEXT"' \
   'FAIL: Codex P1 evaluates through the snapshot driver in report mode on its own generation'
-codex_guard_mutation "a gate() that bypasses the Codex P1 evaluation" \
+guard_mutation "a gate() that bypasses the Codex P1 evaluation" \
   'elif [ "$context" = "${CODEX_P1_CONTEXT:-}" ]; then' \
   'elif false; then' \
   'FAIL: Codex P1 evaluates through the snapshot driver in report mode on its own generation'
-codex_guard_mutation "removal of the Codex P1 relay-pending guard" \
+guard_mutation "removal of the Codex P1 relay-pending guard" \
   'if [ "$relay_rc" -ne 0 ]; then' \
   'if false; then' \
   'FAIL: a pending read-only archive relay withholds Codex P1 clearance without evaluating'
+guard_mutation "a gate() that evaluates CodeRabbit without the surface bracket" \
+  'coderabbit_evaluate "$script" "$pr"' \
+  'output=$(REQUIRE_REVIEW_SUMMARY=true "$script" "$pr" "$REPO" 2>&1); rc=$?' \
+  'FAIL: a comments change during the CodeRabbit evaluation closes the generation red, unpublished'
+guard_mutation "removal of the CodeRabbit surface-change comparison" \
+  'if [ "$pre_fp" != "$post_fp" ]; then' \
+  'if false; then' \
+  'FAIL: a threads change during the CodeRabbit evaluation closes the generation red, unpublished'
+guard_mutation "removal of the CodeRabbit surface read-failure branch" \
+  'if [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; then' \
+  'if false; then' \
+  'FAIL: a failed surface read after a clean gate re-runs it as an evidence failure and closes red'
+guard_mutation "a first surface read failure not passed to the CodeRabbit gate" \
+  '[ "$pre_fp_rc" -eq 0 ] || evidence_failure="fingerprint-read-failed"' \
+  ':' \
+  'FAIL: a failed surface read before the gate is passed to it and closes the generation red'
+guard_mutation "a surface change that keeps the evidence report" \
+  "$(printf '%s\n%s' 'closing this generation red for a fresh evaluation."' '                  : >"$CR_EVIDENCE_REPORT"')" \
+  'closing this generation red for a fresh evaluation."' \
+  'FAIL: a inline change during the CodeRabbit evaluation closes the generation red, unpublished'
+guard_mutation "a publisher fingerprint that drops a surface the sweep reads" \
+  "printf '%s\035%s\035%s\035%s' \"\$comments\" \"\$reviews\" \"\$inline\" \"\$threads\"" \
+  "printf '%s\035%s\035%s' \"\$comments\" \"\$reviews\" \"\$inline\"" \
+  "FAIL: the publisher's cr_surface_fp is the sweep's, line for line"
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
   exit 1
 fi
-echo "All $pass required-check publisher summary-hold behavior tests, 6 mutations, and unrelated-failure control passed."
+echo "All $pass required-check publisher summary-hold behavior tests, 12 mutations, and unrelated-failure control passed."
