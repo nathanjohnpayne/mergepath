@@ -125,3 +125,13 @@ projects:
       - slug: native-app-expansion
         source: projects/gaycruisebingo/prds/native-app-expansion.md
         mirror: docs/projects/gaycruisebingo/prds/native-app-expansion.md
+
+  - slug: sendermark
+    owner:
+      name: sendermark
+      repo: nathanjohnpayne/sendermark
+      path_hint: ../sendermark
+    prds:
+      - slug: sendermark
+        source: projects/sendermark/prds/sendermark.md
+        mirror: docs/projects/sendermark/prds/sendermark.md
