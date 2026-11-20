@@ -66,6 +66,7 @@ The full bootstrap loop runs across each repo the bootstrap wizard has provision
 - fiveacross
 - matchline
 - tadlockpsychiatry
+- sendermark
 <!-- bootstrap-loop-list-end -->
 
 Run the bootstrap script across all of them:
