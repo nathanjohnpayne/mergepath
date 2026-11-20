@@ -198,12 +198,13 @@ consumers:
   # ESLint templated entry below: scripts/ci/check_eslint_config_present
   # treats a repo without a root package.json as not applicable. It is also
   # absent from the scripts/deploy.sh list, which is the Firebase deploy
-  # wrapper; the repo was bootstrapped with firebase=none. The first private
-  # consumer. Follow the canonical per-wave selection and fan-out gates in
+  # wrapper; the repo was bootstrapped with firebase=none. It was bootstrapped
+  # private and made public on 2026-11-19. Follow the canonical per-wave
+  # selection and fan-out gates in
   # docs/agents/propagation-ordering.md.
   - name: sendermark
     repo: nathanjohnpayne/sendermark
-    visibility: private
+    visibility: public
     facts:
       prepush_mode: selected  # repo-lint pre-push policy (#2844, examples/prepush.yml)
 
