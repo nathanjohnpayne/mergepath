@@ -40,6 +40,7 @@ TRUSTED_TARGETS = {
     'nathanjohnpayne/swipewatch': (1165945748, 23488723),
     'nathanjohnpayne/tadlockpsychiatry': (1226654565, 23488723),
     'nathanjohnpayne/fiveacross': (1292606950, 23488723),
+    'nathanjohnpayne/sendermark': (1461877855, 23488723),
 }
 
 SYSTEM_PATH = ('/usr/bin', '/bin', '/usr/sbin', '/sbin')
